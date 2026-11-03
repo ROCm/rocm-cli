@@ -40,6 +40,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     // about the ones a managed `rocm serve` leaves behind.
     ("local_server_records.feature", "server-records"),
     ("logs.feature", "logs"),
+    ("model_catalog.feature", "model-catalog"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
     ("remote.feature", "remote"),
@@ -50,6 +51,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("runtime_setup.feature", "runtime"),
     ("service_record_cleanup.feature", "service-cleanup"),
     ("service_stop.feature", "service-stop"),
+    ("storage.feature", "storage"),
     ("therock_next_generation.feature", "therock-next"),
     ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),

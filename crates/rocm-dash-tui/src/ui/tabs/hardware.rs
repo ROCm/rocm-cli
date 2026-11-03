@@ -413,9 +413,7 @@ pub fn gpu_compact_line(
         ),
     ];
     let base_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let used_g = g.vram_used_mb as f64 / 1024.0;
-    let tot_g = g.vram_total_mb as f64 / 1024.0;
-    let vram = format!("  {used_g:.0}/{tot_g:.0} GB");
+    let vram = format!("  {}", format::mib_pair(g.vram_used_mb, g.vram_total_mb));
     if base_w + vram.chars().count() <= width as usize {
         spans.push(Span::styled(vram, Style::default().fg(theme.muted)));
     }
@@ -751,10 +749,26 @@ mod tests {
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
         // wide → vram segment included
-        assert!(line.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(line.spans.iter().any(|s| s.content.contains("GiB")));
         // narrow → vram segment dropped (truncation by omission)
         let narrow = gpu_compact_line(&hot, &theme, 24, false);
-        assert!(!narrow.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(!narrow.spans.iter().any(|s| s.content.contains("GiB")));
+    }
+
+    #[test]
+    fn gpu_compact_line_vram_truncation_threshold() {
+        // Pins the exact width at which the vram segment starts fitting, since
+        // mib_pair's longer rendering ("142.0 / 192.0 GiB" vs the old
+        // "142/192 GB") moved that threshold up by 7 columns (from 47 to 54)
+        // for this fixture: base_w is 35 (id+marker 9, util bar 9, util% 5,
+        // temp 6, power 6), and the vram string is 19 chars, so the segment
+        // fits once `base_w + vram.len() <= width`, i.e. width >= 54.
+        let theme = Theme::default_dark();
+        let hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        let just_under = gpu_compact_line(&hot, &theme, 53, false);
+        assert!(!just_under.spans.iter().any(|s| s.content.contains("GiB")));
+        let exact_fit = gpu_compact_line(&hot, &theme, 54, false);
+        assert!(exact_fit.spans.iter().any(|s| s.content.contains("GiB")));
     }
 
     #[test]

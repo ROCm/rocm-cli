@@ -452,7 +452,7 @@ fn serve_with_transport(
             return Err(error.context(format!(
                 "a model may now be running on {} port {} with nothing tracking it.\n\
                      Check with: ssh {} -- {remote_cli} services list\n\
-                     Its API key was kept at {} — it is the only copy.",
+                     Its API key was kept at {} - it is the only copy.",
                 request.target,
                 request.remote_port,
                 request.target,
@@ -546,7 +546,7 @@ fn unwind_partial_serve(
     if let Some(service_id) = service_id {
         match transport.exec(&crate::service_hints::remote_service_stop_hint(
             remote_cli,
-            &shell_quote(service_id),
+            &rocm_core::posix_shell_quote(service_id),
         )) {
             Ok(outcome) if outcome.success => {}
             Ok(outcome) => leftovers.push(format!(
@@ -571,11 +571,23 @@ fn unwind_partial_serve(
         session::clear_key(paths, session_id);
     } else {
         leftovers.push(format!(
-            "its API key was kept at {} — it is the only copy",
+            "its API key was kept at {} - it is the only copy",
             session::key_path(paths, session_id).display()
         ));
     }
     leftovers
+}
+
+/// One item per line, bulleted. Shared rather than reimplemented per call
+/// site, so a third copy never has to decide independently whether to match
+/// this formatting. Private: the only other caller is `remote::install`, a
+/// child module, which sees a plain-private item without any added visibility.
+fn bullets(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("  - {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Attach what could not be cleaned up to the error that caused it.
@@ -586,11 +598,7 @@ fn describe_leftovers(error: anyhow::Error, target: &str, leftovers: &[String]) 
     error.context(format!(
         "{target} was left with things this command could not undo:\n{}\n\
          Check it with: ssh {target} -- rocm services list",
-        leftovers
-            .iter()
-            .map(|leftover| format!("  - {leftover}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        bullets(leftovers)
     ))
 }
 
@@ -643,15 +651,19 @@ fn remote_serve_command(remote_cli: &str, request: &ServeRequest) -> String {
     let mut command = format!(
         "IFS= read -r ROCM_SERVE_API_KEY && export ROCM_SERVE_API_KEY && \
          {remote_cli} serve {} --managed --require-api-key --host {} --port {}",
-        shell_quote(&request.model),
+        rocm_core::posix_shell_quote(&request.model),
         publish::LOOPBACK,
         request.remote_port
     );
     if let Some(engine) = &request.engine {
-        let _ = write!(command, " --engine {}", shell_quote(engine));
+        let _ = write!(
+            command,
+            " --engine {}",
+            rocm_core::posix_shell_quote(engine)
+        );
     }
     if let Some(gpu) = &request.gpu {
-        let _ = write!(command, " --gpu {}", shell_quote(gpu));
+        let _ = write!(command, " --gpu {}", rocm_core::posix_shell_quote(gpu));
     }
     command
 }
@@ -968,14 +980,14 @@ fn render_status(
                 Known(publish::PublishState::Published) => "yes".to_owned(),
                 Known(publish::PublishState::Absent) => "no".to_owned(),
                 Known(publish::PublishState::Foreign { forwards_to }) =>
-                    format!("no — that port now forwards to {forwards_to}"),
+                    format!("no - that port now forwards to {forwards_to}"),
                 // Not "no": Funnel is classified before anything is asked about
                 // our own forward and short-circuits, so this state says
                 // nothing either way about whether the endpoint is published.
                 // Leading with "no" answered a question it had not looked at,
                 // and buried the one thing here that needs acting on.
                 Known(publish::PublishState::FunnelAllowed) => format!(
-                    "exposed — Tailscale Funnel is allowed on that port, which puts it on the \
+                    "exposed - Tailscale Funnel is allowed on that port, which puts it on the \
                      public internet; run `tailscale funnel --tcp={} off` on the remote, then \
                      check again",
                     record.tailnet_port
@@ -986,12 +998,12 @@ fn render_status(
                 // stay distinct because the next step differs — fix the reply,
                 // fix the remote's tailscale, or fix the connection.
                 Known(publish::PublishState::Unreadable) =>
-                    "unknown — the machine's reply could not be read".to_owned(),
+                    "unknown - the machine's reply could not be read".to_owned(),
                 // Reached, and it told us why. Printing its own words beats
                 // "could not be asked", which describes a different failure and
                 // sends the user to check the network instead of the remote.
-                Failed(why) => format!("unknown — the machine answered: {why}"),
-                Unreachable(why) => format!("unknown — the machine could not be asked: {why}"),
+                Failed(why) => format!("unknown - the machine answered: {why}"),
+                Unreachable(why) => format!("unknown - the machine could not be asked: {why}"),
             }
         );
 
@@ -1097,7 +1109,7 @@ fn stop_with_transport(
     let withdrawn = publish::withdraw(transport, record.tailnet_port, record.remote_port);
     let stopped = transport.exec(&crate::service_hints::remote_service_stop_hint(
         &record.remote_cli,
-        &shell_quote(&record.remote_service_id),
+        &rocm_core::posix_shell_quote(&record.remote_service_id),
     ));
     let stop_failure = describe_stop_failure(&stopped);
     let model_stopped = stop_failure.is_none();
@@ -1217,7 +1229,7 @@ fn render_stopped(
         if !withdrawn {
             let _ = writeln!(
                 output,
-                "  endpoint still reachable on the tailnet — clear it with:\n    \
+                "  endpoint still reachable on the tailnet - clear it with:\n    \
                  ssh {} -- tailscale serve --tcp={} off",
                 record.target, record.tailnet_port
             );
@@ -1225,29 +1237,13 @@ fn render_stopped(
         if !model_stopped {
             let _ = writeln!(
                 output,
-                "  model may still hold the GPU — check with:\n    \
+                "  model may still hold the GPU - check with:\n    \
                  ssh {} -- {} services list",
                 record.target, record.remote_cli
             );
         }
     }
     output
-}
-
-/// Quote a value for a POSIX remote shell.
-///
-/// Model names and engine flags are user-supplied values being placed into a
-/// command line that a shell on another machine will interpret. Anything not
-/// obviously inert gets single-quoted, with embedded single quotes closed and
-/// re-opened, so no input can end the quoting and start a new command.
-fn shell_quote(value: &str) -> String {
-    let inert = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
-    };
-    if !value.is_empty() && value.chars().all(inert) {
-        return value.to_owned();
-    }
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -1431,36 +1427,6 @@ mod tests {
         assert!(command.contains("--gpu 1"), "{command}");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn hostile_values_survive_a_real_shell_as_one_literal_argument() {
-        // The property that matters is not the shape of the quoting but what a
-        // shell does with it. Ask one: each value must come back byte-identical,
-        // proving it was neither expanded nor split nor able to start a second
-        // command.
-        for value in [
-            "x'; rm -rf ~; echo '",
-            "$(id)",
-            "`id`",
-            "a b",
-            "it's",
-            "*",
-            "--not-a-flag",
-            "qwen2.5-7b-instruct",
-        ] {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf %s {}", shell_quote(value)))
-                .output()
-                .expect("sh should run");
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
-                value,
-                "shell mangled {value:?}"
-            );
-        }
-    }
-
     #[test]
     fn a_hostile_model_name_is_quoted_into_the_remote_command() {
         let command = remote_serve_command(
@@ -1475,16 +1441,6 @@ mod tests {
         assert!(command.contains(r"'\''"), "{command}");
         // And the flags we control still follow it as real flags.
         assert!(command.contains("--require-api-key"), "{command}");
-    }
-
-    #[test]
-    fn shell_quoting_leaves_ordinary_values_alone_and_wraps_the_rest() {
-        for inert in ["qwen2.5-7b-instruct", "vllm", "/models/a.gguf", "auto"] {
-            assert_eq!(shell_quote(inert), inert);
-        }
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]

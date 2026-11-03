@@ -2,34 +2,68 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Property-based tests for version ordering and update-source selection.
+/// A child module so it can reach this module's private items, and the
+/// `pub(super)` comparators in `version`, directly.
+#[cfg(test)]
+#[path = "therock_version_proptests.rs"]
+mod version_proptests;
+
+mod fetch;
+mod io;
+mod process;
+mod version;
+
+pub(crate) use self::fetch::truthy_env;
+use self::fetch::{download_file, download_text_cached, preflight_tarball_space};
+pub(crate) use self::io::write_file_atomically;
+use self::io::{linux_temp_dir, windows_temp_dir};
+#[cfg(test)]
+use self::process::PROGRESS_LINE_SINK;
+use self::process::{
+    SuppressProgressOutput, capture_python_stdout, capture_python_stdout_with_env,
+    extract_tarball_and_discard_archive, progress_line, progress_output_suppressed, run_command,
+    run_command_with_env, run_uv_progress_command, wait_with_output_bounded,
+};
+pub(crate) use self::version::runtime_version_display;
+use self::version::{
+    ParsedVersion, VersionStage, compare_version_strings, is_stable_runtime_version,
+    normalize_requested_build_date, parse_host_version, parse_version, parse_version_for_ordering,
+    runtime_version_build_date, version_relation,
+};
+#[cfg(test)]
+pub(crate) use crate::runtime_registry::RocmSdkLibraryProbe;
+#[cfg(test)]
+use crate::runtime_registry::runtime_registry_dir;
+pub(crate) use crate::runtime_registry::{
+    InstalledRuntimeManifest, RocmSdkPythonProbe, WheelRuntimeComposition, load_runtime_manifests,
+    validate_rocm_sdk_runtime_probe,
+};
+use crate::runtime_registry::{
+    load_runtime_manifests_reporting_unparsed, runtime_manifest_path, save_runtime_manifest,
+    wheel_composition_device_target, wheel_composition_includes_devel,
+};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build,
-    interactive_terminal, known_therock_families, managed_tools_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
-    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
-    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
-    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build, interactive_terminal,
+    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_list_split,
+    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
+    uv_venv_args,
 };
 #[cfg(test)]
-use rocm_core::{
-    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
-};
+use rocm_core::{disk_space, managed_uv_cache_dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::cmp::Ordering;
-use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
 const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
@@ -58,20 +92,6 @@ const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
-/// Timeout for the best-effort HEAD probe that sizes a download before starting it.
-const THEROCK_HEAD_PROBE_TIMEOUT_SECS: u64 = 10;
-/// Whole-transfer budget for an artifact download. A single-digit-gigabyte SDK
-/// tarball on a slow link needs well past the ten minutes the metadata fetches
-/// use; a retry that resumes cannot help if the attempt itself is cut short.
-const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
-/// Largest `Content-Length` accepted as a real SDK tarball size.
-///
-/// SDK tarballs are single-digit gigabytes; anything past this is a
-/// misconfigured proxy or a hostile header rather than a real artifact, and
-/// must not be allowed to refuse an install on its own authority.
-const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
-/// Maximum size accepted for index, catalog, and detached-signature responses.
-const THEROCK_MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -521,6 +541,10 @@ struct PipRuntimeResolution {
     /// `None` on the canonical layout, which picks versions by scraping each
     /// package's simple index rather than by resolving a requirement set.
     version_resolution_specs: Option<Vec<String>>,
+    /// How the torchaudio in `version_resolution_specs` was chosen, kept so the
+    /// plan can say whether it is the hardware-verified build. `None` on the
+    /// canonical layout, which pins no torchaudio before resolving.
+    torchaudio_pin: Option<TorchaudioPin>,
     package_versions: TheRockPipPackageVersions,
     /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
@@ -559,45 +583,6 @@ struct TarballArtifact {
 }
 
 #[derive(Debug, Clone)]
-struct CachedHttpText {
-    text: String,
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-struct CachedHttpMetadata {
-    url: String,
-    #[serde(default)]
-    etag: Option<String>,
-    #[serde(default)]
-    last_modified: Option<String>,
-    #[serde(default)]
-    signature: Option<CachedHttpSignatureMetadata>,
-    fetched_at_unix_ms: u128,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-struct CachedHttpSignatureMetadata {
-    url: String,
-    verified_at_unix_ms: u128,
-    public_key_source: String,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-struct CachedHttpCacheEntry {
-    metadata: CachedHttpMetadata,
-    body: String,
-    #[serde(default)]
-    signature_bytes: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct MetadataSignaturePolicy {
-    required: bool,
-    public_key_path: Option<PathBuf>,
-    public_key_pem: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct PythonLauncher {
     executable: PathBuf,
     source: &'static str,
@@ -608,13 +593,6 @@ struct ManagedPythonManifest {
     executable: PathBuf,
     version: String,
     installed_at_unix_ms: u128,
-}
-
-#[derive(Debug)]
-struct HttpResponseBody {
-    status: u16,
-    headers: String,
-    body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,19 +630,6 @@ pub(crate) struct RuntimeUpdatePlan {
     pub update_available: bool,
 }
 
-/// Exact canonical wheel install intent last applied successfully to a runtime.
-///
-/// Version alone cannot identify a reusable environment: adding a required ROCm
-/// extra at the same release version must make an older cache repairable.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct WheelRuntimeComposition {
-    pub source_layout_generation: String,
-    pub package_specs: Vec<String>,
-    /// Exact target supplied to `rocm_sdk` when resolving runtime libraries.
-    #[serde(default)]
-    pub rocm_sdk_target: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RuntimeFreshness {
     UpToDate,
@@ -698,264 +663,10 @@ struct ResolvedRuntimeUpdate {
     wheel_composition: Option<WheelRuntimeComposition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct InstalledRuntimeManifest {
-    pub runtime_key: String,
-    pub runtime_id: String,
-    pub channel: String,
-    pub format: String,
-    pub family: String,
-    pub family_source: String,
-    pub version: String,
-    pub install_root: PathBuf,
-    pub selected_artifact_url: String,
-    /// Which published layout this runtime's artifact came from.
-    ///
-    /// Provenance, not identity: an update reads it so a runtime resolves the
-    /// stream it was installed from instead of whichever stream the channel
-    /// happens to default to. Absent on every manifest written before the
-    /// layout existed, which reads back as the canonical stream those runtimes
-    /// came from.
-    #[serde(default)]
-    pub source_layout_generation: Option<String>,
-    #[serde(default)]
-    pub index_url: Option<String>,
-    #[serde(default)]
-    pub tarball_file_name: Option<String>,
-    #[serde(default)]
-    pub python_launcher: Option<String>,
-    #[serde(default)]
-    pub python_executable: Option<String>,
-    #[serde(default)]
-    pub pip_cache_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub rocm_sdk: Option<RocmSdkPythonProbe>,
-    /// The torch this SDK install wrote, e.g. `2.11.0+rocm7.13.0`.
-    ///
-    /// Recorded because an engine install later overwrites torch in the same
-    /// environment. Reading the environment afterwards tells you what is there
-    /// now, not which build belongs to these libraries; only the manifest still
-    /// knows that, and it has to survive repeat installs to be worth anything.
-    #[serde(default)]
-    pub sdk_torch: Option<String>,
-    /// Missing on manifests written before composition-aware freshness. Such a
-    /// managed wheel runtime is repaired once and rewritten with this field.
-    #[serde(default)]
-    pub wheel_composition: Option<WheelRuntimeComposition>,
-    #[serde(default)]
-    pub read_only: bool,
-    #[serde(default)]
-    pub imported_from: Option<PathBuf>,
-    /// Whether the compiler toolchain (`devel`) is part of this install, so an
-    /// update reinstalls the same thing the user originally chose.
-    #[serde(default = "devel_default_for_legacy_manifest")]
-    pub devel: bool,
-    pub installed_at_unix_ms: u128,
-}
-
-/// Manifests written before `devel` became opt-in always included the
-/// toolchain, so a missing field means it is present. Defaulting to `false`
-/// here would silently strip it on the next update.
-const fn devel_default_for_legacy_manifest() -> bool {
-    true
-}
-
-impl InstalledRuntimeManifest {
-    /// Whether this runtime has the compiler toolchain.
-    ///
-    /// Prefers the recorded `wheel_composition`, because those specs are what
-    /// `uv` was actually given — so the answer cannot drift from the install
-    /// the way a separately-written flag can. `devel` is the fallback for
-    /// tarball installs and for manifests written before compositions were
-    /// recorded; on a manifest older still it defaults to `true`, since every
-    /// install predating the flag shipped the toolchain.
-    pub(crate) fn includes_devel(&self) -> bool {
-        wheel_composition_includes_devel(self.wheel_composition.as_ref()).unwrap_or(self.devel)
-    }
-
-    fn normalize_host_paths(mut self) -> Self {
-        self.install_root = normalize_manifest_path(self.install_root);
-        self.python_launcher = self
-            .python_launcher
-            .map(|value| normalize_runtime_path_text_for_host(&value));
-        self.python_executable = self
-            .python_executable
-            .map(|value| normalize_runtime_path_text_for_host(&value));
-        self.pip_cache_dir = self.pip_cache_dir.map(normalize_manifest_path);
-        self.imported_from = self.imported_from.map(normalize_manifest_path);
-        if let Some(probe) = self.rocm_sdk.as_mut() {
-            probe.normalize_host_paths();
-        }
-        self
-    }
-
-    pub(crate) fn normalize_storage_paths(mut self) -> Self {
-        self.install_root = normalize_storage_manifest_path(&self.install_root);
-        self.python_launcher = self
-            .python_launcher
-            .map(|value| normalize_runtime_path_text_for_storage(&value));
-        self.python_executable = self
-            .python_executable
-            .map(|value| normalize_runtime_path_text_for_storage(&value));
-        self.pip_cache_dir = self
-            .pip_cache_dir
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        self.imported_from = self
-            .imported_from
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        if let Some(probe) = self.rocm_sdk.as_mut() {
-            probe.normalize_storage_paths();
-        }
-        self
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct RocmSdkPythonProbe {
-    #[serde(default)]
-    pub import_ok: bool,
-    #[serde(default)]
-    pub rocm_sdk_version: Option<String>,
-    #[serde(default)]
-    pub site_packages: Option<PathBuf>,
-    #[serde(default)]
-    pub root_path: Option<PathBuf>,
-    #[serde(default)]
-    pub bin_path: Option<PathBuf>,
-    #[serde(default)]
-    pub cmake_path: Option<PathBuf>,
-    #[serde(default)]
-    pub runtime_roots: Vec<PathBuf>,
-    #[serde(default)]
-    pub bin_paths: Vec<PathBuf>,
-    #[serde(default)]
-    pub library_paths: Vec<PathBuf>,
-    #[serde(default)]
-    pub default_target_family: Option<String>,
-    #[serde(default)]
-    pub available_target_families: Vec<String>,
-    #[serde(default)]
-    pub resolved_target_family: Option<String>,
-    #[serde(default)]
-    pub packages: Vec<RocmSdkPackageProbe>,
-    #[serde(default)]
-    pub library_shortnames: Vec<String>,
-    #[serde(default)]
-    pub resolved_libraries: Vec<RocmSdkLibraryProbe>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-impl RocmSdkPythonProbe {
-    fn normalize_host_paths(&mut self) {
-        self.site_packages = self.site_packages.take().map(normalize_manifest_path);
-        self.root_path = self.root_path.take().map(normalize_manifest_path);
-        self.bin_path = self.bin_path.take().map(normalize_manifest_path);
-        self.cmake_path = self.cmake_path.take().map(normalize_manifest_path);
-        self.runtime_roots = std::mem::take(&mut self.runtime_roots)
-            .into_iter()
-            .map(normalize_manifest_path)
-            .collect();
-        self.bin_paths = std::mem::take(&mut self.bin_paths)
-            .into_iter()
-            .map(normalize_manifest_path)
-            .collect();
-        self.library_paths = std::mem::take(&mut self.library_paths)
-            .into_iter()
-            .map(normalize_manifest_path)
-            .collect();
-        for library in &mut self.resolved_libraries {
-            library.paths = std::mem::take(&mut library.paths)
-                .into_iter()
-                .map(normalize_manifest_path)
-                .collect();
-        }
-    }
-
-    fn normalize_storage_paths(&mut self) {
-        self.site_packages = self
-            .site_packages
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        self.root_path = self
-            .root_path
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        self.bin_path = self
-            .bin_path
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        self.cmake_path = self
-            .cmake_path
-            .as_deref()
-            .map(normalize_storage_manifest_path);
-        self.runtime_roots = self
-            .runtime_roots
-            .iter()
-            .map(|path| normalize_storage_manifest_path(path))
-            .collect();
-        self.bin_paths = self
-            .bin_paths
-            .iter()
-            .map(|path| normalize_storage_manifest_path(path))
-            .collect();
-        self.library_paths = self
-            .library_paths
-            .iter()
-            .map(|path| normalize_storage_manifest_path(path))
-            .collect();
-        for library in &mut self.resolved_libraries {
-            library.paths = library
-                .paths
-                .iter()
-                .map(|path| normalize_storage_manifest_path(path))
-                .collect();
-        }
-    }
-}
-
-fn normalize_manifest_path(path: PathBuf) -> PathBuf {
-    normalize_runtime_path_for_host(&path)
-}
-
-fn normalize_storage_manifest_path(path: &Path) -> PathBuf {
-    normalize_runtime_path_for_storage(path)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RocmSdkPackageProbe {
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RocmSdkLibraryProbe {
-    pub shortname: String,
-    pub paths: Vec<PathBuf>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct TarballIndexFile {
     name: String,
     mtime: f64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct ParsedVersion {
-    major: u32,
-    minor: u32,
-    patch: u32,
-    stage: VersionStage,
-    stage_number: u64,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-enum VersionStage {
-    Alpha,
-    Rc,
-    Stable,
 }
 
 /// Outcome of an `install sdk` request.
@@ -1359,7 +1070,10 @@ fn runtime_freshness(
     required_composition: Option<&WheelRuntimeComposition>,
     target_runtime_key: &str,
 ) -> RuntimeFreshness {
-    match compare_version_strings(&manifest.version, latest_version) {
+    let Some(relation) = version_relation(&manifest.version, latest_version) else {
+        return RuntimeFreshness::AheadOfIndex;
+    };
+    match relation {
         Ordering::Less => RuntimeFreshness::UpdateAvailable,
         Ordering::Greater => RuntimeFreshness::AheadOfIndex,
         Ordering::Equal
@@ -1907,6 +1621,11 @@ fn install_wheel_runtime(
     if let Some(specs) = resolution.version_resolution_specs.as_ref() {
         let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
     }
+    // Printed from the same value that chose the pin, so the line cannot claim
+    // a verified build the requirements above do not name.
+    if let Some(pin) = resolution.torchaudio_pin.as_ref() {
+        let _ = writeln!(output, "  torchaudio_selection: {}", pin.describe());
+    }
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -1965,6 +1684,13 @@ fn install_wheel_runtime(
     // on the real install path too, not only in the dry-run plan.
     if let Some(warning) = no_wheel_warning.as_deref() {
         progress_line(format!("Warning: {warning}"));
+    }
+    if let Some(note) = resolution
+        .torchaudio_pin
+        .as_ref()
+        .and_then(unverified_torchaudio_note)
+    {
+        progress_line(note);
     }
 
     // Explain, in the visible install log, why an older TheRock ROCm is chosen
@@ -2183,14 +1909,22 @@ const fn therock_sdk_extras(include_devel: bool) -> &'static str {
 /// The requirement lines handed to `uv pip compile` to pick a mutually
 /// installable version set on the ROCm 10 (`next`) layout.
 ///
-/// Unversioned for torch/torchvision/torchaudio on purpose: choosing those
-/// versions is what the resolve is for. The `rocm` extras, though, must match
-/// the ones [`therock_pip_package_specs`] will install — resolving against
-/// `devel` for someone who did not ask for it constrains the chosen versions by
-/// a toolchain they declined, and can fail the whole install with a
-/// toolchain-resolution error on a default `rocm install sdk`.
+/// torch and torchvision are unversioned on purpose: choosing those versions is
+/// what the resolve is for, and their published metadata depends on the exact
+/// `rocm` build, so the `rocm` pin carries them to the matching `+rocm<build>`.
+/// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
+/// to the newest build on the index — which is a different ROCm build for every
+/// pin but the newest — and the caller pins it to `torchaudio_version`, already
+/// chosen from this build's published torchaudio wheels.
+///
+/// The `rocm` extras must match the ones [`therock_pip_package_specs`] will
+/// install — resolving against `devel` for someone who did not ask for it
+/// constrains the chosen versions by a toolchain they declined, and can fail the
+/// whole install with a toolchain-resolution error on a default
+/// `rocm install sdk`.
 fn published_pip_requirements(
     rocm_version: &str,
+    torchaudio_version: &str,
     device_target: &str,
     include_devel: bool,
 ) -> Vec<String> {
@@ -2202,7 +1936,7 @@ fn published_pip_requirements(
         ),
         format!("torch[{device_extra}]"),
         format!("torchvision[{device_extra}]"),
-        "torchaudio".to_owned(),
+        format!("torchaudio=={torchaudio_version}"),
     ]
 }
 
@@ -2249,46 +1983,9 @@ fn wheel_runtime_composition(
     }
 }
 
-/// Whether a recorded composition installed the compiler toolchain, read back
-/// out of its `rocm[...]` extras.
-///
-/// Same reasoning as [`wheel_composition_device_target`]: the specs are stored
-/// verbatim, so the answer is derivable from what was actually installed and
-/// cannot drift from a second field. `None` for a manifest with no recorded
-/// composition — see [`InstalledRuntimeManifest::includes_devel`] for how that
-/// legacy case is resolved.
-fn wheel_composition_includes_devel(composition: Option<&WheelRuntimeComposition>) -> Option<bool> {
-    let composition = composition?;
-    composition.package_specs.iter().find_map(|spec| {
-        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
-        Some(
-            extras
-                .split(',')
-                .map(str::trim)
-                .any(|extra| extra == "devel"),
-        )
-    })
-}
-
-/// The GFX target a recorded composition installed, read back out of its
-/// `rocm[...,device-<target>]` requirement.
-///
-/// Update planning needs the target the runtime was built with, not the one this
-/// host happens to report now; storing the specs verbatim means that answer
-/// survives without a second manifest field to keep in sync.
-fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>) -> Option<&str> {
-    let composition = composition?;
-    composition.rocm_sdk_target.as_deref().or_else(|| {
-        composition.package_specs.iter().find_map(|spec| {
-            let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
-            extras
-                .split(',')
-                .map(str::trim)
-                .find_map(|extra| extra.strip_prefix("device-"))
-        })
-    })
-}
-
+/// Quotes `value` for the dry-run preview line only -- it is never fed to a
+/// real subprocess. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_display_arg(value: &str) -> String {
     if value.is_empty()
         || value
@@ -2358,11 +2055,12 @@ fn active_default_runtime_relation(
 ) -> Result<Option<String>> {
     let (manifests, unparsed) = load_runtime_manifests_reporting_unparsed(paths)?;
     let config = RocmCliConfig::load(paths)?;
-    let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
+    let Some(active) = crate::runtime_registry::current_runtime_manifest(&config, &manifests)
+    else {
         return Ok(unresolved_active_default_relation_text(
             config.active_runtime_key.as_deref(),
             config.default_runtime_id.as_deref(),
-            crate::default_runtime_id_matches(&config, &manifests).len(),
+            crate::runtime_registry::default_runtime_id_matches(&config, &manifests).len(),
             &unparsed,
         ));
     };
@@ -2508,7 +2206,15 @@ fn active_default_relation_text(
     resolved_version: &str,
 ) -> String {
     if active.family == family && active.channel == channel.as_str() {
-        let relation = match compare_version_strings(resolved_version, &active.version) {
+        // "reinstall" is a claim about versions, not strings: `7.0.0-rc1` and
+        // `7.0.0rc1` are one version and must not read as an upgrade. When
+        // either side cannot be identified (`version_relation` is `None`) there
+        // is no better word available here, so the total order still decides
+        // rather than inventing a fourth one; an unreadable version sorts below
+        // every readable one, so it reads as the older side.
+        let relation = match version_relation(resolved_version, &active.version)
+            .unwrap_or_else(|| compare_version_strings(resolved_version, &active.version))
+        {
             Ordering::Greater => "upgrade",
             Ordering::Less => "downgrade",
             Ordering::Equal => "reinstall",
@@ -2543,15 +2249,20 @@ fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
 fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
     let host_version = host_version?;
     // Only claim the host is newer when BOTH versions parse and the host is
-    // strictly greater. `parse_host_version` normalises the shapes hosts
-    // actually report — a build suffix (`7.2.4-98` -> 7.2.4) and a
-    // two-component report (`7.4` -> 7.4.0) — so those are compared, not
-    // discarded. Only a string that still fails to parse is "can't tell", and
+    // strictly greater. Only a string that fails to parse is "can't tell", and
     // "can't tell" is never "newer". Falling back to a lexicographic compare
     // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
     // the third char), inventing a host-newer note that misleads the user.
+    //
+    // Each side is read with the parser for where it came from.
+    // `parse_host_version` additionally drops the packaging build number a
+    // legacy ROCm reports (`7.2.4-98` -> 7.2.4); a two-component report
+    // (`7.4` -> 7.4.0) and a `-rc1` pre-release are read the same way by both.
+    // `resolved_version` is not a host string: it is the version resolved from
+    // the index or the tarball catalogue, so it is read exactly as the
+    // comparator that picked it reads it.
     let host_parsed = parse_host_version(&host_version)?;
-    let resolved_parsed = parse_host_version(resolved_version)?;
+    let resolved_parsed = parse_version_for_ordering(resolved_version)?;
     (host_parsed > resolved_parsed).then_some(host_version)
 }
 
@@ -2590,10 +2301,15 @@ fn repo_version_without_wheels(
     resolved_version: &str,
 ) -> Option<String> {
     let newest = newest_repo?;
-    match compare_version_strings(newest, resolved_version) {
-        Ordering::Greater => Some(newest.to_owned()),
-        _ => None,
-    }
+    // "Is there a genuinely newer version?", not "which string sorts higher?".
+    // Two spellings of one version would otherwise produce a warning naming the
+    // same version on both sides of "installing X instead", and a pair this
+    // tool cannot identify would produce one it cannot justify.
+    matches!(
+        version_relation(newest, resolved_version),
+        Some(Ordering::Greater)
+    )
+    .then(|| newest.to_owned())
 }
 
 /// Where an already-granted approval for displacing the active default came
@@ -2769,16 +2485,10 @@ fn confirm_overwrite_existing_sdk(
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
-    print!("{prompt}");
-    std::io::stdout()
-        .flush()
-        .context("failed to flush confirmation prompt")?;
-    let mut response = String::new();
-    std::io::stdin()
-        .read_line(&mut response)
-        .context("failed to read confirmation response")?;
-    let normalized = response.trim().to_ascii_lowercase();
-    Ok(matches!(normalized.as_str(), "y" | "yes"))
+    rocm_core::confirm::print_prompt(&mut std::io::stdout(), prompt)
+        .context("failed to write confirmation prompt")?;
+    rocm_core::confirm::read_answer(&mut std::io::stdin().lock())
+        .context("failed to read confirmation response")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3069,6 +2779,7 @@ fn resolve_pip_runtime_from_index(
 ) -> Result<PipRuntimeResolution> {
     let index_url = source.index_url.as_str();
     let mut version_resolution_specs = None;
+    let mut torchaudio_selection = None;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -3098,14 +2809,31 @@ fn resolve_pip_runtime_from_index(
                 );
                 format!("no TheRock rocm package was found for {requested} in {index_url}")
             })?;
+        // Chosen here, not by `uv`: see `published_pip_requirements`.
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let pin = torchaudio_pin(
+            &torchaudio_versions,
+            &rocm_version,
+            rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
+            index_url,
+        )?;
         // The canonical branch below budgets one `download_timeout_secs` per
         // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
-        // fetches). `uv pip compile` resolves that same four-package metadata
-        // set in one subprocess call, so it needs a comparable aggregate
-        // budget, not the single-fetch one — reusing the bare per-fetch value
-        // here would make a startup check that budgets 2s per fetch reliably
-        // time out a call doing 4 fetches' worth of work.
-        let requirements = published_pip_requirements(&rocm_version, device_target, include_devel);
+        // fetches). `uv pip compile` still fetches metadata for all four
+        // packages in one subprocess call — the torchaudio listing above only
+        // chose its version — so it needs a comparable aggregate budget, not
+        // the single-fetch one: reusing the bare per-fetch value here would make
+        // a startup check that budgets 2s per fetch reliably time out a call
+        // doing 4 fetches' worth of work. That listing is one more fetch on top,
+        // with its own single-fetch budget.
+        let requirements =
+            published_pip_requirements(&rocm_version, &pin.version, device_target, include_devel);
         let versions = resolve_published_pip_package_versions(
             paths,
             index_url,
@@ -3114,6 +2842,7 @@ fn resolve_pip_runtime_from_index(
             download_timeout_secs.map(|secs| secs.saturating_mul(4)),
         )?;
         version_resolution_specs = Some(requirements);
+        torchaudio_selection = Some(pin);
         versions
     } else {
         let torch_versions = load_simple_index_versions(
@@ -3174,6 +2903,7 @@ fn resolve_pip_runtime_from_index(
         latest_version,
         newest_repo_version,
         version_resolution_specs,
+        torchaudio_pin: torchaudio_selection,
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
@@ -3575,61 +3305,6 @@ fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageV
     })
 }
 
-/// Waits for `child` to exit, killing it and failing once `timeout` elapses.
-///
-/// `None` waits unbounded, matching an explicit user-invoked install with no
-/// budget to respect. Reads stdout/stderr on background threads throughout the
-/// wait so a slow or silent child can't deadlock the poll on a full pipe.
-fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Result<Output> {
-    let Some(timeout) = timeout else {
-        return child
-            .wait_with_output()
-            .context("failed to wait for child process");
-    };
-    let stdout_reader = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
-            bytes
-        })
-    });
-    let stderr_reader = child.stderr.take().map(|mut stderr| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        })
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to poll child process status")?
-        {
-            let stdout = stdout_reader
-                .map(|reader| reader.join().unwrap_or_default())
-                .unwrap_or_default();
-            let stderr = stderr_reader
-                .map(|reader| reader.join().unwrap_or_default())
-                .unwrap_or_default();
-            return Ok(Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "timed out after {}s waiting for child process",
-                timeout.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// `requirements` is passed in rather than composed here so that the lines sent
 /// to `uv` and the lines the resolution reports back (and the preview prints)
 /// are one value, not two that can disagree.
@@ -3754,10 +3429,6 @@ fn channel_rocm_candidates(versions: &[String], channel: TheRockChannel) -> Vec<
     all
 }
 
-fn is_stable_runtime_version(version: &str) -> bool {
-    parse_version(version).is_some_and(|parsed| parsed.stage == VersionStage::Stable)
-}
-
 fn select_latest_stack_package(
     versions: &[String],
     rocm_version: &str,
@@ -3771,6 +3442,287 @@ fn select_latest_stack_package(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| compare_version_strings(left, right));
     candidates.pop()
+}
+
+/// The torchaudio build pinned for a ROCm 10 install, and why it was chosen.
+/// The plan line and install-log note are both [`TorchaudioPin::describe`], so
+/// what is printed is derived from the decision rather than restated beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TorchaudioPin {
+    /// The published version pinned, `+rocm…` label included.
+    version: String,
+    /// The ROCm build `version` was chosen for.
+    rocm_version: String,
+    basis: TorchaudioPinBasis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchaudioPinBasis {
+    /// `version` is the hardware-verified release for this ROCm line.
+    Verified,
+    /// A verified release is recorded for this ROCm line, but the index
+    /// publishes no build of it labelled for this exact ROCm build (`+rocm`
+    /// label) for this Python and platform, so `version` is the newest build
+    /// instead.
+    VerifiedNotPublished {
+        release: &'static str,
+        /// A build of `release` this Python and platform can install, labelled
+        /// for another ROCm build, when one is published. The verified release
+        /// is matched by ROCm line, so a `10.1.1` request can find it published
+        /// only as `+rocm10.1.0`; the reason must then name the ROCm build, not
+        /// the Python or platform.
+        other_build: Option<String>,
+    },
+    /// No verified release is recorded for this ROCm line, so `version` is the
+    /// newest build.
+    NoVerifiedRelease,
+}
+
+impl TorchaudioPin {
+    const fn is_verified(&self) -> bool {
+        matches!(self.basis, TorchaudioPinBasis::Verified)
+    }
+
+    fn describe(&self) -> String {
+        let Self {
+            version,
+            rocm_version,
+            basis,
+        } = self;
+        match basis {
+            TorchaudioPinBasis::Verified => format!(
+                "torchaudio {version}, the build verified on hardware for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: None,
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is not published for this Python and platform"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: Some(other_build),
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is published for this Python and platform only for another ROCm build ({other_build}), not for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::NoVerifiedRelease => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because no torchaudio release is recorded as verified for this ROCm line"
+            ),
+        }
+    }
+}
+
+/// The install-log line for a torchaudio pin that is not hardware-verified, or
+/// `None` for one that is.
+///
+/// An unverified torchaudio is the one stack choice ROCm CLI makes on its own
+/// judgement, so a real install says so in the install log, not only in the
+/// plan's `torchaudio_selection:` line. A verified pin needs no such warning.
+/// The text is [`TorchaudioPin::describe`], so it cannot disagree with the pin.
+fn unverified_torchaudio_note(pin: &TorchaudioPin) -> Option<String> {
+    (!pin.is_verified()).then(|| format!("Note: {}", pin.describe()))
+}
+
+/// The torchaudio build to pin for `rocm_version`, from `published` (this
+/// Python and platform's builds on the index).
+///
+/// `verified_release` comes first: it is the release confirmed on hardware for
+/// this ROCm line ([`rocm_engine_vllm::verified_torchaudio_release`], read from
+/// the vLLM ROCm 10.x discover-build table so the SDK and its vLLM install pin
+/// the same build). Recency alone is not a safe choice among builds sharing a
+/// `+rocm<version>` label: `whl-next` publishes `2.11.0`, `2.11.0.2` and
+/// `2.11.0.3` all as `+rocm10.1.0`, and `2.11.0` is a CPU-only rebuild with no
+/// HIP kernels, which nothing in the version or label distinguishes. Only when
+/// no verified release is recorded, or it is not published here, does this fall
+/// back to [`latest_build_for_rocm`], and the returned basis says so.
+///
+/// Refuses when no build for `rocm_version` is published at all, or when none of
+/// the published builds' versions can be read — the second is not the first,
+/// and reporting it as "none published" would send the user to the wrong place.
+fn torchaudio_pin(
+    published: &[String],
+    rocm_version: &str,
+    verified_release: Option<&'static str>,
+    index_url: &str,
+) -> Result<TorchaudioPin> {
+    let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
+    if built_for_rocm.is_empty() {
+        bail!(
+            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+        );
+    }
+    let pin = |version, basis| TorchaudioPin {
+        version,
+        rocm_version: rocm_version.to_owned(),
+        basis,
+    };
+    let basis = match verified_release {
+        Some(release) => match published_build_of(&built_for_rocm, release) {
+            Some(version) => return Ok(pin(version, TorchaudioPinBasis::Verified)),
+            // Not among `built_for_rocm`, so a labelled build of it in the
+            // whole listing is one for another ROCm build.
+            None => TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: published_build_of(
+                    &published
+                        .iter()
+                        .filter(|version| package_rocm_suffix(version).is_some())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    release,
+                ),
+            },
+        },
+        None => TorchaudioPinBasis::NoVerifiedRelease,
+    };
+    let newest = latest_build_for_rocm(published, rocm_version).with_context(|| {
+        format!(
+            "torchaudio builds for ROCm {rocm_version} are published in {index_url}, but none has a PEP 440 version ROCm CLI can order: {}",
+            built_for_rocm.join(", ")
+        )
+    })?;
+    Ok(pin(newest, basis))
+}
+
+/// The build in `versions` whose public version is `release` under PEP 440
+/// (local label ignored, trailing zeros insignificant), as `uv` would match
+/// `torchaudio=={release}`. Not a prefix match: `2.11.0` must not find
+/// `2.11.0.2`.
+fn published_build_of(versions: &[String], release: &str) -> Option<String> {
+    let wanted = package_release_key(release)?;
+    versions
+        .iter()
+        .find(|version| package_release_key(version).as_ref() == Some(&wanted))
+        .cloned()
+}
+
+/// The newest of `versions` built for exactly `rocm_version`, chosen the way
+/// `uv` would choose among them: in PEP 440 order, with final releases ahead of
+/// any pre-release.
+///
+/// The fallback for [`torchaudio_pin`] only, never the first choice: newest is
+/// not a safe discriminator among builds sharing a `+rocm<version>` label (see
+/// there for the CPU-only `2.11.0+rocm10.1.0` precedent, and the vLLM engine's
+/// ROCm 10.x discover-build table, which pins `2.11.0.2` exactly for the same
+/// reason). Nothing on the index pairs a torchaudio build with a torch build,
+/// so this assumes the newest torchaudio of a ROCm build is the one built
+/// against that build's torch — the same choice `uv` made unaided when the
+/// pinned build was also the newest one on the index.
+///
+/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
+/// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
+/// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
+/// rebuild and settle on the original `2.11.0` build.
+fn latest_build_for_rocm(versions: &[String], rocm_version: &str) -> Option<String> {
+    package_versions_matching_rocm(versions, rocm_version)
+        .into_iter()
+        .filter_map(|version| package_release_key(&version).map(|key| (key, version)))
+        .max_by(|(left, _), (right, _)| (left.is_final(), left).cmp(&(right.is_final(), right)))
+        .map(|(_, version)| version)
+}
+
+/// A PEP 440 version, less its `+local` label, as a value whose derived order is
+/// PEP 440's: field order is comparison order, and each enum's variants are
+/// declared lowest first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PackageReleaseKey {
+    epoch: u64,
+    /// Trailing zeros dropped, so `2.11` and `2.11.0` compare equal.
+    release: Vec<u64>,
+    pre: PreRelease,
+    post: Option<u64>,
+    dev: DevRelease,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    /// `X.devN` with no pre- or post-release sorts below every `X` pre-release.
+    DevOnly,
+    /// `a` = 0, `b` = 1, `rc` = 2.
+    Pre(u8, u64),
+    Final,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DevRelease {
+    Dev(u64),
+    Absent,
+}
+
+impl PackageReleaseKey {
+    /// `uv` only picks a pre-release (including any `.devN`) when no final
+    /// release is available; a post-release counts as final.
+    fn is_final(&self) -> bool {
+        self.pre == PreRelease::Final && self.dev == DevRelease::Absent
+    }
+}
+
+/// Parses the normalized PEP 440 form a package index publishes
+/// (`[N!]N(.N)*[{a|b|rc}N][.postN][.devN][+local]`), already percent-decoded
+/// by [`parse_simple_index_versions`]. Anything else is `None`, and is skipped
+/// rather than guessed at.
+fn package_release_key(version: &str) -> Option<PackageReleaseKey> {
+    fn number(rest: &mut &str) -> Option<u64> {
+        let len = rest.chars().take_while(char::is_ascii_digit).count();
+        let (digits, tail) = rest.split_at(len);
+        *rest = tail;
+        digits.parse().ok()
+    }
+
+    let public = version.split('+').next().unwrap_or_default();
+    let (epoch, mut rest) = match public.split_once('!') {
+        Some((epoch, rest)) => (epoch.parse().ok()?, rest),
+        None => (0, public),
+    };
+
+    let mut release = vec![number(&mut rest)?];
+    while let Some(tail) = rest.strip_prefix('.')
+        && tail.starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        rest = tail;
+        release.push(number(&mut rest)?);
+    }
+    while release.len() > 1 && release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let mut pre = None;
+    for (tag, kind) in [("rc", 2), ("a", 0), ("b", 1)] {
+        if let Some(tail) = rest.strip_prefix(tag) {
+            rest = tail;
+            pre = Some((kind, number(&mut rest)?));
+            break;
+        }
+    }
+    let post = match rest.strip_prefix(".post") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    let dev = match rest.strip_prefix(".dev") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    if !rest.is_empty() {
+        return None;
+    }
+
+    Some(PackageReleaseKey {
+        epoch,
+        release,
+        pre: match (pre, post, dev) {
+            (Some((kind, number)), ..) => PreRelease::Pre(kind, number),
+            (None, None, Some(_)) => PreRelease::DevOnly,
+            (None, ..) => PreRelease::Final,
+        },
+        post,
+        dev: dev.map_or(DevRelease::Absent, DevRelease::Dev),
+    })
 }
 
 fn package_versions_matching_rocm(versions: &[String], rocm_version: &str) -> Vec<String> {
@@ -3810,111 +3762,6 @@ fn package_rocm_suffix(version: &str) -> Option<String> {
 
 fn decode_simple_index_version(version: &str) -> String {
     version.replace("%2B", "+").replace("%2b", "+")
-}
-
-pub(crate) fn runtime_version_display(version: &str) -> String {
-    if let Some(date) = runtime_version_build_date(version) {
-        format!("{version} (build {date})")
-    } else {
-        version.to_owned()
-    }
-}
-
-pub(crate) fn runtime_version_build_date(version: &str) -> Option<String> {
-    let bytes = version.as_bytes();
-    if bytes.len() < 8 {
-        return None;
-    }
-    for window in bytes.windows(8) {
-        if !window.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-        let digits = std::str::from_utf8(window).ok()?;
-        let year = digits[0..4].parse::<u32>().ok()?;
-        let month = digits[4..6].parse::<u32>().ok()?;
-        let day = digits[6..8].parse::<u32>().ok()?;
-        if !(2000..=2099).contains(&year) || month == 0 || month > 12 {
-            continue;
-        }
-        let max_day = days_in_month(year, month);
-        if day == 0 || day > max_day {
-            continue;
-        }
-        return Some(format!("{year:04}-{month:02}-{day:02}"));
-    }
-    None
-}
-
-fn normalize_requested_build_date(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("TheRock build date cannot be empty");
-    }
-    let digits = trimmed
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>();
-    if digits.len() != 8 {
-        bail!("TheRock build date `{trimmed}` must use YYYY-MM-DD, YYYYMMDD, or MMDDYYYY");
-    }
-
-    let parsed = if digits.starts_with("20") {
-        parse_yyyy_mm_dd(&digits)
-    } else if digits[4..].starts_with("20") {
-        parse_mm_dd_yyyy(&digits)
-    } else {
-        None
-    };
-    let Some((year, month, day)) = parsed else {
-        bail!("TheRock build date `{trimmed}` must use YYYY-MM-DD, YYYYMMDD, or MMDDYYYY");
-    };
-    validate_date_components(year, month, day)
-        .with_context(|| format!("invalid TheRock build date `{trimmed}`"))?;
-    Ok(format!("{year:04}-{month:02}-{day:02}"))
-}
-
-fn parse_yyyy_mm_dd(digits: &str) -> Option<(u32, u32, u32)> {
-    Some((
-        digits[0..4].parse().ok()?,
-        digits[4..6].parse().ok()?,
-        digits[6..8].parse().ok()?,
-    ))
-}
-
-fn parse_mm_dd_yyyy(digits: &str) -> Option<(u32, u32, u32)> {
-    Some((
-        digits[4..8].parse().ok()?,
-        digits[0..2].parse().ok()?,
-        digits[2..4].parse().ok()?,
-    ))
-}
-
-fn validate_date_components(year: u32, month: u32, day: u32) -> Result<()> {
-    if !(2000..=2099).contains(&year) {
-        bail!("year must be between 2000 and 2099");
-    }
-    if month == 0 || month > 12 {
-        bail!("month must be between 1 and 12");
-    }
-    let max_day = days_in_month(year, month);
-    if day == 0 || day > max_day {
-        bail!("day must be between 1 and {max_day}");
-    }
-    Ok(())
-}
-
-const fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-const fn is_leap_year(year: u32) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn load_simple_index_versions(
@@ -4087,851 +3934,6 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
         TheRockChannel::Release => stable.pop(),
         TheRockChannel::Nightly => all.pop(),
     }
-}
-
-/// Pinned production metadata signing public key (trust root). Empty until the
-/// repository owner publishes production keys (see docs/release-trust.md,
-/// "Remaining Owner Step"). While empty, metadata verification stays opt-in
-/// (enabled only via the `ROCM_CLI_METADATA_PUBLIC_KEY_*` env vars). Once
-/// populated, metadata signatures are verified by default with this key as the
-/// trust root.
-const PINNED_METADATA_PUBLIC_KEY_PEM: &str = "";
-
-/// The pinned metadata trust root, or `None` while the sentinel is still empty.
-fn pinned_metadata_public_key() -> Option<String> {
-    let pem = PINNED_METADATA_PUBLIC_KEY_PEM.trim();
-    (!pem.is_empty()).then(|| pem.to_owned())
-}
-
-impl MetadataSignaturePolicy {
-    fn from_env() -> Self {
-        Self::resolve(
-            truthy_env("ROCM_CLI_REQUIRE_METADATA_SIGNATURE"),
-            env_path("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"),
-            env_nonempty("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"),
-            pinned_metadata_public_key(),
-        )
-    }
-
-    /// Combine the env-provided inputs with the pinned trust root. An explicit
-    /// env key (path or PEM) wins as an escape hatch; otherwise the pinned key is
-    /// used, and its presence makes verification required by default.
-    fn resolve(
-        env_required: bool,
-        env_path: Option<PathBuf>,
-        env_pem: Option<String>,
-        pinned_pem: Option<String>,
-    ) -> Self {
-        let pinned = if env_path.is_none() && env_pem.is_none() {
-            pinned_pem
-        } else {
-            None
-        };
-        Self {
-            required: env_required || pinned.is_some(),
-            public_key_path: env_path,
-            public_key_pem: env_pem.or(pinned),
-        }
-    }
-
-    const fn active(&self) -> bool {
-        self.required || self.public_key_path.is_some() || self.public_key_pem.is_some()
-    }
-
-    fn validate_configuration(&self) -> Result<()> {
-        if !self.active() {
-            return Ok(());
-        }
-        if let Some(public_key_path) = &self.public_key_path {
-            if !public_key_path.is_file() {
-                bail!(
-                    "metadata public key not found: {}",
-                    public_key_path.display()
-                );
-            }
-            return Ok(());
-        }
-        if self.public_key_pem.is_some() {
-            return Ok(());
-        }
-        bail!(
-            "metadata signature verification requires ROCM_CLI_METADATA_PUBLIC_KEY_PATH or ROCM_CLI_METADATA_PUBLIC_KEY_PEM"
-        )
-    }
-}
-
-/// Whether an environment variable is set to an affirmative value.
-///
-/// Deliberately an allowlist rather than "set to anything non-empty": the
-/// callers are opt-ins to weaker behaviour, so `=0` and `=false` must read as
-/// off rather than as "the variable is present, therefore yes".
-pub(crate) fn truthy_env(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim(),
-            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-        )
-    })
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    env_nonempty(name).map(PathBuf::from)
-}
-
-fn with_metadata_public_key<T>(
-    policy: &MetadataSignaturePolicy,
-    temp_key_path: &Path,
-    verify: impl FnOnce(&Path, &'static str) -> Result<T>,
-) -> Result<Option<T>> {
-    if !policy.active() {
-        return Ok(None);
-    }
-    if let Some(public_key_path) = &policy.public_key_path {
-        policy.validate_configuration()?;
-        return verify(public_key_path, "path").map(Some);
-    }
-    if let Some(public_key_pem) = &policy.public_key_pem {
-        let staged_key = stage_file_for_atomic_publish(temp_key_path, public_key_pem.as_bytes())?;
-        let result = verify(&staged_key, "env-pem");
-        let _ = fs::remove_file(staged_key);
-        return result.map(Some);
-    }
-    bail!(
-        "metadata signature verification requires ROCM_CLI_METADATA_PUBLIC_KEY_PATH or ROCM_CLI_METADATA_PUBLIC_KEY_PEM"
-    )
-}
-
-fn metadata_signature_url(url: &str) -> String {
-    format!("{url}.sig")
-}
-
-fn metadata_signature_path(body_path: &Path) -> PathBuf {
-    body_path.with_extension("sig")
-}
-
-fn fetch_and_verify_metadata_signature(
-    policy: &MetadataSignaturePolicy,
-    url: &str,
-    payload: &[u8],
-    temp_key_path: &Path,
-    max_time_secs: Option<u64>,
-) -> Result<Option<(CachedHttpSignatureMetadata, Vec<u8>)>> {
-    if !policy.active() {
-        return Ok(None);
-    }
-    let signature_url = metadata_signature_url(url);
-    let response = http_get(&signature_url, &[], max_time_secs)?;
-    if response.status != 200 {
-        bail!(
-            "HTTP {} while fetching metadata signature {signature_url}",
-            response.status
-        );
-    }
-    let signature = response.body;
-    let public_key_source =
-        with_metadata_public_key(policy, temp_key_path, |public_key, source| {
-            verify_metadata_signature_bytes(payload, &signature, public_key)?;
-            Ok(source.to_owned())
-        })?
-        .context("metadata signature policy was active but no public key was resolved")?;
-    Ok(Some((
-        CachedHttpSignatureMetadata {
-            url: signature_url,
-            verified_at_unix_ms: unix_time_millis(),
-            public_key_source,
-        },
-        signature,
-    )))
-}
-
-#[cfg(test)]
-fn verify_cached_metadata_signature(
-    policy: &MetadataSignaturePolicy,
-    payload_path: &Path,
-    signature_path: &Path,
-    temp_key_path: &Path,
-) -> Result<()> {
-    if !policy.active() {
-        return Ok(());
-    }
-    if !signature_path.is_file() {
-        bail!(
-            "metadata signature verification requested but cached signature is missing: {}",
-            signature_path.display()
-        );
-    }
-    with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
-        verify_metadata_signature(payload_path, signature_path, public_key)
-    })?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn verify_metadata_signature(
-    payload_path: &Path,
-    signature_path: &Path,
-    public_key_path: &Path,
-) -> Result<()> {
-    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
-        format!(
-            "failed to read metadata public key: {}",
-            public_key_path.display()
-        )
-    })?;
-    let signature = fs::read(signature_path).with_context(|| {
-        format!(
-            "failed to read metadata signature: {}",
-            signature_path.display()
-        )
-    })?;
-    let payload = fs::read(payload_path).with_context(|| {
-        format!(
-            "failed to read metadata payload: {}",
-            payload_path.display()
-        )
-    })?;
-    verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "metadata")
-}
-
-fn verify_metadata_signature_bytes(
-    payload: &[u8],
-    signature: &[u8],
-    public_key_path: &Path,
-) -> Result<()> {
-    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
-        format!(
-            "failed to read metadata public key: {}",
-            public_key_path.display()
-        )
-    })?;
-    verify_rsa_pkcs1_sha256_signature(&public_key_pem, payload, signature, "metadata")
-}
-
-#[cfg(test)]
-fn metadata_cache_can_revalidate(
-    metadata: &CachedHttpMetadata,
-    policy: &MetadataSignaturePolicy,
-    signature_path: &Path,
-) -> bool {
-    !policy.active() || (metadata.signature.is_some() && signature_path.is_file())
-}
-
-fn load_cached_http_entry(
-    metadata_path: &Path,
-    legacy_body_path: &Path,
-    legacy_signature_path: &Path,
-) -> Option<CachedHttpCacheEntry> {
-    let bytes = fs::read(metadata_path).ok()?;
-    if let Ok(entry) = serde_json::from_slice(&bytes) {
-        return Some(entry);
-    }
-
-    let metadata: CachedHttpMetadata = serde_json::from_slice(&bytes).ok()?;
-    let body = fs::read_to_string(legacy_body_path).ok()?;
-    let signature_bytes = metadata
-        .signature
-        .as_ref()
-        .map(|_| fs::read(legacy_signature_path))
-        .transpose()
-        .ok()?;
-    Some(CachedHttpCacheEntry {
-        metadata,
-        body,
-        signature_bytes,
-    })
-}
-
-const fn cached_http_entry_can_revalidate(
-    entry: &CachedHttpCacheEntry,
-    policy: &MetadataSignaturePolicy,
-) -> bool {
-    !policy.active() || (entry.metadata.signature.is_some() && entry.signature_bytes.is_some())
-}
-
-fn verify_cached_http_entry_signature(
-    policy: &MetadataSignaturePolicy,
-    entry: &CachedHttpCacheEntry,
-    temp_key_path: &Path,
-) -> Result<()> {
-    if !policy.active() {
-        return Ok(());
-    }
-    let signature = entry.signature_bytes.as_deref().context(
-        "metadata signature verification requested but cached signature bytes are missing",
-    )?;
-    with_metadata_public_key(policy, temp_key_path, |public_key, _source| {
-        verify_metadata_signature_bytes(entry.body.as_bytes(), signature, public_key)
-    })?;
-    Ok(())
-}
-
-fn write_cached_http_entry(path: &Path, entry: &CachedHttpCacheEntry) -> Result<()> {
-    write_file_atomically(
-        path,
-        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
-    )
-}
-
-#[cfg(test)]
-fn write_cached_http_entry_with<S, P, F>(
-    path: &Path,
-    entry: &CachedHttpCacheEntry,
-    suffix_for_attempt: S,
-    before_publish: P,
-    publish: F,
-) -> Result<()>
-where
-    S: FnMut(u32) -> OsString,
-    P: FnOnce(),
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    write_file_atomically_with_publish(
-        path,
-        &serde_json::to_vec_pretty(entry).context("failed to serialize metadata cache entry")?,
-        suffix_for_attempt,
-        before_publish,
-        publish,
-    )
-}
-
-fn download_text_cached(
-    paths: &AppPaths,
-    cache_key: &str,
-    url: &str,
-    max_time_secs: Option<u64>,
-) -> Result<CachedHttpText> {
-    let (body_path, metadata_path) = metadata_cache_paths(paths, cache_key);
-    let signature_path = metadata_signature_path(&body_path);
-    let signature_policy = MetadataSignaturePolicy::from_env();
-    signature_policy.validate_configuration()?;
-    let previous_entry = load_cached_http_entry(&metadata_path, &body_path, &signature_path)
-        .filter(|entry| entry.metadata.url == url);
-    let cache_dir = body_path
-        .parent()
-        .context("metadata cache path has no parent directory")?;
-    fs::create_dir_all(cache_dir)?;
-
-    let tmp_public_key = body_path.with_extension("public-key.pem");
-    let mut headers = Vec::new();
-    if let Some(etag) = previous_entry
-        .as_ref()
-        .filter(|entry| cached_http_entry_can_revalidate(entry, &signature_policy))
-        .and_then(|entry| entry.metadata.etag.as_deref())
-    {
-        headers.push(("If-None-Match", etag));
-    }
-
-    let response = http_get(url, &headers, max_time_secs)?;
-    if response.status == 304 {
-        let entry = previous_entry.context(
-            "metadata cache returned 304 but no complete cached generation is available",
-        )?;
-        verify_cached_http_entry_signature(&signature_policy, &entry, &tmp_public_key)?;
-        return Ok(CachedHttpText { text: entry.body });
-    }
-    if response.status != 200 {
-        bail!("HTTP {} while fetching {url}", response.status);
-    }
-
-    let body =
-        String::from_utf8(response.body).context("metadata response body was not valid UTF-8")?;
-    let fetched_signature = fetch_and_verify_metadata_signature(
-        &signature_policy,
-        url,
-        body.as_bytes(),
-        &tmp_public_key,
-        max_time_secs,
-    )?;
-    let signature_metadata = fetched_signature
-        .as_ref()
-        .map(|(metadata, _)| metadata.clone());
-    let metadata = CachedHttpMetadata {
-        url: url.to_owned(),
-        etag: http_header_value(&response.headers, "etag"),
-        last_modified: http_header_value(&response.headers, "last-modified"),
-        signature: signature_metadata,
-        fetched_at_unix_ms: unix_time_millis(),
-    };
-    let entry = CachedHttpCacheEntry {
-        metadata,
-        body,
-        signature_bytes: fetched_signature.map(|(_, signature)| signature),
-    };
-    write_cached_http_entry(&metadata_path, &entry)?;
-    let _ = fs::remove_file(&body_path);
-    let _ = fs::remove_file(&signature_path);
-    Ok(CachedHttpText { text: entry.body })
-}
-
-fn metadata_cache_paths(paths: &AppPaths, cache_key: &str) -> (PathBuf, PathBuf) {
-    let base = paths
-        .cache_dir
-        .join("therock")
-        .join("metadata")
-        .join(slugify(cache_key));
-    (base.with_extension("body"), base.with_extension("json"))
-}
-
-fn http_header_value(headers: &str, name: &str) -> Option<String> {
-    let prefix = format!("{}:", name.to_ascii_lowercase());
-    let mut value = None;
-    for line in headers.lines() {
-        let trimmed = line.trim();
-        if trimmed.to_ascii_lowercase().starts_with(&prefix) {
-            value = trimmed
-                .split_once(':')
-                .map(|(_, rest)| rest.trim().to_owned())
-                .filter(|rest| !rest.is_empty());
-        }
-    }
-    value
-}
-
-/// Fetch an artifact to `destination`, reporting cumulative bytes written and
-/// (when known) the total size to `on_progress` as the transfer proceeds.
-///
-/// Streams rather than buffers: SDK tarballs are single-digit gigabytes, and
-/// holding one in memory to write it out again costs that much RAM on top of
-/// the same amount of disk. The primitive also handles the free-space
-/// preflight, retry with resume, and the length cross-check that catches a
-/// transfer the server ended early.
-fn download_file(
-    url: &str,
-    destination: &Path,
-    on_progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("download destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let request = rocm_core::DownloadRequest {
-        max_bytes: Some(THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES),
-        ..rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT)
-    };
-    rocm_core::download_file_streaming_with_progress(&request, on_progress)
-        .with_context(|| format!("failed to fetch {url}"))?;
-    Ok(())
-}
-
-/// Content length of `url` from a HEAD request, when the server reports one.
-///
-/// Best effort: any failure yields `None`, so a server that rejects HEAD or
-/// omits `Content-Length` simply skips the preflight instead of blocking the
-/// install.
-fn head_content_length(url: &str) -> Option<u64> {
-    let timeout = Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS);
-    let agent = ureq::AgentBuilder::new()
-        // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
-        // so without it a host that blackholes rather than refuses would stall
-        // the probe well past the intended ceiling.
-        .timeout_connect(timeout)
-        .timeout(timeout)
-        .build();
-    let response = agent.head(url).set("User-Agent", "rocm-cli").call().ok()?;
-    if response.status() != 200 {
-        return None;
-    }
-    let length: u64 = response.header("Content-Length")?.trim().parse().ok()?;
-    // The header is unauthenticated and is never cross-checked against the body
-    // the subsequent GET delivers, so an inflated value from a proxy or CDN
-    // would refuse an install that would in fact succeed. Treat an implausible
-    // size as no answer at all: the preflight is skipped and `download_file`
-    // still checks the real, buffered body length before writing.
-    (length <= THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES).then_some(length)
-}
-
-/// Refuse (or warn) before a multi-GB SDK tarball download and extraction.
-///
-/// The download requirement comes from `Content-Length` and is exact, so a
-/// shortfall is a hard error — it saves the user a long download that cannot
-/// possibly succeed. The extraction requirement is only an estimate (see
-/// [`disk_space::EXTRACTED_SIZE_MULTIPLIER`]), so a shortfall there is a
-/// warning: a false refusal that blocks a valid install would be worse than a
-/// late failure.
-///
-/// Any extraction warning is returned rather than printed, so the caller can
-/// place it in the same accumulated output block as the rest of the install
-/// report instead of having it appear ahead of that block.
-fn preflight_tarball_space(
-    url: &str,
-    cache_path: &Path,
-    install_root: &Path,
-) -> Result<Option<String>> {
-    let Some(download_bytes) = head_content_length(url) else {
-        return Ok(None);
-    };
-    disk_space::ensure_space_for(
-        "download the SDK tarball",
-        cache_path,
-        disk_space::with_margin(download_bytes),
-    )?;
-
-    // When the cache and the install root share a mount, the archive and the
-    // extracted tree must both fit at the same time. Conservative in the other
-    // direction: two mounts backed by one filesystem also share a pool, and this
-    // treats them as separate, so the estimate can come in under the true need.
-    let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
-    if disk_space::on_same_mount(cache_path, install_root) == Some(true) {
-        extract_estimate = extract_estimate.saturating_add(download_bytes);
-    }
-    Ok(disk_space::warn_if_low_space(
-        "extract the SDK tarball",
-        install_root,
-        disk_space::with_margin(extract_estimate),
-    ))
-}
-
-fn http_get(
-    url: &str,
-    headers: &[(&str, &str)],
-    max_time_secs: Option<u64>,
-) -> Result<HttpResponseBody> {
-    let timeout = max_time_secs
-        .filter(|value| *value > 0)
-        .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
-    // Connecting should always be fast if the host is reachable at all, so cap it
-    // independently of the (possibly very generous, e.g. 10-minute default) overall
-    // timeout. Without this, a blackholed host stalls the connect phase for the full
-    // overall timeout on every request instead of failing fast.
-    let connect_timeout = timeout.min(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS));
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(connect_timeout)
-        .timeout(timeout)
-        .build();
-    let mut request = agent.get(url).set("User-Agent", "rocm-cli");
-    for (name, value) in headers {
-        request = request.set(name, value);
-    }
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => bail!("HTTP request failed for {url}: {error}"),
-    };
-    let status = response.status();
-    let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| {
-            response
-                .header(&name)
-                .map(|value| format!("{name}: {value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut reader = response
-        .into_reader()
-        .take(THEROCK_MAX_METADATA_BYTES.saturating_add(1));
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .with_context(|| format!("failed to read HTTP response body for {url}"))?;
-    if body.len() as u64 > THEROCK_MAX_METADATA_BYTES {
-        bail!(
-            "HTTP response body for {url} exceeded the approved metadata limit of {THEROCK_MAX_METADATA_BYTES} bytes"
-        );
-    }
-    Ok(HttpResponseBody {
-        status,
-        headers,
-        body,
-    })
-}
-
-fn linux_temp_dir(prefix: &str) -> Result<PathBuf> {
-    let root = std::env::temp_dir();
-    let base = format!("{prefix}-{}-{}", std::process::id(), unix_time_millis());
-    for attempt in 0..100 {
-        let dir = root.join(format!("{base}-{attempt}"));
-        match fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to create {}", dir.display()));
-            }
-        }
-    }
-    bail!(
-        "failed to create a unique temporary directory under {}",
-        root.display()
-    )
-}
-
-fn windows_temp_dir(prefix: &str) -> Result<PathBuf> {
-    let root = windows_runtime_temp_root().unwrap_or_else(std::env::temp_dir);
-    let base = format!("{prefix}-{}-{}", std::process::id(), unix_time_millis());
-    for attempt in 0..100 {
-        let dir = root.join(format!("{base}-{attempt}"));
-        match fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to create {}", dir.display()));
-            }
-        }
-    }
-    bail!(
-        "failed to create a unique temporary directory under {}",
-        root.display()
-    )
-}
-
-fn windows_runtime_temp_root() -> Option<PathBuf> {
-    for name in ["TEMP", "TMP", "LOCALAPPDATA"] {
-        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
-            let path = PathBuf::from(value);
-            return Some(if name == "LOCALAPPDATA" {
-                path.join("Temp")
-            } else {
-                path
-            });
-        }
-    }
-    None
-}
-
-fn windows_child_path(path: &Path) -> String {
-    runtime_path_for_windows_child(path)
-}
-
-/// A unique temp path next to `path`, preserving the full file name so a
-/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
-/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
-const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
-
-fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
-    let parent = path.parent().context("file path has no parent directory")?;
-    let mut file_name = path
-        .file_name()
-        .context("file path has no file name")?
-        .to_os_string();
-    file_name.push(".tmp-");
-    file_name.push(suffix);
-    Ok(parent.join(file_name))
-}
-
-pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
-    write_file_atomically_with(
-        path,
-        bytes,
-        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
-        || {},
-    )
-}
-
-fn write_file_atomically_with<S, P>(
-    path: &Path,
-    bytes: &[u8],
-    suffix_for_attempt: S,
-    before_publish: P,
-) -> Result<()>
-where
-    S: FnMut(u32) -> OsString,
-    P: FnOnce(),
-{
-    write_file_atomically_with_publish(
-        path,
-        bytes,
-        suffix_for_attempt,
-        before_publish,
-        publish_temp_file,
-    )
-}
-
-fn write_file_atomically_with_publish<S, P, F>(
-    path: &Path,
-    bytes: &[u8],
-    suffix_for_attempt: S,
-    before_publish: P,
-    publish: F,
-) -> Result<()>
-where
-    S: FnMut(u32) -> OsString,
-    P: FnOnce(),
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    let tmp = stage_file_for_atomic_publish_with(path, bytes, suffix_for_attempt)?;
-    before_publish();
-    publish_staged_file_with(&tmp, path, publish)
-}
-
-fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
-    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
-    stage_file_for_atomic_publish_with(path, bytes, |attempt| {
-        OsString::from(format!("{temp_id}-{attempt}"))
-    })
-}
-
-fn stage_file_for_atomic_publish_with<S>(
-    path: &Path,
-    bytes: &[u8],
-    mut suffix_for_attempt: S,
-) -> Result<PathBuf>
-where
-    S: FnMut(u32) -> OsString,
-{
-    let parent = path.parent().context("file path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-
-    let mut reserved = None;
-    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
-        let suffix = suffix_for_attempt(attempt);
-        let tmp = temp_sibling_path(path, &suffix)?;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => {
-                reserved = Some((tmp, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
-            }
-        }
-    }
-    let Some((tmp, mut file)) = reserved else {
-        bail!(
-            "failed to reserve a temporary file next to {} after {} attempts",
-            path.display(),
-            ATOMIC_WRITE_TEMP_ATTEMPTS
-        );
-    };
-
-    if let Err(error) = file.write_all(bytes) {
-        drop(file);
-        let _ = fs::remove_file(&tmp);
-        return Err(disk_space::map_write_error(error, &tmp));
-    }
-    drop(file);
-    Ok(tmp)
-}
-
-#[cfg(test)]
-fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
-    publish_staged_file_with(tmp, path, publish_temp_file)
-}
-
-fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()>
-where
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    publish(tmp, path)
-        .inspect_err(|_| {
-            let _ = fs::remove_file(tmp);
-        })
-        .with_context(|| format!("failed to publish {}", path.display()))
-}
-
-#[cfg(not(windows))]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(tmp, path)
-}
-
-#[cfg(windows)]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
-        return replace_file_windows(path, tmp);
-    }
-
-    match fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            if path.try_exists()? {
-                replace_file_windows(path, tmp)
-            } else {
-                Err(rename_error)
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement_wide: Vec<u16> = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
-    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
-    // remain alive for the duration of the synchronous Windows API call. The
-    // optional backup, exclude, and reserved pointers are intentionally null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            path_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
-    run_command(
-        Path::new("tar"),
-        &[
-            "-xf",
-            archive_path.to_string_lossy().as_ref(),
-            "-C",
-            target_dir.to_string_lossy().as_ref(),
-        ],
-        "extract TheRock tarball artifact",
-    )
-    .map_err(|error| {
-        // The extraction preflight only warns, because the extracted size is an
-        // estimate. When that warning turns out to be right, the failure arrives
-        // as `tar` stderr rather than an `io::Error`, so it never reaches
-        // `map_write_error` — without this the user gets the raw
-        // "tar: ...: No space left on device" this feature exists to replace.
-        disk_space::subprocess_full_disk_error(&format!("{error:#}"), target_dir).unwrap_or(error)
-    })
-}
-
-/// Unpack the SDK archive and then delete it.
-///
-/// Only the extracted tree is used from here on, so keeping the archive would
-/// double the disk cost of every installed version. This mirrors the cleanup
-/// `ensure_uv_binary` already performs after unpacking its own download.
-///
-/// Removing the archive is best-effort: the install has already succeeded by
-/// this point, so a cleanup failure is non-fatal. The message is returned
-/// rather than printed directly, so callers running a progress spinner over
-/// this call can drop it first and avoid interleaving spinner frames with
-/// the report.
-fn extract_tarball_and_discard_archive(
-    archive_path: &Path,
-    target_dir: &Path,
-) -> Result<Option<String>> {
-    extract_tarball(archive_path, target_dir)?;
-    if let Err(error) = fs::remove_file(archive_path) {
-        return Ok(Some(format!(
-            "Could not remove the downloaded archive {}: {error}",
-            archive_path.display()
-        )));
-    }
-    Ok(None)
 }
 
 fn ensure_uv_venv(
@@ -5198,7 +4200,7 @@ try:
         # `Requires-Dist` entries carry environment markers after ';'. Only the
         # requirement itself matters here.
         requirement = raw.split(";")[0].strip()
-        # The distribution name runs up to the first specifier, extra or space —
+        # The distribution name runs up to the first specifier, extra or space -
         # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
         matched = re.match(r"[A-Za-z0-9._-]+", requirement)
         if matched is None:
@@ -5289,46 +4291,6 @@ pub(crate) fn install_pinned_package(
         &rocm_core::uv::uv_command_env(paths),
         "install the SDK build of the engine's torch",
     )
-}
-
-pub(crate) fn validate_rocm_sdk_runtime_probe(probe: &RocmSdkPythonProbe) -> Result<()> {
-    if !probe.import_ok {
-        bail!(
-            "TheRock packages did not expose a usable rocm_sdk runtime: {}",
-            probe.error.as_deref().unwrap_or("<unknown error>")
-        );
-    }
-    let Some(rocm_sdk_root) = probe.root_path.as_ref() else {
-        bail!("TheRock packages exposed rocm_sdk but did not report a runtime root path");
-    };
-    if !rocm_sdk_root.is_dir() {
-        bail!(
-            "TheRock rocm_sdk runtime root path does not exist: {}",
-            rocm_sdk_root.display()
-        );
-    }
-    let Some(rocm_sdk_bin) = probe.bin_path.as_ref() else {
-        bail!("TheRock packages exposed rocm_sdk but did not report a runtime bin path");
-    };
-    if !rocm_sdk_bin.is_dir() {
-        bail!(
-            "TheRock rocm_sdk runtime bin path does not exist: {}",
-            rocm_sdk_bin.display()
-        );
-    }
-    if !probe_has_resolved_library(probe, "amdhip64") {
-        bail!("TheRock rocm_sdk runtime did not expose amdhip64 through rocm_sdk.find_libraries");
-    }
-    if !probe_has_resolved_library(probe, "hipblas") {
-        bail!("TheRock rocm_sdk runtime did not expose hipblas through rocm_sdk.find_libraries");
-    }
-    Ok(())
-}
-
-fn probe_has_resolved_library(probe: &RocmSdkPythonProbe, shortname: &str) -> bool {
-    probe.resolved_libraries.iter().any(|library| {
-        library.shortname == shortname && library.paths.iter().any(|path| path.is_file())
-    })
 }
 
 const ROCM_SDK_PROBE_SCRIPT: &str = r#"
@@ -5455,309 +4417,6 @@ except Exception as exc:
 
 print(json.dumps(out))
 "#;
-
-thread_local! {
-    /// Set while rendering `--json` output, whose "single compact JSON line"
-    /// contract [`progress_line`] and the managed-Python installer would
-    /// otherwise break by writing extra lines to stdout ahead of the JSON.
-    static SUPPRESS_PROGRESS_OUTPUT: Cell<bool> = const { Cell::new(false) };
-}
-
-/// RAII guard that silences [`progress_line`] and redirects managed-Python
-/// installer output away from stdout for its lifetime, restoring the prior
-/// state on drop (so nested callers compose correctly).
-struct SuppressProgressOutput {
-    previous: bool,
-}
-
-impl SuppressProgressOutput {
-    fn new() -> Self {
-        let previous = SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.replace(true));
-        Self { previous }
-    }
-}
-
-impl Drop for SuppressProgressOutput {
-    fn drop(&mut self) {
-        let previous = self.previous;
-        SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.set(previous));
-    }
-}
-
-fn progress_output_suppressed() -> bool {
-    SUPPRESS_PROGRESS_OUTPUT.with(Cell::get)
-}
-
-fn progress_line(message: impl AsRef<str>) {
-    if progress_output_suppressed() {
-        return;
-    }
-    emit_progress_line(message.as_ref());
-}
-
-#[cfg(not(test))]
-fn emit_progress_line(message: &str) {
-    println!("{message}");
-    let _ = std::io::stdout().flush();
-}
-
-// In tests, write through a thread-local buffer instead of stdout so a test can
-// assert on `progress_line`'s actual output (in particular, that a
-// `SuppressProgressOutput` guard held around a call really does silence it),
-// rather than only on the suppression flag's own bookkeeping.
-#[cfg(test)]
-thread_local! {
-    static PROGRESS_LINE_SINK: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn emit_progress_line(message: &str) {
-    PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().push(message.to_owned()));
-}
-
-fn capture_command_output(program: &Path, args: &[&str]) -> Result<Output> {
-    if runtime_is_windows() {
-        return capture_command_output_with_temp_files(program, args);
-    }
-    Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to launch {}", program.display()))
-}
-
-fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Result<Output> {
-    let temp_dir = windows_temp_dir("rocm-cli-command")?;
-    let stdout_path = temp_dir.join("stdout.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    let stdout_file = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let status = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .status()
-        .with_context(|| format!("failed to launch {}", program.display()))?;
-    let stdout = fs::read(&stdout_path).unwrap_or_default();
-    let stderr = fs::read(&stderr_path).unwrap_or_default();
-    let _ = fs::remove_dir_all(&temp_dir);
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-/// Run a probe script with extra environment set and return its stdout.
-///
-/// The script goes to a temp file rather than `python -c`, because the loader
-/// search path this exists to set must reach the child through its environment,
-/// and a file keeps the invocation identical on every platform.
-fn capture_python_stdout_with_env(
-    python_executable: &Path,
-    script: &str,
-    env: &[(String, String)],
-    context_text: &str,
-) -> Result<String> {
-    let temp_root = if runtime_is_windows() {
-        windows_temp_dir("rocm-cli-python-probe")?
-    } else {
-        linux_temp_dir("rocm-cli-python-probe")?
-    };
-    let script_path = temp_root.join("probe.py");
-    fs::write(&script_path, script)
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
-
-    let mut command = Command::new(python_executable);
-    command.arg(&script_path);
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let output = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to launch {}", python_executable.display()));
-    let _ = fs::remove_dir_all(&temp_root);
-    let output = output?;
-
-    if !output.status.success() {
-        bail!(
-            "{context_text}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("{context_text}: failed to decode Python output"))
-}
-
-fn capture_python_stdout(
-    python_executable: &Path,
-    script: &str,
-    context_text: &str,
-) -> Result<String> {
-    if !runtime_is_windows() {
-        let output = capture_command_output(python_executable, &["-c", script])?;
-        if !output.status.success() {
-            bail!(
-                "{context_text}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        return String::from_utf8(output.stdout)
-            .with_context(|| format!("{context_text}: failed to decode Python output"));
-    }
-
-    let temp_dir = windows_temp_dir("rocm-cli-python")?;
-    let script_path = temp_dir.join("probe.py");
-    let wrapper_path = temp_dir.join("wrapper.py");
-    let output_path = temp_dir.join("stdout.txt");
-    let stderr_path = temp_dir.join("stderr.txt");
-    fs::write(&script_path, script)
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
-    fs::write(
-        &wrapper_path,
-        r#"import contextlib
-import pathlib
-import runpy
-import sys
-
-out = pathlib.Path(sys.argv[1])
-script = pathlib.Path(sys.argv[2])
-with out.open("w", encoding="utf-8") as f:
-    with contextlib.redirect_stdout(f):
-        runpy.run_path(str(script), run_name="__main__")
-"#,
-    )
-    .with_context(|| format!("failed to write {}", wrapper_path.display()))?;
-    let stderr_file = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let status = Command::new(python_executable)
-        .arg(windows_child_path(&wrapper_path))
-        .arg(windows_child_path(&output_path))
-        .arg(windows_child_path(&script_path))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .status()
-        .with_context(|| format!("failed to launch {}", python_executable.display()))?;
-    let text = fs::read_to_string(&output_path).unwrap_or_default();
-    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-    let _ = fs::remove_dir_all(&temp_dir);
-    if status.success() {
-        Ok(text)
-    } else {
-        let stderr = stderr.trim().to_owned();
-        let detail = if stderr.is_empty() {
-            format!("command exited with status {status}")
-        } else {
-            stderr
-        };
-        bail!("{context_text}: {detail}")
-    }
-}
-
-fn run_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
-    if runtime_is_windows() {
-        let status = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .with_context(|| format!("failed to launch {}", program.display()))?;
-        if status.success() {
-            return Ok(());
-        }
-        bail!("{context_text}: command exited with status {status}");
-    }
-
-    let output = capture_command_output(program, args)?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("command exited with status {}", output.status)
-    };
-    bail!("{context_text}: {detail}")
-}
-
-#[allow(dead_code)]
-fn run_progress_command(program: &Path, args: &[&str], context_text: &str) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("failed to launch {}", program.display()))?;
-    if status.success() {
-        return Ok(());
-    }
-    bail!("{context_text}: command exited with status {status}");
-}
-
-fn run_command_with_env(
-    program: &Path,
-    args: &[&str],
-    env: &[(String, String)],
-    context_text: &str,
-) -> Result<()> {
-    let mut command = Command::new(program);
-    command.args(args);
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let output = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to launch {}", program.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let detail = if stderr.is_empty() {
-        format!("command exited with status {}", output.status)
-    } else {
-        stderr
-    };
-    bail!("{context_text}: {detail}")
-}
-
-fn run_uv_progress_command(
-    paths: &AppPaths,
-    uv: &Path,
-    args: &[&str],
-    context_text: &str,
-) -> Result<()> {
-    let mut command = Command::new(uv);
-    command.args(args);
-    for (key, value) in &uv_command_env(paths) {
-        command.env(key, value);
-    }
-    let status = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| "failed to launch uv".to_string())?;
-    if status.success() {
-        return Ok(());
-    }
-    bail!("{context_text}: uv exited with status {status}");
-}
 
 fn managed_tools_root(paths: &AppPaths) -> PathBuf {
     managed_tools_dir(&paths.data_dir)
@@ -6028,7 +4687,11 @@ fn ensure_managed_python(
 /// resolver somewhere else without touching the process environment. Tests need
 /// that: `cargo test` runs every test as a thread in one process, so a test that
 /// overwrote `PATH` to steer this resolver also hid every other PATH-resolved
-/// binary from unrelated tests running at the same moment.
+/// binary from unrelated tests running at the same moment. In test builds, a
+/// test can also install one as a thread-local override (see
+/// `OverridePythonResolverEnv`) instead of constructing one to pass directly
+/// to [`resolve_python_launcher_in`].
+#[cfg_attr(test, derive(Clone))]
 struct PythonResolverEnv {
     /// `ROCM_CLI_PYTHON`: an explicit interpreter that wins over any search.
     python_override: Option<String>,
@@ -6047,11 +4710,67 @@ impl PythonResolverEnv {
     }
 }
 
+// Lets a test steer `resolve_python_launcher` at a fixed `PythonResolverEnv`
+// instead of the real process environment, scoped to the calling thread only.
+//
+// Unlike mutating process-wide `PATH`, a thread-local cannot race a sibling
+// test thread that spawns a PATH-resolved binary (e.g. bare-name `tar`)
+// during the window a test is steering resolution (see issue #650, where
+// that mutation intermittently failed unrelated tests under `cargo test`'s
+// one-process-many-threads model).
+//
+// Because the override is thread-local, it only applies when
+// `resolve_python_launcher` runs on the thread that installed it. If the code
+// under test ever resolves from a spawned thread (or `thread::scope`), that
+// thread silently falls back to the real process environment.
+#[cfg(test)]
+thread_local! {
+    static PYTHON_RESOLVER_ENV_OVERRIDE: std::cell::RefCell<Option<PythonResolverEnv>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing a fixed [`PythonResolverEnv`] for [`resolve_python_launcher`]
+/// on the calling thread only, restoring the prior override on drop (so nested
+/// use composes correctly, mirroring [`SuppressProgressOutput`]; the
+/// `nested_python_resolver_env_override_restores_the_outer_one_on_drop` test
+/// covers the property this claims).
+#[cfg(test)]
+struct OverridePythonResolverEnv {
+    previous: Option<PythonResolverEnv>,
+}
+
+#[cfg(test)]
+impl OverridePythonResolverEnv {
+    fn new(env: PythonResolverEnv) -> Self {
+        let previous = PYTHON_RESOLVER_ENV_OVERRIDE.with(|cell| cell.replace(Some(env)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for OverridePythonResolverEnv {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        PYTHON_RESOLVER_ENV_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+#[cfg(test)]
+fn python_resolver_env_override() -> Option<PythonResolverEnv> {
+    PYTHON_RESOLVER_ENV_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+const fn python_resolver_env_override() -> Option<PythonResolverEnv> {
+    None
+}
+
 fn resolve_python_launcher(
     paths: &AppPaths,
     requirement: PythonRequirement,
 ) -> Result<PythonLauncher> {
-    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env(), requirement)
+    let env = python_resolver_env_override().unwrap_or_else(PythonResolverEnv::from_process_env);
+    resolve_python_launcher_in(paths, &env, requirement)
 }
 
 fn resolve_python_launcher_in(
@@ -6255,99 +4974,6 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn compare_version_strings(left: &str, right: &str) -> Ordering {
-    match (parse_version(left), parse_version(right)) {
-        (Some(left_parsed), Some(right_parsed)) => {
-            left_parsed.cmp(&right_parsed).then_with(|| left.cmp(right))
-        }
-        _ => left.cmp(right),
-    }
-}
-
-fn parse_version(value: &str) -> Option<ParsedVersion> {
-    let value = value.split('+').next().unwrap_or(value);
-    let mut parts = value.splitn(3, '.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch_and_rest = parts.next()?;
-
-    let patch_len = patch_and_rest
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .count();
-    if patch_len == 0 {
-        return None;
-    }
-    let patch = patch_and_rest[..patch_len].parse().ok()?;
-    let suffix = &patch_and_rest[patch_len..];
-
-    let (stage, stage_number) = if suffix.is_empty() {
-        (VersionStage::Stable, 0)
-    } else if let Some(rest) = suffix.strip_prefix("rc") {
-        (VersionStage::Rc, rest.parse().ok()?)
-    } else if let Some(rest) = suffix.strip_prefix('a') {
-        (VersionStage::Alpha, rest.parse().ok()?)
-    } else {
-        return None;
-    };
-
-    Some(ParsedVersion {
-        major,
-        minor,
-        patch,
-        stage,
-        stage_number,
-    })
-}
-
-/// Lenient parse of a host-reported ROCm version for the "is the host newer?"
-/// decision. Unlike [`parse_version`], this tolerates the shapes a legacy/system
-/// ROCm actually reports: a build suffix (`7.2.4-98`) and a missing patch
-/// component (`7.4`). Major and minor are required; patch defaults to 0 when
-/// absent and may still carry an `rc`/`a` stage suffix. Returns `None` when
-/// major/minor cannot be read so an unparseable host string is treated as
-/// "can't tell" instead of being compared lexicographically.
-fn parse_host_version(value: &str) -> Option<ParsedVersion> {
-    // Drop build/local metadata: `7.2.4-98`, `7.2.4+local` -> `7.2.4`.
-    let value = value.split(['+', '-']).next().unwrap_or(value).trim();
-    let mut parts = value.splitn(3, '.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let (patch, stage, stage_number) = match parts.next() {
-        // Two-component report (`7.4`) -> treat as `7.4.0`.
-        None => (0, VersionStage::Stable, 0),
-        Some(patch_and_rest) => {
-            let patch_len = patch_and_rest
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .count();
-            if patch_len == 0 {
-                return None;
-            }
-            let patch = patch_and_rest[..patch_len].parse().ok()?;
-            let suffix = &patch_and_rest[patch_len..];
-            let (stage, stage_number) = if suffix.is_empty() {
-                (VersionStage::Stable, 0)
-            } else if let Some(rest) = suffix.strip_prefix("rc") {
-                (VersionStage::Rc, rest.parse().ok()?)
-            } else if let Some(rest) = suffix.strip_prefix('a') {
-                (VersionStage::Alpha, rest.parse().ok()?)
-            } else {
-                return None;
-            };
-            (patch, stage, stage_number)
-        }
-    };
-
-    Some(ParsedVersion {
-        major,
-        minor,
-        patch,
-        stage,
-        stage_number,
-    })
-}
-
 /// Recovery guidance appended to family/index resolution failures so a clean
 /// first run can recover without the user having to guess a `--family`.
 ///
@@ -6524,82 +5150,6 @@ fn resolved_install_root(
     rocm_core::resolve_path_through_symlinks(&requested)
 }
 
-fn runtime_registry_dir(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("runtimes").join("registry")
-}
-
-fn runtime_manifest_path(paths: &AppPaths, runtime_key: &str) -> PathBuf {
-    runtime_registry_dir(paths).join(format!("{runtime_key}.json"))
-}
-
-fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) -> Result<()> {
-    let manifest = manifest.clone().normalize_storage_paths();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    fs::create_dir_all(
-        registry_path
-            .parent()
-            .context("runtime manifest registry path has no parent directory")?,
-    )?;
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&manifest).context("failed to serialize runtime manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", registry_path.display()))?;
-
-    let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
-    fs::write(
-        &local_manifest_path,
-        serde_json::to_vec_pretty(&manifest)
-            .context("failed to serialize local runtime manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
-    Ok(())
-}
-
-pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
-    Ok(load_runtime_manifests_reporting_unparsed(paths)?.0)
-}
-
-/// [`load_runtime_manifests`] plus the registry entries that read fine but did
-/// not deserialize.
-///
-/// A manifest written by an older binary is the ordinary way to land here:
-/// `family_source`, `selected_artifact_url` and `installed_at_unix_ms` carry no
-/// `#[serde(default)]`, so an older file fails `from_slice` against a newer
-/// binary. Dropping those silently is right for the listing and lookup callers
-/// — one stale file must not brick `rocm runtimes list` — but it is wrong for
-/// the install consent gate, which has to know that its view of "what is
-/// active" is incomplete. Hence two entry points rather than one hard error.
-fn load_runtime_manifests_reporting_unparsed(
-    paths: &AppPaths,
-) -> Result<(Vec<InstalledRuntimeManifest>, Vec<PathBuf>)> {
-    let registry_dir = runtime_registry_dir(paths);
-    if !registry_dir.is_dir() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let mut manifests = Vec::new();
-    let mut unparsed = Vec::new();
-    for entry in fs::read_dir(&registry_dir)
-        .with_context(|| format!("failed to read {}", registry_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        match serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
-            Ok(manifest) => manifests.push(manifest.normalize_host_paths()),
-            Err(_) => unparsed.push(path),
-        }
-    }
-    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
-    unparsed.sort();
-    Ok((manifests, unparsed))
-}
-
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -6634,12 +5184,7 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Serializes tests that replace process-global `PATH` (or other env vars) while
-    // they run. Because env is shared across all test threads, any test that spawns a
-    // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
-    // can fail with ENOENT while another test has temporarily narrowed `PATH`.
-    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_support::PROCESS_ENV_TEST_LOCK;
 
     fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
         FamilyResolution {
@@ -7041,56 +5586,12 @@ mod tests {
     }
 
     #[test]
-    fn suppress_progress_output_contract() {
-        // `SUPPRESS_PROGRESS_OUTPUT` is thread-local, so this doesn't race with
-        // other tests' threads.
-        assert!(!progress_output_suppressed());
-        {
-            let _outer = SuppressProgressOutput::new();
-            assert!(progress_output_suppressed());
-            {
-                let _inner = SuppressProgressOutput::new();
-                assert!(
-                    progress_output_suppressed(),
-                    "a nested guard must still suppress"
-                );
-            }
-            assert!(
-                progress_output_suppressed(),
-                "dropping the inner guard must not lift the outer guard's suppression"
-            );
-        }
-        assert!(
-            !progress_output_suppressed(),
-            "dropping the outer guard must restore the pre-guard state"
-        );
-    }
-
-    #[test]
-    fn progress_line_is_suppressed_while_guard_is_held() {
-        // Unlike `suppress_progress_output_contract` (which only checks the
-        // flag `SuppressProgressOutput` flips), this asserts on `progress_line`'s
-        // actual output via the `#[cfg(test)]` sink, so it fails if the guard
-        // is ever wired up but `progress_line` stops consulting it.
-        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
-        progress_line("before guard");
-        {
-            let _guard = SuppressProgressOutput::new();
-            progress_line("during guard");
-        }
-        progress_line("after guard");
-        let captured = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
-        assert_eq!(
-            captured,
-            vec!["before guard".to_owned(), "after guard".to_owned()]
-        );
-    }
-
-    #[test]
     #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn render_update_json_installs_the_suppression_guard_around_resolution() -> Result<()> {
-        // Unlike the two tests above (which only exercise the guard's own
-        // bookkeeping in isolation), this proves `render_update_json` itself
+        // Unlike the two guard tests in `therock::process`
+        // (`suppress_progress_output_contract` and
+        // `progress_line_is_suppressed_while_guard_is_held`, which exercise the
+        // guard in isolation), this proves `render_update_json` itself
         // installs the guard around a code path that *actually reaches* a
         // live `progress_line` call: a wheel-format manifest whose only PATH
         // python is a non-executable stub fails
@@ -7102,6 +5603,18 @@ mod tests {
         // network-free). If `render_update_json` stopped installing the
         // guard, that call would land in `PROGRESS_LINE_SINK` instead of
         // being swallowed, and the assertion below would fail.
+        //
+        // The PATH-python-unusable branch is reached via a thread-local
+        // `OverridePythonResolverEnv`, not a real process `PATH` mutation:
+        // see issue #650, where mutating process-wide `PATH` to steer this
+        // test raced any sibling test thread that spawned a PATH-resolved
+        // binary (e.g. bare-name `tar`) during the window.
+        //
+        // The lock below is no longer for `PATH`: it's still needed because
+        // this test mutates the real `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`
+        // process env var below, and every process-env-mutating test in
+        // `therock` (this file and its child modules) takes this lock, which
+        // lives in `test_support`.
         let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("render-update-json-installs-guard");
 
@@ -7112,28 +5625,21 @@ mod tests {
         fs::create_dir_all(&bin_dir)?;
         fs::write(bin_dir.join("python3"), "not an interpreter")?;
 
-        let old_path = std::env::var_os("PATH");
-        let old_python_override = std::env::var_os("ROCM_CLI_PYTHON");
         let old_bootstrap_disabled = std::env::var_os("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP");
         unsafe {
-            std::env::set_var("PATH", &bin_dir);
-            std::env::remove_var("ROCM_CLI_PYTHON");
             std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1");
         }
+        let resolver_env_guard = OverridePythonResolverEnv::new(PythonResolverEnv {
+            python_override: None,
+            search_dirs: vec![bin_dir],
+        });
 
         PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
         assert!(!progress_output_suppressed());
         let result = render_update_json(&paths, Some(1));
 
+        drop(resolver_env_guard);
         unsafe {
-            match old_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-            match old_python_override {
-                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
-                None => std::env::remove_var("ROCM_CLI_PYTHON"),
-            }
             match old_bootstrap_disabled {
                 Some(value) => {
                     std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", value);
@@ -7215,18 +5721,6 @@ mod tests {
     }
 
     #[test]
-    fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
-        // No HEAD response (unroutable host) must not block an install.
-        let temp = std::env::temp_dir();
-        let warning = preflight_tarball_space("http://127.0.0.1:1/rocm.tar.gz", &temp, &temp)
-            .expect("an unknown download size must not fail the preflight");
-        assert_eq!(
-            warning, None,
-            "an unknown download size must not produce an extraction warning either"
-        );
-    }
-
-    #[test]
     fn download_space_requirement_includes_the_safety_margin() {
         let archive = 2 * 1024 * 1024 * 1024;
         assert_eq!(
@@ -7256,383 +5750,6 @@ mod tests {
         );
         let text = format!("{error:#}");
         assert!(text.contains("ran out of disk space"), "{text}");
-    }
-
-    /// The temp name keeps every extension, so a cleanup sweep over a cache
-    /// directory can still tell what a leftover was going to be.
-    #[test]
-    fn temp_sibling_path_preserves_multi_dot_file_names() {
-        let temp = temp_sibling_path(
-            Path::new("/tmp/cache/sdk.tar.gz"),
-            std::ffi::OsStr::new("test"),
-        )
-        .unwrap();
-        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(name, "sdk.tar.gz.tmp-test");
-        assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
-    }
-
-    #[test]
-    fn concurrent_atomic_writes_do_not_remove_a_published_destination() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-collision-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("sdk.tar.gz");
-        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
-            .into_iter()
-            .enumerate()
-            .map(|(writer, bytes)| {
-                let destination = destination.clone();
-                let before_publish = std::sync::Arc::clone(&before_publish);
-                std::thread::spawn(move || {
-                    write_file_atomically_with(
-                        &destination,
-                        bytes,
-                        |attempt| {
-                            if attempt == 0 {
-                                std::ffi::OsString::from("same-millisecond")
-                            } else {
-                                std::ffi::OsString::from(format!(
-                                    "same-millisecond-{writer}-{attempt}"
-                                ))
-                            }
-                        },
-                        || {
-                            before_publish.wait();
-                        },
-                    )
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().unwrap().unwrap();
-        }
-        let published = fs::read(&destination).expect("a writer must remain published");
-        let _ = fs::remove_dir_all(&root);
-        assert!(published == b"first" || published == b"second");
-    }
-
-    #[test]
-    fn concurrent_cached_publications_use_distinct_staging_files() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-publish-collision-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.body");
-        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
-            .into_iter()
-            .map(|bytes| {
-                let destination = destination.clone();
-                let before_publish = std::sync::Arc::clone(&before_publish);
-                std::thread::spawn(move || {
-                    let staged = stage_file_for_atomic_publish(&destination, bytes)?;
-                    before_publish.wait();
-                    publish_staged_file(&staged, &destination)
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().unwrap().unwrap();
-        }
-        let published = fs::read(&destination).expect("a cache writer must remain published");
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().contains(".tmp-"))
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert!(published == b"first" || published == b"second");
-        assert!(
-            leftovers.is_empty(),
-            "staged cache files leaked: {leftovers:?}"
-        );
-    }
-
-    #[test]
-    fn failed_cached_publication_preserves_destination_and_cleans_staging_file() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-publish-failure-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.body");
-        fs::write(&destination, b"published").unwrap();
-        let staged = stage_file_for_atomic_publish(&destination, b"replacement").unwrap();
-
-        publish_staged_file_with(&staged, &destination, |_, _| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "simulated cache publication failure",
-            ))
-        })
-        .expect_err("simulated cache publication failure must be returned");
-
-        assert_eq!(fs::read(&destination).unwrap(), b"published");
-        assert!(
-            !staged.exists(),
-            "failed publication leaked its staging file"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    fn cached_http_entry(generation: &str) -> CachedHttpCacheEntry {
-        CachedHttpCacheEntry {
-            metadata: CachedHttpMetadata {
-                url: format!("https://example.invalid/{generation}"),
-                etag: Some(format!("etag-{generation}")),
-                last_modified: None,
-                signature: Some(CachedHttpSignatureMetadata {
-                    url: format!("https://example.invalid/{generation}.sig"),
-                    verified_at_unix_ms: 1,
-                    public_key_source: generation.to_owned(),
-                }),
-                fetched_at_unix_ms: 2,
-            },
-            body: format!("body-{generation}"),
-            signature_bytes: Some(generation.as_bytes().to_vec()),
-        }
-    }
-
-    #[test]
-    fn concurrent_cached_http_commits_publish_one_complete_generation() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-generation-collision-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.json");
-        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let writers: Vec<_> = ["first", "second"]
-            .into_iter()
-            .enumerate()
-            .map(|(writer, generation)| {
-                let destination = destination.clone();
-                let before_publish = std::sync::Arc::clone(&before_publish);
-                std::thread::spawn(move || {
-                    let entry = cached_http_entry(generation);
-                    write_cached_http_entry_with(
-                        &destination,
-                        &entry,
-                        |attempt| {
-                            if attempt == 0 {
-                                OsString::from("same-millisecond")
-                            } else {
-                                OsString::from(format!("same-millisecond-{writer}-{attempt}"))
-                            }
-                        },
-                        || {
-                            before_publish.wait();
-                        },
-                        publish_temp_file,
-                    )
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().unwrap().unwrap();
-        }
-        let published: CachedHttpCacheEntry =
-            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().contains(".tmp-"))
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-
-        assert!(
-            published == cached_http_entry("first") || published == cached_http_entry("second"),
-            "published cache mixed generations: {published:?}"
-        );
-        assert!(leftovers.is_empty(), "cache commit leaked: {leftovers:?}");
-    }
-
-    #[test]
-    fn failed_cached_http_commit_preserves_previous_complete_generation() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-generation-failure-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.json");
-        let previous = cached_http_entry("previous");
-        write_cached_http_entry(&destination, &previous).unwrap();
-
-        write_cached_http_entry_with(
-            &destination,
-            &cached_http_entry("replacement"),
-            |attempt| OsString::from(format!("commit-failure-{attempt}")),
-            || {},
-            |tmp, path| {
-                let staged: CachedHttpCacheEntry =
-                    serde_json::from_slice(&fs::read(tmp).unwrap()).unwrap();
-                assert_eq!(staged, cached_http_entry("replacement"));
-                assert_eq!(path, destination);
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "simulated cache generation commit failure",
-                ))
-            },
-        )
-        .expect_err("simulated commit failure must be returned");
-
-        let preserved: CachedHttpCacheEntry =
-            serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-
-        assert_eq!(preserved, previous);
-        assert_eq!(leftovers, vec![OsString::from("index.json")]);
-    }
-
-    #[test]
-    fn failed_atomic_replace_preserves_destination_and_cleans_temp() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-replace-failure-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("sdk.tar.gz");
-        fs::write(&destination, b"published").unwrap();
-
-        write_file_atomically_with_publish(
-            &destination,
-            b"replacement",
-            |attempt| OsString::from(format!("replace-failure-{attempt}")),
-            || {},
-            |tmp, path| {
-                assert_eq!(fs::read(tmp).unwrap(), b"replacement");
-                assert_eq!(path, destination);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "simulated atomic replacement failure",
-                ))
-            },
-        )
-        .expect_err("simulated replacement failure must be returned");
-
-        assert_eq!(fs::read(&destination).unwrap(), b"published");
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(leftovers, vec![OsString::from("sdk.tar.gz")]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_temp_name_preserves_non_unicode_file_name_bytes() {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let file_name = std::ffi::OsString::from_vec(b"sdk-\xff.tar.gz".to_vec());
-        let destination = Path::new("/tmp").join(&file_name);
-        let temp = temp_sibling_path(&destination, std::ffi::OsStr::new("collision")).unwrap();
-
-        let mut expected = file_name.into_vec();
-        expected.extend_from_slice(b".tmp-collision");
-        assert_eq!(temp.file_name().unwrap().as_bytes(), expected);
-    }
-
-    /// Regression: a failed write must not leave a `.tmp-*` scratch file
-    /// behind. The name is unique per attempt, so before this an orphan
-    /// accumulated per retry — and when the failure is a full disk, those
-    /// orphans are exactly what keeps it full.
-    ///
-    /// Provokes the failure by pointing the destination at a non-empty
-    /// directory: the temp file is written, then neither the rename nor the
-    /// replace fallback can succeed. Portable, unlike an out-of-space test.
-    #[test]
-    fn write_file_atomically_cleans_up_temp_when_the_rename_fails() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let occupied = root.join("sdk.tar.gz");
-        fs::create_dir_all(occupied.join("nested")).unwrap();
-        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
-
-        write_file_atomically(&occupied, b"payload")
-            .expect_err("renaming onto a non-empty directory should fail");
-
-        let leftovers: Vec<String> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".tmp-"))
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert!(
-            leftovers.is_empty(),
-            "failed write left temp files behind: {leftovers:?}"
-        );
-    }
-
-    /// Mirrors the `/dev/shm` reproduction from the original report: a genuine
-    /// ENOSPC, not a rename failure standing in for one.
-    ///
-    /// Ignored by default because it fills `/dev/shm`, which is shared with
-    /// anything else on the host, so it is not safe to run concurrently. Run
-    /// with `cargo test -p rocm -- --ignored write_file_atomically_cleans_up`.
-    #[test]
-    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
-    fn write_file_atomically_cleans_up_temp_on_write_failure() {
-        let shm = Path::new("/dev/shm");
-        if !shm.is_dir() {
-            eprintln!("skipping: /dev/shm unavailable");
-            return;
-        }
-        let dir = shm.join(format!("rocm-enospc-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("artifact.tar.gz");
-        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
-        let payload = vec![0u8; 256 * 1024 * 1024];
-
-        let mut failures = Vec::new();
-        for _ in 0..2 {
-            write_file_atomically(&dest, &payload)
-                .expect_err("writing past the end of the filesystem should fail");
-            failures.push(
-                fs::read_dir(&dir)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            );
-        }
-        let destination_exists = dest.exists();
-        let _ = fs::remove_dir_all(&dir);
-
-        for leftovers in &failures {
-            assert!(
-                leftovers.is_empty(),
-                "failed write left files behind: {leftovers:?}"
-            );
-        }
-        assert!(
-            !destination_exists,
-            "destination must not exist after failure"
-        );
     }
 
     #[test]
@@ -8267,6 +6384,347 @@ mod tests {
         Ok(())
     }
 
+    /// The live ROCm 10 index publishes torchaudio rebuilds as a fourth release
+    /// segment beside the original build, for more than one ROCm build at once.
+    #[test]
+    fn torchaudio_pin_is_the_newest_rebuild_of_the_requested_rocm_build() {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.1.0").as_deref(),
+            Some("2.11.0.3+rocm10.1.0")
+        );
+        assert_eq!(latest_build_for_rocm(&published, "10.2.0"), None);
+    }
+
+    /// Mirrors uv's default: a pre-release is only chosen when no final
+    /// release exists for that build, and a post-release counts as final.
+    #[test]
+    fn torchaudio_pin_prefers_final_releases_like_uv() {
+        let published = [
+            "2.12.0a0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+
+        let only_pre = ["2.12.0a0+rocm10.0.0", "2.12.0a1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&only_pre, "10.0.0").as_deref(),
+            Some("2.12.0a1+rocm10.0.0")
+        );
+
+        let post = ["2.11.0+rocm10.0.0", "2.11.0.post1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&post, "10.0.0").as_deref(),
+            Some("2.11.0.post1+rocm10.0.0")
+        );
+    }
+
+    /// Each PEP 440 suffix number compares as a number, and the suffixes rank
+    /// `.devN` < `aN` < `bN` < `rcN` < final < `.postN`, with a `.devN` on any
+    /// of them ranking just below it. Pairs are `(older, newer)`.
+    #[test]
+    fn torchaudio_pin_orders_versions_as_pep_440_does() {
+        for (older, newer) in [
+            ("2.12.0a9", "2.12.0a10"),
+            ("2.12.0rc2", "2.12.0rc10"),
+            ("2.11.0.post9", "2.11.0.post10"),
+            ("2.12.0.dev1", "2.12.0.dev2"),
+            ("2.12.0.dev1", "2.12.0a1"),
+            ("2.12.0a1", "2.12.0b1"),
+            ("2.12.0b1", "2.12.0rc1"),
+            ("2.12.0rc1.dev3", "2.12.0rc1"),
+            ("2.11.0.post1.dev0", "2.11.0.post1"),
+            ("2.11.0", "2.11.0.post1.dev0"),
+            ("2.11", "2.11.0.1"),
+            ("9.0.0", "1!2.0.0"),
+        ] {
+            assert!(
+                package_release_key(&format!("{older}+rocm10.0.0"))
+                    < package_release_key(&format!("{newer}+rocm10.0.0")),
+                "{older} must order below {newer}"
+            );
+        }
+        assert_eq!(
+            package_release_key("2.11+rocm10.0.0"),
+            package_release_key("2.11.0+rocm10.0.0"),
+            "trailing zero release segments are insignificant"
+        );
+    }
+
+    /// The live `whl-next` shape for `+rocm10.1.0`: a CPU-only `2.11.0`, the
+    /// hardware-verified `2.11.0.2`, and a newer `2.11.0.3` sharing the label.
+    fn rocm10_1_torchaudio_builds() -> Vec<String> {
+        [
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// A verified release that is published wins over a newer build with the
+    /// same `+rocm` label, and the printed line says it is the verified one.
+    #[test]
+    fn torchaudio_pin_takes_the_published_verified_release_over_a_newer_build() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.2+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::Verified);
+        assert!(pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains("torchaudio 2.11.0.2+rocm10.1.0, the build verified on hardware")
+                && !line.contains("not hardware-verified"),
+            "{line}"
+        );
+        // The requirement handed to `uv` names the same build the line does.
+        assert_eq!(
+            published_pip_requirements("10.1.0", &pin.version, "gfx1200", false)[3],
+            "torchaudio==2.11.0.2+rocm10.1.0"
+        );
+        Ok(())
+    }
+
+    /// The verified release is matched as a whole PEP 440 version, never a
+    /// prefix: a verified `2.11.0` must not be satisfied by `2.11.0.2`.
+    #[test]
+    fn torchaudio_pin_matches_the_verified_release_exactly() -> Result<()> {
+        let published = ["2.11.0.2+rocm10.1.0", "2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0"), "https://index.test")?;
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0",
+                other_build: None,
+            }
+        );
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        Ok(())
+    }
+
+    /// A verified release published only for another ROCm build falls back to
+    /// the newest build for the requested one, and the printed reason names the
+    /// ROCm build as the cause, not the Python or platform: the verified release
+    /// is matched by ROCm line, so it can be published here under another label
+    /// of the same line.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_published_for_another_rocm_build()
+    -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.1.1",
+            "2.11.0.3+rocm10.1.1",
+            "2.11.0.2+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.1", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.1");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: Some("2.11.0.2+rocm10.1.0".to_owned()),
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.1, the newest build published for ROCm 10.1.1"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is published for this Python and platform only for another ROCm build (2.11.0.2+rocm10.1.0), not for ROCm 10.1.1"
+                )
+                && !line.contains("is not published for this Python and platform"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A verified release with no build at all for this Python and platform
+    /// falls back to the newest build, and the printed line says the release is
+    /// not published here. An unlabelled build is not a ROCm build, so it does
+    /// not count as one "for another ROCm build".
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_unpublished() -> Result<()>
+    {
+        let published = ["2.11.0+rocm10.1.0", "2.11.0.3+rocm10.1.0", "2.11.0.2"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: None,
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is not published for this Python and platform"
+                ),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A real install notes an unverified torchaudio in its install log, for
+    /// both reasons a pin can be unverified, and stays quiet for a verified
+    /// one. The note is the pin's own `describe()` line, so it states the
+    /// decision that was actually taken.
+    #[test]
+    fn unverified_torchaudio_note_is_logged_only_for_an_unverified_pin() -> Result<()> {
+        let builds = rocm10_1_torchaudio_builds();
+        let verified = torchaudio_pin(&builds, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        let not_published =
+            torchaudio_pin(&builds, "10.1.0", Some("2.11.0.9"), "https://index.test")?;
+        let no_verified_release = torchaudio_pin(&builds, "10.1.0", None, "https://index.test")?;
+        assert_eq!(verified.basis, TorchaudioPinBasis::Verified);
+        assert!(matches!(
+            not_published.basis,
+            TorchaudioPinBasis::VerifiedNotPublished { .. }
+        ));
+        assert_eq!(
+            no_verified_release.basis,
+            TorchaudioPinBasis::NoVerifiedRelease
+        );
+
+        assert_eq!(unverified_torchaudio_note(&verified), None);
+        for pin in [&not_published, &no_verified_release] {
+            let note = unverified_torchaudio_note(pin);
+            assert_eq!(note, Some(format!("Note: {}", pin.describe())));
+            assert!(
+                note.as_deref()
+                    .is_some_and(|note| note.contains("torchaudio 2.11.0.3+rocm10.1.0")
+                        && note.contains("not hardware-verified")),
+                "{note:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With no verified release recorded for the line, the newest build is
+    /// pinned, and the printed line says it is not hardware-verified.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_no_release_is_verified() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            None,
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::NoVerifiedRelease);
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains("no torchaudio release is recorded as verified"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// The verified release the SDK reads is the vLLM engine's: 10.1 has one,
+    /// 10.0 has none yet. Pins the wiring, not the table (which the engine's
+    /// own tests own), so a change to it is seen here as a deliberate choice.
+    #[test]
+    fn torchaudio_verified_release_comes_from_the_vllm_discover_table() {
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.1.0"),
+            Some("2.11.0.2")
+        );
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.0.0"),
+            None
+        );
+    }
+
+    /// A version the parser cannot read is left out, never guessed at: a newer
+    /// unreadable build must not win the pin.
+    #[test]
+    fn torchaudio_pin_skips_versions_it_cannot_read() -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.12.0-local-hack+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            torchaudio_pin(&published, "10.0.0", None, "https://index.test")?.version,
+            "2.11.0.2+rocm10.0.0"
+        );
+        Ok(())
+    }
+
+    /// The two refusals name different problems, so each says which one it is.
+    #[test]
+    fn torchaudio_pin_refusal_says_whether_the_build_is_missing_or_unreadable() {
+        let other_build = ["2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let missing = torchaudio_pin(
+            &other_build,
+            "10.0.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )
+        .expect_err("no torchaudio for the pinned build must refuse")
+        .to_string();
+        assert!(
+            missing.contains("no torchaudio built for ROCm 10.0.0 is published"),
+            "{missing}"
+        );
+
+        let unreadable = ["2.12.0-local-hack+rocm10.0.0"].map(str::to_owned);
+        let unreadable = torchaudio_pin(&unreadable, "10.0.0", None, "https://index.test")
+            .expect_err("an unreadable-only build must refuse")
+            .to_string();
+        assert!(
+            unreadable.contains("none has a PEP 440 version")
+                && unreadable.contains("2.12.0-local-hack+rocm10.0.0")
+                && !unreadable.contains("no torchaudio built"),
+            "{unreadable}"
+        );
+    }
+
+    /// A post-release that is itself a dev build is still a pre-release to
+    /// `uv`, so a final release wins over it.
+    #[test]
+    fn torchaudio_pin_treats_a_dev_post_release_as_a_pre_release() {
+        let published = ["2.11.0+rocm10.0.0", "2.11.0.post1.dev0+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0+rocm10.0.0")
+        );
+    }
+
     #[test]
     fn uv_metadata_plan_rejects_mixed_rocm_builds() {
         let error = parse_uv_compiled_package_versions(
@@ -8296,187 +6754,6 @@ mod tests {
             platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
         };
         assert_eq!(uv_python_platform(&linux)?, "x86_64-unknown-linux-gnu");
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
-        Command::new("sleep")
-            .arg(seconds.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sleep")
-    }
-
-    // `timeout.exe` refuses to run at all with its stdin redirected (it demands
-    // a real console even with `/nobreak`), exiting immediately instead of
-    // sleeping — which used to make both tests below pass or fail for the
-    // wrong reason. `Start-Sleep` has no such requirement.
-    #[cfg(windows)]
-    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
-        Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("Start-Sleep -Seconds {seconds}"),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn Start-Sleep")
-    }
-
-    /// A budget-constrained caller (the startup update check) must get its
-    /// child back, not blocked past the budget it asked for.
-    #[test]
-    fn wait_with_output_bounded_kills_a_slow_child_at_the_deadline() {
-        let child = spawn_test_sleep(30);
-        let started = Instant::now();
-
-        let error = wait_with_output_bounded(child, Some(Duration::from_millis(200)))
-            .expect_err("a 30s sleep must not complete inside a 200ms budget");
-
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "kill was not prompt"
-        );
-        assert!(error.to_string().contains("timed out"), "{error}");
-    }
-
-    /// An unbounded wait (an explicit user-invoked install, not a budgeted
-    /// startup check) still returns the child's real output.
-    #[test]
-    fn wait_with_output_bounded_waits_unbounded_when_no_timeout_is_given() {
-        let child = spawn_test_sleep(1);
-
-        let output = wait_with_output_bounded(child, None).expect("child should exit");
-
-        assert!(output.status.success(), "{output:?}");
-    }
-
-    /// The downloaded archive is removed once it has been unpacked; keeping it
-    /// would double the disk cost of every installed SDK version.
-    #[test]
-    fn extracting_the_sdk_archive_removes_it() -> Result<()> {
-        // Extraction spawns bare-name `tar` via `PATH`; hold the shared env lock so a
-        // concurrent test that temporarily narrows `PATH` cannot make it fail to launch.
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
-        let (root, _paths) = test_paths("discard-archive");
-        let cache = root.join("cache");
-        let payload_dir = root.join("payload");
-        fs::create_dir_all(&cache)?;
-        fs::create_dir_all(&payload_dir)?;
-        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
-
-        let archive = cache.join("therock-sdk.tar.gz");
-        let tar = std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&payload_dir)
-            .arg("marker.txt")
-            .status()?;
-        if !tar.success() {
-            eprintln!("skipping: tar unavailable on this host");
-            let _ = fs::remove_dir_all(&root);
-            return Ok(());
-        }
-        assert!(archive.is_file(), "archive fixture should exist");
-
-        let target = root.join("install");
-        fs::create_dir_all(&target)?;
-        let cleanup_warning = extract_tarball_and_discard_archive(&archive, &target)?;
-        assert!(
-            cleanup_warning.is_none(),
-            "archive cleanup should succeed: {cleanup_warning:?}"
-        );
-
-        assert!(
-            target.join("marker.txt").is_file(),
-            "the archive contents should have been extracted"
-        );
-        assert!(
-            !archive.exists(),
-            "the archive should be removed once unpacked, found {}",
-            archive.display()
-        );
-
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    /// If the archive can't be removed after a successful extraction, the
-    /// extraction result still succeeds and callers receive a warning message
-    /// describing the cleanup failure instead of a raised error.
-    #[cfg(unix)]
-    #[test]
-    fn extracting_the_sdk_archive_reports_cleanup_failure() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
-        let (root, _paths) = test_paths("discard-archive-cleanup-failure");
-        let cache = root.join("cache");
-        let payload_dir = root.join("payload");
-        fs::create_dir_all(&cache)?;
-        fs::create_dir_all(&payload_dir)?;
-        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
-
-        let archive = cache.join("therock-sdk.tar.gz");
-        let tar = std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&payload_dir)
-            .arg("marker.txt")
-            .status()?;
-        if !tar.success() {
-            eprintln!("skipping: tar unavailable on this host");
-            let _ = fs::remove_dir_all(&root);
-            return Ok(());
-        }
-
-        // Root can unlink a file regardless of its parent directory's write
-        // permission bit, so the `chmod 0o555` below would not actually block
-        // the removal and `cleanup_warning` would come back `None`, failing
-        // the `.expect(...)` below on a mismatched assumption rather than the
-        // behavior under test.
-        #[allow(unsafe_code)] // libc FFI
-        let euid = unsafe { libc::geteuid() };
-        if euid == 0 {
-            eprintln!("skipping: test requires a non-root user to enforce permissions");
-            let _ = fs::remove_dir_all(&root);
-            return Ok(());
-        }
-
-        let target = root.join("install");
-        fs::create_dir_all(&target)?;
-
-        // Removing the archive requires write access to its parent directory;
-        // strip that so `fs::remove_file` fails after a successful extraction.
-        let cache_perms = fs::metadata(&cache)?.permissions();
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o555))?;
-        let result = extract_tarball_and_discard_archive(&archive, &target);
-        fs::set_permissions(&cache, cache_perms)?;
-
-        let cleanup_warning = result?;
-        assert!(
-            target.join("marker.txt").is_file(),
-            "the archive contents should still be extracted"
-        );
-        assert!(
-            archive.is_file(),
-            "archive removal should have failed, leaving it in place"
-        );
-        let message = cleanup_warning.expect("a cleanup failure should produce a warning message");
-        assert!(
-            message.contains("Could not remove the downloaded archive"),
-            "{message}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
@@ -8519,6 +6796,7 @@ mod tests {
             latest_version: "7.13.0".to_owned(),
             newest_repo_version: None,
             version_resolution_specs: None,
+            torchaudio_pin: None,
             package_versions: TheRockPipPackageVersions {
                 rocm: "7.13.0".to_owned(),
                 torch: "2.11.0+rocm7.13.0".to_owned(),
@@ -8577,21 +6855,24 @@ mod tests {
     /// extras.
     #[test]
     fn version_resolution_requests_the_toolchain_only_when_asked() {
-        let runtime_only = published_pip_requirements("10.0.0", "gfx1200", false);
+        let runtime_only =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", false);
         assert_eq!(
             runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
             "a default install must not resolve against the toolchain: {runtime_only:?}"
         );
 
-        let with_devel = published_pip_requirements("10.0.0", "gfx1200", true);
+        let with_devel =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", true);
         assert_eq!(
             with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
             "--devel must reach the resolved requirements: {with_devel:?}"
         );
 
-        // Only the `rocm` requirement carries the toolchain axis; the torch
-        // stack is unversioned here because choosing those versions is what the
-        // resolve is for.
+        // Only the `rocm` requirement carries the toolchain axis. torch and
+        // torchvision are unversioned because choosing those versions is what
+        // the resolve is for; torchaudio is pinned because its metadata does not
+        // follow the `rocm` pin (see `published_pip_requirements`).
         assert_eq!(
             runtime_only[1..],
             with_devel[1..],
@@ -8602,7 +6883,7 @@ mod tests {
             [
                 "torch[device-gfx1200]".to_owned(),
                 "torchvision[device-gfx1200]".to_owned(),
-                "torchaudio".to_owned(),
+                "torchaudio==2.11.0.2+rocm10.0.0".to_owned(),
             ]
         );
     }
@@ -8619,6 +6900,7 @@ mod tests {
         for include_devel in [false, true] {
             let requirements = published_pip_requirements(
                 &resolution.package_versions.rocm,
+                &resolution.package_versions.torchaudio,
                 "gfx942",
                 include_devel,
             );
@@ -8629,6 +6911,13 @@ mod tests {
                 "resolution and install must request the same rocm extras for \
                  include_devel={include_devel}: {requirements:?} vs {:?}",
                 composition.package_specs
+            );
+            // torchaudio is the one stack package resolution pins rather than
+            // leaving to `uv`, so it has to be the very build install names.
+            assert_eq!(
+                requirements[3], composition.package_specs[3],
+                "resolution and install must name the same torchaudio for \
+                 include_devel={include_devel}"
             );
         }
     }
@@ -8678,117 +6967,48 @@ mod tests {
         }
     }
 
-    /// A manifest from before compositions were recorded has only the field,
-    /// and one older still has neither — those installs all had the toolchain.
-    #[test]
-    fn manifest_without_a_composition_falls_back_to_the_devel_field() {
-        let without_composition = InstalledRuntimeManifest {
-            wheel_composition: None,
-            devel: false,
-            ..test_runtime_manifest(
-                "release-wheel-gfx94X-dcgpu-7.13.0",
-                "therock-release:gfx94X-dcgpu",
-                1,
-            )
-        };
-        assert!(!without_composition.includes_devel());
-
-        let legacy = InstalledRuntimeManifest {
-            wheel_composition: None,
-            devel: devel_default_for_legacy_manifest(),
-            ..test_runtime_manifest(
-                "release-wheel-gfx94X-dcgpu-7.13.0",
-                "therock-release:gfx94X-dcgpu",
-                1,
-            )
-        };
-        assert!(
-            legacy.includes_devel(),
-            "a manifest predating the flag must be treated as a toolchain install"
-        );
-    }
-
-    /// Writing a manifest over an existing one for the same `runtime_key`
-    /// REPLACES it — `devel` included — rather than merging with what was on
-    /// disk. That is the storage half of the reinstall-drift case: a user who
-    /// installed with `--devel` and later reinstalls without it keeps
-    /// `hipcc`/headers on disk while the manifest records `devel: false`, and
-    /// `apply_runtime_update` reinstalls from that field on the next `rocm
-    /// update`. Left as-is rather than fixed — the flag reflects what the most
-    /// recent install asked for, which is arguably correct; the drift risk is
-    /// that neither `rocm runtimes list` nor `rocm examine` surfaces `devel`,
-    /// so the state is invisible.
+    /// The registry load itself breaks install-time ties on the runtime key,
+    /// not only the sort helper it calls: the startup update check and
+    /// `runtimes_cmd::newest_installed_runtime_manifest` both take the first
+    /// entry `load_runtime_manifests` returns, and neither re-sorts.
     ///
-    /// LIMIT: this covers `save_runtime_manifest` only. It does NOT reach
-    /// `install_sdk`, which is what actually threads `include_devel` into the
-    /// manifest — that call needs `uv`, a live index, and a real `rocm_sdk`
-    /// probe, so it has no unit coverage here. Hardcoding `devel: true` at that
-    /// write site passes this test and the rest of the suite.
+    /// Both pairings of file name and runtime key are written, so whichever
+    /// file `read_dir` returns first holds `bbb` in one of them: a load that
+    /// kept the read order for a tie picks the wrong runtime there.
     #[test]
-    fn save_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
-        let (root, paths) = test_paths("manifest-replaces-devel");
-        let install_root = root.join("install-root");
-        fs::create_dir_all(&install_root)?;
-        let with_devel = InstalledRuntimeManifest {
-            install_root,
-            ..test_runtime_manifest(
-                "release-wheel-gfx110X-all-7.13.0",
-                "therock-release:gfx110X-all",
-                1,
-            )
-        };
-        assert!(
-            with_devel.devel,
-            "test fixture should start with devel: true"
-        );
-        save_runtime_manifest(&paths, &with_devel)?;
+    fn registry_load_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = test_paths("registry-load-tie");
+            let registry = runtime_registry_dir(&paths);
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&test_runtime_manifest(
+                        key,
+                        "therock-release:gfx120X-all",
+                        2_000,
+                    ))?,
+                )?;
+            }
+            let pairing = format!("files first={first_file_key}, second={second_file_key}");
 
-        let without_devel = InstalledRuntimeManifest {
-            devel: false,
-            installed_at_unix_ms: 2,
-            ..with_devel.clone()
-        };
-        save_runtime_manifest(&paths, &without_devel)?;
+            let keys = load_runtime_manifests(&paths)?
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["aaa", "bbb"], "{pairing}");
+            assert_eq!(
+                crate::runtimes_cmd::newest_installed_runtime_manifest(&paths)?
+                    .map(|manifest| manifest.runtime_key)
+                    .as_deref(),
+                Some("aaa"),
+                "{pairing}"
+            );
 
-        let manifests = load_runtime_manifests(&paths)?;
-        let reloaded = manifests
-            .iter()
-            .find(|manifest| manifest.runtime_key == with_devel.runtime_key)
-            .expect("manifest should still be registered under the same runtime_key");
-        assert!(
-            !reloaded.devel,
-            "saving a manifest must replace devel, not merge with the prior one"
-        );
-
-        let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&root);
+        }
         Ok(())
-    }
-
-    /// A manifest written before `devel` became opt-in has no such field, and
-    /// those installs all had the toolchain. Reading one back must not claim
-    /// otherwise, or the next update would silently strip it.
-    #[test]
-    fn legacy_manifest_without_devel_field_is_treated_as_having_it() {
-        let json = r#"{
-            "runtime_key": "release-wheel-gfx110X-all-7.13.0",
-            "runtime_id": "therock-release:gfx110X-all",
-            "channel": "release",
-            "format": "wheel",
-            "family": "gfx110X-all",
-            "family_source": "detected",
-            "version": "7.13.0",
-            "install_root": "/tmp/rocm-runtime",
-            "selected_artifact_url": "https://example.invalid/simple",
-            "installed_at_unix_ms": 1
-        }"#;
-
-        let manifest: InstalledRuntimeManifest =
-            serde_json::from_str(json).expect("legacy manifest should still parse");
-
-        assert!(
-            manifest.devel,
-            "a manifest predating the flag must be treated as a toolchain install"
-        );
     }
 
     #[test]
@@ -9350,6 +7570,92 @@ mod tests {
         Ok(())
     }
 
+    /// `resolve_python_launcher` must consult an installed
+    /// `OverridePythonResolverEnv` instead of the real process environment.
+    /// That is what lets a test steer resolution without overwriting
+    /// process-wide `PATH`, which raced sibling test threads spawning
+    /// PATH-resolved binaries (issue #650).
+    #[cfg(unix)]
+    #[test]
+    fn python_resolver_env_override_is_consulted_by_resolve_python_launcher() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            // No wheel platform tag for this host (e.g. macOS): every python fails
+            // the wheel-compatibility check, so resolution always falls through to
+            // the managed/uv path regardless of PATH. Nothing to assert here.
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("python-resolver-env-override-hermetic");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        write_fake_python_with_venv(&bin_dir, "python3")?;
+
+        let launcher = {
+            let _guard = OverridePythonResolverEnv::new(PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![bin_dir.clone()],
+            });
+            resolve_python_launcher(&paths, python_requirement(SourceLayout::Canonical))?
+        };
+
+        assert_eq!(
+            launcher.source, "path",
+            "resolve_python_launcher must consult the test override, not the real environment"
+        );
+        assert!(launcher.executable.starts_with(&bin_dir));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn nested_python_resolver_env_override_restores_the_outer_one_on_drop() {
+        // Mirrors the bookkeeping check `suppress_progress_output_contract` (in
+        // `therock::process`) makes for `SuppressProgressOutput`: proves the
+        // same restore-previous composition for `OverridePythonResolverEnv`,
+        // which its doc comment claims but no other test exercises.
+        // Thread-local, so this doesn't race with other tests' threads.
+        assert!(python_resolver_env_override().is_none());
+        {
+            let _outer = OverridePythonResolverEnv::new(PythonResolverEnv {
+                python_override: Some("outer".to_owned()),
+                search_dirs: vec![],
+            });
+            assert_eq!(
+                python_resolver_env_override()
+                    .unwrap()
+                    .python_override
+                    .as_deref(),
+                Some("outer")
+            );
+            {
+                let _inner = OverridePythonResolverEnv::new(PythonResolverEnv {
+                    python_override: Some("inner".to_owned()),
+                    search_dirs: vec![],
+                });
+                assert_eq!(
+                    python_resolver_env_override()
+                        .unwrap()
+                        .python_override
+                        .as_deref(),
+                    Some("inner")
+                );
+            }
+            assert_eq!(
+                python_resolver_env_override()
+                    .unwrap()
+                    .python_override
+                    .as_deref(),
+                Some("outer"),
+                "dropping the inner override must restore the outer one, not clear it"
+            );
+        }
+        assert!(
+            python_resolver_env_override().is_none(),
+            "dropping the outer override must restore the pre-override state"
+        );
+    }
+
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
         use rocm_core::fake_executable::write_fake_executable;
@@ -9522,25 +7828,6 @@ exit 1
     }
 
     #[test]
-    fn recorded_composition_names_the_device_payload_it_installed() {
-        let composition = WheelRuntimeComposition {
-            source_layout_generation: "multi-arch-v2".to_owned(),
-            package_specs: vec![
-                "rocm[libraries,devel,device-gfx1103]==7.14.1".to_owned(),
-                "torch==2.11.0+rocm7.14.1".to_owned(),
-            ],
-            rocm_sdk_target: Some("gfx1103".to_owned()),
-        };
-
-        assert_eq!(
-            wheel_composition_device_target(Some(&composition)),
-            Some("gfx1103"),
-            "update planning must recover the installed target without probing the current host"
-        );
-        assert_eq!(wheel_composition_device_target(None), None);
-    }
-
-    #[test]
     fn aggregate_wheel_resolution_hint_does_not_recommend_family_override() {
         let hint = canonical_wheel_resolution_hint(TheRockChannel::Release);
         assert!(!hint.contains("--family"));
@@ -9566,370 +7853,6 @@ exit 1
     }
 
     #[test]
-    fn metadata_cache_paths_stay_under_rocm_cli_cache() {
-        let (root, paths) = test_paths("metadata-cache-paths");
-        let (body, metadata) = metadata_cache_paths(&paths, "simple-index:https://example.invalid");
-
-        assert!(body.starts_with(paths.cache_dir.join("therock").join("metadata")));
-        assert_eq!(
-            body.extension().and_then(|value| value.to_str()),
-            Some("body")
-        );
-        assert_eq!(
-            metadata.extension().and_then(|value| value.to_str()),
-            Some("json")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn metadata_signature_paths_are_sidecars() {
-        let (root, paths) = test_paths("metadata-signature-paths");
-        let (body, _) = metadata_cache_paths(&paths, "simple-index:https://example.invalid");
-
-        assert_eq!(
-            metadata_signature_url("https://example.invalid/index").as_str(),
-            "https://example.invalid/index.sig"
-        );
-        assert_eq!(
-            metadata_signature_path(&body)
-                .extension()
-                .and_then(|value| value.to_str()),
-            Some("sig")
-        );
-        assert!(metadata_signature_path(&body).starts_with(&paths.cache_dir));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn metadata_signature_policy_requires_public_key_when_enabled() {
-        let (root, paths) = test_paths("metadata-signature-requires-key");
-        let policy = MetadataSignaturePolicy {
-            required: true,
-            public_key_path: None,
-            public_key_pem: None,
-        };
-        let temp_key = paths.cache_dir.join("metadata-key.pem");
-
-        let error = with_metadata_public_key(&policy, &temp_key, |_path, _source| Ok(()))
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("ROCM_CLI_METADATA_PUBLIC_KEY_PATH"));
-        assert!(error.contains("ROCM_CLI_METADATA_PUBLIC_KEY_PEM"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn metadata_signature_policy_writes_inline_public_key_temporarily() -> Result<()> {
-        let (root, paths) = test_paths("metadata-signature-inline-key");
-        let policy = MetadataSignaturePolicy {
-            required: true,
-            public_key_path: None,
-            public_key_pem: Some(
-                "-----BEGIN PUBLIC KEY-----\nunit-test\n-----END PUBLIC KEY-----\n".to_owned(),
-            ),
-        };
-        let temp_key = paths.cache_dir.join("metadata-key.pem");
-
-        let observed = with_metadata_public_key(&policy, &temp_key, |path, source| {
-            assert_eq!(source, "env-pem");
-            assert_eq!(
-                fs::read_to_string(path)?,
-                "-----BEGIN PUBLIC KEY-----\nunit-test\n-----END PUBLIC KEY-----\n"
-            );
-            Ok(path.to_path_buf())
-        })?
-        .expect("inline key should be active");
-
-        assert_eq!(observed.parent(), temp_key.parent());
-        assert!(
-            observed
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("metadata-key.pem.tmp-")),
-            "inline key must use a reserved sibling path: {}",
-            observed.display()
-        );
-        assert!(!observed.exists());
-        assert!(!temp_key.exists());
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_policy_uses_pinned_key_and_requires_by_default() {
-        // A pinned trust root with no env inputs: verification becomes required
-        // by default and the pinned PEM is used.
-        let pinned = "-----BEGIN PUBLIC KEY-----\npinned\n-----END PUBLIC KEY-----\n";
-        let policy = MetadataSignaturePolicy::resolve(false, None, None, Some(pinned.to_owned()));
-        assert!(policy.required);
-        assert!(policy.active());
-        assert_eq!(policy.public_key_pem.as_deref(), Some(pinned));
-        assert!(policy.public_key_path.is_none());
-    }
-
-    #[test]
-    fn metadata_policy_env_key_overrides_pinned_key() {
-        // An explicit env PEM wins over the pinned root (escape hatch), and does
-        // not force `required` on its own.
-        let pinned = "-----BEGIN PUBLIC KEY-----\npinned\n-----END PUBLIC KEY-----\n";
-        let env_pem = "-----BEGIN PUBLIC KEY-----\nenv\n-----END PUBLIC KEY-----\n";
-        let policy = MetadataSignaturePolicy::resolve(
-            false,
-            None,
-            Some(env_pem.to_owned()),
-            Some(pinned.to_owned()),
-        );
-        assert_eq!(policy.public_key_pem.as_deref(), Some(env_pem));
-
-        let env_path = PathBuf::from("/keys/metadata.pem");
-        let policy = MetadataSignaturePolicy::resolve(
-            false,
-            Some(env_path.clone()),
-            None,
-            Some(pinned.to_owned()),
-        );
-        assert_eq!(policy.public_key_path, Some(env_path));
-        assert!(policy.public_key_pem.is_none());
-    }
-
-    #[test]
-    fn metadata_policy_without_pinned_key_preserves_optin_behavior() {
-        // Empty pinned sentinel + no env inputs: verification stays inactive,
-        // exactly as before pinning was introduced.
-        let policy = MetadataSignaturePolicy::resolve(false, None, None, None);
-        assert!(!policy.required);
-        assert!(!policy.active());
-
-        // `ROCM_CLI_REQUIRE_METADATA_SIGNATURE=1` alone still activates it.
-        let policy = MetadataSignaturePolicy::resolve(true, None, None, None);
-        assert!(policy.required);
-    }
-
-    #[test]
-    fn metadata_cache_revalidation_requires_cached_signature_when_policy_is_active() -> Result<()> {
-        let (root, paths) = test_paths("metadata-signature-revalidate");
-        fs::create_dir_all(&paths.cache_dir)?;
-        let signature_path = paths.cache_dir.join("index.sig");
-        let unsigned_metadata = CachedHttpMetadata {
-            url: "https://example.invalid/index".to_owned(),
-            etag: Some("etag".to_owned()),
-            last_modified: None,
-            signature: None,
-            fetched_at_unix_ms: 1,
-        };
-        let signed_metadata = CachedHttpMetadata {
-            signature: Some(CachedHttpSignatureMetadata {
-                url: "https://example.invalid/index.sig".to_owned(),
-                verified_at_unix_ms: 2,
-                public_key_source: "path".to_owned(),
-            }),
-            ..unsigned_metadata.clone()
-        };
-        let inactive_policy = MetadataSignaturePolicy::default();
-        let active_policy = MetadataSignaturePolicy {
-            required: true,
-            public_key_path: None,
-            public_key_pem: Some("key".to_owned()),
-        };
-
-        assert!(metadata_cache_can_revalidate(
-            &unsigned_metadata,
-            &inactive_policy,
-            &signature_path
-        ));
-        assert!(!metadata_cache_can_revalidate(
-            &unsigned_metadata,
-            &active_policy,
-            &signature_path
-        ));
-        assert!(!metadata_cache_can_revalidate(
-            &signed_metadata,
-            &active_policy,
-            &signature_path
-        ));
-
-        fs::write(&signature_path, "signature")?;
-        assert!(metadata_cache_can_revalidate(
-            &signed_metadata,
-            &active_policy,
-            &signature_path
-        ));
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_signature_verification_accepts_generated_key_and_rejects_tamper() -> Result<()> {
-        let (root, paths) = test_paths("metadata-signature-generated-key");
-        fs::create_dir_all(&paths.cache_dir)?;
-        let private_key = paths.cache_dir.join("metadata-private.pem");
-        let public_key = paths.cache_dir.join("metadata-public.pem");
-        let payload_path = paths.cache_dir.join("index.body");
-        let signature_path = paths.cache_dir.join("index.sig");
-        let temp_key = paths.cache_dir.join("metadata-public.tmp.pem");
-
-        generate_test_signing_key(&private_key, &public_key)?;
-        fs::write(&payload_path, "version = 1\n")?;
-        sign_test_payload(&private_key, &payload_path, &signature_path)?;
-
-        let policy = MetadataSignaturePolicy {
-            required: true,
-            public_key_path: Some(public_key),
-            public_key_pem: None,
-        };
-        verify_cached_metadata_signature(&policy, &payload_path, &signature_path, &temp_key)?;
-
-        fs::write(&payload_path, "version = 2\n")?;
-        let error =
-            verify_cached_metadata_signature(&policy, &payload_path, &signature_path, &temp_key)
-                .unwrap_err()
-                .to_string();
-
-        assert!(error.contains("metadata signature verification failed"));
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn http_header_value_uses_last_response_header_block() {
-        let headers =
-            "HTTP/2 302\r\netag: old\r\n\r\nHTTP/2 200\r\nETag: new\r\nLast-Modified: today\r\n";
-
-        assert_eq!(http_header_value(headers, "etag").as_deref(), Some("new"));
-        assert_eq!(
-            http_header_value(headers, "last-modified").as_deref(),
-            Some("today")
-        );
-    }
-
-    #[test]
-    fn windows_child_path_maps_ape_drive_paths() {
-        assert_eq!(
-            windows_child_path(Path::new("/D/path/to/rocm-cli/file.ps1")),
-            r"D:\path\to\rocm-cli\file.ps1"
-        );
-        assert_eq!(windows_child_path(Path::new("/c")), r"C:\");
-    }
-
-    #[test]
-    fn native_http_download_and_get_round_trip_without_powershell() -> Result<()> {
-        use std::net::TcpListener;
-        use std::thread;
-
-        // Serve a fixed body from a localhost HTTP/1.1 server so the request
-        // exercises the native `ureq` transport that `http_get`/`download_file`
-        // now use on every platform. This runs under `cargo test` on the
-        // windows-latest CI job, where `runtime_is_windows()` is true and the
-        // removed PowerShell/ExecutionPolicy-Bypass backend used to run — so it
-        // verifies the native replacement on real Windows.
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let body = b"native-http-smoke-body".to_vec();
-        let served = body.clone();
-        // Two requests: one for download_file, one for http_get.
-        let server = thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let read = stream.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    served.len()
-                )?;
-                stream.write_all(&served)?;
-                stream.flush()?;
-            }
-            Ok(())
-        });
-
-        let url = format!("http://127.0.0.1:{port}/artifact.bin");
-
-        let temp = workspace_test_artifact_dir().join(format!(
-            "native-http-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&temp)?;
-        let destination = temp.join("artifact.bin");
-
-        download_file(&url, &destination, &mut |_, _| {})?;
-        assert_eq!(fs::read(&destination)?, body);
-
-        let response = http_get(&url, &[], Some(5))?;
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, body);
-
-        server.join().expect("localhost server thread panicked")?;
-        let _ = fs::remove_dir_all(&temp);
-        Ok(())
-    }
-
-    #[test]
-    fn http_get_respects_max_time_secs() {
-        use std::net::TcpListener;
-        use std::thread;
-        use std::time::Instant;
-
-        // Regression test for `http_get`'s `max_time_secs` bound, pre-existing
-        // and unchanged by this PR, which `download_timeout_secs` relies on
-        // once threaded through `resolve_latest_for_manifest`: `http_get` must
-        // actually bound the request to `max_time_secs`, not just accept the
-        // argument and fall back to the 10-minute default. A listener that
-        // accepts the connection but never writes a response simulates a
-        // stalled server past the connect phase, so this exercises the
-        // overall `timeout` (what `max_time_secs` controls), not just
-        // `connect_timeout` (fixed at `THEROCK_HEAD_PROBE_TIMEOUT_SECS`).
-        //
-        // This does not exercise `resolve_latest_for_manifest` itself: its
-        // wheel/tarball index URLs come from `canonical_source`, a `const
-        // fn` over fixed real hostnames with no test-time override, so a
-        // hermetic test can't reach that exact call site without either
-        // hitting the real network or adding a production-code test seam.
-        // `max_time_secs`/`download_timeout_secs` is a single value passed
-        // unchanged through plain pass-through parameters down to here (no
-        // branching on it in between), so a regression in its plumbing would
-        // either fail to compile (type mismatch) or show up as this test
-        // hanging instead of returning quickly.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _server = thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
-                thread::sleep(Duration::from_secs(5));
-                drop(stream);
-            }
-        });
-
-        let url = format!("http://127.0.0.1:{port}/stalled");
-        let started = Instant::now();
-        let result = http_get(&url, &[], Some(1));
-        let elapsed = started.elapsed();
-
-        assert!(
-            result.is_err(),
-            "a stalled server must not be treated as a successful response"
-        );
-        assert!(
-            elapsed < Duration::from_secs(4),
-            "max_time_secs=Some(1) must bound the request; took {elapsed:?}"
-        );
-    }
-
-    #[test]
     fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
         let (root, paths) = test_paths("update-json-empty");
 
@@ -9950,10 +7873,11 @@ exit 1
         //
         // Deliberate gap: this only covers the all-error case. Asserting a
         // successful row survives alongside a failing one would need a second
-        // manifest that resolves for real, and no fixture here stands up a
-        // resolvable wheel index — only a raw-body local HTTP server exists,
-        // for `native_http_download_and_get_round_trip_without_powershell`'s
-        // lower-level use. Not worth building just for this one assertion.
+        // manifest that resolves for real, and no fixture in this module stands
+        // up a resolvable wheel index — only the raw-body local HTTP servers
+        // that the `therock::fetch` tests start exist (for example in
+        // `native_http_download_and_get_round_trip_without_powershell`), for
+        // their lower-level use. Not worth building just for this one assertion.
         let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
         manifest.channel = "unsupported-channel".to_owned();
         write_test_runtime_manifest(&paths, &manifest)?;
@@ -9967,86 +7891,6 @@ exit 1
         assert!(row.latest_version.is_none());
         assert!(row.message.is_some());
         let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
-        use std::net::TcpListener;
-        use std::thread;
-
-        // A multi-chunk body (`download_file_streaming` reads in 64 KiB
-        // chunks) so a single callback firing wouldn't already satisfy the
-        // "monotonically increasing" assertion below.
-        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
-
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let served = body.clone();
-        let server = thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                served.len()
-            )?;
-            stream.write_all(&served)?;
-            stream.flush()?;
-            Ok(())
-        });
-
-        let url = format!("http://127.0.0.1:{port}/artifact.bin");
-
-        let temp = workspace_test_artifact_dir().join(format!(
-            "download-progress-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&temp)?;
-        let destination = temp.join("artifact.bin");
-
-        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
-        download_file(&url, &destination, &mut |bytes, total| {
-            calls.push((bytes, total));
-        })?;
-        assert_eq!(fs::read(&destination)?, body);
-
-        server.join().expect("localhost server thread panicked")?;
-        let _ = fs::remove_dir_all(&temp);
-
-        let total = Some(body.len() as u64);
-        assert!(
-            calls.len() >= 2,
-            "expected at least a pre-transfer and a final callback: {calls:?}"
-        );
-        assert!(
-            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "byte counts must never regress: {calls:?}"
-        );
-        assert_eq!(
-            calls.last(),
-            Some(&(body.len() as u64, total)),
-            "the last callback must report the complete transfer: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .all(|&(_, reported_total)| reported_total == total),
-            "the reported total must stay consistent across callbacks: {calls:?}"
-        );
         Ok(())
     }
 
@@ -11151,21 +8995,6 @@ exit 1
             .join("therock")
     }
 
-    fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
-        fs::write(private_key, private_pem.as_bytes())?;
-        fs::write(public_key, public_pem.as_bytes())?;
-        Ok(())
-    }
-
-    fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        let private_pem = fs::read_to_string(private_key)?;
-        let payload_bytes = fs::read(payload)?;
-        let produced = sign_rsa_pkcs1_sha256_signature(&private_pem, &payload_bytes)?;
-        fs::write(signature, produced)?;
-        Ok(())
-    }
-
     fn test_runtime_manifest(
         runtime_key: &str,
         runtime_id: &str,
@@ -11234,24 +9063,6 @@ exit 1
             "the test fixture must be unparsable, or this asserts nothing"
         );
         Ok(path)
-    }
-
-    #[test]
-    fn runtime_version_display_mentions_embedded_build_date() {
-        assert_eq!(
-            runtime_version_display("7.14.0a20260601"),
-            "7.14.0a20260601 (build 2026-06-01)"
-        );
-        assert_eq!(
-            runtime_version_display("2.11.0+rocm7.13.0a20260416"),
-            "2.11.0+rocm7.13.0a20260416 (build 2026-04-16)"
-        );
-        assert_eq!(runtime_version_display("7.14.0"), "7.14.0");
-        assert_eq!(
-            runtime_version_build_date("7.14.0a20260230"),
-            None,
-            "invalid calendar dates should not be displayed"
-        );
     }
 
     #[test]
@@ -11352,58 +9163,5 @@ exit 1
             !kernel_section.contains(r#"out["device_count"] ="#),
             "a kernel failure must preserve the enumerated device count"
         );
-    }
-}
-
-/// Property tests for the SDK tarball unpack, judged on the filesystem by
-/// `crate::archive_props`. Extraction is the system `tar` resolved from
-/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
-/// guarantees through `extract_tarball_and_discard_archive`.
-#[cfg(all(test, unix))]
-mod archive_properties {
-    use super::extract_tarball_and_discard_archive;
-    use crate::archive_props::{
-        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
-        tar_gz_bytes,
-    };
-
-    /// No escape, and no setuid/setgid or world-writable entry. The modes are
-    /// what the system `tar` gives an unprivileged user, so they are not
-    /// judged when this runs as root (see `Modes`).
-    #[test]
-    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
-        let expect = Expect {
-            modes: Modes::SafeUnlessRoot,
-            no_outward_links: false,
-        };
-        note_mode_scope("therock", expect.modes);
-        run_property("therock", 256, entries(), Some(5), |layout, entries| {
-            run_case(
-                layout,
-                "sdk.tar.gz",
-                &tar_gz_bytes(entries),
-                &[&layout.dest],
-                &layout.dest,
-                |layout, archive| {
-                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
-                },
-            )
-            .judge(expect)
-        })
-        .unwrap();
-    }
-
-    /// The other direction: a well-formed tarball is extracted in full, into
-    /// the install root it was given. An unpack that wrote somewhere else
-    /// entirely escapes the oracle above; this catches it.
-    #[test]
-    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
-        run_round_trip("therock-benign", |layout, entries| {
-            let archive = layout.base.join("sdk.tar.gz");
-            std::fs::write(&archive, tar_gz_bytes(entries))?;
-            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
-            Ok(layout.dest.join("top"))
-        })
-        .unwrap();
     }
 }

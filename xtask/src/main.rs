@@ -11,6 +11,7 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod ascii_output_contract;
 mod catalog;
 mod coverage;
 mod crate_edges;
@@ -19,11 +20,15 @@ mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
 mod env_mutation_contract;
+mod eval_fixtures;
 mod lychee;
 mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod report_mailbox;
+mod report_rollup;
+mod rocm_releases;
 mod signing;
 mod tpn;
 mod verify_commits;
@@ -80,7 +85,7 @@ pub(crate) enum Command {
         signature: PathBuf,
     },
     /// Assert the release/metadata public keys pinned in the installers and
-    /// `apps/rocm/src/therock.rs` match the canonical published keys under
+    /// `apps/rocm/src/therock/fetch.rs` match the canonical published keys under
     /// `docs/keys/`, and that any configured CI signing key matches the pinned
     /// current release key. A no-op while no canonical keys are published.
     VerifyPinnedKeys,
@@ -108,6 +113,14 @@ pub(crate) enum Command {
     Catalog {
         /// Verify the published manifest is current without writing; exit
         /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Regenerate the recorded `rocm` output the rocm-doctor skill evals replay
+    /// from the compiled catalog (skills/rocm-doctor/evals/fixtures/).
+    EvalFixtures {
+        /// Verify the committed recordings are current without writing; exit
+        /// non-zero if any is missing, stale, or unexpected.
         #[arg(long)]
         check: bool,
     },
@@ -217,6 +230,9 @@ pub(crate) enum Command {
     /// tree stays a cache: an install happens only when nothing is present for the
     /// channel, an in-place side-by-side update only when the index is genuinely
     /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    /// `--version`/`--build-date` override all of that: a pin is served if already
+    /// installed, else freshly installed side-by-side — the index's latest is
+    /// never consulted while a pin is set.
     E2ePrewarm {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]
@@ -229,6 +245,23 @@ pub(crate) enum Command {
         /// `data/runtimes` is what the lanes export as `E2E_SHARED_RUNTIMES_DIR`.
         #[arg(long)]
         prewarm_dir: PathBuf,
+        /// Pin the pre-warmed SDK to this exact TheRock package version instead
+        /// of tracking the channel's latest.
+        #[arg(long, conflicts_with_all = ["build_date", "release_label"])]
+        version: Option<String>,
+        /// Pin the pre-warmed SDK to the TheRock package built on this date.
+        #[arg(
+            long,
+            value_name = "YYYY-MM-DD",
+            conflicts_with_all = ["version", "release_label"]
+        )]
+        build_date: Option<String>,
+        /// Pin the pre-warmed SDK to one of the official release list's three
+        /// most recent versions (see `rocm_releases`), for the self-hosted
+        /// sdk_version matrix. `current` tracks the channel's latest, same as
+        /// omitting `--version`/`--build-date` entirely.
+        #[arg(long, conflicts_with_all = ["version", "build_date"])]
+        release_label: Option<rocm_releases::ReleaseLabel>,
     },
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
@@ -242,6 +275,24 @@ pub(crate) enum Command {
         /// Path to write the consolidated HTML report.
         #[arg(long)]
         html_out: PathBuf,
+    },
+    /// Count received Doctor reports from an export of the report mailbox.
+    ///
+    /// Reads `.eml` files (one message each) and raw `.json` report bodies,
+    /// and prints how many reports describe each problem, at every level of
+    /// the group key, with refused and unreadable reports counted apart.
+    /// Sends and files nothing. Counts are reports, not people.
+    ReportRollup {
+        /// `.eml` or `.json` files, or directories holding them (read one
+        /// level deep).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Print the rollup as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also list each message skipped as not a report, by file and subject.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
@@ -280,6 +331,7 @@ fn run() -> Result<()> {
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::Catalog { check } => catalog::run(check)?,
+        Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
@@ -312,11 +364,31 @@ fn run() -> Result<()> {
             channel,
             keep,
             prewarm_dir,
-        } => e2e_prewarm::run(&channel, keep, &prewarm_dir)?,
+            version,
+            build_date,
+            release_label,
+        } => {
+            let resolved_version = match release_label {
+                Some(label) => label.pin().map(str::to_owned),
+                None => version,
+            };
+            e2e_prewarm::run(
+                &channel,
+                keep,
+                &prewarm_dir,
+                resolved_version.as_deref(),
+                build_date.as_deref(),
+            )?;
+        }
         Command::E2eReport {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::ReportRollup {
+            paths,
+            json,
+            verbose,
+        } => report_rollup::run(&paths, json, verbose)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

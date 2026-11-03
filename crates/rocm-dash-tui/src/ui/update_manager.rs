@@ -58,7 +58,7 @@ impl UpdateAction {
     }
 
     /// `rocm` argv (after the binary) for this action.
-    fn args(self) -> Vec<String> {
+    pub(crate) fn args(self) -> Vec<String> {
         match self {
             Self::Check => vec!["update".into()],
             Self::Preview => vec!["update".into(), "--apply".into(), "--dry-run".into()],
@@ -292,11 +292,8 @@ pub fn draw_update_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn check_is_read_only_and_spawns_without_approval() {

@@ -15,13 +15,17 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   #
   # That guarantee covers the table's cells and the auto-applicable prose line —
   # what `skill_steps.rs` actually parses. Free-standing prose that only
-  # restates those same facts in words — the "(N failure modes)" count in the
-  # catalog heading, the Linux-only/Windows-only recap line beneath the table,
-  # SKILL.md's "the other M are print-only" — is not parsed here and can go
-  # stale even while the table itself stays correct.
+  # restates those same facts in words — the Linux-only/Windows-only recap line
+  # beneath the table, for one — is not parsed here and can go stale even while
+  # the table itself stays correct. Two such counts are checked by the unit-level
+  # `tests/skill_reference.rs` instead: the "(N failure modes)" count in the
+  # catalog heading and SKILL.md's "The other M ... print-only" count. Two
+  # SKILL.md sentences are therefore fixtures: that print-only count, and the
+  # contract sentence that skill-07 reads.
   #
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
-  # the CLI is right and `skills/rocm-doctor/reference.md` is what changes.
+  # the CLI is right and the document is what changes: `reference.md`, or
+  # `SKILL.md` for skill-07.
   #
   # Scope is deliberately narrow: EVERY scenario here compares the CLI against
   # the published document, and nothing else belongs. Claims proven elsewhere
@@ -38,7 +42,8 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The distinction that earns this feature its place: those tests compare the
   # CLI against expectations written in the test suite, so they catch the CLI
   # drifting. Only these scenarios catch the DOCUMENT drifting, because only
-  # here is `reference.md` itself the expected value.
+  # here is a published document itself the expected value: `reference.md`, and
+  # for skill-07 the contract number that `SKILL.md` declares.
   #
   # Every scenario is a query: no GPU, no serve, no download, no mutation — so
   # they all run on the blocking mock lane and need no capability tags.
@@ -79,7 +84,7 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The skill's standing rule is "never invent a fix — if nothing matched, route
   # the user upstream". That rule is only followable if the address the CLI hands
   # over is one the skill's own routing table gives, so this is the last claim in
-  # the document that the binary can be held to.
+  # `reference.md` that the binary can be held to.
   #
   # The scenario is about the ADDRESS, not about nothing having matched. Whether
   # a report goes unexplained is not a property this suite can hold still: the
@@ -93,3 +98,23 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     And a user who reports a failure with no catalog keyword in it
     When an agent asks the CLI to diagnose that report for tooling
     Then the CLI routes the report to a tracker the skill documents
+
+  # The one scenario here that reads `SKILL.md` for a claim of its own. Phase 0
+  # tells an agent to stop when the installed CLI publishes a catalog contract
+  # older than the one the skill requires, and that number has to sit in the
+  # text the agent follows. A requirement ahead of the binary would make the
+  # skill refuse every current CLI, so this holds the declared number to what
+  # `rocm fix --json` really publishes. The two must be equal: the check has no
+  # upper bound, so a CLI that publishes a higher number would pass Phase 0 even
+  # though a raised contract means the catalog removed or changed something. The
+  # scenario turns red at that bump, so the skill is read again first.
+  #
+  # Whether an agent obeys the stop is behaviour, not text, and no committed
+  # test checks it today. The skill's evals cannot reach it, because their
+  # runners carry no `rocm`. A stub CLI that the evals can use would let them
+  # grade it.
+  @id:skill-required-contract-is-the-one-the-cli-publishes
+  Scenario: skill-07 - The skill requires the same catalog contract that the CLI publishes
+    Given the ROCm Doctor skill as it is published
+    When a tool asks the CLI for its catalog in machine-readable form
+    Then the contract the skill requires is the one the CLI publishes

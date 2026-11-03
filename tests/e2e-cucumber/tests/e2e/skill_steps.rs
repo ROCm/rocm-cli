@@ -13,7 +13,9 @@
 //! `reference.md` is read as the EXPECTED-value fixture. That is a deliberate,
 //! narrow exception to the suite's black-box rule: nothing is imported from the
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
-//! artifact is the thing under test.
+//! artifact is the thing under test. `SKILL.md` is read too, for two
+//! sentences: `skill-07` reads the catalog contract version Phase 0 requires,
+//! and `tests/skill_reference.rs` reads the "The other N ... print-only" count.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -48,10 +50,11 @@ struct Remediation {
     /// mismatch instead of being quietly translated into agreement.
     os_scope: String,
     /// The marker word this id carries: `AUTO`, `NEEDS-ARG`, `PRINT-ONLY`, or
-    /// `DIAGNOSE-ONLY` (no catalog entry uses the last one yet, but it is
-    /// recognised rather than silently dropped -- an unrecognised marker drops
-    /// its row from the map, which previously made `NEEDS-ARG` vanish fix-9
-    /// entirely instead of failing on the mismatched marker).
+    /// `DIAGNOSE-ONLY` (`info-20-gpu-no-rocm-support` is the only entry using
+    /// the last one today). Every one is recognised rather than silently
+    /// dropped -- an unrecognised marker drops its row from the map, which
+    /// previously made `NEEDS-ARG` vanish fix-9 entirely instead of failing on
+    /// the mismatched marker.
     marker: String,
     /// A platform whose marker differs from [`Remediation::marker`], and what
     /// it is there. `rocm fix`'s listing reports the marker for the machine it
@@ -144,6 +147,25 @@ fn reference_md_path() -> PathBuf {
         .join("reference.md")
 }
 
+/// `SKILL.md`, which `skill-07` reads for the one declaration that has to sit
+/// where the agent acts: the catalog contract the skill requires.
+fn skill_md_path() -> PathBuf {
+    reference_md_path().with_file_name("SKILL.md")
+}
+
+/// The phrase `SKILL.md` uses to declare the contract it requires, followed by
+/// the version number: "requires `contract_version` 1 or higher".
+const REQUIRED_CONTRACT_PHRASE: &str = "requires `contract_version` ";
+
+/// The catalog contract version `SKILL.md` says it requires, if it says so.
+///
+/// The sentence is hard-wrapped in the markdown, which
+/// [`e2e_cucumber::number_after_phrase`] handles; the "The other N ... print-only"
+/// count in `tests/skill_reference.rs` is read the same way.
+fn declared_contract_minimum(skill_md: &str) -> Option<u64> {
+    e2e_cucumber::number_after_phrase(skill_md, REQUIRED_CONTRACT_PHRASE).map(|(n, _)| n)
+}
+
 /// Read the closed-catalog table out of the skill's reference doc.
 ///
 /// Rows look like:
@@ -162,7 +184,12 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
             continue;
         }
         let id = cells[0].trim_matches('`');
-        if !id.starts_with("fix-") {
+        // `info-` as well as `fix-`: the catalog's DIAGNOSE-ONLY entries carry
+        // an `info-` id precisely because they have no fix to offer, and they
+        // are rows in this table like any other. Matching `fix-` alone dropped
+        // them silently, so the table could disagree with the CLI about them
+        // and nothing would say so.
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         // Taken verbatim, never normalised. A shorthand like `both` used to be
@@ -254,7 +281,11 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
             continue;
         };
         let id = rest.split_whitespace().next().unwrap_or_default();
-        if !id.starts_with("fix-") {
+        // `info-` too, matching `parse_reference_catalog`: the DIAGNOSE-ONLY
+        // entry is listed by `rocm fix` like any other, and dropping it from
+        // one side of this comparison and not the other would report it as an
+        // id the CLI no longer offers.
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         out.insert(
@@ -806,5 +837,66 @@ async fn assert_known_verdict(world: &mut E2eWorld) {
         "examine reported {status:?}, which the skill does not account for. \
          reference.md enumerates {documented:?}, and an agent that meets a verdict \
          outside that list has no instruction for what to do next."
+    );
+}
+
+#[then("the contract the skill requires is the one the CLI publishes")]
+async fn assert_required_contract_is_published(world: &mut E2eWorld) {
+    // The When step is `diagnose-34`'s ("a tool asks the CLI for its catalog in
+    // machine-readable form"): the probe Phase 0 runs is the one invocation, so
+    // the two scenarios cannot disagree about how to read the manifest.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the catalog manifest is the probe Phase 0 relies on; it must exit 0. stderr: {:?}",
+        world.cli_stderr
+    );
+    let output = world
+        .cli_output
+        .as_ref()
+        .expect("no catalog manifest output");
+    let manifest: serde_json::Value =
+        serde_json::from_str(output).expect("fix --json did not emit valid JSON");
+    let published = manifest
+        .get("contract_version")
+        .and_then(serde_json::Value::as_u64)
+        .expect("the manifest has no numeric `contract_version`");
+
+    // Read here, not in the shared Given: only this scenario needs SKILL.md, so a
+    // failed read must not take skill-01 to skill-06 down with it.
+    let path = skill_md_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let required = declared_contract_minimum(&text).unwrap_or_else(|| {
+        panic!(
+            "SKILL.md no longer says which catalog contract it requires \
+             (\"{REQUIRED_CONTRACT_PHRASE}<N>\"). Without it the skill cannot tell an \
+             older CLI from a current one, and Phase 0 has nothing to compare against."
+        )
+    });
+
+    assert!(
+        required >= 1,
+        "SKILL.md requires contract version {required}; versions start at 1"
+    );
+    assert!(
+        required <= published,
+        "SKILL.md requires catalog contract version {required}, but the CLI publishes \
+         {published}. Phase 0 would stop on every current CLI. Lower the requirement in \
+         SKILL.md. Only a real breaking change to the catalog contract justifies raising \
+         the published version in crates/rocm-core/src/fix.rs."
+    );
+    // The check in SKILL.md has no upper bound, so a CLI that publishes a higher
+    // number would pass Phase 0. A higher number means the catalog broke
+    // something an older reader relies on, so the skill must be read again
+    // before the two numbers move apart.
+    assert!(
+        required == published,
+        "The CLI now publishes catalog contract version {published}, but SKILL.md still \
+         requires {required}. A raised contract version means the catalog removed or \
+         changed something. Check the entry ids, the auto-applicable set and the exit \
+         codes in SKILL.md and reference.md against the new catalog, then raise the \
+         number in SKILL.md. Raise it only after a release publishes that contract, \
+         because the installer Phase 0 offers installs the release channel."
     );
 }

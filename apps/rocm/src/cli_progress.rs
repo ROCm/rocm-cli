@@ -6,6 +6,24 @@
 //! (starting a server, downloading a large artifact). Written to stderr only,
 //! so piped/redirected output — and stdout, which callers may still be
 //! printing a final summary to — never sees control characters.
+//!
+//! This module is deliberately exempt from ROCMAI-543's "user-facing output
+//! must be ASCII" rule, and the exemption is structural rather than an
+//! oversight. The mojibake that ticket reports ("ΓÇö") is the UTF-8 bytes
+//! `E2 80 94` decoded as code page 437 — a byte-level misdecode that can only
+//! happen once raw bytes leave the process, i.e. on a redirected stream. A
+//! write to a real Windows console never takes that path: the handle is a
+//! console, so it goes out as UTF-16 via `WriteConsoleW` and no code page is
+//! consulted. Every spinner here is hard-gated on `stderr().is_terminal()`
+//! (see [`Spinner::render_current`], which returns early when disabled), so
+//! its labels reach a console or nothing at all, and can never be misdecoded.
+//!
+//! The exemption also cannot be partially applied: [`SPINNER_FRAMES`] is
+//! Braille and [`truncate_to_width`] appends U+2026 as its overflow marker, so
+//! every repaint emits non-ASCII regardless of how the caller spells its
+//! label. Transliterating the labels alone would change nothing observable —
+//! making this module ASCII means replacing its visual language, which is a
+//! deliberate design choice (it matches the dashboard's), not a bug.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -600,12 +618,24 @@ mod tests {
             Duration::from_millis(5),
             true,
         );
-        thread::sleep(Duration::from_millis(60));
-        let idx = spinner.inner.lock().unwrap().idx;
-        assert!(
-            idx >= 3,
-            "the background ticker must keep advancing frames on its own: idx={idx}"
-        );
+        // Poll for 3 ticks instead of asserting a fixed sleep produced them:
+        // the ticker is a real OS thread repainting real stderr on a 5ms
+        // interval, and a single fixed sleep races scheduler/IO jitter under
+        // `cargo test --workspace`'s parallel execution (see #763). A long,
+        // bounded poll tolerates any amount of delay while still failing
+        // promptly if the ticker genuinely stalls.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let idx = spinner.inner.lock().unwrap().idx;
+            if idx >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background ticker must keep advancing frames on its own: idx={idx}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

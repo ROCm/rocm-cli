@@ -117,3 +117,29 @@ pub(super) fn scalar_or_shape(v: &serde_json::Value) -> String {
         Value::Object(o) => format!("{{{} fields}}", o.len()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_slash_tool_is_concise_not_raw_json() {
+        // A representative Result(json) must summarize to a terse, labelled,
+        // length-bounded blurb — never a raw JSON dump with braces-spam.
+        let outcome = crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+            "status": "ok",
+            "model": "llama3",
+            "nested": { "a": 1, "b": 2, "c": 3 },
+        }));
+        let out = summarize_slash_tool("model", &outcome);
+        assert!(out.contains("/model"), "carries the slash label");
+        assert!(out.contains("status: ok"), "scalars shown inline");
+        // Nested containers collapse to a shape hint, not an inlined subtree.
+        assert!(out.contains("{3 fields}"), "nested object shown as shape");
+        assert!(
+            !out.contains("\"nested\""),
+            "no raw JSON keys / braces-spam in summary"
+        );
+        assert!(out.len() < 200, "summary stays length-bounded");
+    }
+}

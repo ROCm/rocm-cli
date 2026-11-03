@@ -240,14 +240,14 @@ pub struct PendingOnboard {
 ///
 /// Any new nested sub-view field (like `browser` or `install_config`) added
 /// here must also be listed in `active_overlay_at_root`'s onboarding clause
-/// in `app/mod.rs` — that hand-maintained enumeration is what tells the
+/// in `app/overlays.rs` — that hand-maintained enumeration is what tells the
 /// shared Esc back-out path not to eject the whole wizard while a sub-view
 /// has focus. The same applies to every other manager-state struct that
 /// clause enumerates (`serve_wizard`, `install_manager`, `runtime_manager`,
 /// `engine_manager`, `services`, `update_manager`, `config_manager`, ...).
-/// `app::tests::active_overlay_at_root_enumeration_is_exhaustive` destructures
-/// every one of those structs without `..`, so forgetting this fails to
-/// compile rather than silently mis-gating Esc.
+/// `app::overlays::tests::active_overlay_at_root_enumeration_is_exhaustive`
+/// destructures every one of those structs without `..`, so forgetting this
+/// fails to compile rather than silently mis-gating Esc.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
@@ -715,11 +715,8 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn welcome_enter_advances_to_choose() {

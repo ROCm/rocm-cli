@@ -17,13 +17,21 @@ concurrency:
   group: demo-gifs
   cancel-in-progress: true
 
+env:
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+
 jobs:
   render:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       # VHS + its runtime deps. ttyd/ffmpeg from apt; vhs pinned via `go install`
       # (Go is preinstalled on the runner). Chrome (used by VHS to rasterize

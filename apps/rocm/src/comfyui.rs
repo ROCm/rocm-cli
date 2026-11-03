@@ -3,16 +3,17 @@
 // SPDX-License-Identifier: MIT
 
 use crate::cli_progress::AnimatedSpinner;
+use crate::freeform_planner::format_structured_tool_call;
 use crate::runtimes_cmd::runtime_usability_status;
-use crate::{format_structured_tool_call, therock};
+use crate::therock;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::browser::{Opener, SystemOpener};
 use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
-    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
-    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
-    uv_command_env, uv_pip_install_base,
+    format_http_base_url, powershell_quote, runtime_is_linux, runtime_is_windows,
+    runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
+    runtime_paths_equivalent, unix_time_millis, uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -1000,10 +1001,6 @@ fn spawn_comfyui_background_windows(
         .parse::<u32>()
         .context("PowerShell launcher returned an invalid process id")?;
     Ok(pid)
-}
-
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn app_root(paths: &AppPaths) -> PathBuf {
@@ -2275,6 +2272,10 @@ fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
     bail!("failed to allocate a temporary command capture directory")
 }
 
+/// Quotes `value` for log text only, using Rust's own `{value:?}`
+/// Debug-format escaping; the real args passed to `Command::args` alongside
+/// this are unquoted. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_log_arg(value: &str) -> String {
     if value
         .chars()
@@ -2297,6 +2298,8 @@ fn child_path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4285,7 +4288,7 @@ mod tests {
         // The summary the assistant answers with after a status tool call
         // passes the note on too.
         // Another tool's output ahead of it in the same text keeps its notes.
-        let summary = crate::deterministic_comfyui_tool_summary(&format!(
+        let summary = chat::deterministic_comfyui_tool_summary(&format!(
             "Engines\n  note: another tool's note\n\n{status}"
         ))
         .context("a status summary")?;
@@ -4308,7 +4311,7 @@ mod tests {
         let answer = render_chat_status_answer(&paths)?;
         assert!(!answer.contains("interrupted"), "{answer}");
         assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
-        let summary = crate::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
+        let summary = chat::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
             .context("a status summary")?;
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
@@ -4663,7 +4666,7 @@ mod tests {
         // sums that up as its running state, not as a note.
         assert!(status.contains("  note: starting\n"), "{status}");
         let summary =
-            crate::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+            chat::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
         assert!(summary.contains("  Running: starting."), "{summary}");
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(!answer.contains("URL:"), "{answer}");
@@ -4749,19 +4752,32 @@ mod archive_properties {
         Ok(())
     }
 
+    /// Whether an entry name or link target is absolute in the generator's
+    /// terms: a leading `/`, which [`concretize`](crate::archive_props::concretize)
+    /// re-roots at the case's fake root, or a leading `@`, the `@OUT`
+    /// placeholder it replaces with the absolute `outside/` path. Moving such
+    /// a path under `a/` would change what it names, so both
+    /// [`moved_one_level_down`] and [`entries_without_top_level_symlink`] leave
+    /// it alone.
+    fn is_absolute(path: &[u8]) -> bool {
+        path.starts_with(b"/") || path.starts_with(b"@")
+    }
+
     /// `entry` moved under `a/`, unless its name is absolute (re-rooted, it
     /// already lands deep inside the extraction root). A relative symlink
     /// target resolves from the link's own directory, now one level deeper,
-    /// so it climbs one more to land where it did unmoved: `../outside`
-    /// still escapes rather than stopping at `dest/outside`.
+    /// so it gains exactly one `../`, whatever the link's depth. A target that
+    /// climbed out of the extraction root then lands where it did unmoved:
+    /// `../outside` still escapes rather than stopping at `dest/outside`. One
+    /// that stayed inside still stays inside, though for a nested link not
+    /// always at the same path.
     fn moved_one_level_down(mut entry: Entry) -> Entry {
-        if entry.name.starts_with(b"/") || entry.name.starts_with(b"@") {
+        if is_absolute(&entry.name) {
             return entry;
         }
         entry.name.splice(0..0, *b"a/");
         if let Kind::Symlink(target) = &mut entry.kind
-            && !target.starts_with(b"/")
-            && !target.starts_with(b"@")
+            && !is_absolute(target)
         {
             target.splice(0..0, *b"../");
         }
@@ -4777,9 +4793,8 @@ mod archive_properties {
     /// left alone: re-rooted, they land deep inside the extraction root.
     /// Moving names down rather than only dropping top-level links keeps
     /// "link, then write through it" in play, one level down where the
-    /// source tree is; a moved symlink's relative target gains a `../` so it
-    /// still resolves to the same place, and an escaping target still
-    /// escapes.
+    /// source tree is; a moved symlink's relative target gains a `../`, so an
+    /// escaping target still escapes, to the same place.
     fn entries_without_top_level_symlink() -> impl Strategy<Value = Vec<Entry>> {
         /// Lexical components, or `None` when the name climbs above the root.
         fn components(name: &[u8]) -> Option<Vec<&[u8]>> {
@@ -4800,10 +4815,7 @@ mod archive_properties {
             let mut kept = Vec::new();
             let moved: Vec<Entry> = entries.into_iter().map(moved_one_level_down).collect();
             for entry in &moved {
-                if matches!(entry.kind, Kind::Symlink(_))
-                    && !entry.name.starts_with(b"/")
-                    && !entry.name.starts_with(b"@")
-                {
+                if matches!(entry.kind, Kind::Symlink(_)) && !is_absolute(&entry.name) {
                     let Some(parts) = components(&entry.name) else {
                         continue;
                     };
@@ -4818,9 +4830,13 @@ mod archive_properties {
         })
     }
 
-    /// Moving an entry down must not move where its symlink points: the
-    /// target, resolved lexically from the link's directory, names the same
-    /// place relative to the extraction root before and after.
+    /// Moving an entry down must not change whether its symlink escapes the
+    /// extraction root, or where to: the target, resolved lexically from the
+    /// link's directory, escapes before exactly when it escapes after, and
+    /// then names the same place. A top-level link names the same place
+    /// whether or not it escapes. A nested link is checked too, so the single
+    /// `../` is shown to be enough at any depth. Absolute names and targets,
+    /// in either spelling, are not touched.
     #[test]
     fn moving_an_entry_down_keeps_its_symlink_target_in_place() {
         /// `dir` joined with `target`, `..` applied lexically; a leading `..`
@@ -4841,47 +4857,88 @@ mod archive_properties {
             }
             out
         }
-        for target in [
-            &b"../outside"[..],
-            b"../../outside",
-            b"../victim",
-            b".",
-            b"l/../..",
-            b"a",
+        for (name, dir) in [
+            (&b"l"[..], &b""[..]),
+            (b"sub/l", b"sub"),
+            (b"sub/deeper/l", b"sub/deeper"),
         ] {
+            for target in [
+                &b"../outside"[..],
+                b"../../outside",
+                b"../../../outside",
+                b"../victim",
+                b".",
+                b"l/../..",
+                b"a",
+            ] {
+                let moved = moved_one_level_down(Entry {
+                    name: name.to_vec(),
+                    kind: Kind::Symlink(target.to_vec()),
+                    mode: 0o777,
+                });
+                assert_eq!(moved.name, [&b"a/"[..], name].concat());
+                let Kind::Symlink(moved_target) = moved.kind else {
+                    panic!("still a symlink");
+                };
+                let label = format!(
+                    "{} -> {} moved to {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(target),
+                    String::from_utf8_lossy(&moved_target)
+                );
+                // Exactly one `../`, whatever the link's depth: the move adds
+                // one directory level, not one per level already there.
+                assert_eq!(moved_target, [&b"../"[..], target].concat(), "{label}");
+                let before = resolve(dir, target);
+                let after = resolve(&[&b"a/"[..], dir].concat(), &moved_target);
+                let escapes = |path: &[Vec<u8>]| path.first().is_some_and(|part| part == b"..");
+                assert_eq!(escapes(&after), escapes(&before), "{label}");
+                if escapes(&before) || dir.is_empty() {
+                    assert_eq!(after, before, "{label}");
+                }
+            }
+        }
+        // Absolute targets and absolute names are left alone, for both
+        // spellings of absolute: a leading `/` and the `@OUT` placeholder.
+        for target in [&b"@OUT/sentinel"[..], b"/etc/passwd"] {
             let moved = moved_one_level_down(Entry {
                 name: b"l".to_vec(),
                 kind: Kind::Symlink(target.to_vec()),
                 mode: 0o777,
             });
             assert_eq!(moved.name, b"a/l");
-            let Kind::Symlink(moved_target) = moved.kind else {
-                panic!("still a symlink");
-            };
-            assert_eq!(
-                resolve(b"a", &moved_target),
-                resolve(b"", target),
-                "{} moved to {}",
-                String::from_utf8_lossy(target),
-                String::from_utf8_lossy(&moved_target)
+            assert!(
+                matches!(&moved.kind, Kind::Symlink(t) if t == target),
+                "target {} was rewritten",
+                String::from_utf8_lossy(target)
             );
         }
-        // Absolute targets and absolute names are left alone.
-        let absolute = moved_one_level_down(Entry {
-            name: b"l".to_vec(),
-            kind: Kind::Symlink(b"@OUT/sentinel".to_vec()),
-            mode: 0o777,
-        });
-        assert!(matches!(absolute.kind, Kind::Symlink(t) if t == b"@OUT/sentinel"));
-        assert_eq!(
-            moved_one_level_down(Entry {
-                name: b"/x".to_vec(),
-                kind: Kind::Dir,
-                mode: 0o755
-            })
-            .name,
-            b"/x"
-        );
+        for name in [&b"/x"[..], b"@OUT/x"] {
+            assert_eq!(
+                moved_one_level_down(Entry {
+                    name: name.to_vec(),
+                    kind: Kind::Dir,
+                    mode: 0o755
+                })
+                .name,
+                name,
+                "name {} was moved",
+                String::from_utf8_lossy(name)
+            );
+            // An absolute-named symlink is left whole: its relative target
+            // does not gain the `../` a moved link gets.
+            let link = moved_one_level_down(Entry {
+                name: name.to_vec(),
+                kind: Kind::Symlink(b"t".to_vec()),
+                mode: 0o777,
+            });
+            assert_eq!(link.name, name, "name {}", String::from_utf8_lossy(name));
+            assert!(
+                matches!(&link.kind, Kind::Symlink(t) if t == b"t"),
+                "target of {} was rewritten",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     fn property(

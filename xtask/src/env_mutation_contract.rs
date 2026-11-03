@@ -12,11 +12,12 @@
 //!
 //! This is invisible on most of CI. `ci.yml`'s `Test (affected crates)` job
 //! runs `cargo nextest` (a process per test, so the mutation cannot escape),
-//! but `windows-build-and-test` runs `cargo test --workspace --all-targets` —
-//! all tests as threads in ONE process. So the Windows lane, a required check,
-//! was the only place the race could fire, and it read as "your change broke
-//! Windows" on branches that never touched the crate. Nothing about the bug is
-//! Windows-specific; it is a property of the runner.
+//! but the `windows-debug` job (part of the required `windows-build-and-test`
+//! check) runs `cargo test --workspace --all-targets` — all tests as threads in
+//! ONE process. So the Windows lane, a required check, was the only place the
+//! race could fire, and it read as "your change broke Windows" on branches that
+//! never touched the crate. Nothing about the bug is Windows-specific; it is a
+//! property of the runner.
 //!
 //! "the Linux lanes use nextest" would be too strong: `coverage`
 //! (`cargo llvm-cov`, no `--nextest`) and `e2e` (`cargo test -p e2e-cucumber
@@ -26,7 +27,7 @@
 //!
 //! The repo already had two ways of handling this — `ScopedTestEnv` in
 //! `apps/rocm/src/main.rs` and `PROCESS_ENV_TEST_LOCK` in
-//! `apps/rocm/src/therock.rs`, both of which take a process-wide lock — and the
+//! `apps/rocm/src/test_support.rs`, both of which take a process-wide lock — and the
 //! `fix.rs` tests that flaked were simply the ones that skipped the discipline.
 //! This guard makes the omission a build failure rather than an intermittent
 //! red on a required check.
@@ -116,10 +117,11 @@ mod tests {
     /// Named helpers that serialize env mutation for their whole scope.
     ///
     /// Membership is "holds a lock for its whole scope", not "wraps an env
-    /// mutation". `ScopedEnvVar` (`apps/rocm/src/main.rs`) was listed here and
+    /// mutation". `ScopedEnvVar` (`apps/rocm/src/engine_ipc.rs` as of
+    /// ROCMAI-213; originally `apps/rocm/src/main.rs`) was listed here and
     /// only ever saved and restored — its one caller,
     /// `with_scoped_builtin_engine_env`, takes `BUILTIN_ENGINE_ENV_LOCK`
-    /// itself. The type is visible to the largest test module in the tree, in
+    /// itself. The type was visible to the largest test module in the tree, in
     /// the same file, so any test that merely named it was granted the full
     /// exemption while holding nothing: the exact failure this guard exists to
     /// prevent, written into the guard.

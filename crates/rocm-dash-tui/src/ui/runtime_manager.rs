@@ -35,8 +35,7 @@ use crate::ui::approval::{
 use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::panel::{self, BoxRole};
+use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
 /// A flattened registered-runtime entry for the list.
@@ -549,11 +548,8 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     fn runtimes() -> Vec<RuntimeSummary> {
         vec![

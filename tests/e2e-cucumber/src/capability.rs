@@ -34,6 +34,30 @@ fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// Whether a container runtime is usable here.
+///
+/// Probed rather than assumed: a developer machine may have the client without
+/// a running daemon.
+///
+/// Necessary but not sufficient for `@requires-docker` — see the
+/// `requires_docker` gate in `expectation.rs`, which also wants an explicit
+/// opt-in. A daemon answering does not mean the fixture image can be built: a
+/// self-hosted runner behind a restricted network has both a working daemon
+/// and no route to the package mirror the image installs from.
+///
+/// Also used by [`HostCapability::engine_available`] for `"aim"`: unlike
+/// lemonade/vllm, the AIM adapter is always present in the binary's inventory
+/// (a static description, not a liveness probe — see `rocm engines list`), so
+/// "can this engine start" must check for a reachable Docker daemon itself.
+pub(crate) fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// What `rocm serve <model>` would pick with no `--engine`, from GPU family + OS.
 ///
 /// Mirrors the product precedence in `preferred_serve_engine_for_host_gpu_summary`
@@ -127,6 +151,10 @@ pub struct HostCapability {
     /// the temp root the scenarios' isolated roots are created in. Gates
     /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
     pub case_sensitive_fs: bool,
+    /// Whether a directory made read-only refuses new files to the user
+    /// running the suite. Gates `@requires-dir-permissions`; see
+    /// [`probe_dir_permissions_bind`].
+    pub dir_permissions_bind: bool,
 }
 
 impl HostCapability {
@@ -139,6 +167,16 @@ impl HostCapability {
             "vllm" => {
                 !self.os_family.eq_ignore_ascii_case("windows")
                     && family_prefers_vllm(self.gfx_target.as_deref())
+            }
+            "aim" => {
+                self.available_engines.iter().any(|e| e == engine)
+                    && docker_available()
+                    // aim's verified hardware is Radeon (gfx110X/120X) and
+                    // Strix Halo (gfx1151) — exactly the families
+                    // `family_prefers_vllm` excludes. Without this, a
+                    // Docker-equipped Instinct lane would run the Radeon aim
+                    // image with a W7900 profile.
+                    && !family_prefers_vllm(self.gfx_target.as_deref())
             }
             _ => self.available_engines.iter().any(|e| e == engine),
         }
@@ -377,6 +415,7 @@ fn probe_host_capability() -> HostCapability {
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
     let case_sensitive_fs = probe_case_sensitive_fs(root);
+    let dir_permissions_bind = probe_dir_permissions_bind(root);
 
     HostCapability {
         os_family,
@@ -388,7 +427,45 @@ fn probe_host_capability() -> HostCapability {
         effective_serve_engine,
         platform_slug,
         case_sensitive_fs,
+        dir_permissions_bind,
     }
+}
+
+/// Whether a directory with its write bits cleared refuses to create a file for
+/// the user running the suite.
+///
+/// Probed rather than inferred from the OS: root is not bound by directory
+/// permissions, and the self-hosted WSL2 guest runs the suite as root even
+/// though it is `os_family` `linux`. A scenario whose fault is "this directory
+/// takes no new files" would then pass without exercising anything, so it is
+/// skipped where this answers `false`.
+///
+/// The probe's directory is created under `dir`, the temp root the scenarios'
+/// isolated roots follow, so it answers for the filesystem they write to, and
+/// its permissions are restored before it returns so the temp root can be
+/// removed. Any I/O error answers `false`: the premise has not been shown to
+/// hold. Always `false` where there are no Unix permission bits to clear.
+#[cfg(unix)]
+fn probe_dir_permissions_bind(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = || -> std::io::Result<bool> {
+        let probe_dir = dir.join("permission-probe");
+        std::fs::create_dir_all(&probe_dir)?;
+        std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o555))?;
+        let created = std::fs::File::create(probe_dir.join("probe-file"));
+        std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o755))?;
+        Ok(created.is_err())
+    };
+    probe().unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+// Platform stub. The Unix arm does I/O and cannot be `const`, so making only
+// this arm `const` would give the two platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
+fn probe_dir_permissions_bind(_dir: &std::path::Path) -> bool {
+    false
 }
 
 /// Whether `dir`'s filesystem keeps two names that differ only in letter case
@@ -647,7 +724,7 @@ fn parse_engines_list(text: &str) -> Vec<String> {
             continue;
         }
         let first = trimmed.split_whitespace().next().unwrap_or("");
-        if matches!(first, "lemonade" | "vllm") && !engines.iter().any(|e| e == first) {
+        if matches!(first, "lemonade" | "vllm" | "aim") && !engines.iter().any(|e| e == first) {
             engines.push(first.to_owned());
         }
     }
@@ -802,6 +879,7 @@ mod tests {
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -817,6 +895,7 @@ mod tests {
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
             case_sensitive_fs: true,
+            dir_permissions_bind: true,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -1133,5 +1212,49 @@ Local model engines
         let not_a_dir = tmp.path().join("plain-file");
         std::fs::write(&not_a_dir, "").expect("write file");
         assert!(!probe_case_sensitive_fs(&not_a_dir));
+    }
+
+    /// A probe that cannot even make its directory has not shown the premise
+    /// holds, so the gate must skip rather than let the scenario fail.
+    #[test]
+    fn permission_probe_answers_false_when_it_cannot_write() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let not_a_dir = tmp.path().join("plain-file");
+        std::fs::write(&not_a_dir, "").expect("write file");
+        assert!(!probe_dir_permissions_bind(&not_a_dir));
+    }
+
+    /// The probe's directory is read-only while it probes; it must be given
+    /// back, or the temp root it lives in could not be removed.
+    #[cfg(unix)]
+    #[test]
+    fn permission_probe_leaves_its_directory_removable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        probe_dir_permissions_bind(tmp.path());
+        let mode = std::fs::metadata(tmp.path().join("permission-probe"))
+            .expect("probe dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o200, 0o200, "owner write bit was not restored");
+    }
+
+    /// The answer the gated scenario relies on: where the suite runs as an
+    /// ordinary user, a read-only directory refuses new files. Skipped as root,
+    /// for whom the probe is rightly `false`.
+    #[cfg(unix)]
+    #[test]
+    fn permission_probe_agrees_with_a_direct_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let direct = tmp.path().join("direct");
+        std::fs::create_dir(&direct).expect("create dir");
+        std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o555))
+            .expect("make read-only");
+        let refused = std::fs::File::create(direct.join("file")).is_err();
+        std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        assert_eq!(probe_dir_permissions_bind(tmp.path()), refused);
     }
 }

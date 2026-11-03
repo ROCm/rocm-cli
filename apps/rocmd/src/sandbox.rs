@@ -2,18 +2,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::ARTIFACT_PREFETCH_TIMEOUT;
-use crate::cli::{SandboxToolArg, SandboxToolPolicy};
-use crate::common::{self, CommandCapture};
+use crate::common;
 use crate::persistence::load_managed_services;
-use crate::service::{sandbox_stop_server_value, stop_managed_service};
-use crate::watchers::restart_managed_service;
+use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
+use crate::service::{stop_managed_service, stop_report_confirmed};
+use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
-#[cfg(target_os = "linux")]
-use rocm_core::command_failure_detail;
 use rocm_core::{
-    AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
-    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AuditEventRecord, CommandCapture, ExamineSummary, ModelRecipeArtifactRecord,
+    append_audit_event, model_artifact_cache_status, resolve_model_recipe_artifact,
+    unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -25,9 +23,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(any(test, target_os = "linux"))]
+// Only the tests still park a thread here; the sandbox spawn now goes through
+// `rocm_core::process::run_with_timeout`, which owns its own reader threads.
+#[cfg(test)]
 use std::thread;
 use std::time::Duration;
+
+const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 
 pub(crate) fn run_sandbox_runner(
     paths: &AppPaths,
@@ -117,7 +119,8 @@ fn run_bubblewrap_sandbox(
         policy,
     );
 
-    let output = run_process_with_timeout(command, Duration::from_mins(1))?;
+    let output =
+        rocm_core::process::run_with_timeout(command, Duration::from_mins(1), "sandbox process")?;
     let value = parse_sandbox_child_output(output, "bubblewrap sandbox")?;
     record_sandbox_audit(paths, tool, "bubblewrap", true, service_id.as_deref())?;
     Ok(sandbox_report(tool, "bubblewrap", value))
@@ -252,6 +255,23 @@ pub(crate) fn run_sandbox_tool(
             }))
         }
     }
+}
+
+/// The `stop_server` sandbox tool's answer for a [`stop_managed_service`]
+/// report. The status is taken from the same verdict that decided what the
+/// stop wrote to the manifest, so the two cannot disagree.
+fn sandbox_stop_server_value(stopped: Value) -> Value {
+    let status = if stop_report_confirmed(&stopped) {
+        "stopped"
+    } else {
+        "stop_unconfirmed"
+    };
+    json!({
+        "tool": SandboxToolArg::StopServer.as_cli_value(),
+        "status": status,
+        "mutating": true,
+        "result": stopped,
+    })
 }
 
 pub(crate) fn record_notification_audit(
@@ -939,43 +959,6 @@ fn append_sandbox_tool_command_args(
 }
 
 #[cfg(target_os = "linux")]
-fn run_process_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn sandbox process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll sandbox process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect sandbox process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out sandbox process output")?;
-            bail!(
-                "sandbox process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn parse_sandbox_child_output(output: std::process::Output, label: &str) -> Result<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -1008,7 +991,12 @@ fn command_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::persistence::load_service_record;
+    use crate::test_support::{
+        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
+        temp_app_paths,
+    };
+    use rocm_core::ManagedServiceRecord;
     use std::io::Read;
 
     fn serve_one_http_response(bytes: Vec<u8>) -> Result<String> {
@@ -2282,5 +2270,90 @@ mod tests {
         assert!(!is_huggingface_url(
             "https://huggingface.co@evil.example/Qwen/Test-1B"
         ));
+    }
+
+    #[test]
+    fn sandbox_tool_stop_server_updates_manifest_and_skips_current_pid() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-stop-current-pid");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-current",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let value = run_sandbox_tool(
+            &paths,
+            SandboxToolArg::StopServer,
+            Some("svc-current".to_owned()),
+            None,
+            None,
+            SandboxToolPolicy::default(),
+        )?;
+        let reloaded = load_service_record(&paths, "svc-current")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(value.get("status").and_then(Value::as_str), Some("stopped"));
+        assert_eq!(value.get("mutating").and_then(Value::as_bool), Some(true));
+        assert_eq!(reloaded.status, "stopped");
+        assert!(
+            value
+                .get("result")
+                .and_then(|result| result.get("skipped_pids"))
+                .and_then(Value::as_array)
+                .is_some_and(|pids| pids
+                    .iter()
+                    .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
+        );
+        Ok(())
+    }
+
+    /// The sandbox tool used to report `status: stopped` unconditionally.
+    #[test]
+    fn sandbox_tool_stop_server_reports_an_unconfirmed_stop() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-stop-unconfirmed");
+        paths.ensure()?;
+        let service_id = "svc-sandbox-stop-unconfirmed";
+        let key_path = seed_keyed_service(&paths, service_id, 11448)?;
+
+        // The tool is `stop_managed_service` feeding `sandbox_stop_server_value`;
+        // `sandbox_tool_stop_server_updates_manifest_and_skips_current_pid`
+        // drives that whole tool for real.
+        let result = stop_with_outcome(
+            &paths,
+            service_id,
+            rocm_core::TerminationOutcome::Unverified,
+        )
+        .map(sandbox_stop_server_value);
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("stop_unconfirmed"),
+            "{value}"
+        );
+        assert_eq!(
+            value.pointer("/result/stopped").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_unconfirmed_stop_kept_the_service(&reloaded?, key_kept);
+        Ok(())
     }
 }

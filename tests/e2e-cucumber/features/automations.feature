@@ -4,10 +4,13 @@ Feature: Automation watchers
   # automation watcher in the CLI config and prints a confirmation; bare `rocm
   # automations` lists the most recent review requests (any status — only the
   # per-entry approve/reject controls are gated on "pending"). This feature
-  # pins the enable/disable/mode-confirmation slice plus the proposal-history
-  # listing's unit formatting; the watcher/daemon trigger behaviour itself is
-  # covered elsewhere. Config-only (no GPU, no network), so it runs on the
-  # mock lane every PR.
+  # pins the enable/disable/mode-confirmation slice, the proposal-history
+  # listing's unit formatting, the bare listing's tolerance of a torn
+  # audit-log tail, how the next write repairs one, and how the audit log
+  # and proposal history are kept
+  # bounded; the watcher/daemon trigger behaviour itself is covered
+  # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
+  # every PR.
 
   @id:automations-enable-confirms-mode
   Scenario: automations-01 - Enabling a watcher confirms its mode
@@ -54,3 +57,97 @@ Feature: Automation watchers
     Given a pending artifact-download proposal approved for a size just under 1 MiB
     When the user lists automations
     Then the CLI reports the approved size in binary units
+
+  # Readers of the audit/events/proposals stores take no lock, so one can
+  # catch a write mid-append; the cut-off last line that leaves is skipped
+  # instead of failing the whole read.
+  # `render_automations_text` already swallows any read error from these
+  # stores via `.unwrap_or_default()`, so `rocm automations` never exits
+  # non-zero either way — what this scenario actually pins is that the clean
+  # record ahead of the torn one still shows up, rather than the torn line's
+  # read error wiping out the whole audit section the way it would without
+  # this skip.
+  # `render_automations_text` is the production reader of the audit store
+  # specifically (the one this scenario seeds). The two places a person
+  # reads its raw text directly are the `rocm automations` CLI subcommand
+  # itself, and the TUI's automations-manager screen, which shells out to
+  # `rocm automations list` as a subprocess — so that's where the audit
+  # store's tolerance is directly user-observable. It's also reachable
+  # through other paths that don't show the raw text the same way —
+  # `rocm chat`'s and the TUI's slash-command `rocm_command` tool in-process
+  # (the model sees it, or the TUI shrinks it to field counts first), and
+  # rocmd's own MCP `rocm_command` tool via a further `rocm automations list`
+  # subprocess — this isn't meant as an exhaustive map of every caller, just
+  # context for why the CLI subcommand is the right level to pin this at.
+  @id:automations-tolerates-torn-audit-tail
+  Scenario: automations-06 - Listing automations tolerates a torn audit-log tail
+    Given a fresh CLI configuration
+    And the audit event log ends in a torn, unterminated line
+    When the user lists automations
+    Then the CLI still lists the record before the torn tail
+
+  # The automation event log and the audit log are size-capped (ROCMAI-729):
+  # the write that finds the live log at its cap first renames it aside to
+  # `events.jsonl.1`, keeping a fixed number of such generations. This seeds the
+  # audit log at the cap, makes one change the CLI audits, and checks both the
+  # files and that the automations listing still shows activity from before the
+  # rollover, which it can only read from the rotated generation.
+  @id:automations-audit-log-rotates-at-cap
+  Scenario: automations-07 - A full audit log is set aside and its recent history stays visible
+    Given an audit log that has reached its size cap
+    When the user selects a permissions mode
+    Then the full audit log is kept aside as its first rotated generation
+    And the permissions change starts a fresh audit log
+    When the user lists automations
+    Then the recent background activity still includes entries from before the rotation
+
+  # The proposal history is compacted, not rotated (ROCMAI-729): a pending
+  # proposal must stay findable by id until it is reviewed, so reviewing one
+  # rewrites the history keeping every pending proposal but only the most
+  # recently reviewed ones. Approves through `rocm mcp-call proposal_action`, the
+  # hidden entry point the dashboard and chat review controls use.
+  @id:automations-review-compaction-keeps-pending
+  Scenario: automations-08 - Approving a proposal trims old review history but keeps older pending proposals
+    Given a pending proposal queued before a long history of reviewed proposals
+    When the user approves the newest pending proposal
+    Then the CLI confirms the approval
+    And only the most recently reviewed proposals are kept
+    When the user looks up the older pending proposal
+    Then the CLI shows it still pending
+
+  # automations-07 only exercises a single rollover: a live file at the cap
+  # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
+  # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
+  # pinned only by unit tests in `automation.rs`. This seeds a full chain of
+  # four already-rotated generations plus a live file at the cap, forces one
+  # more rotation, and checks the whole chain shifted down by one and the
+  # oldest generation's content is gone, not just that `.1` exists.
+  @id:automations-rotation-chain-shifts-and-drops-oldest
+  Scenario: automations-09 - A further rotation shifts the whole chain and drops the oldest generation
+    Given an audit log already holding a full chain of four rotated generations
+    When the user selects a permissions mode
+    Then each rotated generation holds what the previous one held
+    And the oldest previous generation is gone
+
+  # A write that was cut off leaves a torn last line, and the next append
+  # repairs it by writing a clean copy of the audit log beside it and renaming
+  # that over the original. When the copy cannot be made — a full disk, or on
+  # Windows another program holding the log open without delete sharing — the
+  # repair used to give up: the debris stayed, the CLI warned that it failed to
+  # write the audit event on every command that records one, and the event was
+  # lost. The repair now falls back to cutting the debris in place. A directory
+  # that takes no new files is the same failure without filling a disk, so this
+  # drives it through `rocm config set-permissions`, a command the CLI audits.
+  # The fault is a directory permission, which does not bind root (the
+  # self-hosted WSL2 guest runs the suite as root), so `@requires-dir-permissions`
+  # skips it there rather than let it pass without testing anything. The unit
+  # tests in `automation.rs` cover the other triggers (an injected failure of
+  # each step, and on Windows a handle without delete sharing).
+  @id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced @requires-os:linux @requires-dir-permissions
+  Scenario: automations-10 - A command still records its audit event when the torn audit log cannot be replaced
+    Given the audit event log ends in a torn, unterminated line
+    And the audit log's directory takes no new files
+    When the user selects a permissions mode
+    Then the CLI confirms the permissions mode
+    And the CLI prints no warning about the audit log
+    And the audit log keeps its earlier record, drops the torn line and records the permissions change

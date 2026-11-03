@@ -37,6 +37,10 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
   - opening/closing/merging PRs
   - public comments/review replies
   - changes to shared or public state
+- Before proposing or executing a force-push, check the PR's live review/approval state — not just the user's go-ahead for the push itself:
+  - query `gh pr view {pr} --repo OWNER/REPO --json reviews,reviewDecision` and check both fields, since `reviewDecision` alone can read `REVIEW_REQUIRED` even while a reviewer already holds a standing `APPROVED` or `CHANGES_REQUESTED` review
+  - if either field shows a current reviewer opinion, flag it when asking the user for that force-push approval
+  - whether the push itself dismisses an existing review depends on this repo's branch-protection or ruleset settings, not on which commit the review targeted — don't try to compute that yourself, and flag it anyway when unsure
 
 ## 2) Company Identity Required, Internal Content Forbidden
 
@@ -126,6 +130,31 @@ derived from the same value the branch is taken on — as `preapproved_install_l
 `apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
 computed from the decision cannot disagree with it.
 
+**A new test is shown to fail when the code it covers is broken.** Before pushing, break
+the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
+`get(0)`) and confirm the test goes red. A test that stays green with its target removed
+is not coverage. An assertion such as `contains("0.0%")` can be satisfied by unrelated
+text on screen; assert the specific value. Fixtures hold values the real source can
+produce, for example nothing above 4 GiB from a 32-bit WMI field.
+
+**A new state flag, placeholder, or "loading" display starts from a state matrix.** Before
+writing it, list every lifecycle state it can be observed in (for a streaming display:
+initial, connecting, connected with no data yet, connected with an empty result,
+disconnected before and after the first data, reconnect, replay end; a one-shot
+progress placeholder has no reconnect or replay rows, so list the states it does have)
+and write the expected output for each, with
+a test per row. Every "pending" state needs an exit on every path that never delivers
+data. Fixing only the state a reviewer named invites the next round to name its sibling;
+when a finding is one instance of a class, fix the class and list the sibling cases in
+the reply.
+
+**Platform-gated code gets a test that runs on its gate.** When a `cfg(windows)` path
+cannot be driven by e2e, put its logic behind a pure helper or an injectable function
+(a script runner, a clock) so a unit test runs on the Windows CI job, including the error
+and timeout paths. A value matched across files (a version tag, a sentinel string) gets
+one shared constant and a test tying the producer to the consumer. If a path stays
+untested, say which and why in the PR text.
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
@@ -175,10 +204,10 @@ Keep docs and behavior claims in sync while editing:
   docs/manual-testing.md in the same change — do not leave user-facing docs
   for a follow-up
 - the same behavior claim (e.g. "does X automatically") often repeats across
-  README.md, --help doc comments, printed CLI output, and docs/*.md; each
-  drifts independently, so grep for the claim's wording across all of them,
-  not just the surface you're editing, and check each against the actual
-  code path
+  README.md, --help doc comments, printed CLI output, status-bar text, docs/*.md,
+  and the PR body; each drifts independently, so grep for the claim's wording
+  across all of them, not just the surface you're editing, and check each
+  against the actual code path
 - cite a specific repo file in markdown as a link relative to the citing
   file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — not as a
   bare backtick path: the `docs-links` CI job and the `lychee` prek hook
@@ -198,6 +227,12 @@ Keep docs and behavior claims in sync while editing:
   file outside it), and a link leaving a skill folder in `skills/`
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
+- when a statement such as "X is not supported" or "there is no Y" becomes false,
+  grep the same surfaces for the old claim before pushing
+- write the PR body from the final diff, not the first commit, and re-read it after
+  every review-fix commit: it lists every user-visible change (including ones on other
+  platforms), names the lane that exercises the new behavior, and states the reason when
+  there is no scenario
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -205,15 +240,28 @@ Current workspace members:
 
 - apps: `apps/rocm`, `apps/rocmd`
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
-- engine crates: `engines/lemonade`, `engines/vllm`
+- engine crates: `engines/lemonade`, `engines/vllm`, `engines/aim`
 
-Shared UI components — reuse rather than hand-rolling new ones:
-`apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that
-only advances when the caller's own loop ticks it (e.g. `serve`'s
-HTTP-polling wait loop); that same file's `AnimatedSpinner` for progress that
-must keep animating between caller updates, which can go quiet for long
-stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
-`crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts.
+Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps/rocm`) and the dash-TUI (`crates/rocm-dash-tui`) each have their own set; they are not interchangeable (see the naming-collision warning below). A few primitives live in `crates/rocm-core` instead, since they're shared by the CLI and by `rocm-core`'s own [`fix.rs`](crates/rocm-core/src/fix.rs).
+
+Shared (`crates/rocm-core`):
+
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`therock.rs`](apps/rocm/src/therock.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+
+CLI:
+
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+
+dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
+
+- **[`approval.rs`](crates/rocm-dash-tui/src/ui/approval.rs)** — approval-state prompts
+- **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
+- **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
+- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
+
+**Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
 Guardrails:
 
@@ -228,6 +276,24 @@ Guardrails:
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
   - add a comment documenting why the test is skipped (e.g., `#[cfg_attr(not(target_os = "linux"), ignore)]`)
+- subprocess and FFI code, checked before pushing:
+  - a `tokio::process` child awaited under a `timeout` sets `kill_on_drop(true)`, so a
+    timeout that fires does not leak it; children deliberately detached to outlive the
+    CLI (`detach_background_command`) are exempt
+  - blocking FFI runs under `spawn_blocking`, never on an async worker; a `timeout`
+    around `spawn_blocking` drops only the join handle, so the thread still leaks:
+    give the blocking call its own deadline or cancellation flag instead
+  - DLLs load by absolute path, not by bare name
+  - do not pair two independently ordered lists by index when they share an id;
+    correlate by id. Where no id exists, positional pairing is allowed only as the last
+    resort after every stronger identifier (device id, name) has been tried, as
+    `fill_unidentified_gpus_from_hipinfo` in [examine.rs](crates/rocm-core/src/examine.rs) does;
+    otherwise degrade to "unknown", never to a guess on multi-adapter hosts
+  - check the documented width and range of every WMI or Win32 field before trusting
+    it (a 32-bit field saturates at 4 GiB)
+  - choose a ticker's `MissedTickBehavior` deliberately (`rocmd` uses `Delay`, the dash
+    daemon `Skip`), and do not let a slow source block the fast ones sharing its tick
+    (the dash daemon's tick polls its sources serially and does not do this yet)
 
 ## 7) Local Assistant And Tool-Use Policy Consistency
 
@@ -252,21 +318,33 @@ on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the
   `rocm` binary, so it is versioned with the binary and lives here.
-  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
-  incubation for this skill: it carries no automated federation for
-  `rocm-doctor` yet — `.github/federation.json` there only declares
-  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
-  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
-  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
-  whenever it changes materially. So edit it here, and never edit the
-  `amd/skills` copy directly — the next hand-sync overwrites it.
+  [`amd/skills`](https://github.com/amd/skills) vendors a copy under
+  `skills/rocm-doctor`: its `.github/federation.json` declares
+  `ROCm/rocm-cli` as a source, and its nightly `federate-skills` workflow
+  tracks `main` here. When this folder changes on `main`, that workflow opens a
+  "Bump `rocm-doctor`" pull request in `amd/skills`, and the change reaches
+  `amd/skills` only when that pull request is merged. So edit it here, and never edit
+  the `amd/skills` copy directly — the next bump overwrites it. Those bump pull requests are also
+  where the skill is graded; [docs/skill-quality.md](docs/skill-quality.md) says
+  what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
   (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
   checker and OS scoping) — adding, renaming, or re-scoping a failure mode
   means changing the CLI **first**, then the two docs. That feature is what
-  catches you if you forget.
+  catches you if you forget. Two sentences in
+  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
+  sentence "requires `contract_version` N or higher": scenario skill-07 parses
+  it and holds that number (the contract number) equal to what
+  `rocm fix --json` publishes. The other is the "The other N ... print-only"
+  sentence, whose number (the print-only count) is checked by
+  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) against the
+  catalog table. Keep both wordings when editing the skill.
+  Raise the contract number only after a release publishes that contract. The
+  skill is federated from `main`, and the installer that Phase 0 offers installs
+  the release channel, so an earlier raise would make the published skill stop
+  on every released CLI.
 
 The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
 frontmatter for the skill loader, and skills published this way carry no
@@ -292,9 +370,11 @@ Two checks gate it, and they cover different things:
   describes the binary, as above.
 
 Neither grades whether the skill actually *fires*. That is skillscope's
-`routing` and `behavioral`, which need an authenticated `claude` CLI and an
-`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
-so those can be switched on without further work.
+`routing` and `behavioral`, which make paid model calls and need a credential
+this repo does not hold, so they do not run here. `amd/skills` grades the skill
+instead. What runs there today, what the figures mean and what they cannot tell
+you is in [docs/skill-quality.md](docs/skill-quality.md), which is the one place
+that is kept current.
 
 `skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
 verbatim into the chat system prompt with `include_str!`, so the YAML
@@ -357,6 +437,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
+- before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
@@ -379,6 +460,9 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
+After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
+of sequence or a clippy lint cost more than running them first.
+
 ## 13) Upstream Pre-flight Checklist
 
 Run this checklist before any upstream push, PR update, issue update, or public reply:
@@ -394,6 +478,11 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 9. Scope remains one logical change at correct layer — *§11*
 10. CI watched to completion and driven to green — *§12*
 11. User approval obtained for any high-blast-radius external action — *§1*
+12. Force-push's live review/approval state checked before proposing or executing one — *§1*
+13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
+14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
+15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
+16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 
 ## 14) Related Internal Workflows
 
