@@ -21,6 +21,7 @@ use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// Overlay state. `None` on `AppState` means the overlay is closed.
 #[derive(Debug, Clone, Default)]
@@ -58,11 +59,9 @@ pub fn on_key(
     match key.code {
         KeyCode::Esc => *logs = None,
         KeyCode::Enter => return run_logs(l, jobs),
-        KeyCode::Backspace => {
-            l.query.pop();
+        code => {
+            apply_char_key(&mut l.query, code);
         }
-        KeyCode::Char(c) => l.query.push(c),
-        _ => {}
     }
     Vec::new()
 }
@@ -168,6 +167,17 @@ mod tests {
         assert_eq!(fx.len(), 1, "read-only spawn, no approval");
         assert!(matches!(fx[0], SideEffect::SpawnJob { .. }));
         assert_eq!(l.as_ref().unwrap().active_job.as_deref(), Some("logs"));
+    }
+
+    #[test]
+    fn backspace_edits_the_query() {
+        let mut l = Some(LogsViewState::default());
+        let mut jobs = State::default();
+        for c in "vl".chars() {
+            on_key(&mut l, &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut l, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(l.as_ref().unwrap().query, "v");
     }
 
     #[test]

@@ -522,14 +522,56 @@ Feature: Model serving
     And the user is told no AMD GPU was detected
     And the user is not told to relaunch the server with different options
 
+  # Native-Windows platform gate (ROCMAI-823). `rocm engines list` already
+  # reports vLLM as `runtime: unsupported_native_windows`; `serve` takes the
+  # same decision (`engine_ruled_out_by_platform`) and refuses before runtime
+  # resolution or any launch. Before the gate, an active runtime let this print
+  # "managed service launched" and exit 0 while the engine died with no output.
+  # Hermetic (a planted read-only runtime, no GPU, no network, no engine, no
+  # `e2e-test-hooks`), so the required `windows-build-and-test` lane selects it
+  # via `E2E_ALSO_RUN_IDS`.
+  @id:serve-vllm-refused-on-native-windows @requires-os:windows
+  Scenario: serve-33 - Serving with vLLM on native Windows is refused before anything launches
+    Given a registered read-only runtime
+    And the first runtime is active
+    When the user serves a model with the vLLM engine
+    Then serving is refused before any engine starts
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to serve
+    And no local server was recorded
+
+  # The install half of the same gate. Without it `rocm engines install vllm`
+  # either failed on an unrelated "no active ROCm runtime" error (as here, with
+  # no runtime) or went on to run the install. Hermetic, and selected into the
+  # required Windows lane for the same reason as serve-33.
+  @id:serve-vllm-install-refused-on-native-windows @requires-os:windows
+  Scenario: serve-34 - Installing vLLM on native Windows is refused with the platform reason
+    When the user installs the vLLM engine
+    Then the install is refused
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # The same refusal with a runtime present, which is the case that used to go
+  # on to install. The runtime resolves as a managed Python environment and a
+  # recording stand-in replaces `uv`, so an install that was NOT refused would
+  # run `uv pip install vllm`; nothing fetched is shown by that never happening,
+  # not only by the exit message.
+  @id:serve-vllm-install-with-runtime-refused-on-native-windows @requires-os:windows
+  Scenario: serve-35 - Installing vLLM on native Windows with an active runtime never starts the install
+    Given a registered read-only runtime
+    And the first runtime is active
+    And the runtime has a Python interpreter and uv is a recording stand-in
+    When the user installs the vLLM engine
+    Then the install is refused
+    And no vLLM install was started
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
   # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
   # Hugging Face token was passed. The check runs ahead of GPU detection and
   # Docker, so it needs neither and gates every PR (ungated). The refusal names
-  # the remedy and leaves no service record behind; serve-34 proves the named
+  # the remedy and leaves no service record behind; serve-37 proves the named
   # remedy clears the condition. A Docker that logs its calls shows that nothing
-  # was pulled. serve-35 and serve-36 cover the GPU-dependent refusals.
+  # was pulled. serve-38 and serve-39 cover the GPU-dependent refusals.
   @id:serve-gated-aim-refused-without-hf-token
-  Scenario: serve-33 - A gated AIM image is refused without a Hugging Face token
+  Scenario: serve-36 - A gated AIM image is refused without a Hugging Face token
     Given Docker is watched for any call
     When the user serves a gated AIM model without passing a Hugging Face token
     Then serving is refused before any engine starts
@@ -537,7 +579,7 @@ Feature: Model serving
     And no service was started
     And Docker was never called
 
-  # The remedy printed by serve-33 (`export HF_TOKEN`, then `--engine-env
+  # The remedy printed by serve-36 (`export HF_TOKEN`, then `--engine-env
   # HF_TOKEN`) must actually clear that refusal. The host's one GPU is one the
   # image supports and every GPU is masked, so the serve passes the token and
   # GPU-family gates and stops at the GPU pre-flight, still before anything is
@@ -545,7 +587,7 @@ Feature: Model serving
   # Linux only: the empty `HIP_VISIBLE_DEVICES` mask and the planted kernel
   # topology are Linux mechanisms.
   @id:serve-gated-aim-token-remedy-clears-refusal @requires-os:linux
-  Scenario: serve-34 - Passing the exported Hugging Face token clears the gated AIM refusal
+  Scenario: serve-37 - Passing the exported Hugging Face token clears the gated AIM refusal
     Given Docker is watched for any call
     And a host whose only GPU is an AMD Radeon PRO W7900
     When the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked
@@ -559,7 +601,7 @@ Feature: Model serving
   # is planted (an Instinct card against a Radeon-only image), so this needs no
   # AMD hardware and runs on every Linux lane.
   @id:serve-aim-refused-on-unsupported-gpu @requires-os:linux
-  Scenario: serve-35 - An AIM image is refused on a GPU it has no profile for
+  Scenario: serve-38 - An AIM image is refused on a GPU it has no profile for
     Given Docker is watched for any call
     And a host whose only GPU is an AMD Instinct MI300X
     When the user serves a Radeon-only AIM image
@@ -570,7 +612,7 @@ Feature: Model serving
   # `rocm serve` gives an engine one GPU, so an AIM image whose smallest profile
   # needs several is refused before launch instead of starting with too few.
   @id:serve-aim-refused-when-it-needs-several-gpus @requires-os:linux
-  Scenario: serve-36 - An AIM image that needs several GPUs is refused
+  Scenario: serve-39 - An AIM image that needs several GPUs is refused
     Given Docker is watched for any call
     And a host whose only GPU is an AMD Instinct MI300X
     When the user serves an AIM image that needs eight GPUs

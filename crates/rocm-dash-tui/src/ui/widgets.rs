@@ -4,6 +4,7 @@
 
 //! Small UI helpers shared across tabs.
 
+use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
@@ -31,6 +32,39 @@ pub fn trunc(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect()
+    }
+}
+
+/// Apply an append-only text-edit key to `buf`.
+///
+/// `Char` appends and `Backspace` pops one char. Returns `true` when `key` is
+/// one of those two, whether or not `buf` changed, so callers can reset their
+/// own state on any edit key.
+pub fn apply_char_key(buf: &mut String, key: KeyCode) -> bool {
+    apply_char_key_filtered(buf, key, |_| true)
+}
+
+/// [`apply_char_key`] where a `Char` is appended only if `accept` allows it.
+///
+/// A rejected `Char` is still consumed (swallowed); `Backspace` is never
+/// filtered.
+pub fn apply_char_key_filtered(
+    buf: &mut String,
+    key: KeyCode,
+    accept: impl Fn(char) -> bool,
+) -> bool {
+    match key {
+        KeyCode::Char(c) => {
+            if accept(c) {
+                buf.push(c);
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -280,5 +314,66 @@ mod tests {
         };
         let eff = node_efficiency(&snap).expect("finite gen_tps must still produce a result");
         assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
+    }
+
+    #[test]
+    fn apply_char_key_appends_chars_in_order() {
+        let mut buf = String::from("ab");
+        assert!(apply_char_key(&mut buf, KeyCode::Char('c')));
+        assert!(apply_char_key(&mut buf, KeyCode::Char(' ')));
+        assert_eq!(buf, "abc ");
+    }
+
+    #[test]
+    fn apply_char_key_backspace_pops_one_char_not_one_byte() {
+        let mut buf = String::from("aé");
+        assert!(apply_char_key(&mut buf, KeyCode::Backspace));
+        assert_eq!(buf, "a");
+    }
+
+    #[test]
+    fn apply_char_key_backspace_on_empty_is_consumed_and_a_no_op() {
+        let mut buf = String::new();
+        assert!(apply_char_key(&mut buf, KeyCode::Backspace));
+        assert_eq!(buf, "");
+    }
+
+    #[test]
+    fn apply_char_key_ignores_non_text_keys() {
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::Up,
+            KeyCode::Left,
+            KeyCode::Delete,
+        ] {
+            let mut buf = String::from("keep");
+            assert!(
+                !apply_char_key(&mut buf, key),
+                "{key:?} must not be consumed"
+            );
+            assert_eq!(buf, "keep", "{key:?} must not edit the buffer");
+        }
+    }
+
+    #[test]
+    fn apply_char_key_filtered_swallows_a_rejected_char() {
+        let mut buf = String::from("80");
+        assert!(apply_char_key_filtered(&mut buf, KeyCode::Char('x'), |c| c.is_ascii_digit()));
+        assert_eq!(buf, "80", "rejected char is consumed but not appended");
+        assert!(apply_char_key_filtered(&mut buf, KeyCode::Char('1'), |c| c.is_ascii_digit()));
+        assert_eq!(buf, "801");
+    }
+
+    #[test]
+    fn apply_char_key_filtered_never_filters_backspace() {
+        let mut buf = String::from("ab");
+        assert!(apply_char_key_filtered(
+            &mut buf,
+            KeyCode::Backspace,
+            |_| false
+        ));
+        assert_eq!(buf, "a");
     }
 }

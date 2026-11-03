@@ -1655,6 +1655,168 @@ async fn user_serves_live_model_on_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve with an explicit `--engine vllm`. Only run on native Windows
+/// (`@requires-os:windows`), where the platform gate refuses it before any
+/// runtime resolution or launch; the model name is arbitrary because the
+/// refusal comes first.
+#[when("the user serves a model with the vLLM engine")]
+async fn user_serves_with_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", "nonexistent-model-xyz", "--engine", "vllm"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `rocm engines install vllm --yes`. Runs with the scenario's fixture env, so
+/// the recording `uv` of serve-35 is the one an unrefused install would reach.
+#[when("the user installs the vLLM engine")]
+async fn user_installs_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["engines", "install", "vllm", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the install is refused")]
+async fn assert_install_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no install rc recorded");
+    assert!(
+        rc != 0,
+        "expected the install to be refused, but it exited 0:\n{}",
+        serve_output(world)
+    );
+}
+
+/// The native-Windows vLLM refusal, for the action that was attempted. It must
+/// be the platform reason, not the "no active ROCm runtime" error that used to
+/// pre-empt it, and must name the way out for that action. The paired steps
+/// (`serving is refused before any engine starts` / `the install is refused`,
+/// and the no-record / no-environment checks) prove the behavior it describes.
+#[then(expr = "the user is told vLLM needs WSL or Linux, or the Lemonade engine to {word}")]
+async fn assert_vllm_native_windows_refusal(world: &mut E2eWorld, action: String) {
+    let output = serve_output(world);
+    let remedy = match action.as_str() {
+        "serve" => "`--engine lemonade`",
+        "install" => "`rocm engines install lemonade`",
+        other => panic!("unknown action {other:?}"),
+    };
+    assert!(
+        output.contains("vLLM is not supported on native Windows")
+            && output.contains("WSL or Linux")
+            && output.contains(remedy),
+        "expected the native-Windows vLLM refusal naming WSL/Linux and {remedy}, got:\n{output}"
+    );
+    assert!(
+        !output.contains("no active ROCm runtime"),
+        "the platform refusal must come before runtime resolution, got:\n{output}"
+    );
+}
+
+/// The refused serve left nothing behind: a launch always writes a
+/// managed-service record under `<data>/services/`, and `services list --all`
+/// reads exactly those records.
+#[then("no local server was recorded")]
+async fn assert_no_service_recorded(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records: Vec<_> = std::fs::read_dir(&services)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        records.is_empty(),
+        "a refused serve must not record a service, found: {records:?}"
+    );
+    let listed = crate::run_rocm_ok(world, &["services", "list", "--all"]);
+    assert!(
+        !listed.contains("vllm-"),
+        "a refused serve must not appear in `services list --all`:\n{listed}"
+    );
+}
+
+/// Give the planted runtime what a real vLLM install needs to get going, and
+/// stand a recording `uv` in for the real one. The runtime then resolves as a
+/// managed Python environment, so an install that is NOT refused runs
+/// `uv pip install vllm`, which the stand-in records instead of fetching.
+/// Without this the planted runtime is rejected by the vLLM adapter before it
+/// writes anything, and "nothing was installed" could not fail.
+#[given("the runtime has a Python interpreter and uv is a recording stand-in")]
+async fn runtime_with_recording_uv(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let python = install_root.join("python.exe");
+    std::fs::write(&python, "not a real interpreter").expect("failed to write python stand-in");
+
+    let registry = root.join("data").join("runtimes").join("registry");
+    let manifest_path = registry.join("release-tarball-gfx942.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .expect("runtime manifest is not JSON");
+    manifest["python_executable"] = serde_json::json!(python);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize manifest"),
+    )
+    .expect("failed to rewrite runtime manifest");
+
+    let marker = root.join(UV_MARKER);
+    let uv = root.join("recording-uv.cmd");
+    std::fs::write(
+        &uv,
+        format!(
+            "@echo off
+echo %* > \"{}\"
+exit /b 1
+",
+            marker.display()
+        ),
+    )
+    .expect("failed to write recording uv");
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+}
+
+/// File the recording `uv` writes when it is invoked.
+const UV_MARKER: &str = "uv-was-run.txt";
+
+/// The refused install never started: the recording `uv` was not invoked and
+/// nothing exists under the runtime's `<install_root>/engines`, the folder a
+/// real install is rooted at (`env_root_for_runtime`). Both can fail: with the
+/// platform gate removed the install runs `uv pip install vllm`.
+#[then("no vLLM install was started")]
+async fn assert_no_vllm_install_started(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let marker = root.path().join(UV_MARKER);
+    assert!(
+        !marker.exists(),
+        "a refused vLLM install must not run uv, but it was invoked with: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let engines = install_root.join("engines");
+    assert!(
+        !engines.exists(),
+        "a refused vLLM install must not create {}",
+        engines.display()
+    );
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
