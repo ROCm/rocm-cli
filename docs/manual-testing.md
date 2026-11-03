@@ -832,11 +832,13 @@ rocm uninstall
 Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
-  as the command exits) and, under
+  as the command exits), on Linux the `shell completions` file
+  `~/.config/fish/completions/rocm.fish` when the installer wrote one, and, under
   `PATH changes from the installer that would be undone:`, each shell profile
   the installer wrote (Linux, including `~/.config/fish/config.fish` when fish
   was installed) or the user `PATH` entry (Windows). It removes nothing.
-- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+- After confirming, the install folder holds no `rocm`/`rocmd` files, the
+  fish completion script is gone (its `completions` folder stays), and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
 - If another program lives in the install folder, the review instead says

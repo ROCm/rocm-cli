@@ -21,14 +21,15 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::uninstall_plan::{
-    UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
+    UninstallOptions, UninstallPlan, UninstallPlanEntry, build_uninstall_plan, confirm_uninstall,
     is_rocm_install_entry_name, remove_path, render_uninstall_plan,
 };
 
 /// The file, next to the installed binaries, in which `install.sh` and
 /// `install.ps1` record the PATH change they made, one per line:
-/// `profile <shell profile>` and `path-expr <how the block spells the folder>`
-/// from `install.sh`, `user-path <dir>` from `install.ps1`.
+/// `profile <shell profile>`, `path-expr <how the block spells the folder>`,
+/// and `completions <fish completion script>` from `install.sh`,
+/// `user-path <dir>` from `install.ps1`.
 pub(crate) const PATH_EDIT_RECORD: &str = ".rocm-cli-path-edit";
 
 const PROFILE_BLOCK_START: &str = "# >>> rocm-cli path >>>";
@@ -223,6 +224,7 @@ pub(crate) fn plan_path_edits(
             ));
         }
     } else {
+        plan_completion_removals(plan, &entries);
         let mut path_exprs = profile_path_exprs(bin_dir, home);
         for (kind, target) in &entries {
             if *kind == "path-expr" && !path_exprs.contains(target) {
@@ -315,6 +317,39 @@ pub(crate) fn plan_path_edits(
              installer's PATH change is left in place: {error}",
             bin_dir.display()
         )),
+    }
+}
+
+/// Plan removing the fish completion scripts `install.sh` recorded writing.
+///
+/// They only describe the binaries being removed, so they go with them even
+/// when the PATH change stays for other programs in the folder. Only an
+/// absolute path with no `..`, naming a regular file or link at
+/// `completions/rocm.fish`, is taken: the record sits in a user-writable
+/// folder, and a line naming anything else is not one the installer wrote.
+fn plan_completion_removals(plan: &mut UninstallPlan, entries: &[(&str, OsString)]) {
+    for (kind, target) in entries {
+        if *kind != "completions" {
+            continue;
+        }
+        let path = PathBuf::from(target);
+        let is_fish_script = path.is_absolute()
+            && !path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            && path.file_name().is_some_and(|name| name == "rocm.fish")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "completions");
+        let is_file = fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink());
+        if is_fish_script && is_file && !plan.actions.iter().any(|entry| entry.path == path) {
+            plan.actions.push(UninstallPlanEntry {
+                kind: "shell completions",
+                path,
+            });
+        }
     }
 }
 
@@ -1312,6 +1347,179 @@ mod tests {
             assert!(fs::symlink_metadata(&profile)?.is_symlink());
             assert_eq!(fs::read_to_string(&real)?, "export A=1\n");
             assert_eq!(fs::metadata(&real)?.permissions().mode() & 0o777, 0o640);
+            Ok(())
+        }
+
+        /// Where `install.sh` writes fish completions under `layout`'s home.
+        fn fish_completions(layout: &Layout) -> Result<PathBuf> {
+            let dir = layout.home.join(".config").join("fish").join("completions");
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("rocm.fish");
+            fs::write(&path, "complete -c rocm\n")?;
+            Ok(path)
+        }
+
+        fn completion_actions(plan: &UninstallPlan) -> Vec<PathBuf> {
+            plan.actions
+                .iter()
+                .filter(|entry| entry.kind == "shell completions")
+                .map(|entry| entry.path.clone())
+                .collect()
+        }
+
+        #[test]
+        fn recorded_fish_completions_are_removed_with_the_binaries() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            fs::write(&profile, format!("export A=1\n{POSIX_BLOCK}"))?;
+            let completions = fish_completions(&layout)?;
+            let record = record(
+                &layout,
+                &format!(
+                    "profile {}\ncompletions {}\n",
+                    profile.display(),
+                    completions.display()
+                ),
+            )?;
+            let mut plan = with_binaries(&layout, UninstallPlan::default());
+            plan_path_edits(&mut plan, &layout.bin, &layout.removed, Some(&layout.home));
+            assert_eq!(
+                completion_actions(&plan),
+                vec![completions.clone()],
+                "{plan:?}"
+            );
+
+            let (lines, result) = run(&plan);
+            result?;
+            assert!(!completions.exists(), "the completion script is gone");
+            assert!(
+                completions.parent().is_some_and(Path::exists),
+                "only the script goes, not the user's completions folder"
+            );
+            assert!(!record.exists() && !layout.removed[0].exists());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line
+                        == &format!("removed shell completions {}", completions.display())),
+                "{lines:?}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn fish_completions_go_even_when_the_path_change_stays_for_other_programs() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            fs::write(&profile, POSIX_BLOCK)?;
+            fs::write(layout.bin.join("uv"), "")?;
+            let completions = fish_completions(&layout)?;
+            record(
+                &layout,
+                &format!(
+                    "profile {}\ncompletions {}\n",
+                    profile.display(),
+                    completions.display()
+                ),
+            )?;
+            let plan = plan_for(&layout);
+            assert!(plan.path_edits.is_empty(), "{plan:?}");
+            assert_eq!(completion_actions(&plan), vec![completions], "{plan:?}");
+            Ok(())
+        }
+
+        #[test]
+        fn a_completions_line_naming_another_file_is_not_trusted() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            fs::write(&profile, "export A=1\n")?;
+            let elsewhere = layout.home.join("completions").join("other.fish");
+            fs::create_dir_all(elsewhere.parent().expect("has a folder"))?;
+            fs::write(&elsewhere, "")?;
+            let folder = layout
+                .home
+                .join("dir")
+                .join("completions")
+                .join("rocm.fish");
+            fs::create_dir_all(folder.join("keep"))?;
+            let not_completions = layout.home.join("notcompletions").join("rocm.fish");
+            fs::create_dir_all(not_completions.parent().expect("has a folder"))?;
+            fs::write(&not_completions, "")?;
+            let dotted = layout
+                .home
+                .join("x")
+                .join("completions")
+                .join("..")
+                .join("completions")
+                .join("rocm.fish");
+            // `..` that lands on a real `completions/rocm.fish` file.
+            let dotted_target = layout.home.join("x").join("completions");
+            fs::create_dir_all(&dotted_target)?;
+            fs::write(dotted_target.join("rocm.fish"), "")?;
+            let missing = layout
+                .home
+                .join("gone")
+                .join("completions")
+                .join("rocm.fish");
+            record(
+                &layout,
+                &format!(
+                    "completions {}\ncompletions {}\ncompletions {}\ncompletions {}\n\
+                     completions {}\ncompletions {}\n",
+                    profile.display(),
+                    elsewhere.display(),
+                    folder.display(),
+                    missing.display(),
+                    not_completions.display(),
+                    dotted.display()
+                ),
+            )?;
+            let plan = plan_for(&layout);
+            assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            Ok(())
+        }
+
+        #[test]
+        fn linked_fish_completions_lose_the_link_and_keep_its_target() -> Result<()> {
+            let layout = layout()?;
+            let target = layout.home.join("dotfiles").join("rocm.fish");
+            fs::create_dir_all(target.parent().expect("has a folder"))?;
+            fs::write(&target, "complete -c rocm\n")?;
+            let dir = layout.home.join(".config").join("fish").join("completions");
+            fs::create_dir_all(&dir)?;
+            let link = dir.join("rocm.fish");
+            std::os::unix::fs::symlink(&target, &link)?;
+            record(&layout, &format!("completions {}\n", link.display()))?;
+            let plan = plan_for(&layout);
+            assert_eq!(completion_actions(&plan), vec![link.clone()], "{plan:?}");
+            run(&plan).1?;
+            assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+            assert!(target.exists(), "what the link pointed at stays");
+            Ok(())
+        }
+
+        #[test]
+        fn a_record_from_before_completions_were_recorded_still_undoes_the_path_change()
+        -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            fs::write(&profile, format!("export A=1\n{POSIX_BLOCK}"))?;
+            // An earlier installer wrote the script but no `completions` line,
+            // so uninstall has no record of it and leaves it alone.
+            let completions = fish_completions(&layout)?;
+            let record = record(
+                &layout,
+                &format!(
+                    "profile {}\npath-expr $HOME/.local/bin\n",
+                    profile.display()
+                ),
+            )?;
+            let plan = with_binaries(&layout, plan_for(&layout));
+            assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            assert_eq!(profiles(&plan), vec![profile.clone()]);
+            run(&plan).1?;
+            assert_eq!(fs::read_to_string(&profile)?, "export A=1\n");
+            assert!(!record.exists() && completions.exists());
             Ok(())
         }
     }

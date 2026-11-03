@@ -1654,9 +1654,15 @@ Fish profile setup in `install.sh` is covered on its own by
 [`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
 local bundle, points the installer at a temporary home, and checks that a
 bash, zsh, or ksh login shell still updates its own profile and, when `fish`
-is on `PATH` or `~/.config/fish` exists, also writes the fish `PATH` block,
-fish completions, and the uninstall record. A bash home with no fish
-install keeps no fish config. It needs no network or GPU. The Linux
+is on `PATH` or fish's config folder exists (`$XDG_CONFIG_HOME/fish` when that
+is absolute, else `~/.config/fish`), also writes the fish `PATH` block, fish
+completions, and the uninstall record for both. A bash home with no fish
+install keeps no fish config. It also checks that a `rocm` that cannot print
+completions leaves the install and the `PATH` block in place with a hint that
+works, that `rocm` is not handed the installer's stdin, and, as a non-root
+user, that a profile that cannot be written is reported rather than claimed
+as updated, under both `sh` and `bash`. It needs no network or GPU. Set
+`INSTALL_SH` to run it against another copy of the installer. The Linux
 `build-and-test` job runs it:
 
 ```bash
@@ -1664,8 +1670,8 @@ sh tests/install-sh/run.sh
 ```
 
 The same path with the packaged binary, including `rocm uninstall` putting the
-fish config back, is `@id:lifecycle-linux-fish-configured-from-bash` in the
-lifecycle set above.
+bash and fish configs back and removing the fish completions, is
+`@id:lifecycle-linux-fish-configured-from-bash` in the lifecycle set above.
 
 The required `windows-build-and-test` lane additionally folds in the hermetic
 `comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)

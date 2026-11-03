@@ -213,7 +213,7 @@ profile_path_for_shell() {
   case "$(shell_name)" in
     bash) printf '%s\n' "${HOME}/.bashrc" ;;
     zsh) printf '%s\n' "${HOME}/.zshrc" ;;
-    fish) printf '%s\n' "${HOME}/.config/fish/config.fish" ;;
+    fish) fish_config_path ;;
     ksh) printf '%s\n' "${HOME}/.kshrc" ;;
     *) printf '%s\n' "${HOME}/.profile" ;;
   esac
@@ -256,11 +256,13 @@ append_path_snippet() {
   path_expr="$3"
   escaped_path_expr="$(escape_for_double_quotes "${path_expr}")"
 
+  # Any failed write returns non-zero before "updated" is printed, so the
+  # caller reports that the folder is not saved instead of claiming it is.
   profile_dir="${profile%/*}"
   if [ "${profile_dir}" != "${profile}" ]; then
-    mkdir -p "${profile_dir}"
+    mkdir -p "${profile_dir}" || return 1
   fi
-  [ -f "${profile}" ] || : > "${profile}"
+  [ -f "${profile}" ] || : > "${profile}" || return 1
 
   if profile_has_path_entry "${profile}" "${path_expr}"; then
     printf '%s\n' "unchanged:${profile}"
@@ -269,7 +271,7 @@ append_path_snippet() {
 
   case "${shell_kind}" in
     fish)
-      cat >> "${profile}" <<EOF
+      cat >> "${profile}" <<EOF || return 1
 
 # >>> rocm-cli path >>>
 if not contains -- "${escaped_path_expr}" \$PATH
@@ -279,7 +281,7 @@ end
 EOF
       ;;
     *)
-      cat >> "${profile}" <<EOF
+      cat >> "${profile}" <<EOF || return 1
 
 # >>> rocm-cli path >>>
 case ":\$PATH:" in
@@ -321,8 +323,17 @@ record_path_edit() {
   printf '%s\n' "$1" >> "${record}"
 }
 
+# The folder fish reads its config from: $XDG_CONFIG_HOME/fish when that is
+# set to an absolute path, as fish itself resolves it, else ~/.config/fish.
+fish_config_dir() {
+  case "${XDG_CONFIG_HOME:-}" in
+    /*) printf '%s\n' "${XDG_CONFIG_HOME}/fish" ;;
+    *) printf '%s\n' "${HOME}/.config/fish" ;;
+  esac
+}
+
 fish_config_path() {
-  printf '%s\n' "${HOME}/.config/fish/config.fish"
+  printf '%s\n' "$(fish_config_dir)/config.fish"
 }
 
 # Whether fish is set up on this machine, whatever the login shell is: the
@@ -330,11 +341,11 @@ fish_config_path() {
 # login shell is common even for people who run fish interactively.
 fish_is_installed() {
   command -v fish >/dev/null 2>&1 && return 0
-  [ -d "${HOME}/.config/fish" ] && return 0
+  [ -d "$(fish_config_dir)" ] && return 0
   return 1
 }
 
-# Append the fish PATH block to ~/.config/fish/config.fish and record it so
+# Append the fish PATH block to fish's config.fish and record it so
 # `rocm uninstall` can take it out again. The caller skips this when that file
 # is the profile the login-shell step just wrote.
 configure_fish_path() {
@@ -361,15 +372,18 @@ configure_fish_path() {
 }
 
 # Install fish completions from the binary that was just placed, so they match
-# it. Best effort: a binary that cannot print them leaves the install intact.
+# it, and record the file so `rocm uninstall` removes it with the binary. Best
+# effort: a binary that cannot print them leaves the install intact. The binary
+# reads nothing from stdin, which under `curl | sh` is the rest of this script.
 install_fish_completions() {
-  completions_dir="${HOME}/.config/fish/completions"
+  completions_dir="$(fish_config_dir)/completions"
   completions_path="${completions_dir}/rocm.fish"
   completions_tmp="${tmp_dir}/rocm.fish"
-  if "${INSTALL_DIR}/rocm" completions fish > "${completions_tmp}" \
+  if "${INSTALL_DIR}/rocm" completions fish < /dev/null > "${completions_tmp}" \
     && [ -s "${completions_tmp}" ] \
     && mkdir -p "${completions_dir}" \
     && install -m 0644 "${completions_tmp}" "${completions_path}"; then
+    record_path_edit "completions ${completions_path}"
     echo "fish completions installed:"
     echo "  ${completions_path}"
   else

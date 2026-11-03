@@ -80,12 +80,17 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. When fish is installed (`fish` is on `PATH`,
-or `~/.config/fish` already exists), it also writes that `PATH` block to
-`~/.config/fish/config.fish` and installs fish completions, including when the
-login shell is bash, zsh, or ksh. Rerun it any time to upgrade. `rocm uninstall`
-removes the binaries, and undoes the `PATH` change too when no other program
-lives in that directory.
+directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
+`PATH`, or fish's config folder already exists), the installer also adds that
+directory to `PATH` in fish's `config.fish` and installs fish completions,
+including when the login shell is bash, zsh, or ksh. Fish's config folder is
+`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
+`~/.config/fish`.
+Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
+its completions included. Rerun the installer any time to upgrade.
+`rocm uninstall` removes the binaries and the fish completions the installer
+recorded writing, and undoes the `PATH` change too when no other program lives
+in that directory.
 
 ### Linux and WSL2 (x86_64)
 
@@ -1279,8 +1284,9 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
-# The Linux installer writes this file when fish is installed. Run the same
-# command after copying the binaries yourself, or to refresh the script:
+# The Linux installer writes this file when fish is installed (under
+# $XDG_CONFIG_HOME/fish when that is an absolute path). Run the same command
+# after copying the binaries yourself, or to refresh the script:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 

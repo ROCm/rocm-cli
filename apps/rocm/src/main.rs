@@ -693,10 +693,11 @@ rocm logs --search error timeout")]
     /// Remove ROCm CLI-managed files from this computer.
     ///
     /// Removes the config, data, and cache directories and the installed
-    /// binaries, including the running rocm.exe on Windows. It also undoes the
-    /// PATH change the installer made (its marked shell-profile block, or the
-    /// user PATH entry it recorded adding on Windows), unless other programs
-    /// share the install folder.
+    /// binaries, including the running rocm.exe on Windows, and the fish
+    /// completion script the Linux installer recorded writing. It also undoes
+    /// the PATH change the installer made (its marked shell-profile block, or
+    /// the user PATH entry it recorded adding on Windows), unless other
+    /// programs share the install folder.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]

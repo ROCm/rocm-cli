@@ -241,6 +241,9 @@ fn run_installer_command(
     // Isolate the installer's HOME so shell-profile writes and the seeded
     // ~/.rocm/config.json land in the scenario's tree, never the real home.
     cmd.env("HOME", &st.home_dir);
+    // fish's config lives under $XDG_CONFIG_HOME when that is set, which would
+    // point the installer's fish setup at the runner's real config.
+    cmd.env_remove("XDG_CONFIG_HOME");
     for (key, value) in public_key_env {
         cmd.env(key, value);
     }
@@ -1410,8 +1413,12 @@ async fn then_single_path_marker(world: &mut E2eWorld) {
 /// The scenario's shell profile holds the installer's marked PATH block exactly
 /// once.
 fn assert_single_path_marker(st: &LifecycleState) {
-    let profile = shell_profile(st);
-    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_single_path_marker_in(&shell_profile(st));
+}
+
+/// Assert `profile` holds exactly one rocm-cli PATH block, and return its text.
+fn assert_single_path_marker_in(profile: &Path) -> String {
+    let contents = std::fs::read_to_string(profile).unwrap_or_default();
     let count = contents.matches("# >>> rocm-cli path >>>").count();
     assert_eq!(
         count,
@@ -1419,6 +1426,7 @@ fn assert_single_path_marker(st: &LifecycleState) {
         "expected exactly one rocm-cli PATH marker in {}, found {count}:\n{contents}",
         profile.display()
     );
+    contents
 }
 
 #[then("examine reads only the isolated config, data, and cache directories")]
@@ -1503,17 +1511,13 @@ async fn then_profile_restored(world: &mut E2eWorld) {
 async fn then_fish_config_has_path(world: &mut E2eWorld) {
     let st = state(world);
     let config = fish_config(st);
-    let contents = std::fs::read_to_string(&config).expect("fish config not found");
-    let count = contents.matches("# >>> rocm-cli path >>>").count();
-    assert_eq!(
-        count,
-        1,
-        "expected exactly one rocm-cli PATH marker in {}, found {count}:\n{contents}",
-        config.display()
-    );
+    let contents = assert_single_path_marker_in(&config);
+    // The install folder sits outside the scenario's HOME, so the block names
+    // it literally rather than as `$HOME/...`.
+    let install_dir = st.install_dir.to_string_lossy();
     assert!(
-        contents.contains("set -gx PATH"),
-        "the fish config did not get fish syntax:\n{contents}"
+        contents.contains(&format!("set -gx PATH \"{install_dir}\" $PATH")),
+        "the fish config does not put {install_dir} on PATH in fish syntax:\n{contents}"
     );
     assert!(
         contents.contains("# the user's own fish settings"),
@@ -1560,6 +1564,26 @@ async fn then_fish_config_restored(world: &mut E2eWorld) {
     assert_eq!(
         contents, before,
         "uninstall did not restore the fish config to its pre-install contents"
+    );
+}
+
+#[then("the fish completions for the uninstalled rocm are gone")]
+async fn then_fish_completions_removed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        !path.exists(),
+        "uninstall left {} behind for a rocm that is gone",
+        path.display()
+    );
+    assert!(
+        path.parent().is_some_and(Path::is_dir),
+        "uninstall removed the user's fish completions folder, not just rocm's script"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!("removed shell completions {}", path.display())),
+        "uninstall did not report removing the fish completions:\n{out}"
     );
 }
 
