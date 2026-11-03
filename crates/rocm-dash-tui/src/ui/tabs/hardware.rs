@@ -33,11 +33,15 @@ use crate::ui::widgets::{
 
 /// Height of the overall-CPU box when the two CPU boxes are stacked: border
 /// (2) + `panel::padding_for`'s top pad (1, taken at height >= 5) + sparkline
-/// (3).
-const CPU_OVERALL_H: u16 = 6;
-/// Height of the per-core box when stacked: border (2) + bars (2). Below the
-/// height-5 threshold, so this box takes no top pad.
-const CPU_CORES_H: u16 = 4;
+/// (4). Sized so the graph keeps the four rows it had when both charts shared
+/// one box, since stacking is the narrow-terminal path and the trend is what
+/// that panel is read for.
+const CPU_OVERALL_H: u16 = 7;
+/// Height of the per-core box when stacked: border (2) + bars (1). Below the
+/// height-5 threshold, so this box takes no top pad. The strip gives up rows
+/// rather than the graph: stacking only happens on a terminal too narrow to
+/// give each core two columns, where the strip is already a coarse glance.
+const CPU_CORES_H: u16 = 3;
 /// Columns a `panel::bento` box spends on chrome: border (2) + left pad (2) +
 /// right pad (1), per `panel::padding_for`.
 const PANEL_CHROME_W: u16 = 5;
@@ -139,7 +143,7 @@ fn draw_rate_block(
 fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
     let n_cores = snap.host.cpu_per_core_pct.len();
     if n_cores == 0 {
-        draw_cpu_overall(f, area, state, snap, theme);
+        draw_cpu_overall(f, area, state, snap, theme, false);
         return;
     }
     // Side by side keeps both boxes the full height of the slot, so each chart
@@ -151,14 +155,15 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme:
             .direction(Direction::Horizontal)
             .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
             .split(area);
-        draw_cpu_overall(f, cols[0], state, snap, theme);
+        draw_cpu_overall(f, cols[0], state, snap, theme, false);
         draw_cpu_cores(f, cols[1], snap, theme);
         return;
     }
     if area.height < CPU_OVERALL_H + CPU_CORES_H {
         // Too short for two boxes: keep the one carrying history, since the
-        // per-core bars only ever show the current instant.
-        draw_cpu_overall(f, area, state, snap, theme);
+        // per-core bars only ever show the current instant. The core count
+        // moves into its title so the figure survives the dropped box.
+        draw_cpu_overall(f, area, state, snap, theme, true);
         return;
     }
     let rows = Layout::default()
@@ -168,24 +173,42 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme:
             Constraint::Length(CPU_CORES_H),
         ])
         .split(area);
-    draw_cpu_overall(f, rows[0], state, snap, theme);
+    draw_cpu_overall(f, rows[0], state, snap, theme, false);
     draw_cpu_cores(f, rows[1], snap, theme);
 }
 
 /// Whether the CPU slot is wide enough to put the two boxes side by side.
 ///
-/// Each half must leave the core strip a column per core and the graph enough
-/// width to read as a trend rather than a stub. A high core count is what
-/// usually rules this out, and that is exactly the case where the strip needs
-/// the full width.
+/// Each half must leave the graph enough width to read as a trend rather than
+/// a stub, and the core strip **two** columns per core. One per core would fit
+/// the bars but not their gutters (see `core_bars::slot`), so the strip would
+/// come out as one fused block; a strip that cannot be read as separate cores
+/// is not worth halving the graph for. A high core count is what usually rules
+/// this out, and that is exactly the case where the strip needs full width.
 const fn cpu_fits_side_by_side(area: Rect, n_cores: usize) -> bool {
     let half_inner = (area.width / 2).saturating_sub(PANEL_CHROME_W);
-    half_inner >= MIN_GRAPH_W && half_inner as usize >= n_cores
+    half_inner >= MIN_GRAPH_W && half_inner as usize >= 2 * n_cores
 }
 
 /// Overall CPU utilization over the snapshot history.
-fn draw_cpu_overall(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
-    let title = format!("CPU · {}", format::pct(snap.host.cpu_overall_pct));
+///
+/// `with_core_count` folds the core count into this box's title for the
+/// degenerate layout where the per-core box is dropped, so the count the old
+/// combined title always carried is not simply lost.
+fn draw_cpu_overall(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    snap: &Snapshot,
+    theme: &Theme,
+    with_core_count: bool,
+) {
+    let pct = format::pct(snap.host.cpu_overall_pct);
+    let title = if with_core_count {
+        format!("CPU · {pct} · {} cores", snap.host.cpu_per_core_pct.len())
+    } else {
+        format!("CPU · {pct}")
+    };
     let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
     if inner.height == 0 {
         return;
@@ -805,6 +828,40 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_needs_two_columns_per_core_not_one() {
+        // 48 cores in 170 columns: each half has 80 inner columns, enough for
+        // one column per core but not for the gutters between them, so the
+        // strip would render as one fused block. Stack instead.
+        assert!(!cpu_fits_side_by_side(Rect::new(0, 0, 170, 10), 48));
+        // The boundary: 2 columns per core is the point it becomes readable.
+        assert!(cpu_fits_side_by_side(Rect::new(0, 0, 170, 10), 40));
+        assert!(!cpu_fits_side_by_side(Rect::new(0, 0, 170, 10), 41));
+    }
+
+    #[test]
+    fn a_dropped_per_core_box_moves_the_core_count_into_the_cpu_title() {
+        // The old combined title always carried the core count. When the
+        // per-core box is dropped for want of rows, the count must not go
+        // with it.
+        let s = state_with_snapshot(snap_with_cores(32));
+        let out = render_to_string(&s, 38, 9);
+        assert!(!out.contains("Per-core"), "per-core box kept without room");
+        assert!(
+            out.contains("CPU · 2.8% · 32 cores"),
+            "core count lost with the dropped box"
+        );
+    }
+
+    #[test]
+    fn the_stacked_graph_keeps_the_rows_it_had_before_the_split() {
+        // Stacking is the narrow-terminal path. The graph is what that panel
+        // is read for, so it keeps four sparkline rows; the box is sized
+        // border (2) + top pad (1) + 4.
+        assert_eq!(CPU_OVERALL_H, 7);
+        assert_eq!(CPU_OVERALL_H + CPU_CORES_H, 10, "CPU slot is 10 rows");
+    }
+
+    #[test]
     fn cpu_keeps_the_history_graph_when_too_short_to_split() {
         // Stacked and out of rows: one box has to go. Keep the one carrying
         // history, since the per-core bars only ever show the current instant.
@@ -820,6 +877,25 @@ mod tests {
         let out = render_to_string(&s, 90, 20);
         assert!(out.contains("CPU · 2.8%"));
         assert!(!out.contains("Per-core"), "empty per-core box rendered");
+    }
+
+    #[test]
+    fn an_idle_gpu_draws_a_baseline_too_not_an_empty_panel() {
+        // The widget change reaches every sparkline, not just the CPU panel.
+        // A GPU sitting at 2% must show a continuous trace in its own panel
+        // for the same reason the CPU graph does.
+        let mut s = state_with_snapshot(snap_with_gpus(1));
+        for _ in 0..40 {
+            let mut snap = snap_with_gpus(1);
+            snap.gpus[0].gpu_utilization_pct = 2.0;
+            s.history.push_back(snap);
+        }
+        s.latest.as_mut().unwrap().gpus[0].gpu_utilization_pct = 2.0;
+        let out = render_to_string(&s, 120, 30);
+        assert!(
+            out.contains('\u{28c0}') || out.contains('\u{2840}'),
+            "no baseline braille anywhere in the GPU section"
+        );
     }
 
     fn mk_gpu(id: &str, util: f32, temp: f32, power: f32) -> GpuMetrics {

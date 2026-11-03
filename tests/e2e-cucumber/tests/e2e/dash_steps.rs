@@ -222,6 +222,62 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// Cores reported by `dash-43`'s idle recording. A distinctive count so the
+/// title assertion cannot match some other panel's text.
+const IDLE_CORES: usize = 64;
+
+/// Baseline braille cells: the bottom dot row of both columns lit.
+///
+/// Four consecutive cells cannot appear unless idle samples are drawn at all —
+/// before #796 a sample under a few percent of the scale rounded to zero lit
+/// dots and left a gap. Four rather than a longer run because the graph is
+/// right-aligned and grows two samples per column, so a longer run would be
+/// racing the replay's 2-second cadence against the step timeout.
+const IDLE_BASELINE_RUN: &str = "⣀⣀⣀⣀";
+
+#[then("the CPU graph is drawn as a continuous line")]
+async fn cpu_graph_is_continuous(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(IDLE_BASELINE_RUN, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the idle CPU graph did not render as a line: {e}"));
+}
+
+#[then("the CPU box reports the host's core count")]
+async fn cpu_box_reports_core_count(world: &mut E2eWorld) {
+    // Observe's CPU slot is too short for the per-core box, so the count has
+    // to come from the overall box's own title.
+    let expected = format!("· {IDLE_CORES} cores");
+    session(world)
+        .wait_for_screen(&expected, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the CPU box did not report the core count: {e}"));
+}
+
+#[when("the user opens the dashboard replaying an idle host")]
+async fn open_dashboard_replaying_idle_host(world: &mut E2eWorld) {
+    let per_core = (0..IDLE_CORES)
+        .map(|_| "1.0".to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let host = format!(
+        concat!(
+            r#""cpu_overall_pct":2.0,"cpu_per_core_pct":[{per_core}],"memory_used_mb":0,"#,
+            r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+            r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0"#,
+        ),
+        per_core = per_core
+    );
+    replay_recorded_snapshots_with_host(
+        world,
+        "idle-host-recording.ndjson",
+        &host,
+        r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        "",
+        "",
+    );
+}
+
 /// The one warning `dash-39`'s recording reports. Short and ASCII so it stays on
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
@@ -240,18 +296,46 @@ fn replay_recorded_snapshots(
     instances: &str,
     warnings: &str,
 ) {
+    replay_recorded_snapshots_with_host(
+        world,
+        file_name,
+        IDLE_HOST_FIELDS,
+        gpus,
+        instances,
+        warnings,
+    );
+}
+
+/// A quiet host: the body most scenarios want, since they assert on GPUs or
+/// instances rather than on the host panels.
+const IDLE_HOST_FIELDS: &str = concat!(
+    r#""cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+    r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+    r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0"#,
+);
+
+/// As [`replay_recorded_snapshots`], with the snapshot's `host` body supplied
+/// by the caller for scenarios that assert on the host panels themselves.
+/// `host` is the object body without its braces.
+fn replay_recorded_snapshots_with_host(
+    world: &mut E2eWorld,
+    file_name: &str,
+    host: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
     let snapshot = |ts_us: u64| {
         format!(
             concat!(
                 r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
                 r#""timestamp":"2023-11-15T00:00:00Z","#,
-                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
-                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
-                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
+                r#""host":{{{host}}},"#,
                 r#""gpus":[{gpus}],"gpu_system_info":null,"instances":[{instances}],"#,
                 r#""warnings":[{warnings}]}}}}"#,
             ),
             ts_us = ts_us,
+            host = host,
             gpus = gpus,
             instances = instances,
             warnings = warnings

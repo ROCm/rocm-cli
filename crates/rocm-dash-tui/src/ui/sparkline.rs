@@ -264,6 +264,52 @@ mod tests {
     }
 
     #[test]
+    fn odd_sample_count_keeps_its_last_half_column() {
+        // 3 samples occupy 1.5 character columns. Rounding the offset down
+        // instead of up would drop the newest sample off the right edge, so
+        // this pins `div_ceil` rather than `/ 2`.
+        let data = vec![100u64; 3];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        BrailleSparkline::new(&data)
+            .max(100)
+            .render(buf.area, &mut buf);
+        let drawn: Vec<bool> = (0..10)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol() != " ")
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                false, false, false, false, false, false, false, false, true, true
+            ]
+        );
+        // The last column carries one sample, so only its left dots are lit.
+        assert_eq!(buf.cell((9, 0)).unwrap().symbol(), "\u{2847}");
+    }
+
+    #[test]
+    fn the_baseline_cell_takes_the_gradient_start_color() {
+        // The zero-value baseline is part of the graph, so it must carry the
+        // gradient's low color rather than falling through to `style.fg`.
+        // Without this a `cell_value > 0` guard on the gradient would pass.
+        let data = vec![0u64];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let (low, mid, high) = (
+            Color::Rgb(10, 0, 0),
+            Color::Rgb(0, 20, 0),
+            Color::Rgb(0, 0, 30),
+        );
+        BrailleSparkline::new(&data)
+            .max(100)
+            .style(Style::default().fg(Color::Rgb(99, 99, 99)))
+            .gradient(low, mid, high)
+            .render(buf.area, &mut buf);
+        assert_eq!(buf.cell((0, 0)).unwrap().style().fg, Some(low));
+        // One sample fills only the cell's left dot column; its right half has
+        // no sample at all, so those dots stay dark.
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{2840}");
+    }
+
+    #[test]
     fn gradient_disabled_uses_flat_style() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
