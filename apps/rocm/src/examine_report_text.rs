@@ -2413,7 +2413,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
         let _ = fs::remove_dir_all(root);
 
         for (engine, _) in engine_inventory() {
