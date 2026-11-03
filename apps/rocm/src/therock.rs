@@ -6146,10 +6146,20 @@ mod tests {
         // no host-newer note, even where the dropped-suffix reading (`7.20.1`)
         // would have been newer than the version being installed.
         assert!(host_version_newer_than(Some("7.20.1-33rc1".to_owned()), "7.13.0").is_none());
-        assert_eq!(
-            host_version_newer_than(Some("7.20.1-33".to_owned()), "7.13.0").as_deref(),
-            Some("7.20.1-33")
-        );
+        // An empty tail is not a build number: `.all()` holds vacuously on it,
+        // so without the emptiness guard `7.2.4-` would be read as `7.2.4`.
+        assert_eq!(parse_host_version("7.2.4-"), None);
+        // The rule is deliberately strict: only an all-digit tail is a build
+        // number, so distro-style packaging tails are unreadable too. The cost
+        // is a missing host-newer note for such a host, never a false one.
+        for distro_tail in [
+            "7.2.4-98.el9",
+            "6.4.1-120~22.04",
+            "7.2.4-98-1",
+            "7.2.4-98+local",
+        ] {
+            assert_eq!(parse_host_version(distro_tail), None, "{distro_tail}");
+        }
     }
 
     #[test]
