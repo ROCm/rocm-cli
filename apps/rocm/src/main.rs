@@ -3208,6 +3208,14 @@ fn ensure_engine_allowed_on_platform(engine: &str, action: GatedEngineAction) ->
     refuse_if_ruled_out(engine_ruled_out_by_platform(engine), action)
 }
 
+/// The part of [`ensure_engine_allowed_on_platform`] that needs no Docker probe:
+/// treats the daemon as reachable, so only the OS gate can refuse. `serve` runs
+/// it first and the full gate after its own AIM pre-flight, so a request that
+/// pre-flight refuses never reaches `docker info`.
+fn ensure_engine_allowed_on_os(engine: &str, action: GatedEngineAction) -> Result<()> {
+    refuse_if_ruled_out(engine_ruled_out_by_platform_with(engine, || true), action)
+}
+
 /// [`ensure_engine_allowed_on_platform`] with the platform decision passed in,
 /// so the refusing branch is testable on any host.
 fn refuse_if_ruled_out(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Result<()> {

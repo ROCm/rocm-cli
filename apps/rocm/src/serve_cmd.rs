@@ -70,7 +70,7 @@ use crate::service_launch::{
 };
 use crate::{
     GatedEngineAction, cli_progress, collect_serve_notes, device_policy_name,
-    ensure_engine_allowed_on_platform,
+    ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -956,7 +956,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // Before runtime resolution and any launch: an engine the platform gate rules
     // out (vLLM on native Windows) must not reach a "no active runtime" error or
     // a background server that dies with no output.
-    ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
+    ensure_engine_allowed_on_os(&selected_engine, GatedEngineAction::Serve)?;
     // Fail closed: a public bind must be authenticated, but Windows managed
     // Lemonade cannot receive the key (see `ensure_public_bind_engine_supported`),
     // so refuse rather than launch an open public server.
@@ -1258,6 +1258,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !cpu_only && !scripted_backend_failure && !reuse_existing && host_has_no_usable_gpu {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
+    // The Docker probe comes after every refusal that needs no daemon (the AIM
+    // token and GPU pre-flight, the no-usable-GPU bail): a request they refuse
+    // never reaches `docker info`.
+    ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
     // Whether the refusal above was waived *only* because a live service was
     // expected to be reused. `reuse_existing` already implies `!cpu_only` and
     // `host_has_no_usable_gpu` (the pre-gate requires both), so the scripted
