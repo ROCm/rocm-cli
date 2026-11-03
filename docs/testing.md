@@ -304,6 +304,52 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## API docs
+
+The API docs server lives in `rocmd`
+([api_docs.rs](../apps/rocmd/src/api_docs.rs)); the link the CLI prints is
+built in [api_docs_link.rs](../apps/rocm/src/api_docs_link.rs). Unit tests run a
+real docs server against a stand-in model server, covering the route catalogue,
+the forwarder (what it passes on and what it drops, and that a configured proxy
+does not divert it, and that its answers cannot run as pages of the docs'
+origin), stopped and unreachable servers, unreadable service records (503),
+the redirect to a server's page, a stop that does not wait on an open try-it
+stream, the loopback `Host` and `Origin` guard, and a taken or zero docs port. The CLI's tests cover when a
+link is and is not printed:
+
+```bash
+cargo test -p rocmd api_docs
+cargo test -p rocm --bin rocm api_docs_link
+cargo test -p rocm --bin rocm services_list_links_docs
+cargo test -p rocm --bin rocm serve_summary
+```
+
+[service_docs.feature](../tests/e2e-cucumber/features/service_docs.feature)
+starts the real `rocm daemon` in the scenario's isolated tree, on a port of its
+own set in that tree's `config.json`, and drives the CLI and the docs over HTTP.
+`service-docs-03` stops the server with `rocm services stop`, so it is Linux
+only (`@requires-os:linux`):
+
+```bash
+cargo xtask e2e -- -n "service-docs-"
+```
+
+The `docs:` line `rocm serve` prints in its plain (piped) output, and a try-it
+request through it to a real engine, are checked by the GPU serve canaries
+`serve-05` (vLLM) and `serve-07` (Lemonade), which only run on GPU lanes. On
+Linux Lemonade lanes `serve-07` is an expected failure for an unrelated known
+issue, so there a broken docs link would not turn the lane red: the Lemonade
+check is effective on the Windows Lemonade lanes, and `serve-05` on the vLLM
+lanes.
+
+No scenario reaches the other places `rocm serve` prints the link, which are
+checked by hand in [manual-testing.md](manual-testing.md) section 4b: the
+`docs` row of the deployment summary (shown only on a terminal; the e2e harness
+pipes `rocm serve`'s output), the `--verbose` output (attached mode streams the
+engine log until Ctrl-D or Ctrl-C), and the `docs:` line under "managed service
+already running" (piped, but it needs a live server and an active runtime, so a
+scenario for it would only run on GPU lanes).
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs

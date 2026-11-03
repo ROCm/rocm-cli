@@ -1500,7 +1500,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             gpu_refusal_waived_for_reuse,
             &mut |_elapsed| spinner.tick(),
         )?;
-        ensure_background_helper_running_quiet(summary_mode)?;
+        let helper_starting = ensure_background_helper_running_quiet(summary_mode)?;
+        let docs_link = crate::api_docs_link::service_docs_link(
+            &paths,
+            &report.service_id,
+            crate::api_docs_link::serve_docs_wait(helper_starting),
+            &mut || spinner.tick(),
+        );
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1558,6 +1564,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 metrics,
                 api_key: launched_key,
                 notes,
+                docs_url: docs_link,
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
             // in service_launch.rs; see its rationale for why the tag below is currently inert.
@@ -1565,7 +1572,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             print!("{}", serve_summary::render_summary(&summary));
         } else {
             spinner.clear();
-            print_managed_launch_plain(&report, launched_key.as_deref());
+            print_managed_launch_plain(&report, launched_key.as_deref(), docs_link.as_deref());
         }
         return Ok(());
     }

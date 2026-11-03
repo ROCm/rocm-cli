@@ -72,6 +72,7 @@ repository.
 | axum-core | 0.5.6 | MIT |
 | backtrace | 0.3.76 | MIT OR Apache-2.0 |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
+| base64 | 0.23.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
 | bit-set | 0.5.3 | MIT/Apache-2.0 |
 | bit-vec | 0.6.3 | MIT/Apache-2.0 |
@@ -535,6 +536,10 @@ repository.
 | utf-8 | 0.7.6 | MIT OR Apache-2.0 |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT |
+| utoipa | 6.0.0 | MIT OR Apache-2.0 |
+| utoipa-gen | 6.0.1 | MIT OR Apache-2.0 |
+| utoipa-swagger-ui | 10.0.2 | MIT OR Apache-2.0 |
+| utoipa-swagger-ui-vendored | 0.2.0 | MIT OR Apache-2.0 |
 | uuid | 1.23.3 | Apache-2.0 OR MIT |
 | valuable | 0.1.1 | MIT |
 | version_check | 0.9.5 | MIT/Apache-2.0 |
@@ -550,6 +555,7 @@ repository.
 | wasm-bindgen-macro | 0.2.125 | MIT OR Apache-2.0 |
 | wasm-bindgen-macro-support | 0.2.125 | MIT OR Apache-2.0 |
 | wasm-bindgen-shared | 0.2.125 | MIT OR Apache-2.0 |
+| wasm-streams | 0.4.2 | MIT OR Apache-2.0 |
 | wasm-streams | 0.5.0 | MIT OR Apache-2.0 |
 | web-sys | 0.3.102 | MIT OR Apache-2.0 |
 | web-time | 1.1.0 | MIT OR Apache-2.0 |
@@ -763,6 +769,14 @@ cargo xtask tpn
 With the prek hooks installed this runs automatically whenever you commit a
 dependency-graph change, so the notices rarely go stale by hand; the hook skips
 if cargo-about is absent or not the pinned version.
+
+Assets compiled in that are not crates — today, the Swagger UI bundle behind
+the API docs of running model servers — are listed in a "Bundled web assets"
+section maintained by hand at the end of `about.hbs`. `cargo-about` cannot see
+them, so their licenses bypass the `about.toml` check: when a dependency bump
+changes such an asset, update that section from the asset's own upstream
+notices. A test in `rocmd` fails when the served Swagger UI version is not the
+one the notices name.
 
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the

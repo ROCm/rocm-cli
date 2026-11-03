@@ -43,6 +43,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the API docs link printed when it started opens the server's API docs
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
   # each GPU platform end-to-end at least once. The model follows the lane's serve
@@ -69,6 +70,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the API docs link printed when it started opens the server's API docs
 
   # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
   # bypasses Lemonade's model router and runs a packaged llama-server directly

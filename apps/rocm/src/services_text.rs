@@ -431,6 +431,13 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         return Ok(output);
     }
 
+    let docs_links = crate::api_docs_link::service_docs_links(
+        paths,
+        records
+            .iter()
+            .filter(|record| managed_service_is_live(record))
+            .map(|record| record.service_id.as_str()),
+    );
     let _ = writeln!(output, "Servers");
     for record in records {
         let _ = writeln!(output, "- {}", record.service_id);
@@ -438,11 +445,14 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if let Some((_, link)) = docs_links
+            .iter()
+            .find(|(service_id, _)| *service_id == record.service_id)
+        {
+            let _ = writeln!(output, "  docs: {link}");
+        }
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
-        if matches!(
-            record.status.as_str(),
-            "ready" | "running" | "starting" | "recovering"
-        ) {
+        if record.is_live() {
             let _ = writeln!(
                 output,
                 "  stop: {}",
@@ -1777,6 +1787,50 @@ mod tests {
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
+        Ok(())
+    }
+
+    #[test]
+    fn services_list_links_docs_only_for_live_servers() -> Result<()> {
+        use crate::api_docs_link::tests::{
+            openapi_for, paths_with_docs, stand_in_docs_server_after,
+        };
+        use std::sync::atomic::Ordering;
+
+        // A docs server that answers for this id whatever its record says, so
+        // only the CLI's own live filter can keep a stopped server unlinked.
+        let (port, stop, _) = stand_in_docs_server_after(0, "200 OK", openapi_for("svc-x"));
+        let mut rendered = Vec::new();
+        for (name, status) in [
+            ("services-docs-live", "starting"),
+            ("services-docs-stopped", "stopped"),
+        ] {
+            let (root, paths) = paths_with_docs(name, true, port);
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                "svc-x",
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                11436,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            );
+            record.status = status.to_owned();
+            record.write()?;
+            rendered.push(render_services_text(&paths, true)?);
+            let _ = fs::remove_dir_all(root);
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let docs_line = format!("  docs: http://127.0.0.1:{port}/services/svc-x/docs/");
+        assert!(rendered[0].contains(&docs_line), "{}", rendered[0]);
+        assert!(rendered[1].contains("status: stopped"), "{}", rendered[1]);
+        assert!(!rendered[1].contains("docs:"), "{}", rendered[1]);
         Ok(())
     }
 

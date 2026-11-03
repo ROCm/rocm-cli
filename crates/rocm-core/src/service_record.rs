@@ -149,6 +149,17 @@ impl std::fmt::Display for ManagedServiceNotFound {
 impl std::error::Error for ManagedServiceNotFound {}
 
 impl ManagedServiceRecord {
+    /// Whether the record says the server is up or coming up. Shared by the
+    /// CLI's services list and the daemon's API docs, so a docs link is
+    /// printed exactly for the servers the docs serve.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
     /// Read and parse the record for `service_id` exactly as it is on disk.
     ///
     /// The single loader behind every command that takes a service id, in both
@@ -516,6 +527,23 @@ mod tests {
             "{error:?}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_record_is_live_while_its_server_is_up_or_coming_up() {
+        let mut record = probe_test_record(11435);
+        for (status, live) in [
+            ("ready", true),
+            ("running", true),
+            ("starting", true),
+            ("recovering", true),
+            ("stopped", false),
+            ("failed", false),
+            ("", false),
+        ] {
+            record.status = status.to_owned();
+            assert_eq!(record.is_live(), live, "{status:?}");
+        }
     }
 
     #[test]

@@ -64,6 +64,8 @@ pub(crate) struct DeploymentSummary {
     pub api_key: Option<String>,
     /// GPU/device warnings folded in from the serve plan.
     pub notes: Vec<String>,
+    /// The server's API docs page, when the docs server answered for it.
+    pub docs_url: Option<String>,
 }
 
 /// Render `Some(ttft)` as a human duration, or `n/a` when the probe did not
@@ -127,8 +129,13 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ("engine", summary.engine.clone()),
         ],
         model_rows,
+        vec![("endpoint", summary.chat_endpoint.clone())],
+        summary
+            .docs_url
+            .iter()
+            .map(|url| ("docs", url.clone()))
+            .collect(),
         vec![
-            ("endpoint", summary.chat_endpoint.clone()),
             ("time to first token", format_ttft(summary.metrics.ttft)),
             ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
             ("service", summary.service_id.clone()),
@@ -272,7 +279,40 @@ mod tests {
             },
             api_key: None,
             notes: Vec::new(),
+            docs_url: None,
         }
+    }
+
+    // Pins only where the row goes. Whether a link is printed at all is
+    // `api_docs_link`'s tests; that the printed link opens the server's docs is
+    // the GPU serve canaries' last step (serve-05, serve-07).
+    #[test]
+    fn summary_links_the_api_docs_under_the_endpoint_when_they_answered() {
+        let summary = DeploymentSummary {
+            docs_url: Some("http://127.0.0.1:11430/services/vllm-qwen-1720000000/docs/".to_owned()),
+            ..base_summary()
+        };
+        let rendered = render_summary(&summary);
+        let endpoint_row = rendered
+            .lines()
+            .position(|line| line.trim_start().starts_with("endpoint "))
+            .expect("endpoint row");
+        assert_eq!(
+            rendered.lines().nth(endpoint_row + 1).map(str::trim),
+            Some("docs                 http://127.0.0.1:11430/services/vllm-qwen-1720000000/docs/"),
+            "the docs row must follow the endpoint row"
+        );
+    }
+
+    #[test]
+    fn summary_prints_no_docs_row_when_the_docs_did_not_answer() {
+        let rendered = render_summary(&base_summary());
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("docs ")),
+            "no docs row without an answering docs server"
+        );
     }
 
     #[test]

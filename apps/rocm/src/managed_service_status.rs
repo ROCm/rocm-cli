@@ -78,10 +78,7 @@ pub(crate) fn managed_service_sidebar_counts(
 }
 
 pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
-    matches!(
-        record.status.as_str(),
-        "ready" | "running" | "starting" | "recovering"
-    )
+    record.is_live()
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
