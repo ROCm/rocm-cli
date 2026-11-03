@@ -49,8 +49,14 @@
 //! `amd-smi` on a machine without one. They are:
 //!
 //! - the `rocm dash` collector's, where `apps/rocm/src/dash.rs` passes the
-//!   re-rooted path down to the dash daemon — those crates deliberately do not
-//!   depend on this one, so the caller resolves it;
+//!   re-rooted path down to the dash daemon. `rocm-dash-collectors` does depend
+//!   on this crate (EAI-8457) and shares [`crate::device_readable_bounded`], but
+//!   it is still *handed* the re-rooted path rather than calling [`host_path`]
+//!   itself: the path has to come from the same resolution `apps/rocm` used for
+//!   its own probes, and the daemon that carries it in between
+//!   (`rocm-dash-daemon`) has no dependency on this crate to resolve it with.
+//!   The presentation layer, `rocm-dash-tui`, has no edge to this crate at all
+//!   and is the one the `crate_edges.rs` allowlist still forbids;
 //! - the synchronous one behind `crate::amd_smi_json`, which `rocm serve` and
 //!   `rocmd` reach and which calls [`host_path`] itself.
 //!

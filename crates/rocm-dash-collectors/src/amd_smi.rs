@@ -51,11 +51,14 @@ impl AmdSmiCollector {
     /// `gpu_reachable` lets the pre-flight pass without a readable `/dev/kfd`
     /// (e.g. on WSL, where the real signal is `rocm_core::has_usable_amd_gpu()`
     /// rather than any single device node this crate could probe directly).
-    /// This crate deliberately does not depend on `rocm-core` to compute that
-    /// verdict itself; the caller (`apps/rocm`, which already depends on it)
-    /// threads it through instead, so on WSL, `serve`/`examine`/the dashboard
-    /// never disagree about whether a host's GPU is usable. On bare metal the
-    /// caller always passes `false`, so this is still a plain `/dev/kfd` check.
+    /// This crate does depend on `rocm-core` (EAI-8457, for the shared bounded
+    /// device probe below), so computing the verdict here would compile — it is
+    /// still threaded in from the caller (`apps/rocm`) on purpose. The verdict
+    /// is a *decision about this host* that `serve`, `examine` and the dashboard
+    /// must not reach independently; recomputing it in the collector is how the
+    /// three come to disagree about whether a host's GPU is usable, not how they
+    /// stay in step. On bare metal the caller always passes `false`, so this is
+    /// still a plain `/dev/kfd` check.
     ///
     /// `host_kfd_device` is where the caller's hardware probes put `/dev/kfd`
     /// (`rocm_core::host_path`'s answer, threaded in for the same reason as

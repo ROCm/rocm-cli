@@ -88,10 +88,13 @@ pub struct RunnerOptions {
     /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
     /// that lets the amd-smi device pre-flight pass without a readable
     /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
-    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
-    /// deliberately don't depend on `rocm-core` to compute this themselves;
-    /// the caller (`apps/rocm`) does and passes the answer through. `false`
-    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    /// and `examine` already act on. This crate has no `rocm-core` dependency
+    /// to compute it with; `rocm-dash-collectors`, which does have one since
+    /// EAI-8457, still takes it threaded through rather than recomputing it, so
+    /// the dashboard cannot reach a different verdict about the same host than
+    /// `serve` and `examine` did. The caller (`apps/rocm`) computes it once and
+    /// passes the answer through both. `false` (the default) preserves the
+    /// bare-metal-only `/dev/kfd` check.
     pub amd_smi_gpu_reachable: bool,
     /// Where the caller's hardware probes put `/dev/kfd`.
     ///

@@ -17,9 +17,12 @@
 //!   fast public getters (`runtime_os_name`, `is_wsl_host`,
 //!   `detect_host_gpu_summary`) and never `ExamineSummary::gather()`, whose
 //!   Windows path chains several process-spawning inventory queries.
-//! - **Plain data.** The dash crates carry no `rocm-core` dependency; the bin
-//!   detects and renders, and the rendered `String` rides down through
-//!   `ResolvedArgs`.
+//! - **Plain data.** `rocm-dash-tui`, which owns `ResolvedArgs`, carries no
+//!   `rocm-core` dependency and is forbidden one by `xtask/src/crate_edges.rs`.
+//!   So the bin detects and renders, and the rendered `String` rides down
+//!   through `ResolvedArgs`. (`rocm-dash-collectors` did gain a `rocm-core`
+//!   edge in EAI-8457, for the bounded `/dev/kfd` probe; nothing on this path
+//!   runs there.)
 //!
 //! Rendering is separated from detection ([`HostFacts::render`] is pure) so the
 //! wording is unit-testable without a machine.

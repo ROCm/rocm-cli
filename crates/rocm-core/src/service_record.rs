@@ -11,8 +11,9 @@
 //! on-disk format at runtime, through its own `ServiceRecord` mirror struct
 //! in `registry.rs` rather than this type, and the serde test guards that
 //! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
-//! a doc comment — `rocm-dash-core` and `rocm-dash-collectors` do not depend
-//! on `rocm-core` at all.
+//! a doc comment. `rocm-dash-core` does not depend on `rocm-core` at all;
+//! `rocm-dash-collectors` does since EAI-8457, but only for the shared bounded
+//! `/dev/kfd` probe, and it never reads this on-disk format either.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
