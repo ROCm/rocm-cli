@@ -8,9 +8,10 @@ Feature: TheRock "next" ROCm 10 install layout
   # auto-select, and any pin that is not a stable ROCm 10 version, stay on the
   # canonical streams.
   #
-  # Scenarios 01-05 point source overrides at loopback fixtures through the
-  # explicit trust gate. Scenario 06 proves the same overrides are inert when
-  # the trust gate is absent; scenario 07 supplies the live GPU evidence.
+  # Scenarios 01-05, 15 and 16 point source overrides at loopback fixtures
+  # through the explicit trust gate. Scenario 06 proves the same overrides are
+  # inert when the trust gate is absent; scenario 07 supplies the live GPU
+  # evidence.
 
   # An unpinned release install resolves the newest stable version on the next
   # layout. The fixture publishes 10.0.0, 10.1.0, and a newer prerelease on the
@@ -23,26 +24,6 @@ Feature: TheRock "next" ROCm 10 install layout
     Then the preview selects ROCm 10.1.0 from the ROCm 10 pip index
     And the preview reports the next source layout generation
     And the preview does not select the canonical release or the newer prerelease
-
-  # A stable pin below ROCm 10 stays on the canonical fixture. The version is
-  # the one that fixture publishes (7.10.0); 7.14.1 is the same decision and is
-  # covered by `requested_source_layout_reads_the_request_not_the_resolution`.
-  @id:therock-next-16-older-pin-stays-canonical
-  Scenario: therock-next-16 - A ROCm 7 pin stays on the canonical multi-arch source
-    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
-    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.10.0
-    Then the preview resolves the canonical release pip index
-    And the preview reports the canonical multi-arch source layout generation
-    And the preview never mentions the ROCm 10 pip index
-
-  # No silent fallback when the family is a group label. Reverting the default
-  # route to the canonical stream would make this preview succeed.
-  @id:therock-next-15-unpinned-release-group-family-refused
-  Scenario: therock-next-15 - An unpinned release wheel install refuses a group family label
-    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
-    When the user previews a wheel SDK install for family gfx120X-all with no version pin
-    Then the install fails
-    And the failure asks for an exact GPU arch and names --family gfx1200
 
   # `--version 10.0.0` plus a raw arch is the whole opt-in. The device payload is
   # requested as an exact `device-gfx1200` extra on rocm, torch and torchvision;
@@ -272,3 +253,23 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming
     Then the install is refused without replacing the active default runtime
     And the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified
+
+  # No silent fallback when the family is a group label. Reverting the default
+  # route to the canonical stream would make this preview succeed.
+  @id:therock-next-15-unpinned-release-group-family-refused
+  Scenario: therock-next-15 - An unpinned release wheel install refuses a group family label
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for family gfx120X-all with no version pin
+    Then the install fails
+    And the failure asks for an exact GPU arch and names --family gfx1200
+
+  # A stable pin below ROCm 10 stays on the canonical fixture. The version is
+  # the one that fixture publishes (7.10.0); 7.14.1 is the same decision and is
+  # covered by `requested_source_layout_reads_the_request_not_the_resolution`.
+  @id:therock-next-16-older-pin-stays-canonical
+  Scenario: therock-next-16 - A ROCm 7 pin stays on the canonical multi-arch source
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.10.0
+    Then the preview resolves the canonical release pip index
+    And the preview reports the canonical multi-arch source layout generation
+    And the preview never mentions the ROCm 10 pip index

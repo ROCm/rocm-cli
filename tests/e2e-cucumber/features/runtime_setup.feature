@@ -144,9 +144,10 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Both channels now resolve from one canonical aggregate index each, so the
+  # The nightly channel resolves from one canonical aggregate index, and an
+  # unpinned release install from the ROCm 10 index (runtime-09 below), so the
   # provenance the preview prints is the whole of what the user can check before
-  # committing to a multi-GiB install. This pins the nightly half: the source that
+  # committing to a multi-GiB install. This pins the nightly case: the source that
   # was selected, the version that came back from it, and the layout generation
   # that source was read as. `--family` is supplied so the scenario needs no GPU,
   # and `@nightly` because it resolves the real index over the network — the same

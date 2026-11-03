@@ -335,9 +335,11 @@ async fn pip_indexes_for_unpinned_newest_stable(world: &mut E2eWorld) {
     let rocm_index = served.join("next").join("rocm").join("index.html");
     let mut html = std::fs::read_to_string(&rocm_index).expect("rocm index was just written");
     let prerelease = format!("rocm-{NEWER_PRERELEASE_ROCM_VERSION}-{ANY_WHEEL_TAG}.whl");
-    html.push_str(&format!(
-        "<a href=\"{prerelease}\" data-dist-info-metadata=\"true\">{prerelease}</a>\n"
-    ));
+    writeln!(
+        html,
+        "<a href=\"{prerelease}\" data-dist-info-metadata=\"true\">{prerelease}</a>"
+    )
+    .expect("writing to a String cannot fail");
     std::fs::write(&rocm_index, html).expect("failed to add the prerelease link");
     serve_pip_fixtures(world);
 }
@@ -605,7 +607,7 @@ const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
 /// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
 const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[given("a paced canonical release tarball fixture")]
+#[given("a paced release tarball fixture")]
 async fn paced_tarball_fixture(world: &mut E2eWorld) {
     let served = root(world).join("therock-paced-tarball-fixture");
     write_fixture(
@@ -655,7 +657,7 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", catalog.into()));
 }
 
-#[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
+#[when("the user installs the tarball SDK for arch gfx1200 under a real terminal")]
 async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
     // No `--version`: an unpinned release tarball reads the next catalog. The
     // given-step points that catalog at the paced fixture, which publishes

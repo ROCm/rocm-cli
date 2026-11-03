@@ -17,8 +17,8 @@ Feature: Download-progress spinner under a real terminal
   # this scenario alone. Serial execution removes that contention.
   @id:download-progress-linux-tarball-install-shows-live-progress @requires-os:linux @serial
   Scenario: download-progress-01 - The tarball download spinner renders progress and clears on completion
-    Given a paced canonical release tarball fixture
-    When the user installs the tarball SDK for family gfx120X-all under a real terminal
+    Given a paced release tarball fixture
+    When the user installs the tarball SDK for arch gfx1200 under a real terminal
     Then the terminal shows an intermediate download progress frame
     And the terminal shows the archive being extracted
     And the tarball install exits cleanly

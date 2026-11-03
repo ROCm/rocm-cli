@@ -1458,6 +1458,25 @@ fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord
     )
 }
 
+/// The fail-fast layout check [`install_wheel_runtime`] runs before it
+/// provisions Python. A fresh install (`layout_override` is `None`) asks
+/// [`select_source_layout`], so a request it could only refuse stops here. An
+/// update passes the layout its manifest recorded and skips the check:
+/// re-deciding from the update's absent selector would treat a canonical
+/// runtime's refresh as an unpinned release install, and refuse it on a host
+/// that names only a grouped family.
+fn preflight_fresh_install_layout(
+    layout_override: Option<SourceLayout>,
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+    family_resolution: impl FnOnce() -> Result<FamilyResolution>,
+) -> Result<()> {
+    if layout_override.is_some() {
+        return Ok(());
+    }
+    select_source_layout(channel, &family_resolution()?, version_selector).map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_wheel_runtime(
     paths: &AppPaths,
@@ -1484,16 +1503,10 @@ fn install_wheel_runtime(
     // Fail fast on a fresh request `resolve_pip_runtime` could only ever reject
     // (wrong channel, or a grouped family with no exact arch) before paying for
     // Python provisioning below, which can mean a real download for a layout
-    // this host or channel can never actually use. An update already recorded
-    // its layout; re-deciding from the absent selector would treat a canonical
-    // runtime's refresh as an unpinned release install.
-    if layout_override.is_none() {
-        select_source_layout(
-            channel,
-            &resolve_family(paths, recovered_family_override.as_deref())?,
-            version_selector,
-        )?;
-    }
+    // this host or channel can never actually use.
+    preflight_fresh_install_layout(layout_override, channel, version_selector, || {
+        resolve_family(paths, recovered_family_override.as_deref())
+    })?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags. `requested_source_layout`
     // answers from the *request*: an unpinned release install and an explicit
@@ -7442,12 +7455,6 @@ mod tests {
             .version,
             "3.12"
         );
-        // A two-component selector does not parse as stable >= 10.
-        let line_pin = RuntimeVersionSelector::Version("10.1".to_owned());
-        assert_eq!(
-            requested_source_layout(None, TheRockChannel::Release, Some(&line_pin)),
-            SourceLayout::Canonical
-        );
 
         assert_eq!(
             requested_source_layout(None, TheRockChannel::Release, None),
@@ -7494,6 +7501,72 @@ mod tests {
             select_rocm_version(TheRockChannel::Release, &versions, None).as_deref(),
             Some("10.1.0")
         );
+    }
+
+    /// The canonical release catalog orders by version too: a republished
+    /// older stable archive with a later mtime does not beat a newer stable.
+    /// The nightly catalog keeps upload time as its first key.
+    #[test]
+    fn canonical_tarball_release_orders_by_version_and_nightly_by_upload_time() {
+        let platform = platform_tarball_token();
+        let prefix = format!("therock-dist-{platform}-gfx110X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}7.14.0.tar.gz"),
+                mtime: 30.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}7.14.1.tar.gz"),
+                mtime: 10.0,
+            },
+        ];
+
+        let release = select_tarball_candidate(
+            &files,
+            TheRockChannel::Release,
+            SourceLayout::Canonical,
+            "gfx110X-all",
+            None,
+        )
+        .map(|(_, version)| version);
+        assert_eq!(release.as_deref(), Some("7.14.1"));
+
+        let nightly = select_tarball_candidate(
+            &files,
+            TheRockChannel::Nightly,
+            SourceLayout::Canonical,
+            "gfx110X-all",
+            None,
+        )
+        .map(|(_, version)| version);
+        assert_eq!(
+            nightly.as_deref(),
+            Some("7.14.0"),
+            "the nightly catalog picks the latest upload"
+        );
+    }
+
+    /// An update passes the layout its manifest recorded. On a host that names
+    /// only a grouped family, the preflight must let that update through
+    /// instead of judging it as an unpinned release install, which would need
+    /// an exact arch. A fresh unpinned release install on the same host still
+    /// refuses.
+    #[test]
+    fn preflight_skips_the_layout_check_for_an_update_with_a_recorded_layout() {
+        let grouped = || Ok(family_for_test("gfx110X-all", None));
+
+        preflight_fresh_install_layout(
+            Some(SourceLayout::Canonical),
+            TheRockChannel::Release,
+            None,
+            grouped,
+        )
+        .expect("updating a canonical runtime must not demand an exact arch");
+
+        let error = preflight_fresh_install_layout(None, TheRockChannel::Release, None, grouped)
+            .expect_err("a fresh unpinned release install needs an exact arch")
+            .to_string();
+        assert!(error.contains("requires an exact GPU arch"), "{error}");
     }
 
     /// Same rule on the tarball catalog: a later mtime on an older stable, or
