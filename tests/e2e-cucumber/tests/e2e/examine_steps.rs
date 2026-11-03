@@ -173,6 +173,21 @@ async fn assert_version_returned(world: &mut E2eWorld) {
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
     );
+    // `format_cli_version` in apps/rocm/build.rs: a tag `vX.Y.Z` is reported
+    // with that one leading `v` removed; every other resolved ref, including
+    // `main`, is `0.0.0-dev` rather than the unpublished workspace package
+    // version.
+    if reference.strip_prefix('v') == Some(version) {
+        assert!(
+            version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "release version does not start with a digit: {output}"
+        );
+    } else {
+        assert_eq!(
+            version, "0.0.0-dev",
+            "non-release build must report 0.0.0-dev, not a package version: {output}"
+        );
+    }
 
     // `rocm version`'s own two lines beyond the build string. Both are printed
     // unconditionally (either the detected value or a "not detected"/"unmanaged"

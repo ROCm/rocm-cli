@@ -320,6 +320,9 @@ enum Command {
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
+    ///
+    /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A build
+    /// from `main` is shown as `0.0.0-dev (main, <hash>)`.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -1679,17 +1682,24 @@ fn parse_cli() -> Result<Cli> {
 }
 
 /// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
-/// the MCP in-process handler) prints: the semantic version Cargo built, plus
-/// the git ref and commit hash [`build.rs`] embedded, additively — never a
-/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
-/// still reports a real version number rather than none at all.
+/// the MCP in-process handler) prints. `format_cli_version` in `build.rs`
+/// computes this once from the ref and commit hash it already resolves and
+/// exports it as `ROCM_CLI_VERSION`, so these surfaces cannot disagree.
+///
+/// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A branch,
+/// including `main`, is shown as `0.0.0-dev (<ref>, <hash>)`. Only an
+/// unresolved ref falls back to the workspace package version, which is not
+/// itself a release.
 fn cli_version_string() -> String {
-    format!(
-        "{} ({}, {})",
-        env!("CARGO_PKG_VERSION"),
-        env!("ROCM_CLI_VERSION_REF"),
-        env!("ROCM_CLI_GIT_HASH")
-    )
+    env!("ROCM_CLI_VERSION").to_owned()
+}
+
+/// The leading version of [`cli_version_string`], without the parenthetical
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
+fn cli_version_number() -> String {
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
@@ -3232,6 +3242,16 @@ fn perform_delivery(
     format!("{SENDER_NOTICE}\n{outcome}")
 }
 
+/// The report this machine would contribute, naming this build's leading
+/// version: the one `rocm version` starts with.
+fn prepare_cli_report(
+    examination: &rocm_core::Examination,
+    entry: Option<&str>,
+    fix_offered: bool,
+) -> std::result::Result<rocm_core::Report, rocm_core::ReportRefusal> {
+    rocm_core::prepare_report(examination, entry, fix_offered, &cli_version_number())
+}
+
 /// Print the report this machine would contribute, and send nothing.
 fn show_prepared_report(
     examination: &rocm_core::Examination,
@@ -3245,7 +3265,7 @@ fn show_prepared_report(
     // looking for a fault. Anything scripting this reads the outcome from
     // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
     // already asks callers to do.
-    match rocm_core::prepare_report(examination, entry, fix_offered) {
+    match prepare_cli_report(examination, entry, fix_offered) {
         Ok(prepared) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&prepared)?);
@@ -5569,6 +5589,69 @@ pub(crate) mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
+    #[test]
+    fn version_surfaces_share_one_build_script_string() {
+        let full = super::cli_version_string();
+        let number = super::cli_version_number();
+        let reference = env!("ROCM_CLI_VERSION_REF");
+        let hash = env!("ROCM_CLI_GIT_HASH");
+        assert_eq!(full, env!("ROCM_CLI_VERSION"));
+        assert_eq!(
+            super::cli_command().get_version(),
+            Some(full.as_str()),
+            "-V/--version must print the same string as `rocm version`"
+        );
+        assert_eq!(full, format!("{number} ({reference}, {hash})"));
+        // A resolved ref whose text is not `v` plus the leading version is not
+        // a release tag. `main`, a feature branch, and a name such as `vllm`
+        // all land here, and none of them may report the workspace package
+        // version.
+        if reference != "unknown" && reference.strip_prefix('v') != Some(number.as_str()) {
+            assert_eq!(number, "0.0.0-dev", "{full}");
+            assert_ne!(number, env!("CARGO_PKG_VERSION"));
+        }
+        if reference == "unknown" {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    /// `rocm diagnose --report` publishes the version `rocm version` leads
+    /// with, not `rocm-core`'s frozen package version. The e2e side is
+    /// `@id:diagnose-report-names-the-cli-version`, which only reaches a real
+    /// report on a lane with a released AMD GPU.
+    #[test]
+    fn a_problem_report_names_the_version_rocm_version_leads_with() {
+        let examination = rocm_core::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            distro_version: "22.04".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![rocm_core::examine::Gpu {
+                name: "test".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: String::new(),
+                is_apu: Some(false),
+                is_amd: true,
+            }],
+            ..rocm_core::Examination::default()
+        };
+        let report = super::prepare_cli_report(&examination, None, false)
+            .expect("a released GPU must produce a report");
+        let number = super::cli_version_number();
+        assert_eq!(report.cli_version, number);
+        assert!(
+            super::cli_version_string().starts_with(&format!("{number} (")),
+            "{number:?} does not lead `rocm version`'s string"
+        );
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,

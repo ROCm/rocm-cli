@@ -2479,6 +2479,15 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
+`cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
+`vX.Y.Z` tag build, `0.0.0-dev` for any other ref), never the ref and hash
+after it (a release suffix outside letters, digits, `.`, `-` and `+`, or a
+version over 64 characters, is published as `unknown`). Scenario
+`diagnose-48` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
+on a simulated host whose planted GPU is on the allowlist, so it prepares a
+report on every Linux lane, GPU or not; on real hardware, compare the field with
+the first word after `rocm-cli` in `rocm version`.
 
 Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
 answer with a word rather than a value, and the words are not interchangeable.
