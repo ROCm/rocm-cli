@@ -473,19 +473,24 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
     // without ever contributing a displayed value — guarded the same way
     // `gen_tps_cell` guards a single instance's value.
-    let tps: f64 = state
+    let tps_samples: Vec<f64> = state
         .instances
         .values()
         .filter_map(|i| i.gen_tps)
         .filter(|v| v.is_finite())
-        .sum();
+        .collect();
+    let tps: f64 = tps_samples.iter().sum();
     let any_tps_held = state.instances.values().any(|i| {
         i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
     });
-    let tps_str = if any_tps_held {
+    // No instance reporting throughput is "not measured", not a measured 0 —
+    // and an empty f64 sum is -0.0, which `{:.0}` renders as "-0".
+    let tps_str = if tps_samples.is_empty() {
+        "—".to_string()
+    } else if any_tps_held {
         format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
     } else {
         format!("{tps:.0}")
@@ -1032,6 +1037,35 @@ mod tests {
         let mut s = state_with_gpu();
         s.instances.insert(inst.container_id.clone(), inst);
         s
+    }
+
+    /// The hero's T/S value, i.e. the text after the "T/S" label up to the
+    /// panel border on that row.
+    fn hero_tps_value(out: &str) -> &str {
+        out.split("T/S")
+            .nth(1)
+            .and_then(|s| s.split('│').next())
+            .unwrap_or_else(|| panic!("T/S row missing: {out:?}"))
+            .trim()
+    }
+
+    #[test]
+    fn hero_tps_shows_dash_not_negative_zero_when_nothing_reports_throughput() {
+        // A GPU is reported but no instance is serving: the Windows in-process
+        // collectors never send instances, and a Linux host with nothing
+        // running is in the same state.
+        let out = render(&state_with_gpu(), 160, 30);
+        assert_eq!(hero_tps_value(&out), "—", "got:\n{out}");
+    }
+
+    #[test]
+    fn hero_tps_shows_zero_when_an_instance_reports_zero_throughput() {
+        let out = render(
+            &state_with_instance(instance_with_obs(0.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
+        assert_eq!(hero_tps_value(&out), "0", "got:\n{out}");
     }
 
     #[test]
