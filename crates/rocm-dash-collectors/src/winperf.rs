@@ -23,7 +23,10 @@
 //! that.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo};
@@ -78,19 +81,28 @@ impl WinPerfCollector {
         let out = Self::run_script().await?;
         // adlx_readings() calls into amdadlx64.dll via FFI, which blocks on
         // driver I/O — running it directly here would stall a tokio worker
-        // thread, same hazard run_script() avoids by using an async Command.
-        // Timed out the same way: a wedged driver call must not freeze every
-        // other metric this tick forever. A panic or timeout surfaces as a
-        // warning; a driver that is absent or fails to initialise inside
+        // thread, so it runs under spawn_blocking. A native call cannot be
+        // cancelled, so the timeout below only stops *waiting*: a wedged
+        // call keeps its blocking-pool thread. `run_single_flight` therefore
+        // refuses to start another call while one is still running, which
+        // bounds the leak to that one thread instead of one per tick. A
+        // panic, timeout or still-wedged call surfaces as a warning; a
+        // driver that is absent or fails to initialise inside
         // adlx_readings() degrades to no readings with no warning, since
         // "no AMD driver" is an expected state indistinguishable from it.
         let (adlx, adlx_warning) =
-            match timeout(ADLX_TIMEOUT, task::spawn_blocking(adlx_readings)).await {
-                Ok(Ok(readings)) => (readings, None),
-                Ok(Err(_)) => (Vec::new(), Some("ADLX reading task panicked".to_string())),
-                Err(_) => (
+            match run_single_flight(&ADLX_IN_FLIGHT, ADLX_TIMEOUT, adlx_readings).await {
+                SingleFlight::Done(readings) => (readings, None),
+                SingleFlight::Panicked => {
+                    (Vec::new(), Some("ADLX reading task panicked".to_string()))
+                }
+                SingleFlight::TimedOut => (
                     Vec::new(),
                     Some(format!("ADLX query timed out after {ADLX_TIMEOUT:?}")),
+                ),
+                SingleFlight::StillRunning => (
+                    Vec::new(),
+                    Some("ADLX query skipped: a previous call is still running".to_string()),
                 ),
             };
         let metrics = parse_metrics(&out, &adlx);
@@ -104,13 +116,16 @@ impl WinPerfCollector {
     async fn run_script() -> io::Result<String> {
         let out = timeout(
             RUN_TIMEOUT,
-            Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", WINPERF_SCRIPT])
-                // Dropping the child on timeout must actually kill it, or a
-                // hung powershell.exe (and its driver query) leaks forever
-                // instead of exiting with the future that gave up on it.
-                .kill_on_drop(true)
-                .output(),
+            Command::new(powershell_path(
+                std::env::var_os("SystemRoot").as_deref(),
+                Path::exists,
+            ))
+            .args(["-NoProfile", "-NonInteractive", "-Command", WINPERF_SCRIPT])
+            // Dropping the child on timeout must actually kill it, or a
+            // hung powershell.exe (and its driver query) leaks forever
+            // instead of exiting with the future that gave up on it.
+            .kill_on_drop(true)
+            .output(),
         )
         .await
         .map_err(|_| io::Error::other("powershell Get-Counter query timed out"))??;
@@ -123,6 +138,72 @@ impl WinPerfCollector {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+}
+
+/// Set while an `adlx_readings` call is running on a blocking-pool thread.
+static ADLX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SingleFlight<T> {
+    Done(T),
+    Panicked,
+    /// The call did not finish within the deadline; it is still running and
+    /// `in_flight` stays set until it does.
+    TimedOut,
+    /// An earlier call is still running, so none was started.
+    StillRunning,
+}
+
+/// Clears the in-flight flag when the blocking closure ends, panic included.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs `f` on the blocking pool, waiting at most `deadline`, and never
+/// starts a second `f` while a previous one (timed out, but uncancellable) is
+/// still running on `in_flight`.
+async fn run_single_flight<T, F>(
+    in_flight: &'static AtomicBool,
+    deadline: Duration,
+    f: F,
+) -> SingleFlight<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return SingleFlight::StillRunning;
+    }
+    let handle = task::spawn_blocking(move || {
+        let _clear = ClearOnDrop(in_flight);
+        f()
+    });
+    match timeout(deadline, handle).await {
+        Ok(Ok(v)) => SingleFlight::Done(v),
+        Ok(Err(_)) => SingleFlight::Panicked,
+        Err(_) => SingleFlight::TimedOut,
+    }
+}
+
+/// Absolute `System32` PowerShell under `%SystemRoot%` when it exists, else
+/// the bare name. A bare name lets a `PATH`-order entry shadow the system
+/// binary; `crates/rocm-core/src/host_gpu.rs` resolves the same way, but this
+/// crate does not depend on `rocm-core`.
+fn powershell_path(system_root: Option<&OsStr>, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    system_root
+        .map(|root| {
+            Path::new(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|p| exists(p))
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
 /// `Win32_VideoController.AdapterRAM` is a 32-bit WMI field: a card with real
@@ -779,6 +860,73 @@ mod tests {
             total_vram_mb: Some(16384),
         };
         assert_eq!(apply_adlx(Some(&reading)), (65.0, 12.5, Some(1900.0)));
+    }
+
+    #[tokio::test]
+    async fn single_flight_returns_value_and_clears_flag() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let out = run_single_flight(&FLAG, Duration::from_secs(5), || 7).await;
+        assert_eq!(out, SingleFlight::Done(7));
+        assert!(!FLAG.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn single_flight_does_not_start_second_call_while_first_is_wedged() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let out = run_single_flight(&FLAG, Duration::from_millis(50), move || {
+            let _ = release_rx.recv();
+        })
+        .await;
+        assert_eq!(out, SingleFlight::TimedOut);
+
+        // The wedged call still holds its thread: a second call must not run.
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let out = run_single_flight(&FLAG, Duration::from_millis(50), move || {
+            ran2.store(true, Ordering::Release);
+        })
+        .await;
+        assert_eq!(out, SingleFlight::StillRunning);
+        assert!(!ran.load(Ordering::Acquire));
+
+        // Once the wedged call returns, the flag clears and calls resume.
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if !FLAG.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let out = run_single_flight(&FLAG, Duration::from_secs(5), || 1).await;
+        assert_eq!(out, SingleFlight::Done(1));
+    }
+
+    #[tokio::test]
+    async fn single_flight_panic_clears_flag() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let out: SingleFlight<()> =
+            run_single_flight(&FLAG, Duration::from_secs(5), || panic!("boom")).await;
+        assert_eq!(out, SingleFlight::Panicked);
+        assert!(!FLAG.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn powershell_path_prefers_existing_system32_binary() {
+        let p = powershell_path(Some(OsStr::new("C:\\Windows")), |_| true);
+        assert!(p.starts_with("C:\\Windows"), "{p:?}");
+        assert!(p.ends_with("powershell.exe"));
+        assert!(p.components().count() > 1);
+    }
+
+    #[test]
+    fn powershell_path_falls_back_to_bare_name() {
+        let missing = PathBuf::from("powershell.exe");
+        assert_eq!(
+            powershell_path(Some(OsStr::new("C:\\Windows")), |_| false),
+            missing
+        );
+        assert_eq!(powershell_path(None, |_| true), missing);
     }
 
     // adlx_readings() itself (the real ADLX FFI chain) is Windows-only and

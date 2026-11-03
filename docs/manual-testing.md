@@ -691,6 +691,34 @@ Expected result:
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
 
+### 4b. Dashboard Live GPU/CPU/Memory On Windows
+
+On a native Windows machine with an AMD GPU (no `rocmdashd` socket exists
+there, so the dashboard collects in-process):
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- Within a few seconds the Home tab shows live CPU and memory figures and a
+  GPU card with utilization and VRAM, updating about once a second. Until the
+  first reading arrives the GPU area shows a "Detecting GPU…" placeholder
+  rather than 0.0%.
+- On a host with exactly one real display adapter, VRAM total, temperature,
+  power and clock are filled in when the AMD driver's `amdadlx64.dll` is
+  present. With more than one adapter (for example a hybrid laptop) VRAM
+  total stays unmeasured and shows `—` in the Home hero and in the GPU wall
+  sidebar, never `0.0%`.
+- Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
+  back when it ends.
+- Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
+  utilization and VRAM usage working and temperature/power/clock at their
+  unmeasured values, with no crash.
+- No other output of this section needs a daemon: `rocm dash` must not report
+  a failed daemon connection.
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

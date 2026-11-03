@@ -209,7 +209,7 @@ The `ui/` modules the split moved code out of or into, beyond the shared compone
 
 The other three dashboard crates are described at crate level here, not module by module:
 
-- [`rocm-dash-collectors`](../crates/rocm-dash-collectors/src/lib.rs) — the IO-heavy collector implementations behind `rocm-dash-core`'s traits (amd-smi, Docker, host metrics, Lemonade and vLLM scrapers) plus the benchmark load generator; used by `rocm-dash-daemon`.
+- [`rocm-dash-collectors`](../crates/rocm-dash-collectors/src/lib.rs) — the IO-heavy collector implementations behind `rocm-dash-core`'s traits (amd-smi, Docker, host metrics, Lemonade and vLLM scrapers, and on Windows the [`winperf.rs`](../crates/rocm-dash-collectors/src/winperf.rs) perf-counter/ADLX GPU collector) plus the benchmark load generator; used by `rocm-dash-daemon` and, on Windows, by `rocm-dash-tui` in-process.
 - [`rocm-dash-core`](../crates/rocm-dash-core/src/lib.rs) — pure types, traits, schemas and the reducer, with no rendering dependencies.
 - [`rocm-dash-daemon`](../crates/rocm-dash-daemon/src/lib.rs) — the daemon library: [`runner.rs`](../crates/rocm-dash-daemon/src/runner.rs) drives the collectors on tick cadences and broadcasts snapshots, and [`server.rs`](../crates/rocm-dash-daemon/src/server.rs) streams them to TUI clients as NDJSON. `apps/rocm`'s [`dash.rs`](../apps/rocm/src/dash.rs) drives it.
 

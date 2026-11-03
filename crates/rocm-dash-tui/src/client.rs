@@ -190,6 +190,93 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
     Ok(())
 }
 
+/// Maps one tick's host metrics and the GPU collector's result onto the
+/// `Snapshot` sent to the app. A failed GPU query degrades to an empty GPU
+/// list plus a warning rather than dropping the tick, so CPU/memory keep
+/// updating. Pure (and not `cfg(windows)`) so the error path is unit-tested on
+/// every host.
+#[cfg_attr(not(windows), allow(dead_code))] // only the windows arm calls it; unit-tested everywhere
+fn build_host_gpu_snapshot(
+    host: rocm_dash_core::metrics::SystemMetrics,
+    gpu: std::io::Result<(
+        Vec<rocm_dash_core::metrics::GpuMetrics>,
+        rocm_dash_core::metrics::GpuSystemInfo,
+        Vec<String>,
+    )>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Snapshot {
+    let (gpus, gpu_system_info, warnings) = match gpu {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "windows GPU perf-counter query failed");
+            (
+                Vec::new(),
+                rocm_dash_core::metrics::GpuSystemInfo::default(),
+                vec![format!("windows GPU perf-counter query failed: {e}")],
+            )
+        }
+    };
+    Snapshot {
+        timestamp,
+        host,
+        gpus,
+        gpu_system_info: Some(gpu_system_info),
+        instances: Vec::new(),
+        warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, SystemMetrics};
+
+    fn host() -> SystemMetrics {
+        SystemMetrics {
+            cpu_overall_pct: 12.5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gpu_success_is_passed_through() {
+        let gpu = GpuMetrics {
+            device_id: "GPU0".into(),
+            ..Default::default()
+        };
+        let snap = build_host_gpu_snapshot(
+            host(),
+            Ok((vec![gpu], GpuSystemInfo::default(), vec!["w".into()])),
+            chrono::Utc::now(),
+        );
+        assert_eq!(snap.gpus.len(), 1);
+        assert_eq!(snap.gpus[0].device_id, "GPU0");
+        assert_eq!(snap.warnings, vec!["w".to_string()]);
+        assert!(snap.gpu_system_info.is_some());
+    }
+
+    #[test]
+    fn gpu_error_keeps_host_metrics_and_adds_warning() {
+        let snap = build_host_gpu_snapshot(
+            host(),
+            Err(std::io::Error::other(
+                "powershell Get-Counter query timed out",
+            )),
+            chrono::Utc::now(),
+        );
+        assert!(snap.gpus.is_empty());
+        assert!((snap.host.cpu_overall_pct - 12.5).abs() < f32::EPSILON);
+        assert_eq!(
+            snap.warnings,
+            vec![
+                "windows GPU perf-counter query failed: powershell Get-Counter query timed out"
+                    .to_string()
+            ]
+        );
+        assert!(snap.instances.is_empty());
+    }
+}
+
 /// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
 /// instead of connecting anywhere: `HostCollector` (already cross-platform)
 /// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
@@ -201,8 +288,6 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;
     use rocm_dash_collectors::winperf::WinPerfCollector;
-    use rocm_dash_core::metrics::GpuSystemInfo;
-
     info!(
         connect,
         "windows: collecting metrics in-process (no daemon socket)"
@@ -223,26 +308,8 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 
     loop {
         ticker.tick().await;
-        let host_metrics = host.tick();
-        let (gpus, gpu_system_info, warnings) = match gpu.snapshot().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "windows GPU perf-counter query failed");
-                (
-                    Vec::new(),
-                    GpuSystemInfo::default(),
-                    vec![format!("windows GPU perf-counter query failed: {e}")],
-                )
-            }
-        };
-        let snapshot = Snapshot {
-            timestamp: chrono::Utc::now(),
-            host: host_metrics,
-            gpus,
-            gpu_system_info: Some(gpu_system_info),
-            instances: Vec::new(),
-            warnings,
-        };
+        let snapshot =
+            build_host_gpu_snapshot(host.tick(), gpu.snapshot().await, chrono::Utc::now());
         if tx
             .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))
             .is_err()
