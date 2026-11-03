@@ -24,12 +24,15 @@
 //! against 1.05-1.28 GiB in the others, for a reason that is not known. Across
 //! all sixteen it was 0.05% to 5.5% above and never below. That is the same data
 //! the allowances were fitted to, so it measures the fit, not a guarantee:
-//! another engine build, another GPU, a mixture-of-experts model or a different
-//! batch size can miss by more -- in either direction for a state-space model,
-//! whose recurrent state is not counted. That is why the answer is labelled an
-//! *estimate* everywhere it is shown, and why layouts the formula does not
-//! describe (latent attention, split files, models with no attention layers) are
-//! reported as [`EstimateOutcome::CannotEstimate`] rather than guessed at.
+//! another engine build, another GPU or a different batch size can miss by more.
+//! That is why the answer is labelled an *estimate* everywhere it is shown. Where
+//! the figure can be too low -- a mixture-of-experts model, whose expert compute
+//! buffers were not measured; a state-space model, whose recurrent state is not
+//! counted; a header without the widths the compute buffer is sized from -- the
+//! figures are given with no fits / does-not-fit verdict. Layouts the formula
+//! does not describe (latent attention, split files, models with no attention
+//! layers) get no figures either: all of these are reported as
+//! [`EstimateOutcome::CannotEstimate`] rather than guessed at.
 //!
 //! This is the one place the figures above -- which loads, and how close the
 //! estimate came to them -- are written down. The README, `docs/testing.md` and
@@ -191,7 +194,10 @@ pub enum CannotEstimateReason {
     /// state) or not measured (expert compute buffers), so the total can be too
     /// low and no fits / does-not-fit verdict is given.
     UnmeasuredLayout,
-    /// A figure the formula needs is not in the header.
+    /// A figure the formula needs is not in the header. When only the
+    /// feed-forward or embedding width is missing, the figures are still given
+    /// (with that width counted as zero, so they can be too low) and no
+    /// fits / does-not-fit verdict is.
     MissingMetadata,
     /// No GPU is visible to ROCm.
     NoGpu,
@@ -782,16 +788,29 @@ pub fn estimate_fit(
     // confident "fits" that is wrong costs a user a failed load, and a margin
     // with no measurement behind it would be a guess. The host's memory is
     // still reported, so the reader can compare it themselves.
-    if header.ssm || header.moe {
+    let widths_missing = header.feed_forward_length.is_none() || header.embedding_length.is_none();
+    if header.ssm || header.moe || widths_missing {
         let why = match (header.ssm, header.moe) {
             (true, true) => {
                 "it has state-space layers, whose recurrent state is not counted, and \
                              mixture-of-experts layers, whose compute buffer was not measured"
             }
             (true, false) => "it has state-space layers, whose recurrent state is not counted",
-            _ => "it is a mixture-of-experts model, whose compute buffer was not measured",
+            (false, true) => {
+                "it is a mixture-of-experts model, whose compute buffer was not measured"
+            }
+            (false, false) => {
+                "the header does not carry both the feed-forward and the embedding width, \
+                 which size the compute buffer's fixed part"
+            }
         };
-        estimate.cannot_estimate_reason = Some(CannotEstimateReason::UnmeasuredLayout);
+        // A layout the formula does not measure is the stronger statement; a
+        // missing width only matters on its own, and its note says so either way.
+        estimate.cannot_estimate_reason = Some(if header.ssm || header.moe {
+            CannotEstimateReason::UnmeasuredLayout
+        } else {
+            CannotEstimateReason::MissingMetadata
+        });
         estimate.detail = Some(format!(
             "no fits / does-not-fit verdict for this model: {why}, so the total above can be too \
              low; compare it with this GPU's {} MiB yourself and leave headroom",
@@ -996,8 +1015,6 @@ fn offload_suggestion(
     })
 }
 
-/// The evidence lines for an estimate, in the report's own voice.
-#[must_use]
 /// A host's memory in whole MiB, rounded down: a host never reads as offering
 /// more than it does, and an integer figure sits beside the integer figures in
 /// the report. The `1e-6` keeps floating-point error in the GiB figure from
@@ -1007,6 +1024,8 @@ const fn whole_mib_offered(gib: f64) -> f64 {
     gib.mul_add(1024.0, 1e-6).floor()
 }
 
+/// The evidence lines for an estimate, in the report's own voice.
+#[must_use]
 pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
     let mut lines = Vec::new();
     // Where the figures came from is only worth saying when there was a header
@@ -2093,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_without_the_widths_the_compute_buffer_needs_says_it_is_understated() {
+    fn a_header_without_the_widths_the_compute_buffer_needs_gets_figures_and_no_verdict() {
         let builder = Builder::new()
             .string("general.architecture", "x")
             .u32("x.block_count", 2)
@@ -2109,7 +2128,13 @@ mod tests {
             KvCacheType::F16,
             AcceleratorMemory::Dedicated(8.0),
         );
-        assert_eq!(result.outcome, EstimateOutcome::Fits);
+        assert_eq!(result.outcome, EstimateOutcome::CannotEstimate);
+        assert_eq!(
+            result.cannot_estimate_reason,
+            Some(CannotEstimateReason::MissingMetadata)
+        );
+        assert!(result.total_bytes.is_some(), "the figures are still given");
+        assert!(result.max_context.is_none() && result.suggestions.is_empty());
         assert!(
             result.notes.iter().any(|note| note.contains("understated")),
             "{:?}",
@@ -3116,8 +3141,8 @@ mod tests {
             widest_layer_kv_elements: 0.0,
             layers: 1,
         };
-        // 1000 weights at 8 bits is 1000 bytes of file, of which 40% is the
-        // embedding that is not VRAM.
+        // 1000 weights at 8 bits is 1000 bytes of file, of which 60% is the
+        // embedding that is not VRAM, leaving 400 bytes on the GPU.
         assert!((sizing.quant_weights(1000.0, 8.0) - 400.0).abs() < 1e-9);
         assert!((sizing.quant_weights(1000.0, 4.0) - 200.0).abs() < 1e-9);
     }
@@ -3287,7 +3312,8 @@ mod tests {
         );
     }
 
-    /// Either width missing understates the compute buffer, not only both.
+    /// Either width missing understates the compute buffer, not only both, and
+    /// either one withholds the verdict.
     #[test]
     fn a_header_missing_either_width_says_the_compute_buffer_is_understated() {
         let base = || {
@@ -3321,6 +3347,7 @@ mod tests {
                 "{which}: {:?}",
                 result.notes
             );
+            assert_eq!(result.outcome, EstimateOutcome::CannotEstimate, "{which}");
         }
     }
 
@@ -3329,6 +3356,7 @@ mod tests {
             .string("general.architecture", "x")
             .u32("x.block_count", 4)
             .u32("x.embedding_length", 512)
+            .u32("x.feed_forward_length", 1024)
             .u32("x.attention.head_count", 8)
             .u32("split.count", count)
             .tensor("t", &[10])

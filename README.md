@@ -877,7 +877,9 @@ A state-space or hybrid model's recurrent state is not counted, and a
 mixture-of-experts model's compute buffer was not measured, so for those the
 figures are shown with this GPU's memory but with no fits / does-not-fit verdict
 (`cannot_estimate`, reason `unmeasured_layout`): a "fits" that is too low would
-be worse than no answer. Another
+be worse than no answer. A header without the feed-forward or embedding width,
+which size the compute buffer, is treated the same way (reason
+`missing_metadata`, with the figures). Another
 GPU, engine build or batch size can miss by more, so leave headroom. The figures
 are compared with the total dedicated VRAM of the GPU with the most of it that
 ROCm can see, the same figure a curated model's minimum is compared with, not

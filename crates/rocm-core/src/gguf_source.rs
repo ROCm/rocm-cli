@@ -309,7 +309,7 @@ pub fn select_gguf_file<'a>(files: &'a [HubFile], variant: &str) -> Result<&'a H
 /// Split a shard's name `<stem>-00002-of-00004.gguf` into what the shards of one
 /// model share (the stem and the total) and the shard's own index.
 fn shard_parts(name: &str) -> Option<(String, u32)> {
-    let of = name.find("-of-")?;
+    let of = name.rfind("-of-")?;
     let digits = |text: &str| -> Option<u32> {
         (text.len() == 5 && text.bytes().all(|b| b.is_ascii_digit()))
             .then(|| text.parse().ok())
@@ -1098,6 +1098,39 @@ mod tests {
         );
     }
 
+    /// A letter before a label is not a boundary: `F16` does not match `BF16`,
+    /// in either order of listing.
+    #[test]
+    fn a_label_inside_a_longer_label_is_not_matched() {
+        for files in [
+            [file("m-BF16.gguf", 16), file("m-F16.gguf", 16)],
+            [file("m-F16.gguf", 16), file("m-BF16.gguf", 16)],
+        ] {
+            assert_eq!(select_gguf_file(&files, "F16").unwrap().name, "m-F16.gguf");
+            assert_eq!(
+                select_gguf_file(&files, "BF16").unwrap().name,
+                "m-BF16.gguf"
+            );
+        }
+        let only_bf16 = [file("m-BF16.gguf", 16)];
+        assert!(select_gguf_file(&only_bf16, "F16").is_err());
+    }
+
+    /// A shard's numbering is the last `-of-` in its name, so a model whose own
+    /// name contains `-of-` is still recognised as one split model.
+    #[test]
+    fn the_shards_of_a_model_with_of_in_its_name_are_one_model() {
+        let shards = [
+            file("Chain-of-Thought-Q4_K_M-00002-of-00003.gguf", 1),
+            file("Chain-of-Thought-Q4_K_M-00001-of-00003.gguf", 1),
+            file("Chain-of-Thought-Q4_K_M-00003-of-00003.gguf", 1),
+        ];
+        assert_eq!(
+            select_gguf_file(&shards, "Q4_K_M").unwrap().name,
+            "Chain-of-Thought-Q4_K_M-00001-of-00003.gguf"
+        );
+    }
+
     /// `_` before a label is a boundary as `-` and `.` are: llama.cpp's own
     /// conversions name files `model_Q4_K_M.gguf` as often as `model-Q4_K_M.gguf`.
     #[test]
@@ -1393,6 +1426,10 @@ mod tests {
         Unauthorized,
         /// A `206` that arrives after a pause.
         Slow,
+        /// A `206` with no `Content-Range`, so which bytes it carries is unstated.
+        NoContentRange,
+        /// A `HEAD` answered with no `Content-Length`; ranges are honoured.
+        HeadWithoutLength,
     }
 
     /// A hub on loopback. The "model" is a real header followed by zeros out to
@@ -1454,6 +1491,10 @@ mod tests {
                     );
                 } else if path.starts_with("/o/r/resolve/main/") {
                     logged.lock().unwrap().push(format!("{method} {path}"));
+                    if method == "HEAD" && serve == Serve::HeadWithoutLength {
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+                        continue;
+                    }
                     if method == "HEAD" {
                         let _ = write!(
                             stream,
@@ -1477,7 +1518,9 @@ mod tests {
                             | Serve::WrongRange
                             | Serve::ShortBody
                             | Serve::ShortConsistent
-                            | Serve::Slow,
+                            | Serve::Slow
+                            | Serve::NoContentRange
+                            | Serve::HeadWithoutLength,
                         ) => {
                             let (start, end) = range.split_once('-').unwrap();
                             let (start, end): (u64, u64) =
@@ -1496,9 +1539,16 @@ mod tests {
                             if serve == Serve::Slow {
                                 thread::sleep(Duration::from_millis(1500));
                             }
+                            let content_range = if serve == Serve::NoContentRange {
+                                String::new()
+                            } else {
+                                format!(
+                                    "Content-Range: bytes {claimed_start}-{end}/{virtual_size}\r\n"
+                                )
+                            };
                             let _ = write!(
                                 stream,
-                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {claimed_start}-{end}/{virtual_size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 206 Partial Content\r\n{content_range}Content-Length: {}\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
                             if serve == Serve::ShortBody {
@@ -1778,6 +1828,44 @@ mod tests {
             matches!(&error, GgufError::Io(_)) && error.to_string().contains("starts at"),
             "{error}"
         );
+    }
+
+    /// A `206` that does not say which bytes it carries is refused like one that
+    /// names the wrong ones: the reader cannot know it starts where it asked.
+    #[test]
+    fn a_partial_answer_with_no_content_range_is_refused() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::NoContentRange,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf","size":1048576}]}"#.to_owned(),
+        );
+        let mut opened = LiveGgufSource::with_hub(&hub.base)
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        let error = parse_gguf_header(&mut opened.reader).unwrap_err();
+        assert!(
+            matches!(&error, GgufError::Io(_)) && error.to_string().contains("an unstated offset"),
+            "{error}"
+        );
+    }
+
+    /// A file the listing gave no size for, whose `HEAD` gives none either, is
+    /// refused with a reason rather than read as zero bytes long.
+    #[test]
+    fn a_head_with_no_content_length_is_refused() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::HeadWithoutLength,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf"}]}"#.to_owned(),
+        );
+        let error = LiveGgufSource::with_hub(&hub.base)
+            .open(&hub_ref("Q4_K_M"))
+            .err()
+            .expect("a file of unknown size is not opened")
+            .to_string();
+        assert!(error.contains("did not report how large"), "{error}");
     }
 
     #[test]

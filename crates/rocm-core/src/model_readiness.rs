@@ -705,8 +705,10 @@ pub struct ContextRequest {
 /// Size a GGUF model outside the catalog from its file header.
 ///
 /// Acts only on an answer of [`UndeterminedReason::ModelNotCurated`] whose
-/// reference names a GGUF; every other answer is left exactly as it was. The
-/// verdict stays `Undetermined`: what is added is [`ModelReadiness::estimate`]
+/// reference names a GGUF. Every other answer keeps its verdict, plan and
+/// alternatives; the only thing added to it is, when `--context-size` or
+/// `--kv-cache-type` was passed, an evidence line saying why the flag did not
+/// apply. The verdict stays `Undetermined`: what is added is [`ModelReadiness::estimate`]
 /// and the evidence that goes with it. `source` is the only thing that reads a
 /// file or the network, and it reads the header, never the weights.
 ///
@@ -728,7 +730,13 @@ pub fn attach_context_estimate(
         } => {
             let (estimate, refused_models) =
                 read_context_estimate(&reference, &readiness.model_ref, &fit_request, host, source);
-            apply_context_estimate(readiness, &reference, estimate, refused_models.as_deref());
+            apply_context_estimate(
+                readiness,
+                &reference,
+                estimate,
+                refused_models.as_deref(),
+                request,
+            );
         }
     }
 }
@@ -852,8 +860,10 @@ fn apply_context_estimate(
     reference: &GgufRef,
     estimate: ContextEstimate,
     refused_models: Option<&[String]>,
+    request: &ContextRequest,
 ) {
     readiness.evidence.extend(evidence_lines(&estimate));
+    let ask_again = |model_ref: &str| rediagnose(model_ref, request);
     // The route sends a user to the upstream tracker because the catalog lacks
     // the model. A GGUF was looked at directly, so that is no longer the
     // question -- and for a path that does not exist or a hub that did not
@@ -872,7 +882,11 @@ fn apply_context_estimate(
         // and get none here either.
         readiness.fix = (estimate.cannot_estimate_reason
             == Some(CannotEstimateReason::AcceleratorMemoryUnknown))
-        .then(|| read_gpu_memory_fix(&readiness.model_ref));
+        .then(|| {
+            let mut fix = read_gpu_memory_fix(&readiness.model_ref);
+            fix.verify = ask_again(&readiness.model_ref);
+            fix
+        });
         if estimate.outcome == EstimateOutcome::Fits {
             readiness.alternatives.clear();
         }
@@ -885,18 +899,45 @@ fn apply_context_estimate(
         // and `rocm serve <path>` on a file that is not there only repeats this.
         readiness.fix = Some(Fix {
             summary: "check the path, and that the file is a GGUF model, then ask again".to_owned(),
-            verify: format!("rocm diagnose --model {}", readiness.model_ref),
+            verify: ask_again(&readiness.model_ref),
             ..Fix::default()
         });
     } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::NotAModel) {
-        readiness.fix = Some(projector_fix(reference, refused_models));
+        readiness.fix = Some(projector_fix(reference, refused_models, request));
     } else if let Some(fix) = &mut readiness.fix {
-        point_fix_at_unsized_gguf(fix, reference, &readiness.model_ref);
+        point_fix_at_unsized_gguf(fix, reference, &ask_again(&readiness.model_ref));
     }
     if estimate.outcome == EstimateOutcome::DoesNotFit && !estimate.suggestions.is_empty() {
         readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
     }
     readiness.estimate = Some(estimate);
+}
+
+/// The command that asks the same GGUF question again: the same reference,
+/// quoted for a POSIX shell when it needs to be, and the same `--context-size`
+/// and `--kv-cache-type` when they were passed, so following the plan does not
+/// quietly answer a different question.
+fn rediagnose(model_ref: &str, request: &ContextRequest) -> String {
+    use std::fmt::Write as _;
+    let plain = !model_ref.is_empty()
+        && model_ref.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-' | '+' | '@' | ',')
+        });
+    let mut command = if plain {
+        format!("rocm diagnose --model {model_ref}")
+    } else {
+        format!(
+            "rocm diagnose --model '{}'",
+            model_ref.replace('\'', r"'\''")
+        )
+    };
+    if let Some(size) = request.context_size {
+        let _ = write!(command, " --context-size {size}");
+    }
+    if let Some(kind) = request.kv_cache_type {
+        let _ = write!(command, " --kv-cache-type {kind}");
+    }
+    command
 }
 
 /// The plan when this host's GPU memory could not be read: look at what
@@ -921,7 +962,7 @@ fn read_gpu_memory_fix(model_ref: &str) -> Fix {
 /// is to ask about the model instead: by its exact file name when the
 /// repository holds one model, and with no command when it holds several (the
 /// estimate's detail lists them) or none.
-fn projector_fix(reference: &GgufRef, models: Option<&[String]>) -> Fix {
+fn projector_fix(reference: &GgufRef, models: Option<&[String]>, request: &ContextRequest) -> Fix {
     let summary = "name the model's own GGUF file or quantization, not its multimodal projector, \
                    then ask again"
         .to_owned();
@@ -939,7 +980,7 @@ fn projector_fix(reference: &GgufRef, models: Option<&[String]>) -> Fix {
                     variant: Some(only.clone()),
                 });
             if reads_back {
-                format!("rocm diagnose --model {candidate}")
+                rediagnose(&candidate, request)
             } else {
                 String::new()
             }
@@ -955,7 +996,7 @@ fn projector_fix(reference: &GgufRef, models: Option<&[String]>) -> Fix {
 
 /// Rewrite the "serve it and see" plan for a GGUF reference whose header was
 /// reached for but not sized.
-fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, model_ref: &str) {
+fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, verify: &str) {
     // The plan was written for a model that is not a GGUF reference, and its
     // note says so. This one is, and the estimate says why it could not be
     // sized, so the note says that instead of contradicting it.
@@ -969,7 +1010,7 @@ fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, model_ref: &str
     // only, and serve would not read it as a checkpoint. Naming it in a
     // `rocm serve` command would hand the user a line that fails.
     if matches!(reference, GgufRef::Hub { variant: Some(variant), .. } if variant.contains('/')) {
-        fix.verify = format!("rocm diagnose --model {model_ref}");
+        verify.clone_into(&mut fix.verify);
         fix.notes.push(
             "`rocm serve` does not accept an exact file name after the colon; it takes \
              `owner/repo:QUANT`"
@@ -1997,6 +2038,40 @@ mod tests {
         assert!(
             text.contains("names a repository, not a model file: add `:QUANT`"),
             "{text}"
+        );
+    }
+
+    /// The command a GGUF plan offers asks the same question again: the flags
+    /// that were passed come with it, and a path a shell would split is quoted.
+    #[test]
+    fn the_command_to_ask_again_keeps_the_flags_and_quotes_the_path() {
+        let mut readiness = not_curated("my models/nosuch.gguf");
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest {
+                context_size: Some(32_768),
+                kv_cache_type: Some(KvCacheType::Q8_0),
+            },
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        assert_eq!(
+            readiness.fix.as_ref().expect("a plan").verify,
+            "rocm diagnose --model 'my models/nosuch.gguf' --context-size 32768 \
+             --kv-cache-type q8_0"
+        );
+        let plain = ContextRequest::default();
+        assert_eq!(
+            rediagnose("o/r:Q4_K_M", &plain),
+            "rocm diagnose --model o/r:Q4_K_M"
+        );
+        assert_eq!(
+            rediagnose("it's here.gguf", &plain),
+            r"rocm diagnose --model 'it'\''s here.gguf'"
+        );
+        assert_eq!(
+            rediagnose("$HOME/m.gguf", &plain),
+            "rocm diagnose --model '$HOME/m.gguf'"
         );
     }
 

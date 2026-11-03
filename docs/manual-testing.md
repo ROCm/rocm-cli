@@ -1282,7 +1282,7 @@ Expected result:
   far above, report the model and both figures.
 - `llama-server` at the reported largest context should load. The one check of
   this kind made so far was on a single MI300X, with a second process holding
-  most of the card's memory so that about 15.8 GiB could still be allocated
+  most of the card's memory so that about 15.1-15.5 GiB could still be allocated
   (the process's `amd-smi` baselines were 181092 and 180738 MiB used of 196592),
   for a Llama-3.1-8B Q4_K_M with an f16 cache. The card was described to
   `rocm diagnose` as one with 15854 MiB, for which the estimate was 79872 tokens

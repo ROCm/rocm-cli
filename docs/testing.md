@@ -3379,7 +3379,8 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
 - [gguf.rs](../crates/rocm-core/src/gguf.rs): the header parser, tested against
   synthetic headers built byte by byte (versions, truncation at every offset,
   per-layer head arrays, signed 32-bit integers as gguf-py writes them,
-  skipped arrays, alignment, the span of the input embedding) and one test per
+  every fixed-width value type read at its own width as a scalar and as an
+  array element, skipped arrays, alignment, the span of the input embedding) and one test per
   bound a hostile header would walk past (key length, entry counts, tensor
   dimensions, array nesting, an overflowing array length, an unknown value type,
   the layer count, how many shape keys are kept, how large a header may be --
@@ -3406,11 +3407,17 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   in a listing that could leave the repository or hide in a terminal (dropped,
   and never requested), and the range reader, tested against a loopback server that
   records the ranges it is asked for, so a read of the weights would show, and
-  that also answers with a wrong `Content-Range`, a dropped body, a missing
-  size, a gated repository and a slow reply.
+  that also answers with a wrong or missing `Content-Range`, a dropped body, a
+  missing size in the listing and in the `HEAD`, a gated repository and a slow
+  reply. [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs)
+  runs `rocm diagnose --model owner/repo:QUANT` against such a server with every
+  Hugging Face token variable set, and checks that the listing, `HEAD` and
+  range requests carry no `Authorization` or `Cookie` header.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
   host-memory states (dedicated, none, unknown, APU), what is attached to a
-  curated or non-GGUF answer (nothing), the plan a sized estimate keeps when it
+  curated or non-GGUF answer (nothing beyond a note on a flag that did not
+  apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
+  reference quoted for a shell), the plan a sized estimate keeps when it
   could not compare (`amd-smi metric --json` where the memory was unreadable,
   none where no GPU is visible or on an APU; unit-tested only, since no lane has
   a GPU whose memory cannot be read), and the text and JSON shapes.

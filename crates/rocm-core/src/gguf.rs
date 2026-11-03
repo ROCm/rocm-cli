@@ -1200,6 +1200,81 @@ mod tests {
         assert_eq!(read(2, &[0xff, 0xff]), Some(65535));
     }
 
+    /// Every fixed-width value type, as a scalar and as an array element, under a
+    /// key the parser skips and under one it keeps, each followed by a kept
+    /// sentinel. The widths are written here from the GGUF specification, not
+    /// from [`fixed_width`]: a wrong width on any row would desync every later
+    /// key, so the sentinel would be misread or the parse would fail.
+    #[test]
+    fn every_fixed_width_type_is_read_at_its_own_width_as_a_scalar_and_in_an_array() {
+        // (type id, width in bytes, an integer type the parser keeps a value of)
+        let types: [(u32, usize, bool); 11] = [
+            (0, 1, true),   // uint8
+            (1, 1, true),   // int8
+            (2, 2, true),   // uint16
+            (3, 2, true),   // int16
+            (4, 4, true),   // uint32
+            (5, 4, true),   // int32
+            (6, 4, false),  // float32
+            (7, 1, true),   // bool
+            (10, 8, true),  // uint64
+            (11, 8, true),  // int64
+            (12, 8, false), // float64
+        ];
+        let le = |value: u64, width: usize| value.to_le_bytes()[..width].to_vec();
+        let array = |type_id: u32, width: usize, values: &[u64]| {
+            let mut bytes = type_id.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                bytes.extend(le(*value, width));
+            }
+            bytes
+        };
+        let parsed = |entry: Builder| {
+            parse(&entry.u32("x.block_count", 42).file(0)).unwrap_or_else(|error| panic!("{error}"))
+        };
+        let base = || Builder::new().string("general.architecture", "x");
+        for (type_id, width, integer) in types {
+            let skipped_scalar = parsed(base().raw("x.unrelated", type_id, &le(1, width)));
+            assert_eq!(
+                skipped_scalar.block_count,
+                Some(42),
+                "scalar of type {type_id}"
+            );
+            let skipped_array = parsed(base().raw(
+                "x.unrelated",
+                test_builder::ARRAY,
+                &array(type_id, width, &[1, 0, 1]),
+            ));
+            assert_eq!(
+                skipped_array.block_count,
+                Some(42),
+                "array of type {type_id}"
+            );
+
+            let kept_scalar = parsed(base().raw("x.feed_forward_length", type_id, &le(1, width)));
+            assert_eq!(
+                kept_scalar.block_count,
+                Some(42),
+                "kept scalar of type {type_id}"
+            );
+            let kept_array = parsed(base().raw(
+                "x.feed_forward_length",
+                test_builder::ARRAY,
+                &array(type_id, width, &[0, 1, 0]),
+            ));
+            assert_eq!(
+                kept_array.block_count,
+                Some(42),
+                "kept array of type {type_id}"
+            );
+            if integer {
+                assert_eq!(kept_scalar.feed_forward_length, Some(1), "type {type_id}");
+                assert_eq!(kept_array.feed_forward_length, Some(1), "type {type_id}");
+            }
+        }
+    }
+
     #[test]
     fn an_expert_count_above_one_marks_a_mixture_of_experts_model() {
         let base = |experts| {
