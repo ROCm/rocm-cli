@@ -1958,7 +1958,18 @@ fn path_shadowing_out(world: &E2eWorld, name: &str) -> String {
             let link = farm.join(&file_name);
             // First writer wins, so earlier PATH entries keep their precedence.
             if !link.exists() {
-                let _ = std::os::unix::fs::symlink(entry.path(), &link);
+                #[cfg(unix)]
+                {
+                    let _ = std::os::unix::fs::symlink(entry.path(), &link);
+                }
+                // Only the @requires-os:linux progress scenarios build a shadow
+                // PATH, so this arm never runs. It exists because the Windows
+                // lifecycle lanes still compile this target, and a symlink is
+                // the one piece here with no portable spelling.
+                #[cfg(not(unix))]
+                {
+                    unreachable!("a shadow PATH is only built on Unix");
+                }
             }
         }
     }
@@ -2006,6 +2017,10 @@ async fn when_install_pty_without_curl(world: &mut E2eWorld) {
 }
 
 /// First directory on `PATH` holding `name`, or `None`.
+///
+/// Splits on `:`, so this is Unix-shaped. Every caller sits behind a
+/// `@requires-os:linux` scenario; it compiles on Windows but would not find
+/// anything there.
 fn which_on_path(name: &str) -> Option<PathBuf> {
     std::env::var("PATH").ok().and_then(|path| {
         path.split(':')
