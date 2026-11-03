@@ -800,7 +800,7 @@ Feature: Diagnosing failures and listing fixes
   # model file named instead, rather than as a file the repository lacks; and
   # it is refused from the listing alone, before any header is read.
   @id:diagnose-a-projector-named-exactly-is-answered-as-a-projector
-  Scenario: diagnose-51 - Naming a model's multimodal projector says what it is and names the model
+  Scenario: diagnose-52 - Naming a model's multimodal projector says what it is and names the model
     Given a Hugging Face repository that holds a model and its multimodal projector
     When the user asks the CLI whether the projector file would run, naming it exactly
     Then the CLI says the file is a multimodal projector and names the model file instead
@@ -810,7 +810,7 @@ Feature: Diagnosing failures and listing fixes
   # they would be accepted and do nothing, so the CLI refuses them as a usage
   # error before anything runs.
   @id:diagnose-context-options-need-a-model
-  Scenario: diagnose-52 - The context options are refused without a model to apply them to
+  Scenario: diagnose-53 - The context options are refused without a model to apply them to
     When the user asks the CLI for a context size or a KV cache type without naming a model
     Then the CLI refuses each as a usage error that names --model
 
@@ -818,7 +818,7 @@ Feature: Diagnosing failures and listing fixes
   # context size cannot change the answer. The report says so instead of
   # silently ignoring the option, and makes no estimate.
   @id:diagnose-context-options-do-not-apply-to-a-curated-model
-  Scenario: diagnose-53 - A curated model is told the context options do not apply to it
+  Scenario: diagnose-54 - A curated model is told the context options do not apply to it
     When the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form
     Then the answer says the context options do not apply to a curated recipe, and carries no estimate
 
@@ -826,7 +826,7 @@ Feature: Diagnosing failures and listing fixes
   # upstream: the answer names the path, gives no upstream route, and its plan
   # is to ask again once the path is right.
   @id:diagnose-a-missing-gguf-path-is-a-path-to-check
-  Scenario: diagnose-54 - A GGUF path that does not exist is answered as a path to check, not a model to report
+  Scenario: diagnose-55 - A GGUF path that does not exist is answered as a path to check, not a model to report
     When the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form
     Then the answer says the file could not be opened and offers no upstream route
     And the plan is to ask again about that path
@@ -835,7 +835,7 @@ Feature: Diagnosing failures and listing fixes
   # different model, so nothing is read; with a context size the user is told
   # what would make it answerable. The stand-in hub shows no request was made.
   @id:diagnose-a-bare-repository-with-a-context-size-asks-for-a-quantization
-  Scenario: diagnose-55 - A bare repository with a context size is told to name a quantization, and nothing is fetched
+  Scenario: diagnose-56 - A bare repository with a context size is told to name a quantization, and nothing is fetched
     Given a Hugging Face endpoint that records every request made to it
     When the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form
     Then the answer says the reference names a repository and asks for a quantization
@@ -845,7 +845,7 @@ Feature: Diagnosing failures and listing fixes
   # and a multimodal projector is among the files listed, marked as one, rather
   # than left out: a user looking at the hub sees it there too.
   @id:diagnose-a-quantization-that-matches-nothing-lists-every-gguf
-  Scenario: diagnose-56 - A quantization that matches nothing lists the repository's files, projectors marked
+  Scenario: diagnose-57 - A quantization that matches nothing lists the repository's files, projectors marked
     Given a Hugging Face repository that holds a model and its multimodal projector
     When the user asks the CLI about a quantization the repository does not hold
     Then the CLI says nothing matches and lists the model and the projector, marked as a projector

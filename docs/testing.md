@@ -3435,7 +3435,7 @@ Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question
 without `--report` does reach the endpoint and prints no such note. Scenario
-`diagnose-51` has the stand-in answer the repository listing with a model and
+`diagnose-52` has the stand-in answer the repository listing with a model and
 its multimodal projector, and shows that naming the projector exactly is
 answered as a projector, with the model file named instead, after the listing
 request alone.
@@ -3451,12 +3451,12 @@ ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
 by the unit tests, not by a scenario. Nothing in either runs against a real GPU
 load; see [manual-testing.md](manual-testing.md) for the check that does.
 
-Scenarios `diagnose-52` to `diagnose-55` cover the refusals, all host-independent:
+Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independent:
 the context options without `--model` (a usage error naming it), a curated model
 asked about a context size (told the options do not apply, no estimate), a
 `.gguf` path that does not exist (named as not opened, no upstream route, and a
 plan to ask again about that path), and a bare `owner/repo` with a context size
-(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-56` asks the stand-in hub for a quantization that matches
+(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
 ```bash
