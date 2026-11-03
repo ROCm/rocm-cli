@@ -252,6 +252,14 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
 fn serve_pip_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
     world.artifact_server = Some(LoopbackServer::start(&served));
+    point_at_pip_fixtures(world);
+}
+
+/// Queue the env that points the next `rocm` run at the served pip fixtures.
+/// Each run consumes `command_env`, so a step that runs `rocm` a second time
+/// in one scenario calls this again; without it the second run would read the
+/// real indexes.
+fn point_at_pip_fixtures(world: &mut E2eWorld) {
     allow_base_overrides(world);
     let current = current_pip_base(world);
     let next = next_pip_base(world);
@@ -527,6 +535,39 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
         &tarball_index_html(&[
             (NEXT_REAL_TARBALL, 1_787_612_008.0),
             (NEXT_TESTS_TARBALL, 1_787_612_032.0),
+        ]),
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    allow_base_overrides(world);
+    let base = server_base(world);
+    let next = next_tarball_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+}
+
+/// The newer 10.1 patch, uploaded first.
+const NEXT_LINE_NEWEST_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.1.2.tar.gz";
+/// The older 10.1 patch, uploaded last: newest by mtime, not by version.
+const NEXT_LINE_LATEST_UPLOAD_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.1.0.tar.gz";
+
+#[given("a ROCm 10 tarball fixture whose older 10.1 patch was uploaded last")]
+async fn tarball_line_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-tarball-fixtures");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+    write_fixture(
+        &served.join("tarball").join("next").join("index.html"),
+        &tarball_index_html(&[
+            (NEXT_REAL_TARBALL, 1_787_500_000.0),
+            (NEXT_LINE_NEWEST_TARBALL, 1_787_600_000.0),
+            (NEXT_LINE_LATEST_UPLOAD_TARBALL, 1_787_700_000.0),
         ]),
     );
     world.artifact_server = Some(LoopbackServer::start(&served));
@@ -988,6 +1029,26 @@ async fn preview_pinned_tarball_install(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn preview_line_pinned_tarball_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user previews a tarball SDK install for family gfx120X-all pinned to ROCm 10.0.0")]
 async fn preview_pinned_tarball_install_with_group_family(world: &mut E2eWorld) {
     preview(
@@ -1275,6 +1336,22 @@ async fn preview_selects_real_tarball(world: &mut E2eWorld) {
     );
 }
 
+#[then("the preview selects the ROCm 10.1.2 tarball, not the later-uploaded 10.1.0")]
+async fn preview_selects_newest_line_tarball(world: &mut E2eWorld) {
+    let base = next_tarball_base(world);
+    assert_contains(
+        world,
+        &format!("tarball_url: {base}{NEXT_LINE_NEWEST_TARBALL}"),
+        "newest 10.1 release",
+    );
+    assert_contains(world, "latest_version: 10.1.2", "selected line version");
+    assert!(
+        !stdout(world).contains(NEXT_LINE_LATEST_UPLOAD_TARBALL),
+        "a 10.1 line pin took the latest upload instead of the newest release:\n{}",
+        stdout(world)
+    );
+}
+
 #[then("the preview does not select the tests artifact")]
 async fn preview_does_not_select_tests_tarball(world: &mut E2eWorld) {
     assert!(
@@ -1331,13 +1408,19 @@ async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
     );
 }
 
-#[then("the failure names the ROCm 10 next layout and a full version, without suggesting nightly")]
-async fn failure_names_next_layout_without_nightly(world: &mut E2eWorld) {
-    let reported = format!(
+fn reported_output(world: &E2eWorld) -> String {
+    format!(
         "{}\n{}",
         stdout(world),
         world.cli_stderr.as_deref().unwrap_or_default()
-    );
+    )
+}
+
+#[then(
+    "the failure suggests the published ROCm 10.0.0 for arch gfx1200, without suggesting nightly or a 10.1 version"
+)]
+async fn failure_suggests_published_next_release(world: &mut E2eWorld) {
+    let reported = reported_output(world);
     assert!(
         reported.contains(&next_pip_base(world)),
         "the refusal did not search the ROCm 10 next layout:\n{reported}"
@@ -1351,12 +1434,14 @@ async fn failure_names_next_layout_without_nightly(world: &mut E2eWorld) {
         "the refusal did not name the next layout:\n{reported}"
     );
     assert!(
-        reported.contains("--version 10.1.0"),
-        "the refusal did not name a full version in the 10.1 line:\n{reported}"
+        reported.contains(&format!(
+            "`--version {NEXT_ROCM_VERSION} --family {RAW_ARCH}`"
+        )),
+        "the refusal did not suggest the published {NEXT_ROCM_VERSION} with the requested arch:\n{reported}"
     );
     assert!(
-        reported.contains(&format!("--family {RAW_ARCH}")),
-        "the refusal did not name an exact arch:\n{reported}"
+        !reported.contains("--version 10.1"),
+        "the refusal suggested a 10.1 version the index does not publish:\n{reported}"
     );
     assert!(
         !reported.contains("--channel nightly"),
@@ -1366,6 +1451,31 @@ async fn failure_names_next_layout_without_nightly(world: &mut E2eWorld) {
         !reported.contains("package_specs:"),
         "the refusal still printed an install plan:\n{reported}"
     );
+}
+
+/// Runs exactly the `--version`/`--family` pair the previous failure printed,
+/// so the scenario proves the advice clears the failure rather than only
+/// pinning its wording.
+#[when("the user re-runs the preview with the version and arch the failure suggested")]
+async fn rerun_with_suggested_version(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    let suggested = reported
+        .split('`')
+        .find(|chunk| chunk.starts_with("--version "))
+        .unwrap_or_else(|| panic!("the failure suggested no `--version` command:\n{reported}"))
+        .to_owned();
+    let mut args = vec![
+        "install",
+        "sdk",
+        "--channel",
+        "release",
+        "--format",
+        "wheel",
+    ];
+    args.extend(suggested.split_whitespace());
+    args.push("--dry-run");
+    point_at_pip_fixtures(world);
+    preview_ok(world, &args);
 }
 
 #[then("the failure asks for an exact GPU arch and names --family gfx1200")]

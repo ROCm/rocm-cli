@@ -264,12 +264,25 @@ Feature: TheRock "next" ROCm 10 install layout
     And the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild
 
   # The same pin against a next index that only publishes 10.0.0 cannot be
-  # satisfied. The refusal must name the next layout, a full version, and an
-  # exact arch. It must not offer `--channel nightly`: that channel refuses
-  # ROCm 10 and the suggestion cannot succeed.
+  # satisfied. The refusal must name the next layout and suggest a release that
+  # index does publish, with the arch the request used. It must not offer
+  # `--channel nightly` (that channel refuses ROCm 10) or a 10.1 version (the
+  # index has none), because neither suggestion can succeed. Running the
+  # suggested command proves the advice clears the failure.
   @id:therock-next-16-unsatisfied-line-pin-skips-nightly
-  Scenario: therock-next-16 - An unsatisfied ROCm 10.1 line pin does not suggest the nightly channel
+  Scenario: therock-next-16 - An unsatisfied ROCm 10.1 line pin suggests a published release, not the nightly channel
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.1
     Then the install fails
-    And the failure names the ROCm 10 next layout and a full version, without suggesting nightly
+    And the failure suggests the published ROCm 10.0.0 for arch gfx1200, without suggesting nightly or a 10.1 version
+    When the user re-runs the preview with the version and arch the failure suggested
+    Then the preview resolves the ROCm 10 pip index
+
+  # On the tarball catalog an unpinned pick is "newest upload". A line pin is
+  # "newest stable release in the line": the fixture uploads 10.1.0 AFTER
+  # 10.1.2, so upload order alone would pick the older patch.
+  @id:therock-next-17-tarball-line-pin-takes-newest-release @requires-os:linux
+  Scenario: therock-next-17 - A ROCm 10.1 line pin on the tarball catalog takes the newest 10.1 release, not the newest upload
+    Given a ROCm 10 tarball fixture whose older 10.1 patch was uploaded last
+    When the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the preview selects the ROCm 10.1.2 tarball, not the later-uploaded 10.1.0

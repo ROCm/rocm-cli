@@ -209,13 +209,18 @@ fn split_u32_prefix(value: &str) -> Option<(u32, &str)> {
 }
 
 /// Whether `published` is a stable release of the `major.minor` line.
+///
+/// Reads `published` with the lenient [`parse_version_for_ordering`], not the
+/// strict three-component [`parse_version`], because an index can publish a
+/// four-component release such as `7.2.4.70204`, and that is still a stable
+/// release of the 7.2 line. The ordering key drops trailing zeros, so a
+/// missing minor component reads as zero, as PEP 440 pads it.
 fn published_in_stable_line(published: &str, major: u32, minor: u32) -> bool {
-    if let Some(parsed) = parse_version(published) {
-        return parsed.stage == VersionStage::Stable
-            && parsed.major == major
-            && parsed.minor == minor;
-    }
-    stable_release_line_pin(published) == Some((major, minor))
+    parse_version_for_ordering(published).is_some_and(|key| {
+        key.stage == VersionStage::Stable
+            && key.release.first().copied().unwrap_or(0) == u64::from(major)
+            && key.release.get(1).copied().unwrap_or(0) == u64::from(minor)
+    })
 }
 
 fn selector_is_release_line(selector: &RuntimeVersionSelector) -> bool {
@@ -3214,18 +3219,46 @@ fn resolve_pip_runtime_with_timeout(
         ),
         published_device_targets,
     };
+    // Loaded here rather than inside `resolve_pip_runtime_from_index` so a
+    // failure further down can name the releases this index does publish.
+    let exact_arch = family_resolution.raw_arch.as_deref();
+    let rocm_versions = load_simple_index_versions(
+        paths,
+        &source.index_url,
+        "rocm",
+        None,
+        download_timeout_secs,
+    )
+    .with_context(|| {
+        wheel_resolution_failure_context(
+            channel,
+            layout,
+            &source.index_url,
+            version_selector,
+            None,
+            exact_arch,
+        )
+    })?;
     resolve_pip_runtime_from_index(
         paths,
         channel,
         &family_resolution,
         &source,
+        &rocm_versions,
         wheel_compatibility,
         version_selector,
         include_devel,
         download_timeout_secs,
     )
     .with_context(|| {
-        wheel_resolution_failure_context(channel, layout, &source.index_url, version_selector)
+        wheel_resolution_failure_context(
+            channel,
+            layout,
+            &source.index_url,
+            version_selector,
+            Some(&rocm_versions),
+            exact_arch,
+        )
     })
 }
 
@@ -3238,6 +3271,7 @@ fn resolve_pip_runtime_from_index(
     channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     source: &ResolvedAggregateWheelSource,
+    rocm_versions: &[String],
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     include_devel: bool,
@@ -3246,8 +3280,6 @@ fn resolve_pip_runtime_from_index(
     let index_url = source.index_url.as_str();
     let mut version_resolution_specs = None;
     let mut torchaudio_selection = None;
-    let rocm_versions =
-        load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
         && version_selector.is_none()
         && !rocm_versions
@@ -3267,7 +3299,7 @@ fn resolve_pip_runtime_from_index(
                 )
             }
         };
-        let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
+        let rocm_version = select_rocm_version(channel, rocm_versions, version_selector)
             .with_context(|| {
                 let requested = version_selector.map_or_else(
                     || "latest compatible version".to_owned(),
@@ -3334,7 +3366,7 @@ fn resolve_pip_runtime_from_index(
         )?;
         select_matching_pip_package_versions(
             channel,
-            &rocm_versions,
+            rocm_versions,
             &torch_versions,
             &torchvision_versions,
             &torchaudio_versions,
@@ -3355,7 +3387,7 @@ fn resolve_pip_runtime_from_index(
     // Only meaningful when we auto-selected "latest" (no explicit request), so a
     // caller can warn when that newest version has no installable wheels.
     let newest_repo_version = if version_selector.is_none() {
-        channel_rocm_candidates(&rocm_versions, channel)
+        channel_rocm_candidates(rocm_versions, channel)
             .into_iter()
             .last()
     } else {
@@ -3432,12 +3464,17 @@ fn resolve_tarball_artifact_with_timeout(
         version_selector,
     )
     .with_context(|| {
+        let published =
+            tarball_family_candidates(&files, channel, layout, &family_resolution.family)
+                .into_iter()
+                .map(|(_, version)| version)
+                .collect::<Vec<_>>();
         tarball_resolution_failure_context(
             channel,
             layout,
-            &family_resolution.source,
-            &family_resolution.family,
+            &family_resolution,
             version_selector,
+            &published,
         )
     })?;
     Ok(TarballArtifact {
@@ -3469,6 +3506,38 @@ fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
     }
 }
 
+/// Every archive in `files` this channel can install for `family`, before any
+/// version pin narrows them, paired with the version its name carries.
+///
+/// [`select_tarball_candidate`] picks from these. A next-layout failure lists
+/// their versions, so the releases it suggests are ones the pick could take.
+fn tarball_family_candidates(
+    files: &[TarballIndexFile],
+    channel: TheRockChannel,
+    layout: SourceLayout,
+    family: &str,
+) -> Vec<(TarballIndexFile, String)> {
+    let prefix = format!(
+        "therock-dist-{}-{}-",
+        platform_tarball_token(),
+        tarball_family_token(layout, family)
+    );
+    files
+        .iter()
+        .filter_map(|file| {
+            let version = file
+                .name
+                .strip_prefix(&prefix)?
+                .strip_suffix(".tar.gz")?
+                .to_owned();
+            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            Some((file.clone(), version))
+        })
+        .collect()
+}
+
 /// The newest archive in `files` that this request can actually install.
 ///
 /// The release channel's stable-version filter does double duty on the next
@@ -3485,28 +3554,10 @@ fn select_tarball_candidate(
     family: &str,
     version_selector: Option<&RuntimeVersionSelector>,
 ) -> Option<(TarballIndexFile, String)> {
-    let prefix = format!(
-        "therock-dist-{}-{}-",
-        platform_tarball_token(),
-        tarball_family_token(layout, family)
-    );
-    let mut candidates = files
-        .iter()
-        .filter_map(|file| {
-            let version = file
-                .name
-                .strip_prefix(&prefix)?
-                .strip_suffix(".tar.gz")?
-                .to_owned();
-            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
-                return None;
-            }
-            if version_selector.is_some_and(|selector| !selector.matches_version(&version)) {
-                return None;
-            }
-            Some((file.clone(), version))
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = tarball_family_candidates(files, channel, layout, family);
+    if let Some(selector) = version_selector {
+        candidates.retain(|(_, version)| selector.matches_version(version));
+    }
     // An unpinned catalog pick is "newest upload". A major.minor line pin is
     // "newest stable release in that line", even when an older patch was
     // uploaded later. Exact pins match one archive, so the order does not
@@ -7103,17 +7154,21 @@ fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
 /// A ROCm >= 10 pin already refused `--channel nightly` before resolution
 /// (`select_source_layout`), so the canonical hint's nightly suggestion must
 /// not be what that failure prints. The next-layout branch points at the
-/// layout that was searched, a full version, and an exact `--family`.
+/// layout that was searched and at the releases it does publish; see
+/// [`next_layout_unsatisfied_hint`]. `published` is `None` when the `rocm`
+/// listing itself could not be read.
 fn wheel_resolution_failure_context(
     channel: TheRockChannel,
     layout: SourceLayout,
     index_url: &str,
     version_selector: Option<&RuntimeVersionSelector>,
+    published: Option<&[String]>,
+    exact_arch: Option<&str>,
 ) -> String {
     let (source_label, hint) = match layout {
         SourceLayout::Next => (
             "next-layout source",
-            next_layout_unsatisfied_hint(version_selector),
+            next_layout_unsatisfied_hint(version_selector, published, exact_arch, None),
         ),
         SourceLayout::Canonical => ("canonical source", canonical_wheel_resolution_hint(channel)),
     };
@@ -7126,18 +7181,28 @@ fn wheel_resolution_failure_context(
 fn tarball_resolution_failure_context(
     channel: TheRockChannel,
     layout: SourceLayout,
-    family_source: &str,
-    family: &str,
+    family_resolution: &FamilyResolution,
     version_selector: Option<&RuntimeVersionSelector>,
+    published: &[String],
 ) -> String {
     let (stream, hint) = match layout {
         SourceLayout::Next => (
             "next-layout",
-            next_layout_unsatisfied_hint(version_selector),
+            next_layout_unsatisfied_hint(
+                version_selector,
+                Some(published),
+                family_resolution.raw_arch.as_deref(),
+                Some(&family_resolution.family),
+            ),
         ),
         SourceLayout::Canonical => (
             "canonical",
-            family_resolution_hint(family_source, family, channel, "tarball"),
+            family_resolution_hint(
+                &family_resolution.source,
+                &family_resolution.family,
+                channel,
+                "tarball",
+            ),
         ),
     };
     format!(
@@ -7146,33 +7211,94 @@ fn tarball_resolution_failure_context(
     )
 }
 
-/// Recovery guidance when a ROCm >= 10 pin cannot be satisfied on the next layout.
+/// How many published releases a next-layout failure lists by name.
+const NEXT_LAYOUT_HINT_MAX_LISTED: usize = 5;
+
+/// Recovery guidance when a ROCm >= 10 request cannot be satisfied on the next layout.
 ///
 /// Does not offer `--channel nightly`: that channel refuses these pins, and
 /// the refusal tells the user to come back to the release channel.
-fn next_layout_unsatisfied_hint(version_selector: Option<&RuntimeVersionSelector>) -> String {
+///
+/// The suggested `--version` is one the next layout actually publishes, never
+/// the request that just failed. `published` is that layout's version listing
+/// (`None` when the listing itself could not be read), narrowed to one GPU
+/// family when `family_scope` names it. The release the failed request
+/// resolved to is derived with [`select_rocm_version`], the function that
+/// chose it, and left out: a line pin that failed on `10.1.2` must not be told
+/// to try `10.1.2` again. Only releases [`next_layout_requested`] would route
+/// back to this layout are offered, so a re-run with the suggestion searches
+/// the same layout rather than the canonical one. When nothing else qualifies
+/// the hint says so and names no command, because no `--version` pin could
+/// succeed. `exact_arch` is the arch the failed request resolved with, so the
+/// suggested command repeats it. Without one this layout cannot resolve any
+/// version, so the hint asks for `--family` instead of a version.
+fn next_layout_unsatisfied_hint(
+    version_selector: Option<&RuntimeVersionSelector>,
+    published: Option<&[String]>,
+    exact_arch: Option<&str>,
+    family_scope: Option<&str>,
+) -> String {
+    let layout = format!("the ROCm {THEROCK_NEXT_MIN_MAJOR}+ next layout");
+    let Some(published) = published else {
+        return format!(
+            "Could not read the releases {layout} publishes, so no other version can be suggested."
+        );
+    };
     let requested = version_selector.map_or_else(
         || "the requested release".to_owned(),
         RuntimeVersionSelector::describe,
     );
-    let version_clause = match version_selector {
-        Some(RuntimeVersionSelector::Version(version)) => {
-            if let Some((major, minor)) = stable_release_line_pin(version) {
-                format!(
-                    "Re-run with a full version in that line, such as `--version {major}.{minor}.0`, and an exact GPU arch, for example `--family gfx1200`."
-                )
-            } else {
-                format!(
-                    "Re-run with that full version and an exact GPU arch, for example `--version {version} --family gfx1200`."
-                )
-            }
-        }
-        _ => "Re-run with a full version such as `--version 10.0.0` and an exact GPU arch, for example `--family gfx1200`."
-            .to_owned(),
+    let lead =
+        format!("No complete compatible package stack was found for {requested} on {layout}.");
+    let Some(exact_arch) = exact_arch else {
+        return format!(
+            "{lead} That layout needs an exact GPU arch: re-run with `--family` set to the raw `gfx` code `rocm examine` reports."
+        );
     };
-    format!(
-        "No complete compatible package stack was found for {requested} on the ROCm {THEROCK_NEXT_MIN_MAJOR}+ next layout. {version_clause}"
-    )
+    let scope = family_scope.map_or_else(String::new, |family| format!(" for {family}"));
+    let attempted = select_rocm_version(TheRockChannel::Release, published, version_selector);
+    let mut alternatives = published
+        .iter()
+        .filter(|version| attempted.as_deref() != Some(version.as_str()))
+        .filter(|version| {
+            next_layout_requested(&RuntimeVersionSelector::Version((*version).clone()))
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    alternatives.sort_by(|left, right| compare_version_strings(right, left));
+    alternatives.dedup();
+    let other = if attempted.is_some() { " other" } else { "" };
+    let Some(newest) = alternatives.first() else {
+        return format!(
+            "{lead} It publishes no{other} stable release{scope}, so no `--version` pin can install from it yet."
+        );
+    };
+    let mut listed = alternatives
+        .iter()
+        .take(NEXT_LAYOUT_HINT_MAX_LISTED)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if alternatives.len() > NEXT_LAYOUT_HINT_MAX_LISTED {
+        let older = alternatives.len() - NEXT_LAYOUT_HINT_MAX_LISTED;
+        listed.push_str(", and ");
+        listed.push_str(&older.to_string());
+        listed.push_str(" older");
+    }
+    let command = match version_selector {
+        Some(_) => format!(
+            "Re-run with one of them, for example `--version {newest} --family {exact_arch}`."
+        ),
+        None => format!(
+            "Install one of them, for example `rocm install sdk --channel release --version {newest} --family {exact_arch}`."
+        ),
+    };
+    let label = if attempted.is_some() {
+        "Other stable releases it publishes"
+    } else {
+        "Stable releases it publishes"
+    };
+    format!("{lead} {label}{scope}: {listed}. {command}")
 }
 
 /// Identify a wheel runtime by channel, version, AND the exact composition it
@@ -7664,6 +7790,21 @@ mod tests {
             Some("7.14.1")
         );
 
+        // A four-component publish is still a stable release of its line.
+        let four_component_line = RuntimeVersionSelector::version("7.2").unwrap();
+        assert!(four_component_line.matches_version("7.2.4.70204"));
+        assert!(!four_component_line.matches_version("7.20.4.70204"));
+        assert!(!four_component_line.matches_version("7.2.4.70204rc1"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &["7.2.3".to_owned(), "7.2.4.70204".to_owned()],
+                Some(&four_component_line),
+            )
+            .as_deref(),
+            Some("7.2.4.70204")
+        );
+
         let prerelease = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
         assert_eq!(
             select_source_layout(TheRockChannel::Release, &exact, Some(&prerelease)).unwrap(),
@@ -7684,15 +7825,19 @@ mod tests {
 
     /// The wording is produced by [`wheel_resolution_failure_context`], which
     /// `resolve_pip_runtime_with_timeout` appends when resolution fails. The
-    /// install that prints it is `@id:therock-next-16-unsatisfied-line-pin-skips-nightly`.
+    /// install that prints it, and the re-run that proves its suggestion
+    /// clears the failure, is `@id:therock-next-16-unsatisfied-line-pin-skips-nightly`.
     #[test]
     fn unsatisfied_rocm_10_line_pin_does_not_suggest_nightly() {
         let line = RuntimeVersionSelector::version("10.1").unwrap();
+        let published = vec!["10.0.0".to_owned()];
         let message = wheel_resolution_failure_context(
             TheRockChannel::Release,
             SourceLayout::Next,
             THEROCK_NEXT_PIP_INDEX_BASE,
             Some(&line),
+            Some(&published),
+            Some("gfx1201"),
         );
         assert!(
             !message.contains("nightly"),
@@ -7700,24 +7845,13 @@ mod tests {
         );
         assert!(message.contains("next layout"), "{message}");
         assert!(message.contains(THEROCK_NEXT_PIP_INDEX_BASE), "{message}");
-        assert!(message.contains("--version 10.1.0"), "{message}");
-        assert!(message.contains("--family gfx1200"), "{message}");
-
-        let exact = RuntimeVersionSelector::version("10.1.0").unwrap();
-        let exact_message = wheel_resolution_failure_context(
-            TheRockChannel::Release,
-            SourceLayout::Next,
-            THEROCK_NEXT_PIP_INDEX_BASE,
-            Some(&exact),
-        );
-        assert!(!exact_message.contains("nightly"), "{exact_message}");
         assert!(
-            exact_message.contains("--version 10.1.0"),
-            "{exact_message}"
+            message.contains("`--version 10.0.0 --family gfx1201`"),
+            "the suggestion must name a published release and the arch the request used: {message}"
         );
         assert!(
-            exact_message.contains("--family gfx1200"),
-            "{exact_message}"
+            !message.contains("--version 10.1"),
+            "the index publishes no 10.1 release, so none may be suggested: {message}"
         );
 
         // Canonical misses keep the other-channel hint. The 10.1 advice is the
@@ -7727,9 +7861,194 @@ mod tests {
             SourceLayout::Canonical,
             THEROCK_RELEASE_PIP_INDEX_BASE,
             None,
+            Some(&published),
+            None,
         );
         assert!(canonical.contains("--channel nightly"), "{canonical}");
         assert!(canonical.contains("canonical source"), "{canonical}");
+    }
+
+    /// Every state [`next_layout_unsatisfied_hint`] can be reached in. The
+    /// rule under test: the hint never suggests the release the failed
+    /// request resolved to, and never names a command when the index offers
+    /// nothing else.
+    #[test]
+    fn next_layout_unsatisfied_hint_only_suggests_releases_that_were_not_tried() {
+        let versions = |list: &[&str]| list.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+        let line = RuntimeVersionSelector::version("10.1").unwrap();
+        let exact = RuntimeVersionSelector::version("10.1.0").unwrap();
+
+        // A line pin whose newest release (10.1.2) was found but could not be
+        // installed: the other 10.1 release is still worth trying, 10.1.2 is not.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&line),
+            Some(&versions(&["10.0.0", "10.1.0", "10.1.2"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(
+            hint.contains("Other stable releases it publishes: 10.1.0, 10.0.0."),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("`--version 10.1.0 --family gfx1200`"),
+            "{hint}"
+        );
+        assert!(!hint.contains("10.1.2"), "{hint}");
+
+        // An exact pin that is published but failed is not suggested again.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&exact),
+            Some(&versions(&["10.0.0", "10.1.0"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(
+            hint.contains("`--version 10.0.0 --family gfx1200`"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--version 10.1.0"), "{hint}");
+
+        // An exact pin that is the only release: nothing else to suggest, so
+        // no command is named.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&exact),
+            Some(&versions(&["10.1.0"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(
+            hint.contains("It publishes no other stable release"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--version 10"), "{hint}");
+
+        // An index with no stable release at all; prereleases are not offered.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&line),
+            Some(&versions(&["10.1.0a20260822"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(hint.contains("It publishes no stable release"), "{hint}");
+        assert!(!hint.contains("10.1.0a20260822"), "{hint}");
+        assert!(!hint.contains("--version 10"), "{hint}");
+
+        // `rocm update --apply` reaches the next layout with no selector. The
+        // newest release is the one it tried; the hint offers the full
+        // install command for an older one.
+        let hint = next_layout_unsatisfied_hint(
+            None,
+            Some(&versions(&["10.0.0", "10.1.0"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(hint.contains("the requested release"), "{hint}");
+        assert!(
+            hint.contains("`rocm install sdk --channel release --version 10.0.0 --family gfx1200`"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--version 10.1.0"), "{hint}");
+        assert!(!hint.contains("nightly"), "{hint}");
+
+        // No exact arch (only reachable through `rocm update --apply`): this
+        // layout cannot resolve any version without one, so the hint asks for
+        // `--family` and suggests no version.
+        let hint =
+            next_layout_unsatisfied_hint(Some(&line), Some(&versions(&["10.0.0"])), None, None);
+        assert!(hint.contains("needs an exact GPU arch"), "{hint}");
+        assert!(hint.contains("`--family`"), "{hint}");
+        assert!(!hint.contains("--version 10"), "{hint}");
+
+        // The listing itself could not be read: say that, not "no stack was
+        // found", and suggest nothing.
+        let hint = next_layout_unsatisfied_hint(Some(&line), None, Some("gfx1200"), None);
+        assert!(
+            hint.starts_with("Could not read the releases the ROCm 10+ next layout publishes"),
+            "{hint}"
+        );
+        assert!(
+            !hint.contains("No complete compatible package stack"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--version 10"), "{hint}");
+
+        // Only releases a re-run would route back to this layout are offered.
+        // A four-component or sub-10 publish would re-resolve against the
+        // canonical index, so suggesting it could not clear the failure.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&line),
+            Some(&versions(&["9.9.0", "10.0.0", "10.0.1.12345"])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(
+            hint.contains("Stable releases it publishes: 10.0.0. "),
+            "{hint}"
+        );
+        assert!(!hint.contains("10.0.1.12345"), "{hint}");
+        assert!(!hint.contains("9.9.0"), "{hint}");
+
+        // A family-scoped listing (the tarball catalog) says so.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&line),
+            Some(&versions(&[])),
+            Some("gfx1200"),
+            Some("gfx120X-all"),
+        );
+        assert!(
+            hint.contains("It publishes no stable release for gfx120X-all"),
+            "{hint}"
+        );
+
+        // A long listing is capped, newest first.
+        let hint = next_layout_unsatisfied_hint(
+            Some(&line),
+            Some(&versions(&[
+                "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+            ])),
+            Some("gfx1200"),
+            None,
+        );
+        assert!(
+            hint.contains("10.0.6, 10.0.5, 10.0.4, 10.0.3, 10.0.2, and 2 older."),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn tarball_failure_on_next_layout_suggests_a_published_release() {
+        let family = family_for_test("gfx120X-all", Some("gfx1200"));
+        let line = RuntimeVersionSelector::version("10.1").unwrap();
+        let next = tarball_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            &family,
+            Some(&line),
+            &["10.0.0".to_owned()],
+        );
+        assert!(
+            next.starts_with("next-layout TheRock release tarball"),
+            "{next}"
+        );
+        assert!(
+            next.contains("`--version 10.0.0 --family gfx1200`"),
+            "{next}"
+        );
+        assert!(!next.contains("nightly"), "{next}");
+
+        let canonical = tarball_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Canonical,
+            &family,
+            None,
+            &[],
+        );
+        assert!(
+            canonical.starts_with("canonical TheRock release tarball"),
+            "{canonical}"
+        );
+        assert!(canonical.contains("--channel nightly"), "{canonical}");
     }
 
     #[test]

@@ -568,7 +568,9 @@ carries the same ROCm build identifier.
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
 `install sdk` resolves the same release and nightly sources as before. It doesn't
 quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead.
+you what it couldn't find instead. When a ROCm 10 pin can't be satisfied, the
+error lists the other stable ROCm 10 releases that source publishes, if any,
+and suggests one of them to re-run with.
 
 #### Driver installation
 

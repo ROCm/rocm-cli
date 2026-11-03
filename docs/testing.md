@@ -455,6 +455,20 @@ The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
 never prompts and never refuses, whatever the active default is.
 
+`--version` accepts a `major.minor` line as well as an exact
+`major.minor.patch`. `--version 10.1` resolves the newest stable 10.1.x on the
+ROCm 10 next layout, and `--version 7.14` the newest stable 7.14.x on the
+canonical index. When a ROCm 10 pin cannot be satisfied, the error lists the
+other stable ROCm 10 releases that layout publishes, if any, and suggests one
+of them, never the release that just failed and never `--channel nightly`.
+Loopback-fixture scenarios in
+[therock_next_generation.feature](../tests/e2e-cucumber/features/therock_next_generation.feature)
+cover this: `therock-next-15` (a wheel line pin), `therock-next-16` (the
+failure, which re-runs the suggested command to prove it succeeds) and
+`therock-next-17` (a tarball line pin takes the newest release in the line, not
+the newest upload). They run in the default e2e lane; `therock-next-17` is
+Linux-only because Windows refuses tarball installs.
+
 Then it verifies:
 
 - runtime manifest metadata
