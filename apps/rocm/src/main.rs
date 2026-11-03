@@ -8624,7 +8624,9 @@ pub(crate) mod tests {
                     if stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
                     let mut buffer = [0_u8; 1024];
                     let Ok(read) = stream.read(&mut buffer) else {
                         continue;
