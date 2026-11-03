@@ -395,6 +395,35 @@ rocm services restart <service-id> --yes
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
 
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"   # bash: export ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE=1
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it.
+- `rocm services list --all` shows the attempt as `failed`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `failed` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
 up: section 3 serves Lemonade and then stops it on both of its branches, the

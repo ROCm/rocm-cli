@@ -575,7 +575,7 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 
 /// A managed service's record exactly as it is on disk, without the engine-state
 /// and liveness refresh [`load_managed_service`] applies (and may persist).
-fn read_managed_service_manifest(
+pub(crate) fn read_managed_service_manifest(
     paths: &AppPaths,
     service_id: &str,
 ) -> Result<(ManagedServiceRecord, PathBuf)> {
