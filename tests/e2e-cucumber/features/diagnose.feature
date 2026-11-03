@@ -771,17 +771,23 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
-  # Expected to FAIL on a bare-metal GPU host whose device group is not the
-  # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario diagnose-49:
-  # even after the verify text agrees, the actual change must agree too.
+  # Expected to FAIL on every bare-metal Linux GPU host. The device's group is
+  # substituted (a `stat` shim names a real group other than the hard-coded
+  # default), so the premise does not depend on the host, and the CLI's own
+  # inspection is checked to see it first. The diagnosis promises one command
+  # and its matching fix previews another. This is distinct from scenario
+  # diagnose-49: even after the verify text agrees, the actual change must agree
+  # too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
   Scenario: diagnose-51 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
 
-  # Expected to FAIL on a bare-metal GPU host where direct access already works.
+  # Expected to FAIL on every bare-metal Linux GPU host. The usable device is
+  # substituted, not a property of the host: `stat` and `id` shims make the
+  # device world-readable and writable and put the user in none of the
+  # conventional groups, and the CLI's own inspection is checked to agree first.
   # Membership in one conventional group is only a means to access the device,
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.

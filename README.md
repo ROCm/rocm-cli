@@ -821,7 +821,14 @@ rocm model [--verbose]
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines.
+GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+images are among the hidden recipes: `--verbose` shows each one's supported GPU
+families, the GPU count it needs per family, and whether it needs a Hugging Face
+token (`requires_hf_token=yes`), and
+`rocm serve <model> --engine aim` runs it (needs a reachable Docker daemon).
+AIM entries are hand-maintained and record when they were last verified;
+`rocm model --verbose` warns when one is over 180 days old (see
+`docs/aim-catalog.md`).
 
 ### Model serving
 
@@ -912,7 +919,10 @@ instead of silently substituting a different model.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
-before serving gated models.
+before serving gated models. The exception is `--engine aim`, whose container
+does not read your environment on its own: export `HF_TOKEN` and pass
+`--engine-env HF_TOKEN` (see above), or `rocm serve` refuses a gated AIM image
+before pulling anything.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
 per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
@@ -1287,7 +1297,12 @@ you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
   the managed `uv` package cache, which `--keep-data` controls.
 
 By default, the configuration and data directories are both `~/.rocm`, and the
-cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+cache directory is `~/.rocm/cache`. The `ROCM_CLI_CONFIG_DIR`,
+`ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR` environment variables move them;
+when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
+`<data directory>/cache`. A cache that an earlier version kept at `~/.rocm/cache`
+while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by `rocm
+uninstall`; delete it by hand if you don't need it. `uninstall` removes a category's directory
 unless you keep that category, so on a default installation a flag doesn't
 protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.

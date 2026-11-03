@@ -1882,13 +1882,28 @@ async fn given_unnameable_device_group(world: &mut E2eWorld) {
     // What `stat` itself prints for an owning id with no entry in the group
     // database — the state a container inherits when the device's group exists
     // on the host but not inside.
-    world.path_override = Some(crate::stat_shim_path(
-        world,
-        GPU_DEVICE,
-        "crw-rw----",
-        "root",
-        "UNKNOWN",
-    ));
+    let path = crate::stat_shim_path(world, GPU_DEVICE, "crw-rw----", "root", "UNKNOWN");
+    assert_cli_sees_device_group(world, &path, "UNKNOWN");
+    world.path_override = Some(path);
+}
+
+/// Prove the CLI's own inspection reads `group` as the owner of the GPU device
+/// through `path`, so a shim that stops answering fails the premise instead of
+/// letting the scenario pass on the host's real device state.
+fn assert_cli_sees_device_group(world: &E2eWorld, path: &str, group: &str) {
+    let (report, _, _) = crate::run_rocm_with_env(world, &["examine", "--json"], &[("PATH", path)]);
+    let json: serde_json::Value = serde_json::from_str(&report)
+        .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{report}"));
+    let stated = json
+        .get(GPU_DEVICE_FIELD)
+        .and_then(|device| device.get("owner_group"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        stated,
+        Some(group),
+        "the inspection does not report {GPU_DEVICE} as owned by group {group:?}, so the \
+         substituted premise did not take:\n{report}"
+    );
 }
 
 #[given("the GPU device belongs to a recognised non-default group")]
@@ -1919,13 +1934,9 @@ async fn given_non_default_device_group(world: &mut E2eWorld) {
         usable(&group),
         "picked {group:?} as the non-default device group, which the remedy adds anyway"
     );
-    world.path_override = Some(crate::stat_shim_path(
-        world,
-        GPU_DEVICE,
-        "crw-rw----",
-        "root",
-        &group,
-    ));
+    let path = crate::stat_shim_path(world, GPU_DEVICE, "crw-rw----", "root", &group);
+    assert_cli_sees_device_group(world, &path, &group);
+    world.path_override = Some(path);
 }
 
 #[given("the user can already read and write the GPU device")]
@@ -2684,7 +2695,7 @@ async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
     );
 }
 
-fn workspace_root() -> std::path::PathBuf {
+pub(crate) fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -2692,7 +2703,7 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-fn xtask_command() -> std::process::Command {
+pub(crate) fn xtask_command() -> std::process::Command {
     if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
         std::process::Command::new(binary)
     } else {

@@ -190,10 +190,12 @@ fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
     builtin_model_recipes()
         .into_iter()
         .map(|r| ModelRecipeSummary {
+            // Same rule as the chat planner: a host-gated AIM first choice is
+            // not pre-selected when the recipe lists another engine.
+            preferred_engine: crate::freeform_planner::planner_recipe_engine(&r).map(str::to_owned),
             id: r.canonical_model_id,
             aliases: r.aliases,
             task: r.task,
-            preferred_engine: r.preferred_engines.into_iter().next(),
         })
         .collect()
 }

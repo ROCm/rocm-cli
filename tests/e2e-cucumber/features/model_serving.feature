@@ -345,7 +345,9 @@ Feature: Model serving
   # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
   # serves via the raw AIM Docker image reference rather than the catalog
   # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
-  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # exact image/profile, not a catalog-discovery test. Because it names the raw
+  # image, the catalog's GPU-family refusal (no profile for Strix Halo) does not
+  # apply to it. `@requires-engine:aim`
   # skips here when Docker is unreachable OR the gfx family isn't one aim is
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
@@ -562,6 +564,62 @@ Feature: Model serving
     And no vLLM install was started
     And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
 
+  # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
+  # Hugging Face token was passed. The check runs ahead of GPU detection and
+  # Docker, so it needs neither and gates every PR (ungated). The refusal names
+  # the remedy and leaves no service record behind; serve-37 proves the named
+  # remedy clears the condition. A Docker that logs its calls shows that nothing
+  # was pulled. serve-38 and serve-39 cover the GPU-dependent refusals.
+  @id:serve-gated-aim-refused-without-hf-token
+  Scenario: serve-36 - A gated AIM image is refused without a Hugging Face token
+    Given Docker is watched for any call
+    When the user serves a gated AIM model without passing a Hugging Face token
+    Then serving is refused before any engine starts
+    And the CLI explains that the model needs a Hugging Face token
+    And no service was started
+    And Docker was never called
+
+  # The remedy printed by serve-36 (`export HF_TOKEN`, then `--engine-env
+  # HF_TOKEN`) must actually clear that refusal. The host's one GPU is one the
+  # image supports and every GPU is masked, so the serve passes the token and
+  # GPU-family gates and stops at the GPU pre-flight, still before anything is
+  # pulled. The GPU is planted, so the outcome does not depend on the runner.
+  # Linux only: the empty `HIP_VISIBLE_DEVICES` mask and the planted kernel
+  # topology are Linux mechanisms.
+  @id:serve-gated-aim-token-remedy-clears-refusal @requires-os:linux
+  Scenario: serve-37 - Passing the exported Hugging Face token clears the gated AIM refusal
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Radeon PRO W7900
+    When the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked
+    Then serving is refused before any engine starts
+    And the refusal is that no usable GPU is visible
+    And Docker was never called
+
+  # An AIM image only carries profiles for some GPUs. On a GPU it has none for,
+  # `rocm serve --engine aim` is refused up front and names what the image does
+  # support, rather than pulling a container that fails inside. The detected GPU
+  # is planted (an Instinct card against a Radeon-only image), so this needs no
+  # AMD hardware and runs on every Linux lane.
+  @id:serve-aim-refused-on-unsupported-gpu @requires-os:linux
+  Scenario: serve-38 - An AIM image is refused on a GPU it has no profile for
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves a Radeon-only AIM image
+    Then serving is refused before any engine starts
+    And the CLI says the image has no profile for this GPU and names the GPUs it supports
+    And Docker was never called
+
+  # `rocm serve` gives an engine one GPU, so an AIM image whose smallest profile
+  # needs several is refused before launch instead of starting with too few.
+  @id:serve-aim-refused-when-it-needs-several-gpus @requires-os:linux
+  Scenario: serve-39 - An AIM image that needs several GPUs is refused
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves an AIM image that needs eight GPUs
+    Then serving is refused before any engine starts
+    And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
+    And Docker was never called
+
   # `serve` advertises a set of device policies, and the list the user is offered
   # has to be the list the command accepts. Runs on the no-GPU lane, where a
   # refusal that names the policy itself is cleanly distinguishable from the
@@ -571,7 +629,7 @@ Feature: Model serving
   # advertised list and the accepted list are one list), so this ships as a
   # guard rather than an expected failure.
   @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
-  Scenario: serve-36 - Every device policy the serve command offers is one it accepts
+  Scenario: serve-40 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
 
@@ -589,7 +647,7 @@ Feature: Model serving
   # little headroom left on main alone, so three more real serves follow
   # serve-06/07/08 onto the merge-queue path where the budget for them lives.
   @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
-  Scenario: serve-37 - Stopping a running server reports that it stopped it
+  Scenario: serve-41 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
     When the user stops the server that is running
@@ -606,7 +664,7 @@ Feature: Model serving
   # still a real `rocm uninstall`, so it runs with the other `@lifecycle`
   # scenarios rather than on every Linux lane.
   @id:serve-uninstall-stops-what-it-manages @requires-os:linux @lifecycle
-  Scenario: serve-38 - Removing the CLI's managed files stops the servers it manages
+  Scenario: serve-42 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
     Then the server is no longer running
@@ -619,7 +677,7 @@ Feature: Model serving
   # this scenario also guards them.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
-  Scenario: serve-39 - Letting the CLI choose the GPU names the device it chose
+  Scenario: serve-43 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active
     And a machine with an AMD GPU
     When the user serves a model letting the CLI choose the GPU
@@ -631,7 +689,7 @@ Feature: Model serving
   # or say the usual one is busy — but silently reusing it is not.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
-  Scenario: serve-40 - A second server does not take an address already in use
+  Scenario: serve-44 - A second server does not take an address already in use
     Given a managed runtime is active
     And the address a new server would use is already taken
     When the user serves a model without choosing an address

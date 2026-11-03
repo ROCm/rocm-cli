@@ -29,14 +29,15 @@
 //! `render_model_registry_verbose_text_with_context_and_host`,
 //! `model_catalog_header`, `append_model_recipe_registry_source`,
 //! `append_model_recipe_metadata_lines`,
-//! `append_model_engine_recipe_settings_lines`, `format_list_or_none`,
+//! `append_model_engine_recipe_settings_lines`,
+//! `append_model_recipe_staleness_lines`, `format_list_or_none`,
 //! `format_string_map_or_none`, `append_model_artifact_lines`,
 //! `append_artifact_source_policy_lines`, `artifact_source_policy_label`,
 //! `format_bytes`, `append_model_host_ram_fit_lines`,
 //! `append_model_fit_lines`, `append_manual_alternative_lines`,
 //! `manual_alternative_recommendations`, `recipe_is_manual_fit`,
 //! `append_model_engine_support_lines`, `recipe_display_ref`,
-//! `preferred_engine_action_target`, `model_registry_reason`, `format_gib`,
+//! `preferred_engine_action_target`, `once_per_call`, `model_registry_reason`, `format_gib`,
 //! `append_engine_detect_summary`, `friendly_engine_runtime_kind`,
 //! `friendly_engine_detect_notes`, `friendly_engine_detect_note_fallback`,
 //! and `engine_runtime_status_label`).
@@ -123,6 +124,7 @@ use rocm_engine_protocol::{
     DetectRequest, DetectResponse, ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod,
 };
 
+use crate::cli_report::write_marked_row;
 use crate::engine_ipc::{
     builtin_engine_available, engine_request, resolve_engine_binary_path,
     resolve_engine_binary_path_with_paths,
@@ -134,7 +136,8 @@ use crate::runtimes_cmd::{
 };
 use crate::therock;
 use crate::{
-    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform, missing_packaged_engine_reason,
+    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform,
+    engine_ruled_out_by_platform_with, missing_packaged_engine_reason,
 };
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
@@ -241,7 +244,8 @@ fn plain_status_label(status: &str) -> String {
 const DEFAULT_ENGINE_MARKER: &str = "*";
 
 /// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
-/// engine-inventory renderers so the two copies cannot drift apart.
+/// engine-inventory renderers so the two copies cannot drift apart; their rows
+/// share [`write_marked_row`] for the same reason.
 fn write_default_engine_legend(output: &mut String) {
     let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
 }
@@ -292,12 +296,8 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
         write_default_engine_legend(&mut output);
     }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
-        let _ = writeln!(output, "{marker} {name:10} {note}");
+        let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
+        write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
     let _ = writeln!(
@@ -483,11 +483,7 @@ fn append_examine_engine_inventory(
         write_default_engine_legend(output);
     }
     for (engine, note) in engine_inventory() {
-        let marker = if *engine == effective_default {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
+        let marker = (*engine == effective_default).then_some(DEFAULT_ENGINE_MARKER);
         let adapter = if builtin_engine_available(engine) {
             "built_in".to_owned()
         } else {
@@ -507,9 +503,11 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
-        let _ = writeln!(
+        write_marked_row(
             output,
-            "  {marker} {engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"
+            "  ",
+            marker,
+            format_args!("{engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"),
         );
     }
 }
@@ -561,14 +559,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     for platform in &platforms {
         let mut group = visible
             .iter()
-            .filter(|recipe| {
-                recipe.preferred_engines.first().is_some_and(|engine| {
-                    platform
-                        .engines
-                        .iter()
-                        .any(|e| e.eq_ignore_ascii_case(engine))
-                })
-            })
+            .filter(|recipe| rocm_core::model_recipe_targets_platform(recipe, platform))
             .peekable();
         if group.peek().is_none() {
             continue;
@@ -649,6 +640,11 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
             return output;
         }
     };
+    // Every AIM recipe asks whether Docker is reachable; one `docker info` per
+    // listing answers all of them.
+    let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
+    // Detected only if a recipe's first engine is AIM, whose usability depends on it.
+    let host_gpu = std::cell::OnceCell::new();
     for recipe in &registry.recipes {
         let aliases = if recipe.aliases.is_empty() {
             "<none>".to_owned()
@@ -692,17 +688,36 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
         append_model_host_ram_fit_lines(&mut output, recipe, host_ram_gib);
-        append_model_fit_lines(&mut output, recipe, aggregate_gpu_vram_gib);
-        append_model_engine_support_lines(&mut output, recipe, paths);
+        append_model_fit_lines(
+            &mut output,
+            recipe,
+            aggregate_gpu_vram_gib,
+            &host_gpu,
+            paths,
+        );
+        append_model_engine_support_lines(&mut output, recipe, paths, &docker_reachable);
         if recipe.trust_remote_code {
             let _ = writeln!(output, "      trust_remote_code: true");
         }
         for warning in &recipe.warnings {
             let _ = writeln!(output, "      warning: {warning}");
         }
+        append_model_recipe_staleness_lines(&mut output, recipe, rocm_core::unix_time_millis());
     }
     append_model_recipe_registry_source(&mut output, &registry);
     output
+}
+
+fn append_model_recipe_staleness_lines(
+    output: &mut String,
+    recipe: &ModelRecipeRecord,
+    now_ms: u128,
+) {
+    for engine_recipe in &recipe.engine_recipes {
+        if let Some(warning) = rocm_core::model_recipe_staleness_warning(engine_recipe, now_ms) {
+            let _ = writeln!(output, "      warning: {warning}");
+        }
+    }
 }
 
 /// The `rocm model` header. For the default built-in list it just names the
@@ -800,6 +815,31 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
                 .join("; ")
         };
         let notes = format_list_or_none(&engine_recipe.notes);
+        if !engine_recipe.supported_gfx_families.is_empty()
+            || engine_recipe.requires_hf_token
+            || !engine_recipe.profile_ids.is_empty()
+            || !engine_recipe.min_gpu_counts.is_empty()
+        {
+            let _ = writeln!(
+                output,
+                "      engine_recipe {} supported_gfx_families=[{}] requires_hf_token={} profile_ids=[{}] min_gpu_counts=[{}]",
+                engine_recipe.engine,
+                format_list_or_none(&engine_recipe.supported_gfx_families),
+                if engine_recipe.requires_hf_token {
+                    "yes"
+                } else {
+                    "no"
+                },
+                format_string_map_or_none(&engine_recipe.profile_ids),
+                format_string_map_or_none(
+                    &engine_recipe
+                        .min_gpu_counts
+                        .iter()
+                        .map(|(family, count)| (family.clone(), count.to_string()))
+                        .collect()
+                )
+            );
+        }
         let _ = writeln!(
             output,
             "      engine_recipe {} required_flags=[{}] parser_settings=[{}] preferred_endpoint={} unsupported_combinations=[{}] notes=[{}]",
@@ -1026,7 +1066,10 @@ fn append_model_fit_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
     aggregate_gpu_vram_gib: Option<f64>,
+    host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
+    paths: Option<&AppPaths>,
 ) {
+    let engine_target = preferred_engine_action_target(recipe, host_gpu, paths);
     match recipe.min_gpu_mem_gb {
         None => {
             let _ = writeln!(output, "      gpu_fit: supported");
@@ -1039,7 +1082,7 @@ fn append_model_fit_lines(
                 output,
                 "      action: use /plan serve {} with {}",
                 recipe_display_ref(recipe),
-                preferred_engine_action_target(recipe)
+                engine_target
             );
         }
         Some(required) => match aggregate_gpu_vram_gib {
@@ -1055,7 +1098,7 @@ fn append_model_fit_lines(
                     output,
                     "      action: use /plan serve {} with {}",
                     recipe_display_ref(recipe),
-                    preferred_engine_action_target(recipe)
+                    engine_target
                 );
             }
             Some(available) => {
@@ -1177,11 +1220,19 @@ fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: Opti
     }
 }
 
+/// Wraps `probe` so it runs at most once, however many times the result is asked
+/// for, for as long as the returned closure lives.
+fn once_per_call(probe: impl Fn() -> bool) -> impl Fn() -> bool {
+    let cached = std::cell::OnceCell::new();
+    move || *cached.get_or_init(&probe)
+}
+
 #[allow(dead_code)]
 fn append_model_engine_support_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
     paths: Option<&AppPaths>,
+    docker_reachable: &dyn Fn() -> bool,
 ) {
     if recipe.preferred_engines.is_empty() {
         let _ = writeln!(output, "      engine_support: unknown");
@@ -1195,7 +1246,7 @@ fn append_model_engine_support_lines(
     let _ = writeln!(output, "      engine_support:");
     for engine in &recipe.preferred_engines {
         if builtin_engine_available(engine) {
-            if let Some(note) = model_registry_adapter_availability_note(engine) {
+            if let Some(note) = model_registry_adapter_availability_note(engine, docker_reachable) {
                 let _ = writeln!(
                     output,
                     "        {engine}: adapter_available path=<built-in> {note}"
@@ -1206,7 +1257,9 @@ fn append_model_engine_support_lines(
         } else if let Some(paths) = paths {
             match resolve_engine_binary_path_with_paths(engine, paths) {
                 Ok(path) => {
-                    if let Some(note) = model_registry_adapter_availability_note(engine) {
+                    if let Some(note) =
+                        model_registry_adapter_availability_note(engine, docker_reachable)
+                    {
                         let _ = writeln!(
                             output,
                             "        {engine}: adapter_available path={} {note}",
@@ -1245,8 +1298,11 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    match engine_ruled_out_by_platform(engine) {
+fn model_registry_adapter_availability_note(
+    engine: &str,
+    docker_reachable: &dyn Fn() -> bool,
+) -> Option<&'static str> {
+    match engine_ruled_out_by_platform_with(engine, docker_reachable) {
         PlatformRuleOut::Allowed => None,
         PlatformRuleOut::AimDockerUnavailable => Some(
             "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
@@ -1269,11 +1325,22 @@ fn recipe_display_ref(recipe: &ModelRecipeRecord) -> &str {
 }
 
 #[allow(dead_code)]
-fn preferred_engine_action_target(recipe: &ModelRecipeRecord) -> &str {
-    recipe
+fn preferred_engine_action_target(
+    recipe: &ModelRecipeRecord,
+    host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
+    paths: Option<&AppPaths>,
+) -> String {
+    let first = recipe
         .preferred_engines
         .first()
-        .map_or("<engine>", String::as_str)
+        .map_or("<engine>", String::as_str);
+    if !first.eq_ignore_ascii_case("aim") {
+        return first.to_owned();
+    }
+    // AIM is host-gated (GPU family, platform), so name the engine `rocm serve`
+    // would pick on this host instead of assuming AIM.
+    let host = host_gpu.get_or_init(|| rocm_core::detect_host_gpu_summary(paths));
+    crate::serve_cmd::select_serve_engine(None, None, Some(recipe), Some(host)).engine
 }
 
 #[allow(dead_code)]
@@ -1686,6 +1753,28 @@ mod tests {
     }
 
     #[test]
+    fn render_engine_inventory_text_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("engine-inventory-row-layout");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        for (name, _) in engine_inventory() {
+            let expected = if *name == host_default {
+                format!("{DEFAULT_ENGINE_MARKER} {name:10} ")
+            } else {
+                format!("  {name:10} ")
+            };
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
         // A configured default naming an external plugin (or a stale/typo'd
         // name) matches zero rows in `engine_inventory()`'s built-ins list —
@@ -1828,12 +1917,12 @@ mod tests {
                 "unsupported_native_windows"
             );
             assert!(
-                model_registry_adapter_availability_note("vllm")
+                model_registry_adapter_availability_note("vllm", &|| true)
                     .is_some_and(|note| note.contains("unsupported_native_windows"))
             );
         } else {
             assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
-            assert!(model_registry_adapter_availability_note("vllm").is_none());
+            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
         }
     }
 
@@ -1909,8 +1998,8 @@ mod tests {
         assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"));
-        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
@@ -2002,7 +2091,7 @@ mod tests {
         assert!(rendered.contains("source: built-in recipe registry"));
         // Verbose keeps every recipe (including hidden ones) and annotates each
         // with its curated catalog placement.
-        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
         // ROCMAI-543: `rocm model --verbose` output must stick to ASCII too, not
@@ -2050,6 +2139,12 @@ mod tests {
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
             image_digest: None,
+            generated_at_unix_ms: None,
+            supported_gfx_families: Vec::new(),
+            profile_ids: BTreeMap::new(),
+            requires_hf_token: false,
+            supported_boards: Vec::new(),
+            min_gpu_counts: BTreeMap::new(),
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();
@@ -2113,6 +2208,107 @@ mod tests {
     }
 
     #[test]
+    fn verbose_model_listing_shows_aim_gpu_families_and_token_requirement() {
+        let engine_lines = |id: &str| {
+            let recipe = rocm_core::resolve_builtin_model_recipe(id).expect("aim recipe");
+            let mut output = String::new();
+            append_model_engine_recipe_settings_lines(&mut output, &recipe);
+            output
+        };
+        let gated = engine_lines("meta-llama/Llama-3.2-3B-Instruct");
+        assert!(
+            gated.contains(
+                "engine_recipe aim supported_gfx_families=[gfx94X-dcgpu,gfx950-dcgpu] \
+                 requires_hf_token=yes profile_ids=[<none>] min_gpu_counts=[<none>]"
+            ),
+            "{gated}"
+        );
+        // Radeon images list the profile pinned per family and the GPU counts.
+        let radeon = engine_lines("zai-org/GLM-4.7-Flash");
+        assert!(
+            radeon.contains(
+                "supported_gfx_families=[gfx110X-all,gfx120X-all] requires_hf_token=no \
+                 profile_ids=[gfx110X-all="
+            ) && radeon.contains("min_gpu_counts=[gfx110X-all=2,gfx120X-all=4]"),
+            "{radeon}"
+        );
+        // A recipe with no AIM entry prints no such line.
+        let lemonade = engine_lines("qwen");
+        assert!(!lemonade.contains("supported_gfx_families"), "{lemonade}");
+    }
+
+    #[test]
+    fn engine_action_target_follows_what_serve_would_pick_on_this_host() {
+        let target = |recipe_id: &str, family: &str| {
+            let recipe = rocm_core::resolve_builtin_model_recipe(recipe_id).expect("recipe");
+            let host = std::cell::OnceCell::new();
+            let _ = host.set(rocm_core::HostGpuSummary {
+                therock_family: Some(family.to_owned()),
+                ..rocm_core::HostGpuSummary::default()
+            });
+            preferred_engine_action_target(&recipe, &host, None)
+        };
+        // A recipe that lists no AIM is untouched by the host.
+        assert_eq!(target("tiny-gpt2", "gfx1151"), "vllm");
+        if !cfg!(windows) {
+            // AIM is named only where `rocm serve` would pick it.
+            assert_eq!(target("Qwen/Qwen3.5-9B", "gfx110X-all"), "aim");
+            assert_ne!(target("Qwen/Qwen3.5-9B", "gfx1151"), "aim");
+            // Instinct hosts prefer vLLM, which `rocm serve` picks over AIM.
+            assert_eq!(target("Qwen/Qwen3-32B", "gfx94X-dcgpu"), "vllm");
+        }
+    }
+
+    #[test]
+    fn once_per_call_runs_the_probe_once() {
+        let calls = std::cell::Cell::new(0);
+        let cached = once_per_call(|| {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert!(!cached() && !cached() && !cached());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn verbose_model_listing_shows_a_token_requirement_without_gfx_families() {
+        // A schema-valid record can carry `requires_hf_token` alone; the listing
+        // must still say the image needs a token.
+        let mut recipe =
+            rocm_core::resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+                .expect("aim recipe");
+        for record in &mut recipe.engine_recipes {
+            record.supported_gfx_families.clear();
+        }
+        let mut output = String::new();
+        append_model_engine_recipe_settings_lines(&mut output, &recipe);
+        assert!(
+            output.contains(
+                "engine_recipe aim supported_gfx_families=[<none>] requires_hf_token=yes"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn model_recipe_staleness_lines_warn_only_for_stale_engine_recipes() {
+        let recipe = rocm_core::resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("aim entry");
+        let verified = recipe.engine_recipes[0]
+            .generated_at_unix_ms
+            .expect("aim entries record when they were verified");
+        let stale_ms = rocm_core::MODEL_RECIPE_STALE_AFTER_MS;
+        let mut fresh = String::new();
+        append_model_recipe_staleness_lines(&mut fresh, &recipe, verified + stale_ms);
+        assert!(fresh.is_empty(), "{fresh}");
+        let mut stale = String::new();
+        append_model_recipe_staleness_lines(&mut stale, &recipe, verified + stale_ms + 1);
+        assert!(
+            stale.contains("warning: aim entry was last verified 180 days ago"),
+            "{stale}"
+        );
+    }
+
+    #[test]
     fn render_model_registry_text_marks_tiny_recipe_as_gpu_smoke_support() {
         let rendered = render_model_registry_verbose_text_with_context_and_host(None, None, None);
 
@@ -2139,7 +2335,12 @@ mod tests {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
         let mut output = String::new();
 
-        append_model_engine_support_lines(&mut output, &recipe, Some(&paths));
+        append_model_engine_support_lines(
+            &mut output,
+            &recipe,
+            Some(&paths),
+            &rocm_engine_aim::builtin_docker_daemon_reachable,
+        );
         let _ = fs::remove_dir_all(root);
 
         if cfg!(windows) {
@@ -2335,6 +2536,28 @@ mod tests {
             legend_pos < marker_pos,
             "legend must appear before the entries it explains:\n{output}"
         );
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("examine-engine-inventory-row-layout");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        for (engine, _) in engine_inventory() {
+            let expected = if *engine == "vllm" {
+                format!("  {DEFAULT_ENGINE_MARKER} {engine} adapter=")
+            } else {
+                format!("    {engine} adapter=")
+            };
+            assert!(
+                output.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{output}"
+            );
+        }
     }
 
     #[test]

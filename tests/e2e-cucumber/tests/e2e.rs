@@ -1101,10 +1101,27 @@ pub fn run_rocm_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (String, String, i32) {
+    run_rocm_with_env_and_unset(world, args, envs, &[])
+}
+
+/// Like [`run_rocm_with_env`], but first removes each of `unset` from the env.
+///
+/// For a scenario about what the CLI resolves when one of the
+/// `ROCM_CLI_*_DIR` settings is left out. Everything the scenario keeps set
+/// still points inside its isolated root.
+pub fn run_rocm_with_env_and_unset(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    unset: &[&str],
+) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }

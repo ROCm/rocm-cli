@@ -1263,7 +1263,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
     (
-        "crates/rocm-core/src/host_gpu.rs",
+        "crates/rocm-core/src/host_gpu/capture.rs",
         "rocm debug: command capture {stage} failed for {}: {detail}",
         "debug log line",
     ),

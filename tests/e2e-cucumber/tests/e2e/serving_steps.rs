@@ -1094,6 +1094,123 @@ async fn user_serves_negative_temperature(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// A gated AIM catalog entry (`requires_hf_token`), with a profile for a Radeon
+/// PRO W7900 (`gfx110X-all`). The token check runs before GPU detection and
+/// Docker, so no engine or GPU is needed to reach it.
+const GATED_AIM_MODEL: &str = "meta-llama/Llama-3.1-8B-Instruct";
+
+/// An AIM image with profiles for Radeon (`gfx110X-all`, `gfx120X-all`) only.
+const RADEON_AIM_MODEL: &str = "Qwen/Qwen3.5-9B";
+
+/// An AIM image that needs 8 GPUs on an Instinct MI300X.
+const EIGHT_GPU_AIM_MODEL: &str = "deepseek-ai/DeepSeek-R1";
+
+/// Put a `docker` that always fails first on `PATH` and have it log every call to
+/// a file in the scenario root, so a refused serve can be shown never to have
+/// reached Docker (not even `docker info`).
+#[given("Docker is watched for any call")]
+async fn docker_is_watched(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+    let bin_dir = root.join("watched-docker-bin");
+    crate::install_fixture_binary(
+        "fake-docker",
+        &bin_dir.join(e2e_cucumber::fixture_binary::fixture_target_name("docker")),
+    );
+    let mut path = std::ffi::OsString::from(&bin_dir);
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("FAKE_DOCKER_LOG", docker_call_log(world).into_os_string()));
+}
+
+fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("docker-calls.log")
+}
+
+/// Plant one GPU in the simulated kernel topology (`ROCM_CLI_TEST_HOST_ROOT`, honoured
+/// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
+/// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
+fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root");
+    let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+/// gfx942, TheRock family `gfx94X-dcgpu`.
+#[given("a host whose only GPU is an AMD Instinct MI300X")]
+async fn host_with_an_mi300x(world: &mut E2eWorld) {
+    plant_single_gpu(world, 90402);
+}
+
+/// gfx1100, TheRock family `gfx110X-all`.
+#[given("a host whose only GPU is an AMD Radeon PRO W7900")]
+async fn host_with_a_w7900(world: &mut E2eWorld) {
+    plant_single_gpu(world, 110_000);
+}
+
+fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {
+    let mut full = vec!["serve"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--engine", "aim"]);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &full);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a gated AIM model without passing a Hugging Face token")]
+async fn user_serves_gated_aim_without_token(world: &mut E2eWorld) {
+    run_serve_aim(world, &[GATED_AIM_MODEL]);
+}
+
+#[when(
+    "the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked"
+)]
+async fn user_serves_gated_aim_with_token(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("HF_TOKEN", "hf_e2e_placeholder".into()));
+    // An empty mask hides every device, so a GPU host presents as having none usable.
+    world.command_env.push(("HIP_VISIBLE_DEVICES", "".into()));
+    run_serve_aim(world, &[GATED_AIM_MODEL, "--engine-env", "HF_TOKEN"]);
+}
+
+#[when("the user serves a Radeon-only AIM image")]
+async fn user_serves_radeon_only_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[RADEON_AIM_MODEL]);
+}
+
+#[when("the user serves an AIM image that needs eight GPUs")]
+async fn user_serves_eight_gpu_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[EIGHT_GPU_AIM_MODEL]);
+}
+
 /// Serve with every GPU hidden from the CLI and engine via an empty
 /// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
 #[when("the user serves a model with every GPU masked from view")]
@@ -1123,6 +1240,13 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
 
 // ── Device policies the command offers ─────────────────────────────
 
+/// A help line that starts a new option: `--long` or `-x, --long`.
+fn is_option_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("--")
+        || (line.len() > 1 && line.starts_with('-') && line.as_bytes()[1].is_ascii_alphanumeric())
+}
+
 /// The device policies `serve --help` advertises, read out of the help rather
 /// than listed here so the check follows whatever the command currently offers.
 ///
@@ -1144,13 +1268,6 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
 /// nothing" — it silently removes the very list the scenario exists to check.
 /// The caller's guard turns that into a loud failure, but recognising both
 /// shapes is what keeps the scenario measuring the contract at all.
-/// A help line that starts a new option: `--long` or `-x, --long`.
-fn is_option_line(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("--")
-        || (line.len() > 1 && line.starts_with('-') && line.as_bytes()[1].is_ascii_alphanumeric())
-}
-
 fn advertised_device_policies(help: &str) -> Vec<String> {
     let lines: Vec<&str> = help.lines().collect();
     let device = lines.iter().position(|line| {
@@ -1593,15 +1710,9 @@ async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
             // ("already running", "already being served").
             let said = output.to_lowercase();
             assert!(
-                [
-                    "in use",
-                    "address already",
-                    "port already",
-                    "already bound",
-                    "unavailable"
-                ]
-                .iter()
-                .any(|phrase| said.contains(phrase)),
+                ["in use", "address already", "port already", "already bound"]
+                    .iter()
+                    .any(|phrase| said.contains(phrase)),
                 "the CLI refused, but without naming the address that is taken — so this \
                  says nothing about whether it noticed the conflict:\n{output}"
             );
@@ -2349,6 +2460,71 @@ async fn assert_no_engine_preparation(world: &mut E2eWorld) {
         !output.contains("Preparing "),
         "a live managed service for an unrelated model must not drag engine \
          preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
+#[then("the CLI explains that the model needs a Hugging Face token")]
+async fn assert_hf_token_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs a Hugging Face token") && output.contains("--engine-env HF_TOKEN"),
+        "expected the gated-model refusal naming the remedy, got:\n{output}"
+    );
+}
+
+#[then("no service was started")]
+async fn assert_no_service_started(world: &mut E2eWorld) {
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records = std::fs::read_dir(&services_dir).map_or(0, Iterator::count);
+    assert_eq!(records, 0, "a refused serve left service records behind");
+}
+
+#[then("the refusal is that no usable GPU is visible")]
+async fn assert_refusal_is_no_usable_gpu(world: &mut E2eWorld) {
+    // The token gate and the GPU-family gate were both passed: the serve got as
+    // far as the GPU-required pre-flight, which the empty mask fails.
+    let output = serve_output(world);
+    assert!(
+        output.contains("no usable AMD GPU") && !output.contains("needs a Hugging Face token"),
+        "expected the exported token to clear its gate and the serve to stop at the \
+         GPU pre-flight, got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image has no profile for this GPU and names the GPUs it supports")]
+async fn assert_no_profile_for_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("has no profile for this GPU (gfx94X-dcgpu)")
+            && output.contains("it supports: gfx110X-all, gfx120X-all"),
+        "expected the unsupported-GPU refusal naming the detected and supported families, \
+         got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image needs eight GPUs and multi-GPU serving is not supported")]
+async fn assert_needs_eight_gpus(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs 8 GPUs") && output.contains("does not support multi-GPU serving"),
+        "expected the multi-GPU refusal, got:\n{output}"
+    );
+}
+
+#[then("Docker was never called")]
+async fn assert_docker_never_called(world: &mut E2eWorld) {
+    let log = docker_call_log(world);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "a refused serve reached Docker ({}):\n{calls}",
+        log.display()
     );
 }
 
