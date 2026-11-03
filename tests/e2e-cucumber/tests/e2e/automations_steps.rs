@@ -986,8 +986,8 @@ async fn newer_proposals_for_other_servers(world: &mut E2eWorld) {
 }
 
 /// Stop requests for [`HOT_SERVICE`] still waiting for review.
-fn pending_stop_requests(world: &E2eWorld) -> usize {
-    load_automation_proposals(&world.app_paths())
+fn pending_stop_requests(paths: &rocm_core::AppPaths) -> usize {
+    load_automation_proposals(paths)
         .expect("proposal history reads back")
         .iter()
         .filter(|proposal| {
@@ -998,8 +998,8 @@ fn pending_stop_requests(world: &E2eWorld) -> usize {
         .count()
 }
 
-fn stop_already_waiting_recorded(world: &E2eWorld) -> bool {
-    load_recent_automation_events(&world.app_paths(), 50)
+fn stop_already_waiting_recorded(paths: &rocm_core::AppPaths) -> bool {
+    load_recent_automation_events(paths, 50)
         .expect("automation events read back")
         .iter()
         .any(|event| {
@@ -1010,35 +1010,35 @@ fn stop_already_waiting_recorded(world: &E2eWorld) -> bool {
 
 #[then("one stop request for the server is waiting for review")]
 async fn one_stop_request_waiting(world: &mut E2eWorld) {
-    let world = &*world;
+    let paths = world.app_paths();
     wait_until("the daemon to queue a stop request", || {
-        pending_stop_requests(world) >= 1
+        pending_stop_requests(&paths) >= 1
     })
     .await;
-    assert_eq!(pending_stop_requests(world), 1);
+    assert_eq!(pending_stop_requests(&paths), 1);
 }
 
 #[then("the daemon records that a stop request is already waiting for the server")]
 async fn daemon_records_stop_already_waiting(world: &mut E2eWorld) {
-    let world = &*world;
+    let paths = world.app_paths();
     // A second stop request ends the wait too: that is the defect, and it is
     // reported below rather than after a timeout.
     wait_until("the daemon to handle the repeated alert", || {
-        stop_already_waiting_recorded(world) || pending_stop_requests(world) >= 2
+        stop_already_waiting_recorded(&paths) || pending_stop_requests(&paths) >= 2
     })
     .await;
     assert!(
-        stop_already_waiting_recorded(world),
+        stop_already_waiting_recorded(&paths),
         "the daemon queued another stop request instead of noting the first was still waiting; \
          {} are now waiting",
-        pending_stop_requests(world)
+        pending_stop_requests(&paths)
     );
 }
 
 #[then("only one stop request for the server is waiting for review")]
 async fn still_one_stop_request_waiting(world: &mut E2eWorld) {
     assert_eq!(
-        pending_stop_requests(world),
+        pending_stop_requests(&world.app_paths()),
         1,
         "the repeated alert must not queue a second stop request for {HOT_SERVICE}"
     );
