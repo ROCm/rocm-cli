@@ -45,8 +45,6 @@ use rocm_core::format_http_base_url;
 use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServiceRecord};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
-#[cfg(not(windows))]
-use crate::apply_app_path_env;
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
 #[cfg(not(windows))]
@@ -321,9 +319,9 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// stop": that is itself anomalous, and silently treating it as a clean stop
 /// would risk masking a real crash.
 pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
-    crate::read_managed_service_manifest(paths, service_id).is_ok_and(|(record, _)| {
-        record.stop_requested_unix_ms.is_some() || record.status == "stopped"
-    })
+    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
+        |(record, _)| record.stop_requested_unix_ms.is_some() || record.status == "stopped",
+    )
 }
 
 /// Decide a managed launch's final status from the HTTP readiness wait and the
@@ -381,7 +379,7 @@ fn finalize_managed_launch_readiness(
     if readiness != EndpointReadiness::Serving && !child_is_alive() {
         if managed_service_stop_was_requested(paths, &record.service_id) {
             if let Ok((on_disk, _)) =
-                crate::read_managed_service_manifest(paths, &record.service_id)
+                crate::services_text::read_managed_service_manifest(paths, &record.service_id)
             {
                 *record = on_disk;
             }
@@ -1438,7 +1436,7 @@ pub(crate) fn run_attached_service(
             // unguarded would let the clobber this guard prevents on the
             // manifest simply round-trip back in through that file instead.
             let still_watching_this_supervisor =
-                crate::read_managed_service_manifest(&paths, &service_id).is_ok_and(
+                crate::services_text::read_managed_service_manifest(&paths, &service_id).is_ok_and(
                     |(current, _)| {
                         current.supervisor_pid == child_pid
                             && current.supervisor_start_ticks == supervisor_start_ticks
@@ -2509,7 +2507,8 @@ mod tests {
         // engine state file because the engine process that owns it is gone and
         // cannot write "failed" there itself.
         assert_eq!(record.status, "failed");
-        let (reread, _) = crate::read_managed_service_manifest(&paths, "svc-dead-3")?;
+        let (reread, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-dead-3")?;
         assert_eq!(reread.status, "failed");
         let engine_state: serde_json::Value =
             serde_json::from_slice(&fs::read(&record.engine_state_path)?)?;
@@ -2635,8 +2634,10 @@ mod tests {
         assert_eq!(record.status, "stopped", "record is refreshed from disk");
         assert_eq!(record.stop_requested_unix_ms, Some(999));
 
-        let (on_disk, _) =
-            crate::read_managed_service_manifest(&paths, "svc-stopped-during-launch")?;
+        let (on_disk, _) = crate::services_text::read_managed_service_manifest(
+            &paths,
+            "svc-stopped-during-launch",
+        )?;
         assert_eq!(
             on_disk.status, "stopped",
             "the manifest must not be overwritten with `failed`"

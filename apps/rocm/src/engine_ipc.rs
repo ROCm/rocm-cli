@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
+#[cfg(feature = "e2e-test-hooks")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
