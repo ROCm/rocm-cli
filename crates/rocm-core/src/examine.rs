@@ -1219,6 +1219,17 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
     (gfx.to_owned(), gfx_is_apu_family(gfx))
 }
 
+/// The packaging an AMD marketing name states, or `None` when the name resolves
+/// no part.
+///
+/// Unlike [`classify_amd_marketing_name`], this does not default an
+/// unresolved name to "not an APU": it is for a GPU that has no PCI row, where
+/// that default would be read as "a discrete GPU" with nothing behind it.
+fn marketing_name_apu_verdict(name: &str) -> Option<bool> {
+    let (target, is_apu) = classify_amd_marketing_name(name);
+    (!target.is_empty()).then_some(is_apu)
+}
+
 /// Whether a gfx target belongs to an AMD APU family.
 ///
 /// APUs: the Vega iGPUs gfx902 / gfx909 (Raven Ridge, Picasso / Raven2) and
@@ -1304,10 +1315,12 @@ fn gfx_model_digit(gfx: &str, prefix: &str) -> Option<u32> {
 /// gfx942 covers both the MI300X accelerator and the MI300A, which is an APU
 /// with unified HBM. It is listed discrete because MI300X is what ROCm hosts
 /// run and what the CLI has always answered; telling the two apart needs a
-/// signal the target does not carry.
+/// signal the target does not carry. gfx940 and gfx941, the earlier MI300
+/// targets that `normalize_therock_family` folds into the same `gfx94X-dcgpu`
+/// family, are listed for the same reason.
 const DISCRETE_GFX_TARGETS: &[&str] = &[
     // GCN / CDNA.
-    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950",
     // RDNA1: Navi 10 / 12 / 14.
     "gfx1010", "gfx1011", "gfx1012", // RDNA2: Navi 21 / 22 / 23 / 24.
     "gfx1030", "gfx1031", "gfx1032", "gfx1034", // RDNA3: Navi 31 / 32 / 33.
@@ -1558,6 +1571,7 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
         if let Some(&gpu_idx) = amd_indices.get(idx) {
             let gpu = &mut e.gpus[gpu_idx];
             gpu.gfx_target = gfx.clone();
+            let named_is_apu = marketing_name_apu_verdict(&marketing);
             if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
                 gpu.name = marketing;
             }
@@ -1569,22 +1583,28 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
             // identified into a discrete card, clearing `has_apu` and with it
             // the iGPU+dGPU collision diagnosis. (Latent while #393 makes the
             // parser drop every agent on a real host; live the day it is fixed.)
+            //
+            // A row that still has no verdict at all -- a kernel-topology
+            // placeholder whose target nothing classifies, in a container
+            // with no `pciutils` -- takes the agent's marketing name when that
+            // resolves a part, exactly as an unpaired agent does below. The
+            // agent is paired by position, like the target and name above, so
+            // on a multi-GPU host a mispairing decides this verdict too (#508).
             if let Some(is_apu) = gfx_apu_verdict(&gfx) {
                 gpu.is_apu = Some(is_apu);
+            } else if gpu.is_apu.is_none() {
+                gpu.is_apu = named_is_apu;
             }
         } else {
-            // An agent with no PCI row to pair with -- the ordinary ROCm
-            // container, which ships `rocminfo` but not `pciutils`. Same
-            // precedence, over the evidence there is: the target when its
-            // packaging is known, else the agent's own marketing name when that
-            // resolves a part. When neither answers, `is_apu` stays unset rather
-            // than defaulting to `false`, which `summarise_gpu_categories` would
-            // read as "a discrete GPU" -- the conclusion
-            // `probe_gpus_sysfs_fallback` reaches for the same reason.
-            let is_apu = gfx_apu_verdict(&gfx).or_else(|| {
-                let (named_target, named_is_apu) = classify_amd_marketing_name(&marketing);
-                (!named_target.is_empty()).then_some(named_is_apu)
-            });
+            // An agent with no PCI row and no kernel-topology node to pair
+            // with: KFD unreadable, and no `pciutils`. Same precedence, over the
+            // evidence there is: the target when its packaging is known, else
+            // the agent's own marketing name when that resolves a part. When
+            // neither answers, `is_apu` stays unset rather than defaulting to
+            // `false`, which `summarise_gpu_categories` would read as "a
+            // discrete GPU" -- the conclusion `probe_gpus_sysfs_fallback`
+            // reaches for the same reason.
+            let is_apu = gfx_apu_verdict(&gfx).or_else(|| marketing_name_apu_verdict(&marketing));
             e.gpus.push(Gpu {
                 name: if marketing.is_empty() {
                     "AMD GPU".to_owned()
@@ -1635,15 +1655,17 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination, gfx_target: fn() -> Option<Str
     let Some(gfx_target) = gfx_target() else {
         return;
     };
-    // `is_apu` is left unset rather than guessed: sysfs gives the target, not
-    // the packaging, and `summarise_gpu_categories` reads `Some(true)` /
-    // `Some(false)` to populate has_apu / has_discrete_amd. Claiming either
-    // would be inventing a fact, so both stay false and only has_amd_gpu moves.
+    // `summarise_gpu_categories` reads `Some(true)` / `Some(false)` to populate
+    // has_apu / has_discrete_amd, so `is_apu` is set only where the target's
+    // packaging is known ([`gfx_apu_verdict`]). For a target nothing classifies
+    // it stays unset: claiming either would be inventing a fact, so both flags
+    // stay false and only has_amd_gpu moves.
+    let is_apu = gfx_apu_verdict(&gfx_target);
     e.gpus.push(Gpu {
         name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
         gfx_target,
         is_amd: true,
-        is_apu: None,
+        is_apu,
         ..Gpu::default()
     });
     e.notes.push(
@@ -1837,10 +1859,10 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
                 gfx_target: node.gfx_target.clone(),
                 pci_id: node.pci_id.clone(),
                 is_amd: true,
-                // Left unset rather than guessed, for the same reason
-                // `probe_gpus_sysfs_fallback` leaves it unset: KFD gives the
-                // target, not the packaging.
-                is_apu: None,
+                // The target's own verdict where its packaging is known, and
+                // unset rather than guessed where it is not -- the same reading
+                // `probe_gpus_sysfs_fallback` takes of the same KFD target.
+                is_apu: gfx_apu_verdict(&node.gfx_target),
             });
             continue;
         };
@@ -1853,6 +1875,17 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         // there is nothing to compare it against.
         if gpu.gfx_target.is_empty() {
             gpu.gfx_target = node.gfx_target.clone();
+            // The verdict follows the target it now carries. A PCI row that
+            // resolved no target holds the scan's "not an APU" default (see
+            // `classify_amd_marketing_name`), which is a guess; a target whose
+            // packaging is known replaces it, the same precedence the
+            // `rocminfo` fold applies. This is the only route by which a Raven
+            // Ridge or Picasso iGPU is classified on a real host: no lookup
+            // table names them, and KFD's packed `gfx_target_version` is what
+            // yields gfx902 / gfx909. An unknown target leaves the guess alone.
+            if let Some(is_apu) = gfx_apu_verdict(&gpu.gfx_target) {
+                gpu.is_apu = Some(is_apu);
+            }
         }
         gpus.push(gpu);
     }
@@ -3352,12 +3385,12 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
 /// prints a block for a card the PCI-id table resolved, but that card is no
 /// longer an empty slot, so a naive "first empty slot" walk hands *its*
 /// architecture to the next card along. The concrete case: a Radeon 680M
-/// (resolved to `gfx1035` from its device id) beside an RX 6800M (in neither
-/// table). `hipInfo` prints gfx1035 then gfx1031; the first line finds the 6800M
-/// as the only empty slot and makes it a `gfx1035` APU. That inverts both
-/// `has_apu` and `has_discrete_amd`, which gate `fix-9-igpu-dgpu`, and the
-/// second line is then dropped — the discrete card ends up described as the
-/// integrated one.
+/// (resolved to `gfx1035` from its device id) beside a discrete RX 6800M whose
+/// row neither table resolved. `hipInfo` prints gfx1035 then gfx1031; the first
+/// line finds the 6800M as the only empty slot and makes it a `gfx1035` APU.
+/// That inverts both `has_apu` and `has_discrete_amd`, which gate
+/// `fix-9-igpu-dgpu`, and the second line is then dropped — the discrete card
+/// ends up described as the integrated one.
 ///
 /// So an architecture already held by an identified GPU is consumed rather than
 /// assigned: one line per holder, by count, not by presence. Counting matters —
@@ -3391,6 +3424,11 @@ fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
         };
         // Same rule as `apply_rocminfo_gpu_agents`: a target whose packaging is
         // known outranks the display probe's verdict, an unknown one leaves it.
+        // Today the two branches cannot disagree here: a row reaches this loop
+        // only with an empty target, and the Windows probe gives every such row
+        // the "not an APU" default, so an unknown target leaves exactly what an
+        // overwrite with `gfx_is_apu_family`'s `false` would. The rule is kept
+        // so the hipInfo fold cannot quietly drift from the rocminfo one.
         if let Some(is_apu) = gfx_apu_verdict(&gfx) {
             gpu.is_apu = Some(is_apu);
         }
@@ -5970,15 +6008,16 @@ mod tests {
 
     #[test]
     fn a_topology_sourced_gpu_counts_as_present_without_claiming_a_package() {
-        // What the fallback produces: enough to stop reporting "no AMD GPU",
-        // and no more. `is_apu: None` is deliberate -- the topology says which
-        // target, not whether it is integrated -- so the APU and discrete
-        // tallies must both stay false rather than guess.
+        // What the fallback produces for a target nothing classifies: enough
+        // to stop reporting "no AMD GPU", and no more. `is_apu: None` is
+        // deliberate -- the topology names a target whose packaging this crate
+        // does not know -- so the APU and discrete tallies must both stay false
+        // rather than guess.
         let mut e = Examination {
             os_family: "linux".to_owned(),
             gpus: vec![Gpu {
                 name: "AMD GPU (from kernel topology)".to_owned(),
-                gfx_target: "gfx942".to_owned(),
+                gfx_target: "gfx1170".to_owned(),
                 is_amd: true,
                 is_apu: None,
                 ..Gpu::default()
@@ -6155,7 +6194,7 @@ mod tests {
         // ROCMAI-546: the real host this ticket was filed against. Windows
         // reports Renoir/Cezanne's Vega iGPU under the generic marketing name
         // "AMD Radeon(TM) Graphics", which `classify_amd_marketing_name` does
-        // not recognize (it only maps Phoenix/Strix-and-newer names) -- so
+        // not resolve (the generic name names no part) -- so
         // without the PCI-id lookup this host's `gfx_target` stays empty and
         // `info-20-gpu-no-rocm-support` can never fire on it.
         let out = "AMD Radeon(TM) Graphics\t31.0.21004.7\tPCI\\VEN_1002&DEV_1636&SUBSYS_12341002&REV_C8\\4&1a2b3c4d&0&0008";
@@ -6174,7 +6213,7 @@ mod tests {
         // Barcelo-R laptop (PNP id 164d), but `gfx_is_apu_family` used to have
         // no gfx103x arm at all, so a real iGPU reported `is_apu: Some(false)`
         // -- the opposite of what the marketing-name path ("AMD Radeon 680M")
-        // would have said via `APU_KEYWORDS`. That silently suppressed
+        // would have said. That silently suppressed
         // `fix-9-igpu-dgpu` detection on exactly the iGPU+dGPU host shape this
         // PR is otherwise improving detection for.
         let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\\3&11583659&0&08";
@@ -6279,8 +6318,8 @@ mod tests {
     /// (`check_9_igpu_dgpu_collision`), and both are derived from `is_apu` by
     /// `summarise_gpu_categories`. A Rembrandt iGPU reported as discrete does
     /// not merely carry a wrong field: it turns the gate off on the one host
-    /// shape the check exists for. Note the dGPU's marketing name carries no
-    /// APU keyword either way, so nothing here rests on `APU_KEYWORDS`.
+    /// shape the check exists for. Both rows resolve by device id here, so
+    /// nothing in this test rests on the marketing-name table.
     #[test]
     fn a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate() {
         let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\n\
@@ -6311,7 +6350,7 @@ mod tests {
     /// identify.
     ///
     /// Concretely: a Radeon 680M resolved to gfx1035 from its device id, beside
-    /// an RX 6800M that is in neither table. `hipInfo` prints gfx1035 then
+    /// an RX 6800M the probe left unidentified. `hipInfo` prints gfx1035 then
     /// gfx1031. Unguarded, the 6800M becomes a gfx1035 APU, `has_discrete_amd`
     /// goes false, `has_apu` is the only flag left, and `fix-9-igpu-dgpu` is
     /// suppressed on the one host shape it exists for.
@@ -6325,8 +6364,10 @@ mod tests {
                 is_apu: Some(true),
                 ..Gpu::default()
             },
-            // In neither table: no device-id arm, and "RX 6800M" carries no APU
-            // keyword, so it arrives here genuinely unidentified.
+            // Unidentified on arrival: the probe resolved no target for this
+            // row, so it carries the "not an APU" default. (The name table does
+            // know "RX 6800M"; the row stands for any card whose name and
+            // device id both miss.)
             Gpu {
                 name: "AMD Radeon RX 6800M".to_owned(),
                 is_amd: true,
@@ -6498,6 +6539,9 @@ mod tests {
         assert_eq!(gfx_apu_verdict("gfx1036-generic"), Some(true));
         assert_eq!(gfx_apu_verdict("gfx1100"), Some(false));
         assert_eq!(gfx_apu_verdict("GFX942:sramecc+:xnack-"), Some(false));
+        // The earlier MI300 targets, in the same TheRock family as gfx942.
+        assert_eq!(gfx_apu_verdict("gfx940"), Some(false));
+        assert_eq!(gfx_apu_verdict("gfx941"), Some(false));
         assert_eq!(gfx_apu_verdict("gfx1100-generic"), Some(false));
         assert_eq!(gfx_apu_verdict("gfx1170"), None);
         assert_eq!(gfx_apu_verdict(""), None);
@@ -6594,6 +6638,175 @@ mod tests {
         assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
         assert_eq!(e.gpus[0].gfx_target, "gfx1030", "{:?}", e.gpus);
         assert_eq!(e.gpus[0].is_apu, Some(false), "{:?}", e.gpus);
+    }
+
+    /// A Raven Ridge laptop with a discrete card, as a real host reads it.
+    ///
+    /// No lookup table names Raven: its PCI row resolves no target and so
+    /// carries the scan's "not an APU" default. The gfx902 target arrives only
+    /// from KFD's topology, so the kernel-membership pass is where the verdict
+    /// must follow it -- `rocminfo`, the other route, drops every agent on a
+    /// real host today (#393). Without that, the host reports no APU and the
+    /// `fix-9-igpu-dgpu` gate stays shut on the shape it exists for.
+    #[test]
+    fn a_kernel_topology_target_decides_the_verdict_of_a_row_the_pci_scan_could_not_name() {
+        let mut e = Examination::default();
+        apply_lspci_gpus(
+            &mut e,
+            "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+             [AMD/ATI] Raven Ridge [Radeon Vega Series / Radeon Vega Mobile Series] [1002:15dd] (rev c4)\n\
+             0000:01:00.0 Display controller [0380]: Advanced Micro Devices, Inc. \
+             [AMD/ATI] Device [1002:7480] (rev c7)",
+        );
+        assert_eq!(e.gpus.len(), 2, "{:?}", e.gpus);
+        assert_eq!(
+            (e.gpus[0].gfx_target.as_str(), e.gpus[0].is_apu),
+            ("", Some(false)),
+            "the premise: nothing names Raven from its PCI row: {:?}",
+            e.gpus[0]
+        );
+
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:01:00.0".to_owned(),
+                    gfx_target: "gfx1102".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:03:00.0".to_owned(),
+                    gfx_target: "gfx902".to_owned(),
+                },
+            ],
+        );
+        let raven = e.gpus.iter().find(|g| g.pci_id == "0000:03:00.0").unwrap();
+        assert_eq!(raven.gfx_target, "gfx902", "{raven:?}");
+        assert_eq!(raven.is_apu, Some(true), "{raven:?}");
+        let dgpu = e.gpus.iter().find(|g| g.pci_id == "0000:01:00.0").unwrap();
+        assert_eq!(dgpu.is_apu, Some(false), "{dgpu:?}");
+
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: {:?}",
+            e.gpus
+        );
+    }
+
+    /// The kernel-membership pass revises only a verdict that came with no
+    /// target. Where the PCI scan resolved a target, that target and its
+    /// verdict stand; and a KFD target nothing classifies leaves the scan's
+    /// verdict alone.
+    #[test]
+    fn a_kernel_topology_target_never_revises_a_row_that_already_had_one() {
+        let row = |gfx_target: &str, is_apu| Gpu {
+            name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+            gfx_target: gfx_target.to_owned(),
+            pci_id: "0000:03:00.0".to_owned(),
+            is_amd: true,
+            is_apu,
+        };
+        for (before, node_target, expected) in [
+            // Resolved by the scan: the node's target does not replace it.
+            (
+                row("gfx1035", Some(true)),
+                "gfx1100",
+                ("gfx1035", Some(true)),
+            ),
+            // Unresolved, and the node's target is one nothing classifies.
+            (row("", Some(false)), "gfx1170", ("gfx1170", Some(false))),
+        ] {
+            let mut e = Examination {
+                gpus: vec![before],
+                ..Examination::default()
+            };
+            apply_kernel_gpu_membership(
+                &mut e,
+                &[crate::KfdGpuNode {
+                    pci_id: "0000:03:00.0".to_owned(),
+                    gfx_target: node_target.to_owned(),
+                }],
+            );
+            assert_eq!(
+                (e.gpus[0].gfx_target.as_str(), e.gpus[0].is_apu),
+                expected,
+                "node target {node_target}: {:?}",
+                e.gpus[0]
+            );
+        }
+    }
+
+    /// A GPU known only from the kernel topology -- no `lspci`, as in an
+    /// ordinary ROCm container -- is classified from its target where the
+    /// target's packaging is known, and from the `rocminfo` agent's marketing
+    /// name where it is not. Neither answering leaves it unset.
+    #[test]
+    fn a_kernel_topology_gpu_is_classified_from_the_evidence_there_is() {
+        let node = |pci_id: &str, gfx_target: &str| crate::KfdGpuNode {
+            pci_id: pci_id.to_owned(),
+            gfx_target: gfx_target.to_owned(),
+        };
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                node("0000:03:00.0", "gfx1151"),
+                node("0000:04:00.0", "gfx942"),
+                node("0000:05:00.0", "gfx1170"),
+                node("0000:06:00.0", "gfx1170"),
+            ],
+        );
+        let verdicts: Vec<_> = e.gpus.iter().map(|g| g.is_apu).collect();
+        assert_eq!(
+            verdicts,
+            [Some(true), Some(false), None, None],
+            "{:?}",
+            e.gpus
+        );
+
+        // `rocminfo` then pairs one agent per row. The two unknown targets get
+        // one marketing name that resolves an APU and one that resolves nothing.
+        let agent = |gfx: &str, marketing: &str| {
+            format!(
+                "*******\nAgent 1\n*******\n  Name:                    {gfx}\n  \
+                 Marketing Name:          {marketing}\n  \
+                 Device Type:             GPU\n"
+            )
+        };
+        let out = [
+            agent("gfx1151", "AMD Radeon(TM) 8060S Graphics"),
+            agent("gfx942", "AMD Instinct MI300X"),
+            agent("gfx1170", "AMD Radeon(TM) 8060S Graphics"),
+            agent("gfx1170", "AMD Radeon Graphics"),
+        ]
+        .concat();
+        apply_rocminfo_gpu_agents(&mut e, &out);
+        let verdicts: Vec<_> = e.gpus.iter().map(|g| g.is_apu).collect();
+        assert_eq!(
+            verdicts,
+            [Some(true), Some(false), Some(true), None],
+            "{:?}",
+            e.gpus
+        );
+    }
+
+    #[test]
+    fn a_sysfs_fallback_gpu_carries_its_targets_verdict_where_one_is_known() {
+        for (target, expected) in [
+            ("gfx1151", Some(true)),
+            ("gfx942", Some(false)),
+            ("gfx1170", None),
+        ] {
+            let mut e = Examination::default();
+            let probe: fn() -> Option<String> = match target {
+                "gfx1151" => || Some("gfx1151".to_owned()),
+                "gfx942" => || Some("gfx942".to_owned()),
+                _ => || Some("gfx1170".to_owned()),
+            };
+            probe_gpus_sysfs_fallback(&mut e, probe);
+            assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+            assert_eq!(e.gpus[0].is_apu, expected, "{target}: {:?}", e.gpus[0]);
+        }
     }
 
     #[test]

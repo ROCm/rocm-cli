@@ -593,6 +593,15 @@ proptest! {
     /// verdict the PCI scan already reached. More evidence must not produce a
     /// worse answer -- including when the agent reports a target this crate
     /// does not classify, which is what [`agent_target_for`] draws.
+    ///
+    /// The domain is the APU's own target or an unclassified one, on purpose.
+    /// An agent reporting a target classified *discrete* does replace the
+    /// verdict, because the target names the silicon and outranks the PCI
+    /// scan's reading of a name. On a correctly paired row that does not meet
+    /// an APU verdict in practice: the scan's verdicts come from the same
+    /// tables, so its APU rows carry APU targets (gfx942, which MI300A shares,
+    /// is discrete in both).
+    /// What the rule forbids is a downgrade from an *absence* of evidence.
     #[test]
     fn rocminfo_never_downgrades_an_apu_verdict(
         (device, agent_target) in proptest::sample::select(apu_lspci_devices())

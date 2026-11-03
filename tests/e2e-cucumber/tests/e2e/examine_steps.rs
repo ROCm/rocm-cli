@@ -1538,20 +1538,142 @@ const PCI_BUS_GPUS: &[(&str, &str, bool, &str)] = &[
 
 #[given("a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs")]
 async fn machine_with_five_amd_gpus_on_the_bus(world: &mut E2eWorld) {
+    plant_pci_bus(world, PCI_BUS_GPUS, &[]);
+}
+
+/// The two AMD GPUs `examine-30` puts on the PCI bus, in [`PCI_BUS_GPUS`]'s
+/// shape, plus the KFD `gfx_target_version` the kernel topology reports for
+/// each. Neither row resolves a target from its PCI line: the Raven Ridge iGPU
+/// (`15dd`) is in neither lookup table, and the Navi 33 card (`7480`) is in
+/// neither and has no `pci.ids` name. Only the topology names them.
+const KERNEL_IDENTIFIED_GPUS: &[(&str, &str, bool, &str)] = &[
+    (
+        "0000:03:00.0",
+        "gfx902",
+        true,
+        "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Raven Ridge [Radeon Vega Series / Radeon Vega Mobile Series] [1002:15dd] (rev c4)",
+    ),
+    (
+        "0000:01:00.0",
+        "gfx1102",
+        false,
+        "0000:01:00.0 Display controller [0380]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Device [1002:7480] (rev c7)",
+    ),
+];
+
+/// `(PCI address, KFD gfx_target_version)` for each [`KERNEL_IDENTIFIED_GPUS`]
+/// row: gfx902 packs as 90002, gfx1102 as 110002.
+const KERNEL_IDENTIFIED_NODES: &[(&str, u32)] =
+    &[("0000:03:00.0", 90002), ("0000:01:00.0", 110002)];
+
+#[given(
+    "a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies"
+)]
+async fn machine_with_kernel_identified_gpus(world: &mut E2eWorld) {
+    plant_pci_bus(world, KERNEL_IDENTIFIED_GPUS, KERNEL_IDENTIFIED_NODES);
+}
+
+/// The two GPUs `examine-31`'s kernel topology lists, as `(KFD
+/// gfx_target_version, gfx target, integrated)`: a Strix Halo iGPU and an RX
+/// 9070 XT. Neither node states a PCI address, so the report lists both from the
+/// topology alone, the way it does in a container with no `pciutils`.
+const KERNEL_ONLY_GPUS: &[(u32, &str, bool)] =
+    &[(110501, "gfx1151", true), (120001, "gfx1201", false)];
+
+#[given(
+    "a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT"
+)]
+async fn machine_whose_gpus_only_the_kernel_lists(world: &mut E2eWorld) {
+    // An empty address plants a node with no `location_id`, which matches no
+    // PCI row.
+    let nodes: Vec<(&str, u32)> = KERNEL_ONLY_GPUS
+        .iter()
+        .map(|(version, _, _)| ("", *version))
+        .collect();
+    plant_pci_bus(world, &[], &nodes);
+}
+
+#[then("the inspection reports the Strix Halo GPU as integrated and the RX 9070 XT as discrete")]
+async fn assert_kernel_only_gpus_classified(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let reported: Vec<(Option<&str>, Option<bool>)> = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no gpus array:\n{json:#}"))
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .map(|gpu| {
+            (
+                gpu.get("gfx_target").and_then(serde_json::Value::as_str),
+                gpu.get("is_apu").and_then(serde_json::Value::as_bool),
+            )
+        })
+        .collect();
+    let expected: Vec<(Option<&str>, Option<bool>)> = KERNEL_ONLY_GPUS
+        .iter()
+        .map(|(_, target, integrated)| (Some(*target), Some(*integrated)))
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "each topology GPU, in node order, with its target and packaging:\n{json:#}"
+    );
+}
+
+/// Plant a simulated host: a stand-in `lspci` listing `rows`, a stand-in
+/// `rocminfo` with no agents, and a simulated host root whose kernel topology
+/// holds one GPU node per `nodes` entry (none at all when `nodes` is empty). A
+/// node whose address is empty states none, so it matches no PCI row.
+fn plant_pci_bus(world: &mut E2eWorld, rows: &[(&str, &str, bool, &str)], nodes: &[(&str, u32)]) {
     let root = world
         .isolated_root
         .as_ref()
         .expect("no isolated root")
         .path()
         .to_owned();
-    // An empty simulated host root: no kernel topology, no sysfs GPU, so
-    // nothing but the PCI scan names a card, and no real card on the runner
-    // can join the list.
+    // A simulated host root holding only the planted topology: with no nodes,
+    // nothing but the PCI scan names a card; either way no real card on the
+    // runner can join the list.
     let host_root = root.join("host-root");
     std::fs::create_dir_all(&host_root).expect("failed to create the simulated host root");
+    for (index, (address, version)) in nodes.iter().enumerate() {
+        let node = host_root.join(format!("sys/class/kfd/kfd/topology/nodes/{}", index + 1));
+        std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+        if address.is_empty() {
+            std::fs::write(
+                node.join("properties"),
+                format!("cpu_cores_count 0\nsimd_count 120\ngfx_target_version {version}\n"),
+            )
+            .expect("failed to write planted KFD node properties");
+            continue;
+        }
+        // KFD states the address as `location_id = (bus << 8) | devfn`.
+        let mut parts = address.split([':', '.']);
+        let (_domain, bus, device, function) = (
+            parts.next(),
+            u32::from_str_radix(parts.next().expect("bus"), 16).expect("bus"),
+            u32::from_str_radix(parts.next().expect("device"), 16).expect("device"),
+            parts
+                .next()
+                .expect("function")
+                .parse::<u32>()
+                .expect("function"),
+        );
+        let location_id = (bus << 8) | (device << 3) | function;
+        std::fs::write(
+            node.join("properties"),
+            format!(
+                "cpu_cores_count 0\nsimd_count 120\ngfx_target_version {version}\n\
+                 domain 0\nlocation_id {location_id}\n"
+            ),
+        )
+        .expect("failed to write planted KFD node properties");
+    }
     let bin = root.join("fake-bin");
     std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    let listing = PCI_BUS_GPUS
+    let listing = rows
         .iter()
         .map(|(_, _, _, line)| *line)
         .collect::<Vec<_>>()
@@ -1577,6 +1699,19 @@ async fn machine_with_five_amd_gpus_on_the_bus(world: &mut E2eWorld) {
 
 #[then("the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete")]
 async fn assert_each_gpu_classified(world: &mut E2eWorld) {
+    assert_gpus_classified(world, PCI_BUS_GPUS);
+}
+
+#[then(
+    "the inspection reports the Raven Ridge GPU as an integrated gfx902 and the other card as discrete"
+)]
+async fn assert_kernel_identified_gpus_classified(world: &mut E2eWorld) {
+    assert_gpus_classified(world, KERNEL_IDENTIFIED_GPUS);
+}
+
+/// Each planted row is reported once, with its own target and packaging, and
+/// no other AMD GPU is reported.
+fn assert_gpus_classified(world: &E2eWorld, rows: &[(&str, &str, bool, &str)]) {
     assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
     let json = parsed_json(world);
     let gpus = json
@@ -1589,11 +1724,11 @@ async fn assert_each_gpu_classified(world: &mut E2eWorld) {
         .collect();
     assert_eq!(
         amd.len(),
-        PCI_BUS_GPUS.len(),
+        rows.len(),
         "one AMD GPU per planted PCI row and no other:\n{json:#}"
     );
     let mut wrong = Vec::new();
-    for (address, target, integrated, _) in PCI_BUS_GPUS {
+    for (address, target, integrated, _) in rows {
         let Some(gpu) = amd
             .iter()
             .find(|gpu| gpu.get("pci_id").and_then(serde_json::Value::as_str) == Some(address))

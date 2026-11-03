@@ -286,7 +286,10 @@ Expected result:
 - Each AMD GPU carries a `gfx_target`, and an integrated one carries
   `is_apu: true`. On a Ryzen 7000 or later desktop the iGPU is `gfx1036`; on a
   Ryzen 6000 laptop `gfx1035`; on a Krackan Point laptop (Radeon 860M or 840M)
-  `gfx1152`, never `gfx1150`; on a Ryzen 4000 or 5000 machine `gfx90c`.
+  `gfx1152`, never `gfx1150`; on a Ryzen 4000 or 5000 machine `gfx90c`; on a
+  Ryzen 2000 or 3000 laptop (Raven Ridge or Picasso) `gfx902` or `gfx909`,
+  which today only the kernel reports, so an `is_apu: false` there means the
+  topology's target did not reach the verdict.
 - A discrete card beside it carries `is_apu: false`, and `has_apu` and
   `has_discrete_amd` are both `true`. An iGPU reported with `is_apu: false`, or
   an iGPU-only machine with `has_discrete_amd: true`, is a regression unless

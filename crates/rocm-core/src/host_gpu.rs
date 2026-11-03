@@ -1896,11 +1896,16 @@ impl WindowsExamineInventory {
                 })
             })
             // A recognized-but-unsupported iGPU (gfx90c) ranks below every
-            // other recognized adapter, so it cannot hide a discrete card.
+            // other recognized adapter, so it cannot hide a discrete card --
+            // but above an adapter nothing recognizes, whether the iGPU was
+            // recognized by its device id or by its name. That is the order
+            // `parse_windows_display_gfx_target` takes, so the adapter named
+            // here is the one whose target is reported.
             .or_else(|| {
-                self.displays
-                    .iter()
-                    .find(|display| pci_target(display).is_some())
+                self.displays.iter().find(|display| {
+                    pci_target(display).is_some()
+                        || gfx_target_from_amd_marketing_name(&display.name).is_some()
+                })
             })
             .or_else(|| {
                 self.displays
@@ -4016,6 +4021,36 @@ mod tests {
             inventory.amd_display_name().as_deref(),
             Some("AMD Radeon RX 6800M")
         );
+    }
+
+    /// The other half of the same ranking: a gfx90c iGPU recognised by its
+    /// *name* still outranks an adapter nothing recognises, on both sides.
+    ///
+    /// `parse_windows_display_gfx_target` reports gfx90c for this host, so the
+    /// adapter `preferred_amd_display` names must be the iGPU the target came
+    /// from, not whichever unrecognised adapter happens to be listed first.
+    #[test]
+    fn a_named_vega_igpu_outranks_an_unrecognised_adapter_in_both_install_probes() {
+        let unrecognised = "AMD Radeon Pro Unlisted";
+        let igpu = "AMD Radeon(TM) Graphics (Renoir)";
+        assert_eq!(gfx_target_from_amd_marketing_name(unrecognised), None);
+        assert_eq!(
+            parse_windows_display_gfx_target(&format!("{unrecognised}\t\n{igpu}\t")),
+            Some("gfx90c".to_owned())
+        );
+
+        let inventory = WindowsExamineInventory {
+            displays: [unrecognised, igpu]
+                .into_iter()
+                .map(|name| WindowsDisplayAdapter {
+                    name: name.to_owned(),
+                    driver_version: None,
+                    pnp_device_id: None,
+                })
+                .collect(),
+            ..WindowsExamineInventory::default()
+        };
+        assert_eq!(inventory.amd_display_name().as_deref(), Some(igpu));
     }
 
     #[test]
