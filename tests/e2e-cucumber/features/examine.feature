@@ -224,7 +224,9 @@ Feature: GPU detection and system inspection
   # correct one.
   #
   # The eight-GPU machine is simulated (the MI300X topology this was found on),
-  # so the step's premises always hold and it runs on every Linux lane.
+  # so the step's premises always hold and it runs on every Linux lane. On a
+  # simulated machine the step does not no-op: it fails unless it reads back as
+  # many GPU nodes as were planted.
   @id:examine-lists-every-gpu-with-its-address-and-target @requires-os:linux
   Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
     Given a machine with eight AMD Instinct GPUs

@@ -12,19 +12,21 @@
 //! the real host's answers cannot leak into the simulated one.
 //!
 //! It answers from `$ROCM_CLI_TEST_HOST_ROOT/.fake-tools/`: the file named after
-//! the full command line (`uname -r`), else the one named after the tool alone
-//! (`lsmod`). Its contents are printed and the exit code is 0. With neither file
-//! the simulated host does not have that tool, which is reported the way a shell
-//! reports a missing command: on stderr, with exit code 127.
+//! the exact command line (`uname -r`, `lspci -nn -D`). Its contents are printed
+//! and the exit code is 0. Only a tool in
+//! [`ARGV_INDEPENDENT_TOOLS`](e2e_cucumber::simulated_host::ARGV_INDEPENDENT_TOOLS)
+//! also answers from the file named after the tool alone, whatever its
+//! arguments (see [`canned_output_names`]). Any other command line nobody
+//! planted is reported the way a shell reports a missing command, on stderr
+//! with exit code 127, naming the full command line: a stand-in that answered
+//! a changed invocation with the old canned text would hide exactly the drift
+//! between the CLI and the simulated machine this suite exists to catch.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Must match `simulated_host::TOOL_OUTPUT_DIR`.
-const TOOL_OUTPUT_DIR: &str = ".fake-tools";
-/// Must match `rocm_core::hardware_root::TEST_HOST_ROOT_ENV`.
-const TEST_HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
+use e2e_cucumber::simulated_host::{TEST_HOST_ROOT_ENV, TOOL_OUTPUT_DIR, canned_output_names};
 
 fn main() -> ExitCode {
     let mut args = std::env::args();
@@ -36,18 +38,19 @@ fn main() -> ExitCode {
         return ExitCode::from(127);
     };
     let outputs = PathBuf::from(root).join(TOOL_OUTPUT_DIR);
-    let with_args = std::iter::once(tool.as_str())
-        .chain(args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for name in [with_args.as_str(), tool.as_str()] {
+    let names = canned_output_names(&tool, &args);
+    for name in &names {
         if let Ok(text) = std::fs::read(outputs.join(name)) {
             // A closed stdout (the caller stopped reading) is not this tool's failure.
             let _ = std::io::stdout().write_all(&text);
             return ExitCode::SUCCESS;
         }
     }
-    eprintln!("{tool}: command not found");
+    eprintln!(
+        "{tool}: command not found (fake-host-tool: the simulated machine has no canned \
+         answer for `{}`; plant one in simulated_host.rs if the CLI now runs it)",
+        names[0]
+    );
     ExitCode::from(127)
 }
 

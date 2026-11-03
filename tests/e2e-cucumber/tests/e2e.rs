@@ -694,7 +694,20 @@ impl E2eWorld {
 
     /// Make every later `rocm` invocation in this scenario see `host` instead of
     /// the machine the suite is running on (see `e2e_cucumber::simulated_host`).
+    ///
+    /// # Panics
+    ///
+    /// A scenario describes one machine: a second call — two "Given a machine
+    /// ..." steps in one scenario — fails, naming both machines, rather than
+    /// planting one tree over the other.
     pub fn plant_simulated_host(&mut self, host: SimulatedHost) {
+        if let Some(planted) = &self.simulated_host {
+            panic!(
+                "this scenario already describes a simulated machine ({:?}); a second Given \
+                 step cannot also plant {host:?} — a scenario describes one machine",
+                planted.host
+            );
+        }
         let root = self
             .isolated_root
             .as_ref()

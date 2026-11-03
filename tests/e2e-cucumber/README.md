@@ -92,6 +92,14 @@ Run only the matching lifecycle set for the current host through the harness:
 E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 ```
 
+On a machine with an AMD GPU, a plain run still skips every
+`@requires-real-gpu` scenario: the default hardware mode is `simulated`. Opt in
+to the real-hardware scenarios the way the self-hosted GPU lanes do:
+
+```bash
+E2E_HARDWARE=real cargo xtask e2e
+```
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -101,6 +109,7 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
+| `E2E_HARDWARE` | `simulated` | `simulated` or `real`. `real` also runs the `@requires-real-gpu` scenarios (on a host with a usable AMD GPU); any other value aborts the run. See [docs/testing.md](../../docs/testing.md) |
 
 ## Tags and per-scenario expectations
 

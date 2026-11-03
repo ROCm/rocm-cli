@@ -1045,9 +1045,21 @@ fn host_has_lspci(world: &E2eWorld) -> bool {
 
 #[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
 async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
-    let Some(versions) =
-        kfd_gpu_node_versions(&kfd_nodes_dir(world)).filter(|versions| !versions.is_empty())
-    else {
+    let topology = kfd_gpu_node_versions(&kfd_nodes_dir(world));
+    // On a simulated machine every premise is planted, so the early returns
+    // below would only hide a planting or probe-root regression: hold the
+    // topology read here to the planted GPU count and never decline to check.
+    if let Some(simulated) = world.simulated_host.as_ref() {
+        let planted = simulated.host.gpus.len();
+        let read = topology.as_ref().map(Vec::len);
+        assert!(
+            planted > 0 && read == Some(planted),
+            "the simulated machine planted {planted} GPU node(s) under {}, but the step \
+             read {read:?} from it",
+            kfd_nodes_dir(world).display()
+        );
+    }
+    let Some(versions) = topology.filter(|versions| !versions.is_empty()) else {
         return;
     };
     if !host_has_lspci(world) {

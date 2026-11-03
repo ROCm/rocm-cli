@@ -33,8 +33,8 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Directory under the root holding the canned tool outputs.
-/// Must match `TOOL_OUTPUT_DIR` in `src/bin/fake-host-tool.rs`.
+/// Directory under the root holding the canned tool outputs, which
+/// `src/bin/fake-host-tool.rs` answers from.
 pub const TOOL_OUTPUT_DIR: &str = ".fake-tools";
 
 /// The environment variable that points the CLI at a simulated root.
@@ -66,6 +66,32 @@ pub const HOST_TOOLS: &[&str] = &[
     "journalctl",
     "dmesg",
 ];
+
+/// Tools whose canned answer is stored under the tool's bare name.
+///
+/// That answer is given whatever arguments the tool is run with.
+/// `powershell.exe` is the only one: the CLI passes it a whole inventory
+/// script, which no file can be named after. Every other tool answers only the
+/// exact command line that was planted.
+pub const ARGV_INDEPENDENT_TOOLS: &[&str] = &["powershell.exe"];
+
+/// The canned-output file names `fake-host-tool` tries for `tool args...`.
+///
+/// In order: the exact command line, then — only for an
+/// [`ARGV_INDEPENDENT_TOOLS`] entry — the bare tool name. The first entry is the
+/// one a missing-answer message names.
+#[must_use]
+pub fn canned_output_names(tool: &str, args: &[String]) -> Vec<String> {
+    let exact = std::iter::once(tool)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut names = vec![exact];
+    if !args.is_empty() && ARGV_INDEPENDENT_TOOLS.contains(&tool) {
+        names.push(tool.to_owned());
+    }
+    names
+}
 
 /// One AMD GPU, as the PCI bus and the kernel's KFD topology describe it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,9 +158,9 @@ pub enum Platform {
     /// DRM cards.
     BareMetal,
     /// A WSL2 distribution reaching the GPU through `/dev/dxg` and the Windows
-    /// host driver. `rocdxg_ready` adds ROCDXG (the library and its linker-cache
-    /// entry), without which ROCm cannot reach the device.
-    Wsl2 { rocdxg_ready: bool },
+    /// host driver, with ROCDXG (the library and its linker-cache entry)
+    /// installed, without which ROCm cannot reach the device.
+    Wsl2,
 }
 
 /// A machine to simulate.
@@ -181,7 +207,7 @@ impl SimulatedHost {
     #[must_use]
     pub fn wsl2_strix_halo() -> Self {
         Self {
-            platform: Platform::Wsl2 { rocdxg_ready: true },
+            platform: Platform::Wsl2,
             gpus: vec![SimulatedGpu::strix_halo()],
         }
     }
@@ -207,7 +233,7 @@ impl SimulatedHost {
         tool: &Path,
         real_path: &std::ffi::OsStr,
     ) -> io::Result<Vec<PathBuf>> {
-        let wsl = matches!(self.platform, Platform::Wsl2 { .. });
+        let wsl = self.platform == Platform::Wsl2;
         let kernel = if wsl { WSL2_KERNEL } else { BARE_METAL_KERNEL };
 
         write(
@@ -246,7 +272,7 @@ impl SimulatedHost {
 
         match self.platform {
             Platform::BareMetal => self.plant_bare_metal(root)?,
-            Platform::Wsl2 { rocdxg_ready } => plant_wsl2(root, rocdxg_ready)?,
+            Platform::Wsl2 => plant_wsl2(root)?,
         }
         let stand_ins = link_stand_ins(&tools, tool)?;
         let filtered = filter_real_path(&tools.join("host-path"), real_path)?;
@@ -305,17 +331,22 @@ impl SimulatedHost {
         // Every simulated machine is a prepared one: the system libraries vLLM
         // and PyTorch's ROCm wheels need (OpenMPI, libatomic, libnuma) are
         // installed, as the CLI's own dependency checks would have left them.
-        let mut text = String::from("5 libs found in cache `/etc/ld.so.cache'\n");
-        for (soname, path) in [
+        let mut libraries = vec![
             ("libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"),
             ("libmpi.so.40", "/usr/lib/x86_64-linux-gnu/libmpi.so.40"),
             ("libatomic.so.1", "/lib/x86_64-linux-gnu/libatomic.so.1"),
             ("libnuma.so.1", "/lib/x86_64-linux-gnu/libnuma.so.1"),
-        ] {
-            let _ = writeln!(text, "\t{soname} (libc6,x86-64) => {path}");
+        ];
+        if self.platform == Platform::Wsl2 {
+            libraries.push(("librocdxg.so", "/opt/rocm/lib/librocdxg.so"));
         }
-        if self.platform == (Platform::Wsl2 { rocdxg_ready: true }) {
-            text.push_str("\tlibrocdxg.so (libc6,x86-64) => /opt/rocm/lib/librocdxg.so\n");
+        // The header counts the entries listed below it, as the real one does.
+        let mut text = format!(
+            "{} libs found in cache `/etc/ld.so.cache'\n",
+            libraries.len()
+        );
+        for (soname, path) in libraries {
+            let _ = writeln!(text, "\t{soname} (libc6,x86-64) => {path}");
         }
         text
     }
@@ -325,7 +356,7 @@ impl SimulatedHost {
     /// through `/dev/dxg`.
     #[must_use]
     pub fn lspci(&self) -> String {
-        if matches!(self.platform, Platform::Wsl2 { .. }) {
+        if self.platform == Platform::Wsl2 {
             return String::new();
         }
         let mut text = String::from(
@@ -345,7 +376,7 @@ impl SimulatedHost {
     }
 }
 
-fn plant_wsl2(root: &Path, rocdxg_ready: bool) -> io::Result<()> {
+fn plant_wsl2(root: &Path) -> io::Result<()> {
     // What the CLI's video-controller inventory query prints on the Windows
     // host: one tab-separated `GPU` line per AMD display adapter.
     write(
@@ -357,11 +388,8 @@ fn plant_wsl2(root: &Path, rocdxg_ready: bool) -> io::Result<()> {
     write(root, "dev/dxg", "")?;
     write(root, "usr/lib/wsl/lib/libdxcore.so", "")?;
     write(root, "proc/modules", "")?;
-    if rocdxg_ready {
-        write(root, "opt/rocm/lib/librocdxg.so", "")?;
-        write(root, "opt/rocm/share/rocdxg/dids.conf", "")?;
-    }
-    Ok(())
+    write(root, "opt/rocm/lib/librocdxg.so", "")?;
+    write(root, "opt/rocm/share/rocdxg/dids.conf", "")
 }
 
 /// Write `contents` to `root/relative`, creating parent directories.
@@ -517,9 +545,11 @@ pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
              file under /{KFD_NODES}, which is where the simulated machine puts it"
         ));
     }
-    let Some((_, simulated_props)) = simulated_gpus.first() else {
-        return drift;
-    };
+    // Compared property by property against the simulated GPU node when there
+    // is one; the CPU-node and DRM-card checks below hold whatever was planted.
+    let simulated_props = simulated_gpus
+        .first()
+        .map_or(&[][..], |(_, props)| props.as_slice());
     for (node, real_props) in &real_gpus {
         let name = node.file_name().unwrap_or_default().to_string_lossy();
         for (key, _) in simulated_props {
@@ -748,6 +778,45 @@ mod tests {
         assert!(cache.contains("librocdxg.so"), "{cache}");
     }
 
+    /// The `ldconfig -p` header states how many entries follow it, as the real
+    /// cache listing does, on every platform the fixture plants.
+    #[test]
+    fn the_linker_cache_header_counts_the_libraries_it_lists() {
+        for host in [
+            SimulatedHost::instinct_mi300x(1),
+            SimulatedHost::bare_metal_without_gpu(),
+            SimulatedHost::wsl2_strix_halo(),
+        ] {
+            let cache = host.ldconfig_cache();
+            let (header, entries) = cache.split_once('\n').expect("a header line");
+            let listed = entries.lines().count();
+            assert_eq!(
+                header,
+                format!("{listed} libs found in cache `/etc/ld.so.cache'"),
+                "{host:?}:\n{cache}"
+            );
+        }
+    }
+
+    /// A stand-in only answers the command line it was planted for: `lspci`
+    /// with flags the fixture never wrote must not get the `-nn -D` listing.
+    /// Only an argv-independent tool falls back to its bare name.
+    #[test]
+    fn a_stand_in_answers_only_the_command_line_it_was_planted_for() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            canned_output_names("lspci", &args(&["-nn", "-D"])),
+            ["lspci -nn -D"]
+        );
+        assert_eq!(canned_output_names("lspci", &args(&["-D"])), ["lspci -D"]);
+        assert_eq!(canned_output_names("uname", &args(&["-n"])), ["uname -n"]);
+        assert_eq!(canned_output_names("mpirun", &[]), ["mpirun"]);
+        assert_eq!(
+            canned_output_names("powershell.exe", &args(&["-NoLogo", "-Command", "Get-X"])),
+            ["powershell.exe -NoLogo -Command Get-X", "powershell.exe"]
+        );
+    }
+
     /// Only the tools the simulated machine has are on its `PATH`; the real
     /// machine's hardware tools are filtered out, and everything else it has
     /// stays reachable.
@@ -837,6 +906,32 @@ mod drift_tests {
         let drift = bare_metal_layout_drift(real.path(), simulated.path());
         assert!(
             drift.iter().any(|line| line.contains("gfx_target_version")),
+            "{drift:#?}"
+        );
+    }
+
+    /// Held against a simulated machine with no GPU, the checks that do not
+    /// need a simulated GPU node to compare with still run: a real CPU node
+    /// that reports a target, or no AMD DRM card at all, is drift either way.
+    #[test]
+    fn checks_without_a_simulated_gpu_node_still_run() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        let cpu = real.path().join(KFD_NODES).join("0");
+        let props = std::fs::read_to_string(cpu.join("properties")).expect("props");
+        std::fs::write(
+            cpu.join("properties"),
+            props.replace("gfx_target_version 0", "gfx_target_version 90402"),
+        )
+        .expect("rewrite");
+        std::fs::remove_dir_all(real.path().join("sys/class/drm")).expect("drop drm");
+        let simulated = planted(&SimulatedHost::bare_metal_without_gpu());
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert!(
+            drift.iter().any(|line| line.contains("CPU KFD node")),
+            "{drift:#?}"
+        );
+        assert!(
+            drift.iter().any(|line| line.contains("vendor 0x1002")),
             "{drift:#?}"
         );
     }

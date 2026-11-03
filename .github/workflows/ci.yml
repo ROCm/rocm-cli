@@ -1744,8 +1744,8 @@ jobs:
   # out. Each job writes a platform.json sidecar the consolidated report joins by
   # scenario id to render the (scenario × platform) expectation grid.
 
-  # Blocking mock job (GitHub-hosted, no GPU): must stay green. @requires-gpu
-  # scenarios resolve to skip here; known bugs resolve to xfail from
+  # Blocking mock job (GitHub-hosted, no GPU): must stay green.
+  # @requires-real-gpu scenarios resolve to skip here; known bugs resolve to xfail from
   # expectations.toml.
   e2e:
     name: E2E tests
