@@ -25,7 +25,7 @@
 //!
 //! The `examine` child modules and `fix.rs` still reach several items here
 //! through `lib.rs`'s flat `crate::` re-export paths rather than
-//! `crate::host_gpu::` — a deliberate transitional step from the zero-diff
+//! `crate::host_gpu::` — a deliberate transitional step from the mechanical
 //! extraction, not an oversight.
 
 pub use crate::confirm::interactive_terminal;
