@@ -442,13 +442,13 @@ Feature: GPU detection and system inspection
 
   # `examine` on Windows adds the AMD display driver's version, date and an age
   # line. Windows only: the driver comes from the Windows adapter inventory, so
-  # no other platform has these lines. `@requires-gpu` so that a driver exists
+  # no other platform has these lines. `@requires-real-gpu` so that a driver exists
   # to be read. The scenario names no driver: it holds the readable form to the
   # machine-readable one, and holds the verdict to the date, so it passes on a
   # machine with an old driver and on one with a current driver, and fails only
   # if the CLI calls a driver old that is not. Whether a driver dated before
   # 27 July 2023 is reported as old needs such a machine and is not covered here.
-  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-gpu
+  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-real-gpu
   Scenario: examine-29 - On Windows the inspection reports the display driver and judges its age by its date
     Given a machine with an AMD GPU
     When the user inspects the system both for reading and for scripting
@@ -497,7 +497,7 @@ Feature: GPU detection and system inspection
   # fixture assumption is held against the live /dev, /sys and `lspci`. Nightly,
   # because kernels change on the scale of runner reimages, not pull requests.
   @id:examine-simulated-machine-matches-the-kernel @requires-real-gpu @requires-bare-metal @requires-os:linux @nightly
-  Scenario: examine-30 - The simulated GPU machine is laid out like a real GPU host
+  Scenario: examine-32 - The simulated GPU machine is laid out like a real GPU host
     When the simulated GPU machine is compared with this machine's kernel
     Then the simulated machine is laid out the same way
 
@@ -507,6 +507,6 @@ Feature: GPU detection and system inspection
   # WSL itself mounts, and the WSL lane deliberately runs without ROCm
   # passthrough, so a GPU gate would keep it from ever running there.
   @id:examine-simulated-wsl-machine-matches-wsl @requires-wsl @nightly
-  Scenario: examine-31 - The simulated WSL machine is laid out like a real WSL2 host
+  Scenario: examine-33 - The simulated WSL machine is laid out like a real WSL2 host
     When the simulated WSL machine is compared with this machine
     Then the simulated machine is laid out the same way

@@ -795,14 +795,14 @@ gate is not applied: run it only on Linux.
 
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed
 runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
-added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
+added. It carries `@requires-real-gpu @nightly @requires-os:linux @requires-bare-metal`
 and does a real `install sdk --yes` first (system-package consent, and a sudo
 OpenMPI install on vLLM families). Those tags gate it only in a
-harness-selected run, which needs the nightly opt-in and a bare-metal Linux AMD
-GPU host:
+harness-selected run, which needs the nightly opt-in, the real-hardware opt-in
+and a bare-metal Linux AMD GPU host:
 
 ```bash
-E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e
+E2E_INCLUDE_NIGHTLY=1 E2E_HARDWARE=real cargo xtask e2e
 ```
 
 Do not select it with `-n`/`--name`, or with the `name_filter` input of the
@@ -2074,7 +2074,7 @@ That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
 see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
 call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
 probe is a real hardware probe with no injection point. serve-31 closes it, and
-being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
+being `@requires-real-gpu` it runs on the **`E2E self-hosted`** lane only, never on
 the per-PR mock lane. The host predicate itself is the shared
 `host_has_no_usable_gpu` function, called by both the bail and the test rather
 than restated in either, so the test cannot drift from the production rule.
@@ -2160,7 +2160,7 @@ The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:
 
 - serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
-  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
+  (**`@requires-real-gpu`**, so the `E2E self-hosted` lane only) — on a host that
   *does* have a usable GPU, a live service this invocation really could reuse
   still does not pull engine or registry work ahead of `--gpu` validation. The
   record matches on liveness, engine and canonical model id, so every term of

@@ -319,7 +319,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # tracks lifting that gate. Separately, if Windows is ever admitted, note the
   # `nvidia-*` check has no teeth there (PyPI's Windows torch wheels are CPU
   # builds).
-  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-real-gpu @nightly @requires-os:linux @requires-bare-metal
   Scenario: comfyui-14 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given a machine with a managed ROCm runtime
     And the runtime has torch and no CUDA packages

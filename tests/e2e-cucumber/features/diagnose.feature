@@ -642,7 +642,7 @@ Feature: Diagnosing failures and listing fixes
   # machine, so it passes with a current driver (no advice) and with an old one
   # (advice present). The old-driver branch needs such a machine and is not
   # exercised here.
-  @id:diagnose-windows-display-driver-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  @id:diagnose-windows-display-driver-advice-follows-the-inspection @requires-os:windows @requires-real-gpu
   Scenario: diagnose-41 - On Windows the diagnosis agrees with the inspection about the old display driver
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom
@@ -750,7 +750,7 @@ Feature: Diagnosing failures and listing fixes
   # (below the match threshold) as present, which is what production does for
   # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
   # bonus wrong, so whoever changes it must update this scenario's oracle too.
-  @id:diagnose-windows-hip-sdk-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  @id:diagnose-windows-hip-sdk-advice-follows-the-inspection @requires-os:windows @requires-real-gpu
   Scenario: diagnose-48 - On Windows the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom

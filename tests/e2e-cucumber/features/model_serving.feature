@@ -365,7 +365,7 @@ Feature: Model serving
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-real-gpu @requires-engine:aim @serve-timeout:1200
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -380,7 +380,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-real-gpu @requires-engine:aim @serve-timeout:1200
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -494,7 +494,7 @@ Feature: Model serving
   # would make the last Then vacuous. With the gate wrongly open the manifest is
   # re-filed before the refusal and that Then goes red; with it shut the registry
   # is still empty.
-  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-gpu @requires-os:linux
+  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-real-gpu @requires-os:linux
   Scenario: serve-31 - A reusable live service does not pull engine work ahead of --gpu validation
     Given a live managed vLLM serve is already running
     And setup names an unregistered runtime folder
