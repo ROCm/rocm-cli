@@ -21,7 +21,7 @@ use crate::ui::theme::{self, Theme};
 ///
 /// `sel` is the picker cursor; clamped against `theme_names().len()`.
 /// `current_name` is the currently-active theme name (rendered with a marker).
-pub(super) fn draw_theme_picker(
+pub fn draw_theme_picker(
     f: &mut Frame,
     area: Rect,
     sel: usize,
@@ -125,7 +125,7 @@ fn draw_theme_list(
 /// `active_theme` is the currently-applied theme — used only for the inner
 /// title border / label color so the preview frame stays consistent with
 /// the surrounding modal even when the previewed bg is light/dark inverse.
-fn draw_theme_preview(f: &mut Frame, area: Rect, preview_theme: &Theme, active_theme: &Theme) {
+pub fn draw_theme_preview(f: &mut Frame, area: Rect, preview_theme: &Theme, active_theme: &Theme) {
     let inner = panel::bento(
         f,
         area,

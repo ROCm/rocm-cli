@@ -42,7 +42,7 @@ const fn menu_fits(inner_height: u16, inner_width: u16) -> bool {
 
 /// Esc main menu: Home backdrop dimmed by `grey_overlay`, a double-border modal
 /// with the btop `draw_logo` and the Options/Help/Quit list.
-pub(super) fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
+pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     grey_overlay(f);
     let modal = centered_rect(50, 70, 60, 17, area);
     f.render_widget(Clear, modal);
@@ -84,7 +84,7 @@ pub(super) fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
 
 /// Command palette: dimmed backdrop + centered "Go to…" card with a `:` filter
 /// line and the destination rows.
-pub(super) fn draw_palette(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
+pub fn draw_palette(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     grey_overlay(f);
     let modal = centered_rect(50, 60, 54, 12, area);
     let inner = draw_popup_frame(f, modal, "Go to…", theme);
@@ -126,7 +126,7 @@ pub(super) fn draw_palette(f: &mut Frame, area: Rect, sel: usize, theme: &Theme)
 }
 
 /// Tabbed Options panel reusing the outlined tab renderer + `opt_row`.
-pub(super) fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     grey_overlay(f);
     let modal = centered_rect(80, 80, 112, 26, area);
     f.render_widget(Clear, modal);
@@ -196,7 +196,7 @@ fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
 ///
 /// `cx` is the left column of the 31-wide logo; it occupies 5 rows from `y`.
 /// Reuses the crate's [`gradient::lerp3_t`] ramp rather than a local lerp.
-fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
+pub fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
     use ratatui::style::Color;
     const R: [&str; 5] = ["██████ ", "██   ██", "██████ ", "██   ██", "██   ██"];
     const O: [&str; 5] = [" █████ ", "██   ██", "██   ██", "██   ██", " █████ "];
@@ -227,7 +227,7 @@ fn draw_logo(f: &mut Frame, cx: u16, y: u16, theme: &Theme) {
 
 /// One settings row for the Options panel: focusable label on the left, value +
 /// control hint right-aligned.
-fn opt_row(
+pub fn opt_row(
     f: &mut Frame,
     area: Rect,
     label: &str,

@@ -76,7 +76,7 @@ fn warning_lines<'a>(warning: &'a str, theme: &Theme) -> Vec<Line<'a>> {
 /// [`draw_help`](crate::ui::help_modal::draw_help): a title marker needs a popup
 /// at least ~38 columns wide and is silently dropped on a narrower one, which
 /// would leave cut-off warning text unmarked.
-pub(super) fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
+pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
     grey_overlay(f);
     let body: Vec<Line> = if warnings.is_empty() {
         // The daemon can clear its warnings while the popup is open.

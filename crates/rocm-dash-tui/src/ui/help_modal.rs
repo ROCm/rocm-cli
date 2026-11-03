@@ -34,7 +34,7 @@ use crate::ui::theme::Theme;
 /// [`help_title`] marks the title in that case rather than leaving the user to
 /// guess, which is the whole of what is claimed here: an honest indicator, not a
 /// guarantee that everything is visible.
-pub(super) fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
+pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     grey_overlay(f);
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
@@ -192,7 +192,7 @@ fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {
 /// Holds no row for `!` (warnings): at the pinned 80x20 this card has no row to
 /// spare and one more is silently cut. Like the replay keys it is listed in the
 /// contextual [`draw_help`], and the header badge advertises it.
-pub(super) fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
+pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
     grey_overlay(f);
     let left: &[(&str, &[(&str, &str)])] = &[
         (
