@@ -499,17 +499,7 @@ fn assess(
              fallback",
             recipe.device_policy
         ));
-        readiness.fix = Some(Fix {
-            summary: "make a GPU visible to ROCm, then ask again".to_owned(),
-            commands: vec!["rocm diagnose".to_owned()],
-            verify: format!("rocm diagnose --model {model_ref}"),
-            notes: vec![
-                "`rocm diagnose` matches this machine against the known reasons a GPU does not \
-                 show up"
-                    .to_owned(),
-            ],
-            ..Fix::default()
-        });
+        readiness.fix = Some(no_gpu_fix(format!("rocm diagnose --model {model_ref}")));
         return readiness;
     }
 
@@ -876,17 +866,19 @@ fn apply_context_estimate(
         // header could not be read (nothing was learnt, so it is still the honest
         // next step), except where the branches below replace it: a local path,
         // and a hub name refused as a projector.
-        // The one host gap with a next step: memory that could not be read,
-        // which `amd-smi` is how to look into, as for a curated model. No GPU
-        // and an APU's unreadable pool have no command that changes the answer,
-        // and get none here either.
-        readiness.fix = (estimate.cannot_estimate_reason
-            == Some(CannotEstimateReason::AcceleratorMemoryUnknown))
-        .then(|| {
-            let mut fix = read_gpu_memory_fix(&readiness.model_ref);
-            fix.verify = ask_again(&readiness.model_ref);
-            fix
-        });
+        // The host gaps with a next step get the plan a curated model gets:
+        // memory that could not be read is looked into with `amd-smi`, and no
+        // visible GPU with `rocm diagnose`. An APU's unreadable pool has no
+        // command that changes the answer, and gets none.
+        readiness.fix = match estimate.cannot_estimate_reason {
+            Some(CannotEstimateReason::AcceleratorMemoryUnknown) => {
+                let mut fix = read_gpu_memory_fix(&readiness.model_ref);
+                fix.verify = ask_again(&readiness.model_ref);
+                Some(fix)
+            }
+            Some(CannotEstimateReason::NoGpu) => Some(no_gpu_fix(ask_again(&readiness.model_ref))),
+            _ => None,
+        };
         if estimate.outcome == EstimateOutcome::Fits {
             readiness.alternatives.clear();
         }
@@ -938,6 +930,22 @@ fn rediagnose(model_ref: &str, request: &ContextRequest) -> String {
         let _ = write!(command, " --kv-cache-type {kind}");
     }
     command
+}
+
+/// The plan when no GPU is visible to ROCm: find out why, then ask again with
+/// `verify`. Shared by a curated model that needs a GPU and a GGUF estimate.
+fn no_gpu_fix(verify: String) -> Fix {
+    Fix {
+        summary: "make a GPU visible to ROCm, then ask again".to_owned(),
+        commands: vec!["rocm diagnose".to_owned()],
+        verify,
+        notes: vec![
+            "`rocm diagnose` matches this machine against the known reasons a GPU does not show \
+             up"
+            .to_owned(),
+        ],
+        ..Fix::default()
+    }
 }
 
 /// The plan when this host's GPU memory could not be read: look at what
@@ -1863,15 +1871,15 @@ mod tests {
     }
 
     /// A sized estimate that could not be compared keeps a next step only where
-    /// one exists: memory that could not be read is looked into with `amd-smi`,
-    /// as for a curated model; no GPU and an APU have no command that would
-    /// change the answer.
+    /// one exists, the one a curated model gets: memory that could not be read
+    /// is looked into with `amd-smi`, no visible GPU with `rocm diagnose`; an
+    /// APU has no command that would change the answer.
     #[test]
     fn a_sized_estimate_that_could_not_compare_keeps_a_plan_only_when_one_exists() {
-        for (memory, expect_amd_smi) in [
-            (AcceleratorMemory::Unknown, true),
-            (AcceleratorMemory::None, false),
-            (AcceleratorMemory::UnifiedMemoryUnreadable, false),
+        for (memory, expected) in [
+            (AcceleratorMemory::Unknown, Some("amd-smi metric --json")),
+            (AcceleratorMemory::None, Some("rocm diagnose")),
+            (AcceleratorMemory::UnifiedMemoryUnreadable, None),
         ] {
             let host = HostFacts {
                 accelerator_memory: memory,
@@ -1900,14 +1908,16 @@ mod tests {
                 .as_ref()
                 .map(|fix| fix.commands.clone())
                 .unwrap_or_default();
-            assert_eq!(
-                commands == vec!["amd-smi metric --json".to_owned()],
-                expect_amd_smi,
-                "{memory:?}: {:?}",
-                readiness.fix
-            );
-            if !expect_amd_smi {
-                assert!(readiness.fix.is_none(), "{memory:?}: {:?}", readiness.fix);
+            match expected {
+                Some(command) => {
+                    assert_eq!(commands, vec![command.to_owned()], "{memory:?}");
+                    assert_eq!(
+                        readiness.fix.as_ref().map(|fix| fix.verify.as_str()),
+                        Some("rocm diagnose --model some-lab/never-curated-7b:Q4_K_M"),
+                        "{memory:?}"
+                    );
+                }
+                None => assert!(readiness.fix.is_none(), "{memory:?}: {:?}", readiness.fix),
             }
         }
     }
