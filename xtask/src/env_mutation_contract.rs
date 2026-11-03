@@ -105,10 +105,10 @@ mod tests {
     /// an offense. Both directions have fixtures.
     /// `RestoredEnvVar::set(` is here because the guard matches TEXT, and a
     /// mutation spelled as a method on a restoring wrapper contains neither
-    /// direct call. The two tests that use it are the sanctioned exception this
-    /// change documents, and before this entry existed they sat outside the
-    /// guard entirely — deleting their lock acquisition left the scan green,
-    /// which is the opposite of what their comments told the next contributor.
+    /// direct call. The tests that use it are the sanctioned exception, and
+    /// before this entry existed they sat outside the guard entirely —
+    /// deleting their lock acquisition left the scan green, which is the
+    /// opposite of what their comments told the next contributor.
     /// Listing the helper keeps the escape hatch narrow: it is still the lock
     /// that is required, the wrapper just stops hiding the requirement.
     ///
@@ -116,9 +116,10 @@ mod tests {
     /// for the same reason, from the other side: `UnsetKeyOnExit` is a guard
     /// whose `Drop` removes a variable, so the mutation happens in an impl the
     /// scan never enters. What the test body does contain is the call that
-    /// builds the guard, and that call is what is listed. A guard built by
-    /// naming a unit struct, with no call, would leave nothing for this
-    /// list's call text to match; build such a guard through a named call.
+    /// builds the guard, and that call is what is listed. A guard constructed
+    /// directly from its type, rather than through that call, would leave
+    /// nothing for this list's text to match; build such a guard only through
+    /// the listed call.
     const MUTATIONS: [&str; 4] = [
         "set_var(",
         "remove_var(",
@@ -778,7 +779,7 @@ mod tests {
     /// `remove_var` inside a `#[test]` was flagged at all.
     ///
     /// The length assertion is what stops the next entry arriving untested: a
-    /// third call added to the const fails here until it gains a case.
+    /// new call added to the const fails here until it gains a case.
     #[test]
     fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
         let kinds = ["set_var", "remove_var"];

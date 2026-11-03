@@ -101,17 +101,19 @@ it reads what the panicking one left behind. `rocm-core`'s `RestoredEnvVar`
 unwinding runs it; prefer it where one exists. It restores but does not
 serialize, so the lock is still yours to take.
 
-Keep the mutation and the lock in the same test body. Three known blind spots,
-all of which the scan reports nothing for:
+Keep the mutation and the lock in the same test body. The scan reports nothing
+for any of these known blind spots:
 
 - A `#[test]` that delegates its mutation to a helper — the helper's body is a
   different scope, so the scan cannot see the two together. It matches call
   text, so a wrapper hides the mutation until the wrapper itself is named in the
   scanner's `MUTATIONS` list, as `RestoredEnvVar::set(` is. Add a new restoring
-  helper to that list, or it is outside the guard. A guard whose `Drop` mutates
-  the environment hides its mutation the same way: list the call that builds
-  it, as `UnsetKeyOnExit::arm(` is, and build it through a named call rather
-  than as a bare unit struct, which leaves no call text to match.
+  helper to that list, or it is outside the guard.
+- A guard held by the test whose `Drop` mutates the environment — the mutation
+  runs in the `Drop` impl, which the scan never enters. List the call that
+  builds the guard in `MUTATIONS`, as `UnsetKeyOnExit::arm(` is, and build it
+  only through that call: constructing the type directly leaves no listed text
+  to match, and nothing enforces this.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as

@@ -63,6 +63,7 @@ impl Drop for RestoredEnvVar {
 mod tests {
     use super::RestoredEnvVar;
     use std::ffi::OsString;
+    use std::marker::PhantomData;
     use std::path::Path;
     use std::sync::MutexGuard;
 
@@ -74,27 +75,31 @@ mod tests {
 
     /// Leaves [`KEY`] unset when a test exits, including by a failed assertion.
     ///
-    /// Declare it after the lock so it drops while the lock is still held. A
-    /// test about not leaking environment state should not leak the probe when
-    /// it fails, which is exactly when someone would be looking at it.
+    /// It borrows the lock guard it was armed with, so it drops while that
+    /// lock is still held: releasing the lock first does not compile. A test
+    /// about not leaking environment state should not leak the probe when it
+    /// fails, which is exactly when someone would be looking at it.
     ///
     /// Holding one mutates the environment from a `Drop` impl the contract
     /// guard cannot see, so the call that builds one, `UnsetKeyOnExit::arm(`,
     /// is named in its `MUTATIONS` list: a test that arms one without taking a
-    /// `*_TEST_LOCK` is flagged like a direct call.
-    struct UnsetKeyOnExit;
+    /// `*_TEST_LOCK` is flagged like a direct call. Build it only through
+    /// `arm`: constructing it directly (`UnsetKeyOnExit(PhantomData)`) skips
+    /// both the lock borrow and the text the scan matches.
+    struct UnsetKeyOnExit<'lock>(PhantomData<&'lock ()>);
 
-    impl UnsetKeyOnExit {
-        /// Takes the caller's lock guard by reference, so arming one without
-        /// holding a lock does not compile. Any `Mutex<()>` guard satisfies
-        /// the type; that some `*_TEST_LOCK` is taken stays the contract
-        /// guard's to check (it does not check which one).
-        const fn arm(_lock: &MutexGuard<'_, ()>) -> Self {
-            Self
+    impl<'lock> UnsetKeyOnExit<'lock> {
+        /// Borrows the caller's lock guard for as long as the returned value
+        /// lives, so arming one without holding a lock, or releasing the lock
+        /// before this drops, does not compile. Any `Mutex<()>` guard
+        /// satisfies the type; that some `*_TEST_LOCK` is taken stays the
+        /// contract guard's to check (it does not check which one).
+        const fn arm(_lock: &'lock MutexGuard<'_, ()>) -> Self {
+            Self(PhantomData)
         }
     }
 
-    impl Drop for UnsetKeyOnExit {
+    impl Drop for UnsetKeyOnExit<'_> {
         #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024
         fn drop(&mut self) {
             // SAFETY: dropped inside the caller's `TEST_ENV_TEST_LOCK` scope,
@@ -103,8 +108,9 @@ mod tests {
         }
     }
 
-    /// The restore is this type's whole purpose, and it is what its callers
-    /// (in `fix`, `lib`, `examine` and `hardware_root`) rely on to keep a panicking test from leaking a value into the next one.
+    /// The restore is this type's whole purpose, and it is what every caller
+    /// relies on to keep a panicking test from leaking a value into the next
+    /// one.
     ///
     /// Both prior states are needed, because they catch different mistakes:
     ///
@@ -114,13 +120,16 @@ mod tests {
     ///   "restore" the new value and leave the key set;
     /// * *previously set* must come back to that exact value, which a `Drop`
     ///   that does nothing would leave as the planted one.
+    ///
+    /// It ends by dropping its [`UnsetKeyOnExit`] by hand, with the probe still
+    /// set, and asserting the probe is gone: the cleanup is a claim too.
     #[test]
     #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
     fn dropping_the_guard_restores_the_previous_state() {
         let lock = TEST_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _unset_on_exit = UnsetKeyOnExit::arm(&lock);
+        let unset_on_exit = UnsetKeyOnExit::arm(&lock);
 
         // SAFETY: serialized by the lock above, and nothing else reads this key.
         unsafe { std::env::remove_var(KEY) };
@@ -144,6 +153,13 @@ mod tests {
             std::env::var_os(KEY).as_deref(),
             Some(std::ffi::OsStr::new("before")),
             "a key that was set must get its previous value back"
+        );
+
+        drop(unset_on_exit);
+        assert_eq!(
+            std::env::var_os(KEY),
+            None,
+            "dropping the cleanup guard must leave the probe unset"
         );
     }
 
