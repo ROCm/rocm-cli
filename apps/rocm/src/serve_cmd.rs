@@ -67,7 +67,10 @@ use crate::service_launch::{
     print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
     validate_bind_host,
 };
-use crate::{cli_progress, collect_serve_notes, device_policy_name};
+use crate::{
+    GatedEngineAction, cli_progress, collect_serve_notes, device_policy_name,
+    ensure_engine_allowed_on_platform,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ServeEngineSelection {
@@ -718,6 +721,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
+    // Before runtime resolution and any launch: an engine the platform gate rules
+    // out (vLLM on native Windows) must not reach a "no active runtime" error or
+    // a background server that dies with no output.
+    ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
     // Fail closed: a public bind must be authenticated, but Windows managed
     // Lemonade cannot receive the key (see `ensure_public_bind_engine_supported`),
     // so refuse rather than launch an open public server.

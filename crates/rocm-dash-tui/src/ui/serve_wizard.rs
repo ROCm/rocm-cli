@@ -35,6 +35,7 @@ use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::{apply_char_key, apply_char_key_filtered};
 
 /// Engine inventory — names mirror `apps/rocm` `engine_inventory()`. Kept
 /// TUI-local (a stable, small list) so this layer needs no `rocm-core` dep.
@@ -149,29 +150,15 @@ impl ServeWizardState {
         }
     }
 
-    fn type_char(&mut self, c: char) {
+    /// Type or backspace into the focused text field; other fields ignore it.
+    fn edit_text(&mut self, code: KeyCode) {
         match self.current_field() {
-            Field::Model => self.model.push(c),
-            Field::Host => self.host.push(c),
+            Field::Model => apply_char_key(&mut self.model, code),
+            Field::Host => apply_char_key(&mut self.host, code),
             // Port accepts digits only — never builds an unparseable `--port`.
-            Field::Port if c.is_ascii_digit() => self.port.push(c),
-            _ => {}
-        }
-    }
-
-    fn backspace(&mut self) {
-        match self.current_field() {
-            Field::Model => {
-                self.model.pop();
-            }
-            Field::Host => {
-                self.host.pop();
-            }
-            Field::Port => {
-                self.port.pop();
-            }
-            _ => {}
-        }
+            Field::Port => apply_char_key_filtered(&mut self.port, code, |c| c.is_ascii_digit()),
+            _ => false,
+        };
     }
 
     /// Build the `rocm` argv for the current form, or an error message.
@@ -334,9 +321,7 @@ pub fn on_key(
                 w.move_field(1);
             }
         }
-        KeyCode::Backspace => w.backspace(),
-        KeyCode::Char(c) => w.type_char(c),
-        _ => {}
+        code => w.edit_text(code),
     }
     Vec::new()
 }
@@ -665,10 +650,7 @@ mod tests {
         w.port.clear();
         w.field = FIELDS.iter().position(|f| *f == Field::Port).unwrap();
         for k in typed("80a0") {
-            // route through type_char via the field
-            if let KeyCode::Char(c) = k.code {
-                w.type_char(c);
-            }
+            w.edit_text(k.code);
         }
         assert_eq!(w.port, "800");
     }
@@ -724,6 +706,33 @@ mod tests {
         assert!(fx.is_empty());
         assert!(wiz.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_each_text_field_through_on_key() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        {
+            let w = wiz.as_mut().unwrap();
+            w.model.clear();
+            w.host.clear();
+            w.port.clear();
+        }
+        for (field, text) in [
+            (Field::Model, "ab"),
+            (Field::Host, "cd"),
+            (Field::Port, "12"),
+        ] {
+            wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == field).unwrap();
+            for k in typed(text) {
+                on_key(&mut wiz, &mut jobs, &[], k);
+            }
+            on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Backspace));
+        }
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "a");
+        assert_eq!(w.host, "c");
+        assert_eq!(w.port, "1");
     }
 
     #[test]

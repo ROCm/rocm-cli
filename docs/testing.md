@@ -532,7 +532,7 @@ when changing it:
   which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
   no GPU tag. The detected-GPU wording itself is covered at unit level by
   `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
-  [therock.rs](../apps/rocm/src/therock.rs).
+  [family.rs](../apps/rocm/src/therock/family.rs).
 
 The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
 end-to-end lane at all, and that gap is stated here rather than papered over.
@@ -1011,6 +1011,18 @@ rocm engines list
 
 The packaged Linux/WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
+`rocm serve <model> --engine vllm` and `rocm engines install vllm` take the
+same decision and must exit non-zero with "vLLM is not supported on native
+Windows", naming WSL/Linux and the Lemonade engine, before any runtime check,
+download, or launch. Focused tests:
+
+```powershell
+cargo test -p rocm --test vllm_native_windows_gate
+cargo test -p rocm --bin rocm platform_refusal
+```
+
+The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cover the
+same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
 
@@ -1085,6 +1097,18 @@ narrows the race against a concurrent `restart` rather than eliminating it.
 asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
+
+Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
+and `rocm logs --service`) reads the record through one loader,
+`ManagedServiceRecord::read_manifest` in
+[service_record.rs](../crates/rocm-core/src/service_record.rs), which `rocmd`
+shares too. An id with no record fails with one plain line pointing at
+`rocm services list --all` and no OS error under it; a record that exists but
+cannot be read or parsed keeps its cause. The loader's unit tests cover all
+three cases, and `features/service_unknown_id.feature` (`service-unknown-01`
+through `-05`, mock lane) runs each command against a missing id, asserting
+the exit code and the exact error together, then runs the listing command the
+error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
@@ -1750,13 +1774,14 @@ expectation and applicability resolver.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios (not themselves `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+scenarios and the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
 comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
 cargo xtask e2e
 ```
 
@@ -2414,15 +2439,34 @@ cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
-just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
-have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+just because no HIP SDK is installed — has no Linux end-to-end coverage.
+`check_13_hip_sdk_missing` returns early on every non-Windows host, so
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
 [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
-(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
-neighbours) and by the Windows manual check in
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
+`fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+and their neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
+On the Windows GPU lane (`e2e-gpu-strix-windows`), `diagnose-48` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) runs the
+gate on a real host, like `diagnose-41`: it names no host shape and holds
+`rocm diagnose --json` to `rocm examine --json` on the same machine.
+`fix-13-hip-sdk-missing` has to appear exactly when the inspection reports an
+AMD GPU and either a HIP-built llama.cpp with no usable system HIP SDK, or an
+ambient (not managed-runtime) HIP-built PyTorch: the latter scores a further
+25 whether or not the SDK is healthy, so it lists the entry (weakly, below the
+match threshold) even beside a working SDK. ROCMAI-837 considers that +25
+listing wrong, so whoever changes the bonus must update the scenario's oracle
+too. On that lane's Strix Halo hosts (Lemonade, no system SDK) it asserts the
+cause is absent, which is the host shape of ROCMAI-830. Run it only on
+Windows:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-48)'
+```
 
 ## Model Fit Preflight
 

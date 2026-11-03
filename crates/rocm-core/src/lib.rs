@@ -105,7 +105,7 @@ pub use host_gpu::{
     detect_system_ram_gib, extract_first_gfx_token, gfx_target_has_no_rocm_build,
     gpu_support_level, gpu_support_level_for_host_gpu, has_usable_amd_gpu, interactive_terminal,
     is_amdgpu_device, is_wsl_host, known_therock_families, normalize_therock_family,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    pinned_gpu_name, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -189,7 +189,9 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_identity::{ServiceId, generate_service_id};
-pub use service_record::{ManagedServiceRecord, engine_stop_decides_confirmation};
+pub use service_record::{
+    ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
+};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,

@@ -1284,7 +1284,7 @@ async fn failure_names_the_exact_arch_flag(world: &mut E2eWorld) {
 }
 
 /// The default (un-overridden) ROCm 10 preview pip index base. Matches
-/// `THEROCK_NEXT_RELEASE_PIP_INDEX_BASE` in `apps/rocm/src/therock.rs`.
+/// `THEROCK_NEXT_PIP_INDEX_BASE` in `apps/rocm/src/therock/source.rs`.
 const DEFAULT_NEXT_RELEASE_PIP_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
 
 /// The newest `rocm` version the live ROCm 10 preview source actually

@@ -52,7 +52,10 @@ use crate::runtimes_cmd::{
     validate_runtime_manifest_for_activation,
 };
 use crate::therock;
-use crate::{record_cli_audit_event, render_engine_inventory_text_with_paths};
+use crate::{
+    GatedEngineAction, ensure_engine_allowed_on_platform, record_cli_audit_event,
+    render_engine_inventory_text_with_paths,
+};
 
 pub(crate) fn render_engine_inventory_text() -> String {
     let paths = AppPaths::discover().ok();
@@ -78,6 +81,9 @@ pub(crate) fn engines(command: EnginesCommand) -> Result<()> {
             reinstall,
             yes,
         } => {
+            // Before runtime resolution and any download: the same platform
+            // decision `engines list` reports as `unsupported_native_windows`.
+            ensure_engine_allowed_on_platform(&engine, GatedEngineAction::Install)?;
             let paths = AppPaths::discover()?;
             let mut config = RocmCliConfig::load(&paths)?;
             let runtime_id =
@@ -553,6 +559,11 @@ fn engine_shell(
     env_id: Option<&str>,
     shell_override: Option<&str>,
 ) -> Result<()> {
+    // `resolve_engine_env` below issues `EngineMethod::Install` itself when an
+    // active runtime has no environment yet, so this is an install route and
+    // takes the same up-front platform refusal as `engines install`. It sits
+    // before the terminal check so the refusal does not depend on a TTY.
+    ensure_engine_allowed_on_platform(engine, GatedEngineAction::Install)?;
     if !interactive_terminal() {
         bail!("`rocm engines shell` requires an interactive terminal");
     }
