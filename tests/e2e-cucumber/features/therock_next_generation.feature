@@ -76,7 +76,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # is what resolves requires the real default), so it runs on the scheduled
   # network lane rather than the hermetic ones above. The unit test
   # `env_override_is_ignored_end_to_end_without_the_opt_in` in
-  # `apps/rocm/src/therock.rs` covers the same trust boundary on the blocking
+  # `apps/rocm/src/therock/source.rs` covers the same trust boundary on the blocking
   # lane, without depending on the live network.
   @id:therock-next-06-base-override-requires-opt-in @nightly
   Scenario: therock-next-06 - A ROCm 10 source override is ignored without explicit trust

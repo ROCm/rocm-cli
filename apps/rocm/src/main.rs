@@ -36,6 +36,7 @@ mod provider_keys;
 mod providers;
 mod remote;
 mod runtime_install_finalize;
+mod runtime_registry;
 mod runtime_services;
 mod runtimes_cmd;
 mod serve_cmd;
@@ -115,8 +116,8 @@ use crate::runtime_install_finalize::{
     print_sdk_install_success,
 };
 use crate::runtimes_cmd::{
-    active_runtime_marker_path, current_runtime_manifest, default_runtime_id_matches,
-    recover_setup_runtime_registration, runtime_usability_status, runtimes, setup_runtime_paths,
+    active_runtime_marker_path, current_runtime_manifest, recover_setup_runtime_registration,
+    runtime_usability_status, runtimes, setup_runtime_paths,
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
@@ -301,6 +302,10 @@ enum Command {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
         /// Skip the interactive confirmation (use after approving the plan).
+        /// Without it, a fix that changes files or settings asks `[y/N]`
+        /// (default: no); when stdin is not a terminal it prints the plan and
+        /// refuses with exit 5, changing nothing. Answering no also exits 5.
+        /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
         /// Show the plan without changing anything.
@@ -505,6 +510,21 @@ rocm model --verbose"
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
+    ///
+    /// Under --device gpu_required (the default) this command refuses on a host with no
+    /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
+    /// launches nothing, so it is allowed through. The exception applies only when the
+    /// server would actually be reused: same engine and model, matching recipe settings,
+    /// a key already present if --require-api-key is asked for, and a device policy at
+    /// least as strong as this one. A live server for a different engine, or for a model
+    /// whose name does not overlap, does not soften the refusal, and nothing is prepared
+    /// before it. A same-model server this run turns out not to be able to reuse does not
+    /// soften it either, but engine preparation has already run by the time that is known.
+    /// Model names are matched leniently, so a live server whose name overlaps the one you
+    /// asked for (`qwen` for a running `qwen3-8b-instruct`) does let engine preparation run
+    /// before the refusal.
+    /// With an explicit --gpu the index is still validated after the exception, so a
+    /// pinned GPU that is not visible is refused even when a reusable server exists.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
@@ -698,7 +718,10 @@ rocm logs --search error timeout")]
     /// user PATH entry it recorded adding on Windows), unless other programs
     /// share the install folder.
     Uninstall {
-        /// Do not ask for interactive confirmation.
+        /// Do not ask for interactive confirmation. Without it, the command
+        /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
+        /// when there is something to remove, it prints the plan and refuses
+        /// with exit 1, removing nothing.
         #[arg(long)]
         yes: bool,
         /// Show what would be removed without deleting anything.
@@ -839,7 +862,8 @@ rocm install sdk --devel")]
         /// Use the DKMS driver wrapper flow.
         #[arg(long)]
         dkms: bool,
-        /// Apply without asking.
+        /// Apply the plan. This command never asks for confirmation: without
+        /// --yes it prints the plan and changes nothing, in a terminal or not.
         #[arg(long)]
         yes: bool,
         /// Show what would happen without changing files.
@@ -872,7 +896,14 @@ rocm engines install vllm --reinstall")]
         /// Reinstall even if the engine already exists.
         #[arg(long)]
         reinstall: bool,
-        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        /// Approve the system-package installs vLLM needs (OpenMPI, libatomic,
+        /// libnuma), including a sudo password prompt. This command never asks
+        /// for confirmation. Without --yes, a Linux host with root or
+        /// passwordless sudo installs a missing package anyway, and one that
+        /// would need a password prints the commands to run while the install
+        /// continues. With --yes, a failed OpenMPI install is an error; a
+        /// failed libatomic or libnuma install only warns. On Windows these
+        /// installs are skipped.
         #[arg(long)]
         yes: bool,
     },
@@ -904,7 +935,9 @@ enum RuntimesCommand {
         /// Restart running local servers so they use the newly active runtime.
         #[arg(long)]
         restart_services: bool,
-        /// Approve restarting running local servers. Requires --restart-services.
+        /// Approve restarting running local servers. Pass it with
+        /// --restart-services, which is refused without it, in a terminal or
+        /// not; this command never prompts.
         //
         // `requires` rather than a silent no-op: unlike `runtimes uninstall`,
         // where `--yes` skips a real prompt, activation has nothing to confirm
@@ -922,7 +955,9 @@ left, so it cannot undo more than one activation."
         /// Restart running local servers so they use the restored runtime.
         #[arg(long)]
         restart_services: bool,
-        /// Approve restarting running local servers. Requires --restart-services.
+        /// Approve restarting running local servers. Pass it with
+        /// --restart-services, which is refused without it, in a terminal or
+        /// not; this command never prompts.
         #[arg(long, requires = "restart_services")]
         yes: bool,
     },
@@ -931,7 +966,9 @@ left, so it cannot undo more than one activation."
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
-        /// Do not ask for interactive confirmation.
+        /// Do not ask for interactive confirmation. Without it, the command
+        /// asks `[y/N]` (default: no) in an interactive terminal; outside one
+        /// it prints the plan and refuses with exit 1, removing nothing.
         #[arg(long)]
         yes: bool,
         /// Show what would be removed without deleting anything.
@@ -994,7 +1031,10 @@ enum StorageCommand {
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Do not ask for confirmation.
+        /// Do not ask for confirmation. Without it, the command asks `[y/N]`
+        /// (default: no) in an interactive terminal; outside one, when there
+        /// is something to remove, it prints the plan and refuses with exit 1,
+        /// removing nothing.
         #[arg(long)]
         yes: bool,
     },
@@ -1004,7 +1044,10 @@ enum StorageCommand {
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Do not ask for confirmation.
+        /// Do not ask for confirmation. Without it, the command asks `[y/N]`
+        /// (default: no) in an interactive terminal; outside one, when there
+        /// is something to remove, it prints the plan and refuses with exit 1,
+        /// removing nothing.
         #[arg(long)]
         yes: bool,
     },
@@ -3127,6 +3170,59 @@ fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<Stri
         PlatformRuleOut::NativeWindowsVllm | PlatformRuleOut::NativeWindowsAim => Some(format!(
             "{engine} has no adapter on native Windows; serve it from WSL or Linux"
         )),
+    }
+}
+
+/// What the user asked to do with an engine the platform gate may rule out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatedEngineAction {
+    Serve,
+    Install,
+}
+
+/// Refuse `serve`, `engines install` and `engines shell` (which installs the
+/// engine itself when its environment is missing) up front when the platform gate rules
+/// the engine out on this host.
+///
+/// Takes the same decision `rocm engines list` reports as
+/// `runtime: unsupported_native_windows`, and runs before runtime resolution,
+/// so a native-Windows vLLM request gets the platform reason rather than an
+/// unrelated "no active ROCm runtime" error, a network fetch, or a launched
+/// service that dies with no output.
+fn ensure_engine_allowed_on_platform(engine: &str, action: GatedEngineAction) -> Result<()> {
+    refuse_if_ruled_out(engine_ruled_out_by_platform(engine), action)
+}
+
+/// [`ensure_engine_allowed_on_platform`] with the platform decision passed in,
+/// so the refusing branch is testable on any host.
+fn refuse_if_ruled_out(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Result<()> {
+    match platform_refusal(ruled_out, action) {
+        Some(refusal) => bail!("{refusal}"),
+        None => Ok(()),
+    }
+}
+
+/// The refusal message for an engine, given why the platform gate already
+/// ruled it out.
+///
+/// `ruled_out` is passed in rather than re-derived, as in
+/// [`unsupported_here_for`], so both branches are unit-testable on any host.
+/// Only native-Windows vLLM is refused here. The AIM conditions are left to
+/// the AIM adapter, which checks Docker and GPU passthrough itself when it
+/// launches; refusing them up front would be a separate behavior change.
+fn platform_refusal(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Option<String> {
+    match ruled_out {
+        PlatformRuleOut::NativeWindowsVllm => Some(match action {
+            GatedEngineAction::Serve => "vLLM is not supported on native Windows; serve it from \
+                 WSL or Linux, or use the Lemonade engine (`--engine lemonade`)"
+                .to_owned(),
+            GatedEngineAction::Install => "vLLM is not supported on native Windows; install it \
+                 from WSL or Linux, or use the Lemonade engine (`rocm engines install lemonade`)"
+                .to_owned(),
+        }),
+        PlatformRuleOut::Allowed
+        | PlatformRuleOut::NativeWindowsAim
+        | PlatformRuleOut::AimDockerUnavailable => None,
     }
 }
 
@@ -5686,6 +5782,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn yes_help_says_what_happens_without_it_outside_a_terminal() {
+        // Wording pin: the sentences are only worth having while they are true,
+        // and the behavior itself is proven elsewhere —
+        //   uninstall              uninstall-04
+        //   runtimes uninstall     runtime-lifecycle-04
+        //   storage remove-*       storage-01, `removal_requires_yes_when_there_is_no_terminal_to_prompt`
+        //   fix                    diagnose-08, `consent_without_prompt` unit tests
+        //   install driver         driver-install-02
+        //   engines install        `system_package_install_action` unit tests
+        //   runtimes activate and rollback   runtime-lifecycle-11 and -14
+        //                          (--restart-services without --yes), -17 (--yes without it)
+        // Each entry is read from the `--yes` argument's own help, not the whole
+        // page, so a sibling flag cannot satisfy it.
+        // The trailing comma keeps `exit 1` from matching `exit 10`. Everything
+        // refuses with 1 except `fix`, whose exit 5 is its own declined status.
+        const REFUSES: &[&str] = &["(default: no)", "refuses with exit 1,"];
+        const NEVER_ASKS: &[&str] = &["never asks for confirmation"];
+        const NEVER_PROMPTS: &[&str] = &["never prompts"];
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["uninstall"], REFUSES),
+            (&["runtimes", "uninstall"], REFUSES),
+            (&["storage", "remove-old-installs"], REFUSES),
+            (&["storage", "remove-downloads"], REFUSES),
+            (
+                &["fix"],
+                &["(default: no)", "refuses with exit 5,", "also exits 5"],
+            ),
+            (&["install", "driver"], NEVER_ASKS),
+            (
+                &["engines", "install"],
+                &[
+                    "never asks for confirmation",
+                    // The least obvious sentence: no `--yes` still installs.
+                    "installs a missing package anyway",
+                    // Only OpenMPI's failure is an error; libatomic/libnuma warn.
+                    "only warns",
+                ],
+            ),
+            (&["runtimes", "activate"], NEVER_PROMPTS),
+            (&["runtimes", "rollback"], NEVER_PROMPTS),
+        ];
+        for (path, expected) in cases {
+            let mut command = Cli::command();
+            let mut subcommand = &mut command;
+            for name in *path {
+                subcommand = subcommand.find_subcommand_mut(name).unwrap_or_else(|| {
+                    panic!("no `{name}` subcommand on `rocm {}`", path.join(" "))
+                });
+            }
+            let yes = subcommand
+                .get_arguments()
+                .find(|arg| arg.get_id() == "yes")
+                .unwrap_or_else(|| panic!("`rocm {}` must offer --yes", path.join(" ")));
+            let yes_help = yes
+                .get_long_help()
+                .or_else(|| yes.get_help())
+                .unwrap_or_else(|| panic!("`rocm {} --yes` must be documented", path.join(" ")))
+                .to_string();
+            for phrase in *expected {
+                assert!(
+                    yes_help.contains(phrase),
+                    "`rocm {} --yes` help must contain `{phrase}`:\n{yes_help}",
+                    path.join(" ")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn update_apply_approval_never_credits_the_inert_yes_flag() {
         // Pins `SdkInstallApprovalSource::UpdateApply`: the update path is
         // preapproved, but it must never print a line crediting `--yes`.
@@ -7875,7 +8040,7 @@ pub(crate) mod tests {
 
         // The claim itself (onboarding only opens via an explicit `n` on the
         // Observe tab, never automatically) is proven by
-        // `crates/rocm-dash-tui/src/app/event_loop.rs`'s
+        // `crates/rocm-dash-tui/src/app/focus.rs`'s
         // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
         // test and the `onboarding.rs` module doc — this assertion only
         // guards the string, not the behavior.
@@ -9147,6 +9312,86 @@ pub(crate) mod tests {
             message.to_lowercase().contains("docker"),
             "the message has to name the actual reason, Docker: {message:?}"
         );
+    }
+
+    /// Native-Windows vLLM is refused for both serve and install, and each
+    /// refusal names the way out for that action. Wording only: that the
+    /// refusal fires before anything is launched or installed is proven by the
+    /// binary-level tests in `tests/vllm_native_windows_gate.rs` and the
+    /// `serve-vllm-refused-on-native-windows` /
+    /// `serve-vllm-install-refused-on-native-windows` scenarios.
+    #[test]
+    fn platform_refusal_names_wsl_linux_and_lemonade_for_native_windows_vllm() {
+        let serve = platform_refusal(PlatformRuleOut::NativeWindowsVllm, GatedEngineAction::Serve)
+            .expect("native-Windows vLLM serve is refused");
+        let install = platform_refusal(
+            PlatformRuleOut::NativeWindowsVllm,
+            GatedEngineAction::Install,
+        )
+        .expect("native-Windows vLLM install is refused");
+        for message in [&serve, &install] {
+            assert!(
+                message.contains("vLLM is not supported on native Windows")
+                    && message.contains("WSL or Linux")
+                    && message.contains("Lemonade"),
+                "{message:?}"
+            );
+        }
+        assert!(serve.contains("`--engine lemonade`"), "{serve:?}");
+        assert!(
+            install.contains("`rocm engines install lemonade`"),
+            "{install:?}"
+        );
+    }
+
+    /// Only native-Windows vLLM is refused up front; an allowed engine, and
+    /// the AIM conditions left to its own adapter, pass through.
+    #[test]
+    fn platform_refusal_is_none_unless_native_windows_vllm() {
+        for ruled_out in [
+            PlatformRuleOut::Allowed,
+            PlatformRuleOut::NativeWindowsAim,
+            PlatformRuleOut::AimDockerUnavailable,
+        ] {
+            for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+                assert_eq!(platform_refusal(ruled_out, action), None, "{ruled_out:?}");
+            }
+        }
+    }
+
+    /// The refusing branch of the gate, with an injected decision so it is
+    /// exercised on Linux CI too (the host-decision test below is vacuous there
+    /// for vLLM): native-Windows vLLM becomes an error carrying the action's
+    /// message, and everything else passes.
+    #[test]
+    fn refuse_if_ruled_out_errors_with_the_refusal_on_any_host() {
+        for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+            let error = refuse_if_ruled_out(PlatformRuleOut::NativeWindowsVllm, action)
+                .expect_err("native-Windows vLLM must be refused");
+            assert_eq!(
+                error.to_string(),
+                platform_refusal(PlatformRuleOut::NativeWindowsVllm, action)
+                    .expect("native-Windows vLLM has a refusal")
+            );
+            assert!(refuse_if_ruled_out(PlatformRuleOut::Allowed, action).is_ok());
+        }
+    }
+
+    /// The gate takes the host's own decision: vLLM is refused on native
+    /// Windows and allowed everywhere else, and Lemonade is never refused.
+    #[test]
+    fn ensure_engine_allowed_on_platform_follows_the_host_decision() {
+        for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+            assert_eq!(
+                ensure_engine_allowed_on_platform("vllm", action).is_err(),
+                rocm_core::runtime_is_windows()
+            );
+            assert_eq!(
+                ensure_engine_allowed_on_platform("VLLM", action).is_err(),
+                rocm_core::runtime_is_windows()
+            );
+            assert!(ensure_engine_allowed_on_platform("lemonade", action).is_ok());
+        }
     }
 
     /// Child half of [`engine_ruled_out_by_platform_gates_aim_on_docker_reachability`].

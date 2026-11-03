@@ -27,7 +27,7 @@ pub struct LegacyRocmSummary {
     /// declares no version anywhere.
     ///
     /// Optional and defaulted so the daemon's serialised snapshot
-    /// (`apps/rocmd/src/lib.rs`) written before this field existed still loads.
+    /// (`apps/rocmd/src/host_snapshot.rs`) written before this field existed still loads.
     #[serde(default)]
     pub version: Option<String>,
 }

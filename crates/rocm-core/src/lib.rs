@@ -62,9 +62,9 @@ pub use automation::{
     AutomationTriggerEvent, BuiltinWatcherSpec, EVENT_LOG_ROTATE_BYTES,
     EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot,
     append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, find_automation_proposal, generate_proposal_id, load_automation_proposals,
-    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    update_automation_proposal_status,
+    builtin_watchers, find_automation_proposal, generate_proposal_id, jsonl_lock_path,
+    load_automation_proposals, load_recent_audit_events, load_recent_automation_events,
+    load_recent_automation_proposals, update_automation_proposal_status,
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
@@ -193,7 +193,9 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_identity::{ServiceId, generate_service_id};
-pub use service_record::{ManagedServiceRecord, engine_stop_decides_confirmation};
+pub use service_record::{
+    ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
+};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,

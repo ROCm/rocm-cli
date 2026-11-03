@@ -17,9 +17,9 @@ cargo test --workspace --all-targets
 ```
 
 Note that `cargo test` runs every test as a thread in **one process**, which is
-also what the required `windows-build-and-test` lane does. See
-[Tests that touch the environment](#tests-that-touch-the-environment) before
-writing a test that sets an environment variable.
+also what the `windows-debug` job of the required `windows-build-and-test` lane
+does. See [Tests that touch the environment](#tests-that-touch-the-environment)
+before writing a test that sets an environment variable.
 
 Run clippy with warnings as errors:
 
@@ -532,7 +532,7 @@ when changing it:
   which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
   no GPU tag. The detected-GPU wording itself is covered at unit level by
   `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
-  [therock.rs](../apps/rocm/src/therock.rs).
+  [family.rs](../apps/rocm/src/therock/family.rs).
 
 The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
 end-to-end lane at all, and that gap is stated here rather than papered over.
@@ -882,6 +882,29 @@ anything is removed:
 cargo xtask e2e -- -n "uninstall-"
 ```
 
+What each command does without `--yes` when there is no terminal is stated in
+its `--yes` help, and
+`yes_help_says_what_happens_without_it_outside_a_terminal` keeps those lines in
+step with this table. The help is a wording pin; the behavior is proven here:
+
+| Command | Without `--yes`, no terminal | Proven by |
+|---|---|---|
+| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing | `uninstall-04` (Linux) |
+| `rocm runtimes uninstall` | same | `runtime-lifecycle-04` |
+| `rocm storage remove-downloads`, `remove-old-installs` | same; only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
+| `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
+| `rocm install driver` | never asks; prints the plan, changes nothing, exit 0 | `driver-install-02` (WSL) |
+| `rocm engines install` | never asks; a missing package installs only where no password is needed | `system_package_install_action` unit tests |
+| `rocm runtimes activate`, `rollback` | never ask; `--restart-services` is refused without `--yes`, and `--yes` is refused without `--restart-services` | `runtime-lifecycle-11`, `-14` (the first), `-17` (the second) |
+
+To check the first row by hand, run the command with no terminal attached. A
+regression would delete real settings, so the command points `HOME` at a
+scratch folder itself:
+
+```bash
+HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+```
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity
@@ -988,6 +1011,18 @@ rocm engines list
 
 The packaged Linux/WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
+`rocm serve <model> --engine vllm` and `rocm engines install vllm` take the
+same decision and must exit non-zero with "vLLM is not supported on native
+Windows", naming WSL/Linux and the Lemonade engine, before any runtime check,
+download, or launch. Focused tests:
+
+```powershell
+cargo test -p rocm --test vllm_native_windows_gate
+cargo test -p rocm --bin rocm platform_refusal
+```
+
+The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cover the
+same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
 
@@ -1062,6 +1097,18 @@ narrows the race against a concurrent `restart` rather than eliminating it.
 asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
+
+Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
+and `rocm logs --service`) reads the record through one loader,
+`ManagedServiceRecord::read_manifest` in
+[service_record.rs](../crates/rocm-core/src/service_record.rs), which `rocmd`
+shares too. An id with no record fails with one plain line pointing at
+`rocm services list --all` and no OS error under it; a record that exists but
+cannot be read or parsed keeps its cause. The loader's unit tests cover all
+three cases, and `features/service_unknown_id.feature` (`service-unknown-01`
+through `-05`, mock lane) runs each command against a missing id, asserting
+the exit code and the exact error together, then runs the listing command the
+error names to confirm it works and does not list the id.
 
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
@@ -1500,9 +1547,18 @@ rotation policy; two further tests go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
-itself stays covered. The user-visible side is `automations-07` through
-`automations-09` in
+itself stays covered. The repair of a torn tail, which normally replaces the
+store and falls back to cutting the debris in place when that replacement
+fails, has its own tests there: each step injected to fail, the error naming
+both causes when both fail, and a real fault on each platform (a directory
+that takes no new files on Unix, a handle without delete sharing on Windows).
+The user-visible side is `automations-07` through `automations-09`, plus
+`automations-10` for the fallback, in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature).
+`automations-10` makes the audit directory read-only, which does not bind root,
+so it carries `@requires-dir-permissions` and resolves to a skip for a user the
+permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
+than pass without testing the fallback.
 
 Natural-language plan handoff tests:
 
@@ -1716,14 +1772,16 @@ The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
 
-The required `windows-build-and-test` lane additionally folds in the hermetic
-`comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
-via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
+The `windows-release` job of the required `windows-build-and-test` lane
+additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
+scenarios and the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
 cargo xtask e2e
 ```
 
@@ -1899,6 +1957,150 @@ toolchain, so install the runtime with `rocm install sdk --devel` (see
 [vllm.md](vllm.md)).
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
+
+## The Serve Reuse Exemption From The No-GPU Refusal
+
+Under the default `gpu_required` policy, `rocm serve` refuses on a host with no
+usable AMD GPU before any engine work. A `serve` that matches an
+already-running managed service for the same engine and model launches nothing,
+so it is exempt and reaches the reuse short-circuit. See
+[the README](../README.md#reuse-is-exempt-from-the-no-gpu-refusal) for the
+user-facing contract.
+
+The pre-gate that decides which invocations may skip the refusal:
+
+```bash
+cargo test -p rocm --bin rocm reuse_pregate_
+```
+
+The pre-gate has five conditions. Three decide whether a live record matches
+this invocation, and each has a test that fails when only that condition is
+broken — `reuse_pregate_still_keys_on_the_engine` for the engine,
+`reuse_pregate_admits_a_match_on_the_raw_model_ref_alone` for the
+`record.model_ref` arm (every other positive case also matches on the canonical
+id, so without it that arm was deletable with the suite green), and
+`reuse_pregate_rejects_a_record_that_is_no_longer_live` for
+`managed_service_is_live`, which the shared helper otherwise always satisfies.
+
+The other two decide whether the gate may be consulted at all, and both live in
+`reuse_pregate_opens` (`apps/rocm/src/serve_cmd.rs`):
+
+- `host_has_no_usable_gpu` — the no-usable-GPU bail's own predicate, computed
+  once in `serve()` and handed to both. On a host that has a usable GPU the bail
+  cannot fire, so reuse buys nothing and the gate stays shut — which keeps
+  `--gpu` validation in the position #267 gave it. An unprobeable platform is
+  "unknown", not "no GPU", so it does not open the gate either.
+- `cpu_only` — a `--device cpu_only` serve never reaches the bail, so it has
+  nothing to exempt. (The CLI cannot actually produce that policy today;
+  `parse_device_policy` rejects it. The term is the helper's own guard.)
+
+`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu` covers both,
+including that the managed-service probe is not even *consulted* on a GPU host
+(`load_managed_services` refreshes liveness and can cost a probe and a
+`record.write()` per live record).
+
+That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
+see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
+call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
+probe is a real hardware probe with no injection point. serve-31 closes it, and
+being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
+the per-PR mock lane. The host predicate itself is the shared
+`host_has_no_usable_gpu` function, called by both the bail and the test rather
+than restated in either, so the test cannot drift from the production rule.
+
+The bypass decision's other arguments are in the same position — the unit tests
+in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
+not which values `serve()` hands it — so each one has a scenario instead:
+serve-30 for `require_api_key`, serve-32 for the requested recipe. The device
+policy needs neither: the predicate takes it by value rather than as an
+`Option`, so a call site that drops it does not compile.
+
+E2E scenarios, in
+[`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
+Run the suite unfiltered and let the harness select:
+
+```bash
+cargo xtask e2e
+```
+
+Unfiltered, deliberately — do not reach for the `cargo xtask e2e -- -n "..."`
+form other sections of this file use. Cucumber 0.23 honours *either* its own CLI
+filter *or* the harness closure, never both, so `-n` and `--tags` bypass the OS,
+capability and expectation resolution that decides whether a scenario may run at
+all (see the comment at
+[`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
+`only_lifecycle`). That caveat applies to every `-n` in this file, but it bites
+hardest here: these five are selected *by* host GPU state, so `-n` runs them on
+hosts whose premise does not hold — serve-28/29/30/32 need a host with no usable
+AMD GPU and serve-31 needs one with a GPU, and each silently reports the wrong
+answer on the other. (The one supported way to drive them off their own lane is
+to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
+the harness and the product agree the host has no usable GPU, which is what the
+mock lane has.) Note also that `-n` matches the scenario *name* (`serve-28 -
+Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
+silently selects nothing.
+
+- serve-28, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
+  matches an already-running vLLM service on a GPU-less host is not refused: it
+  prints the reuse summary. The only end-to-end proof of the exemption's happy
+  path.
+- serve-29, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+  Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
+  serving a different model is refused before any engine starts, and nothing is
+  prepared or downloaded. Lemonade specifically, because it manages its own
+  runtime and so is the engine whose preparation is user-visible.
+  It carries a second premise — a configured setup venv the runtime registry has
+  not yet recorded — which makes the refusal's *ordering* observable. `rocm
+  serve` resolves its runtime selection below the no-GPU bail deliberately,
+  because that resolution reaches `recover_setup_runtime_registration`, which
+  writes a runtime registry manifest and can fail with a manifest error that has
+  nothing to do with the GPU. Recovery returns early when no setup venv is
+  configured, and no other e2e root has one, so without this fixture the call
+  could be hoisted above the bail with every refusal scenario still green. The
+  final `Then` asserts the registry is still empty after the refusal.
+- serve-30, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
+  service for the *same* model, which this invocation nonetheless cannot reuse
+  (`--require-api-key` against a service that has no key), also does not soften
+  the refusal. This is the pre-gate's *acceptance* term, which serve-28 and
+  serve-29 cannot reach: serve-28 plants a record that really is reusable, and
+  serve-29 fails the gate's outer engine/model condition before the acceptance
+  test runs. The discriminating assertion is that the `rocm services stop`
+  advice is absent — that advice is printed only from the spawn, which is
+  reachable only once the no-GPU bail has been bypassed.
+- serve-32, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
+  same shape for the *other* independent argument of that acceptance test. A
+  live vLLM service for the same model, against a serve that asks for a
+  `--tool-call-parser` the service was not started with, is a recipe mismatch,
+  so it also earns no bypass. serve-30 cannot stand in for it: the record every
+  other scenario plants carries `engine_recipe_json: null`, which is exactly
+  what a serve with no recipe-bearing flags requests, so the recipe argument
+  matched whether `serve()` passed it or not. `--tool-call-parser` is the
+  cheapest way to make the requested recipe non-null without a catalog entry —
+  on vLLM it synthesizes a recipe hint for a model that has none. The
+  discriminating assertion is that the message is still the no-GPU one: grant
+  the bypass and the run reaches the spawn, whose own recipe-mismatch refusal
+  replaces it.
+
+Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-28,
+serve-30 and serve-32 also carry `@requires-os:linux`.
+
+The fifth is the pre-gate's other half, and it is the one that needs real
+hardware:
+
+- serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
+  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
+  *does* have a usable GPU, a live service this invocation really could reuse
+  still does not pull engine or registry work ahead of `--gpu` validation. The
+  record matches on liveness, engine and canonical model id, so every term of
+  the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
+  alone is what holds the gate shut. It reuses serve-29's setup-venv fixture so
+  the final `Then` can assert the registry is still empty: with the gate wrongly
+  open, `recover_setup_runtime_registration` re-files the planted manifest before
+  the refusal. This is the only check in the repo that fails if `serve()` stops
+  passing the host predicate into `reuse_pregate_opens` — the unit test pins the
+  helper, not the call site, and the four no-GPU scenarios above run where the
+  gate opens either way.
 
 ## Windows Tool Notes
 
@@ -2191,15 +2393,34 @@ cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
-just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
-have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+just because no HIP SDK is installed — has no Linux end-to-end coverage.
+`check_13_hip_sdk_missing` returns early on every non-Windows host, so
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
 [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
-(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
-neighbours) and by the Windows manual check in
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
+`fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+and their neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
+On the Windows GPU lane (`e2e-gpu-strix-windows`), `diagnose-48` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) runs the
+gate on a real host, like `diagnose-41`: it names no host shape and holds
+`rocm diagnose --json` to `rocm examine --json` on the same machine.
+`fix-13-hip-sdk-missing` has to appear exactly when the inspection reports an
+AMD GPU and either a HIP-built llama.cpp with no usable system HIP SDK, or an
+ambient (not managed-runtime) HIP-built PyTorch: the latter scores a further
+25 whether or not the SDK is healthy, so it lists the entry (weakly, below the
+match threshold) even beside a working SDK. ROCMAI-837 considers that +25
+listing wrong, so whoever changes the bonus must update the scenario's oracle
+too. On that lane's Strix Halo hosts (Lemonade, no system SDK) it asserts the
+cause is absent, which is the host shape of ROCMAI-830. Run it only on
+Windows:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-48)'
+```
 
 ## Model Fit Preflight
 
@@ -2416,3 +2637,84 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Doctor Skill Eval Replays
+
+The rocm-doctor skill's behavioural evals
+([`skills/rocm-doctor/evals/`](../skills/rocm-doctor/evals/)) run on grading machines
+that have no `rocm` binary. An agent following the skill stops at the install offer
+there, so a case can only grade what the agent does before a diagnosis exists. A case
+that grades how the agent reads a diagnosis, or what it does on an older CLI, needs a
+`rocm` to talk to. How those cases are graded, and where, is in
+[skill-quality.md](skill-quality.md).
+
+[`evals/hooks.py`](../skills/rocm-doctor/evals/hooks.py) supplies one. For a case that
+has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/), the
+hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
+removes it afterwards. The stub replays recorded output for `rocm --version`,
+`rocm fix --json` and `rocm diagnose`, and refuses every other command with exit
+code 2. It only prints text read from the recording, so whatever an agent asks it,
+it cannot change a machine or send anything; that comes from answering a fixed set
+of commands, not from the refusals. It also refuses `diagnose` options the
+recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
+only: the recorded answer belongs to one symptom, and replaying it for a variant
+would show the agent output the real CLI never prints. A case with no fixture
+directory runs as before, with no `rocm` on `PATH`. The hook assumes skillscope
+runs one case at a time in one process, which `skillscope/behavior.py` does: it
+puts the stub on the process-wide `PATH` because the agent inherits that, and
+refuses to start a second replay while one is active. `cargo test -p xtask` runs the
+hook's own tests
+([`evals/test_hooks.py`](../skills/rocm-doctor/evals/test_hooks.py)): a replayed
+command, the refused ones, and that `PATH` and the temporary directory are left as
+they were found. They need `python3` or `python` on `PATH`; on CI a missing Python
+fails the test, elsewhere it says it skipped.
+
+The recordings are generated, not typed in:
+
+```bash
+cargo xtask eval-fixtures          # write skills/rocm-doctor/evals/fixtures/*/replies.json
+cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or unexpected
+```
+
+The manifest comes from the compiled catalog and each diagnosis from
+`rocm_core::run_diagnose`, run over the recorded examination in
+[`tests/remote-ssh/examination.json`](../tests/remote-ssh/examination.json), so a
+catalog change cannot leave a stale recording behind. After a change to the failure
+catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and commit
+the result; the check names what is out of date. CI runs the check, and
+`cargo test -p xtask` runs it too. Read the diff after regenerating: a recording that
+changed is output the skill is now graded against. What an older CLI printed cannot be
+generated. It was recorded once from a real older build and lives in
+[`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
+
+To add a case, add an entry to
+[`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
+case id, `current` or `older`, and the error text the agent would pass as the
+symptom), run the command above, and add the case to
+[`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
+check also fails when a case id is not an id in `evals.json`, or when the part of the
+symptom before its first `:` does not appear in that case's prompt, because the hook
+finds a replay by id and a recording for a different question grades nothing. A
+directory that no case owns fails the check, and the command never deletes one:
+remove it by hand.
+
+Limits worth knowing. A replay says what the catalog says for a recorded host
+with no GPU data, so it grades how the agent reads and relays an answer, not whether
+the CLI is right about a real machine; and it answers `diagnose` with the same
+recorded output whatever `--symptom` is. The current-CLI replay's `--version` line
+is not the format the real `rocm --version` prints (the older-CLI replay prints that
+one), so only `fix --json` tells
+the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
+pin matches, and `cargo test -p xtask` fails if a pin is quoted in `SKILL.md` or
+`reference.md`, where it would stop proving the replay ran.
+
+On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionless
+`rocm` script (Git Bash, which does not look for `.cmd`). The Windows CI job runs
+`cargo test --workspace --all-targets` when a change touches the heavy paths, which
+include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
+directory and Python path without spaces; a path with spaces or parentheses is not
+exercised, and neither is the agent's own shell on the amd/skills Windows leg.
+Both replay cases also say "on Linux" in the prompt: run on a Windows host, the
+agent answered that its own machine is Windows and declined to run the CLI there, so
+neither case passed (0 of 2 in a local run), while on a Linux host (WSL2) both
+passed. Treat them as Linux-host cases when reading a run.

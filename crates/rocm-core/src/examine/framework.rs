@@ -102,7 +102,7 @@ fn runtime_library_path_env(
         // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
         // trims, drops empty entries and host-normalises each one, on top of the
         // same quoting rules `split_paths` applies. The sibling composition in
-        // `probe_runtime_devices` (`apps/rocm/src/therock.rs`, a different crate)
+        // `probe_runtime_devices` (`apps/rocm/src/therock/probe.rs`, a different crate)
         // already uses it, and the two building the same variable differently is
         // how they drift.
         //
