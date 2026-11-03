@@ -1396,8 +1396,11 @@ jobs:
           # See .github/scripts/Invoke-WslBash.ps1.
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
-          # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF'
+          # variable is named in WSLENV. The HF_* names are the self-hosted
+          # pool's Hugging Face mirror settings, which the Linux and Windows
+          # lanes already get from the runner; without them the guest's model
+          # downloads go straight to the Hub.
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:HF_ENDPOINT:HF_HUB_DISABLE_XET:HF_HUB_DOWNLOAD_TIMEOUT'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli

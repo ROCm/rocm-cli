@@ -1446,8 +1446,10 @@ jobs:
       - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)
         shell: powershell
         run: |
-          # See .github/scripts/Invoke-WslBash.ps1.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          # See .github/scripts/Invoke-WslBash.ps1. HF_* forward the
+          # self-hosted runner's Hugging Face mirror settings, as in
+          # e2e-selfhosted.yml's e2e-wsl.
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF:HF_ENDPOINT:HF_HUB_DISABLE_XET:HF_HUB_DOWNLOAD_TIMEOUT'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
