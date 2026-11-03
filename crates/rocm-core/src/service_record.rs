@@ -125,7 +125,59 @@ pub fn engine_stop_decides_confirmation(engine: &str) -> bool {
     engine == "aim"
 }
 
+/// No record exists for the requested service id.
+///
+/// [`ManagedServiceRecord::read_manifest`] returns this, as the root of its
+/// error, only when the manifest file is absent. Its message is the whole
+/// story for the user, so it carries no OS cause; a manifest that exists but
+/// cannot be read or parsed surfaces its cause instead. Callers can tell the
+/// two apart with `err.downcast_ref::<ManagedServiceNotFound>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedServiceNotFound {
+    pub service_id: String,
+}
+
+impl std::fmt::Display for ManagedServiceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No local server named `{}`. See `rocm services list --all`.",
+            self.service_id
+        )
+    }
+}
+
+impl std::error::Error for ManagedServiceNotFound {}
+
 impl ManagedServiceRecord {
+    /// Read and parse the record for `service_id` exactly as it is on disk.
+    ///
+    /// The single loader behind every command that takes a service id, in both
+    /// `rocm` and `rocmd`. A missing manifest is [`ManagedServiceNotFound`];
+    /// any other read failure (permission denied, a directory in its place) and
+    /// a manifest that does not parse keep their underlying cause. The caller
+    /// validates the id first; this only joins it onto the services directory.
+    pub fn read_manifest(paths: &AppPaths, service_id: &str) -> Result<Self> {
+        let manifest_path = paths.service_manifest_path(service_id);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ManagedServiceNotFound {
+                    service_id: service_id.to_owned(),
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to read the record for local server `{service_id}` at {}",
+                    manifest_path.display()
+                )));
+            }
+        };
+        serde_json::from_slice::<Self>(&bytes)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         paths: &AppPaths,
@@ -397,6 +449,75 @@ impl ManagedServiceRecord {
 mod tests {
     use super::*;
     use crate::test_support::{probe_test_record, temp_app_paths};
+
+    /// An unknown id reads as one plain sentence pointing at the listing
+    /// command, with no OS error chained under it.
+    #[test]
+    fn read_manifest_reports_a_missing_record_as_not_found_without_an_os_cause() {
+        let (root, paths) = temp_app_paths("read-manifest-missing");
+        let error =
+            ManagedServiceRecord::read_manifest(&paths, "nope").expect_err("no record was written");
+        assert_eq!(
+            error.downcast_ref::<ManagedServiceNotFound>(),
+            Some(&ManagedServiceNotFound {
+                service_id: "nope".to_owned()
+            })
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "No local server named `nope`. See `rocm services list --all`."
+        );
+        assert_eq!(error.chain().count(), 1, "{error:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A manifest path that exists but cannot be read is not "not found": the
+    /// OS error stays in the chain so the user can act on it.
+    #[test]
+    fn read_manifest_keeps_the_cause_of_an_unreadable_record() {
+        let (root, paths) = temp_app_paths("read-manifest-unreadable");
+        fs::create_dir_all(paths.service_manifest_path("svc-dir")).expect("dir in place");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-dir")
+            .expect_err("a directory is not a readable record");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("svc-dir"),
+            "names the record: {error:#}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A corrupt manifest exists, so it is a parse failure with its cause, not
+    /// "not found".
+    #[test]
+    fn read_manifest_keeps_the_cause_of_a_corrupt_record() {
+        let (root, paths) = temp_app_paths("read-manifest-corrupt");
+        let manifest = paths.service_manifest_path("svc-corrupt");
+        fs::create_dir_all(manifest.parent().expect("parent")).expect("services dir");
+        fs::write(&manifest, b"{ not json").expect("write corrupt");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-corrupt")
+            .expect_err("corrupt json must not parse");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error.to_string().starts_with("failed to parse "),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<serde_json::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn restarting_drops_the_previous_runs_inference_verification() {

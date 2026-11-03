@@ -1171,7 +1171,7 @@ async fn assert_hip_copies_reported(world: &mut E2eWorld) {
 }
 
 // Sources the loader itself actually consults, mirrored from
-// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
+// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine/library_copies.rs`: a `rocm-install` or
 // `managed-runtime` hit is evidence a copy exists, not evidence anything
 // would load it. Shared by the HIP and comgr selection assertions below so
 // the two cannot drift apart.
@@ -1274,7 +1274,7 @@ async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
         // the probe ran and found nothing or never ran at all -- exactly the
         // state of every lane where this scenario is the only coverage. The
         // "no libamd_comgr found" note is pushed only by the probe actually
-        // running and coming up empty (see `probe_comgr` in examine.rs), so
+        // running and coming up empty (see `probe_comgr` in examine/library_copies.rs), so
         // requiring it here is what makes this assertion prove the probe ran.
         let notes = value["notes"].as_array().expect("notes must be a list");
         assert!(

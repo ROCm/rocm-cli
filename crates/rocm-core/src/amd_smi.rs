@@ -528,7 +528,7 @@ fn amd_smi_json_with(
         bail!(
             "amd-smi {} failed: {}",
             args.join(" "),
-            crate::examine::truncate_to_chars(
+            crate::probe_exec::truncate_to_chars(
                 crate::command_failure_detail_or_else(&output, || format!(
                     "exit status {}",
                     output.status
