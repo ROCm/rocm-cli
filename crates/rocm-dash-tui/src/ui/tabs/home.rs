@@ -514,47 +514,62 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ])
         .split(area);
 
-    let n_running = state
+    // Starting services count too: until the readiness probe passes they are
+    // the only sign the serve command did something.
+    let mut live: Vec<_> = state
         .instances
         .values()
-        .filter(|i| i.status.is_serving())
-        .count();
+        .filter(|i| i.status.is_live())
+        .collect();
+    live.sort_by_key(|i| !i.status.is_serving());
     let running = card(
         f,
         mid[0],
-        &format!("Running · {n_running}"),
+        &format!("Running · {}", live.len()),
         BoxRole::Success,
         theme,
     );
     if running.height > 0 {
-        let lines = state
-            .instances
-            .values()
-            .find(|i| i.status.is_serving())
-            .map_or_else(
-                || {
-                    let mut lines = vec![Line::from(Span::styled(
-                        "Nothing running",
-                        Style::default().fg(theme.muted),
-                    ))];
-                    if running.height > 1 {
-                        lines.push(Line::from(Span::styled(
-                            "Press 3 → Serving to launch a model",
-                            Style::default().fg(theme.muted),
-                        )));
+        let lines = if live.is_empty() {
+            let mut lines = vec![Line::from(Span::styled(
+                "Nothing running",
+                Style::default().fg(theme.muted),
+            ))];
+            if running.height > 1 {
+                lines.push(Line::from(Span::styled(
+                    "Press 3 → Serving to launch a model",
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            lines
+        } else {
+            live.iter()
+                .take(running.height as usize)
+                .map(|i| {
+                    if i.status.is_serving() {
+                        Line::from(vec![
+                            Span::styled("● ", Style::default().fg(theme.ok)),
+                            Span::styled(
+                                i.model_name.clone(),
+                                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled("◌ ", Style::default().fg(theme.warn)),
+                            Span::styled(
+                                i.model_name.clone(),
+                                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("  {}", i.status.label().to_lowercase()),
+                                Style::default().fg(theme.muted),
+                            ),
+                        ])
                     }
-                    lines
-                },
-                |i| {
-                    vec![Line::from(vec![
-                        Span::styled("● ", Style::default().fg(theme.ok)),
-                        Span::styled(
-                            i.model_name.clone(),
-                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                        ),
-                    ])]
-                },
-            );
+                })
+                .collect()
+        };
         f.render_widget(Paragraph::new(lines), running);
     }
 
@@ -990,6 +1005,39 @@ mod tests {
         s.active_tab = ActiveTab::Home;
         let out = render(&s, 160, 30);
         assert!(out.contains("Nothing running"), "empty running tile");
+    }
+
+    #[test]
+    fn running_tile_counts_and_lists_starting_service_with_stage() {
+        use rocm_dash_core::metrics::StartupPhase;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Loading-Model".into(),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading),
+                },
+                ..Default::default()
+            },
+        );
+        s.instances.insert(
+            "b".into(),
+            Instance {
+                container_id: "b".into(),
+                model_name: "Dead-Model".into(),
+                status: InstanceStatus::Stopped,
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 1"), "{out:?}");
+        assert!(out.contains("Loading-Model"), "{out:?}");
+        assert!(out.contains("loading"), "{out:?}");
+        assert!(!out.contains("Nothing running"), "{out:?}");
+        assert!(!out.contains("Dead-Model"), "{out:?}");
     }
 
     #[test]

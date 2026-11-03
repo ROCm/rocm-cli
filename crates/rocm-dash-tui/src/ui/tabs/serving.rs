@@ -238,6 +238,37 @@ mod tests {
     }
 
     #[test]
+    fn running_now_lists_starting_service_with_stage() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus, StartupPhase};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2;
+        let mk = |name: &str, status| Instance {
+            container_name: name.into(),
+            model_name: name.into(),
+            status,
+            ..Default::default()
+        };
+        s.instances.insert(
+            "a".into(),
+            mk(
+                "Starting-Model",
+                InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Downloading),
+                },
+            ),
+        );
+        s.instances
+            .insert("b".into(), mk("Dead-Model", InstanceStatus::Stopped));
+        let out = render(&s, 120, 28);
+        assert!(out.contains("Running now — 1"), "{out:?}");
+        assert!(out.contains("Starting-Model"), "{out:?}");
+        assert!(out.contains("downloading"), "{out:?}");
+        assert!(!out.contains("none running"), "{out:?}");
+        assert!(!out.contains("Dead-Model"), "{out:?}");
+    }
+
+    #[test]
     fn serving_detail_shows_held_legend_when_gen_tps_held() {
         use rocm_dash_core::metrics::{
             Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,

@@ -428,11 +428,14 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
             (lines, false)
         }
         KeyAction::OpenServices => {
-            let running: Vec<_> = state
+            // Starting services are listed (with their stage) so a fresh serve
+            // is visible before it passes its readiness probe.
+            let mut running: Vec<_> = state
                 .instances
                 .values()
-                .filter(|i| i.status.is_serving())
+                .filter(|i| i.status.is_live())
                 .collect();
+            running.sort_by_key(|i| !i.status.is_serving());
             let mut lines = vec![head(format!("Running now — {}", running.len()))];
             let mut any_held = false;
             if running.is_empty() {
@@ -452,6 +455,18 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                             .as_ref()
                             .is_some_and(|m| m.freshness == ObservationFreshness::Held);
                     let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
+                    if !i.status.is_serving() {
+                        lines.push(Line::from(vec![
+                            Span::styled("◌ ", Style::default().fg(theme.warn)),
+                            Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
+                            Span::styled(port, Style::default().fg(theme.muted)),
+                            Span::styled(
+                                format!("  {}", i.status.label().to_lowercase()),
+                                Style::default().fg(theme.muted),
+                            ),
+                        ]));
+                        continue;
+                    }
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
                         Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
