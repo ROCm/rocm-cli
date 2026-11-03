@@ -72,13 +72,18 @@ fn is_safe_component(component: &str) -> bool {
 /// share a name in different directories. `rocm serve` takes no `/` in a variant;
 /// here it is safe because every segment is checked and the whole is sent to the
 /// hub as percent-encoded path segments, never to the filesystem.
+///
+/// A file name may also carry `+`, which hub file names do (`m+x-Q4_K_M.gguf`):
+/// it reaches the hub percent-encoded, so it is as safe as the other characters,
+/// and refusing it would leave such a file impossible to name exactly.
 fn is_safe_variant(variant: &str) -> bool {
     if is_safe_component(variant) {
         return true;
     }
+    let file_component = |component: &str| is_safe_component(&component.replace('+', "_"));
     variant.to_ascii_lowercase().ends_with(".gguf")
         && variant.split('/').count() <= 8
-        && variant.split('/').all(is_safe_component)
+        && variant.split('/').all(file_component)
 }
 
 /// Read a model reference as a GGUF file, if it is shaped like one.
@@ -400,8 +405,8 @@ pub struct OpenedGguf {
 /// every time, so each skip became a syscall and the next read a refill: a
 /// 300k-token header took seconds to read from disk. `seek_relative` keeps the
 /// buffer when the target is inside it. The position is tracked here, because
-/// `BufReader`'s own `stream_position` asks the file, which is a seek too, and
-/// the parser asks after every skip.
+/// a relative seek has to know where it lands to report it, and `BufReader`'s
+/// own `stream_position` would ask the file, which is a seek too.
 struct RelativeSeekBuf<R> {
     inner: BufReader<R>,
     /// Where the next read starts, from the start of the stream.
@@ -509,14 +514,15 @@ impl LiveGgufSource {
             .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?)
             .call()
             .map_err(|error| describe_http_error(&error, &format!("`{owner}/{repo}`")))?;
-        let mut text = String::new();
+        let mut text = Vec::new();
         // One byte past the cap, so a listing that is exactly too long is told
         // apart from one that fits instead of being cut short and misread as bad
-        // JSON.
+        // JSON. Read as bytes: the cut can fall inside a multi-byte character,
+        // and reading it as text would report that, not the size.
         response
             .into_reader()
             .take(MAX_LISTING_BYTES + 1)
-            .read_to_string(&mut text)
+            .read_to_end(&mut text)
             .with_context(|| format!("could not read the file list of `{owner}/{repo}`"))?;
         if text.len() as u64 > MAX_LISTING_BYTES {
             bail!(
@@ -524,7 +530,7 @@ impl LiveGgufSource {
                 MAX_LISTING_BYTES / (1024 * 1024)
             );
         }
-        let body: Value = serde_json::from_str(&text)
+        let body: Value = serde_json::from_slice(&text)
             .with_context(|| format!("the file list of `{owner}/{repo}` was not JSON"))?;
         let siblings = body
             .get("siblings")
@@ -583,20 +589,6 @@ fn describe_http_error(error: &ureq::Error, what: &str) -> anyhow::Error {
             anyhow!("could not reach the hub for {what}: {transport}")
         }
     }
-}
-
-/// Percent-encode one path segment of a repository file name.
-fn encode_segment(segment: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            let _ = write!(out, "%{byte:02X}");
-        }
-    }
-    out
 }
 
 /// What to say when a path that does not exist is shaped like a file in a Hugging
@@ -661,7 +653,11 @@ impl GgufSource for LiveGgufSource {
                 let deadline = Instant::now() + TOTAL_BUDGET;
                 let files = self.list_files(&agent, owner, repo, deadline)?;
                 let file = select_gguf_file(&files, variant)?;
-                let path: Vec<String> = file.name.split('/').map(encode_segment).collect();
+                let path: Vec<String> = file
+                    .name
+                    .split('/')
+                    .map(crate::report_delivery::percent_encode)
+                    .collect();
                 let url = format!(
                     "{}/{owner}/{repo}/resolve/main/{}",
                     self.hub,
@@ -1291,6 +1287,47 @@ mod tests {
             seeks < tokens / 100,
             "{seeks} seeks reached the file for {tokens} tokens"
         );
+    }
+
+    /// The position reported is where the reads and skips have reached, and
+    /// asking for it never reaches the file under the buffer.
+    #[test]
+    fn the_buffered_reader_tracks_its_position_without_asking_the_file() {
+        let seeks = Arc::new(Mutex::new(0));
+        let mut reader = RelativeSeekBuf::new(BufReader::new(CountingSeeks {
+            inner: Cursor::new(vec![7_u8; 100_000]),
+            seeks: Arc::clone(&seeks),
+        }));
+        let mut byte = [0_u8; 10];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(reader.seek(SeekFrom::Current(90)).unwrap(), 100);
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(reader.seek(SeekFrom::Current(-5)).unwrap(), 105);
+        let before = *seeks.lock().unwrap();
+        for _ in 0..1000 {
+            assert_eq!(reader.stream_position().unwrap(), 105);
+        }
+        assert_eq!(
+            *seeks.lock().unwrap(),
+            before,
+            "asking the position sought the file"
+        );
+        // A skip past the buffer still lands where it was asked to.
+        assert_eq!(reader.seek(SeekFrom::Current(50_000)).unwrap(), 50_105);
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(reader.stream_position().unwrap(), 50_115);
+    }
+
+    /// A `+` is allowed in an exact file name, which is how a hub file such as
+    /// `m+x-Q4_K_M.gguf` is named; it is sent percent-encoded.
+    #[test]
+    fn an_exact_file_name_with_a_plus_can_be_named() {
+        assert!(matches!(
+            parse_gguf_ref_with("o/r:dir/m+x-Q4_K_M.gguf", &|_| false),
+            Some(GgufRef::Hub { variant: Some(ref v), .. }) if v == "dir/m+x-Q4_K_M.gguf"
+        ));
+        // Not in a bare quantization label, which `rocm serve` also reads.
+        assert!(parse_gguf_ref_with("o/r:Q4+K", &|_| false).is_none());
     }
 
     #[test]
@@ -1977,15 +2014,19 @@ mod tests {
 
     #[test]
     fn a_listing_beyond_the_cap_is_refused_not_cut_short() {
-        let padding = "x".repeat(usize::try_from(MAX_LISTING_BYTES).unwrap());
-        let listing = format!(r#"{{"siblings":[],"pad":"{padding}"}}"#);
-        let hub = fake_hub_with(Vec::new(), 1, Serve::Honour, listing);
-        let error = LiveGgufSource::with_hub(&hub.base)
-            .open(&hub_ref("Q4_K_M"))
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("is larger than 16 MiB"), "{error}");
+        let cap = usize::try_from(MAX_LISTING_BYTES).unwrap();
+        // ASCII padding, and two-byte characters placed so that the cut falls
+        // inside one: the size is what is reported either way, not bad text.
+        for padding in ["x".repeat(cap), "é".repeat(cap / 2 + 1)] {
+            let listing = format!(r#"{{"siblings":[],"pad":"{padding}"}}"#);
+            let hub = fake_hub_with(Vec::new(), 1, Serve::Honour, listing);
+            let error = LiveGgufSource::with_hub(&hub.base)
+                .open(&hub_ref("Q4_K_M"))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("is larger than 16 MiB"), "{error}");
+        }
     }
 
     #[test]
@@ -2054,7 +2095,8 @@ mod tests {
 
     #[test]
     fn path_segments_are_percent_encoded() {
-        assert_eq!(encode_segment("m Q4+K.gguf"), "m%20Q4%2BK.gguf");
-        assert_eq!(encode_segment("a-b_c.d~e"), "a-b_c.d~e");
+        let encode = crate::report_delivery::percent_encode;
+        assert_eq!(encode("m Q4+K.gguf"), "m%20Q4%2BK.gguf");
+        assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
     }
 }

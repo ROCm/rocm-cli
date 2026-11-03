@@ -104,8 +104,11 @@ const QUANT_SMALLER_FACTOR: f64 = 0.95;
 
 /// Typical bits per weight of common llama.cpp quantizations, averaged over a
 /// whole model. Approximate: the real figure depends on the model's tensor mix.
+/// The K-quant and Q8_0 rows are llama.cpp's `quantize` table sizes for
+/// LLaMA-v1-7B (in GiB) converted to bits over its 6 738 415 616 weights; a
+/// test holds them to that.
 const QUANT_BITS_PER_WEIGHT: [(&str, f64); 7] = [
-    ("Q2_K", 2.63),
+    ("Q2_K", 3.35),
     ("Q3_K_M", 3.91),
     ("IQ4_XS", 4.25),
     ("Q4_K_M", 4.85),
@@ -205,7 +208,9 @@ pub enum CannotEstimateReason {
     /// state) or not measured (expert compute buffers), so the total can be too
     /// low and no fits / does-not-fit verdict is given.
     UnmeasuredLayout,
-    /// A figure the formula needs is not in the header. When only the
+    /// A figure the formula needs is not in the header, or is there but not
+    /// plausible (a layer count past the parser's bound, head counts or widths
+    /// whose total is past any real model). When only the
     /// feed-forward or embedding width is missing, the figures are still given
     /// (with that width counted as zero, so they can be too low) and no
     /// fits / does-not-fit verdict is.
@@ -3195,6 +3200,39 @@ mod tests {
         // embedding that is not VRAM, leaving 400 bytes on the GPU.
         assert!((sizing.quant_weights(1000.0, 8.0) - 400.0).abs() < 1e-9);
         assert!((sizing.quant_weights(1000.0, 4.0) - 200.0).abs() < 1e-9);
+    }
+
+    /// Each row is a bits-per-weight figure, not a file size: llama.cpp's
+    /// `quantize` table gives LLaMA-v1-7B sizes in GiB, and the row is that size
+    /// in bits over the model's weights. A size entered as bits (Q2_K's 2.63 GiB
+    /// read as 2.63 bits) prices the quantization about 20% light, and would
+    /// name it as fitting where it does not.
+    #[test]
+    fn the_bits_per_weight_table_is_the_published_sizes_in_bits() {
+        const LLAMA_V1_7B_WEIGHTS: f64 = 6_738_415_616.0;
+        let published_gib = [
+            ("Q2_K", 2.63),
+            ("Q3_K_M", 3.07),
+            ("Q4_K_M", 3.80),
+            ("Q5_K_M", 4.45),
+            ("Q6_K", 5.15),
+            ("Q8_0", 6.70),
+        ];
+        for (label, gib) in published_gib {
+            let bits = gib * GIB * 8.0 / LLAMA_V1_7B_WEIGHTS;
+            let row = QUANT_BITS_PER_WEIGHT
+                .iter()
+                .find(|(name, _)| *name == label)
+                .unwrap_or_else(|| panic!("{label} is not in the table"))
+                .1;
+            assert!((row - bits).abs() < 0.05, "{label}: {row} vs {bits:.3}");
+        }
+        // The table runs from smallest to largest, which the suggestion relies on.
+        assert!(
+            QUANT_BITS_PER_WEIGHT
+                .windows(2)
+                .all(|pair| pair[0].1 < pair[1].1)
+        );
     }
 
     /// A table entry within [`QUANT_SMALLER_FACTOR`] of the current figure is the

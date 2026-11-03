@@ -769,6 +769,9 @@ fn plan_context_estimate(readiness: &ModelReadiness, request: &ContextRequest) -
                 .to_owned(),
         );
     }
+    // Every answer that reaches here today is a catalog miss: the other
+    // undetermined answers carry the recipe they were about, and are left above.
+    // This keeps a future recipe-less answer from being estimated by accident.
     if readiness.undetermined_reason != Some(UndeterminedReason::ModelNotCurated) {
         return ContextPlan::LeaveAsIs { note: None };
     }
@@ -1040,6 +1043,16 @@ fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, verify: &str) {
         fix.notes.push(
             "`rocm serve` does not accept an exact file name after the colon; it takes \
              `owner/repo:QUANT`"
+                .to_owned(),
+        );
+    }
+    // Nor does it take a local file: `rocm serve <path>` would fail, so the
+    // line offered is the question asked again.
+    if matches!(reference, GgufRef::Local(_)) {
+        verify.clone_into(&mut fix.verify);
+        fix.notes.push(
+            "`rocm serve` does not take a local file path; it takes a catalog model or \
+             `owner/repo:QUANT` on Hugging Face"
                 .to_owned(),
         );
     }
@@ -2142,6 +2155,60 @@ mod tests {
         assert_eq!(
             rediagnose("$HOME/m.gguf", &plain),
             "rocm diagnose --model '$HOME/m.gguf'"
+        );
+    }
+
+    /// A local file that was read but cannot be sized (here one shard of a
+    /// split model) is not offered back as `rocm serve <path>`, which takes no
+    /// path: the line is the question asked again, with its flags.
+    #[test]
+    fn an_unsized_local_gguf_is_not_offered_to_rocm_serve() {
+        let mut readiness = not_curated("models/split.gguf");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &FakeSource::with(llama_like(10).u32("split.count", 3).file(0)),
+        );
+        assert_eq!(
+            readiness.estimate.as_ref().unwrap().cannot_estimate_reason,
+            Some(CannotEstimateReason::SplitFile)
+        );
+        let fix = readiness.fix.as_ref().expect("a plan");
+        assert_eq!(
+            fix.verify,
+            "rocm diagnose --model models/split.gguf --context-size 8192"
+        );
+        assert!(
+            fix.notes
+                .iter()
+                .any(|note| note.contains("does not take a local file path")),
+            "{fix:?}"
+        );
+        assert!(!render_model_readiness_text(&readiness).contains("rocm serve models/"));
+    }
+
+    /// A context flag with a reference that is neither curated nor a GGUF says
+    /// the estimate is for GGUF models only, and reads nothing.
+    #[test]
+    fn a_context_flag_on_a_reference_that_is_not_a_gguf_says_why_it_was_not_applied() {
+        let mut readiness = not_curated("some-bare-model-name");
+        let source = FakeSource::weights(64);
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        assert_eq!(source.calls(), 0);
+        assert!(readiness.estimate.is_none());
+        assert!(
+            readiness
+                .evidence
+                .iter()
+                .any(|line| line.contains("estimated for GGUF models only")),
+            "{:?}",
+            readiness.evidence
         );
     }
 
