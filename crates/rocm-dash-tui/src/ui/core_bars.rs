@@ -186,11 +186,32 @@ mod tests {
         }
     }
 
+    /// How many neighbouring core pairs have no blank column between them.
+    fn touching_pairs(n: usize, width: usize) -> usize {
+        (0..n - 1)
+            .filter(|&c| slot(c + 1, n, width).0 == slot(c, n, width).1)
+            .count()
+    }
+
     #[test]
     fn gutters_are_all_or_nothing_across_the_strip() {
-        // 32 cores into 48 columns: slots alternate 1 and 2 wide. Taking a
-        // gutter only from the 2-wide ones would leave pairs of bars touching
-        // and reading as 16 wider bars.
+        // The strip is one of two shapes, never a mixture.
+        //
+        // At 2+ columns per core every bar is separated. At fewer, slots
+        // alternate 1 and 2 columns wide, and taking a gutter only from the
+        // 2-wide ones would leave *some* pairs touching, so 32 cores would
+        // read as 16 wider bars. All touching is a contiguous histogram and
+        // is honest about the core count; a mixture is not.
+        assert_eq!(touching_pairs(32, 170), 0, "wide strip should be separated");
+        assert_eq!(
+            touching_pairs(32, 48),
+            31,
+            "narrow strip should be contiguous, not partly gapped"
+        );
+    }
+
+    #[test]
+    fn every_core_keeps_a_bar_in_the_contiguous_regime() {
         let (n, width) = (32, 48);
         let widths: Vec<usize> = (0..n)
             .map(|c| {
@@ -199,10 +220,29 @@ mod tests {
             })
             .collect();
         assert!(widths.iter().all(|&w| w >= 1), "a core lost its bar");
-        let touching = (0..n - 1)
-            .filter(|&c| slot(c + 1, n, width).0 == slot(c, n, width).1)
-            .count();
-        assert_eq!(touching, n - 1, "gutters applied unevenly: {widths:?}");
+    }
+
+    #[test]
+    fn the_baseline_bar_takes_the_gradient_start_color() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        // Same contract as the sparkline: an idle core's baseline is part of
+        // the chart, so it carries the gradient's low color. A `v > 0.0`
+        // guard on the gradient would pass without this.
+        let values = [0.0_f32];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let (low, mid, high) = (
+            Color::Rgb(10, 0, 0),
+            Color::Rgb(0, 20, 0),
+            Color::Rgb(0, 0, 30),
+        );
+        CoreBars::new(&values)
+            .max(100.0)
+            .style(Style::default().fg(Color::Rgb(99, 99, 99)))
+            .gradient(low, mid, high)
+            .render(buf.area, &mut buf);
+        assert_eq!(buf.cell((0, 0)).unwrap().style().fg, Some(low));
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{28c0}");
     }
 
     #[test]

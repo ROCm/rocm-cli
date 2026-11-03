@@ -84,9 +84,10 @@ pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolReq
 ///
 /// The braille sparkline packs two samples into each character column, so this
 /// bounds how much of a panel the graph can ever cover: 600 samples fill an
-/// inner width of 300 columns, which is wider than any terminal we expect. At
-/// 240 the graph topped out at 120 columns and a full-width panel kept a
-/// permanent blank margin on its left, since the series is right-aligned.
+/// inner width of 300 columns. That covers the half-width CPU box on a very
+/// wide terminal and a full-width stacked panel up to about 305 columns; past
+/// that the graph still stops short of the left edge. At 240 it topped out at
+/// 120 columns, which a full-width panel exceeds on any ordinary terminal.
 /// Snapshots arrive about once a second, so this is also roughly 10 minutes of
 /// history before the oldest samples start falling off the left.
 pub const HISTORY_CAP: usize = 600;
