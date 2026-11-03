@@ -8,7 +8,7 @@
 //!
 //! * [`crate::remote`] builds a command line that a shell on *another* machine
 //!   will parse, so an unquoted value there is a remote command injection.
-//! * [`crate::format_structured_tool_call`] builds the command line a human is
+//! * [`crate::freeform_planner::format_structured_tool_call`] builds the command line a human is
 //!   shown — in the chat approval card, in `rocm <request>`'s request plan, and
 //!   in the `run:` lines the CLI offers to be copied. An unquoted value there
 //!   means the line the operator reads is not the argv that runs, and the
@@ -29,13 +29,17 @@
 //! them ended up with quoters that did not escape `$`, backticks or `;`, and
 //! left a lone `"` unquoted entirely.
 //!
-//! That implementation is `rocm-dash-tui`'s `ui::exec::quote_display_arg`,
-//! which also renders the dash's approval previews, and its tests — the
-//! round-trip properties and the real-`sh` read-back — live beside it.
-//! `apps/rocm` already depends on `rocm-dash-tui`, so delegating needs no new
-//! crate edge; the opposite direction would (`rocm-dash-tui` may not depend on
-//! `rocm-core`, see `xtask/src/crate_edges.rs`). This module is the CLI's name
-//! for it, plus the control-character predicate the chat guards share.
+//! That implementation is [`rocm_core::posix_shell_quote`], the quoter
+//! `rocm-core` keeps for command lines with execution stakes, with its own
+//! real-`sh` read-back test. This module is the CLI's name for it, plus the
+//! control-character predicate the chat guards share.
+//!
+//! `rocm-dash-tui` renders its approval previews with a copy,
+//! `ui::exec::quote_display_arg`, because it may not depend on `rocm-core`
+//! (see `xtask/src/crate_edges.rs`); the round-trip properties and the
+//! real-`sh` read-back for that copy live beside it. `apps/rocm` can reach
+//! both, so the property test below holds the two to the same output for every
+//! value — a fix to one that is not made to the other turns it red.
 //!
 //! Scope: the surfaces above. Older `rocm …` hints elsewhere in the CLI that
 //! interpolate a value without it are not covered by this module's guarantee.
@@ -59,10 +63,11 @@
 /// Values that cannot mean anything but themselves are returned bare, so an
 /// ordinary command line stays readable: `rocm serve qwen2.5-7b --managed`,
 /// not `rocm 'serve' 'qwen2.5-7b' '--managed'`. `=` is among them, which is
-/// safe only after the program word — see the implementation's comment before
+/// safe only after the program word — see [`rocm_core::posix_shell_quote`]'s
+/// note on `=` before
 /// putting a quoted value in command position.
 pub(crate) fn shell_quote(value: &str) -> String {
-    rocm_dash_tui::ui::exec::quote_display_arg(value)
+    rocm_core::posix_shell_quote(value)
 }
 
 /// Whether `value` carries a character a terminal acts on rather than prints.
@@ -124,7 +129,8 @@ pub(crate) mod hostile {
     /// single example.
     const ALPHABET: &[char] = &[
         ' ', '\t', '"', '\'', '\\', '$', '`', ';', '|', '&', '*', '?', '(', ')', '<', '>', '#',
-        '=', '-', '~', '!', '[', ']', '{', '}', '%', ',', '@', '+', 'a', '1', '/', 'é',
+        '=', '-', '~', '!', '[', ']', '{', '}', '%', ',', '@', '+', 'a', '1', '/', 'é', '_', ':',
+        '.', 'Z',
     ];
 
     pub(crate) fn arg() -> impl Strategy<Value = String> {
@@ -162,15 +168,18 @@ mod tests {
     use super::hostile::argv as hostile_argv;
     use super::*;
 
-    // The quoter's own properties — the shlex round-trip and a real `sh`
-    // reading the line back — are tested where it is implemented,
-    // `rocm-dash-tui`'s `ui::exec`. What is tested here is this crate's: that
-    // the generator the CLI's renderer tests draw from still reaches the
-    // shapes that break quoting, and the control-character predicate.
+    // `rocm-core`'s `quoting` asks a real `sh` to read back a fixed set of
+    // hostile values; the generated-input properties — the shlex round-trip
+    // and the real-`sh` read-back — run against the dash's copy in
+    // `rocm-dash-tui`'s `ui::exec`. They cover the quoter the CLI uses because
+    // the two tests below hold that copy to `rocm-core`'s output for every
+    // value. Also tested here: that the generator the CLI's renderer tests draw
+    // from still reaches the shapes that break quoting, and the
+    // control-character predicate.
 
-    /// The CLI's entry point is the shared quoter, not a look-alike.
+    /// The CLI's entry point is `rocm-core`'s quoter, not a look-alike.
     #[test]
-    fn the_cli_quotes_exactly_as_the_shared_quoter_does() {
+    fn the_cli_quotes_exactly_as_rocm_core_does() {
         for value in [
             "qwen2.5-7b",
             "/mnt/my folder",
@@ -181,9 +190,58 @@ mod tests {
         ] {
             assert_eq!(
                 shell_quote(value),
-                rocm_dash_tui::ui::exec::quote_display_arg(value),
+                rocm_core::posix_shell_quote(value),
                 "{value:?}"
             );
+        }
+    }
+
+    /// The CLI and the dash agree on every single character a quoting
+    /// decision can turn on.
+    ///
+    /// The property test below draws from a small alphabet, so a one-sided
+    /// change to how a character outside it is treated — `_` or `:` dropped
+    /// from one copy's inert set, uppercase letters no longer counted as
+    /// alphanumeric — could pass it. This walks all of ASCII, both alone and
+    /// inside an otherwise inert word, plus a few non-ASCII characters.
+    #[test]
+    fn the_cli_and_the_dash_agree_on_every_ascii_character() {
+        let characters = (0_u8..=0x7f)
+            .map(char::from)
+            .chain(['é', 'ß', '\u{a0}', '\u{2028}']);
+        for character in characters {
+            for value in [character.to_string(), format!("ab{character}cd")] {
+                assert_eq!(
+                    shell_quote(&value),
+                    rocm_dash_tui::ui::exec::quote_display_arg(&value),
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// The CLI and the dash render a value the same way.
+        ///
+        /// They are two copies because `rocm-dash-tui` may not depend on
+        /// `rocm-core`, and this is the one crate that can reach both. Drawn
+        /// from the same metacharacter-heavy generator the renderer tests use,
+        /// so a one-sided change to how values combining those characters are
+        /// quoted fails here; the per-character walk above covers what the
+        /// alphabet leaves out. Together they stop two previews that disagree
+        /// from shipping.
+        #[test]
+        fn the_cli_and_the_dash_quote_every_value_identically(
+            args in hostile_argv()
+        ) {
+            for value in &args {
+                proptest::prop_assert_eq!(
+                    shell_quote(value),
+                    rocm_dash_tui::ui::exec::quote_display_arg(value),
+                    "value = {:?}",
+                    value
+                );
+            }
         }
     }
 

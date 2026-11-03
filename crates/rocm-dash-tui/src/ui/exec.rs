@@ -38,13 +38,14 @@ pub fn exe_label(cmd: &str) -> &str {
 /// ordinary preview stays readable — `rocm serve qwen2.5-7b --managed`, not
 /// `rocm 'serve' 'qwen2.5-7b' '--managed'`.
 ///
-/// The one quoter in the workspace. `apps/rocm`'s `shell_quote` delegates
-/// here rather than keeping a copy: `apps/rocm` already depends on this crate,
-/// so this is the place both can reach without a new crate edge (the reverse,
-/// `rocm-dash-tui -> rocm-core`, is the one `xtask/src/crate_edges.rs`
-/// forbids). The remote `ssh` command line, the CLI's printed `run:` hints,
-/// these approval previews and the quit prompt's `rocm services stop` lines
-/// therefore cannot drift apart.
+/// A copy of `rocm_core::posix_shell_quote`, which the CLI's `shell_quote` and
+/// the remote `ssh` command line use: this crate may not depend on `rocm-core`
+/// (`xtask/src/crate_edges.rs` forbids `rocm-dash-tui -> rocm-core`). Two
+/// tests in `apps/rocm/src/shell_quote.rs`, the one crate that can reach
+/// both, hold the two to the same output — a walk over every ASCII character
+/// and a property test over hostile values — so these
+/// approval previews and the quit prompt's `rocm services stop` lines cannot
+/// drift from the CLI's.
 pub fn quote_display_arg(value: &str) -> String {
     // `=` is left bare because POSIX gives it meaning only in a word ahead of
     // the command name, where `A=b` is an assignment rather than an argument.
@@ -163,7 +164,8 @@ mod tests {
     /// visible to another crate's tests.
     const HOSTILE_ALPHABET: &[char] = &[
         ' ', '\t', '"', '\'', '\\', '$', '`', ';', '|', '&', '*', '?', '(', ')', '<', '>', '#',
-        '=', '-', '~', '!', '[', ']', '{', '}', '%', ',', '@', '+', 'a', '1', '/', 'é',
+        '=', '-', '~', '!', '[', ']', '{', '}', '%', ',', '@', '+', 'a', '1', '/', 'é', '_', ':',
+        '.', 'Z',
     ];
 
     fn hostile_arg() -> impl Strategy<Value = String> {

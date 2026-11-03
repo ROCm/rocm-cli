@@ -49,8 +49,8 @@ pub(crate) fn service_stop_hint(service_id: &str) -> String {
 /// session recorded). `service_id` is quoted here, so the same line is both
 /// the human-readable hint and the command a transport's `exec` hands to the
 /// remote shell; callers pass it unquoted. `remote_cli` is not quoted: it is
-/// the command word itself, which [`shell_quote`] does not cover (see its note
-/// on `=`).
+/// the command word itself, which [`shell_quote`] does not cover (see
+/// [`rocm_core::posix_shell_quote`]'s note on `=`).
 pub(crate) fn remote_service_stop_hint(remote_cli: &str, service_id: &str) -> String {
     format!(
         "{remote_cli} services stop {} --yes",
