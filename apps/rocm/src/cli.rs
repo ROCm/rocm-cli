@@ -1488,9 +1488,13 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// `-V`/`--version` and `rocm version` both print `ROCM_CLI_VERSION`, the
-    /// one string `format_cli_version` in `build.rs` embeds. Tag, `main`, and
-    /// unknown shapes are the `format_cli_version_*` tests there.
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
     #[test]
     fn version_surfaces_share_one_build_script_string() {
         let full = crate::cli_version_string();

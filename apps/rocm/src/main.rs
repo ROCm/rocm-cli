@@ -428,12 +428,11 @@ fn cli_version_string() -> String {
 }
 
 /// The leading version of [`cli_version_string`], without the parenthetical
-/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`.
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
 fn cli_version_number() -> String {
-    let full = cli_version_string();
-    full.split_once(' ')
-        .map_or(full.as_str(), |(version, _)| version)
-        .to_owned()
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
