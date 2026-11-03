@@ -994,9 +994,6 @@ fn restart_internal_managed_service_with(
     restart_internal_managed_service_inner(paths, service_id, runtime_pin, terminate, None)
 }
 
-/// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
-/// through `rocm_core::spawn_detached_no_inherit`). Test-only seam, so a test
-/// can observe the leased port at the exact instant production would spawn.
 /// How long a restart waits for the new child to serve.
 #[allow(clippy::missing_const_for_fn)] // not const under `cfg(test)`, where a test shortens it
 fn restart_readiness_timeout() -> Duration {
@@ -1007,6 +1004,9 @@ fn restart_readiness_timeout() -> Duration {
     Duration::from_secs(45)
 }
 
+/// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
+/// through `rocm_core::spawn_detached_no_inherit`). Test-only seam, so a test
+/// can observe the leased port at the exact instant production would spawn.
 type RestartSpawnOverride<'a> =
     dyn Fn(&mut std::process::Command) -> io::Result<std::process::Child> + 'a;
 

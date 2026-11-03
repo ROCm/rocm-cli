@@ -942,6 +942,13 @@ rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 recorded process is gone; if the stop cannot confirm that, it says so, starts
 nothing, and leaves the stop request recorded.
 
+After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
+and re-checks the port before it respawns: if another live managed service is
+now recorded on that port, or the port is bound by another process, it refuses
+and the service stays stopped (`rocm services list` shows it). The lock wait is
+unbounded, as it is for `rocm serve`, so a launch that holds the lock for a long
+time delays the restart while the service is down.
+
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers

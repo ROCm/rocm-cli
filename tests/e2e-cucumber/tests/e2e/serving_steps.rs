@@ -1960,7 +1960,7 @@ async fn assert_refused_naming_running_port(world: &mut E2eWorld) {
     );
     assert!(
         output.contains(REUSE_REFUSAL_SERVICE_ID)
-            && output.contains("on port 9")
+            && output.contains("on port 9,")
             && output.contains("port 11500 would not be used"),
         "the refusal must name the running service and both ports:\n{output}"
     );
