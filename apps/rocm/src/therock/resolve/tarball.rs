@@ -17,8 +17,8 @@ use super::super::family::{family_resolution_hint, resolve_family};
 use super::super::fetch::download_text_cached;
 use super::super::platform_tarball_token;
 use super::super::source::{
-    RuntimeVersionSelector, SourceLayout, TheRockChannel, resolve_source, select_source_layout,
-    selector_is_release_line,
+    FamilyResolution, RuntimeVersionSelector, SourceLayout, TheRockChannel, resolve_source,
+    select_source_layout, selector_is_release_line,
 };
 use super::super::version::{compare_version_strings, is_stable_runtime_version};
 use super::wheel::next_layout_unsatisfied_hint;
@@ -104,12 +104,17 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
         version_selector,
     )
     .with_context(|| {
+        let published =
+            tarball_family_candidates(&files, channel, layout, &family_resolution.family)
+                .into_iter()
+                .map(|(_, version)| version)
+                .collect::<Vec<_>>();
         tarball_resolution_failure_context(
             channel,
             layout,
-            &family_resolution.source,
-            &family_resolution.family,
+            &family_resolution,
             version_selector,
+            &published,
         )
     })?;
     Ok(TarballArtifact {
@@ -143,6 +148,38 @@ fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
     }
 }
 
+/// Every archive in `files` this channel can install for `family`, before any
+/// version pin narrows them, paired with the version its name carries.
+///
+/// [`select_tarball_candidate`] picks from these. A next-layout failure lists
+/// their versions, so the releases it suggests are ones the pick could take.
+fn tarball_family_candidates(
+    files: &[TarballIndexFile],
+    channel: TheRockChannel,
+    layout: SourceLayout,
+    family: &str,
+) -> Vec<(TarballIndexFile, String)> {
+    let prefix = format!(
+        "therock-dist-{}-{}-",
+        platform_tarball_token(),
+        tarball_family_token(layout, family)
+    );
+    files
+        .iter()
+        .filter_map(|file| {
+            let version = file
+                .name
+                .strip_prefix(&prefix)?
+                .strip_suffix(".tar.gz")?
+                .to_owned();
+            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            Some((file.clone(), version))
+        })
+        .collect()
+}
+
 /// The newest archive in `files` that this request can actually install.
 ///
 /// The release channel's stable-version filter does double duty on the next
@@ -159,28 +196,10 @@ fn select_tarball_candidate(
     family: &str,
     version_selector: Option<&RuntimeVersionSelector>,
 ) -> Option<(TarballIndexFile, String)> {
-    let prefix = format!(
-        "therock-dist-{}-{}-",
-        platform_tarball_token(),
-        tarball_family_token(layout, family)
-    );
-    let mut candidates = files
-        .iter()
-        .filter_map(|file| {
-            let version = file
-                .name
-                .strip_prefix(&prefix)?
-                .strip_suffix(".tar.gz")?
-                .to_owned();
-            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
-                return None;
-            }
-            if version_selector.is_some_and(|selector| !selector.matches_version(&version)) {
-                return None;
-            }
-            Some((file.clone(), version))
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = tarball_family_candidates(files, channel, layout, family);
+    if let Some(selector) = version_selector {
+        candidates.retain(|(_, version)| selector.matches_version(version));
+    }
     // An unpinned catalog pick is "newest upload". A major.minor line pin is
     // "newest stable release in that line", even when an older patch was
     // uploaded later. Exact pins match one archive, so the order does not
@@ -205,18 +224,28 @@ fn select_tarball_candidate(
 fn tarball_resolution_failure_context(
     channel: TheRockChannel,
     layout: SourceLayout,
-    family_source: &str,
-    family: &str,
+    family_resolution: &FamilyResolution,
     version_selector: Option<&RuntimeVersionSelector>,
+    published: &[String],
 ) -> String {
     let (stream, hint) = match layout {
         SourceLayout::Next => (
             "next-layout",
-            next_layout_unsatisfied_hint(version_selector),
+            next_layout_unsatisfied_hint(
+                version_selector,
+                Some(published),
+                family_resolution.raw_arch.as_deref(),
+                Some(&family_resolution.family),
+            ),
         ),
         SourceLayout::Canonical => (
             "canonical",
-            family_resolution_hint(family_source, family, channel, "tarball"),
+            family_resolution_hint(
+                &family_resolution.source,
+                &family_resolution.family,
+                channel,
+                "tarball",
+            ),
         ),
     };
     format!(
@@ -288,6 +317,7 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::family_for_test;
     use super::*;
     use rocm_core::normalize_therock_family;
 
@@ -521,5 +551,40 @@ mod tests {
             .map(|(_, version)| version),
             Some("10.1.0".to_owned())
         );
+    }
+
+    #[test]
+    fn tarball_failure_on_next_layout_suggests_a_published_release() {
+        let family = family_for_test("gfx120X-all", Some("gfx1200"));
+        let line = RuntimeVersionSelector::version("10.1").unwrap();
+        let next = tarball_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            &family,
+            Some(&line),
+            &["10.0.0".to_owned()],
+        );
+        assert!(
+            next.starts_with("next-layout TheRock release tarball"),
+            "{next}"
+        );
+        assert!(
+            next.contains("`--version 10.0.0 --family gfx1200`"),
+            "{next}"
+        );
+        assert!(!next.contains("nightly"), "{next}");
+
+        let canonical = tarball_resolution_failure_context(
+            TheRockChannel::Release,
+            SourceLayout::Canonical,
+            &family,
+            None,
+            &[],
+        );
+        assert!(
+            canonical.starts_with("canonical TheRock release tarball"),
+            "{canonical}"
+        );
+        assert!(canonical.contains("--channel nightly"), "{canonical}");
     }
 }

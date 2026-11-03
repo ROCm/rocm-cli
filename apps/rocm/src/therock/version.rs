@@ -283,13 +283,18 @@ fn split_u32_prefix(value: &str) -> Option<(u32, &str)> {
 }
 
 /// Whether `published` is a stable release of the `major.minor` line.
+///
+/// Reads `published` with the lenient [`parse_version_for_ordering`], not the
+/// strict three-component [`parse_version`], because an index can publish a
+/// four-component release such as `7.2.4.70204`, and that is still a stable
+/// release of the 7.2 line. The ordering key drops trailing zeros, so a
+/// missing minor component reads as zero, as PEP 440 pads it.
 fn published_in_stable_line(published: &str, major: u32, minor: u32) -> bool {
-    if let Some(parsed) = parse_version(published) {
-        return parsed.stage == VersionStage::Stable
-            && parsed.major == major
-            && parsed.minor == minor;
-    }
-    stable_release_line_pin(published) == Some((major, minor))
+    parse_version_for_ordering(published).is_some_and(|key| {
+        key.stage == VersionStage::Stable
+            && key.release.first().copied().unwrap_or(0) == u64::from(major)
+            && key.release.get(1).copied().unwrap_or(0) == u64::from(minor)
+    })
 }
 
 /// Split a leading run of ASCII digits off `value`, returning it and the rest.

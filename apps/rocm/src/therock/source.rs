@@ -639,6 +639,21 @@ mod tests {
             Some("7.14.1")
         );
 
+        // A four-component publish is still a stable release of its line.
+        let four_component_line = RuntimeVersionSelector::version("7.2").unwrap();
+        assert!(four_component_line.matches_version("7.2.4.70204"));
+        assert!(!four_component_line.matches_version("7.20.4.70204"));
+        assert!(!four_component_line.matches_version("7.2.4.70204rc1"));
+        assert_eq!(
+            select_rocm_version(
+                TheRockChannel::Release,
+                &["7.2.3".to_owned(), "7.2.4.70204".to_owned()],
+                Some(&four_component_line),
+            )
+            .as_deref(),
+            Some("7.2.4.70204")
+        );
+
         let prerelease = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
         assert_eq!(
             select_source_layout(TheRockChannel::Release, &exact, Some(&prerelease)).unwrap(),
