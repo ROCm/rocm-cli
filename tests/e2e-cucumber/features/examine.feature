@@ -464,3 +464,38 @@ Feature: GPU detection and system inspection
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system in machine-readable form
     Then the inspection reports a current install-method name
+
+  # #449: older packaged copies of `pci.ids` predate Strix Halo, so `lspci`
+  # prints the bare word "Device" and the PCI scan cannot resolve a target --
+  # but it still stamped `is_apu: false` from that failed name lookup. The
+  # kernel's own topology names the part (gfx1151), and a kernel target is
+  # enough to answer the family question, so the machine came out as
+  # `has_apu: false` + `has_discrete_amd: true` on a unified-memory APU.
+  #
+  # Simulated host rather than `@requires-gpu`: the premise is a *kernel* node
+  # plus a PCI name the id table does not know, both planted under the scenario's
+  # own root, so every Linux lane can drive it. The When step has to be the
+  # planted-host one: it runs the CLI through the scenario environment, which is
+  # what puts the stub `lspci`/`rocminfo` on PATH and points the probes at that
+  # root. The plain "inspects the system" step ignores that environment and asks
+  # the runner itself, which has no APU and answers `gpus: []`. The `rocminfo`
+  # stub is load-bearing too -- on a runner with ROCm installed the real probe
+  # resolves the APU on its own (it already classifies by target) and would mask
+  # the defect.
+  @id:examine-classifies-an-apu-the-pci-name-cannot @requires-os:linux
+  Scenario: examine-31 - A GPU whose PCI name is unrecognised is still classified as an APU
+    Given a machine whose PCI name for its APU is unrecognised
+    When the user inspects that machine in machine-readable form
+    Then the inspection classifies the kernel-visible GPU as an APU
+
+  # The other half of #449: the GPU is only in the kernel topology because the
+  # PCI scan sees nothing at all (no `lspci`, or one that enumerates an empty
+  # bus). That branch decides `is_apu` from the node's target alone, and before
+  # this change it left the verdict unset -- so a gfx1151 host with no PCI tools
+  # still reported `has_apu: false`. examine-31 always has a PCI match and never
+  # reaches the branch, so nothing covered it.
+  @id:examine-classifies-a-kernel-only-apu @requires-os:linux
+  Scenario: examine-32 - An APU the PCI scan never sees is still classified as an APU
+    Given a machine whose kernel exposes an APU the PCI scan cannot see
+    When the user inspects that machine in machine-readable form
+    Then the inspection classifies the kernel-only GPU as an APU

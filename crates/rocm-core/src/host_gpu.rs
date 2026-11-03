@@ -722,6 +722,18 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         "15bf" | "164f" | "1900" | "1901" => Some("gfx1103"),
         // RDNA3.5 APUs with public PCI IDs that map cleanly to one gfx target.
         "1114" => Some("gfx1152"),
+        // Strix Halo: KFD reports gfx_target_version 110501 (gfx1151) for
+        // device 1586. Upstream `pci.ids` now carries the id as "Strix Halo
+        // [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+        // but older packaged copies predate that entry, which is why this table
+        // answers without reading one.
+        //
+        // Only the Windows/PNP path reads this row today
+        // (`gfx_target_from_pnp_device_id`); the Linux `lspci` reader that would
+        // consume it is the other half of #507 and does not exist yet. The Linux
+        // e2e scenarios for #449 exercise the kernel-target reclassification in
+        // `apply_kernel_gpu_membership`, not this row.
+        "1586" => Some("gfx1151"),
         // Navi 48: Radeon RX 9070 / 9070 XT / 9070 GRE.
         "7550" => Some("gfx1201"),
         _ => None,
@@ -3902,6 +3914,7 @@ mod tests {
             ("164F", "gfx1103"),
             ("1900", "gfx1103"),
             ("1114", "gfx1152"),
+            ("1586", "gfx1151"),
             // Vega APUs: Renoir, Cezanne, Lucienne, Barcelo.
             ("1636", "gfx90c"),
             ("1638", "gfx90c"),
