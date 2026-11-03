@@ -89,7 +89,7 @@ pub fn is_scrapeable_status(status: &str) -> bool {
 /// for safety.
 ///
 /// **`running` + `startup_phase` overlap:** the rocm-cli supervisor
-/// (`apps/rocmd/src/lib.rs::supervise_service`) flips the on-disk record to
+/// (`apps/rocmd/src/supervise.rs::supervise_service`) flips the on-disk record to
 /// `running` immediately after spawning the engine child — *before* it starts
 /// polling and parsing `startup_phase` from the serve log — and only clears
 /// `startup_phase` once the service reaches `ready`. So a record can be
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn discovered_from_record_surfaces_startup_phase_while_running() {
-        // The real producer (`apps/rocmd/src/lib.rs::supervise_service`) flips
+        // The real producer (`apps/rocmd/src/supervise.rs::supervise_service`) flips
         // the on-disk record to `running` *before* it starts polling and
         // parsing `startup_phase` from the serve log, and only clears
         // `startup_phase` once the service reaches `ready`. Exercise that

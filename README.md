@@ -428,7 +428,11 @@ hardware, not something an install or a setting can put right.
 `rocm fix` takes these flags:
 
 - `--dry-run` shows any fix's plan without changing anything.
-- `--yes` skips the interactive confirmation once you've reviewed it.
+- `--yes` skips the interactive confirmation once you've reviewed it. Without
+  it, a fix that changes files or settings asks `[y/N]` (default: no). When
+  stdin is not a terminal it prints the plan and refuses with exit code 5,
+  changing nothing; answering no also exits 5. Fixes that only print steps
+  never ask.
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
@@ -587,6 +591,10 @@ Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits
 non-zero, after printing the plan.
 
+`install driver` never asks for confirmation. Without `--yes`, in a terminal or
+not, it prints the plan, changes nothing, and exits 0. A plan that would install
+something is marked `approval: required`.
+
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first
@@ -695,8 +703,9 @@ reported as stopped by the attempt. The error says which is which. Read
 to fail the same way again — then start a stopped server with
 `rocm services restart <service-id> --yes` once the cause is fixed.
 
-`uninstall` prompts for confirmation unless `--yes` is passed; outside an
-interactive terminal `--yes` is required. `--dry-run` prints the plan and
+`runtimes uninstall` prompts `[y/N]` (default: no) unless `--yes` is passed.
+Outside an interactive terminal it prints the plan and refuses with exit code 1,
+removing nothing, so `--yes` is required there. `--dry-run` prints the plan and
 exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
@@ -714,6 +723,11 @@ rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
+
+Both removal commands list what they would remove, then ask `[y/N]` (default:
+no) unless `--yes` is passed. Outside an interactive terminal, when there is
+something to remove, they refuse with exit code 1 and remove nothing, so `--yes`
+is required there. `--dry-run` never asks.
 
 `remove-old-installs` keeps the two most recent installs for each channel,
 format, GPU family, and toolchain choice, and never touches the install in use,
@@ -763,8 +777,13 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
-`--yes` approves required system-package installs, such as OpenMPI for vLLM,
-without asking.
+`--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
+libnuma), including a `sudo` password prompt. `engines install` never asks for
+confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
+installs a missing package anyway, and one that would need a password prints the
+commands to run while the install continues. With `--yes`, a failed OpenMPI
+install is an error; a failed libatomic or libnuma install only warns. On
+Windows these installs are skipped.
 
 ### Will a model run here?
 
@@ -906,6 +925,60 @@ The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied through `HIP_VISIBLE_DEVICES`, ROCm CLI warns
 when `ROCR_VISIBLE_DEVICES` is set, because the two orderings can diverge.
+
+#### Reuse is exempt from the no-GPU refusal
+
+Under the default `gpu_required` policy, `rocm serve` on a host with no usable
+AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
+prepared or downloaded. A `rocm serve` that matches an **already-running
+managed service for the same engine and model** now skips that refusal and
+prints the reuse summary instead. This is a real change to a refusal you may be
+relying on: on a GPU-less host, `rocm serve <model>` can now succeed where it
+previously always failed.
+
+The exemption is limited to that case, and nothing else about `gpu_required`
+changes. The reused service was vetted against the policy at its own launch,
+and the reusing invocation launches no process and does no GPU work. A live
+service for a different engine does not soften the refusal, and neither does one
+for a model whose name does not overlap — those still fail fast with the usual
+message and prepare nothing.
+
+Matching the engine and model is necessary but not sufficient. The exemption
+applies only when the service would *actually* be reused, and that is decided by
+exactly the predicate the launch itself applies: the recipe settings must match
+(the sampling-control rule under [Model serving](#model-serving) above), a
+`--require-api-key` request must be satisfiable by a service that already has a
+key, and the service's recorded device policy must satisfy this one — a
+`gpu_required` serve is not reused from a service recorded as `cpu_only`. That
+is the only policy pair refused; any other combination, including a record that
+predates the field and so names no policy at all, is accepted. (No `rocm serve`
+can record a `cpu_only` service today — `--device cpu_only` is refused outright,
+since CPU is not a fallback path here — so that term is a guard, not a refusal
+you will meet.) A live service that fails any of those is not reusable, so it
+buys no bypass: `rocm serve` refuses on the GPU instead, which is the accurate
+message and leaves your running server alone. (Telling you to stop it and re-run
+would not help: the re-run would have nothing left to reuse and would hit the
+same GPU refusal.)
+
+Two limits are worth stating exactly, because they are easy to read as stronger
+than they are:
+
+- **Model names are matched leniently.** The check that decides whether reuse is
+  even worth asking about uses the same two-way substring match the service
+  listings use, so a live `qwen3-8b-instruct` service opens it for
+  `rocm serve qwen`. On a GPU-less host that invocation then does engine
+  preparation — possibly printing `Preparing <engine> for GPU serving...` and
+  installing — *before* the refusal it ultimately gets, and if that preparation
+  fails you get its error rather than the GPU one. Leniency is deliberate:
+  tightening it would silently break legitimate reuse by short name. Only a
+  model name that does not overlap is guaranteed to refuse first with nothing
+  prepared.
+- **The exemption does not apply with an explicit `--gpu <index>`.** It skips
+  the no-usable-GPU bail, not the pinned-index check that follows it — and that
+  check refuses *every* index on a host with no usable GPU, because there is no
+  visible ordinal for one to name. So `rocm serve <model> --gpu 0` is refused on
+  a GPU-less host whether or not a reusable service is running, and so is
+  `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
 
 Manage background servers started with `--managed`:
 
@@ -1201,8 +1274,10 @@ rocm uninstall [--yes] [--dry-run]
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks before doing it. Use `--dry-run` to only list, and `--yes` to skip
-the confirmation. Each `--keep-*` flag skips the removal of one category:
+do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
+and `--yes` to skip the confirmation. Outside an interactive terminal, when there
+is something to remove, it refuses with exit code 1 and removes nothing unless
+you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
