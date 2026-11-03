@@ -275,7 +275,7 @@ pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path
 /// renders, the exit really is unexplained — i.e. a crash. The service log is
 /// the only record of why, since the child is detached and writes nowhere else
 /// — platform-generic since ROCMAI-541 attaches it on Windows too (see
-/// `spawn_hidden_console_with_log` above).
+/// `spawn_detached_with_log` above).
 pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
     let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
@@ -773,7 +773,7 @@ fn spawn_managed_engine_child(
         // reaching nothing: the log would stop at the engine's last explicit
         // progress write, and both `rocm serve --verbose` and `rocm logs` would
         // never see why it died.
-        let child_pid = rocm_core::spawn_hidden_console_with_log(
+        let child_pid = rocm_core::spawn_detached_with_log(
             &current_exe,
             &serve_args,
             &env_refs,

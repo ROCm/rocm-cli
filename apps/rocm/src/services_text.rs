@@ -1060,7 +1060,7 @@ fn restart_internal_managed_service_with(
         // this, a restarted engine's own output — including the final error
         // chain a failing `__engine-serve-http` prints to stderr — reaches
         // nothing and is lost.
-        let child_pid = rocm_core::spawn_hidden_console_with_log(
+        let child_pid = rocm_core::spawn_detached_with_log(
             &current_exe,
             &serve_args,
             &env_refs,

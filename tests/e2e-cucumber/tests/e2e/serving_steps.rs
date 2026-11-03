@@ -2199,7 +2199,7 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
 // Both scenarios below spawn a REAL managed child — the `rocm` binary itself,
 // re-invoked as `__engine-serve-http` — rather than a planted record, but swap
 // out the real Lemonade/vLLM dispatch for a scripted stand-in
-// (`run_scripted_e2e_engine_serve_http` in `apps/rocm/src/main.rs`, armed by
+// (`run_scripted_e2e_engine_serve_http` in `apps/rocm/src/engine_ipc.rs`, armed by
 // `ROCM_E2E_SCRIPTED_ENGINE`) so the child can survive past both platforms'
 // early-startup liveness checks and then either die or run until stopped,
 // without any GPU. Both attach with `--verbose` under piped (non-TTY) stdio,

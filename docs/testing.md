@@ -2077,6 +2077,40 @@ hardware:
   helper, not the call site, and the four no-GPU scenarios above run where the
   gate opens either way.
 
+### Managed-engine crash vs. stop (ROCMAI-541)
+
+A managed engine that dies *after* its early-startup window used to be
+indistinguishable from one that is merely slow: `rocm serve --verbose` printed
+"server process exited" and exited 0, and on Windows the child's stdout/stderr
+were attached to nothing, so the reason never reached the service log at all.
+These two scenarios pin both halves of the fix, and they are companions — each
+is the other's control, since both land in the same
+`AttachOutcome::ServerExited` arm and only the stop marker tells them apart:
+
+- serve-33, `@id:serve-scripted-death-after-startup` — a managed child that dies
+  after startup must fail the attach loudly: non-zero exit, the crash named, and
+  `failed` on both the service record and the engine state file.
+- serve-34, `@id:serve-scripted-external-stop-while-attached` — a `rocm services
+  stop` issued from another shell during the same window must stay a clean stop:
+  exit 0 and no `failed` stamp. `AttachOutcome::Stop` fires only from the
+  attached session's *own* keystroke reader, and piped stdio has none, so an
+  external stop lands in the crash arm and would otherwise be reported as one.
+
+Both carry `@requires-no-gpu`, so the GitHub-hosted mock lane is where they get
+their live coverage. Neither needs a GPU or a real engine: the scripted-engine
+hook (`ROCM_E2E_SCRIPTED_ENGINE`, with `ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS`,
+compiled only under the `e2e-test-hooks` feature — see
+`run_scripted_e2e_engine_serve_http` in `apps/rocm/src/engine_ipc.rs`) stands in
+for the whole Lemonade/vLLM dispatch, so a real `__engine-serve-http` child
+still spawns and still clears both platforms' early-startup liveness checks
+before it dies. `serve_cmd.rs`'s `scripted_engine_death` bypasses the no-GPU
+pre-flight and the self-managed-engine install that would otherwise refuse these
+on that lane.
+
+To run them on a host that *does* have a GPU, mask it so the harness resolves to
+its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-3[34]"`
+— otherwise `@requires-no-gpu` skips them.
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global

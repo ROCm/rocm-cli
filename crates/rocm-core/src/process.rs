@@ -82,12 +82,65 @@ pub fn spawn_hidden_console_no_inherit(
     )
 }
 
+/// Detached background spawn whose stdout/stderr land in `log_path`.
+///
+/// The managed-engine spawn (ROCMAI-541). Identical in creation flags to
+/// [`spawn_detached_no_inherit`] — no console, own process group, outlives this
+/// process — and differs only in attaching the child's output to the service
+/// log, which is what [`spawn_detached_no_inherit`] loses. Deliberately NOT
+/// [`spawn_hidden_console_with_log`]: that one creates a console
+/// (`CREATE_NEW_CONSOLE`) and so pays for a `conhost` per engine, which a
+/// detached background service has no use for.
+///
+/// Handing `CreateProcessW` std handles forces `bInheritHandles`, so the child
+/// inherits every inheritable handle this process holds, not only the two
+/// below. That is the same blanket-inheritance model
+/// [`spawn_hidden_console_with_log`] already uses; scoping it would need
+/// `STARTUPINFOEXW` with an explicit handle list.
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
+pub fn spawn_detached_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        log_path,
+    )
+}
+
+#[cfg(windows)]
 pub fn spawn_hidden_console_with_log(
     program: &Path,
     args: &[String],
     env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        log_path,
+    )
+}
+
+/// Duplicate `log_path` into inheritable stdout/stderr handles and spawn with
+/// them, closing this process's copies whether or not the spawn succeeded.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn spawn_windows_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    creation_flags: u32,
+    hide_window: bool,
     log_path: &Path,
 ) -> Result<u32> {
     use std::os::windows::io::AsRawHandle;
@@ -145,8 +198,8 @@ pub fn spawn_hidden_console_with_log(
         program,
         args,
         env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
+        creation_flags,
+        hide_window,
         Some((stdout_handle, stderr_handle)),
     );
     unsafe {

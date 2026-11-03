@@ -360,7 +360,7 @@ pub(crate) fn builtin_engine_available(engine: &str) -> bool {
 ///
 /// ROCMAI-541: on Windows this process's stdout/stderr reach the service log
 /// only because the parent attached them at spawn time
-/// (`rocm_core::spawn_hidden_console_with_log`); a gap there (or in a future
+/// (`rocm_core::spawn_detached_with_log`); a gap there (or in a future
 /// caller that spawns this subcommand some other way) would otherwise lose an
 /// engine's failure reason completely, since nothing else reads a detached
 /// child's output. So this wrapper does not rely on that attachment alone: on
