@@ -906,22 +906,40 @@ fn apply_context_estimate(
 }
 
 /// The command that asks the same GGUF question again: the same reference,
-/// quoted for a POSIX shell when it needs to be, and the same `--context-size`
-/// and `--kv-cache-type` when they were passed, so following the plan does not
-/// quietly answer a different question.
+/// quoted for this platform's shell when it needs to be, and the same
+/// `--context-size` and `--kv-cache-type` when they were passed, so following
+/// the plan does not quietly answer a different question.
 fn rediagnose(model_ref: &str, request: &ContextRequest) -> String {
+    rediagnose_for(model_ref, request, cfg!(windows))
+}
+
+/// [`rediagnose`] for a chosen platform, so both are tested on either.
+///
+/// A reference made only of characters no shell treats specially is printed
+/// as it is, so a plain Windows path (`C:\models\m.gguf`) still works in both
+/// `cmd.exe` and PowerShell; anything else is quoted for PowerShell on Windows
+/// and for a POSIX shell elsewhere. A reference that starts with `-` is joined
+/// to the flag (`--model=-x.gguf`), because the argument parser would read it
+/// as another flag.
+fn rediagnose_for(model_ref: &str, request: &ContextRequest, windows: bool) -> String {
     use std::fmt::Write as _;
     let plain = !model_ref.is_empty()
         && model_ref.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-' | '+' | '@' | ',')
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | ':' | '.' | '_' | '-' | '=')
+                || (windows && c == '\\')
         });
-    let mut command = if plain {
-        format!("rocm diagnose --model {model_ref}")
+    let quoted = if plain {
+        model_ref.to_owned()
+    } else if windows {
+        crate::quoting::powershell_quote(model_ref)
     } else {
-        format!(
-            "rocm diagnose --model '{}'",
-            model_ref.replace('\'', r"'\''")
-        )
+        crate::quoting::posix_shell_quote(model_ref)
+    };
+    let mut command = if model_ref.starts_with('-') {
+        format!("rocm diagnose --model={quoted}")
+    } else {
+        format!("rocm diagnose --model {quoted}")
     };
     if let Some(size) = request.context_size {
         let _ = write!(command, " --context-size {size}");
@@ -1827,6 +1845,22 @@ mod tests {
             fix.verify,
             "rocm diagnose --model some-lab/vision-7b:vision-7b-Q4_K_M.gguf"
         );
+        // Asked with a context size, the command for the model asks with it too.
+        let mut with_flags = not_curated("some-lab/vision-7b:mmproj-vision-7b-f16.gguf");
+        attach_context_estimate(
+            &mut with_flags,
+            &ContextRequest {
+                context_size: Some(16_384),
+                kv_cache_type: Some(KvCacheType::Q4_0),
+            },
+            &host_with(24.0, 64.0),
+            &FakeSource::refusing_a_projector(&["vision-7b-Q4_K_M.gguf"]),
+        );
+        assert_eq!(
+            with_flags.fix.as_ref().expect("a plan").verify,
+            "rocm diagnose --model some-lab/vision-7b:vision-7b-Q4_K_M.gguf --context-size \
+             16384 --kv-cache-type q4_0"
+        );
         let text = render_model_readiness_text(&one);
         assert!(!text.contains("header could not be read"), "{text}");
         // No header was read, so the report does not say the figures came from one.
@@ -1894,7 +1928,10 @@ mod tests {
             );
             attach_context_estimate(
                 &mut readiness,
-                &ContextRequest::default(),
+                &ContextRequest {
+                    context_size: Some(32_768),
+                    kv_cache_type: None,
+                },
                 &host,
                 &FakeSource::weights(64),
             );
@@ -1913,7 +1950,10 @@ mod tests {
                     assert_eq!(commands, vec![command.to_owned()], "{memory:?}");
                     assert_eq!(
                         readiness.fix.as_ref().map(|fix| fix.verify.as_str()),
-                        Some("rocm diagnose --model some-lab/never-curated-7b:Q4_K_M"),
+                        Some(
+                            "rocm diagnose --model some-lab/never-curated-7b:Q4_K_M \
+                             --context-size 32768"
+                        ),
                         "{memory:?}"
                     );
                 }
@@ -2076,8 +2116,28 @@ mod tests {
             "rocm diagnose --model o/r:Q4_K_M"
         );
         assert_eq!(
-            rediagnose("it's here.gguf", &plain),
+            rediagnose_for("it's here.gguf", &plain, false),
             r"rocm diagnose --model 'it'\''s here.gguf'"
+        );
+        // Windows: a plain path is left as it is, so cmd.exe reads it too;
+        // one with a space is quoted for PowerShell, which doubles a `'`.
+        assert_eq!(
+            rediagnose_for(r"C:\models\m.gguf", &plain, true),
+            r"rocm diagnose --model C:\models\m.gguf"
+        );
+        assert_eq!(
+            rediagnose_for(r"C:\my models\it's.gguf", &plain, true),
+            r"rocm diagnose --model 'C:\my models\it''s.gguf'"
+        );
+        // A backslash is not plain to a POSIX shell.
+        assert_eq!(
+            rediagnose_for(r"a\b.gguf", &plain, false),
+            r"rocm diagnose --model 'a\b.gguf'"
+        );
+        // A reference that starts with `-` is joined to the flag.
+        assert_eq!(
+            rediagnose_for("-x.gguf", &plain, false),
+            "rocm diagnose --model=-x.gguf"
         );
         assert_eq!(
             rediagnose("$HOME/m.gguf", &plain),

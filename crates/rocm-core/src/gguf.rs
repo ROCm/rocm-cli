@@ -34,7 +34,9 @@ const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_ENTRIES: u64 = 1 << 20;
 const MAX_KEY_LEN: u64 = 4096;
 
-/// The input-embedding tensor, which llama.cpp keeps in host memory.
+/// The input-embedding tensor. llama.cpp keeps it in host memory when the file
+/// has its own [`OUTPUT_NAME`]; with tied embeddings it is the output layer's
+/// weight too, on the GPU.
 const TOKEN_EMBD_NAME: &str = "token_embd.weight";
 const OUTPUT_NAME: &str = "output.weight";
 /// String values longer than this are skipped rather than stored; the only
@@ -832,10 +834,12 @@ mod tests {
 
     #[test]
     fn an_output_tensor_is_noticed_and_its_absence_means_tied_embeddings() {
+        // Not the last tensor, so a later one cannot clear what it set.
         let untied = Builder::new()
             .tensor_at("token_embd.weight", &[8, 8], 0)
             .tensor_at("output.weight", &[8, 8], 64)
-            .file(128);
+            .tensor_at("output_norm.weight", &[8], 128)
+            .file(160);
         assert!(parse(&untied).unwrap().has_output);
         let tied = Builder::new()
             .tensor_at("token_embd.weight", &[8, 8], 0)
@@ -1299,6 +1303,10 @@ mod tests {
             if integer {
                 assert_eq!(kept_scalar.feed_forward_length, Some(1), "type {type_id}");
                 assert_eq!(kept_array.feed_forward_length, Some(1), "type {type_id}");
+            } else {
+                // A float is never read as an integer from its bits.
+                assert_eq!(kept_scalar.feed_forward_length, None, "type {type_id}");
+                assert_eq!(kept_array.feed_forward_length, None, "type {type_id}");
             }
         }
     }

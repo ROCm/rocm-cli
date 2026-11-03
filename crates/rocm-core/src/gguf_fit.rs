@@ -351,7 +351,9 @@ struct Sizing {
     /// Everything after the header: what a bits-per-weight figure is over.
     data: f64,
     /// The part of `data` that lands in VRAM. llama.cpp keeps the input
-    /// embedding (`token_embd.weight`) in host memory, so it is left out.
+    /// embedding (`token_embd.weight`) in host memory when the file has its own
+    /// `output.weight`, and then it is left out; with tied embeddings it is the
+    /// output layer's weight on the GPU, and `weights` is all of `data`.
     weights: f64,
     /// The compute buffer's size before anything that grows with the context.
     compute_base: f64,
@@ -440,8 +442,9 @@ impl Sizing {
     }
 
     /// The part of a `bits_per_weight` quantization of `params` weights that
-    /// lands in VRAM: the same share of the file as now, because the input
-    /// embedding stays in host memory at any quantization.
+    /// lands in VRAM: the same share of the file as now, because whether the
+    /// input embedding stays in host memory (it does unless the embeddings are
+    /// tied) does not change with the quantization.
     fn quant_weights(&self, params: f64, bits_per_weight: f64) -> f64 {
         params * bits_per_weight / 8.0 * (self.weights / self.data)
     }
@@ -1235,7 +1238,8 @@ mod tests {
             KvCacheType::F16,
             AcceleratorMemory::Dedicated(64.0),
         );
-        // The input embedding stays in host memory, so it is not VRAM.
+        // The file has its own output layer, so the input embedding stays in
+        // host memory and is not VRAM.
         let weights = (size - header.data_offset - EMBD_BYTES) as f64 / GIB;
         // The attention mask adds 512 x 2 bytes per token of context.
         let compute = (LLAMA_COMPUTE_BASE + 512 * 2 * 8192) as f64 / GIB;
@@ -2600,10 +2604,11 @@ mod tests {
     }
 
     /// The sixteenth load, made with the card almost full: the process overhead
-    /// measured only about 0.4 GiB there against 1.05-1.28 GiB elsewhere, so the
-    /// estimate was further above what was used than in the other fifteen. It is
-    /// still above, and the documented range (0.05% to 5.5%) is the range over
-    /// all sixteen, so the 5% bound the other fifteen meet is not asserted here.
+    /// measured only about 0.4 GiB there against 1.05-1.1 GiB in the model's
+    /// other loads, so the estimate was further above what was used. It is still
+    /// above, by 5.5% (the module documentation gives the range over all
+    /// sixteen loads), so the 5% bound the model's other loads meet is not
+    /// asserted here.
     #[test]
     fn the_load_made_with_the_card_almost_full_is_estimated_above_by_about_five_and_a_half_percent()
     {

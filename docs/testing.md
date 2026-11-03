@@ -3421,8 +3421,9 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
   reference quoted for a shell), the plan a sized estimate keeps when it
   could not compare (`amd-smi metric --json` where the memory was unreadable,
-  none where no GPU is visible or on an APU; unit-tested only, since no lane has
-  a GPU whose memory cannot be read), and the text and JSON shapes.
+  `rocm diagnose` where no GPU is visible, as for a curated model, and none on
+  an APU; unit-tested only, since no lane has a GPU whose memory cannot be
+  read), and the text and JSON shapes.
 - [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
   `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
   device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB),
