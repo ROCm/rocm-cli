@@ -16,7 +16,8 @@
 //! * [`crate::therock::quote_display_arg`] builds the `command: uv … && uv …`
 //!   line the install dry-run prints. Its install root comes from a `--prefix`
 //!   the local assistant can choose, and the line is offered to be run.
-//! * [`crate::service_hints`] and the runtime-activation report in
+//! * [`crate::service_hints`], the `rocm services` list in
+//!   [`crate::services_text`] and the runtime-activation report in
 //!   [`crate::runtime_services`] build the `rocm services … <id> --yes`,
 //!   `rocm services logs <id>` and `rocm runtimes activate <key> …` lines a
 //!   user is told to run next. A service id is not limited to inert
