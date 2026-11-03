@@ -1211,12 +1211,8 @@ pub(crate) fn run_attached_service(
 
     match outcome {
         AttachOutcome::Detach => {
-            println!("detached - server still running");
-            println!("  service_id: {service_id}");
-            println!("  endpoint: {endpoint}");
-            println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
-            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
+            // Audit before printing: a closed stdout makes `println!` panic,
+            // which must not lose the event.
             record_cli_audit_event(
                 &paths,
                 "service",
@@ -1225,6 +1221,12 @@ pub(crate) fn run_attached_service(
                 format!("detached from attached serve service_id={service_id} endpoint={endpoint}"),
                 Some(&service_id),
             );
+            println!("detached - server still running");
+            println!("  service_id: {service_id}");
+            println!("  endpoint: {endpoint}");
+            println!("  list: rocm services");
+            println!("  logs: rocm logs {service_id}");
+            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             Ok(())
         }
         AttachOutcome::Stop => {
@@ -1442,11 +1444,6 @@ fn finish_attached_stop(
             )
         }
         Ok(result) => {
-            write!(
-                out,
-                "{}",
-                render_service_action_result_with_helper_note(paths, "stop_server", &result)
-            )?;
             record_cli_audit_event(
                 paths,
                 "service",
@@ -1455,17 +1452,17 @@ fn finish_attached_stop(
                 format!("stopped attached serve service_id={service_id}"),
                 Some(service_id),
             );
+            write!(
+                out,
+                "{}",
+                render_service_action_result_with_helper_note(paths, "stop_server", &result)
+            )?;
             Ok(())
         }
         Err(error) => {
             let signal = signal_child(child_pid);
-            writeln!(err, "  note: {error:#}")?;
-            if let Err(signal_error) = &signal {
-                writeln!(
-                    err,
-                    "  note: signaling this session's server process {child_pid} directly also failed: {signal_error:#}"
-                )?;
-            }
+            // Record the audit event before writing to stderr, so a failed
+            // write cannot skip it.
             let message = match &signal {
                 Ok(()) => format!(
                     "stop failed; signaled attached serve child {child_pid} service_id={service_id}"
@@ -1482,6 +1479,13 @@ fn finish_attached_stop(
                 message,
                 Some(service_id),
             );
+            writeln!(err, "  note: {error:#}")?;
+            if let Err(signal_error) = &signal {
+                writeln!(
+                    err,
+                    "  note: signaling this session's server process {child_pid} directly also failed: {signal_error:#}"
+                )?;
+            }
             Ok(())
         }
     }
@@ -1676,6 +1680,61 @@ mod tests {
             audit["message"],
             "stop failed; signaling attached serve child 777 also failed: no such process service_id=svc-attached"
         );
+    }
+
+    /// A writer whose every write fails, standing in for a closed stdout/stderr.
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn attached_ctrl_c_records_the_audit_event_even_when_writing_the_outcome_fails() {
+        // One case per branch that writes after deciding: a confirmed stop
+        // (stdout) and a stop that itself failed (stderr notes). The write
+        // error is returned, but the audit event is already on disk.
+        let cases: [(&str, Result<serde_json::Value>, &str); 2] = [
+            (
+                "attached-broken-out",
+                Ok(stop_answer(true, "graceful")),
+                "stopped attached serve service_id=svc-attached",
+            ),
+            (
+                "attached-broken-err",
+                Err(anyhow::anyhow!("managed service `svc-attached` not found")),
+                "stop failed; signaled attached serve child 777 service_id=svc-attached",
+            ),
+        ];
+        for (name, stop, expected_message) in cases {
+            let (root, paths) = test_paths(name);
+            paths.ensure().unwrap();
+            let result = finish_attached_stop(
+                &paths,
+                "svc-attached",
+                777,
+                stop,
+                |_| Ok(()),
+                &mut BrokenWriter,
+                &mut BrokenWriter,
+            );
+            let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+            let _ = fs::remove_dir_all(root);
+            assert!(result.is_err(), "{name}: the write error is surfaced");
+            let audit: serde_json::Value = serde_json::from_str(
+                audit_text
+                    .lines()
+                    .last()
+                    .unwrap_or_else(|| panic!("{name}: no audit event recorded")),
+            )
+            .expect("audit json");
+            assert_eq!(audit["message"], expected_message, "{name}: {audit}");
+        }
     }
 
     #[test]
