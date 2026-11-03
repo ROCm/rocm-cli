@@ -1191,7 +1191,7 @@ pub fn stat_shim_path(
         .find(|candidate| std::path::Path::new(candidate).is_file())
         .expect("no real `stat` binary to delegate to");
     // Answers only the one call this scenario is substituting: the CLI's
-    // `stat -c %A|%U|%G <device>` in `stat_device` (crates/rocm-core/src/examine.rs).
+    // `stat -c %A|%U|%G <device>` in `rocm_core`'s `stat_device`.
     // Both the format AND the path must match — keying on the path alone would
     // hand this `mode|owner|group` line to any other `stat` of the same device
     // added later, in whatever format it asked for, and the caller would parse

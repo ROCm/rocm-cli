@@ -219,10 +219,12 @@ flaky = true
 # For the contract this scenario actually exists to hold:
 # EAI-8007 has NO row on purpose. `services stop` reported stopping 0 processes
 # for a service it did in fact stop on the pod, but neither fixture reproduces it
-# here: a plain child process registered as a managed service is counted
-# correctly (no-GPU lane), and so is a real vLLM serve (MI300X, run 188). Its
-# scenario therefore ships as a guard rather than an expected failure — a row
-# would be a stale XPASS on both lanes and would fail them. The ticket keeps the
+# here: a plain child process registered as a managed service was counted
+# correctly in a one-off no-GPU check during development, and so was a real vLLM
+# serve (MI300X, run 188). The shipped scenario is the real-serve one, which is
+# `@requires-gpu @merge-queue`, so no blocking lane holds this contract. It ships
+# as a guard rather than an expected failure, because a row would be a stale
+# XPASS and would fail the lane. The ticket keeps the
 # pod observation; what distinguishes that host is still unknown.
 
 # --- EAI-8014: a PROPOSED contract, not a README one. The README documents that
@@ -238,16 +240,19 @@ when = {}
 bug = "EAI-8014"
 reason = "Uninstall reports completion while leaving the servers it manages running, and removes the records needed to stop them."
 
-# --- EAI-8020: MEASURE. The other half of the same divergence: `diagnose` names
+# --- EAI-8020. The other half of the same divergence: `diagnose` names
 # the device's actual owning group while the `fix` recipe is hard-coded to
 # `render`, so the two propose different changes wherever the device's group is
-# not `render`. Needs a real device node, hence the GPU lane. ---
+# not `render`. Needs a real device node, hence the GPU lane. Measured on the
+# MI300X lane (E2E self-hosted ROCm/rocm-cli run 192) and the Strix Halo Ubuntu lane
+# (run 196), failing for this reason on both, with 0 XPASS. The group is substituted
+# by a `stat` shim, so the outcome does not depend on the host. ---
 [["diagnose-and-fix-agree-on-the-remedy-command"]]
 when = {}
 bug = "EAI-8020"
 reason = "The diagnosis proposes adding the user to the device's own group while the fix is hard-coded to `render`."
 
-# --- EAI-8021: MEASURE. The render-group check only ever ADDS score for missing
+# --- EAI-8021. The render-group check only ever ADDS score for missing
 # group membership and never credits access that demonstrably works, so a device
 # the user can already read and write is still diagnosed as a permission problem.
 # The scenario substitutes a world-writable device answer and asserts the
@@ -256,7 +261,8 @@ reason = "The diagnosis proposes adding the user to the device's own group while
 # ones), so the runner's own group membership cannot reach the result: the
 # outcome is the same on every bare-metal Linux GPU host. If this XPASSes, the
 # product changed; it is not a host difference, and NOT a reason to add
-# `flaky = true`. ---
+# `flaky = true`. Measured on MI300X (run 192) and Strix Halo Ubuntu (run 196),
+# failing for this reason on both, with 0 XPASS. ---
 [["diagnose-credits-a-usable-device"]]
 when = {}
 bug = "EAI-8021"
@@ -283,10 +289,13 @@ bug = "EAI-8006"
 reason = "Letting the CLI choose a GPU reports that it selected none on a Windows machine that has one."
 serve_timeout_secs = 180
 
-# --- EAI-8016: MEASURE. The serve path has no address-availability check: the
+# --- EAI-8016. The serve path has no address-availability check: the
 # default port is used whether or not something already holds it, so a second
 # server is handed the address the first is on. The scenario holds the address
-# itself rather than starting a second real server. ---
+# itself rather than starting a second real server. Measured on all three GPU
+# lanes before the scenario became `@merge-queue`: MI300X (run 192), Strix Halo
+# Ubuntu (run 196) and Strix Halo Windows (runs 196 and 210). It failed for this
+# reason on each, Windows included, with 0 XPASS. ---
 [["serve-second-server-gets-a-free-port"]]
 when = {}
 bug = "EAI-8016"
