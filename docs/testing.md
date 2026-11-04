@@ -516,7 +516,7 @@ Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
 when changing it:
 
 - `gfx_target_has_no_rocm_build` in
-  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  [gfx_target.rs](../crates/rocm-core/src/gfx_target.rs) is deliberately conjoined
   with `normalize_therock_family` returning `None`. Do not simplify it to a bare
   target-name check. Every test that drives the refusal does so by naming the
   target explicitly, and the conjunct is the only reason any of them is also
@@ -532,7 +532,7 @@ when changing it:
   which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
   no GPU tag. The detected-GPU wording itself is covered at unit level by
   `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
-  [therock.rs](../apps/rocm/src/therock.rs).
+  [family.rs](../apps/rocm/src/therock/family.rs).
 
 The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
 end-to-end lane at all, and that gap is stated here rather than papered over.
@@ -845,6 +845,7 @@ cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
 cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
+cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
@@ -1011,6 +1012,18 @@ rocm engines list
 
 The packaged Linux/WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
+`rocm serve <model> --engine vllm` and `rocm engines install vllm` take the
+same decision and must exit non-zero with "vLLM is not supported on native
+Windows", naming WSL/Linux and the Lemonade engine, before any runtime check,
+download, or launch. Focused tests:
+
+```powershell
+cargo test -p rocm --test vllm_native_windows_gate
+cargo test -p rocm --bin rocm platform_refusal
+```
+
+The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cover the
+same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
 
@@ -1111,7 +1124,7 @@ would simply deadlock. Both tests therefore stage the launch from a second
 thread and let the code under test block on it.
 
 - `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
-  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  ([`apps/rocm/src/service_records.rs`](../apps/rocm/src/service_records.rs)) holds the lock on the main thread with only the key
   written, runs `prune` on a worker, asserts the worker does *not* report
   completion while the lock is held, then publishes the record and releases.
   Two assertions fail independently if the acquire is removed: that negative
@@ -1762,13 +1775,14 @@ expectation and applicability resolver.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios (not themselves `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+scenarios and the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
 comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
 cargo xtask e2e
 ```
 
@@ -1783,7 +1797,10 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; cover generated private-key PEM packaging and
+sidecars before activation; assert the installer's get-started block (banner art
+only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+piped or `NO_COLOR` output (the colored TTY branch is not driven by any
+scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config
@@ -2152,7 +2169,7 @@ cargo xtask e2e
 To run just this one, go through xtask so it still builds the binary:
 
 ```bash
-cargo xtask e2e -- -n "serve-33"
+cargo xtask e2e -- -n "serve-40"
 ```
 
 That works because `cargo xtask e2e` compiles the binary under test itself,
@@ -2161,7 +2178,7 @@ the only producer of `ROCM_E2E_OOM_FAULT_INJECTION=1`.
 
 The CI dispatch filter does **not** take the same route, and that is precisely
 the hazard described below: it runs a **prebuilt** `ROCM_CLI_BINARY`, so a
-`name_filter=serve-33` dispatch selects this scenario against a build with the
+`name_filter=serve-40` dispatch selects this scenario against a build with the
 hook compiled out.
 
 The caveat is about the filter, not about this scenario. Cucumber 0.23 honours
@@ -2169,22 +2186,22 @@ The caveat is about the filter, not about this scenario. Cucumber 0.23 honours
 `--tags` bypasses the OS, capability and expectation resolution that decides
 whether a scenario may run at all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
-`only_lifecycle`). For serve-33 that bypass is a hazard only when the binary is
+`only_lifecycle`). For serve-40 that bypass is a hazard only when the binary is
 a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route. Note also that `-n` matches the scenario *name*
-(`serve-33 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
+(`serve-40 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
-- serve-33, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+- serve-40, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
   GPU memory blames this launch, names the knobs, and quotes the engine's own
   failing line. It carries `@requires-no-gpu` (the fabricated launch stands in
   for the GPU the mock lane does not have) and `@requires-os:linux`.
 
 ### The OOM fault-injection capability
 
-serve-33 needs a managed launch that really failed on VRAM, which a GPU-less CI
+serve-40 needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
@@ -2204,7 +2221,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-33 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-40 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -2214,7 +2231,7 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-33 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
+serve-40 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
 the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
@@ -2314,9 +2331,9 @@ value `sh` would assign or nothing: the driver plan
 ([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
-examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
-([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 
@@ -2510,15 +2527,34 @@ cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
-just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
-have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+just because no HIP SDK is installed — has no Linux end-to-end coverage.
+`check_13_hip_sdk_missing` returns early on every non-Windows host, so
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
 [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
-(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
-neighbours) and by the Windows manual check in
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
+`fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+and their neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
+On the Windows GPU lane (`e2e-gpu-strix-windows`), `diagnose-48` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) runs the
+gate on a real host, like `diagnose-41`: it names no host shape and holds
+`rocm diagnose --json` to `rocm examine --json` on the same machine.
+`fix-13-hip-sdk-missing` has to appear exactly when the inspection reports an
+AMD GPU and either a HIP-built llama.cpp with no usable system HIP SDK, or an
+ambient (not managed-runtime) HIP-built PyTorch: the latter scores a further
+25 whether or not the SDK is healthy, so it lists the entry (weakly, below the
+match threshold) even beside a working SDK. ROCMAI-837 considers that +25
+listing wrong, so whoever changes the bonus must update the scenario's oracle
+too. On that lane's Strix Halo hosts (Lemonade, no system SDK) it asserts the
+cause is absent, which is the host shape of ROCMAI-830. Run it only on
+Windows:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-48)'
+```
 
 ## Model Fit Preflight
 

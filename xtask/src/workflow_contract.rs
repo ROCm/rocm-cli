@@ -4213,6 +4213,8 @@ fi
         );
     }
 
+    /// The hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM
+    /// refusal scenarios serve-33/34/35 (no GPU, no network, no
     /// `release.yml` must build the shipped binaries with no feature flags, so a
     /// test-only feature cannot reach a release artefact.
     ///
@@ -4386,7 +4388,7 @@ fi
     /// the selection lives in `env:`), so dropping the env var — or narrowing
     /// its id list — fails here rather than silently reopening the coverage gap.
     #[test]
-    fn ci_windows_lifecycle_lane_also_selects_the_hermetic_comfyui_scenarios() {
+    fn ci_windows_lifecycle_lane_also_selects_the_hermetic_comfyui_and_vllm_refusal_scenarios() {
         let ci = read_workflow("ci.yml");
         let windows = job_block(&ci, "windows-release");
         let lines: Vec<&str> = windows.lines().collect();
@@ -4405,13 +4407,18 @@ fi
             also_run_ids.len(),
             1,
             "the Windows lifecycle lane must set env.E2E_ALSO_RUN_IDS exactly \
-             once to additionally select the hermetic comfyui scenarios, so \
+             once to additionally select the hermetic comfyui and vLLM-refusal scenarios, so \
              they get required-CI Windows coverage (#689):\n{step}"
         );
         for id in [
             "comfyui-uv-install-failure-names-log",
             "comfyui-uv-install-progress-streamed",
             "comfyui-ambiguous-runtime-actionable",
+            // The native-Windows vLLM refusal (serve-33/34/35) is
+            // `@requires-os:windows` and hermetic, so this is its required lane.
+            "serve-vllm-refused-on-native-windows",
+            "serve-vllm-install-refused-on-native-windows",
+            "serve-vllm-install-with-runtime-refused-on-native-windows",
         ] {
             assert!(
                 also_run_ids[0].contains(id),

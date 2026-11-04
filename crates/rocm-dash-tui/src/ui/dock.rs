@@ -114,14 +114,16 @@ pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .label_fg(theme.fg),
             Rect::new(inner.x, y + 1, inner.width, 1),
         );
+        // A zero total means VRAM size is unmeasured (e.g. a multi-adapter
+        // Windows host), not 0% used: show the same "—" the Home hero does.
         let vram = if g.vram_total_mb > 0 {
-            g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0
+            format::pct((g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0) as f32)
         } else {
-            0.0
+            "—".to_string()
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("VRAM {}", format::pct(vram as f32)),
+                format!("VRAM {vram}"),
                 Style::default().fg(theme.muted),
             ))),
             Rect::new(inner.x, y + 2, inner.width, 1),
@@ -555,5 +557,43 @@ mod tests {
         term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
         let out = flat(&term);
         assert!(out.contains("GPUs"), "gpu wall title missing: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_placeholder_for_unmeasured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        let out = flat(&term);
+        assert!(out.contains("VRAM —"), "placeholder missing: {out:?}");
+        assert!(!out.contains("VRAM 0.0%"), "fake zero shown: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_percentage_for_measured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 4_000,
+                vram_total_mb: 16_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        assert!(flat(&term).contains("VRAM 25.0%"));
     }
 }

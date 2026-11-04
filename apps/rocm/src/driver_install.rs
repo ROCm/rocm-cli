@@ -5,14 +5,15 @@
 //! `rocm install driver` command handlers and reconciliation.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
-//! `install()` dispatcher's call sites stay byte-identical
+//! `install()` dispatcher's call sites stayed byte-identical
 //! (`install_driver(...)`/`reconcile_driver_install(...)`, re-imported via
-//! `use crate::driver_install::{install_driver, reconcile_driver_install};`).
+//! `use crate::driver_install::{install_driver, reconcile_driver_install};`);
+//! `install()` has since moved to `install_cmd.rs`, which imports them itself.
 //! `InstallTarget`/`Cli` remain in the crate root; neither is referenced
 //! from this file. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
 //! private types (`DriverInstallPlan` and friends), so those moved here too
 //! rather than staying in `main.rs`. `DriverInstallResult`/`DriverInstallError`
-//! are the exception: they're `pub(crate)` and read from `main.rs`'s
+//! are the exception: they're `pub(crate)` and read from `install_cmd.rs`'s
 //! `install()` (`result.output`/`result.executed`, `error.source`/`error.executed`).
 
 use std::fmt::Write as _;
@@ -2251,7 +2252,7 @@ mod tests {
 
     /// On WSL, `build_driver_install_plan_read`'s `Unreadable` branch must
     /// not fire at all: WSL has its own guest-side os-release probe (see
-    /// `examine.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
+    /// `examine/wsl.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
     /// function receives is never authoritative for a WSL host, and the plan
     /// must stay the ordinary `wsl_rocdxg` one — not `unreadable_os_release` —
     /// regardless of what it says. Without the `reaches_os_release_parse`
