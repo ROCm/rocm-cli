@@ -13,6 +13,17 @@
 //! Exit codes are named in [`exit`] and published in the catalog manifest, so
 //! the number, its meaning, and what a reader is told it means all come from one
 //! place.
+//!
+//! This file is the module root. The exit codes, [`FixOptions`] and [`FixClass`]
+//! live in `fix/options.rs`, and the consent decision, the timeouts and the
+//! `fail!` helper in `fix/consent.rs`; the names are re-exported from here, so
+//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving.
+
+mod consent;
+mod options;
+
+use consent::{QUERY_TIMEOUT, RUN_TIMEOUT, confirm, current_os, fail, relay_output};
+pub use options::{FixClass, FixOptions, exit};
 
 use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
@@ -20,14 +31,12 @@ use crate::quoting::ps_single_quote_escape;
 use crate::rocm_install::{
     RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
 };
-use crate::{runtime_is_linux, runtime_is_windows};
+#[cfg(test)]
+use crate::runtime_is_linux;
+use crate::runtime_is_windows;
 use serde::{Deserialize, Serialize};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-const RUN_TIMEOUT: Duration = Duration::from_mins(1);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Shared verbatim by this recipe's own note and `diagnose.rs`'s
 /// `check_18_comgr_conflict` evidence, which states the same claim in its own
@@ -35,114 +44,6 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 /// claim is a second thing to keep correct, and the two had already drifted
 /// apart in wording before they shared this constant.
 pub(crate) const COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED: &str = "Neither option is recommended over the other: which is right depends on which stack you mean to keep, and removing the wrong one breaks a working environment.";
-
-/// The exit codes `apply` returns, named so the published manifest and the code
-/// that produces them cannot come to disagree.
-///
-/// These were written down only in the module comment above. A consumer reading
-/// the manifest is being told what a number means, so the number and its meaning
-/// have to come from one place -- a manifest that restated them by hand would be
-/// the same defect this whole contract exists to remove, one level up.
-pub mod exit {
-    /// Applied, previewed with `--dry-run`, printed, or listed. Nothing failed.
-    pub const OK: i32 = 0;
-    /// The CLI is inconsistent with itself -- a recipe it says it can carry out,
-    /// with nothing to carry it out with. Never a fault of the machine.
-    pub const INTERNAL: i32 = 1;
-    /// No such fix-id.
-    pub const UNKNOWN_ID: i32 = 2;
-    /// Real, but not for this machine: wrong platform, or a precondition the
-    /// host does not meet. Distinct from [`FAILED`], which means it was tried.
-    pub const NOT_APPLICABLE: i32 = 3;
-    /// Attempted, and a command it ran failed.
-    pub const FAILED: i32 = 4;
-    /// The user was asked and said no.
-    pub const DECLINED: i32 = 5;
-}
-
-/// Print a failure explanation to stderr, ignoring write failures (closed
-/// stderr, full disk) so an I/O error while explaining a failure can't itself
-/// panic the process.
-macro_rules! fail {
-    ($($arg:tt)*) => {{
-        let _ = writeln!(std::io::stderr(), $($arg)*);
-    }};
-}
-
-/// Relay a captured command's stdout/stderr, ignoring write failures for the
-/// same reason `fail!` does — relaying subprocess output can't itself panic
-/// the process if the pipe on the other end is closed.
-fn relay_output(out: &str, err: &str) {
-    let _ = write!(std::io::stdout(), "{out}");
-    let _ = write!(std::io::stderr(), "{err}");
-}
-
-/// Options controlling how a fix is applied.
-#[derive(Debug, Clone, Default)]
-pub struct FixOptions {
-    /// Skip the interactive confirmation (the user already approved the plan).
-    pub yes: bool,
-    /// Show the plan without changing anything.
-    pub dry_run: bool,
-    /// For `fix-9-igpu-dgpu`: the discrete GPU index to pin.
-    pub device_index: Option<i64>,
-}
-
-/// What `rocm fix <id>` will do with an entry — the answer to "will running
-/// this plainly change my machine?".
-///
-/// This was a `bool` (`auto_applicable`), and a bool could not say two things
-/// the catalog needed to say. `fix-2-unset-override` applies itself on Windows
-/// but only reports on Linux, where its runner takes no [`FixOptions`] and
-/// never mutates. `fix-9-igpu-dgpu` applies itself only once it is told which
-/// device to pin, and merely prints the identifying query otherwise. Both were
-/// marked auto-applicable, so both told a user — and an agent — that the CLI
-/// was about to act when it was not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FixClass {
-    /// `rocm fix <id>` carries it out (asking first, unless `--yes`).
-    Auto,
-    /// `rocm fix <id>` carries it out only once the argument named in
-    /// [`Platform::needs`] is supplied; without it, it reports what to pass and
-    /// changes nothing.
-    NeedsArgument,
-    /// `rocm fix <id>` leaves the machine alone. The fix is real; carrying it
-    /// out needs sudo, a reboot, a reinstall or a download.
-    ///
-    /// This says nothing about whether a runner runs. `fix-2-unset-override`
-    /// is print-only on Linux and still reads the live override and scans the
-    /// shell rc files to report where it is set — it just never writes.
-    #[default]
-    PrintOnly,
-    /// The problem can be detected and explained, but no reliable fix exists.
-    /// `rocm fix <id>` names it and applies nothing.
-    ///
-    /// Defaulting to [`FixClass::PrintOnly`] rather than this one is
-    /// deliberate: a missing class should understate what the CLI will do, and
-    /// "there is no fix" is a stronger claim than "here are the steps".
-    DiagnoseOnly,
-}
-
-impl FixClass {
-    /// Whether `rocm fix <id>`, invoked with no extra arguments, will change
-    /// the machine. This is the claim the old `auto_applicable` bool was making.
-    #[must_use]
-    pub const fn applies_itself(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-
-    /// The marker shown in the catalog listing and in `diagnose` output.
-    #[must_use]
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::Auto => "AUTO",
-            Self::NeedsArgument => "NEEDS-ARG",
-            Self::PrintOnly => "PRINT-ONLY",
-            Self::DiagnoseOnly => "DIAGNOSE-ONLY",
-        }
-    }
-}
 
 /// One operating system a recipe applies on, and what it does there.
 ///
@@ -1531,20 +1432,6 @@ pub fn needs_on(fix_id: &str, os: &str) -> Option<&'static str> {
         .and_then(|p| p.needs)
 }
 
-/// The platform family a recipe is selected by.
-///
-/// WSL is its own family, which is why recipes valid on both have to name `wsl`
-/// explicitly. Not `const fn`: unlike the OS, WSL has to be probed at runtime.
-fn current_os() -> &'static str {
-    if runtime_is_windows() {
-        "windows"
-    } else if runtime_is_linux() {
-        if crate::is_wsl_host() { "wsl" } else { "linux" }
-    } else {
-        "other"
-    }
-}
-
 /// Whether `value` is a `rocm diagnose` ranking position (`#2`, or a bare `2`)
 /// rather than a fix-id.
 ///
@@ -1948,39 +1835,6 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
 // ---------------------------------------------------------------------------
 // Consent / environment helpers
 // ---------------------------------------------------------------------------
-
-/// The half of the consent decision that needs no I/O: `Some(verdict)` when the
-/// answer is already determined, `None` when the user must actually be asked.
-///
-/// Split out from [`confirm`] so the two rules that matter — `--yes` approves,
-/// and a non-interactive shell *refuses* rather than silently proceeding — are
-/// testable without a controlled stdin. A test that drove `confirm` directly
-/// would block on `read_line` whenever the suite happened to run with a terminal
-/// attached.
-const fn consent_without_prompt(assume_yes: bool, stdin_is_terminal: bool) -> Option<bool> {
-    if assume_yes {
-        return Some(true);
-    }
-    if !stdin_is_terminal {
-        return Some(false);
-    }
-    None
-}
-
-fn confirm(prompt: &str, assume_yes: bool) -> bool {
-    if let Some(verdict) = consent_without_prompt(assume_yes, std::io::stdin().is_terminal()) {
-        if !verdict {
-            fail!("Non-interactive shell and --yes not passed; refusing to apply.");
-        }
-        return verdict;
-    }
-    let _ = crate::confirm::print_prompt(&mut std::io::stdout(), &format!("{prompt} [y/N]: "));
-    let confirmed = crate::confirm::read_answer(&mut std::io::stdin().lock()).unwrap_or(false);
-    if !confirmed {
-        fail!("Not confirmed; refusing to apply.");
-    }
-    confirmed
-}
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -3036,36 +2890,6 @@ mod tests {
                 .notes
                 .iter()
                 .any(|n| n.contains("only prints this plan"))
-        );
-    }
-
-    /// Restored, not new. This PR made the `wsl` arm of the platform lookup
-    /// carry more weight, not less -- it now drives the per-platform class, the
-    /// plan, the recipe printer and the listing -- so the guard tying that arm
-    /// to the real host detector matters more here than it did before.
-    #[test]
-    fn current_os_reports_wsl_exactly_when_is_wsl_host_does() {
-        // `current_os()`'s wsl branch is `crate::is_wsl_host()`, which is
-        // `crate::wsl_signals_indicate_wsl()` against the real `/dev/dxg` and
-        // `/proc/version` -- `$WSL_DISTRO_NAME` plays no part any more, so
-        // there is nothing left to force portably here. The table-driven
-        // coverage of the predicate itself lives with
-        // `wsl_signals_indicate_wsl` in lib.rs; this test only checks that
-        // `current_os()` reports the same answer `is_wsl_host()` does on
-        // whatever machine actually runs it, whether that is a bare-metal CI
-        // runner, Windows, or a real WSL host.
-        //
-        // In an `e2e-test-hooks` build both calls read through the simulated
-        // host root, which another test may be setting and clearing, so hold
-        // its lock to compare two answers about the same host. Without the
-        // feature the lock is uncontended and costs nothing.
-        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(
-            current_os() == "wsl",
-            crate::is_wsl_host(),
-            "current_os() must agree with is_wsl_host()"
         );
     }
 
@@ -4301,24 +4125,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn yes_flag_approves_without_prompting() {
-        assert_eq!(consent_without_prompt(true, false), Some(true));
-        assert_eq!(consent_without_prompt(true, true), Some(true));
-    }
-
-    #[test]
-    fn non_interactive_shell_refuses_instead_of_proceeding() {
-        // The rule the skill relies on: without --yes and with nothing to prompt,
-        // the answer is a definite NO, never an implicit yes.
-        assert_eq!(consent_without_prompt(false, false), Some(false));
-    }
-
-    #[test]
-    fn interactive_shell_without_yes_must_actually_ask() {
-        assert_eq!(consent_without_prompt(false, true), None);
-    }
-
     /// `auto_applicable` means "the CLI has a runner", not "the runner mutates".
     ///
     /// fix-2's Linux arm only reports where the override is persisted; it never
@@ -5336,7 +5142,18 @@ mod tests {
     /// matched.
     #[test]
     fn fix_runners_return_named_exit_constants_not_integers() {
-        let scan = scan_exit_code_literals(include_str!("fix.rs"));
+        let mut scan = scan_exit_code_literals(include_str!("fix.rs"));
+        // The runners' module root and its children are one body of code: scan
+        // every file, so splitting a runner out of `fix.rs` cannot take it out
+        // of the net.
+        for source in [
+            include_str!("fix/options.rs"),
+            include_str!("fix/consent.rs"),
+        ] {
+            let more = scan_exit_code_literals(source);
+            scan.checked.extend(more.checked);
+            scan.bare.extend(more.bare);
+        }
         // A reorder or a rename must not leave the scan looking at fewer
         // runners than it should without anyone noticing.
         for runner in [

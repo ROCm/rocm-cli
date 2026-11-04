@@ -259,7 +259,7 @@ fn catalog_markers_use_the_cli_vocabulary() {
         "skills/rocm-doctor/reference.md marks these fixes with words `rocm fix` never prints: \
          {bad:?}.\n\
          A marker cell must be one of {MARKER_WORDS:?}, matching `FixClass::marker` in \
-         crates/rocm-core/src/fix.rs (lower-cased). {} of those are `yes`/`no`, the vocabulary \
+         crates/rocm-core/src/fix/options.rs (lower-cased). {} of those are `yes`/`no`, the vocabulary \
          the class rewrite retired -- replace with the CLI's own marker word.",
         bad.iter()
             .filter(|(_, word)| retired.contains(word.as_str()))
