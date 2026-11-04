@@ -2670,7 +2670,8 @@ On a machine whose runtime is older than 14.40, `diagnose` reports
 and runs nothing: the update needs the Windows administrator prompt. After the
 update, the plan's verify command prints the new version.
 
-The version comparison is covered by unit tests in `diagnose.rs`, and the
+The version comparison is covered by unit tests in
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs), and the
 symptom keywords by `outdated_runtime_symptom_keywords_score_honestly` in
 [scoring.rs](../crates/rocm-core/src/diagnose/scoring.rs). No end-to-end scenario drives this check, because the e2e suite
 cannot give a Linux host a Windows runtime: the check is gated to Windows. The
@@ -2721,7 +2722,7 @@ just because no HIP SDK is installed — has no Linux end-to-end coverage.
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs)
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
 `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
 and their neighbours) and by the Windows manual check in

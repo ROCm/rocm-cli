@@ -739,7 +739,7 @@ Feature: Diagnosing failures and listing fixes
   # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
   # an ambient HIP framework needs the SDK is held by the unit test
   # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
-  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # in crates/rocm-core/src/diagnose/windows.rs. The oracle also counts a weak listing
   # (below the match threshold) as present, which is what production does for
   # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
   # bonus wrong, so whoever changes it must update this scenario's oracle too.
