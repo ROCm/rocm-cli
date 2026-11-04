@@ -20,6 +20,7 @@ pub mod confirm;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
+mod download;
 pub mod endpoint_key;
 mod endpoint_readiness;
 pub mod examine;
@@ -96,6 +97,11 @@ pub use disk_space::{
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
+pub use download::{
+    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
+    download_file_streaming_with_progress, download_file_to_path,
+    download_file_to_path_with_progress,
+};
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
@@ -153,12 +159,10 @@ pub use model_catalog::{
     resolve_model_recipe_artifact, verify_model_recipe_index_signature,
 };
 pub use net::{
-    Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
-    DownloadRequest, HttpResponseParts, connect_tcp_stream, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
-    download_file_to_path_with_progress, format_host_for_url, format_host_port,
-    format_http_base_url, http_get_text, http_get_text_with_auth, http_post_json_with_auth,
-    parse_http_endpoint, read_http_response_bounded, write_all_tcp_stream,
+    DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
+    format_host_for_url, format_host_port, format_http_base_url, http_get_text,
+    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
+    read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{
