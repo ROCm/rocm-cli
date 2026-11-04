@@ -2723,10 +2723,13 @@ Those probes degrade to service-state-only GPU selection rather than failing,
 so there is no user-visible *output* for a scenario to assert on; what they do
 with a missing count is covered by `gpu_policy.rs`'s unit tests. The decline
 itself is no longer discarded — `gpu_policy.rs`'s `amd_smi_probe_json` logs it
-at `debug` with the full error chain, which is what makes "why did `--gpu auto`
-not rank my GPUs?" answerable from `RUST_LOG=debug` or the CLI log file. It is
-`debug` and not `warn` because on a GPU-less host it fires on every `serve`,
-where it is the expected answer and not a fault.
+at `info` with the full error chain, which is what makes "why did `--gpu auto`
+not rank my GPUs?" answerable without re-running. It is not `warn`, because on
+a GPU-less host it fires on every `serve`, where it is the expected answer and
+not a fault; and not `debug`, because the default filter is `warn,rocm=info`,
+so a `debug` line is invisible unless the user already suspected this — the
+wrong way round for the case that needs it, where the 2s open bound trips on a
+slow but healthy host and the decline is indistinguishable from "no GPU".
 
 ### Keeping new launch sites inside the gate
 

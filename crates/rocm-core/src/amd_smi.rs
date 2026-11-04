@@ -233,8 +233,12 @@ fn preflight_kfd_device() -> PathBuf {
 #[cfg(target_os = "linux")]
 fn kfd_readable(device: &Path) -> bool {
     kfd_readable_with(
-        // `&&` short-circuits: `has_usable_amd_gpu` runs on WSL only.
-        wsl_wave_through(is_wsl_host(), has_usable_amd_gpu()),
+        // Second argument is a closure, not a value: extracting this condition
+        // into a named function turned a short-circuit into two eager
+        // evaluations, so `has_usable_amd_gpu` was running on every Linux
+        // launch rather than on WSL only. Passing the probe unevaluated keeps
+        // the original behaviour and still lets the condition be tested.
+        wsl_wave_through(is_wsl_host(), has_usable_amd_gpu),
         device,
         &host_path(device),
     )
@@ -246,14 +250,17 @@ fn kfd_readable(device: &Path) -> bool {
 /// [`kfd_readable_with`] with literal booleans, which says nothing about how
 /// the caller computes that argument — `&&` could become `||`, or
 /// `has_usable_amd_gpu()` could be dropped entirely, and every one of them
-/// would stay green on a GPU-less lane. Both conjuncts are load-bearing in
+/// would stay green on a GPU-less lane. The GPU probe is taken unevaluated so
+/// the short-circuit survives the extraction: on bare metal `is_wsl` is false
+/// and `has_usable_amd_gpu` must not run at all. Both conjuncts are
+/// load-bearing in
 /// opposite directions: without `is_wsl_host` a bare-metal host with a GPU
 /// would skip the device check the gate exists for, and without
 /// `has_usable_amd_gpu` an unready WSL host would be waved through to an
 /// `amd-smi` that cannot work.
 #[cfg(target_os = "linux")]
-const fn wsl_wave_through(is_wsl: bool, has_usable_gpu: bool) -> bool {
-    is_wsl && has_usable_gpu
+fn wsl_wave_through(is_wsl: bool, has_usable_gpu: impl FnOnce() -> bool) -> bool {
+    is_wsl && has_usable_gpu()
 }
 
 /// [`kfd_readable`] with its two non-syscall inputs injected, so the
@@ -733,18 +740,21 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_wsl_wave_through_needs_both_a_wsl_host_and_a_reachable_gpu() {
-        assert!(wsl_wave_through(true, true), "ready WSL host waves through");
         assert!(
-            !wsl_wave_through(true, false),
+            wsl_wave_through(true, || true),
+            "ready WSL host waves through"
+        );
+        assert!(
+            !wsl_wave_through(true, || false),
             "a WSL host with no reachable GPU must not wave through: amd-smi \
              cannot work there, and `||` would allow it"
         );
         assert!(
-            !wsl_wave_through(false, true),
+            !wsl_wave_through(false, || true),
             "bare metal must reach the device check even with a usable GPU, or \
              the gate this whole module exists for is skipped"
         );
-        assert!(!wsl_wave_through(false, false));
+        assert!(!wsl_wave_through(false, || false));
     }
 
     /// The simulated-root routing, which `kfd_readable` applies to the real
