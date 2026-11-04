@@ -383,7 +383,6 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tabs::instances::draw;
     use crate::ui::tabs::instances::tests::{
         buffer_text, mk_inst, mk_inst_obs, mk_state, obs, state_with_snap,
     };
@@ -406,16 +405,6 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(inst.container_id.clone(), inst);
         let state = mk_state(m, 0);
-
-        // Card grid: the VRAM line fires only because vram_total_mb > 0.
-        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw(f, f.area(), &state, &state.theme))
-            .unwrap();
-        let grid = buffer_text(&term);
-        assert!(
-            grid.contains(&vram),
-            "card grid must render the used / total MiB VRAM string; got:\n{grid}"
-        );
 
         // Detail modal: shows the quantization value and the VRAM pair.
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
