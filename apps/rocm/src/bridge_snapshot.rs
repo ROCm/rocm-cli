@@ -7,8 +7,9 @@
 //! from the examination, config, automation state and managed services,
 //! `build_codex_bridge_gpu_snapshot` builds its GPU part, and
 //! `builtin_codex_bridge_engine_inventory` its engine list, which it derives
-//! from `builtin_engine_inventory`, the table of built-in engine ids and
-//! summaries.
+//! from `main.rs`'s `engine_inventory`, the single table of built-in engine
+//! ids and summaries that `rocm examine`, `rocm update` and the `main.rs`
+//! test checking `--engine`'s help read too.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `dispatch()`'s `InternalBridgeSnapshot` arm calls
@@ -17,10 +18,7 @@
 //! `engines`) reach `build_codex_bridge_snapshot`,
 //! `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
 //! as `crate::<name>` through the same re-import, so those three are
-//! `pub(crate)`. `builtin_engine_inventory` is `pub(crate)` too, because a
-//! `main.rs` test checks `--engine`'s help against it. It is a separate table
-//! from `main.rs`'s `engine_inventory`, which stays where it is; the two are
-//! not merged.
+//! `pub(crate)`.
 
 use anyhow::Result;
 use rocm_core::{
@@ -29,6 +27,7 @@ use rocm_core::{
     default_engine_for_platform, load_recent_automation_events,
 };
 
+use crate::engine_inventory;
 use crate::managed_service_status::load_managed_services;
 
 pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -69,7 +68,7 @@ pub(crate) fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> 
     let binary_path = daemon_binary_path()
         .ok()
         .map(|path| path.display().to_string());
-    builtin_engine_inventory()
+    engine_inventory()
         .iter()
         .map(|(id, summary)| CodexBridgeEngine {
             id: (*id).to_owned(),
@@ -79,21 +78,4 @@ pub(crate) fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> 
             binary_path: binary_path.clone(),
         })
         .collect()
-}
-
-pub(crate) const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
-    &[
-        (
-            "lemonade",
-            "default embedded Lemonade server with ROCm llama.cpp backend",
-        ),
-        (
-            "vllm",
-            "Linux/WSL ROCm GPU serving engine through external vLLM",
-        ),
-        (
-            "aim",
-            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
-        ),
-    ]
 }
