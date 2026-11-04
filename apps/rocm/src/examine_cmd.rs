@@ -93,7 +93,7 @@ pub(crate) fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Resul
         // `detected_gfx_target`; WSL skips the probes that would set
         // `has_amd_gpu`, so take it from here rather than leave the two forms
         // to disagree on a healthy host.
-        examination.adopt_wsl_host_gpu(host.detected_gfx_target.as_deref());
+        examination.adopt_wsl_host_gpu(host.detected_gfx_target.is_some());
         let configured_default_engine = config.default_engine.as_deref();
         // Same resolution the human report uses, minus the recovery write above:
         // an unreadable registry leaves the root `null` rather than failing the

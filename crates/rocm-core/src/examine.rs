@@ -219,7 +219,14 @@ pub struct Examination {
     /// field. WSL skips those probes, so [`Examination::probe_with_interpreter`]
     /// leaves it `false` there; `rocm examine --json` then sets it with
     /// [`Examination::adopt_wsl_host_gpu`] from the Windows-side detection the
-    /// human report also reads. `gpus` stays empty on WSL either way.
+    /// human report also reads. `gpus`, `has_apu` and `has_discrete_amd` stay
+    /// at their probe values (empty, `false`, `false`) on WSL either way, so
+    /// `has_amd_gpu: true` beside both `false` is the normal WSL shape: the
+    /// Windows side reports a gfx target, not a PCI listing to tell an APU
+    /// from a discrete part. Other readers do not depend on them on WSL: the
+    /// failure catalog scopes the checks that read them to `linux` and
+    /// `windows`, and the WSL checks and the model-fit probe-result check use
+    /// `wsl.rocm_sees_gpu`.
     pub has_amd_gpu: bool,
     pub has_nvidia_gpu: bool,
     pub has_apu: bool,
@@ -567,8 +574,11 @@ impl Examination {
         e
     }
 
-    /// Set `has_amd_gpu` on a WSL host from the GPU target the Windows side
-    /// detected, the value the human report's "AMD GPU detected" line reads.
+    /// Set `has_amd_gpu` on a WSL host from whether the Windows side detected a
+    /// GPU target, the value the human report's "AMD GPU detected" line reads.
+    /// It sets that one field only: `has_apu` and `has_discrete_amd` stay at
+    /// their probe values, because a target string does not say which kind of
+    /// part it is.
     ///
     /// WSL reaches the GPU through the Windows host driver, so the DRM/KFD probes
     /// that fill `has_amd_gpu` are skipped and the field would read `false` on a
@@ -578,9 +588,9 @@ impl Examination {
     /// nothing off WSL, where the probes own the field, and leaves `gpus` empty
     /// (there is no PCI listing to build entries from) and `status` alone
     /// (`compute_status` answers `wsl` before it asks about a GPU).
-    pub const fn adopt_wsl_host_gpu(&mut self, detected_gfx_target: Option<&str>) {
+    pub const fn adopt_wsl_host_gpu(&mut self, host_has_amd_gpu: bool) {
         if self.is_wsl {
-            self.has_amd_gpu = detected_gfx_target.is_some();
+            self.has_amd_gpu = host_has_amd_gpu;
         }
     }
 
@@ -830,11 +840,15 @@ mod tests {
         };
         assert!(!e.has_amd_gpu, "the probe itself reports no GPU on WSL");
 
-        e.adopt_wsl_host_gpu(Some("gfx1151"));
+        e.adopt_wsl_host_gpu(true);
         assert!(e.has_amd_gpu, "a detected gfx target means a GPU is there");
         assert!(
             e.gpus.is_empty(),
             "there is no PCI listing on WSL to build gpu entries from"
+        );
+        assert!(
+            !e.has_apu && !e.has_discrete_amd,
+            "a target string does not say which kind of part it is"
         );
         assert_eq!(
             e.compute_status(),
@@ -842,7 +856,7 @@ mod tests {
             "status answers wsl before it asks about a GPU"
         );
 
-        e.adopt_wsl_host_gpu(None);
+        e.adopt_wsl_host_gpu(false);
         assert!(!e.has_amd_gpu, "no detected target, no GPU: it can go back");
     }
 
@@ -855,11 +869,11 @@ mod tests {
             has_amd_gpu: false,
             ..Examination::default()
         };
-        bare_metal.adopt_wsl_host_gpu(Some("gfx1151"));
+        bare_metal.adopt_wsl_host_gpu(true);
         assert!(!bare_metal.has_amd_gpu);
 
         bare_metal.has_amd_gpu = true;
-        bare_metal.adopt_wsl_host_gpu(None);
+        bare_metal.adopt_wsl_host_gpu(false);
         assert!(bare_metal.has_amd_gpu);
     }
 
