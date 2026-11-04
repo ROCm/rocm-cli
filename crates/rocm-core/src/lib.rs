@@ -28,6 +28,7 @@ pub mod fix;
 mod gfx_target;
 pub mod hardware_root;
 pub mod host_gpu;
+mod jsonl_store;
 pub mod log_tail;
 pub mod managed_runtime;
 pub mod model_catalog;
@@ -65,7 +66,7 @@ pub use automation::{
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
     REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot, append_audit_event,
     append_automation_event, append_automation_proposal, find_automation_proposal,
-    generate_proposal_id, jsonl_lock_path, load_automation_proposals, load_recent_audit_events,
+    generate_proposal_id, load_automation_proposals, load_recent_audit_events,
     load_recent_automation_events, load_recent_automation_proposals,
     update_automation_proposal_status,
 };
@@ -128,6 +129,7 @@ use host_gpu::{
     detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
+pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::tail_lines;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
@@ -333,7 +335,7 @@ pub fn unix_time_millis() -> u128 {
 /// - Serializing writers: this takes no lock, so two read-modify-write
 ///   cycles that overlap still lose one update (last rename wins). A caller
 ///   whose new content depends on the old must hold a lock across the whole
-///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
+///   cycle, as the JSONL proposal store does (`jsonl_store::jsonl_lock_path`).
 ///   Two callers in the *same process* within the same millisecond are a
 ///   sharper case of this, not just a milder one: they generate the exact
 ///   same temp path below, so concurrent `fs::write`s truncating that one

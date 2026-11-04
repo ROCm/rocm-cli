@@ -1619,25 +1619,29 @@ Automation history stores (events, audit, proposals):
 
 ```bash
 cargo test -p rocm-core automation::tests
+cargo test -p rocm-core jsonl_store::tests
 ```
 
 These cover the three JSONL stores in
-[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+[automation.rs](../crates/rocm-core/src/automation.rs) and the generic JSONL
+store engine under them in
+[jsonl_store.rs](../crates/rocm-core/src/jsonl_store.rs): concurrent writers
 across threads and processes losing no records, size-based rotation of the
 event and audit logs under the same lock (no record lost or duplicated while
 writers rotate, recent reads spanning the rollover, a failed rotation still
 keeping the record and printing its one-shot warning to stderr, lock-free
 readers never reading a file twice or skipping a generation), and proposal
 compaction keeping every pending proposal, the
-newest reviewed ones, and legacy proposal ids. Most of those drive
+newest reviewed ones, and legacy proposal ids. The rotation tests in
+`jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests go through the public
+rotation policy; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
 itself stays covered. The repair of a torn tail, which normally replaces the
 store and falls back to cutting the debris in place when that replacement
-fails, has its own tests there: each step injected to fail, the error naming
+fails, has its own tests in `jsonl_store::tests`: each step injected to fail, the error naming
 both causes when both fail, and a real fault on each platform (a directory
 that takes no new files on Unix, a handle without delete sharing on Windows).
 The user-visible side is `automations-07` through `automations-09`, plus
