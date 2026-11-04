@@ -312,7 +312,7 @@ sentence fails the scenario. `skill_reference.rs` reads the print-only count.
 
 Two rules follow:
 
-- The catalog is authoritative in `crates/rocm-core/src/fix/catalog.rs`. When one of
+- The catalog is authoritative in [fix/catalog.rs](../../crates/rocm-core/src/fix/catalog.rs). When one of
   these scenarios fails, the CLI is right and the docs are what change.
 - A skill-only edit must still run this job, so `skills/**` is in the `heavy`
   paths filter that gates the `e2e` job.
