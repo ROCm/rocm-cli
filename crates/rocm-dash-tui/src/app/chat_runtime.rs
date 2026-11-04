@@ -35,7 +35,7 @@ pub(super) struct ChatRuntime {
     /// after a switch to a remote provider. Without this, switching to OpenAI
     /// and back to local would leave `agent` pointing at the OpenAI backend
     /// (silent wrong-backend bug) — `build_chat_agent(Local)` returns `None` by
-    /// design (Local is the inline-built backend), so the caller must restore the
+    /// design (Local is the backend built at startup), so the caller must restore the
     /// saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
     local_agent: Option<SharedAgent>,
 }
@@ -103,11 +103,6 @@ impl ChatRuntime {
             // over the ChatGPT cloud default at startup instead of only the single
             // well-known :8000 port that a bare `resolve_llm_config` probe covers.
             //
-            // NOTE: unmerged PR #97 also touches this branch (model discovery when
-            // `chat_model` is None, inside `resolve_llm_config`'s own fallback
-            // path) — this change is conflict-minimal by leaving the
-            // `resolve_llm_config` call below untouched.
-            //
             // Gate on `chat_api_key.is_none()` too: local detection returns a
             // keyless `detected_llm_config` (api_key/auth_header forced to None),
             // so firing it when the user configured a key would SILENTLY DROP that
@@ -157,10 +152,9 @@ impl ChatRuntime {
                     probe_ok,
                 )
             });
-            // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
-            // with no explicit model resolves to the `local-model` placeholder,
-            // which 404s on servers that register the model under its real id. Only
-            // the `Configured` outcome needs this — the `Local` outcome already
+            // A *configured* URL (CLI/env) with no explicit model resolves to the
+            // `local-model` placeholder, which 404s on servers that register the
+            // model under its real id. Only the `Configured` outcome needs this — the `Local` outcome already
             // carries a `/v1/models`-discovered model from `detect_local_chat`, and
             // `OAuth` has no config. Discovery is gated inside the helper on
             // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
@@ -216,8 +210,8 @@ impl ChatRuntime {
     }
 
     /// Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
-    /// newly-selected backend. `Local` reuses whatever the inline launch path
-    /// built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
+    /// newly-selected backend. `Local` restores the backend `start` saved
+    /// (it owns the auto-detect probe). `Openai`/`Anthropic` are built
     /// from `ResolvedArgs` keys (in-process seam, never argv). A build failure
     /// (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
     /// error turn. Construction only — no network until the next submit.
@@ -230,8 +224,8 @@ impl ChatRuntime {
         if let Some(ProviderSwitch { previous, target }) = state.provider_switch.take() {
             match target {
                 ChatProvider::Local => {
-                    // Restore the auto-detected local backend saved before the
-                    // event loop. `build_chat_agent(Local)` returns None by
+                    // Restore the auto-detected local backend saved in
+                    // `ChatRuntime::start`. `build_chat_agent(Local)` returns None by
                     // design, so the restore must happen here — otherwise a prior
                     // `/provider openai` would leave requests routed to OpenAI.
                     self.agent = self.local_agent.clone();
