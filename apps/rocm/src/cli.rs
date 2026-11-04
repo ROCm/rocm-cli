@@ -1985,6 +1985,8 @@ mod tests {
             }
             other => panic!("expected diagnose, got {other:?}"),
         }
+        // The smallest size accepted, beside the 0 refused below.
+        assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", "1"]).is_ok());
         for bad in [
             &["--context-size", "0"][..],
             &["--context-size", "-1"][..],

@@ -14,22 +14,51 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// The smallest GGUF header the parser accepts: version 3, no tensors, one
-/// metadata entry naming the architecture. Enough to drive every request.
+/// A small but complete GGUF header: the shape keys an estimate reads and one
+/// tensor record, so the read ends in a sized estimate. 2 layers of 4 KV heads,
+/// key and value width 64 each: 1024 cache elements, 2048 bytes at f16, per
+/// token of context.
 fn gguf_header() -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn uint(out: &mut Vec<u8>, key: &str, value: u32) {
+        string(out, key);
+        out.extend_from_slice(&4_u32.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut metadata = Vec::new();
+    string(&mut metadata, "general.architecture");
+    metadata.extend_from_slice(&8_u32.to_le_bytes());
+    string(&mut metadata, "llama");
+    for (key, value) in [
+        ("llama.block_count", 2),
+        ("llama.embedding_length", 256),
+        ("llama.feed_forward_length", 512),
+        ("llama.attention.head_count", 4),
+        ("llama.attention.head_count_kv", 4),
+        ("llama.attention.key_length", 64),
+        ("llama.attention.value_length", 64),
+    ] {
+        uint(&mut metadata, key, value);
+    }
     let mut bytes = b"GGUF".to_vec();
     bytes.extend_from_slice(&3_u32.to_le_bytes());
-    bytes.extend_from_slice(&0_u64.to_le_bytes());
-    bytes.extend_from_slice(&1_u64.to_le_bytes());
-    let key = b"general.architecture";
-    bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(key);
-    bytes.extend_from_slice(&8_u32.to_le_bytes());
-    let value = b"llama";
-    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(value);
+    bytes.extend_from_slice(&1_u64.to_le_bytes()); // tensors
+    bytes.extend_from_slice(&8_u64.to_le_bytes()); // metadata entries
+    bytes.extend(metadata);
+    string(&mut bytes, "blk.0.attn_q.weight");
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&256_u64.to_le_bytes());
+    bytes.extend_from_slice(&256_u64.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes()); // f32
+    bytes.extend_from_slice(&0_u64.to_le_bytes()); // offset
     bytes
 }
+
+/// The KV cache the header above implies at the default 4096 tokens, f16.
+const EXPECTED_KV_CACHE_BYTES: u64 = 2 * 4 * (64 + 64) * 2 * 4096;
 
 /// What the file is said to weigh: larger than the header, so the reader asks
 /// for a range and never the whole file.
@@ -159,5 +188,33 @@ fn a_hub_header_read_sends_no_token_even_when_one_is_set() {
             "a credential went to the hub:\n{request}"
         );
         assert!(!request.contains("hf_secret_token"), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nuser-agent: rocm-cli"),
+            "{request}"
+        );
     }
+
+    // And the read is the estimate's: the answer is sized from that header.
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("{error}\nstdout: {stdout}\nstderr: {stderr}"));
+    let estimate = &report["model"]["estimate"];
+    assert_eq!(
+        estimate["source"].as_str(),
+        Some("o/r: m-Q4_K_M.gguf"),
+        "{report:#}"
+    );
+    assert_eq!(
+        estimate["architecture"].as_str(),
+        Some("llama"),
+        "{report:#}"
+    );
+    assert_eq!(estimate["layers"].as_u64(), Some(2), "{report:#}");
+    assert_eq!(
+        estimate["kv_cache_bytes"].as_u64(),
+        Some(EXPECTED_KV_CACHE_BYTES),
+        "{report:#}"
+    );
+    assert!(estimate["total_bytes"].as_u64().is_some(), "{report:#}");
 }

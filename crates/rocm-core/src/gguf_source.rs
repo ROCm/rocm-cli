@@ -495,7 +495,9 @@ impl LiveGgufSource {
     }
 
     fn agent() -> ureq::Agent {
+        // The same User-Agent the CLI's other downloads send.
         ureq::AgentBuilder::new()
+            .user_agent("rocm-cli")
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -556,19 +558,13 @@ impl LiveGgufSource {
 
 /// Whether a file name from a repository listing may be requested and shown: no
 /// empty, `.` or `..` path segment, and no character that changes how a terminal
-/// shows the text around it (a control character, a bidirectional override or
-/// isolate, or a zero-width character).
+/// shows the text around it: the predicates in `terminal` decide which, so this
+/// and the other untrusted text the CLI prints are held to one set.
 fn is_safe_listed_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|c| {
-            // Code points, not char literals: the ASCII output contract
-            // (`xtask/src/ascii_output_contract.rs`) rejects a `\u{..}` escape
-            // for a non-ASCII character in a literal.
-            c.is_control()
-                || matches!(
-                    u32::from(c),
-                    0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF
-                )
+            crate::terminal::is_control_or_format(c)
+                || crate::terminal::is_control_or_line_separator(c)
         })
         && name
             .split('/')
@@ -954,6 +950,14 @@ mod tests {
             "m-Q4_K_M\u{202A}.gguf",
             "m-Q4_K_M\u{2069}.gguf",
             "m-Q4_K_M\u{FEFF}.gguf",
+            // What the shared terminal predicates add: line and paragraph
+            // separators, invisible operators, the soft hyphen, tag characters.
+            "m-Q4_K_M\u{2028}.gguf",
+            "m-Q4_K_M\u{2029}.gguf",
+            "m-Q4_K_M\u{2060}.gguf",
+            "m-Q4_K_M\u{2064}.gguf",
+            "m-Q4\u{00AD}_K_M.gguf",
+            "m-Q4_K_M\u{E0041}.gguf",
         ] {
             assert!(!is_safe_listed_name(name), "{name:?}");
         }

@@ -865,10 +865,11 @@ fn apply_context_estimate(
     if estimate.total_gib.is_some() {
         // The header was read and sized, so the "serve it directly and read the
         // engine's refusal" plan answered a question that no longer applies --
-        // whether or not this host could be compared against. It stays when the
-        // header could not be read (nothing was learnt, so it is still the honest
-        // next step), except where the branches below replace it: a local path,
-        // and a hub name refused as a projector.
+        // whether or not this host could be compared against. A header that could
+        // not be read gets a plan of its own below (check the path, or the name
+        // and the network), as does a hub name refused as a projector; one that
+        // was read but could not be sized keeps the "serve it" plan, pointed at a
+        // command that accepts the reference.
         // The host gaps with a next step get the plan a curated model gets:
         // memory that could not be read is looked into with `amd-smi`, and no
         // visible GPU with `rocm diagnose`. An APU's unreadable pool has no
@@ -892,9 +893,41 @@ fn apply_context_estimate(
         // A path that could not be read is a path to check. "Serve it directly and
         // read the engine's refusal" is advice for a model nobody has looked at,
         // and `rocm serve <path>` on a file that is not there only repeats this.
+        // A URL is read as a path, and the "could not open" it gets does not say
+        // why; the form that is read is `owner/repo:QUANT`.
+        let lower = readiness.model_ref.to_ascii_lowercase();
+        let notes = if lower.starts_with("http://") || lower.starts_with("https://") {
+            vec![
+                "a URL is not read: name a Hugging Face file as `owner/repo:QUANT` (or \
+                 `owner/repo:file.gguf`), or download it and pass the local path"
+                    .to_owned(),
+            ]
+        } else {
+            Vec::new()
+        };
         readiness.fix = Some(Fix {
             summary: "check the path, and that the file is a GGUF model, then ask again".to_owned(),
             verify: ask_again(&readiness.model_ref),
+            notes,
+            ..Fix::default()
+        });
+    } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::HeaderUnreadable)
+        && matches!(reference, GgufRef::Hub { .. })
+    {
+        // The header could not be fetched: a name that does not exist, a gated
+        // or private repository, or no network. Serving it would start a
+        // download of the whole file to learn the same thing, so the plan is to
+        // check and ask again.
+        readiness.fix = Some(Fix {
+            summary: "check the repository name and quantization, and that this machine can \
+                      reach Hugging Face, then ask again"
+                .to_owned(),
+            verify: ask_again(&readiness.model_ref),
+            notes: vec![
+                "a gated or private repository cannot be read, because no token is sent: \
+                 download the file yourself and ask about its local path"
+                    .to_owned(),
+            ],
             ..Fix::default()
         });
     } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::NotAModel) {
@@ -926,10 +959,13 @@ fn rediagnose(model_ref: &str, request: &ContextRequest) -> String {
 /// as another flag.
 fn rediagnose_for(model_ref: &str, request: &ContextRequest, windows: bool) -> String {
     use std::fmt::Write as _;
+    // `~` is plain after the first character, where neither shell expands it;
+    // Windows short names (`ADMINI~1`) carry one in the middle of a path.
     let plain = !model_ref.is_empty()
+        && !model_ref.starts_with('~')
         && model_ref.chars().all(|c| {
             c.is_ascii_alphanumeric()
-                || matches!(c, '/' | ':' | '.' | '_' | '-' | '=')
+                || matches!(c, '/' | ':' | '.' | '_' | '-' | '=' | '~')
                 || (windows && c == '\\')
         });
     let quoted = if plain {
@@ -2142,6 +2178,16 @@ mod tests {
             rediagnose_for(r"C:\my models\it's.gguf", &plain, true),
             r"rocm diagnose --model 'C:\my models\it''s.gguf'"
         );
+        // A Windows short name keeps a path plain on either shell; a leading
+        // `~` is quoted, since a shell would expand it.
+        assert_eq!(
+            rediagnose_for(r"C:\Users\ADMINI~1\Temp\m.gguf", &plain, true),
+            r"rocm diagnose --model C:\Users\ADMINI~1\Temp\m.gguf"
+        );
+        assert_eq!(
+            rediagnose_for("~/m.gguf", &plain, false),
+            "rocm diagnose --model '~/m.gguf'"
+        );
         // A backslash is not plain to a POSIX shell.
         assert_eq!(
             rediagnose_for(r"a\b.gguf", &plain, false),
@@ -2212,10 +2258,55 @@ mod tests {
         );
     }
 
+    /// A hub header that could not be fetched is not answered with `rocm serve`,
+    /// which would download the whole file to fail the same way: the plan is to
+    /// check the name and the network, and ask again.
+    #[test]
+    fn an_unreadable_hub_header_is_not_answered_with_a_download() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        let fix = readiness.fix.as_ref().expect("a plan");
+        assert!(fix.summary.contains("reach Hugging Face"), "{fix:?}");
+        assert_eq!(
+            fix.verify,
+            "rocm diagnose --model some-lab/never-curated-7b:Q4_K_M --context-size 8192"
+        );
+        assert!(
+            fix.notes.iter().any(|note| note.contains("local path")),
+            "{fix:?}"
+        );
+        assert!(!render_model_readiness_text(&readiness).contains("rocm serve some-lab"));
+    }
+
+    /// A pasted URL is read as a path and cannot be opened; the plan says which
+    /// form is read instead.
+    #[test]
+    fn a_url_is_told_which_form_is_read() {
+        let mut readiness = not_curated("https://huggingface.co/o/r/resolve/main/m.gguf");
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        let fix = readiness.fix.as_ref().expect("a plan");
+        assert!(
+            fix.notes
+                .iter()
+                .any(|note| note.contains("`owner/repo:QUANT`")),
+            "{fix:?}"
+        );
+    }
+
     #[test]
     fn a_gguf_that_cannot_be_read_is_not_sent_to_the_upstream_tracker() {
-        // A typo'd path: the tracker cannot help with it. The plan to serve the
-        // model directly stays, because nothing was learnt about the model.
+        // A typo'd path: the tracker cannot help with it, and the plan is to
+        // check the path.
         let mut readiness = not_curated("models/nosuch.gguf");
         assert!(
             readiness.route.is_some(),
@@ -2243,25 +2334,6 @@ mod tests {
         assert!(
             !text.contains("serve this model directly") && !text.contains("rocm serve"),
             "{text}"
-        );
-    }
-
-    #[test]
-    fn a_hub_file_that_cannot_be_read_keeps_the_serve_it_directly_plan() {
-        // Nothing was learnt about the model, and `rocm serve owner/repo:QUANT` is
-        // a real way to find out.
-        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
-        attach_context_estimate(
-            &mut readiness,
-            &ContextRequest::default(),
-            &host_with(24.0, 64.0),
-            &FakeSource::failing(),
-        );
-        let fix = readiness.fix.as_ref().unwrap();
-        assert!(
-            fix.summary.contains("serve this model directly"),
-            "{}",
-            fix.summary
         );
     }
 
@@ -2329,6 +2401,8 @@ mod tests {
 
     /// `owner/repo:dir/file.gguf` selects an exact file for the estimate; `rocm
     /// serve` reads only `owner/repo:QUANT`, so a verify line naming it would fail.
+    /// Shown on a file that was read but could not be sized (one shard of a
+    /// split model), where serving it is still the plan.
     #[test]
     fn the_verify_command_is_one_rocm_serve_accepts() {
         let verify = |model_ref: &str| {
@@ -2337,11 +2411,11 @@ mod tests {
                 &mut readiness,
                 &ContextRequest::default(),
                 &host_with(24.0, 64.0),
-                &FakeSource::failing(),
+                &FakeSource::with(llama_like(10).u32("split.count", 3).file(64)),
             );
             readiness
                 .fix
-                .expect("the plan stays for an unreadable file")
+                .expect("the plan stays for a file that could not be sized")
                 .verify
         };
         assert_eq!(
@@ -2488,12 +2562,10 @@ mod tests {
             assert!(!text.contains("not a GGUF reference"), "{text}");
             readiness.fix.expect("the plan stays").notes.join("\n")
         };
-        // Unreadable, and read but not sizeable (a shard of a split model).
+        // Unreadable (its own plan, about the name and the network), and read
+        // but not sizeable (a shard of a split model).
         let unreadable = note_of(&FakeSource::failing());
-        assert!(
-            unreadable.contains("could not size this GGUF"),
-            "{unreadable}"
-        );
+        assert!(unreadable.contains("no token is sent"), "{unreadable}");
         let shard = note_of(&FakeSource::with(
             llama_like(10).u32("split.count", 3).file(64),
         ));
