@@ -27,11 +27,17 @@
 use crate::automations::{render_automations_text, render_daemon_text};
 use crate::engine_runtime_select::{app_path_env_vars, service_model_names_match};
 use crate::freeform_planner::{
-    format_structured_tool_call, infer_engine_from_request, plan_freeform_request_with_context,
-    serve_args_request_cpu_device,
+    format_structured_tool_call, plan_freeform_request_with_context, serve_args_request_cpu_device,
 };
 use crate::managed_service_status::{
     friendly_engine_label, load_managed_services, managed_service_is_live,
+};
+// `any_substring` lives in `prompt_text.rs` and stays reachable here as
+// `chat::any_substring` for `freeform_answer.rs`.
+pub(crate) use crate::prompt_text::any_substring;
+use crate::prompt_text::{
+    infer_engine_from_request, requested_install_prefix_from_prompt,
+    requested_therock_build_date_from_prompt, requested_therock_version_from_prompt,
 };
 // `ensure_flag` lives in `rocm_argv.rs` and stays reachable here as
 // `chat::ensure_flag` for `freeform_execution.rs`.
@@ -1440,10 +1446,6 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
     None
 }
 
-pub(crate) fn any_substring(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
 fn install_sdk_without_prefix_chat_approval(prompt: &str) -> Option<ChatToolApprovalRequest> {
     install_sdk_chat_approval_for_prompt(prompt).and_then(|approval| {
         chat_cli_arg_value(&approval.args, "--prefix")
@@ -1609,151 +1611,6 @@ fn prompt_requests_install_action(normalized: &str) -> bool {
             "set up amd gpu",
         ],
     )
-}
-
-pub(crate) fn requested_install_prefix_from_prompt(prompt: &str) -> Option<String> {
-    let lower = prompt.to_ascii_lowercase();
-    for phrase in [
-        "--prefix=",
-        "--prefix ",
-        " into folder ",
-        " into ",
-        " in folder ",
-        " in ",
-        " to folder ",
-        " to ",
-        " under ",
-        " at ",
-        " use folder ",
-        " use ",
-        "use ",
-        " folder is ",
-        " folder: ",
-        "folder:",
-    ] {
-        let mut search_start = 0;
-        while let Some(relative_index) = lower[search_start..].find(phrase) {
-            let value_start = search_start + relative_index + phrase.len();
-            if let Some(prefix) = clean_requested_install_prefix(&prompt[value_start..]) {
-                return Some(prefix);
-            }
-            search_start = value_start;
-        }
-    }
-    requested_bare_install_prefix_from_prompt(prompt)
-}
-
-fn requested_bare_install_prefix_from_prompt(prompt: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let mut remaining = prompt;
-        while let Some(start) = remaining.find(quote) {
-            let after_start = &remaining[start + quote.len_utf8()..];
-            let Some(end) = after_start.find(quote) else {
-                break;
-            };
-            if let Some(prefix) = clean_requested_install_prefix(&after_start[..end]) {
-                return Some(prefix);
-            }
-            remaining = &after_start[end + quote.len_utf8()..];
-        }
-    }
-    prompt.split_whitespace().find_map(|token| {
-        clean_requested_install_prefix(
-            token.trim_matches(|ch: char| {
-                matches!(ch, '"' | '\'' | '`' | ',' | ';' | '.' | ')' | ']')
-            }),
-        )
-    })
-}
-
-fn clean_requested_install_prefix(candidate: &str) -> Option<String> {
-    let trimmed = candidate.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut chars = trimmed.chars();
-    let first = chars.next()?;
-    let extracted = if first == '"' || first == '\'' {
-        let close = trimmed[first.len_utf8()..].find(first)?;
-        &trimmed[first.len_utf8()..first.len_utf8().saturating_add(close)]
-    } else {
-        trimmed
-            .split(['\r', '\n', ',', ';'])
-            .next()
-            .unwrap_or_default()
-            .split(" and ")
-            .next()
-            .unwrap_or_default()
-            .split(" with ")
-            .next()
-            .unwrap_or_default()
-            .split(" then ")
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(['.', ')', ']'])
-    };
-    let prefix = extracted.trim();
-    if prefix.is_empty() || !looks_like_user_path(prefix) {
-        return None;
-    }
-    Some(prefix.to_owned())
-}
-
-fn looks_like_user_path(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with('~')
-        || value.starts_with("\\\\")
-        || value.contains(":\\")
-        || value.contains(":/")
-        || value.contains('\\')
-}
-
-pub(crate) fn requested_therock_build_date_from_prompt(normalized: &str) -> Option<String> {
-    normalized
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| token.len() == 8 && token.chars().all(|ch| ch.is_ascii_digit()))
-        .find_map(
-            |token| match therock::RuntimeVersionSelector::build_date(token).ok()? {
-                therock::RuntimeVersionSelector::BuildDate(date) => Some(date),
-                therock::RuntimeVersionSelector::Version(_) => None,
-            },
-        )
-        .or_else(|| {
-            normalized
-                .split_whitespace()
-                .map(|token| {
-                    token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-                })
-                .find_map(|token| {
-                    match therock::RuntimeVersionSelector::build_date(token).ok()? {
-                        therock::RuntimeVersionSelector::BuildDate(date) => Some(date),
-                        therock::RuntimeVersionSelector::Version(_) => None,
-                    }
-                })
-        })
-}
-
-fn requested_therock_version_from_prompt(normalized: &str) -> Option<String> {
-    normalized
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '+' | '-' | '_')))
-        .filter(|token| looks_like_therock_runtime_version(token))
-        .find_map(|token| {
-            therock::RuntimeVersionSelector::version(token)
-                .ok()
-                .map(|_| token.to_owned())
-        })
-}
-
-fn looks_like_therock_runtime_version(token: &str) -> bool {
-    let Some((prefix, date)) = token.rsplit_once('a') else {
-        return false;
-    };
-    !prefix.is_empty()
-        && prefix.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        && prefix.contains('.')
-        && date.len() == 8
-        && date.chars().all(|ch| ch.is_ascii_digit())
-        && therock::RuntimeVersionSelector::build_date(date).is_ok()
 }
 
 fn visible_chat_content(content: &str) -> String {

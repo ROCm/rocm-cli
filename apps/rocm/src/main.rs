@@ -42,6 +42,7 @@ mod install_cmd;
 mod logging;
 mod managed_service_status;
 mod model_fit;
+mod prompt_text;
 mod provider_keys;
 mod providers;
 mod remote;

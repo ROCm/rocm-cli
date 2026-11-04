@@ -49,7 +49,7 @@ use std::fmt::Write as _;
 // `freeform_planner::serve_args_request_cpu_device` (read by `chat.rs`).
 pub(crate) use crate::rocm_argv::{format_structured_tool_call, serve_args_request_cpu_device};
 use crate::service_launch::is_loopback_host;
-use crate::{Cli, chat, providers, rocm_argv};
+use crate::{Cli, chat, prompt_text, providers, rocm_argv};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
 /// below; production code calls [`plan_freeform_request_with_context`]
@@ -372,7 +372,7 @@ fn build_freeform_plan_on(
             .map(|recipe| recipe.canonical_model_id.as_str())
             .or(requested_model)
             .unwrap_or("<model>");
-        let engine = infer_engine_from_request(&lower)
+        let engine = prompt_text::infer_engine_from_request(&lower)
             .or_else(|| resolved_recipe.as_ref().and_then(planner_recipe_engine))
             .unwrap_or(default_engine);
         let device_policy = infer_device_policy_from_request(&lower).or_else(|| {
@@ -460,7 +460,7 @@ fn build_freeform_plan_on(
     }
 
     if planner_mentions_comfyui(&lower) {
-        if chat::any_substring(&lower, &["log", "logs"]) {
+        if prompt_text::any_substring(&lower, &["log", "logs"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Inspect,
@@ -475,7 +475,7 @@ fn build_freeform_plan_on(
                 Vec::new(),
             );
         }
-        if chat::any_substring(&lower, &["start", "run", "launch", "open"]) {
+        if prompt_text::any_substring(&lower, &["start", "run", "launch", "open"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Serve,
@@ -526,8 +526,8 @@ fn build_freeform_plan_on(
         } else {
             "release"
         };
-        let build_date = chat::requested_therock_build_date_from_prompt(&lower);
-        let Some(prefix) = chat::requested_install_prefix_from_prompt(trimmed) else {
+        let build_date = prompt_text::requested_therock_build_date_from_prompt(&lower);
+        let Some(prefix) = prompt_text::requested_install_prefix_from_prompt(trimmed) else {
             let mut parsed = vec![
                 ("channel".to_owned(), channel.to_owned()),
                 ("format".to_owned(), "wheel".to_owned()),
@@ -1167,11 +1167,11 @@ fn planner_is_inspect_request(lower: &str) -> bool {
 }
 
 fn planner_mentions_comfyui(lower: &str) -> bool {
-    chat::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
+    prompt_text::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
 }
 
 fn planner_requests_comfyui_install(lower: &str) -> bool {
-    chat::any_substring(
+    prompt_text::any_substring(
         lower,
         &[
             "can you setup",
@@ -1189,19 +1189,6 @@ fn planner_requests_comfyui_install(lower: &str) -> bool {
 fn contains_planner_word(text: &str, expected: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
         .any(|word| word == expected)
-}
-
-pub(crate) fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
-    // Word-boundary match, not substring: "aim" as a bare `.contains` also
-    // matches "aiming"/"claim"/"maintain", silently steering an unrelated
-    // chat request onto the Docker-backed AIM engine.
-    let words: std::collections::HashSet<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
-    ["lemonade", "vllm", "aim"]
-        .into_iter()
-        .find(|engine| words.contains(engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -1255,26 +1242,6 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_engine_from_request;
-
-    /// "aim" must match as its own word, not as a substring of an unrelated
-    /// word like "aiming"/"claim"/"maintain" in a free-text chat request.
-    #[test]
-    fn infer_engine_from_request_does_not_match_aim_as_a_substring() {
-        assert_eq!(
-            infer_engine_from_request("serve a small model, aiming for low latency"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("please explain how to maintain a claim"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("serve qwen3.5-9b with aim"),
-            Some("aim")
-        );
-    }
-
     use super::*;
     use crate::tests::test_paths;
 
