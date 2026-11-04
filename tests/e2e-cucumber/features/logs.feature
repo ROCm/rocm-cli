@@ -45,7 +45,7 @@ Feature: Log inspection
 
   # The same follow behavior through the `rocm services logs` entry point, using
   # the `-f` short form (the `rocm logs` scenarios above use `--follow`).
-  @id:services-logs-follow-stopped-service-returns
+  @id:logs-services-follow-stopped-service-returns
   Scenario: logs-06 - Following a stopped server's logs through the services command returns
     Given a stopped local server whose log shows a download at 43 percent
     When the user follows that server's logs with rocm services logs -f

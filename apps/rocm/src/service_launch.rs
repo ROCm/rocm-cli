@@ -711,7 +711,7 @@ fn process_is_zombie(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_is_zombie(_pid: u32) -> bool {
+const fn process_is_zombie(_pid: u32) -> bool {
     false
 }
 
