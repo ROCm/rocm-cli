@@ -5,8 +5,9 @@
 //! A stand-in for the runtime's Python interpreter, for the ComfyUI install
 //! scenarios' two probes.
 //!
-//! `apps/rocm/src/comfyui.rs` shells out to the runtime's Python twice:
-//! `-c <script>` for the pre-install torch-stack version probe (answered here
+//! `apps/rocm/src/comfyui/install.rs` and `apps/rocm/src/comfyui.rs` shell out
+//! to the runtime's Python twice: `-c <script>` for the pre-install torch-stack
+//! version probe (in `install.rs`; answered here
 //! with empty JSON, so the probe reads "nothing pinned") and
 //! `<script-path> <result-path>` for the post-install GPU check (answered by
 //! writing a fixed, GPU-having result to the given path). One binary answers
