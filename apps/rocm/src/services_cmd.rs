@@ -10,7 +10,7 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `ServicesCommand`, the clap enum it matches on,
-//! stays in `main.rs` with the rest of the `Command`/`Cli` definition.
+//! lives in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `main.rs`'s `dispatch()` calls `services` through the re-import
 //! `use crate::services_cmd::services;`, and `advised_commands.rs`'s test
 //! reaches `run_approved_service_action` as `super::run_approved_service_action`

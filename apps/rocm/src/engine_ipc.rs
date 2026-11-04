@@ -33,7 +33,8 @@
 //! own test) in addition to the one inside it, and `impl From<WatcherModeArg>
 //! for WatcherMode` is unrelated clap-arg-to-domain-type conversion that only
 //! happens to sit between `find_engine_plugin_binary` and `engine_request` in
-//! the original file.
+//! the original file (it has since moved to `cli.rs`, next to the enum it
+//! converts).
 //!
 //! `main.rs` calls into it for `resolve_engine_binary_path`,
 //! `resolve_engine_binary_path_with_paths`, `engine_request`,

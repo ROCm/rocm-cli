@@ -17,9 +17,9 @@
 //! `validate_service_id`) and builds its advice text with `service_hints.rs`;
 //! none of those modules depends on this one. `services_cmd.rs`'s `services()`
 //! calls `remove_managed_service_record`, `service_prune_min_age_hours` and
-//! `prune_managed_service_records`, and `main.rs`'s clap
+//! `prune_managed_service_records`, and `cli.rs`'s clap
 //! `ServicesCommand::Prune` definition uses
-//! `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, which `main.rs` re-imports; all four
+//! `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, which `cli.rs` imports; all four
 //! are `pub(crate)`. Every other item has no caller outside this module and
 //! stays private.
 //!

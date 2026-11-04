@@ -9,7 +9,8 @@
 //! re-imported via `use crate::engines_cmd::{engine_manages_own_runtime,
 //! engines, env_root_for_engine_install, env_root_for_service,
 //! runtime_key_for_python, runtime_manifest_for_selector};`). `EnginesCommand`
-//! remains in the crate root and is reached via `use crate::EnginesCommand`;
+//! lives in `cli.rs` and is reached via `use crate::EnginesCommand`, a
+//! re-import in `main.rs`;
 //! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
 //! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
 //! only caller is `serve_cmd.rs`; `env_root_for_service` and

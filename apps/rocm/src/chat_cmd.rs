@@ -15,8 +15,8 @@
 //! because the handler calls into both `chat.rs` and `dash.rs` while `dash.rs`
 //! already calls into `chat.rs`: placing it in `chat.rs` would make the two
 //! depend on each other. This module depends on both, and neither depends on
-//! it. `Provider`, the clap enum behind `--provider`, and `ChatInferenceParams`
-//! stay in `main.rs`; `run_chat_command` is `pub(crate)` for `dispatch()`,
+//! it. `Provider`, the clap enum behind `--provider`, lives in `cli.rs`, and
+//! `ChatInferenceParams` stays in `main.rs`; `run_chat_command` is `pub(crate)` for `dispatch()`,
 //! which calls it through the re-import `use crate::chat_cmd::run_chat_command;`.
 //!
 //! Four source-text tests in this module's own `mod tests`
