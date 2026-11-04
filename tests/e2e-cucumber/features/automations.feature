@@ -151,3 +151,22 @@ Feature: Automation watchers
     Then the CLI confirms the permissions mode
     And the CLI prints no warning about the audit log
     And the audit log keeps its earlier record, drops the torn line and records the permissions change
+
+  # The background helper's lifecycle (ROCMAI-827). Enabling a watcher starts a
+  # detached `rocm daemon`; it used to run forever after that, so a helper
+  # started by `serve` or `automations enable` outlived every service and every
+  # watcher. It now exits on its own once no watcher is enabled. This drives the
+  # real spawn — no suppression marker — and checks the `helper:` line the
+  # enable prints together with the process it claims to have started, then
+  # that disabling the only watcher makes that process exit. The other half,
+  # that `serve` with no watcher enabled starts no helper at all, needs a real
+  # serve and is `serve-stop-leaves-no-background-helper` on the GPU lane.
+  # Config-only — no GPU or network — so it runs on the mock lane every PR.
+  @id:automations-helper-stops-when-no-watcher-is-enabled
+  Scenario: automations-11 - The background helper stops on its own once no watcher is enabled
+    Given no automation watcher is enabled
+    When the user enables an automation watcher in observe mode
+    Then the CLI reports starting the background helper and it is running
+    When the user disables the watcher
+    Then the CLI confirms the watcher is disabled
+    And the background helper stops on its own

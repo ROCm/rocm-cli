@@ -1071,6 +1071,81 @@ serve_timeout_secs = 90
         assert!(unmatched_also_run_ids(&[], &known).is_empty());
     }
 
+    /// The tag line directly above `Scenario: <prefix>` in `model_serving.feature`.
+    fn model_serving_tags(prefix: &str) -> Vec<String> {
+        let feature = include_str!("../features/model_serving.feature");
+        let lines: Vec<&str> = feature.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&format!("Scenario: {prefix}")))
+            .unwrap_or_else(|| panic!("no `Scenario: {prefix}` in model_serving.feature"));
+        lines[at - 1]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
+        // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
+        // may each wait out a 1200s readiness cap. Run per-PR on the Strix Ubuntu
+        // pool they pushed the job (~25 min otherwise) into its 45 min cap on every
+        // run. They must resolve to Skip unless the nightly opt-in is set, and must
+        // still be reachable (not Skip for the nightly reason) when it is.
+        let m = Expectations::default();
+        for prefix in ["serve-26 -", "serve-27 -"] {
+            let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
+            assert_eq!(d.requires_engine.as_deref(), Some("aim"), "{prefix}");
+            assert!(d.nightly, "{prefix} must be @nightly");
+            match resolve(&d, &cap("strix-ubuntu"), &m, Included::default()) {
+                Expectation::Skip { reason } => {
+                    assert!(reason.contains("E2E_INCLUDE_NIGHTLY"), "{prefix}: {reason}");
+                }
+                other => panic!("{prefix} must skip per-PR, got {other:?}"),
+            }
+            // Opted in: the nightly gate must not fire. What remains is the engine
+            // requirement, which `engine_available("aim")` decides from the host's
+            // engine list, its GFX family and whether Docker answers. Pin both
+            // sides of it: a host that lists aim runs the scenario exactly when
+            // Docker is reachable, and one that does not list aim skips on the
+            // engine, never on the nightly opt-in.
+            let opted_in = Included {
+                nightly: true,
+                ..Included::default()
+            };
+            let mut with_aim = cap("strix-ubuntu");
+            with_aim.available_engines.push("aim".to_owned());
+            match resolve(&d, &with_aim, &m, opted_in) {
+                Expectation::ExpectPass => assert!(
+                    docker_available(),
+                    "{prefix} ran although Docker is unreachable"
+                ),
+                Expectation::Skip { reason } => {
+                    assert!(
+                        !docker_available(),
+                        "{prefix} skipped with the opt-in set, aim listed and Docker                          reachable: {reason}"
+                    );
+                    assert!(
+                        reason.contains("engine 'aim' cannot start"),
+                        "{prefix}: wrong skip reason with the opt-in set: {reason}"
+                    );
+                }
+                other @ Expectation::ExpectXfail { .. } => {
+                    panic!("{prefix}: unexpected outcome when opted in: {other:?}")
+                }
+            }
+            match resolve(&d, &cap("strix-ubuntu"), &m, opted_in) {
+                Expectation::Skip { reason } => assert!(
+                    reason.contains("engine 'aim' cannot start"),
+                    "{prefix}: {reason}"
+                ),
+                other => {
+                    panic!("{prefix}: host without aim must skip on the engine, got {other:?}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn docker_scenario_skips_unless_included() {
         // A container-backed scenario is opt-in, not merely "docker is here".

@@ -352,12 +352,20 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
+  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
+  # image and a 9B checkpoint on a cold runner and may wait out the full
+  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. They run only when
+  # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
+  # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
+  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
+  # skip every night (the nightly job logs whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -372,7 +380,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -619,6 +627,18 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+  # ROCMAI-827: `rocm serve` started the background automation helper
+  # (`rocm daemon`) on every launch, even with every automation watcher off —
+  # when it has nothing to do — and that helper outlived the service. With no
+  # watcher enabled, serve now starts no helper; the scenario's fresh config
+  # has none enabled. The helper's own lifecycle once a watcher is on is
+  # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
+  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
+    Given a managed runtime is active
+    When the user serves a GGUF model on lemonade with no automation enabled
+    Then serving started no background helper
+
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -632,7 +652,7 @@ Feature: Model serving
   # where xtask builds the binary with the feature. @requires-no-gpu because the
   # fabricated launch stands in for the GPU the mock lane does not have.
   @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-40 - A launch that runs out of GPU memory names the memory knobs
+  Scenario: serve-41 - A launch that runs out of GPU memory names the memory knobs
     Given a managed vLLM launch will run out of GPU memory
     When the user opens the interactive serve summary for that launch
     Then the deployment summary blames this launch for GPU memory

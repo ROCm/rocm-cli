@@ -24,7 +24,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::metrics::{Instance, ObservationFreshness, ObservationMetadata};
+use rocm_dash_core::metrics::{
+    Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+};
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
@@ -83,7 +85,9 @@ pub struct ServiceRow {
     pub id: String,
     pub model: String,
     pub port: Option<u16>,
-    pub status: String,
+    /// The renderer derives both the label and the color from this one value, so
+    /// a stopped or failed service cannot be colored like a running one.
+    pub status: InstanceStatus,
     pub gen_tps: Option<f64>,
     /// Freshness metadata for `gen_tps`; `None` for legacy snapshots.
     pub gen_tps_observation: Option<ObservationMetadata>,
@@ -99,9 +103,7 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             id: i.container_id.clone(),
             model: i.model_name.clone(),
             port: i.port,
-            // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup phase
-            // when the instance is `Starting`; never a raw `{:?}` debug string.
-            status: i.status.label().to_owned(),
+            status: i.status,
             gen_tps: i.gen_tps,
             gen_tps_observation: i.gen_tps_observation.clone(),
         })
@@ -349,7 +351,13 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                         format!(":{:<6}", port_str(r.port)),
                         Style::default().fg(theme.muted),
                     ),
-                    Span::styled(format!("{:<10}", r.status), Style::default().fg(theme.ok)),
+                    // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup
+                    // phase when the instance is `Starting`; never a raw `{:?}`
+                    // debug string.
+                    Span::styled(
+                        format!("{:<10}", r.status.label()),
+                        Style::default().fg(theme.instance_status_color(r.status)),
+                    ),
                     Span::styled(
                         format!(
                             "gen {}",
@@ -566,6 +574,77 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn status_text_is_colored_by_service_state() {
+        // Regression: every row's status used to be painted `theme.ok`, so a
+        // stopped or failed service looked as healthy as a running one.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let cases = [
+            ("svc-1", InstanceStatus::Ready, "READY"),
+            (
+                "svc-2",
+                InstanceStatus::Starting { phase: None },
+                "STARTING",
+            ),
+            ("svc-3", InstanceStatus::Stopped, "STOPPED"),
+            ("svc-4", InstanceStatus::Error, "ERROR"),
+            ("svc-5", InstanceStatus::Unknown, "UNKNOWN"),
+            ("svc-6", InstanceStatus::Running, "RUNNING"),
+        ];
+        let mut insts = HashMap::new();
+        for (id, status, _) in cases {
+            insts.insert(
+                id.to_string(),
+                Instance {
+                    status,
+                    ..inst(id, "llama3", None)
+                },
+            );
+        }
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        let sm = ServicesManagerState::default();
+        let jobs = State::default();
+        term.draw(|f| draw_services_manager(f, f.area(), &sm, &insts, &jobs, 0, &theme))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        // The status word is read from the row that shows the service's id, so
+        // unrelated text elsewhere on screen cannot be mistaken for it.
+        let fg_of = |id: &str, label: &str| {
+            let row = buffer
+                .content()
+                .chunks(width)
+                .find(|cells| {
+                    cells
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                        .contains(id)
+                })
+                .unwrap_or_else(|| panic!("row for {id} should render"));
+            let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+            let len = label.chars().count();
+            let at = (0..=symbols.len().saturating_sub(len))
+                .find(|&i| symbols[i..i + len].concat() == label)
+                .unwrap_or_else(|| panic!("status label {label} should render on the {id} row"));
+            row[at].fg
+        };
+        for (id, status, label) in cases {
+            assert_eq!(
+                fg_of(id, label),
+                theme.instance_status_color(status),
+                "{label} must use its own status color"
+            );
+        }
+        // The point of the fix: the failed states are not the "ok" color.
+        assert_eq!(fg_of("svc-1", "READY"), theme.ok);
+        assert_eq!(fg_of("svc-6", "RUNNING"), theme.ok);
+        assert_ne!(fg_of("svc-3", "STOPPED"), theme.ok);
+        assert_ne!(fg_of("svc-4", "ERROR"), theme.ok);
     }
 
     #[test]

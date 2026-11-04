@@ -858,9 +858,10 @@ own process/container (repeatable); currently only `aim` consumes these (e.g.
 argv and in `rocm services list --json`, so do not put secrets there; pass a
 bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
 current environment without storing it. A service restarted by the daemon
-after a crash inherits the daemon's environment, not yours, so a forwarded
-secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
-5-minute readiness wait for a cold-start model download.
+after a crash (with the `server-recover` automation enabled) inherits the
+daemon's environment, not yours, so a forwarded secret must also be set
+there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
+for a cold-start model download.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -1307,6 +1308,14 @@ apply changes automatically. `list` shows the available watchers and their IDs.
 - `contained` lets a watcher act on its own only where that is safe. Today only
   `server-recover` does: it restarts a managed service that failed. The other
   watchers stay review-gated or record only in this mode.
+
+Enabled watchers run in a background helper process (`rocm daemon`), which
+`enable` starts, and `rocm serve` starts too while any watcher is on. All
+watchers are off by default, so serving a model starts no helper. The helper
+exits on its own within a few seconds once no watcher is enabled; disable each
+enabled watcher to stop it. `rocm daemon --status` shows whether it is running.
+The helper is not tied to a service: while a watcher is enabled it outlives
+`rocm services stop`, and that command, like `rocm uninstall`, says so.
 
 ### Configuration
 
