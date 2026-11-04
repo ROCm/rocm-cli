@@ -7,16 +7,22 @@ use crate::persistence::load_service_record;
 use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AutomationProposalRecord, AutomationRuntimeState, AutomationTriggerEvent,
-    CodexBridgeGpuSnapshot, ManagedServiceRecord, RocmCliConfig, WatcherMode,
-    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers, format_host_port,
-    resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeGpuSnapshot,
+    ManagedServiceRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot, builtin_watchers,
+    format_host_port, resolve_model_recipe_artifact, unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
 use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
+
+mod policy;
+
+use policy::{
+    WatcherPolicyAction, pending_proposal_exists, queue_proposal, queue_proposal_with_arguments,
+    watcher_policy_action,
+};
 
 const SERVER_RECOVER_BACKOFF_MS: u128 = 30_000;
 const SERVER_TRANSIENT_STALE_MS: u128 = 5 * 60 * 1_000;
@@ -864,31 +870,6 @@ fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result
     )
 }
 
-/// Whether `watcher_id` already has a pending proposal for `service_id`, either
-/// queued under `action` or carrying `tool`.
-///
-/// Reads the whole proposals store rather than a recent window: a pending
-/// proposal is never dropped, so it can be arbitrarily old, and a window that
-/// missed it would let the watcher queue a duplicate once the original aged
-/// out of that window. Compaction bounds the reviewed proposals to a fixed
-/// count; pending ones are kept.
-fn pending_proposal_exists(
-    paths: &AppPaths,
-    watcher_id: &str,
-    service_id: &str,
-    action: &str,
-    tool: &str,
-) -> Result<bool> {
-    Ok(rocm_core::load_automation_proposals(paths)?
-        .into_iter()
-        .any(|proposal| {
-            proposal.status == "pending"
-                && proposal.watcher_id == watcher_id
-                && proposal.service_id.as_deref() == Some(service_id)
-                && (proposal.action == action || proposal.tool.as_deref() == Some(tool))
-        }))
-}
-
 fn handle_cache_warm_event(
     paths: &AppPaths,
     mode: WatcherMode,
@@ -1398,21 +1379,6 @@ fn server_recover_due(state: &AutomationRuntimeState, now: u128) -> bool {
         .is_none_or(|last_event| now.saturating_sub(last_event) >= SERVER_RECOVER_BACKOFF_MS)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum WatcherPolicyAction {
-    Observe,
-    QueueProposal,
-    RunContained,
-}
-
-const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPolicyAction {
-    match (watcher_id, mode) {
-        (_, WatcherMode::Observe) => WatcherPolicyAction::Observe,
-        (_, WatcherMode::Propose) => WatcherPolicyAction::QueueProposal,
-        (_, WatcherMode::Contained) => WatcherPolicyAction::RunContained,
-    }
-}
-
 pub(crate) fn find_recoverable_service(
     paths: &AppPaths,
 ) -> Result<Option<(ManagedServiceRecord, String)>> {
@@ -1501,77 +1467,6 @@ fn manifest_service_recovery_reason(
     }
 }
 
-fn queue_proposal(
-    paths: &AppPaths,
-    watcher_id: &str,
-    action: &str,
-    title: &str,
-    message: &str,
-    service_id: Option<String>,
-) -> Result<()> {
-    queue_proposal_with_arguments(
-        paths,
-        watcher_id,
-        action,
-        title,
-        message,
-        service_id.clone(),
-        proposal_arguments_for_action(action, service_id.as_deref()),
-    )
-}
-
-fn queue_proposal_with_arguments(
-    paths: &AppPaths,
-    watcher_id: &str,
-    action: &str,
-    title: &str,
-    message: &str,
-    service_id: Option<String>,
-    arguments: Value,
-) -> Result<()> {
-    append_automation_proposal(
-        paths,
-        &AutomationProposalRecord {
-            at_unix_ms: unix_time_millis(),
-            proposal_id: String::new(),
-            watcher_id: watcher_id.to_owned(),
-            action: action.to_owned(),
-            title: title.to_owned(),
-            message: message.to_owned(),
-            status: "pending".to_owned(),
-            service_id,
-            tool: proposal_tool_for_action(action).map(str::to_owned),
-            arguments,
-            reviewed_at_unix_ms: None,
-        },
-    )
-}
-
-fn proposal_tool_for_action(action: &str) -> Option<&'static str> {
-    match action {
-        "queue_restart_proposal" => Some("restart_server"),
-        "queue_stop_server_proposal" => Some("stop_server"),
-        "queue_update_proposal" => Some("check_updates"),
-        "queue_prefetch_proposal" => Some("prefetch_artifact"),
-        "prepare_driver_plan" => Some("driver_plan"),
-        _ => None,
-    }
-}
-
-fn proposal_arguments_for_action(action: &str, service_id: Option<&str>) -> Value {
-    match action {
-        "queue_restart_proposal" => json!({
-            "service_id": service_id,
-        }),
-        "queue_stop_server_proposal" => json!({
-            "service_id": service_id,
-        }),
-        "queue_update_proposal" => json!({}),
-        "prepare_driver_plan" => json!({}),
-        _ => Value::Null,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1579,7 +1474,10 @@ mod tests {
         UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
         test_runtime_state, test_watcher_snapshot,
     };
-    use rocm_core::{AuditEventRecord, AutomationEventRecord};
+    use rocm_core::{
+        AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
+        append_automation_proposal,
+    };
     use std::fs;
 
     #[test]
@@ -3390,26 +3288,6 @@ mod tests {
         );
         assert!(notification.message.contains("No updates were applied"));
         Ok(())
-    }
-
-    #[test]
-    fn watcher_policy_maps_modes_to_decisions() {
-        assert_eq!(
-            watcher_policy_action("server-recover", WatcherMode::Observe),
-            WatcherPolicyAction::Observe
-        );
-        assert_eq!(
-            watcher_policy_action("server-recover", WatcherMode::Propose),
-            WatcherPolicyAction::QueueProposal
-        );
-        assert_eq!(
-            watcher_policy_action("server-recover", WatcherMode::Contained),
-            WatcherPolicyAction::RunContained
-        );
-        assert_eq!(
-            watcher_policy_action("therock-update", WatcherMode::Contained),
-            WatcherPolicyAction::RunContained
-        );
     }
 
     /// An unconfirmed stop leaves the status at `ready` on purpose, which is
