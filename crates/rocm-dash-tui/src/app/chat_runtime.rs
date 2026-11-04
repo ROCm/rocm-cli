@@ -362,3 +362,377 @@ impl ChatRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::test_support::{args_with_anthropic_key, st};
+    use super::super::types::Focus;
+    use super::*;
+    use crate::agent::MockAgentClient;
+    use crate::app::{ChatConsent, ChatRole};
+
+    fn mock(reply: &str) -> SharedAgent {
+        Arc::new(MockAgentClient::new(reply))
+    }
+
+    fn is(slot: Option<&SharedAgent>, agent: &SharedAgent) -> bool {
+        slot.is_some_and(|a| Arc::ptr_eq(a, agent))
+    }
+
+    fn channel() -> (
+        mpsc::UnboundedSender<ClientMsg>,
+        mpsc::UnboundedReceiver<ClientMsg>,
+    ) {
+        mpsc::unbounded_channel()
+    }
+
+    fn last_turn(state: &AppState) -> &ChatTurn {
+        state.chat.last().expect("a transcript turn was pushed")
+    }
+
+    async fn next_msg(rx: &mut mpsc::UnboundedReceiver<ClientMsg>) -> ClientMsg {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a chat message arrives within 5 s")
+            .expect("the channel stays open")
+    }
+
+    // --- start ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_focused_host_builds_no_backend_and_leaves_chat_unconfigured() {
+        let mut s = st();
+        let (tx, _rx) = channel();
+        let mut args = args_with_anthropic_key(None);
+        args.focus = Some(Focus::Examine);
+        // `chat_mock` would build an agent if the focus gate were skipped.
+        args.chat_mock = true;
+
+        let rt = ChatRuntime::start(&mut s, &args, &tx).await;
+
+        assert!(rt.agent.is_none() && rt.local_agent.is_none());
+        assert!(s.chat_llm.is_none());
+        assert_eq!(s.chat_consent, ChatConsent::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn chat_mock_builds_the_offline_agent_with_consent_and_saves_it_as_the_local_one() {
+        let mut s = st();
+        let (tx, mut rx) = channel();
+        let mut args = args_with_anthropic_key(None);
+        args.chat_mock = true;
+
+        let rt = ChatRuntime::start(&mut s, &args, &tx).await;
+
+        let agent = rt.agent.clone().expect("the mock backend is built");
+        assert!(
+            is(rt.local_agent.as_ref(), &agent),
+            "`/provider local` restores it"
+        );
+        let cfg = s.chat_llm.as_ref().expect("the mock config is installed");
+        assert_eq!(cfg.base_url, "mock://offline-demo");
+        assert_eq!(cfg.model, "mock-agent");
+        assert_eq!(s.chat_consent, ChatConsent::Accepted);
+
+        let reply = agent
+            .complete(&[ChatTurn::user("hello")], s.state_snapshot())
+            .await
+            .unwrap();
+        assert!(reply.contains("GPU-2 is running hot"), "got: {reply}");
+
+        // The approval trigger is wired to the loop's chat channel.
+        agent
+            .complete(
+                &[ChatTurn::user("Please install the SDK")],
+                s.state_snapshot(),
+            )
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Ok(ClientMsg::ChatApprovalRequired { intent }) => {
+                assert_eq!(intent.name, "install_sdk");
+            }
+            _ => panic!("the approval request must reach the loop's chat channel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_endpoint_is_used_without_local_detection() {
+        // An unreachable loopback URL: the probe is refused at once, so nothing
+        // is detected, and the configured URL is carried through as the backend.
+        let mut s = st();
+        let (tx, _rx) = channel();
+        let mut args = args_with_anthropic_key(None);
+        args.chat_url = Some("http://127.0.0.1:1/v1".to_string());
+        args.chat_model = Some("my-model".to_string());
+
+        let rt = ChatRuntime::start(&mut s, &args, &tx).await;
+
+        let cfg = s
+            .chat_llm
+            .as_ref()
+            .expect("the configured endpoint is kept");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:1/v1");
+        assert_eq!(cfg.model, "my-model");
+        assert_eq!(s.chat_consent, ChatConsent::Pending, "no --chat-yes");
+        let agent = rt.agent.clone().expect("a backend is built for it");
+        assert!(is(rt.local_agent.as_ref(), &agent));
+
+        args.chat_auto_consent = true;
+        let mut s2 = st();
+        let _ = ChatRuntime::start(&mut s2, &args, &tx).await;
+        assert_eq!(s2.chat_consent, ChatConsent::Accepted, "--chat-yes");
+    }
+
+    // --- drain_provider_switch -----------------------------------------------
+
+    #[test]
+    fn switching_to_a_keyed_remote_provider_replaces_only_the_live_agent() {
+        let (tx, _rx) = channel();
+        let local = mock("local");
+        let mut rt = ChatRuntime {
+            agent: Some(local.clone()),
+            local_agent: Some(local.clone()),
+        };
+        let mut s = st();
+        s.provider_switch = Some(ProviderSwitch {
+            previous: ChatProvider::Local,
+            target: ChatProvider::Anthropic,
+        });
+        let args = args_with_anthropic_key(Some("dummy-anthropic-key"));
+
+        rt.drain_provider_switch(&mut s, &args, &tx);
+
+        assert!(s.provider_switch.is_none(), "the edge is consumed");
+        assert!(!is(rt.agent.as_ref(), &local), "the live agent was rebuilt");
+        assert!(rt.agent.is_some());
+        assert!(
+            is(rt.local_agent.as_ref(), &local),
+            "the restore snapshot is kept"
+        );
+        assert_eq!(last_turn(&s), &ChatTurn::system("switched to anthropic"));
+    }
+
+    #[test]
+    fn a_failed_switch_keeps_the_agent_and_reverts_to_the_previous_provider() {
+        let (tx, _rx) = channel();
+        let current = mock("openai-backed");
+        let mut rt = ChatRuntime {
+            agent: Some(current.clone()),
+            local_agent: None,
+        };
+        let mut s = st();
+        // The slash handler optimistically set Anthropic; Openai was active.
+        s.active_provider = ChatProvider::Anthropic;
+        s.provider_switch = Some(ProviderSwitch {
+            previous: ChatProvider::Openai,
+            target: ChatProvider::Anthropic,
+        });
+        let args = args_with_anthropic_key(None);
+
+        rt.drain_provider_switch(&mut s, &args, &tx);
+
+        assert!(
+            is(rt.agent.as_ref(), &current),
+            "no stale-remote re-routing"
+        );
+        assert_eq!(
+            s.active_provider,
+            ChatProvider::Openai,
+            "not forced to Local"
+        );
+        assert_eq!(last_turn(&s).role, ChatRole::Error);
+        assert_eq!(
+            last_turn(&s).content,
+            "could not switch to anthropic: anthropic requires ANTHROPIC_API_KEY in env or secure store"
+        );
+
+        // The OpenAI hint names its own variable.
+        s.provider_switch = Some(ProviderSwitch {
+            previous: ChatProvider::Local,
+            target: ChatProvider::Openai,
+        });
+        rt.drain_provider_switch(&mut s, &args, &tx);
+        assert_eq!(
+            last_turn(&s).content,
+            "could not switch to openai: openai requires OPENAI_API_KEY in the environment"
+        );
+    }
+
+    #[test]
+    fn switching_back_to_local_restores_the_saved_local_agent() {
+        let (tx, _rx) = channel();
+        let local = mock("local");
+        let remote = mock("remote");
+        let mut rt = ChatRuntime {
+            agent: Some(remote),
+            local_agent: Some(local.clone()),
+        };
+        let mut s = st();
+        s.provider_switch = Some(ProviderSwitch {
+            previous: ChatProvider::Openai,
+            target: ChatProvider::Local,
+        });
+        let args = args_with_anthropic_key(None);
+
+        rt.drain_provider_switch(&mut s, &args, &tx);
+
+        assert!(is(rt.agent.as_ref(), &local));
+        assert_eq!(last_turn(&s), &ChatTurn::system("switched to local"));
+    }
+
+    #[test]
+    fn a_provider_drain_with_no_switch_pending_changes_nothing() {
+        let (tx, _rx) = channel();
+        let local = mock("local");
+        let mut rt = ChatRuntime {
+            agent: Some(local.clone()),
+            local_agent: Some(local.clone()),
+        };
+        let mut s = st();
+        rt.drain_provider_switch(&mut s, &args_with_anthropic_key(None), &tx);
+        assert!(is(rt.agent.as_ref(), &local));
+        assert!(s.chat.is_empty());
+    }
+
+    // --- drain_endpoint_rebuild ----------------------------------------------
+
+    #[test]
+    fn an_accepted_local_endpoint_repoints_the_agent_and_the_restore_snapshot() {
+        let (tx, _rx) = channel();
+        let stale = mock("cloud");
+        let mut rt = ChatRuntime {
+            agent: Some(stale.clone()),
+            local_agent: Some(stale.clone()),
+        };
+        let mut s = st();
+        s.chat_llm = Some(crate::llm::LlmConfig {
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            model: "m".to_string(),
+            api_key: None,
+            auth_header: None,
+        });
+        s.chat_endpoint_rebuild = Some(ChatProvider::Openai);
+        s.active_provider = ChatProvider::Local;
+        let args = args_with_anthropic_key(None);
+
+        rt.drain_endpoint_rebuild(&mut s, &args, &tx);
+
+        assert!(s.chat_endpoint_rebuild.is_none(), "the edge is consumed");
+        let rebuilt = rt.agent.clone().expect("a new local backend is built");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &stale),
+            "not the stale startup agent"
+        );
+        assert!(
+            is(rt.local_agent.as_ref(), &rebuilt),
+            "snapshot refreshed too"
+        );
+        assert_eq!(
+            s.active_provider,
+            ChatProvider::Local,
+            "no revert on success"
+        );
+        assert_eq!(last_turn(&s), &ChatTurn::system("switched to local"));
+    }
+
+    #[test]
+    fn a_rebuild_with_no_endpoint_reverts_the_provider_and_keeps_the_agent() {
+        let (tx, _rx) = channel();
+        let stale = mock("cloud");
+        let mut rt = ChatRuntime {
+            agent: Some(stale.clone()),
+            local_agent: Some(stale.clone()),
+        };
+        let mut s = st();
+        s.chat_llm = None;
+        s.chat_endpoint_rebuild = Some(ChatProvider::Anthropic);
+        s.active_provider = ChatProvider::Local; // the optimistic switch
+        let args = args_with_anthropic_key(None);
+
+        rt.drain_endpoint_rebuild(&mut s, &args, &tx);
+
+        assert!(s.chat_endpoint_rebuild.is_none());
+        assert_eq!(s.active_provider, ChatProvider::Anthropic);
+        assert!(is(rt.agent.as_ref(), &stale) && is(rt.local_agent.as_ref(), &stale));
+        assert_eq!(last_turn(&s).role, ChatRole::Error);
+        assert_eq!(
+            last_turn(&s).content,
+            "could not switch to the detected local endpoint: no endpoint configured"
+        );
+    }
+
+    // --- drain_dispatch ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_submit_spawns_exactly_one_round_trip_and_posts_the_reply() {
+        let (tx, mut rx) = channel();
+        let rt = ChatRuntime {
+            agent: Some(mock("pong")),
+            local_agent: None,
+        };
+        let mut s = st();
+        s.chat.push(ChatTurn::user("ping"));
+        s.chat_dispatch = true;
+
+        rt.drain_dispatch(&mut s, &tx);
+
+        assert!(!s.chat_dispatch, "the edge is consumed");
+        match next_msg(&mut rx).await {
+            ClientMsg::ChatReply { text } => assert_eq!(text, "pong"),
+            _ => panic!("expected the agent's reply"),
+        }
+        // No edge raised: a second drain must not spawn another request.
+        rt.drain_dispatch(&mut s, &tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
+            "no second round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_agent_posts_an_error_message() {
+        let (tx, mut rx) = channel();
+        let rt = ChatRuntime {
+            agent: Some(Arc::new(MockAgentClient::failing())),
+            local_agent: None,
+        };
+        let mut s = st();
+        s.chat.push(ChatTurn::user("ping"));
+        s.chat_dispatch = true;
+
+        rt.drain_dispatch(&mut s, &tx);
+
+        match next_msg(&mut rx).await {
+            ClientMsg::ChatError { message } => {
+                assert!(message.contains("mock failure"), "got: {message}");
+            }
+            _ => panic!("expected an error message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_submit_with_no_backend_surfaces_the_no_backend_error_turn() {
+        let (tx, mut rx) = channel();
+        let rt = ChatRuntime {
+            agent: None,
+            local_agent: None,
+        };
+        let mut s = st();
+        s.chat.push(ChatTurn::user("ping"));
+        s.chat_sending = true;
+        s.chat_dispatch = true;
+
+        rt.drain_dispatch(&mut s, &tx);
+
+        assert!(!s.chat_dispatch);
+        assert!(!s.chat_sending, "the pending indicator is cleared");
+        assert_eq!(last_turn(&s), &ChatTurn::error(NO_CHAT_BACKEND_MSG));
+        assert!(rx.try_recv().is_err(), "nothing was spawned");
+    }
+}
