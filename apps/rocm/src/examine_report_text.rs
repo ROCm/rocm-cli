@@ -39,7 +39,7 @@
 //! otherwise be an unused import in a non-test build. Every other item in this
 //! list has no caller outside this module and stays private.
 //!
-//! This module reaches three items that live at the crate root because they
+//! This module reaches four items that live at the crate root because they
 //! have other callers: `engine_inventory()` (the built-in engine list, also
 //! read from `update_cmd.rs`), `PlatformRuleOut` (which
 //! `engine_runtime_status_label` matches on) and
