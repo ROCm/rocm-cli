@@ -610,27 +610,41 @@ mod tests {
         let jobs = State::default();
         term.draw(|f| draw_services_manager(f, f.area(), &sm, &insts, &jobs, 0, &theme))
             .unwrap();
-        let cells = term.backend().buffer().content().to_vec();
-        let symbols: Vec<&str> = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
-        let fg_of = |label: &str| {
-            let width = label.chars().count();
-            let at = (0..symbols.len().saturating_sub(width))
-                .find(|&i| symbols[i..i + width].concat() == label)
-                .unwrap_or_else(|| panic!("status label {label} should render"));
-            cells[at].fg
+        let buffer = term.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        // The status word is read from the row that shows the service's id, so
+        // unrelated text elsewhere on screen cannot be mistaken for it.
+        let fg_of = |id: &str, label: &str| {
+            let row = buffer
+                .content()
+                .chunks(width)
+                .find(|cells| {
+                    cells
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                        .contains(id)
+                })
+                .unwrap_or_else(|| panic!("row for {id} should render"));
+            let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+            let len = label.chars().count();
+            let at = (0..=symbols.len().saturating_sub(len))
+                .find(|&i| symbols[i..i + len].concat() == label)
+                .unwrap_or_else(|| panic!("status label {label} should render on the {id} row"));
+            row[at].fg
         };
-        for (_, status, label) in cases {
+        for (id, status, label) in cases {
             assert_eq!(
-                fg_of(label),
+                fg_of(id, label),
                 theme.instance_status_color(status),
                 "{label} must use its own status color"
             );
         }
         // The point of the fix: the failed states are not the "ok" color.
-        assert_eq!(fg_of("READY"), theme.ok);
-        assert_eq!(fg_of("RUNNING"), theme.ok);
-        assert_ne!(fg_of("STOPPED"), theme.ok);
-        assert_ne!(fg_of("ERROR"), theme.ok);
+        assert_eq!(fg_of("svc-1", "READY"), theme.ok);
+        assert_eq!(fg_of("svc-6", "RUNNING"), theme.ok);
+        assert_ne!(fg_of("svc-3", "STOPPED"), theme.ok);
+        assert_ne!(fg_of("svc-4", "ERROR"), theme.ok);
     }
 
     #[test]

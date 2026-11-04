@@ -403,10 +403,16 @@ pub fn draw_runtime_manager(
     if any_marked {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(ACTIVE_MARKER, Style::default().fg(theme.ok)),
+                Span::styled(
+                    ACTIVE_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Success)),
+                ),
                 Span::styled("= active", Style::default().fg(theme.muted)),
                 Span::styled(" · ", Style::default().fg(theme.muted)),
-                Span::styled(ROLLBACK_MARKER, Style::default().fg(theme.warn)),
+                Span::styled(
+                    ROLLBACK_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Warning)),
+                ),
                 Span::styled("= rollback target", Style::default().fg(theme.muted)),
             ])),
             rows[0],

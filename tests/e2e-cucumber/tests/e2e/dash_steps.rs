@@ -178,14 +178,20 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
 
-#[when("the user opens the dashboard replaying a recording that reports a warning")]
-async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
-    // A snapshot with a working GPU *and* a warning: the combination where the
-    // warning text used to be drawn nowhere in the dashboard. The dashboard
-    // forgets its latest snapshot the moment a replay ends, and replay caps the
-    // wait between entries at two seconds, so a single line would be gone before
-    // the scenario looked at it. Sixty entries two seconds apart keep the
-    // recording playing for two minutes, far longer than the scenario runs.
+/// Spawn `dash --replay` on a recording of identical snapshots. The dashboard
+/// forgets its latest snapshot the moment a replay ends, and replay caps the wait
+/// between entries at two seconds, so a single line would be gone before a
+/// scenario looked at it. Sixty entries two seconds apart keep the recording
+/// playing for two minutes, far longer than any scenario runs. `gpus`,
+/// `instances` and `warnings` are the JSON array bodies (without brackets) of
+/// the snapshot's fields of those names.
+fn replay_recorded_snapshots(
+    world: &mut E2eWorld,
+    file_name: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
     let snapshot = |ts_us: u64| {
         format!(
             concat!(
@@ -194,12 +200,13 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
                 r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
                 r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
                 r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
-                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
-                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
-                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+                r#""gpus":[{gpus}],"gpu_system_info":null,"instances":[{instances}],"#,
+                r#""warnings":[{warnings}]}}}}"#,
             ),
             ts_us = ts_us,
-            warning = RECORDED_WARNING
+            gpus = gpus,
+            instances = instances,
+            warnings = warnings
         )
     };
     let recording_text: String = (0..60u64)
@@ -211,13 +218,29 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
         .expect("no isolated root")
         .path()
         .to_path_buf();
-    let recording = root.join("warning-recording.ndjson");
+    let recording = root.join(file_name);
     std::fs::write(&recording, recording_text)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
     let path = recording.to_string_lossy().to_string();
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
     world.tui = Some(session);
+}
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard.
+    replay_recorded_snapshots(
+        world,
+        "warning-recording.ndjson",
+        concat!(
+            r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+            r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        ),
+        "",
+        &format!(r#""{RECORDED_WARNING}""#),
+    );
 }
 
 /// One recorded instance per lifecycle state the Services manager colors. The
@@ -239,9 +262,6 @@ fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
     "the user opens the dashboard replaying a recording with running, starting, stopped and failed services"
 )]
 async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
-    // Sixty entries two seconds apart keep the recording playing for two
-    // minutes, far longer than the scenario runs (see the warning recording
-    // above: the dashboard forgets its latest snapshot when a replay ends).
     let instances = [
         recorded_instance("c1", "state-running", r#""running""#),
         recorded_instance("c2", "state-starting", r#"{"starting":{"phase":null}}"#),
@@ -249,36 +269,7 @@ async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
         recorded_instance("c4", "state-failed", r#""error""#),
     ]
     .join(",");
-    let snapshot = |ts_us: u64| {
-        format!(
-            concat!(
-                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
-                r#""timestamp":"2023-11-15T00:00:00Z","#,
-                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
-                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
-                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
-                r#""gpus":[],"gpu_system_info":null,"instances":[{instances}],"warnings":[]}}}}"#,
-            ),
-            ts_us = ts_us,
-            instances = instances
-        )
-    };
-    let recording_text: String = (0..60u64)
-        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
-        .collect();
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("no isolated root")
-        .path()
-        .to_path_buf();
-    let recording = root.join("service-states-recording.ndjson");
-    std::fs::write(&recording, recording_text)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
-    let path = recording.to_string_lossy().to_string();
-    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
-        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
-    world.tui = Some(session);
+    replay_recorded_snapshots(world, "service-states-recording.ndjson", "", &instances, "");
 }
 
 #[then("the header shows that one warning is reported")]
