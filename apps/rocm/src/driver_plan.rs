@@ -1152,8 +1152,6 @@ fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(unix)]
-    use std::fs;
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::process::Command as ProcessCommand;
