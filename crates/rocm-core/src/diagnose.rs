@@ -251,21 +251,29 @@ mod tests {
     #[test]
     fn no_checker_hand_sets_auto_applicable() {
         // The checkers live in this file and in the modules under `diagnose/`.
-        // Every file that holds one is listed here: a checker that moves into a
-        // file missing from this list would leave the guard passing vacuously.
-        let sources = [
-            include_str!("diagnose.rs"),
-            include_str!("diagnose/catalog.rs"),
-            include_str!("diagnose/engine.rs"),
-            include_str!("diagnose/host.rs"),
-            include_str!("diagnose/linux.rs"),
-            include_str!("diagnose/report.rs"),
-            include_str!("diagnose/scoring.rs"),
-            include_str!("diagnose/windows.rs"),
-            include_str!("diagnose/wsl.rs"),
-        ];
+        // The directory is read rather than listed, so a new child module is
+        // scanned without anyone remembering to add it here. Only the test-only
+        // `test_support.rs` is skipped: it builds `Examination` fixtures and no `Fix`.
+        let mut sources = vec![include_str!("diagnose.rs").to_owned()];
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/diagnose");
+        let mut scanned_children = 0;
+        for entry in std::fs::read_dir(dir).expect("the diagnose/ directory is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            let is_rust = path.extension().is_some_and(|ext| ext == "rs");
+            let is_test_support = path
+                .file_name()
+                .is_some_and(|name| name == "test_support.rs");
+            if is_rust && !is_test_support {
+                sources.push(std::fs::read_to_string(&path).expect("a readable source file"));
+                scanned_children += 1;
+            }
+        }
+        assert!(
+            scanned_children > 0,
+            "no module under {dir} was scanned, so this guard would pass vacuously"
+        );
         let offenders: Vec<&str> = sources
-            .into_iter()
+            .iter()
             .flat_map(|source| source.lines())
             .filter(|line| {
                 let trimmed = line.trim_start();
