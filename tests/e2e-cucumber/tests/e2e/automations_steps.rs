@@ -16,14 +16,20 @@
 //! listing's unit formatting, the bare listing's tolerance of a torn
 //! audit-log tail, the repair of one by the next audited command, and the
 //! size cap on the audit log and compaction of the
-//! proposal history (ROCMAI-729); the watcher/daemon trigger behaviour itself
-//! is covered separately.
+//! proposal history (ROCMAI-729). One scenario (automations-12) starts a real
+//! `rocmd run` and feeds it GPU thermal alerts through its loopback webhook; the
+//! rest of the watcher/daemon trigger behaviour is covered separately.
+
+use std::io::{Read, Write};
+use std::process::Stdio;
+use std::time::Duration;
 
 use cucumber::{given, then, when};
+use e2e_cucumber::polled_deadline::{PolledDeadline, RetryTiming};
 use rocm_core::{
     AuditEventRecord, AutomationProposalRecord, EVENT_LOG_ROTATE_BYTES,
     EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, append_automation_proposal,
-    jsonl_lock_path, load_automation_proposals,
+    jsonl_lock_path, load_automation_proposals, load_recent_automation_events,
 };
 
 use crate::E2eWorld;
@@ -119,6 +125,13 @@ fn refresh_harness_autostart_claim(world: &E2eWorld) {
 #[given("a daemon spawn is already in flight")]
 async fn daemon_spawn_in_flight(world: &mut E2eWorld) {
     plant_inflight_autostart_claim(world);
+}
+
+#[given("no automation watcher is enabled")]
+async fn no_watcher_enabled(_world: &mut E2eWorld) {
+    // The World already gives each scenario an isolated, empty config dir, where
+    // every watcher is off. Deliberately plants NO spawn-suppression marker: the
+    // scenario drives the real daemon spawn.
 }
 
 #[given("a pending artifact-download proposal approved for a size just under 1 MiB")]
@@ -547,6 +560,125 @@ async fn no_second_daemon(world: &mut E2eWorld) {
     );
 }
 
+/// How long the helper gets to publish its runtime state after the spawn, or
+/// to exit after its last watcher is disabled (it re-reads the config on a 5 s
+/// tick). Generous because the mock lane runs many scenarios at once.
+const HELPER_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The helper's recorded pid and `running` flag, read from the runtime state
+/// the daemon itself publishes — the same file `rocm daemon --status` reads.
+fn helper_runtime_state(world: &E2eWorld) -> Option<(u32, bool)> {
+    rocm_core::AutomationRuntimeState::load(&world.app_paths())
+        .ok()
+        .flatten()
+        .map(|state| (state.daemon_pid, state.running))
+}
+
+/// Teardown for a scenario that started a real helper: stop it if it is still
+/// alive, whatever step failed. The helper is found from the runtime state it
+/// published (when it says `running`) or, if it never got that far, from the
+/// autostart claim the spawn writes synchronously (honoured for the CLI's own
+/// 30 s). It is signalled only through `terminate_verified`, against the identity
+/// captured when the scenario saw it live, or captured now where the state or
+/// claim names a live pid — never by a bare pid. Best-effort: teardown must not
+/// panic.
+pub(crate) fn stop_leftover_helper(
+    paths: &rocm_core::AppPaths,
+    seen: Option<rocm_core::ProcessIdentity>,
+) {
+    let from_state = rocm_core::AutomationRuntimeState::load(paths)
+        .ok()
+        .flatten()
+        .filter(|state| state.running)
+        .map(|state| state.daemon_pid);
+    let from_claim = || {
+        let text = std::fs::read_to_string(paths.automation_autostart_claim_path()).ok()?;
+        let mut parts = text.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        let at_ms: u128 = parts.next()?.parse().ok()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        (now_ms.saturating_sub(at_ms) < 30_000).then_some(pid)
+    };
+    let identity = seen.or_else(|| {
+        from_state
+            .or_else(from_claim)
+            // Scenarios that suppress the spawn plant a state and claim naming
+            // this very harness; it is never the helper.
+            .filter(|pid| *pid != std::process::id())
+            .filter(|pid| rocm_core::process_is_running(*pid))
+            .map(rocm_core::ProcessIdentity::capture)
+    });
+    if let Some(identity) = identity {
+        let _ = rocm_core::terminate_verified(
+            &identity,
+            rocm_core::KillScope::Single,
+            std::time::Duration::from_secs(5),
+            true,
+        );
+    }
+}
+
+#[then("the CLI reports starting the background helper and it is running")]
+async fn helper_started_and_running(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("helper: started background automation daemon"),
+        "expected the enable to report starting the helper, got:
+{}",
+        combined(world)
+    );
+    // The claim is checked against the process: the helper publishes a running
+    // state under its own pid, and that pid is a live process.
+    let deadline = std::time::Instant::now() + HELPER_LIFECYCLE_TIMEOUT;
+    loop {
+        if let Some((pid, true)) = helper_runtime_state(world)
+            && rocm_core::process_is_running(pid)
+        {
+            world.helper_identity = Some(rocm_core::ProcessIdentity::capture(pid));
+            let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+            assert!(
+                status.contains("Status: running"),
+                "expected `rocm daemon --status` to report the helper running, got:
+{status}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper never published a running state under a live pid; state: {:?}",
+            helper_runtime_state(world)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[then("the background helper stops on its own")]
+async fn helper_stops_on_its_own(world: &mut E2eWorld) {
+    let (pid, _) = helper_runtime_state(world).expect("the helper recorded no runtime state");
+    let deadline = std::time::Instant::now() + HELPER_LIFECYCLE_TIMEOUT;
+    loop {
+        let running = helper_runtime_state(world).is_some_and(|(_, running)| running);
+        if !running && !rocm_core::process_is_running(pid) {
+            let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+            assert!(
+                status.contains("Status: not running"),
+                "expected `rocm daemon --status` to report the helper stopped, got:
+{status}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper (pid {pid}) was still running {}s after its last watcher was disabled",
+            HELPER_LIFECYCLE_TIMEOUT.as_secs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 #[then("the CLI confirms the watcher is disabled")]
 async fn confirm_disabled(world: &mut E2eWorld) {
     let out = ok_output(world);
@@ -748,6 +880,293 @@ async fn shows_still_pending(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("Proposal {OLD_PENDING_PROPOSAL} (pending)")),
         "expected the older pending proposal to still be found, got:\n{out}"
+    );
+}
+
+// ── Thermal alerts through a running daemon ────────────────────────
+
+/// The managed server the thermal alerts name.
+const HOT_SERVICE: &str = "e2e-hot";
+/// How often a wait re-reads the stores the daemon writes.
+const DAEMON_POLL: Duration = Duration::from_millis(100);
+/// Generous: the daemon answers in milliseconds, but the mock lane runs many
+/// scenarios at once and each blocks a worker while its `rocm` child runs.
+const DAEMON_WAIT: Duration = Duration::from_secs(30);
+
+/// A `rocmd run` the scenario started, and the local webhook it listens on.
+/// Killed and reaped on drop, so it never outlives the scenario.
+#[derive(Debug)]
+pub struct AutomationDaemon {
+    child: std::process::Child,
+    /// `http://127.0.0.1:<port>/automation-events`.
+    endpoint: String,
+}
+
+impl Drop for AutomationDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Re-check `ready` every [`DAEMON_POLL`] until it holds, counting only the time
+/// this step was actually polled (see `polled_deadline`).
+async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let mut deadline = PolledDeadline::start(RetryTiming {
+        timeout: DAEMON_WAIT,
+        resend_interval: DAEMON_POLL,
+        poll_interval: DAEMON_POLL,
+    });
+    while !ready() {
+        if let Some(expiry) = deadline.expired() {
+            panic!("gave up after {expiry} waiting for {what}");
+        }
+        let budget = deadline.budget(DAEMON_POLL);
+        deadline.run(tokio::time::sleep(budget)).await;
+    }
+}
+
+#[given("the GPU thermal-protection watcher is enabled in propose mode")]
+async fn thermal_watcher_in_propose_mode(world: &mut E2eWorld) {
+    crate::run_rocm_ok(
+        world,
+        &[
+            "automations",
+            "enable",
+            "gpu-thermal-protect",
+            "--mode",
+            "propose",
+        ],
+    );
+}
+
+/// The server's recorded process is a disposable `sleep` the scenario owns, not
+/// this harness: teardown stops every recorded service, and that signals the
+/// recorded pid.
+#[given("a ready managed model server")]
+async fn ready_managed_server(world: &mut E2eWorld) {
+    let process = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process to record");
+    let pid = process.id();
+    world.recorded_process = Some(process);
+
+    let paths = world.app_paths();
+    paths
+        .ensure()
+        .expect("failed to create the data directories");
+    // Planted as plain JSON, not through the record type: the harness exercises
+    // the CLI's own reading of the record.
+    let manifest = paths.service_manifest_path(HOT_SERVICE);
+    let record = serde_json::json!({
+        "service_id": HOT_SERVICE,
+        "engine": "vllm",
+        "model_ref": "tiny",
+        "canonical_model_id": "Tiny/Test",
+        "host": "127.0.0.1",
+        "port": 11435,
+        "endpoint_url": "http://127.0.0.1:11435/v1",
+        "mode": "managed",
+        "status": "ready",
+        "supervisor_pid": pid,
+        "supervisor_start_ticks": rocm_core::process_start_ticks(pid),
+        "engine_pid": null,
+        "manifest_path": manifest,
+        "log_path": paths.service_log_path(HOT_SERVICE),
+        "engine_state_path": paths.service_engine_state_path("vllm", HOT_SERVICE),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::create_dir_all(manifest.parent().expect("manifest path has a parent"))
+        .expect("failed to create the services directory");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize the record"),
+    )
+    .expect("failed to write the managed server record");
+}
+
+#[given("the automation daemon is running with its local webhook")]
+async fn daemon_running_with_webhook(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    // No `amd-smi` on PATH, so the daemon's own telemetry polling raises no
+    // alert of its own: the only alerts are the ones the scenario posts.
+    let empty_path = root.join("empty-path");
+    std::fs::create_dir_all(&empty_path).expect("failed to create the isolated PATH directory");
+    let (stdout_log, stderr_log) = (root.join("rocmd.out"), root.join("rocmd.err"));
+    let mut command = std::process::Command::new(crate::rocmd_binary());
+    // Port 0 binds an ephemeral port; the startup banner names the real one.
+    command.args(["run", "--automations-enabled", "--local-webhook-port", "0"]);
+    world.isolate_cmd(&mut command);
+    command
+        .env("PATH", &empty_path)
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stdout_log).expect("failed to create the rocmd stdout log"))
+        .stderr(std::fs::File::create(&stderr_log).expect("failed to create the rocmd stderr log"));
+    let child = command.spawn().expect("failed to start rocmd");
+    let mut daemon = AutomationDaemon {
+        child,
+        endpoint: String::new(),
+    };
+
+    let mut endpoint = None;
+    wait_until("rocmd to print its webhook endpoint", || {
+        let banner = std::fs::read_to_string(&stdout_log).unwrap_or_default();
+        endpoint = banner
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("local_webhook_endpoint: "))
+            .filter(|value| value.starts_with("http://"))
+            .map(str::to_owned);
+        if endpoint.is_none()
+            && let Ok(Some(status)) = daemon.child.try_wait()
+        {
+            panic!(
+                "rocmd exited with {status} before it was ready:\n{banner}\n{}",
+                std::fs::read_to_string(&stderr_log).unwrap_or_default()
+            );
+        }
+        endpoint.is_some()
+    })
+    .await;
+    daemon.endpoint = endpoint.expect("the wait returned without an endpoint");
+    world.automation_daemon = Some(daemon);
+}
+
+/// POST the thermal alert the dashboard's telemetry would raise for
+/// [`HOT_SERVICE`] to the daemon's local webhook, as a plain HTTP/1.1 request.
+fn post_thermal_alert(endpoint: &str) {
+    let (authority, path) = endpoint
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap_or_else(|| panic!("unexpected webhook endpoint `{endpoint}`"));
+    let body = serde_json::json!({
+        "watcher_hint": "gpu-thermal-protect",
+        "kind": "gpu.thermal_pressure",
+        "service_id": HOT_SERVICE,
+        "reason": "hotspot_temperature_threshold",
+        "payload": { "summary": "GPU 0 hotspot temperature is 96 C (limit 95 C)" },
+    })
+    .to_string();
+    let request = format!(
+        "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = std::net::TcpStream::connect(authority)
+        .unwrap_or_else(|error| panic!("failed to reach the webhook at {authority}: {error}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("failed to set the webhook read timeout");
+    stream
+        .write_all(request.as_bytes())
+        .expect("failed to send the thermal alert");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("failed to read the webhook's answer");
+    assert!(
+        response.starts_with("HTTP/1.1 202"),
+        "the daemon did not accept the thermal alert:\n{response}"
+    );
+}
+
+#[when(regex = r"^a GPU thermal alert for the server reaches the daemon(?: again)?$")]
+async fn thermal_alert_reaches_daemon(world: &mut E2eWorld) {
+    let daemon = world
+        .automation_daemon
+        .as_ref()
+        .expect("no automation daemon is running");
+    post_thermal_alert(&daemon.endpoint);
+}
+
+#[when("more proposals for other servers are queued after it than the history keeps")]
+async fn newer_proposals_for_other_servers(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    for n in 0..=REVIEWED_PROPOSALS_RETAINED {
+        append_automation_proposal(
+            &paths,
+            &AutomationProposalRecord {
+                at_unix_ms: 1_700_000_000_000,
+                proposal_id: String::new(),
+                watcher_id: "gpu-thermal-protect".to_owned(),
+                action: "queue_stop_server_proposal".to_owned(),
+                title: "Review GPU pressure stop".to_owned(),
+                message: "asking before stopping another server".to_owned(),
+                status: "pending".to_owned(),
+                service_id: Some(format!("e2e-other-{n}")),
+                tool: Some("stop_server".to_owned()),
+                arguments: serde_json::json!({}),
+                reviewed_at_unix_ms: None,
+            },
+        )
+        .expect("failed to queue a proposal for another server");
+    }
+}
+
+/// Stop requests for [`HOT_SERVICE`] still waiting for review.
+fn pending_stop_requests(paths: &rocm_core::AppPaths) -> usize {
+    load_automation_proposals(paths)
+        .expect("proposal history reads back")
+        .iter()
+        .filter(|proposal| {
+            proposal.status == "pending"
+                && proposal.tool.as_deref() == Some("stop_server")
+                && proposal.service_id.as_deref() == Some(HOT_SERVICE)
+        })
+        .count()
+}
+
+fn stop_already_waiting_recorded(paths: &rocm_core::AppPaths) -> bool {
+    load_recent_automation_events(paths, 50)
+        .expect("automation events read back")
+        .iter()
+        .any(|event| {
+            event.action == "stop_proposal_already_pending"
+                && event.service_id.as_deref() == Some(HOT_SERVICE)
+        })
+}
+
+#[then("one stop request for the server is waiting for review")]
+async fn one_stop_request_waiting(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    wait_until("the daemon to queue a stop request", || {
+        pending_stop_requests(&paths) >= 1
+    })
+    .await;
+    assert_eq!(pending_stop_requests(&paths), 1);
+}
+
+#[then("the daemon records that a stop request is already waiting for the server")]
+async fn daemon_records_stop_already_waiting(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    // A second stop request ends the wait too: that is the defect, and it is
+    // reported below rather than after a timeout.
+    wait_until("the daemon to handle the repeated alert", || {
+        stop_already_waiting_recorded(&paths) || pending_stop_requests(&paths) >= 2
+    })
+    .await;
+    assert!(
+        stop_already_waiting_recorded(&paths),
+        "the daemon queued another stop request instead of noting the first was still waiting; \
+         {} are now waiting",
+        pending_stop_requests(&paths)
+    );
+}
+
+#[then("only one stop request for the server is waiting for review")]
+async fn still_one_stop_request_waiting(world: &mut E2eWorld) {
+    assert_eq!(
+        pending_stop_requests(&world.app_paths()),
+        1,
+        "the repeated alert must not queue a second stop request for {HOT_SERVICE}"
     );
 }
 
