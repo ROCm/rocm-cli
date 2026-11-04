@@ -1703,11 +1703,11 @@ mod tests {
         // `run_agent_request_registers_tool_sets_and_enforces_turn_limit` below
         // asserts those tools are actually sent on the wire from that one site.
         //
-        // Telemetry/skill set: register_telemetry_tools registers exactly the
+        // Telemetry set: register_telemetry_tools registers exactly the
         // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
-        // TokensPerWatt, ListSkills, SkillPlan). Pinning the size here means the
-        // telemetry registration can't silently diverge from the canonical set.
-        assert_eq!(SKILL_NAMES.len(), 6, "canonical telemetry/skill set size");
+        // TokensPerWatt). Pinning the size here means the telemetry
+        // registration can't silently diverge from the canonical set.
+        assert_eq!(SKILL_NAMES.len(), 4, "canonical telemetry set size");
         for n in SKILL_NAMES {
             assert!(!n.is_empty(), "empty telemetry/skill tool name");
             // Telemetry tools are disjoint from both ROCm sets.
@@ -1811,6 +1811,13 @@ mod tests {
             assert!(
                 sent_tool_names.contains(expected),
                 "registered tool {expected} missing from the wire request"
+            );
+        }
+        // The retired skill-registry tools are not offered to the model.
+        for gone in ["list_skills", "skill_plan"] {
+            assert!(
+                !sent_tool_names.contains(gone),
+                "retired tool {gone} was sent on the wire request"
             );
         }
 
