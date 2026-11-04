@@ -2,7 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm serve` command handler and engine-recipe overrides.
+//! `rocm serve` command handler and the AIM pre-flight that runs inside it.
+//!
+//! The engine-recipe overrides `serve()` applies to the launch hint
+//! (`--tool-call-parser`, `--gpu-memory-utilization`, generation defaults and
+//! `--engine-env`) live in `serve_recipe.rs`; this file imports them by name.
 //!
 //! Originally a mechanical relocation from `main.rs` with no behavior change —
 //! the `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,

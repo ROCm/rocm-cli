@@ -3131,7 +3131,7 @@ mod tests {
         // `rocm serve`'s `parse_gpu_memory_utilization` rejects `<= 0` and
         // accepts `1`, so the domain is (0, 1]. The behaviour itself is proved
         // by `gpu_memory_utilization_rejects_out_of_range_and_unparsable_values`
-        // in `apps/rocm/src/serve_cmd.rs`, which rejects `0`/`0.0` and accepts
+        // in `apps/rocm/src/serve_recipe.rs`, which rejects `0`/`0.0` and accepts
         // `1`; this assertion pins only the wording that advertises it, which
         // has no behaviour of its own. `<0-1>` advertises `0`, and this
         // hint prints in three places (pre-launch note, engine OOM hint, and the

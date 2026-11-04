@@ -336,7 +336,7 @@ fn set_vllm_gpu_memory_utilization(flags: &mut Vec<String>, value: f64) {
 }
 
 /// Parse `rocm serve --gpu-memory-utilization`. Unlike the env-var overrides
-/// elsewhere in this file, an explicit CLI value is never silently ignored: a
+/// in `serve_cmd.rs`, an explicit CLI value is never silently ignored: a
 /// user who types a bad fraction is told so.
 pub(crate) fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
     let Some(raw) = value else {
