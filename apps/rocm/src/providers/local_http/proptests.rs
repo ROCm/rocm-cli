@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Property tests for the local provider's SSE transport readers.
+//! Property tests for the local provider's SSE transport readers, declared
+//! from `local_http.rs` so they sit with the readers they test.
 //!
 //! Each property re-frames one of the SSE bodies the unit tests in
 //! `providers.rs` already use (plus the same shape with CRLF line endings and
