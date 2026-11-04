@@ -189,6 +189,10 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// The `rocmd run` a daemon-driven automations scenario started, with the
+    /// local webhook it listens on. Held here so `Drop` can kill and reap it
+    /// whatever the scenario's outcome.
+    pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -345,6 +349,7 @@ impl Default for E2eWorld {
             helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
+            automation_daemon: None,
         }
     }
 }
@@ -607,10 +612,17 @@ impl E2eWorld {
     /// on every platform, instead of depending on an ambient system `/opt/rocm`
     /// that exists on the MI300X box but not on the Strix Windows runner.
     pub fn plant_unmanaged_rocm(&mut self) {
+        self.plant_unmanaged_rocm_reporting("6.0.0");
+    }
+
+    /// [`Self::plant_unmanaged_rocm`], with the version its `.info/version`
+    /// reports chosen by the scenario — for the install preview's note about a
+    /// host ROCm newer than the SDK it selects.
+    pub fn plant_unmanaged_rocm_reporting(&mut self, version: &str) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let rocm = root.path().join("legacy-rocm");
         std::fs::create_dir_all(rocm.join(".info")).expect("failed to create legacy rocm dir");
-        std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
+        std::fs::write(rocm.join(".info").join("version"), format!("{version}\n"))
             .expect("failed to write legacy rocm marker");
         self.legacy_rocm_path = Some(rocm);
     }
@@ -662,6 +674,11 @@ impl Drop for E2eWorld {
         // removed — so it never outlives the scenario or races teardown.
         if let Some(tui) = self.tui.take() {
             drop(tui);
+        }
+        // Stop the automation daemon before the isolated directory it writes its
+        // state and logs into is removed, so it never outlives the scenario.
+        if let Some(daemon) = self.automation_daemon.take() {
+            drop(daemon);
         }
         // Let `service-cleanup-07`'s staged launch finish and join it, so its last
         // write lands while the isolated root still exists rather than panicking
@@ -767,7 +784,7 @@ fn stop_managed_services(root: &std::path::Path) -> String {
             Ok(out) => format!(
                 "{service_id}: STOP FAILED (rc={}) {}",
                 out.status.code().unwrap_or(-1),
-                last_line(&String::from_utf8_lossy(&out.stderr))
+                e2e_cucumber::stop_failure_summary(&String::from_utf8_lossy(&out.stderr))
             ),
             Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
         });
@@ -776,21 +793,6 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         return format!("no services recorded in {}", services_dir.display());
     }
     outcomes.join("; ")
-}
-
-/// The last non-blank line of `text`, clipped, for a one-line failure summary.
-fn last_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > 200 {
-        format!("{}…", line.chars().take(200).collect::<String>())
-    } else {
-        line.to_owned()
-    }
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────

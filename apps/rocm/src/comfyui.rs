@@ -3667,8 +3667,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reinstall_replaces_code_and_keeps_user_data() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-keeps-data")?;
         let source = source_path_from_app_root(&app_root);
         plant_cached_source_archive(
@@ -3687,11 +3685,10 @@ mod tests {
         )?;
         let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
         let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
         )?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
 
         let rendered = install(&paths, &config, reinstall_options(false))?;
 
@@ -3905,8 +3902,6 @@ mod tests {
     /// check, so `install` runs to completion offline.
     #[cfg(unix)]
     fn plant_installable_release(paths: &AppPaths, app_root: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         plant_cached_source_archive(
             app_root,
             &[
@@ -3917,11 +3912,10 @@ mod tests {
         )?;
         let runtime = ready_runtime_manifest(paths, "reinstall-runtime")?;
         let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
         )?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
 
@@ -4382,18 +4376,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failure_after_the_swap_names_what_it_replaced() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-fails-after-swap")?;
         let source = source_path_from_app_root(&app_root);
         plant_installable_release(&paths, &app_root)?;
         let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
         let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}' > \"$2\"\n",
         )?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
 
         let error =
             install(&paths, &config, reinstall_options(false)).expect_err("the GPU check fails");
@@ -4442,18 +4433,15 @@ mod tests {
     #[test]
     fn only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it() -> Result<()>
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let (paths, config, app_root) = reinstall_fixture("comfyui-install-fails-no-swap")?;
         let source = source_path_from_app_root(&app_root);
         plant_installable_release(&paths, &app_root)?;
         let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
         let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &python,
             "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}' > \"$2\"\n",
         )?;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
         let plain = ComfyUiInstallOptions {
             runtime_id: None,
             reinstall: false,
@@ -5005,13 +4993,13 @@ mod archive_properties {
     /// of the app root, and the very next install step creates `models/`
     /// through it. Minimal shrunk counterexample: one entry, `l -> ..`.
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn source_unpack_never_writes_outside_the_app_root() {
         property("comfyui", entries(), ESCAPES_ONLY, false).unwrap();
     }
 
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn installed_source_path_is_a_real_directory() {
         property("comfyui-source-dir", entries(), ESCAPES_ONLY, true).unwrap();
     }
@@ -5041,7 +5029,7 @@ mod archive_properties {
     /// first install write, nothing may exist under `outside/` and `source`
     /// must be a real directory.
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn top_level_symlink_in_source_archive_does_not_redirect_the_install() {
         use crate::archive_props::{OUTSIDE_TOKEN, concretize};
         let layout = Layout::new();

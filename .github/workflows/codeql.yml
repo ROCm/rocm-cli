@@ -17,7 +17,7 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: static analysis; the image does not change what it finds
     permissions:
       security-events: write
       packages: read

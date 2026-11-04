@@ -1614,6 +1614,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_host_version_drops_only_an_all_digit_build_suffix() {
+        // An all-digit tail is a packaging build number and is dropped.
+        assert_eq!(
+            parse_host_version("7.2.4-98"),
+            parse_version_for_ordering("7.2.4")
+        );
+        assert!(parse_host_version("7.2.4-98").is_some());
+        // A PEP 440 pre-release spelled with `-` is kept and read as one.
+        assert_eq!(
+            parse_host_version("7.0.0-rc1"),
+            parse_version_for_ordering("7.0.0rc1")
+        );
+        // A tail that starts with a digit but is not all digits is neither a
+        // build number nor a PEP 440 stage. The whole string goes to the
+        // ordering parser, which cannot read it, so the host version is
+        // unreadable rather than silently read as `7.2.4`.
+        assert_eq!(parse_host_version("7.2.4-98rc1"), None);
+        assert_eq!(parse_version_for_ordering("7.2.4-98rc1"), None);
+        // What the user sees: an unreadable host version is "can't tell", so
+        // no host-newer note, even where the dropped-suffix reading (`7.20.1`)
+        // would have been newer than the version being installed.
+        assert!(host_version_newer_than(Some("7.20.1-33rc1".to_owned()), "7.13.0").is_none());
+        // An empty tail is not a build number: `.all()` holds vacuously on it,
+        // so without the emptiness guard `7.2.4-` would be read as `7.2.4`.
+        assert_eq!(parse_host_version("7.2.4-"), None);
+        // The rule is deliberately strict: only an all-digit tail is a build
+        // number, so distro-style packaging tails are unreadable too. The cost
+        // is a missing host-newer note for such a host, never a false one.
+        for distro_tail in [
+            "7.2.4-98.el9",
+            "6.4.1-120~22.04",
+            "7.2.4-98-1",
+            "7.2.4-98+local",
+        ] {
+            assert_eq!(parse_host_version(distro_tail), None, "{distro_tail}");
+        }
+    }
+
+    #[test]
     fn host_version_notes_and_warning_render_the_expected_text() {
         // Wheel path: the note names both versions and offers the --version override.
         let wheel = wheel_host_version_note("7.14.0", "7.13.0");

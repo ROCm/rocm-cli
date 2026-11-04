@@ -275,17 +275,41 @@ pub const SKILL_NAMES: [&str; 6] = [
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
 /// executor (None ⇒ a clear "not available in this mode" message; ApprovalRequired
-/// ⇒ a "needs approval" note — read-only tools shouldn't hit it, handled defensively).
-fn run_rocm_read_tool(exec: Option<&SharedRocmToolExecutor>, name: &str, args: &Value) -> Value {
-    match exec {
-        None => json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." }),
-        Some(e) => match e.execute(name, args) {
-            RocmToolOutcome::Result(v) => v,
-            RocmToolOutcome::Error(s) => json!({ "error": s }),
-            RocmToolOutcome::ApprovalRequired(_) => {
-                json!({ "error": "this action requires approval (interactive chat only)" })
-            }
-        },
+/// ⇒ a "needs approval" error and nothing runs — `rocm_command` lands here for
+/// any argv the bin classifies as mutating, since a read tool has no approval
+/// channel).
+///
+/// `execute()` is synchronous and can block for seconds or longer: the bin's
+/// read tools run host-probe subprocesses, make HTTP readiness probes of
+/// running managed services, and can fetch a package index (the SDK install
+/// preview) or call a configured model endpoint (a provider-assisted plan). So
+/// it runs on tokio's blocking pool, as the slash-tool path does, rather than on
+/// the async worker driving the agent — where it would stall every other task
+/// queued on that worker for as long as the executor takes. If the agent's
+/// request timeout fires first, the blocking call still runs to completion,
+/// including its incidental writes (refreshed service records, the package
+/// index cache), and its result is dropped.
+async fn run_rocm_read_tool(
+    exec: Option<&SharedRocmToolExecutor>,
+    name: &'static str,
+    args: Value,
+) -> Value {
+    let Some(exec) = exec.cloned() else {
+        return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
+    };
+    match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
+        Ok(RocmToolOutcome::Result(v)) => v,
+        Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
+        Ok(RocmToolOutcome::ApprovalRequired(_)) => {
+            json!({ "error": "this action requires approval (interactive chat only)" })
+        }
+        // A panic (or cancellation at runtime shutdown): log the details rather
+        // than hand a panic payload to the model, and so to a possibly remote
+        // provider; the model only needs to know the tool failed.
+        Err(e) => {
+            tracing::warn!(tool = name, error = %e, "ROCm read tool task failed");
+            json!({ "error": format!("ROCm tool `{name}` failed to run") })
+        }
     }
 }
 
@@ -314,7 +338,7 @@ macro_rules! rocm_read_tool {
             }
             async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                 record(&self.fired, $name);
-                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, &args))
+                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, args).await)
             }
         }
     };
@@ -1039,6 +1063,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_rocm_command_reports_approval_without_executing() {
+        // `rocm_command` is registered as a read-only tool, so it has no
+        // approval channel: when the executor classifies the argv as mutating,
+        // the tool must hand the model an error and run nothing.
+        let approved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingMutatingExec {
+            approved: approved.clone(),
+        });
+        let tool = RocmCommandRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "args": ["serve", "qwen", "--managed"] }))
+            .await
+            .expect("tool call ok");
+        assert!(
+            out.get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("requires approval")),
+            "an approval request must reach the model as an error, got {out}"
+        );
+        assert!(
+            approved.lock().unwrap().is_empty(),
+            "a read-only tool must never execute a mutating command"
+        );
+    }
+
+    #[tokio::test]
     async fn mutating_tool_none_executor_is_graceful() {
         let tool = LaunchServerRocmTool {
             executor: None,
@@ -1075,6 +1128,126 @@ mod tests {
                 "collision with read tool: {n}"
             );
         }
+    }
+
+    /// Executor whose `execute()` can only finish if the async runtime keeps
+    /// making progress while it runs: it spawns a task onto the current runtime
+    /// and blocks until that task has run. On an async worker thread the task
+    /// is stuck behind the blocked worker, so `execute()` gives up after
+    /// [`STALL_TIMEOUT`] and reports the stall instead of hanging the test.
+    #[derive(Debug)]
+    struct NeedsRuntimeProgressExec;
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    impl crate::tool_exec::RocmToolExecutor for NeedsRuntimeProgressExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::runtime::Handle::current().spawn(async move {
+                let _ = tx.send(());
+            });
+            match rx.recv_timeout(STALL_TIMEOUT) {
+                Ok(()) => RocmToolOutcome::Result(json!({ "ok": true })),
+                Err(_) => RocmToolOutcome::Error("async runtime stalled".to_string()),
+            }
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    #[test]
+    fn read_only_tool_call_does_not_block_the_async_runtime() {
+        // The bin's executor blocks (see `run_rocm_read_tool`). The dash runs
+        // the agent on a multi-thread runtime, which on a single-CPU host has
+        // one worker; a `call()` that ran `execute()` inline would hold that
+        // worker, and no other async task could run until the executor returned.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(NeedsRuntimeProgressExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // Spawned like the event loop spawns `agent.complete`, so the call runs
+        // on the runtime's worker rather than on the `block_on` thread.
+        let out = rt
+            .block_on(async move { tokio::spawn(async move { tool.call(json!({})).await }).await })
+            .expect("tool task joins")
+            .expect("tool call ok");
+        assert_eq!(
+            out,
+            json!({ "ok": true }),
+            "the executor ran on an async worker and starved the runtime"
+        );
+    }
+
+    /// Executor whose `execute()` panics, standing in for a bug in the bin.
+    #[derive(Debug)]
+    struct PanickingExec;
+    impl crate::tool_exec::RocmToolExecutor for PanickingExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            panic!("executor bug");
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    /// In-memory `tracing` writer, so a test can read back what was logged.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_reports_a_panicking_executor_as_a_tool_error() {
+        // A panic inside `execute()` must come back to the model as a tool
+        // error. Unwinding instead would end the spawned agent task without a
+        // reply, leaving the chat waiting on a turn that never finishes.
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(PanickingExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // `#[tokio::test]` runs on one thread, so the thread-local subscriber
+        // sees the warning logged after the blocking task is joined.
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = tool.call(json!({})).await.expect("tool call ok");
+        drop(guard);
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("WARN")
+                && logged.contains("examine")
+                && logged.contains("executor bug"),
+            "the panic must be logged with the tool name and payload, got: {logged}"
+        );
+        let error = out.get("error").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            error.contains("`examine` failed to run"),
+            "expected a tool error naming the tool, got {out}"
+        );
+        assert!(
+            !error.contains("executor bug"),
+            "the panic payload must not be sent to the model, got {out}"
+        );
     }
 
     #[tokio::test]

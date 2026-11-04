@@ -712,3 +712,14 @@ Feature: Interactive dashboard
     And each service's status is colored by its state
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # The Home "Running" tile counts a service that is still coming up and shows
+  # its stage, so a fresh serve is visible before the readiness probe passes.
+  # The seeded record is the one dash-03 uses (`starting` / `loading`).
+  @id:dash-home-lists-starting-service @requires-os:linux
+  Scenario: dash-41 - Home counts a still-loading model as running and shows its stage
+    Given a managed model is still loading
+    When the user opens the dashboard
+    Then the Home view counts the managed model as running and shows it as loading
+    When the user quits the dashboard
+    Then the dashboard exits successfully

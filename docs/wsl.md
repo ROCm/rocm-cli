@@ -303,9 +303,15 @@ below.
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
 - managed TheRock runtime count and active default runtime
 
-The driver, device-node, and group probes stay skipped. In the `--json` output,
-`has_amd_gpu` is therefore always false and `gpus` is empty on WSL, even on a
-healthy host, because both describe the bare-metal view.
+The driver, device-node, and group probes stay skipped, and `gpus` is empty on
+WSL, even on a healthy host, because it describes the bare-metal view. In the
+`--json` output, `has_amd_gpu` follows the GPU target the Windows side reports,
+the same value behind the text report's "AMD GPU detected" line, so the two
+forms agree. It says an AMD display adapter exists, not that ROCm can enumerate
+it from inside the distro: `rocm_sees_gpu` under `wsl` answers that. `has_apu`
+and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
+a listing that says whether the part is an APU or a discrete card, so
+`has_amd_gpu: true` beside both `false` is the expected WSL shape.
 
 ## Install UX Recommendations
 

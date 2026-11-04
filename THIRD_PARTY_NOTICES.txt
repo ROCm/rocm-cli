@@ -5966,6 +5966,7 @@ The following component(s) are licensed under Apache License 2.0:
   - atomic-waker 1.1.2 <https://github.com/smol-rs/atomic-waker>
   - backtrace 0.3.76 <https://github.com/rust-lang/backtrace-rs>
   - base64 0.22.1 <https://github.com/marshallpierce/rust-base64>
+  - base64 0.23.1 <https://github.com/marshallpierce/rust-base64>
   - bitflags 1.3.2 <https://github.com/bitflags/bitflags>
   - bitflags 2.13.0 <https://github.com/bitflags/bitflags>
   - blocking 1.6.2 <https://github.com/smol-rs/blocking>
@@ -6052,7 +6053,7 @@ The following component(s) are licensed under Apache License 2.0:
   - security-framework-sys 2.17.0 <https://github.com/kornelski/rust-security-framework>
   - security-framework 2.11.1 <https://github.com/kornelski/rust-security-framework>
   - security-framework 3.7.0 <https://github.com/kornelski/rust-security-framework>
-  - self-replace 1.5.0 <https://github.com/mitsuhiko/self-replace>
+  - self-replace 1.5.1 <https://github.com/mitsuhiko/self-replace>
   - serde_with 3.21.0 <https://github.com/jonasbb/serde_with/>
   - serde_with_macros 3.21.0 <https://github.com/jonasbb/serde_with/>
   - signal-hook-mio 0.2.5 <https://github.com/vorner/signal-hook>
@@ -8358,7 +8359,7 @@ The following component(s) are licensed under Apache License 2.0:
   - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - directories 6.0.0 <https://github.com/soc/directories-rs>
   - dirs-sys 0.5.0 <https://github.com/dirs-dev/dirs-sys-rs>
-  - dirs 6.0.0 <https://github.com/soc/dirs-rs>
+  - dirs 7.0.0 <https://codeberg.org/dirs/dirs-rs>
   - document-features 0.2.12 <https://github.com/slint-ui/document-features>
   - dyn-clone 1.0.20 <https://github.com/dtolnay/dyn-clone>
   - eventsource-stream 0.2.3 <https://github.com/jpopesculian/eventsource-stream>
@@ -8419,7 +8420,7 @@ The following component(s) are licensed under Apache License 2.0:
   - time-core 0.1.9 <https://github.com/time-rs/time>
   - time-macros 0.2.30 <https://github.com/time-rs/time>
   - time 0.3.51 <https://github.com/time-rs/time>
-  - typed-path 0.12.3 <https://github.com/chipsenkbeil/typed-path>
+  - typed-path 0.13.0 <https://github.com/chipsenkbeil/typed-path>
   - unicode-ident 1.0.24 <https://github.com/dtolnay/unicode-ident>
   - utf8parse 0.2.2 <https://github.com/alacritty/vte>
   - vte 0.15.0 <https://github.com/alacritty/vte>
@@ -10828,7 +10829,7 @@ MIT License
 
 The following component(s) are licensed under MIT License:
   - tokio-util 0.7.20 <https://github.com/tokio-rs/tokio>
-  - tokio 1.53.3 <https://github.com/tokio-rs/tokio>
+  - tokio 1.54.1 <https://github.com/tokio-rs/tokio>
 
 MIT License
 
@@ -11039,7 +11040,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - zip 9.0.5 <https://github.com/zip-rs/zip2>
+  - zip 9.1.2 <https://github.com/zip-rs/zip2>
 
 The MIT License (MIT)
 
