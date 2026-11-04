@@ -53,6 +53,9 @@ pub(crate) struct DeploymentSummary {
     pub api_model: String,
     /// Full chat-completions endpoint, e.g. `http://127.0.0.1:1337/v1/chat/completions`.
     pub chat_endpoint: String,
+    /// Base URL of the Anthropic-compatible endpoint (clients append
+    /// `/v1/messages`), when the service has published one.
+    pub anthropic_endpoint: Option<String>,
     pub service_id: String,
     /// `"ready"`, `"starting"`, or an existing service's status.
     pub status: String,
@@ -122,14 +125,20 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         ]
     };
 
+    let anthropic_rows: Vec<(&str, String)> = summary
+        .anthropic_endpoint
+        .iter()
+        .map(|url| ("anthropic endpoint", url.clone()))
+        .collect();
     let rows: Vec<(&str, String)> = [
         vec![
             ("status", summary.status.clone()),
             ("engine", summary.engine.clone()),
         ],
         model_rows,
+        vec![("endpoint", summary.chat_endpoint.clone())],
+        anthropic_rows,
         vec![
-            ("endpoint", summary.chat_endpoint.clone()),
             ("time to first token", format_ttft(summary.metrics.ttft)),
             ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
             ("service", summary.service_id.clone()),
@@ -449,6 +458,7 @@ mod tests {
             requested_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
             api_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
             chat_endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
+            anthropic_endpoint: None,
             service_id: "vllm-qwen-1720000000".to_owned(),
             status: "ready".to_owned(),
             already_running: false,
@@ -474,6 +484,26 @@ mod tests {
         assert_eq!(format_tps(None), "n/a");
         assert_eq!(format_tps(Some(0.0)), "n/a");
         assert_eq!(format_tps(Some(f64::INFINITY)), "n/a");
+    }
+
+    #[test]
+    fn summary_lists_the_anthropic_endpoint_beside_the_openai_one_when_published() {
+        let mut summary = base_summary();
+        summary.anthropic_endpoint = Some("http://127.0.0.1:41000".to_owned());
+        let rendered = render_summary(&summary);
+        let endpoint = rendered
+            .find("http://127.0.0.1:1337/v1/chat/completions")
+            .unwrap();
+        let anthropic = rendered.lines().any(|line| {
+            line.trim_start().starts_with("anthropic endpoint")
+                && line.ends_with("http://127.0.0.1:41000")
+        });
+        assert!(anthropic, "{rendered}");
+        let anthropic = rendered.find("anthropic endpoint").unwrap();
+        assert!(endpoint < anthropic, "{rendered}");
+        // Nothing published (the service is not ready, or the wait ran out):
+        // no row rather than a made-up one.
+        assert!(!render_summary(&base_summary()).contains("anthropic"));
     }
 
     #[test]
