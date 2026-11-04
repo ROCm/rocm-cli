@@ -352,12 +352,20 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
+  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
+  # image and a 9B checkpoint on a cold runner and may wait out the full
+  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. They run only when
+  # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
+  # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
+  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
+  # skip every night (the nightly job logs whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -372,7 +380,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim

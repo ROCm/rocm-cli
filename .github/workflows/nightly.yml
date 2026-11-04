@@ -718,7 +718,12 @@ jobs:
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    timeout-minutes: 90
+    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits when
+    # this host has Docker; on a host without it they skip and cost nothing.
+    # Whether it has Docker is unconfirmed: nothing in this job installs or checks
+    # it, so the "Report whether Docker is reachable" step logs the answer. If it
+    # does not, no nightly lane runs AIM serve and a pool-based one is needed.
+    timeout-minutes: 120
     # `native` disambiguates this runner from any host that might carry a bare
     # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
     # before the WSL lanes moved to the ephemeral pool) -- the paths below
@@ -769,6 +774,16 @@ jobs:
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
+      # silently. Say which it is, so a nightly that never ran them is visible.
+      - name: Report whether Docker is reachable (AIM serve scenarios need it)
+        run: |
+          if docker info >/dev/null 2>&1; then
+            echo "docker reachable: serve-26/27 (AIM) can run on this host"
+          else
+            echo "::warning::docker is not reachable on this host: serve-26/27 (AIM) will skip"
+          fi
 
       - name: Run E2E tests on Strix Halo (incl. nightly-only)
         run: |
