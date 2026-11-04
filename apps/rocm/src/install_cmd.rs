@@ -284,7 +284,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
 
-    /// The half `main.rs`'s
+    /// The half `cli.rs`'s
     /// `install_sdk_devel_flag_defaults_off_and_wires_through_when_passed` cannot reach: that the parsed flag is what
     /// the install request carries.
     ///

@@ -18,7 +18,7 @@
 //! `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
 //! as `crate::<name>` through the same re-import, so those three are
 //! `pub(crate)`. `builtin_engine_inventory` is `pub(crate)` too, because a
-//! `main.rs` test checks `--engine`'s help against it. It is a separate table
+//! `cli.rs` test checks `--engine`'s help against it. It is a separate table
 //! from `main.rs`'s `engine_inventory`, which stays where it is; the two are
 //! not merged.
 

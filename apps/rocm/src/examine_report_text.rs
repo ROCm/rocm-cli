@@ -104,7 +104,8 @@
 //! because their primary subject is unrelated: `missing_packaged_engine_reason`'s
 //! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`)
 //! and the whole-command-tree ASCII-help walk
-//! (`every_help_text_in_the_command_tree_is_ascii`). Two further such tests, for
+//! (`every_help_text_in_the_command_tree_is_ascii`, since moved to `cli.rs`
+//! with the rest of the clap tests). Two further such tests, for
 //! the CLI audit/lifecycle log, stayed there when this module was split out and
 //! have since moved to `cli_audit.rs`.
 

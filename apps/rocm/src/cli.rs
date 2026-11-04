@@ -1380,3 +1380,869 @@ impl PermissionsModeArg {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge_snapshot::builtin_engine_inventory;
+    use crate::{cli_command, device_policy_name};
+    use clap::{CommandFactory, Parser};
+    use rocm_engine_protocol::DevicePolicy;
+
+    #[test]
+    fn cli_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,
+    /// including clap's implicit `help` entry (it must sort into place, not be
+    /// pinned last).
+    ///
+    /// Renders the real help text (not just the command model) so the assertion
+    /// covers what clap actually prints.
+    #[test]
+    fn top_level_help_lists_commands_alphabetically() {
+        let help = cli_command().render_long_help().to_string();
+
+        let commands_section = help
+            .split_once("Commands:")
+            .expect("help output has a Commands section")
+            .1;
+
+        // Each command entry starts at a fixed two-space indent; wrapped
+        // description lines are indented further, so a non-space third column
+        // uniquely identifies a command row. Stop at the blank line that ends
+        // the section.
+        let names: Vec<String> = commands_section
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+
+        assert!(
+            names.iter().any(|name| name == "help"),
+            "expected the implicit `help` entry to appear in the list, got {names:?}"
+        );
+        assert!(
+            names.len() > 1,
+            "expected several visible subcommands, got {names:?}"
+        );
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "top-level `rocm --help` commands are not alphabetized"
+        );
+    }
+
+    #[test]
+    fn every_framework_choice_reaches_the_library() {
+        // The defect this flag fixes was not a missing enum -- the library had
+        // all four variants -- but that no caller could select one. Pin the
+        // mapping so a renamed variant cannot silently fall back to the default.
+        use rocm_core::FrameworkProbe;
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Auto),
+            FrameworkProbe::Auto
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Pytorch),
+            FrameworkProbe::PyTorch
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::LlamaCpp),
+            FrameworkProbe::LlamaCpp
+        );
+        assert_eq!(
+            FrameworkProbe::from(FrameworkArg::Skip),
+            FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn the_framework_choice_is_offered_on_the_command_line() {
+        // Guards the actual regression: the variants existed in the library and
+        // were unreachable from here. A user must be able to see and pass them.
+        let help = Cli::command()
+            .find_subcommand_mut("examine")
+            .expect("examine subcommand")
+            .render_long_help()
+            .to_string();
+        for choice in ["auto", "pytorch", "llama-cpp", "skip"] {
+            assert!(
+                help.contains(choice),
+                "`{choice}` must be offered by `rocm examine --help`:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_sdk_help_describes_the_gate_as_replacing_the_active_default() {
+        // `rocm install sdk --help` is the most-read description of the `--yes`
+        // gate, and it is the one surface a "reword every site" pass can miss —
+        // this branch's own history has it being missed once and corrected in a
+        // follow-up. So the assertions read the `yes` argument's own help text
+        // rather than the whole rendered page: the sibling
+        // `--approve-replacing-active-default` doc independently satisfies a
+        // page-wide "active default" match, which would keep a reverted `--yes`
+        // doc green.
+        //
+        // The effect is a displacement, not a deletion: in the default managed
+        // install root `runtime_key` embeds the resolved version, so an upgrade
+        // or downgrade lands in its own install root and the previous install
+        // stays on disk — only the active default moves. Claiming an overwrite
+        // here would promise a deletion that does not happen and contradict the
+        // prompt and the README.
+        let mut command = Cli::command();
+        let sdk = command
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand");
+        let yes = sdk
+            .get_arguments()
+            .find(|arg| arg.get_id() == "yes")
+            .expect("`install sdk` must offer --yes");
+        let yes_help = yes
+            .get_long_help()
+            .or_else(|| yes.get_help())
+            .expect("--yes must be documented")
+            .to_string();
+
+        assert!(
+            yes_help.contains("active default"),
+            "`--yes` must document itself as approving a replacement of the \
+             active default:\n{yes_help}"
+        );
+        assert!(
+            !yes_help.to_lowercase().contains("overwrit"),
+            "`--yes` must not claim an overwrite; an upgrade or downgrade leaves \
+             the previous install on disk:\n{yes_help}"
+        );
+    }
+
+    #[test]
+    fn install_sdk_help_separates_the_two_consents_yes_carries() {
+        // `--yes` approves two unrelated things: replacing the active default
+        // runtime, and running `sudo` for required system packages. The whole
+        // point of the narrow flag is that a caller with no terminal can grant
+        // the first without the second, so the help has to say so — a reader who
+        // believes it is a synonym for `--yes` will reach for `--yes` from a
+        // script and get a sudo prompt nothing can answer.
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--approve-replacing-active-default"),
+            "`rocm install sdk --help` must document the narrow consent flag:\n{help}"
+        );
+        assert!(
+            help.contains("does not approve system-package installs"),
+            "`rocm install sdk --help` must say the narrow flag excludes \
+             system-package installs:\n{help}"
+        );
+    }
+
+    #[test]
+    fn yes_help_says_what_happens_without_it_outside_a_terminal() {
+        // Wording pin: the sentences are only worth having while they are true,
+        // and the behavior itself is proven elsewhere —
+        //   uninstall              uninstall-04
+        //   runtimes uninstall     runtime-lifecycle-04
+        //   storage remove-*       storage-01, `removal_requires_yes_when_there_is_no_terminal_to_prompt`
+        //   fix                    diagnose-08, `consent_without_prompt` unit tests
+        //   install driver         driver-install-02
+        //   engines install        `system_package_install_action` unit tests
+        //   runtimes activate and rollback   runtime-lifecycle-11 and -14
+        //                          (--restart-services without --yes), -17 (--yes without it)
+        // Each entry is read from the `--yes` argument's own help, not the whole
+        // page, so a sibling flag cannot satisfy it.
+        // The trailing comma keeps `exit 1` from matching `exit 10`. Everything
+        // refuses with 1 except `fix`, whose exit 5 is its own declined status.
+        const REFUSES: &[&str] = &["(default: no)", "refuses with exit 1,"];
+        const NEVER_ASKS: &[&str] = &["never asks for confirmation"];
+        const NEVER_PROMPTS: &[&str] = &["never prompts"];
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["uninstall"], REFUSES),
+            (&["runtimes", "uninstall"], REFUSES),
+            (&["storage", "remove-old-installs"], REFUSES),
+            (&["storage", "remove-downloads"], REFUSES),
+            (
+                &["fix"],
+                &["(default: no)", "refuses with exit 5,", "also exits 5"],
+            ),
+            (&["install", "driver"], NEVER_ASKS),
+            (
+                &["engines", "install"],
+                &[
+                    "never asks for confirmation",
+                    // The least obvious sentence: no `--yes` still installs.
+                    "installs a missing package anyway",
+                    // Only OpenMPI's failure is an error; libatomic/libnuma warn.
+                    "only warns",
+                ],
+            ),
+            (&["runtimes", "activate"], NEVER_PROMPTS),
+            (&["runtimes", "rollback"], NEVER_PROMPTS),
+        ];
+        for (path, expected) in cases {
+            let mut command = Cli::command();
+            let mut subcommand = &mut command;
+            for name in *path {
+                subcommand = subcommand.find_subcommand_mut(name).unwrap_or_else(|| {
+                    panic!("no `{name}` subcommand on `rocm {}`", path.join(" "))
+                });
+            }
+            let yes = subcommand
+                .get_arguments()
+                .find(|arg| arg.get_id() == "yes")
+                .unwrap_or_else(|| panic!("`rocm {}` must offer --yes", path.join(" ")));
+            let yes_help = yes
+                .get_long_help()
+                .or_else(|| yes.get_help())
+                .unwrap_or_else(|| panic!("`rocm {} --yes` must be documented", path.join(" ")))
+                .to_string();
+            for phrase in *expected {
+                assert!(
+                    yes_help.contains(phrase),
+                    "`rocm {} --yes` help must contain `{phrase}`:\n{yes_help}",
+                    path.join(" ")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_scope_commands_are_marked_preview_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in ["chat", "comfyui", "automations"] {
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
+            assert!(
+                line.contains("[preview]"),
+                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime". The approval
+        // modal raised by a mutating `rocm runtimes …` from chat says the same
+        // noun too, but clap doesn't render that title — see
+        // `chat::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+    }
+
+    #[test]
+    fn the_preview_marker_is_explained_and_not_contradicted() {
+        let help = Cli::command().render_long_help().to_string();
+        // A marker nobody can interpret is no better than no marker.
+        assert!(
+            help.contains("Commands marked [preview]"),
+            "the marker must be explained in the help footer:\n{help}"
+        );
+        // A command cannot be promoted as a headline example while being marked
+        // unfinished — that is the contradiction this pairing exists to prevent.
+        let examples = help
+            .split_once("EXAMPLES:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        for command in ["chat", "comfyui", "automations"] {
+            assert!(
+                !examples.contains(&format!("rocm {command}")),
+                "`{command}` is marked preview, so it must not headline the examples:\n{examples}"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_load_rejects_zero_and_unbounded_numeric_arguments() {
+        for args in [
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--concurrency",
+                "0",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--isl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--osl",
+                "32769",
+            ]
+            .as_slice(),
+            [
+                "rocm",
+                "bench",
+                "load",
+                "--endpoint",
+                "http://localhost:8000",
+                "--requests",
+                "10001",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted invalid args: {args:?}"
+            );
+        }
+    }
+
+    fn serve_possible_values(arg_id: &str) -> Vec<String> {
+        let cli = Cli::command();
+        let serve = cli
+            .find_subcommand("serve")
+            .expect("serve subcommand exists");
+        serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_owned())
+            .collect()
+    }
+
+    // Both `--engine` and `--device` restrict their input to a fixed set via a
+    // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
+    // error (exit code 2) with the accepted choices listed. Values are advertised
+    // in `--help` and shell completion structurally (not a hand-written doc
+    // string), with one deliberate exception: `--device cpu_only` is
+    // `#[value(hide = true)]` — still accepted so its exit-1 rejection message
+    // survives, but kept out of help and completion. The sync tests below keep the
+    // advertised lists honest; `serve_device_help_lists_match_device_policy_names`
+    // compares against the full `DevicePolicy` set (hidden entries included, via
+    // `get_possible_values`), so a dropped or renamed variant still fails.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = serve_possible_values("engine");
+        let mut expected: Vec<String> = builtin_engine_inventory()
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --engine possible-values must stay in sync with builtin_engine_inventory()"
+        );
+    }
+
+    #[test]
+    fn serve_device_help_lists_match_device_policy_names() {
+        let mut listed = serve_possible_values("device");
+        let mut expected: Vec<String> = [
+            DevicePolicy::GpuRequired,
+            DevicePolicy::GpuPreferred,
+            DevicePolicy::CpuOnly,
+        ]
+        .iter()
+        .map(|policy| device_policy_name(policy).to_owned())
+        .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "serve --device possible-values must stay in sync with DevicePolicy names"
+        );
+    }
+
+    #[test]
+    fn serve_rejects_unknown_device_policy_as_usage_error() {
+        // An invalid `--device` must fail clap's value validation (a usage error,
+        // exit code 2) rather than parsing as a free-form string and failing later
+        // in application logic (exit code 1). This keeps `--device` consistent with
+        // every other enum-style argument and lists the valid choices in the error.
+        let error = parse_serve(&["--device", "bogus"]).expect_err("invalid device rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn serve_accepts_device_policy_values_and_aliases() {
+        for (value, expected) in [
+            ("gpu_required", DevicePolicyArg::GpuRequired),
+            ("gpu_preferred", DevicePolicyArg::GpuPreferred),
+            ("cpu_only", DevicePolicyArg::CpuOnly),
+            // Historical aliases stay accepted for backward compatibility.
+            ("auto", DevicePolicyArg::GpuRequired),
+            ("gpu", DevicePolicyArg::GpuRequired),
+            ("cpu", DevicePolicyArg::CpuOnly),
+        ] {
+            let cli = parse_serve(&["--device", value]).expect("device value parses");
+            match cli.command {
+                Some(Command::Serve { device, .. }) => {
+                    assert_eq!(device, Some(expected), "device value `{value}`");
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
+    }
+
+    fn parse_runtimes(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "runtimes"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    /// The two restart flags as `activate` and `rollback` parsed them.
+    fn runtimes_restart_flags(args: &[&str]) -> (bool, bool) {
+        match parse_runtimes(args).expect("flags parse").command {
+            Some(Command::Runtimes {
+                command:
+                    Some(
+                        RuntimesCommand::Activate {
+                            restart_services,
+                            yes,
+                            ..
+                        }
+                        | RuntimesCommand::Rollback {
+                            restart_services,
+                            yes,
+                        },
+                    ),
+            }) => (restart_services, yes),
+            other => panic!("expected runtimes activate or rollback, got {other:?}"),
+        }
+    }
+
+    // `--yes` approves a restart, so on its own it asks for something that was
+    // never requested. Mutation: removing `requires = "restart_services"` from
+    // either subcommand's `yes` makes that subcommand's argv parse and fails
+    // the loop on it.
+    #[test]
+    fn runtimes_activate_and_rollback_refuse_yes_without_restart_services() {
+        for args in [&["activate", "x", "--yes"][..], &["rollback", "--yes"][..]] {
+            let error = parse_runtimes(args)
+                .expect_err("a bare --yes has nothing to approve and must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "expected a missing-argument refusal for {args:?}"
+            );
+            assert!(
+                error.to_string().contains("restart-services"),
+                "the refusal must name the flag that is missing for {args:?}:\n{error}"
+            );
+        }
+    }
+
+    // Mutation: making `--restart-services` conflict with `--yes`, or dropping
+    // the `yes` field from either variant, fails the pair assertions.
+    #[test]
+    fn runtimes_restart_flags_parse_together_and_alone() {
+        for prefix in [&["activate", "x"][..], &["rollback"][..]] {
+            let mut together = prefix.to_vec();
+            together.extend(["--restart-services", "--yes"]);
+            assert_eq!(
+                runtimes_restart_flags(&together),
+                (true, true),
+                "{together:?}"
+            );
+
+            let mut alone = prefix.to_vec();
+            alone.push("--restart-services");
+            assert_eq!(runtimes_restart_flags(&alone), (true, false), "{alone:?}");
+
+            assert_eq!(runtimes_restart_flags(prefix), (false, false), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn runtimes_activate_parses_the_runtime_it_was_given() {
+        let cli = parse_runtimes(&["activate", "release-pip-x", "--restart-services", "--yes"])
+            .expect("activate parses");
+        match cli.command {
+            Some(Command::Runtimes {
+                command: Some(RuntimesCommand::Activate { runtime, .. }),
+            }) => assert_eq!(runtime, "release-pip-x"),
+            other => panic!("expected runtimes activate, got {other:?}"),
+        }
+    }
+
+    fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "serve", "qwen"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn serve_parses_verbose_and_no_smoke_test_flags() {
+        let cli = parse_serve(&["--verbose", "--no-smoke-test"]).expect("flags parse");
+        match cli.command {
+            Some(Command::Serve {
+                verbose,
+                no_smoke_test,
+                foreground,
+                managed,
+                ..
+            }) => {
+                assert!(verbose, "--verbose should set verbose");
+                assert!(no_smoke_test, "--no-smoke-test should set no_smoke_test");
+                assert!(!foreground);
+                assert!(!managed);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_verbose_conflicts_with_managed() {
+        // `--verbose` streams logs in the foreground; a backgrounded managed
+        // server has no foreground stream to attach to, so the two are mutually
+        // exclusive (point users at `rocm logs` for a managed server instead).
+        let error = parse_serve(&["--verbose", "--managed"]).expect_err("conflict rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn serve_defaults_have_all_flags_off() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve {
+                verbose,
+                no_smoke_test,
+                foreground,
+                managed,
+                ..
+            }) => {
+                assert!(!verbose && !no_smoke_test && !foreground && !managed);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_generation_flags() {
+        let cli = parse_serve(&[
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "128",
+        ])
+        .expect("generation flags parse");
+        match cli.command {
+            Some(Command::Serve {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(128));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_out_of_range_sampling() {
+        // top-p is a probability; temperature must be non-negative. Both are
+        // validated at the CLI boundary so a bad value never reaches the engine.
+        assert_eq!(
+            parse_serve(&["--top-p=1.5"])
+                .expect_err("top-p above 1.0 is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--temperature=-0.1"])
+                .expect_err("negative temperature is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--max-tokens=0"])
+                .expect_err("zero max-tokens is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn serve_negative_sampling_space_form_reaches_range_validator() {
+        // The space form (`--temperature -1`) must reach the value parser and
+        // report a value error, not be rejected by clap as an unexpected argument.
+        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
+        // makes both forms validate identically. `--max-tokens` shares the gotcha even
+        // though it is a positive integer: the ambiguity is at the tokenizer, before the
+        // value parser runs, so the space form must reach `parse_positive_u32` too.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            assert_eq!(
+                parse_serve(args)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_negative_sampling_space_form_reaches_range_validator() {
+        // Mirrors `serve_negative_sampling_space_form_reaches_range_validator`: the
+        // same numeric value flags carry `allow_negative_numbers` on `chat`, so the
+        // space form reaches the value parser instead of clap's unexpected-argument path.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            let mut argv = vec!["rocm", "chat", "--prompt", "hi"];
+            argv.extend_from_slice(args);
+            assert_eq!(
+                Cli::try_parse_from(argv)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_parses_generation_flags() {
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "chat",
+            "--prompt",
+            "hello",
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "64",
+        ])
+        .expect("chat generation flags parse");
+        match cli.command {
+            Some(Command::Chat {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(64));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_rejects_zero_max_tokens() {
+        let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
+            .expect_err("zero max-tokens is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn update_rejects_zero_timeout_secs() {
+        let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
+            .expect_err("zero timeout-secs is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `--any-age` and an explicit `--older-than-hours` would be two answers to
+    /// one question; clap has to reject the pair rather than silently pick one.
+    #[test]
+    fn services_prune_rejects_any_age_with_an_explicit_age() {
+        let error = Cli::try_parse_from([
+            "rocm",
+            "services",
+            "prune",
+            "--any-age",
+            "--older-than-hours",
+            "5",
+        ])
+        .expect_err("the two age arguments must conflict");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
+            "the conflict must name both arguments:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn update_dry_run_does_not_require_apply() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run"])
+            .expect("update --dry-run should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
+            .expect("update --apply --dry-run should still parse");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
+            .expect("update --dry-run --runtime should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
+            .expect("update --dry-run --activate should parse without --apply");
+    }
+
+    #[test]
+    fn update_dry_run_conflicts_with_json() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--json"]).expect_err(
+            "update --dry-run --json should be rejected instead of silently dropping --json",
+        );
+    }
+
+    #[test]
+    fn install_sdk_accepts_family_override() {
+        Cli::try_parse_from([
+            "rocm",
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--prefix",
+            "D:\\ROCm\\therock_venvs",
+            "--family",
+            "gfx110X-all",
+        ])
+        .expect("install sdk should accept a TheRock family override");
+    }
+
+    #[test]
+    fn install_sdk_devel_flag_defaults_off_and_wires_through_when_passed() {
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk"])
+            .expect("install sdk should parse with no flags");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(!devel, "--devel should default to false"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--devel"])
+            .expect("install sdk should accept --devel");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(devel, "--devel should set the flag to true"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t5_bench_load_clap_parse_smoke() {
+        // T5: verify BenchCommand::Load parses correctly including comma-separated concurrency.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "bench",
+            "load",
+            "--endpoint",
+            "http://x",
+            "--concurrency",
+            "1,8,32,64",
+        ])
+        .expect("rocm bench load should parse");
+        match cli.command {
+            Some(Command::Bench {
+                command: BenchCommand::Load { concurrency, .. },
+            }) => {
+                assert_eq!(concurrency, vec![1u32, 8, 32, 64]);
+            }
+            other => panic!("expected Bench/Load, got {other:?}"),
+        }
+    }
+
+    /// ROCMAI-543: the clap doc comments are the largest single surface of
+    /// user-facing text this fix rewrote, and nothing exercised them — no test
+    /// renders `--help` at all. Walking the whole command tree, rather than
+    /// only the top-level `--help`, is what makes this cover the edits that
+    /// were actually made: every one of them sits on a nested subcommand's
+    /// field or variant (`rocm runtime install --family`, `rocm services
+    /// prune --older-than-hours`, `rocm runtime rollback`'s `after_help`,
+    /// ...), none of which the top-level help renders. Asserting on the
+    /// rendered help rather than on individual strings means a future option
+    /// added anywhere in the tree is covered the day it lands.
+    #[test]
+    fn every_help_text_in_the_command_tree_is_ascii() {
+        fn assert_ascii_help(cmd: &mut clap::Command, path: &str) {
+            // Both renderings: `-h` and `--help` draw from different fields
+            // (`about` vs `long_about`, and clap truncates the short form at
+            // the first paragraph), so a non-ASCII character in a later
+            // paragraph is only visible in the long form.
+            for rendered in [cmd.render_help(), cmd.render_long_help()] {
+                let rendered = rendered.to_string();
+                assert!(
+                    rendered.is_ascii(),
+                    "`{path} --help` must be ASCII-only; non-ASCII punctuation renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): \
+                     {rendered}"
+                );
+            }
+            // Collect first: `find_subcommand_mut` needs a mutable borrow that
+            // cannot overlap the iterator borrowing `cmd`.
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                let child = cmd
+                    .find_subcommand_mut(&name)
+                    .expect("subcommand name was just enumerated from this command");
+                assert_ascii_help(child, &child_path);
+            }
+        }
+
+        assert_ascii_help(&mut Cli::command(), "rocm");
+    }
+}

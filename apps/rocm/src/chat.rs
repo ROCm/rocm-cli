@@ -4133,7 +4133,7 @@ mod tests {
         // `comfyui install`'s selection errors steer the user to `rocm runtimes`
         // and say "ROCm runtime". Running a mutating `rocm runtimes …` from chat
         // raises an approval modal whose title is written here, not by clap, so
-        // `main.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
+        // `cli.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
         // covers `--help` text) cannot reach it. It said "Change ROCm install"
         // until this rename.
         let action = chat_rocm_command_action_from_args(vec![
