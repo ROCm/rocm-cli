@@ -17,7 +17,7 @@ use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, instance_status_tone};
 use crate::ui::widgets::trunc;
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -354,25 +354,15 @@ pub(in crate::ui) const fn status_meta(
     theme: &Theme,
 ) -> (ratatui::style::Color, &'static str) {
     // The text label (incl. the DOWNLOADING/LOADING/WARMUP startup phases) is
-    // owned by `InstanceStatus::label`; only the color is chosen here.
-    let color = match status {
-        InstanceStatus::Ready | InstanceStatus::Running => theme.ok,
-        InstanceStatus::Starting { .. } => theme.warn,
-        InstanceStatus::Stopped | InstanceStatus::Error => theme.err,
-        InstanceStatus::Unknown => theme.muted,
-    };
-    (color, status.label())
+    // owned by `InstanceStatus::label`; the color by the shared
+    // `Theme::instance_status_color`, so every screen agrees on it.
+    (theme.instance_status_color(status), status.label())
 }
 
 /// Map an instance status to a bento box role so unselected cards take a
 /// health-driven border color.
 const fn status_role(status: InstanceStatus) -> BoxRole {
-    match status {
-        InstanceStatus::Running | InstanceStatus::Ready => BoxRole::Success,
-        InstanceStatus::Starting { .. } => BoxRole::Warning,
-        InstanceStatus::Stopped | InstanceStatus::Error => BoxRole::Danger,
-        InstanceStatus::Unknown => BoxRole::Muted,
-    }
+    BoxRole::from_tone(instance_status_tone(status))
 }
 
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

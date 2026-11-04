@@ -178,14 +178,20 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
 
-#[when("the user opens the dashboard replaying a recording that reports a warning")]
-async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
-    // A snapshot with a working GPU *and* a warning: the combination where the
-    // warning text used to be drawn nowhere in the dashboard. The dashboard
-    // forgets its latest snapshot the moment a replay ends, and replay caps the
-    // wait between entries at two seconds, so a single line would be gone before
-    // the scenario looked at it. Sixty entries two seconds apart keep the
-    // recording playing for two minutes, far longer than the scenario runs.
+/// Spawn `dash --replay` on a recording of identical snapshots. The dashboard
+/// forgets its latest snapshot the moment a replay ends, and replay caps the wait
+/// between entries at two seconds, so a single line would be gone before a
+/// scenario looked at it. Sixty entries two seconds apart keep the recording
+/// playing for two minutes, far longer than any scenario runs. `gpus`,
+/// `instances` and `warnings` are the JSON array bodies (without brackets) of
+/// the snapshot's fields of those names.
+fn replay_recorded_snapshots(
+    world: &mut E2eWorld,
+    file_name: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
     let snapshot = |ts_us: u64| {
         format!(
             concat!(
@@ -194,12 +200,13 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
                 r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
                 r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
                 r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
-                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
-                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
-                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+                r#""gpus":[{gpus}],"gpu_system_info":null,"instances":[{instances}],"#,
+                r#""warnings":[{warnings}]}}}}"#,
             ),
             ts_us = ts_us,
-            warning = RECORDED_WARNING
+            gpus = gpus,
+            instances = instances,
+            warnings = warnings
         )
     };
     let recording_text: String = (0..60u64)
@@ -211,13 +218,58 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
         .expect("no isolated root")
         .path()
         .to_path_buf();
-    let recording = root.join("warning-recording.ndjson");
+    let recording = root.join(file_name);
     std::fs::write(&recording, recording_text)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
     let path = recording.to_string_lossy().to_string();
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
     world.tui = Some(session);
+}
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard.
+    replay_recorded_snapshots(
+        world,
+        "warning-recording.ndjson",
+        concat!(
+            r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+            r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        ),
+        "",
+        &format!(r#""{RECORDED_WARNING}""#),
+    );
+}
+
+/// One recorded instance per lifecycle state the Services manager colors. The
+/// model name carries the state so the scenario can find each row by it.
+fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"container_id":"{id}","container_name":"vllm-{id}","status":{status},"#,
+            r#""model_name":"{model}","gpu_ids":["0"],"tensor_parallel_size":1,"#,
+            r#""vram_used_mb":0,"vram_total_mb":0,"gen_tps":null,"launch_args":[],"env_vars":{{}}}}"#,
+        ),
+        id = id,
+        model = model,
+        status = status_json
+    )
+}
+
+#[when(
+    "the user opens the dashboard replaying a recording with running, starting, stopped and failed services"
+)]
+async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
+    let instances = [
+        recorded_instance("c1", "state-running", r#""running""#),
+        recorded_instance("c2", "state-starting", r#"{"starting":{"phase":null}}"#),
+        recorded_instance("c3", "state-stopped", r#""stopped""#),
+        recorded_instance("c4", "state-failed", r#""error""#),
+    ]
+    .join(",");
+    replay_recorded_snapshots(world, "service-states-recording.ndjson", "", &instances, "");
 }
 
 #[then("the header shows that one warning is reported")]
@@ -1750,6 +1802,60 @@ async fn services_manager_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
+}
+
+#[then("each service's status is colored by its state")]
+async fn services_status_colored_by_state(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Every row carries its model name; waiting for the last one means the whole
+    // list has rendered.
+    tui.wait_for_screen("state-failed", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services list did not render every row: {e}"));
+    // A row is read only when it carries both the model name and the status
+    // word, and every such row (the Instances tab behind the overlay can draw
+    // one too) must agree, so no layout order can hide a wrong color.
+    let color = |model: &str, label: &str| {
+        let found = tui.foregrounds_in_rows_with(model, label);
+        let first = *found.first().unwrap_or_else(|| {
+            panic!(
+                "no row shows {label} next to {model}:\n{}",
+                tui.screen_text()
+            )
+        });
+        assert!(
+            found.iter().all(|c| *c == first),
+            "{label} next to {model} is not colored consistently: {found:?}\n{}",
+            tui.screen_text()
+        );
+        first
+    };
+    let running = color("state-running", "RUNNING");
+    let starting = color("state-starting", "STARTING");
+    let stopped = color("state-stopped", "STOPPED");
+    let failed = color("state-failed", "ERROR");
+    // Before the fix every row's status was painted the "ok" color, so a stopped
+    // or failed service looked as healthy as a running one.
+    assert_ne!(
+        running, stopped,
+        "a stopped service is colored like a running one"
+    );
+    assert_ne!(
+        running, failed,
+        "a failed service is colored like a running one"
+    );
+    assert_ne!(
+        running, starting,
+        "a starting service is colored like a running one"
+    );
+    assert_ne!(
+        starting, stopped,
+        "a stopped service is colored like a starting one"
+    );
+    assert_eq!(
+        stopped, failed,
+        "stopped and failed services are both errors and share a color"
+    );
 }
 
 #[then("the services manager is closed")]
