@@ -174,7 +174,7 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
-/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// The one warning `dash-39`'s recording reports. Short and ASCII so it stays on
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
 
@@ -390,6 +390,22 @@ async fn open_chat(world: &mut E2eWorld) {
     let session = TuiSession::spawn(world, args)
         .unwrap_or_else(|e| panic!("failed to open interactive chat: {e}"));
     world.tui = Some(session);
+}
+
+/// An empty simulated host root: no `/dev/kfd`, no WSL signals, so the
+/// dashboard daemon's GPU pre-flight fails whatever the runner really has.
+#[given("a machine with no GPU")]
+async fn machine_with_no_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(&root).expect("failed to create the simulated host root");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
 }
 
 #[when("the user opens the dashboard")]
@@ -1415,6 +1431,61 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the hero reports no GPU telemetry available")]
+async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
+    let tui = session(world);
+    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
+    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    // Runs after the resize: the header line carries the socket path and is
+    // cut off before "rocm daemon" at the default 80-column pty.
+    // A client that never reached the daemon also reads "Unknown GPU" with
+    // "—" values (`Disconnected` ends the pending placeholder), so first
+    // require the connected header, which proves a snapshot channel exists.
+    // Match "rocm daemon" rather than "connected", which "disconnected"
+    // contains.
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard never connected to its daemon: {e}"));
+
+    // `use_wide_size` only resizes the pty; the TUI redraws asynchronously
+    // once it processes the resulting SIGWINCH. Wait for that redraw by
+    // polling for the hero's wide-layout content, not just "Unknown GPU"
+    // (already visible pre-resize from the title bar alone).
+    tui.wait_for_screen_where(
+        "the hero's wide VRAM/TEMP/POWER layout",
+        |screen| screen.contains("Unknown GPU") && screen.contains("VRAM"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the no-GPU hero did not render: {e}"));
+    let screen = tui.screen_text();
+    for label in ["VRAM", "TEMP", "POWER"] {
+        let row = screen
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
+        // Check the text *after* the label, not the whole row: the
+        // utilization gauge on the same row draws its own "—" placeholder,
+        // which would make this pass even if this mini-spark's value were a
+        // fake reading instead of the placeholder.
+        let after_label = row.split_once(label).map_or_else(
+            || panic!("no text after {label} on row:\n{row}"),
+            |(_, rest)| rest,
+        );
+        assert!(
+            after_label.contains('—'),
+            "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
+        );
+    }
+}
+
 #[then("the dashboard reports live GPU telemetry")]
 async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     let tui = session(world);
@@ -1890,7 +1961,7 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
 }
 
 /// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
-/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// `ui/menu.rs`) down to "Quit" and activates it — `j` twice from the
 /// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
 /// the menu to already be open (`the dashboard menu is displayed`).
 #[when("the user selects Quit from the dashboard menu")]

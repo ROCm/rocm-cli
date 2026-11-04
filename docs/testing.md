@@ -516,7 +516,7 @@ Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
 when changing it:
 
 - `gfx_target_has_no_rocm_build` in
-  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  [gfx_target.rs](../crates/rocm-core/src/gfx_target.rs) is deliberately conjoined
   with `normalize_therock_family` returning `None`. Do not simplify it to a bare
   target-name check. Every test that drives the refusal does so by naming the
   target explicitly, and the conjunct is the only reason any of them is also
@@ -532,7 +532,7 @@ when changing it:
   which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
   no GPU tag. The detected-GPU wording itself is covered at unit level by
   `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
-  [therock.rs](../apps/rocm/src/therock.rs).
+  [family.rs](../apps/rocm/src/therock/family.rs).
 
 The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
 end-to-end lane at all, and that gap is stated here rather than papered over.
@@ -845,6 +845,7 @@ cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
 cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
+cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
@@ -1123,7 +1124,7 @@ would simply deadlock. Both tests therefore stage the launch from a second
 thread and let the code under test block on it.
 
 - `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
-  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  ([`apps/rocm/src/service_records.rs`](../apps/rocm/src/service_records.rs)) holds the lock on the main thread with only the key
   written, runs `prune` on a worker, asserts the worker does *not* report
   completion while the lock is held, then publishes the record and releases.
   Two assertions fail independently if the acquire is removed: that negative
@@ -1796,7 +1797,10 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; cover generated private-key PEM packaging and
+sidecars before activation; assert the installer's get-started block (banner art
+only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+piped or `NO_COLOR` output (the colored TTY branch is not driven by any
+scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config
@@ -2197,9 +2201,9 @@ value `sh` would assign or nothing: the driver plan
 ([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
-examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
-([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 

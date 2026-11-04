@@ -14,20 +14,19 @@
 //! action of the service-record-management cluster (this module reaches only
 //! stop, via `AttachOutcome::Stop`; restart/remove/prune are not called here)
 //! — and this later pass (ROCMAI-91, Phase 6b) separates the spawning tail out
-//! from them; they stay at the crate root (see below).
+//! from them; see below for where they live now.
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
-//! services(command)` doesn't call anything in this cluster directly, and
-//! `ServicesCommand`/`services()` stay in `main.rs` (a dedicated clap
-//! subcommand's enum and dispatch function usually do, per
-//! `docs/architecture.md`'s convention note). `record_cli_audit_event`,
-//! `existing_live_managed_service`, and the broader "service record management"
-//! cluster (stop/restart/remove/prune, reached from `services()`; stop/restart
-//! are also reachable from the chat/LLM sandbox tool-calling path) stay at the
-//! crate root too — reached via `crate::`, same as other mechanically relocated
-//! modules. Several functions here are `pub(crate)` specifically because
-//! `main.rs`, `serve_cmd.rs`, and `automations.rs` all call into this cluster
-//! across the new module boundary.
+//! services(command)` doesn't call anything in this cluster directly.
+//! `ServicesCommand` stays in `main.rs` (a dedicated clap subcommand's enum
+//! usually does, per `docs/architecture.md`'s convention note). Since this
+//! split, `services()` has moved to `services_cmd.rs`, the record removal and
+//! pruning it dispatches to to `service_records.rs`, `record_cli_audit_event`
+//! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
+//! a re-import in `main.rs`), and `existing_live_managed_service` to
+//! `managed_service_status.rs`. Several functions here are `pub(crate)`
+//! specifically because `main.rs`, `serve_cmd.rs`, and `automations.rs` all
+//! call into this cluster across the new module boundary.
 
 use std::fmt::Write as _;
 use std::fs;

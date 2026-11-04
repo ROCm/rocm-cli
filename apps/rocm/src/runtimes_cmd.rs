@@ -653,11 +653,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            ACTIVE_RUNTIME_MARKER
+            Some(ACTIVE_RUNTIME_MARKER)
         } else if rollback {
-            ROLLBACK_RUNTIME_MARKER
+            Some(ROLLBACK_RUNTIME_MARKER)
         } else {
-            " "
+            None
         };
         let status = runtime_usability_status(&manifest);
         let mode = if manifest.read_only {
@@ -669,17 +669,21 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         // says, so an install missing it should not be silent about that.
         // `rocm examine` reports the same thing for the active runtime.
         let toolchain = toolchain_state_text(manifest.includes_devel());
-        let _ = writeln!(
-            output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
-            manifest.runtime_key,
-            manifest.runtime_id,
-            therock::runtime_version_display(&manifest.version),
-            manifest.format,
-            manifest.family,
-            mode,
-            status,
-            toolchain
+        cli_report::write_marked_row(
+            &mut output,
+            "  ",
+            marker,
+            format_args!(
+                "{} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
+                manifest.runtime_key,
+                manifest.runtime_id,
+                therock::runtime_version_display(&manifest.version),
+                manifest.format,
+                manifest.family,
+                mode,
+                status,
+                toolchain
+            ),
         );
         let _ = writeln!(
             output,
@@ -1847,6 +1851,38 @@ pub(crate) mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn render_runtimes_text_keeps_every_row_in_the_marker_layout() -> Result<()> {
+        let (root, paths) = test_paths("runtime-row-layout");
+        for (key, version, build) in [
+            ("rt-active", "7.13.0", 30),
+            ("rt-rollback", "7.12.0", 20),
+            ("rt-idle", "7.11.0", 10),
+        ] {
+            write_test_pip_runtime(&paths, key, "therock-release:gfx120X-all", version, build)?;
+        }
+        let config = RocmCliConfig {
+            active_runtime_key: Some("rt-active".to_owned()),
+            previous_runtime_key: Some("rt-rollback".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let _ = fs::remove_dir_all(root);
+
+        for expected in [
+            format!("  {ACTIVE_RUNTIME_MARKER} rt-active runtime_id="),
+            format!("  {ROLLBACK_RUNTIME_MARKER} rt-rollback runtime_id="),
+            "    rt-idle runtime_id=".to_owned(),
+        ] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
         Ok(())
     }
 
