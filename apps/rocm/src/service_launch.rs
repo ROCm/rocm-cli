@@ -691,6 +691,62 @@ fn wait_past_readiness_budget(
     }
 }
 
+/// Whether `pid` is a running process that is not a zombie. The serve
+/// supervisor is an unreaped child of this process, so after it dies
+/// `process_is_running` alone keeps reporting it alive.
+fn service_pid_is_alive(pid: u32) -> bool {
+    rocm_core::process_is_running(pid) && !process_is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` may contain spaces and parentheses; the state follows the last `)`.
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .and_then(|rest| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// Whether the record still describes a server that can finish starting: its
+/// status is a live one *and* a tracked process is alive. The status alone is
+/// not enough, since a killed engine never writes a terminal state.
+fn record_still_live(record: &ManagedServiceRecord, pid_alive: impl Fn(u32) -> bool) -> bool {
+    if !crate::managed_service_status::managed_service_is_live(record) {
+        return false;
+    }
+    let pids = crate::managed_service_status::recorded_service_pids(record);
+    pids.is_empty() || pids.into_iter().any(pid_alive)
+}
+
+/// [`record_still_live`] over the manifest on disk, so a `rocm services stop`
+/// from another terminal (which writes only the manifest) ends the wait too.
+fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32) -> bool) -> bool {
+    let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
+        return false;
+    };
+    let _ = latest.refresh_from_engine_state();
+    record_still_live(&latest, pid_alive)
+}
+
+/// Record a server that died mid-start as stopped, leaving a manifest that a
+/// `services stop` already settled untouched.
+fn settle_exited_service(paths: &AppPaths, service_id: &str) {
+    if let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id)
+        && crate::managed_service_status::managed_service_is_live(&latest)
+    {
+        latest.status = "stopped".to_owned();
+        let _ = latest.write();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     engine: &str,
@@ -758,15 +814,20 @@ pub(crate) fn start_managed_service(
     let readiness = if wait_until_ready {
         wait_past_readiness_budget(
             || probe(&mut *on_wait_tick),
-            || {
-                let mut latest = record.clone();
-                let _ = latest.refresh_from_engine_state();
-                crate::managed_service_status::managed_service_is_live(&latest)
-            },
+            || service_still_live(&paths, service_id, service_pid_is_alive),
         )
     } else {
         probe(on_wait_tick)
     };
+    if wait_until_ready
+        && readiness != EndpointReadiness::Serving
+        && !service_still_live(&paths, service_id, service_pid_is_alive)
+    {
+        settle_exited_service(&paths, service_id);
+        bail!(
+            "the server exited before it became ready; see `rocm logs --service {service_id}` for its output"
+        );
+    }
     let launch_status = status_for_readiness(readiness);
     record.status = launch_status.to_owned();
     if readiness == EndpointReadiness::Serving {
@@ -1493,6 +1554,96 @@ mod tests {
             || panic!("liveness is irrelevant once serving"),
         );
         assert_eq!(result, EndpointReadiness::Serving);
+    }
+
+    fn record_tracking_pid(paths: &AppPaths, pid: u32, status: &str) -> ManagedServiceRecord {
+        let mut record = reusable_record(paths);
+        record.supervisor_pid = pid;
+        record.status = status.to_owned();
+        record
+    }
+
+    #[cfg(unix)]
+    fn exited_child_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn record_still_live_ends_the_wait_for_a_dead_pid_with_a_live_status() {
+        // The engine was killed before writing any terminal state: the status
+        // still says `starting`, but nothing tracked is running.
+        let (root, paths) = test_paths("wait-dead-pid");
+        paths.ensure().expect("paths");
+        let dead = record_tracking_pid(&paths, exited_child_pid(), "starting");
+        assert!(!record_still_live(&dead, service_pid_is_alive));
+
+        let alive = record_tracking_pid(&paths, std::process::id(), "starting");
+        assert!(record_still_live(&alive, service_pid_is_alive));
+
+        // A settled status ends the wait even while the pid is still around.
+        let stopped = record_tracking_pid(&paths, std::process::id(), "stopped");
+        assert!(!record_still_live(&stopped, service_pid_is_alive));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn service_pid_is_alive_treats_an_unreaped_child_as_dead() {
+        // The serve supervisor is our own unreaped child; once it dies it is a
+        // zombie that `kill(pid, 0)` still reports as running.
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !process_is_zombie(pid) {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_running(pid),
+            "a zombie still answers kill(pid, 0)"
+        );
+        assert!(!service_pid_is_alive(pid));
+        child.wait().expect("reap");
+    }
+
+    #[test]
+    fn service_still_live_follows_the_manifest_on_disk() {
+        // `rocm services stop` from another terminal writes only the manifest.
+        let (root, paths) = test_paths("wait-manifest");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.write().expect("write");
+        assert!(service_still_live(&paths, &record.service_id, |_| true));
+
+        record.status = "stopped".to_owned();
+        record.write().expect("write");
+        assert!(!service_still_live(&paths, &record.service_id, |_| true));
+        assert!(!service_still_live(&paths, "no-such-service", |_| true));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settle_exited_service_demotes_a_live_manifest_and_spares_a_settled_one() {
+        let (root, paths) = test_paths("wait-settle");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.write().expect("write");
+        settle_exited_service(&paths, &record.service_id);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "stopped");
+
+        // A stop that already settled the record keeps its own fields.
+        record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = Some(7);
+        record.write().expect("write");
+        settle_exited_service(&paths, &record.service_id);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.stop_requested_unix_ms, Some(7));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

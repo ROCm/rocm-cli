@@ -383,6 +383,14 @@ Expected result:
   block at all.
 - `rocm services list --all` shows saved history, including the failed or
   stopped attempts the default view hides.
+- `rocm services logs <service-id> --follow` prints the recent output, then new
+  output as it arrives (a download bar redraws on one terminal row), and returns
+  by itself with `Service <id> is <status>; stopped following.` once the server
+  stops; Ctrl-C ends the follow and the server keeps running.
+- `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
+  server answers. If the server is killed or stopped meanwhile, it exits non-zero
+  with `the server exited before it became ready` and a `rocm logs --service`
+  pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the

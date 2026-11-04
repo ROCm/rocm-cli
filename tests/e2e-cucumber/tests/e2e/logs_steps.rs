@@ -169,6 +169,13 @@ async fn follow_stopped_server(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user follows that server's logs with rocm services logs -f")]
+async fn follow_stopped_server_through_services(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["services", "logs", FOLLOW_SERVICE_ID, "-f"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user asks to follow logs without naming a service")]
 async fn follow_without_service(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--follow"]);

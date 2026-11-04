@@ -18,7 +18,10 @@
 //! status surfaces (`render_services_text`, `render_services_json`,
 //! `render_service_logs_text`, `render_service_logs_text_with_options`,
 //! `render_service_action_result`, `read_managed_service_manifest`,
-//! `load_managed_service`), the internal `rocmd`-compatible status/sandbox
+//! `load_managed_service`), the `--follow` tail behind `rocm logs --service
+//! <id> --follow` and `rocm services logs <id> --follow`
+//! (`follow_service_logs`, `follow_service_logs_with`, the `LogTail` and
+//! `LogSegment` types, `write_log_segments`), the internal `rocmd`-compatible status/sandbox
 //! surface (`render_internal_status_text`, `run_internal_sandbox_tool`), and
 //! the managed-service stop/restart implementation behind both the sandbox
 //! tool and `rocm services stop|restart` (`terminate_recorded_service_pids`,
@@ -46,8 +49,9 @@
 //! `render_service_logs_text`, `render_logs_browser_text`, and
 //! `render_logs_text` — re-imported via `use crate::services_text::{...};`.
 //! `services_cmd.rs`'s `services()` calls `render_services_text`,
-//! `render_services_json` and `render_service_logs_text` through its own
-//! imports, and its `run_approved_service_action` also reads
+//! `render_services_json`, `render_service_logs_text` and
+//! `follow_service_logs` through its own imports, and `dispatch()` calls
+//! `follow_service_logs` for `rocm logs --service <id> --follow`, and its `run_approved_service_action` also reads
 //! `render_service_action_result`, `run_internal_sandbox_tool`, and
 //! `validate_service_id`. `service_records.rs` reads `validate_service_id`
 //! (in `service_record_artifacts` and `remove_managed_service_record`) and
@@ -609,6 +613,12 @@ impl LogTail {
         let mut index = 0;
         while index < self.pending.len() {
             let byte = self.pending[index];
+            // A `\r` at the very end of the data may be the first half of a `\r\n`
+            // that the next poll completes; hold it back rather than emit an
+            // empty segment (which would erase a final redraw frame on a tty).
+            if byte == b'\r' && index + 1 == self.pending.len() {
+                break;
+            }
             if byte == b'\n' || byte == b'\r' {
                 let mut redraw = byte == b'\r';
                 let text = String::from_utf8_lossy(&self.pending[start..index]).into_owned();
@@ -624,6 +634,19 @@ impl LogTail {
         }
         self.pending.drain(..start);
         segments
+    }
+
+    /// The unterminated output still held back, for when following ends: a
+    /// last write cut short by a crash is otherwise never shown.
+    fn finish(&mut self) -> Option<LogSegment> {
+        let mut bytes = std::mem::take(&mut self.pending);
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        (!bytes.is_empty()).then(|| LogSegment {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            redraw: false,
+        })
     }
 }
 
@@ -695,7 +718,9 @@ fn follow_service_logs_with(
         let record = load_managed_service(paths, service_id)?;
         if !managed_service_is_live(&record) {
             // Output written between the last poll and the exit.
-            write_log_segments(out, &tail.poll(), tty)?;
+            let mut last = tail.poll();
+            last.extend(tail.finish());
+            write_log_segments(out, &last, tty)?;
             if tty {
                 writeln!(out)?;
             }
@@ -1872,6 +1897,67 @@ mod tests {
     }
 
     #[test]
+    fn log_tail_holds_back_a_trailing_cr_and_flushes_the_rest_on_finish() -> Result<()> {
+        let (root, paths) = test_paths("log-tail-edges");
+        paths.ensure()?;
+        let log = root.join("edges.log");
+        fs::write(&log, "")?;
+        let mut tail = LogTail::at_end(&log);
+
+        // A `\r` ending the data may be half of a `\r\n`: it is not a redraw yet.
+        fs::write(&log, " 99%|#\r")?;
+        assert!(tail.poll().is_empty());
+        let mut file = fs::OpenOptions::new().append(true).open(&log)?;
+        std::io::Write::write_all(&mut file, b"\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: " 99%|#".into(),
+                redraw: false
+            }],
+            "the held `\\r` joins the next `\\n` instead of yielding an empty segment"
+        );
+
+        // Output cut short before any terminator is shown when following ends.
+        std::io::Write::write_all(&mut file, b"crashed mid-wri")?;
+        assert!(tail.poll().is_empty());
+        assert_eq!(
+            tail.finish(),
+            Some(LogSegment {
+                text: "crashed mid-wri".into(),
+                redraw: false
+            })
+        );
+        assert_eq!(tail.finish(), None);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn write_log_segments_redraws_in_place_only_on_a_tty() -> Result<()> {
+        let segments = [
+            LogSegment {
+                text: "28%".into(),
+                redraw: true,
+            },
+            LogSegment {
+                text: "done".into(),
+                redraw: false,
+            },
+        ];
+        let mut tty = Vec::new();
+        write_log_segments(&mut tty, &segments, true)?;
+        // A redraw segment leaves the cursor on its row; the next segment (or
+        // line) erases the row first, and a plain line ends with a newline.
+        assert_eq!(String::from_utf8(tty)?, "\r\x1b[2K28%\r\x1b[2Kdone\n");
+
+        let mut piped = Vec::new();
+        write_log_segments(&mut piped, &segments, false)?;
+        assert_eq!(String::from_utf8(piped)?, "28%\ndone\n");
+        Ok(())
+    }
+
+    #[test]
     fn follow_service_logs_prints_snapshot_and_returns_for_a_stopped_service() -> Result<()> {
         let (root, paths) = test_paths("follow-stopped");
         paths.ensure()?;
@@ -1937,14 +2023,19 @@ mod tests {
         let log_path = record.log_path;
         let manifest_paths = paths.clone();
         let writer = thread::spawn(move || -> Result<()> {
-            thread::sleep(Duration::from_millis(150));
-            let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
-            std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
-            thread::sleep(Duration::from_millis(150));
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            // Stop the service even when the append failed, so the follow loop
+            // under test always ends instead of hanging the run.
             let mut record = load_managed_service(&manifest_paths, "svc_follow_live")?;
             record.status = "stopped".to_owned();
             record.write()?;
-            Ok(())
+            appended
         });
         let mut out = Vec::new();
         follow_service_logs_with(

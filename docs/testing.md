@@ -1010,7 +1010,8 @@ rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
 While a first-time model download is running, `rocm serve <model> --wait` keeps
-waiting past the usual 45 seconds until the server answers (or exits), and
+waiting past the usual 45 seconds until the server answers (or exits, which fails the
+command), and
 `--wait` with `--verbose` or `--foreground` is refused (`serve-41`). Run the
 log follow above from a second terminal to watch the download.
 
