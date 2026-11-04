@@ -19,6 +19,16 @@
 
 use std::path::PathBuf;
 
+/// What the `fake-lemonade` stand-in prints on stderr each time it refuses a
+/// `lemonade backends install`.
+///
+/// The Lemonade recovery scenario asserts it in `rocm serve`'s output, which
+/// proves the install the CLI attempted was the planted runtime's. If the
+/// planted manifest stopped matching what `Detect` expects, `serve` would run
+/// the real runtime install instead, and this line would be missing.
+pub const FAKE_LEMONADE_INSTALL_REFUSAL: &str =
+    "fake-lemonade: refusing to install a backend; this runtime was planted by the E2E harness";
+
 /// The path cargo built the `[[bin]]` named `name` at, alongside this test
 /// binary.
 pub fn fixture_binary(name: &str) -> PathBuf {

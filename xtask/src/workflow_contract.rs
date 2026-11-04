@@ -270,8 +270,8 @@ mod tests {
     /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
     /// enables when it builds for itself.
     ///
-    /// The suite's deterministic failure seams (e.g. the scripted Lemonade
-    /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
+    /// The suite's test seams (e.g. the simulated host root,
+    /// `ROCM_CLI_TEST_HOST_ROOT`) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
     /// that omits the feature ships a binary in which those seams do not exist,
     /// so the scenarios relying on them cannot reach their premise and fail as
     /// regressions — but only on whichever lane happens to select them, which is
@@ -293,8 +293,8 @@ mod tests {
                 ),
                 "{workflow} prebuilt E2E lane must build with \
                  `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                 builds for itself; without it the suite's test seams, such as the \
+                 simulated host root, are compiled out:\n{block}"
             );
         }
     }
