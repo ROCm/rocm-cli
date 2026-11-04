@@ -11,29 +11,24 @@
 //! The KV-cache formula is exact for a plain full-attention model (it is how
 //! llama.cpp lays the cache out), and the weights are the file's own size from
 //! its tensor offsets, less the input embedding when the file has its own output
-//! layer: llama.cpp keeps the input embedding in host memory, but a model with
-//! tied embeddings (no `output.weight`) uses the same tensor as its output
-//! layer's weight, which goes to the GPU with that layer, so there it is counted.
+//! layer, which is where llama.cpp keeps it: in host memory. A model with tied
+//! embeddings (no `output.weight`) uses the same tensor as its output layer's
+//! weight, and that layer is on the GPU, so there the embedding is counted. That
+//! case is **not measured**: both calibration models have their own output
+//! layer, so it is the side that can only overstate.
 //! Only two allowances are **calibrated against real loads on one GPU and one
 //! engine build**: the compute buffer and the runtime overhead. The loads were on
 //! an MI300X (gfx942) with llama.cpp b9752 on ROCm 7.2, flash attention on, two
-//! dense full-attention models -- a 32-layer Llama-3.1-8B-shaped Q4_K_M with its
-//! own output layer, and a 28-layer Qwen2.5-1.5B-shaped Q8_0 with tied embeddings
-//! -- each at several context sizes and KV-cache types (fifteen loads), and one
-//! more load of the Llama-shaped model made with the card almost full. In all
-//! sixteen the total came out *above* what the GPU's used memory grew by, never
-//! below. For the Llama-shaped model it was 0.8% to 2.9% above with an f16 KV
-//! cache and up to 4.5% with a quantized one, where the dequantization allowance
-//! is deliberately generous, and 5.5% in the load made with the card almost full,
-//! because the process overhead measured there was about 0.4 GiB against 1.05-1.1
-//! GiB in the others, for a reason that is not known. For the tied Qwen-shaped
-//! model it was 3.6% to 7.9% above with an f16 cache and 9.5% with a q8_0 one: the
-//! output layer's copy of the embedding (236 MiB) is counted, and llama.cpp's own
-//! log did not show it in the GPU's model buffer, but the overhead left over for
-//! that model was about 180 MiB larger than for the Llama-shaped one, so whether
-//! it is really on the GPU is not settled and the estimate takes the side that
-//! cannot say "fits" when it does not. Across all sixteen it was 0.8% to 9.5%
-//! above. That is the same data
+//! dense full-attention models, each with its own output layer (a 32-layer
+//! Llama-3.1-8B-shaped Q4_K_M and a 28-layer Qwen2.5-1.5B-shaped Q8_0), each at
+//! several context sizes and KV-cache types (fifteen loads), and one more load of
+//! the Llama-shaped model made with the card almost full. In fifteen of the
+//! sixteen the total came out *above* what the GPU's used memory grew by: by
+//! 0.05% to 2.9% with an f16 KV cache and up to 4.5% with a quantized one, where
+//! the dequantization allowance is deliberately generous. In the sixteenth it was
+//! 5.5% above, because the process overhead measured there was about 0.4 GiB
+//! against 1.05-1.28 GiB in the others, for a reason that is not known. Across
+//! all sixteen it was 0.05% to 5.5% above and never below. That is the same data
 //! the allowances were fitted to, so it measures the fit, not a guarantee:
 //! another engine build, another GPU or a different batch size can miss by more.
 //! That is why the answer is labelled an *estimate* everywhere it is shown. Where
@@ -58,6 +53,7 @@ use crate::gguf_source::ProjectorNamed;
 use crate::model_readiness::{AcceleratorMemory, format_gib};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+#[cfg(test)]
 use std::str::FromStr;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -159,6 +155,9 @@ impl fmt::Display for KvCacheType {
     }
 }
 
+// The CLI parses the flag with clap (`KvCacheTypeArg`); this is for tests
+// that read a type back out of the report text.
+#[cfg(test)]
 impl FromStr for KvCacheType {
     type Err = String;
 
@@ -511,6 +510,24 @@ fn cannot(
     (reason, detail.into())
 }
 
+/// Text from a stranger's header as it may be shown: every character that would
+/// change how a terminal renders the text around it (a control, a
+/// bidirectional override, a line separator) becomes `?`. The architecture name
+/// is the one header string the report prints.
+fn shown_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if crate::terminal::is_control_or_format(c)
+                || crate::terminal::is_control_or_line_separator(c)
+            {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Work out the sizing, or why it cannot be worked out.
 fn sizing(header: &GgufHeader, file_size: u64) -> Result<Sizing, (CannotEstimateReason, String)> {
     if header.split_count.is_some_and(|count| count > 1) {
@@ -689,7 +706,7 @@ pub fn estimate_fit(
         outcome: EstimateOutcome::CannotEstimate,
         cannot_estimate_reason: None,
         detail: None,
-        architecture: header.architecture.clone(),
+        architecture: header.architecture.as_deref().map(shown_text),
         layers: header.block_count,
         context_size: request.context_size,
         context_size_defaulted: request.context_size_defaulted,
@@ -2137,6 +2154,23 @@ mod tests {
         assert_eq!(dense.outcome, EstimateOutcome::Fits);
     }
 
+    /// The architecture name comes from the file and is printed in the report,
+    /// so a character that would reorder or break the line is replaced.
+    #[test]
+    fn an_architecture_name_cannot_steer_the_terminal() {
+        let builder = llama_like(10).string("general.architecture", "llama\u{202E}evil\n");
+        let (header, size) = header_of(&builder, 4096);
+        let result = estimate(
+            &header,
+            size,
+            1024,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(8.0),
+        );
+        assert_eq!(result.architecture.as_deref(), Some("llama?evil?"));
+        assert!(evidence_lines(&result).iter().all(|line| line.is_ascii()));
+    }
+
     #[test]
     fn a_header_without_the_widths_the_compute_buffer_needs_gets_figures_and_no_verdict() {
         let builder = Builder::new()
@@ -2476,12 +2510,11 @@ mod tests {
     }
 
     /// Qwen2.5-1.5B Q8_0: 28 layers, 2 KV heads, head width 128, embedding 1536,
-    /// feed-forward 8960, tied embeddings (no `output.weight`). 1_888_581_632
-    /// bytes of tensor data, of which the 151936 x 1536 Q8_0 `token_embd.weight`
-    /// is 247_959_552 (236.47 MiB logged host-mapped, 1564.63 MiB on the GPU).
-    /// The estimate counts the embedding in VRAM as well, for the output layer's
-    /// use of it, so its total is above this model's loads by more than the
-    /// Llama-shaped model's.
+    /// feed-forward 8960. The model's weights are tied, but the GGUF file has its
+    /// own `output.weight` (a second 247_959_552-byte copy, last in the data), so
+    /// it is not a tied-embedding file. 1_888_581_632 bytes of tensor data, of
+    /// which the 151936 x 1536 Q8_0 `token_embd.weight` is 247_959_552 (236.47 MiB
+    /// logged host-mapped, 1564.63 MiB on the GPU).
     fn measured_qwen() -> (GgufHeader, u64) {
         let builder = Builder::new()
             .string("general.architecture", "qwen2")
@@ -2492,7 +2525,8 @@ mod tests {
             .u32("qwen2.attention.head_count_kv", 2)
             .u32("qwen2.context_length", 32_768)
             .tensor_at("token_embd.weight", &[1536, 151_936], 0)
-            .tensor_at("blk.0.attn_q.weight", &[1536, 1536], 247_959_552);
+            .tensor_at("blk.0.attn_q.weight", &[1536, 1536], 247_959_552)
+            .tensor_at("output.weight", &[1536, 151_936], 1_640_622_080);
         let (header, size) = header_of(&builder, 0);
         (header, size + 1_888_581_632)
     }
@@ -2601,16 +2635,14 @@ mod tests {
     }
 
     #[test]
-    fn the_qwen_shaped_tied_embedding_model_reproduces_the_measured_loads() {
+    fn the_qwen_shaped_model_reproduces_the_measured_loads() {
         let (header, size) = measured_qwen();
-        // The output layer's copy of the tied embedding is counted: 3.6% to
-        // 9.5% above.
-        check_against_measured(&header, size, &QWEN_LOADS, 1.10);
+        check_against_measured(&header, size, &QWEN_LOADS, 1.05);
     }
 
     /// The sixteenth load, made with the card almost full: the process overhead
-    /// measured only about 0.4 GiB there against 1.05-1.1 GiB in the model's
-    /// other loads, so the estimate was further above what was used. It is still
+    /// measured only about 0.4 GiB there against 1.05-1.28 GiB in the other
+    /// loads, so the estimate was further above what was used. It is still
     /// above, by 5.5% (the module documentation gives the range over all
     /// sixteen loads), so the 5% bound the model's other loads meet is not
     /// asserted here.
@@ -2660,11 +2692,11 @@ mod tests {
             KvCacheType::F16,
             AcceleratorMemory::Dedicated(192.0),
         );
-        // Tied embeddings: the whole tensor data, the embedding included.
-        assert_eq!(result.weights_bytes, Some(1_888_581_632));
+        // 1564.63 MiB on the GPU, the embedding's 236.47 MiB left on the host.
+        assert_eq!(result.weights_bytes, Some(1_640_622_080));
         assert_eq!(result.kv_cache_bytes, Some(896 * MIB));
         assert_eq!(result.compute_buffer_bytes, Some(64_487_424 + 32 * MIB));
-        assert_eq!(result.total_bytes, Some(4_020_365_312 + 247_959_552));
+        assert_eq!(result.total_bytes, Some(4_020_365_312));
     }
 
     #[test]

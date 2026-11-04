@@ -866,11 +866,12 @@ The KV cache is exact for a plain full-attention model, and the weights are the
 file's own size from its tensor offsets, less the input embedding, which
 llama.cpp keeps in host memory -- except for a model with tied embeddings (no
 separate output layer), where llama.cpp uses the same tensor for the output
-layer. Whether that use takes VRAM was not settled by the calibration loads, so
-for such a model it is counted, which can only overstate the figure. Only the compute buffer and the runtime reserve are
-allowances, calibrated against real loads of two dense full-attention models on
-one MI300X with llama.cpp b9752, flash attention on: a Llama-3.1-8B-shaped model
-with its own output layer and a Qwen2.5-1.5B-shaped model with tied embeddings.
+layer on the GPU, so there it is counted. That case was not measured, and
+counting it can only overstate the figure. Only the compute buffer and the
+runtime reserve are allowances, calibrated against real loads of two dense
+full-attention models on one MI300X with llama.cpp b9752, flash attention on:
+a Llama-3.1-8B-shaped and a Qwen2.5-1.5B-shaped GGUF, each with its own output
+layer.
 No mixture-of-experts, state-space, hybrid or sliding-window model was among
 them. How close the estimate came to those
 loads, and why that describes the fit rather than a bound, is written down once,
