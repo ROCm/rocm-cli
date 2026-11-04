@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 use serde_json::{Value, json};
 
 use crate::report::{GROUP_AXES, ReadOutcome, Report, UNRECOGNISED};
+use crate::report_trend::{Trend, TrendView, Week};
 
 /// Reports sharing one value at one level, and how they split below it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,13 +69,28 @@ pub struct Rollup {
     /// Reports this reader could not read, by the schema version they
     /// declared. `0` means no schema could be found at all.
     pub unread: BTreeMap<u32, usize>,
+    /// The understood reports again, by week. See [`crate::report_trend`].
+    pub trend: Trend,
 }
 
 impl Rollup {
-    /// Count one report.
+    /// Count one report that has no date.
+    ///
+    /// It is in every count and in no week. Production hands every report to
+    /// [`Rollup::add_in_week`], with `None` when it has no date, so this and the
+    /// other convenience forms below exist for tests only.
+    #[cfg(test)]
     pub fn add(&mut self, outcome: &ReadOutcome) {
+        self.add_in_week(None, outcome);
+    }
+
+    /// Count one report, in the week it was received when that is known.
+    ///
+    /// The week is all a caller may pass: it is what a date reduces to, so no
+    /// finer time can reach a count or an output from here.
+    pub fn add_in_week(&mut self, week: Option<Week>, outcome: &ReadOutcome) {
         match outcome {
-            ReadOutcome::Understood(report) => self.add_report(report),
+            ReadOutcome::Understood(report) => self.add_report(week, report),
             ReadOutcome::Refused { reason } => {
                 *self.refused.entry(reason.clone()).or_default() += 1;
             }
@@ -92,15 +108,17 @@ impl Rollup {
     /// can be built without going through the reader: free text or terminal
     /// control characters must not reach either output whichever way a report
     /// arrived.
-    fn add_report(&mut self, report: &Report) {
+    fn add_report(&mut self, week: Option<Week>, report: &Report) {
         if report.is_in_vocabulary() {
             self.understood.add(&report.group_key());
+            self.trend.add(week, report);
         } else {
             *self.unread.entry(report.schema).or_default() += 1;
         }
     }
 
-    /// Count every report.
+    /// Count every report, none of them dated.
+    #[cfg(test)]
     #[must_use]
     pub fn of<'a>(outcomes: impl IntoIterator<Item = &'a ReadOutcome>) -> Self {
         let mut rollup = Self::default();
@@ -138,9 +156,16 @@ impl Rollup {
             .map_or(0, |group| group.count)
     }
 
-    /// The rollup as a person reads it.
+    /// The rollup as a person reads it, with the default view of the trend.
+    #[cfg(test)]
     #[must_use]
     pub fn render_text(&self) -> String {
+        self.render_text_with(&TrendView::default())
+    }
+
+    /// The rollup as a person reads it, with the trend shown as `view` asks.
+    #[must_use]
+    pub fn render_text_with(&self, view: &TrendView) -> String {
         let mut out = String::new();
         let refused: usize = self.refused.values().sum();
         let unread: usize = self.unread.values().sum();
@@ -185,13 +210,22 @@ impl Rollup {
                 let _ = writeln!(out, "{label:<44}{count:>6}");
             }
         }
+        out.push_str(&self.trend.render_text(view));
         out
+    }
+
+    /// The rollup as a script reads it, with the default view of the trend.
+    #[cfg(test)]
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        self.to_json_with(&TrendView::default())
     }
 
     /// The rollup as a script reads it. Groups are ranked as in the text.
     #[must_use]
-    pub fn to_json(&self) -> Value {
+    pub fn to_json_with(&self, view: &TrendView) -> Value {
         json!({
+            "trend": self.trend.to_json(view),
             "total": self.total(),
             "understood": self.understood.count,
             "recognised": self.recognised(),
@@ -401,6 +435,34 @@ mod tests {
         assert!(
             !outputs.contains("Jane Doe") && !outputs.contains('\u{1b}'),
             "{outputs}"
+        );
+    }
+
+    /// The rollup puts a report in the week it is given, a report with no week in
+    /// none, and a report outside the vocabulary in neither the groups nor a
+    /// week. This is the wiring between the rollup and the trend, checked here so
+    /// that this crate catches a broken one by itself and not only through the
+    /// `xtask` run that exercises it end to end.
+    #[test]
+    fn a_report_is_placed_in_the_week_it_is_given_and_one_without_a_week_in_none() {
+        let week = Week::from_unix_day(20_755);
+        let genuine = report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22"));
+        let mut rollup = Rollup::default();
+        rollup.add_in_week(Some(week), &genuine);
+        rollup.add_in_week(Some(week), &genuine);
+        rollup.add(&genuine);
+        rollup.add_in_week(
+            Some(week),
+            &report("fix-6-path", "Jane Doe", "7.1", ("ubuntu", "22")),
+        );
+
+        assert_eq!(rollup.understood.count, 3, "the forged one is not a group");
+        assert_eq!(rollup.trend.weeks["fix-6-path"][&week].count, 2);
+        assert_eq!(rollup.understood.count - rollup.trend.undated, 2);
+        assert_eq!(rollup.trend.undated, 1, "added with no week");
+        assert_eq!(
+            rollup.unread[&REPORT_SCHEMA_VERSION], 1,
+            "counted, in no week"
         );
     }
 
