@@ -4,11 +4,12 @@
 
 //! Automation-daemon runtime state and its on-disk records.
 //!
-//! The built-in watcher catalog (`BuiltinWatcherSpec`/`builtin_watcher(s)`),
-//! the running daemon's live snapshot (`AutomationRuntimeState`), the
+//! The running daemon's live snapshot (`AutomationRuntimeState`), the
 //! logically append-only JSONL stores for watcher action events
 //! (`AutomationEventRecord`), audit log entries, and review proposals, and
-//! the accessors used to read them back.
+//! the accessors used to read them back. The built-in watcher catalog
+//! (`BuiltinWatcherSpec`/`builtin_watcher(s)`) lives in `config.rs`, next to
+//! `WatcherMode`, which it and this module both read.
 //!
 //! The `rocm` CLI and `rocmd` write these stores concurrently, so every
 //! mutation of a store holds its sibling `.lock` file (see `jsonl_lock_path`).
@@ -59,68 +60,6 @@ use crate::FileLock;
 use crate::WatcherMode;
 use crate::require_nonempty;
 use crate::unix_time_millis;
-
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinWatcherSpec {
-    pub id: &'static str,
-    pub summary: &'static str,
-    pub trigger: &'static str,
-    pub default_mode: WatcherMode,
-    pub actions: &'static [&'static str],
-}
-
-const BUILTIN_WATCHERS: &[BuiltinWatcherSpec] = &[
-    BuiltinWatcherSpec {
-        id: "therock-update",
-        summary: "Emit scheduled TheRock update reminders and proposals.",
-        trigger: "schedule: every 6h",
-        default_mode: WatcherMode::Observe,
-        actions: &["remind_update_check", "queue_update_proposal"],
-    },
-    BuiltinWatcherSpec {
-        id: "server-recover",
-        summary: "Observe or restart failed managed services when restart metadata exists.",
-        trigger: "event: managed_service_failed",
-        default_mode: WatcherMode::Contained,
-        actions: &["collect_failure_snapshot", "restart_managed_service"],
-    },
-    BuiltinWatcherSpec {
-        id: "gpu-metrics",
-        summary: "Record read-only local amd-smi GPU telemetry availability; no proposals or mutations.",
-        trigger: "event: gpu.metrics availability/unavailability",
-        default_mode: WatcherMode::Observe,
-        actions: &["record_gpu_metrics"],
-    },
-    BuiltinWatcherSpec {
-        id: "cache-warm",
-        summary: "Queue reviewed artifact prefetch proposals for registry model artifacts.",
-        trigger: "event: cache.warm",
-        default_mode: WatcherMode::Propose,
-        actions: &["queue_prefetch_proposal"],
-    },
-    BuiltinWatcherSpec {
-        id: "driver-upgrade",
-        summary: "Queue reviewed read-only driver install plans when a local driver update signal is received.",
-        trigger: "event: update.available component=driver",
-        default_mode: WatcherMode::Propose,
-        actions: &["prepare_driver_plan"],
-    },
-    BuiltinWatcherSpec {
-        id: "gpu-thermal-protect",
-        summary: "Queue reviewed stop-serving proposals when GPU temperature or memory pressure is high.",
-        trigger: "event: gpu.thermal_pressure or gpu.memory_pressure",
-        default_mode: WatcherMode::Propose,
-        actions: &["queue_stop_server_proposal"],
-    },
-];
-
-pub const fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
-    BUILTIN_WATCHERS
-}
-
-pub fn builtin_watcher(id: &str) -> Option<&'static BuiltinWatcherSpec> {
-    builtin_watchers().iter().find(|watcher| watcher.id == id)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatcherRuntimeSnapshot {
@@ -1340,46 +1279,6 @@ mod tests {
             .expect("one store's failure must not silence another store's warning");
         assert!(other.contains("rotation-warning-test/audit/events.jsonl"));
         assert_eq!(rotation_failure_warning(audit, &error), None);
-    }
-
-    #[test]
-    fn builtin_watchers_include_read_only_gpu_metrics() {
-        let watcher = builtin_watcher("gpu-metrics").expect("gpu-metrics watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Observe);
-        assert!(watcher.trigger.contains("gpu.metrics"));
-        assert_eq!(watcher.actions, &["record_gpu_metrics"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_cache_warm() {
-        let watcher = builtin_watcher("cache-warm").expect("cache-warm watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("cache.warm"));
-        assert_eq!(watcher.actions, &["queue_prefetch_proposal"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_driver_upgrade() {
-        let watcher =
-            builtin_watcher("driver-upgrade").expect("driver-upgrade watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("update.available"));
-        assert!(watcher.trigger.contains("component=driver"));
-        assert_eq!(watcher.actions, &["prepare_driver_plan"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_gpu_thermal_protect() {
-        let watcher = builtin_watcher("gpu-thermal-protect")
-            .expect("gpu-thermal-protect watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("gpu.thermal_pressure"));
-        assert!(watcher.trigger.contains("gpu.memory_pressure"));
-        assert_eq!(watcher.actions, &["queue_stop_server_proposal"]);
     }
 
     #[test]

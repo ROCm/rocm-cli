@@ -61,21 +61,22 @@ pub mod windows_driver;
 pub use amd_smi::resolve_amd_smi_binary;
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
-    AutomationTriggerEvent, BuiltinWatcherSpec, EVENT_LOG_ROTATE_BYTES,
-    EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, find_automation_proposal, generate_proposal_id, jsonl_lock_path,
-    load_automation_proposals, load_recent_audit_events, load_recent_automation_events,
-    load_recent_automation_proposals, update_automation_proposal_status,
+    AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
+    REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot, append_audit_event,
+    append_automation_event, append_automation_proposal, find_automation_proposal,
+    generate_proposal_id, jsonl_lock_path, load_automation_proposals, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals,
+    update_automation_proposal_status,
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
-    AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
-    EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
-    PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
+    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
+    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
+    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
+    WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::interactive_terminal;
 pub use crypto::{
