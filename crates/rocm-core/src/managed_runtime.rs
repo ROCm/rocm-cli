@@ -487,7 +487,7 @@ pub(crate) struct TheRockSdkProbeCandidate {
     /// The SDK's own recorded library directories -- every package root the
     /// probe script actually imported and asked Python for (see
     /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
-    /// `root_path`/`site_packages` after the fact. This is what
+    /// `root_path` after the fact. This is what
     /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
     /// a caller that needs to find a managed runtime's actual libraries (comgr
     /// included) should prefer this over re-deriving the layout.
@@ -1145,7 +1145,7 @@ mod tests {
     /// Those are what `examine`'s comgr/HIP search now reads to find a managed
     /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
     /// `examine/library_copies.rs`), in place of re-deriving the layout from
-    /// `root_path` and `site_packages` after the fact -- a guess that does not hold for every
+    /// `root_path` after the fact -- a guess that does not hold for every
     /// real install shape, which is what left a managed runtime's own code
     /// object manager library unseen on a real host
     /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
