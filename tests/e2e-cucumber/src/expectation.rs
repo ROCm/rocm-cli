@@ -2057,15 +2057,21 @@ flaky = true
         ));
     }
 
+    /// EAI-7998's row (`examine --json` reporting `has_amd_gpu: false` on a WSL2
+    /// host whose own summary names a gfx target) is resolved by taking the
+    /// field from that same target on WSL, not by this test, which only guards
+    /// against a silent regression. A WSL host with a reported target and one
+    /// without both go through the scenario now, so re-adding the row has to be
+    /// a deliberate decision.
     #[test]
-    fn gpu_report_disagreement_xfail_requires_a_reported_gfx_target() {
+    fn gpu_report_agreement_has_no_xfail_on_wsl() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        assert!(m.is_xfail(
-            "examine-both-forms-agree-on-gpu",
-            &cap("wsl-no-passthrough"),
-            "lemonade"
-        ));
-        assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
+        for host in ["wsl-no-passthrough", "wsl"] {
+            assert!(
+                !m.is_xfail("examine-both-forms-agree-on-gpu", &cap(host), "lemonade"),
+                "examine-08 must run, not xfail, on the {host} host"
+            );
+        }
     }
 
     /// EAI-8031's row (Windows lane cold-downloading its HF checkpoint every
