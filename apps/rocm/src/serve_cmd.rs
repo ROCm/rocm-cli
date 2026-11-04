@@ -59,8 +59,9 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::gpu_policy::{
-    GpuVramUsage, detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
+    GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage, parse_device_policy,
+    parse_gpu_selection, pinned_index_bound, select_gpu_indices_under_launch_lock,
+    serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_summary;
@@ -1282,14 +1283,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
-    // Whether *any* visibility mask is active. The visible set alone cannot say:
-    // with no mask it is just `0..present`, indistinguishable from a HIP mask
-    // that happens to list the low ordinals. `validate_pinned_gpu_index` uses
-    // this only to word its rejection — "under the active visibility mask" when a
-    // mask is set, "not present on this host" when none is — so an out-of-range
-    // `--gpu` on an unmasked host is not blamed on a mask the user never set.
-    let visibility_mask_active =
-        rocr_visible_devices_set || std::env::var_os("HIP_VISIBLE_DEVICES").is_some();
+    // Which visibility variables name a mask that acts on this platform, or
+    // `None` when none does. The visible set alone cannot say: with no mask it
+    // is just `0..present`, indistinguishable from a HIP mask that happens to
+    // list the low ordinals. `validate_pinned_gpu_index` uses this only to word
+    // its rejection — "under the active visibility mask" when a mask is set,
+    // "not present on this host" when none is — so an out-of-range `--gpu` on an
+    // unmasked host is not blamed on a mask the user never set. Native Windows
+    // HIP has no ROCr layer, so `ROCR_VISIBLE_DEVICES` is no mask there.
+    let visibility_mask = active_visibility_mask(
+        rocr_visible_devices_set,
+        std::env::var_os("HIP_VISIBLE_DEVICES").is_some(),
+        rocm_core::runtime_is_windows(),
+    );
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
     // Validate an explicit `--gpu <index>` up front — before engine/runtime
     // resolution — so an out-of-range or masked-out ordinal produces a
@@ -1304,13 +1310,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // The single exception is the reuse exemption, which by construction only
     // runs on a host the bail above already applies to — where `visible_gpu_indices`
     // is `Some([])` and so *every* `--gpu <index>` is out of range anyway.
+    //
+    // On native Windows `visible_gpu_indices` is always `None` and amd-smi is
+    // usually missing or unusable, so the index had nothing to be checked
+    // against and `--gpu 7` on a one-GPU machine was accepted (ROCMAI-824).
+    // There the AMD display adapters Windows lists bound the index instead.
+    // That listing is only queried here, for an explicit index: it can count an
+    // adapter HIP does not support, so it may refuse an index but must not pick
+    // one for `--gpu auto`.
     let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
-        Some(validate_pinned_gpu_index(
+        let detected = detect_gpu_count();
+        let bound = pinned_index_bound(
+            visible_gpu_indices.clone(),
+            detected,
+            visibility_mask.is_some(),
+            rocm_core::windows_amd_gpu_listing,
+        );
+        let pinned = validate_pinned_gpu_index(
             *index,
-            detect_gpu_count(),
-            visible_gpu_indices.as_deref(),
-            visibility_mask_active,
-        )?)
+            bound.count,
+            bound.visible.as_deref(),
+            visibility_mask,
+            bound.mask_unresolved,
+        )?;
+        write_unchecked_index_warning(&mut std::io::stderr(), &pinned).ok();
+        Some(pinned.indices)
     } else {
         None
     };

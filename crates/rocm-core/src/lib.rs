@@ -107,11 +107,11 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
-    default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
+    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
+    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
     detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};

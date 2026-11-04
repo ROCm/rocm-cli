@@ -158,9 +158,15 @@ Feature: Model serving
 
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
-  # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
-  # refuses ("no usable AMD GPU") before the index is ever validated, so the
-  # index-specific rejection can only be observed where a real device is present.
+  # fallback), and no server is started for it. Runs on GPU hardware: on a no-GPU
+  # host the GPU-required pre-flight refuses ("no usable AMD GPU") before the
+  # index is ever validated, so the index-specific rejection can only be observed
+  # where a real device is present.
+  #
+  # Runs on Windows too (ROCMAI-824). Native Windows has no KFD probe and amd-smi
+  # is usually unusable there, so `--gpu` used to be accepted unchecked and a
+  # managed service launched for it. The index is now checked against the AMD
+  # adapters Windows lists.
   #
   # This is the live coverage for an index the host does not have. The *masked*
   # sub-case — an index that exists but is hidden by an active visibility mask —
@@ -168,11 +174,12 @@ Feature: Model serving
   # The step here accepts several refusal wordings only because which authority
   # answers depends on the lane: the visible set when it could be enumerated,
   # the raw amd-smi count when it could not.
-  @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
+  @id:serve-absent-gpu-index-rejected @requires-gpu
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+    And no local server was recorded
 
   # A runtime and an environment are two ways to pick what a serve runs against,
   # and choosing both at once is ambiguous, so the CLI rejects the combination

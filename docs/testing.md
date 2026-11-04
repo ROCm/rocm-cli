@@ -1494,6 +1494,30 @@ install steps also require a native Windows build before any CLI invocation.
 that ordering without running an installer. Do not run these scenarios on a
 non-Windows host.
 
+`serve-16` (`@id:serve-absent-gpu-index-rejected`,
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)) runs
+on every GPU lane, the Windows one included. It serves with `--gpu 99`, which no
+host has, and checks the exit code, the refusal naming an unavailable index, and
+that no service record was written, using the shared `no local server was
+recorded` step: it lists `<data>/services` (a missing directory counts as no
+records; any other read error fails the step) and checks `rocm services list
+--all` shows nothing.
+On native Windows there is no KFD probe and `amd-smi` is usually unusable, so the
+index is checked against the AMD display adapters Windows lists
+(`windows_amd_gpu_listing` in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs)),
+cut to the `amd-smi` count when that works (the Windows list is not queried at all
+when `amd-smi` gave a count and no mask is set). When `HIP_VISIBLE_DEVICES` cannot
+be read as ordinals, or is empty (nothing verifies that Windows HIP hides every
+device for an empty value, so it is not assumed), the adapter count (and the `amd-smi` count, the smaller of the
+two) still refuses an index at or past it; an index below it is accepted with a
+warning that the mask was not applied. The unit tests for the composition
+(`pinned_index_bound`), the `ROCR_VISIBLE_DEVICES` wording and the stderr warning
+for an unchecked index (`write_unchecked_index_warning`) are in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs) and run on every platform. The
+warnings need a host where no source can list the GPUs, or a mask that cannot
+be resolved, and an accepted index starts a server, so no scenario reaches them;
+the unit tests cover the printed text.
+
 Lines that `rocm fix` and `rocm diagnose` print for Windows are meant to be
 pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
 `&&` or `||`, no bare `where`, no `%NAME%`, no empty-string argument, and no

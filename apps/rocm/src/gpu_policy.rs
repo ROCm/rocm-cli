@@ -176,27 +176,160 @@ pub(crate) fn select_gpu_indices_under_launch_lock(
     Ok((indices, lock))
 }
 
+/// An explicit `--gpu <index>` that [`validate_pinned_gpu_index`] let through.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PinnedGpuIndex {
+    /// The single ordinal to pin.
+    pub(crate) indices: Vec<u32>,
+    /// Set when the index was accepted without a full check: neither source
+    /// could list the host's GPUs, or a visibility mask is set but could not be
+    /// applied (it could not be resolved to ordinals, or no GPU list was
+    /// available to apply it to), so only the GPU count bounded the index.
+    /// `serve()` prints it as a warning so an unchecked index is never accepted
+    /// silently.
+    pub(crate) unchecked_warning: Option<String>,
+}
+
+/// The warning for an index let through without being checked against the
+/// visibility mask or the GPU list. `mask_unresolved` says the Windows adapter
+/// listing worked but `HIP_VISIBLE_DEVICES` could not be read as ordinals, so
+/// "could not list the GPUs" would be wrong: the index was still bounded by the
+/// GPU count, only the mask could not be applied. `mask` names the variables of
+/// a mask that is set but was not applied for another reason (no GPU list to
+/// apply it to).
+fn unchecked_index_warning(index: u32, mask_unresolved: bool, mask: Option<&str>) -> String {
+    if mask_unresolved {
+        format!(
+            "HIP_VISIBLE_DEVICES could not be resolved to GPU ordinals on this host (an empty \
+             value, a UUID, or an ordinal past the adapters Windows lists), so `--gpu {index}` \
+             was checked only against the GPU count, not against that mask"
+        )
+    } else if let Some(vars) = mask {
+        format!(
+            "{vars} is set but the usable GPUs could not be listed to apply it to, so \
+             `--gpu {index}` was checked only against the GPU count, not against that mask"
+        )
+    } else {
+        format!(
+            "could not list the AMD GPUs on this host, so `--gpu {index}` was not checked \
+             against them"
+        )
+    }
+}
+
+/// Print the warning an unchecked `--gpu` index carries, if any, to `out`.
+/// `serve()` calls this with stderr, so the text a test reads from a buffer is
+/// the text the user sees.
+pub(crate) fn write_unchecked_index_warning(
+    out: &mut impl std::io::Write,
+    pinned: &PinnedGpuIndex,
+) -> std::io::Result<()> {
+    match &pinned.unchecked_warning {
+        Some(warning) => writeln!(out, "warning: {warning}"),
+        None => Ok(()),
+    }
+}
+
+/// The visibility variables that act on this platform and are set, as the name
+/// to put in a refusal, or `None` when no mask applies. Native Windows HIP has
+/// no ROCr layer, so there `ROCR_VISIBLE_DEVICES` has no effect and must not be
+/// blamed.
+pub(crate) fn active_visibility_mask(
+    rocr_set: bool,
+    hip_set: bool,
+    windows: bool,
+) -> Option<&'static str> {
+    if windows {
+        hip_set.then_some("HIP_VISIBLE_DEVICES")
+    } else {
+        (rocr_set || hip_set).then_some("HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES")
+    }
+}
+
+/// What bounds an explicit `--gpu <index>`, from the sources serve has.
+pub(crate) struct PinnedIndexBound {
+    /// The ordinals the index may name, when some source could say.
+    pub(crate) visible: Option<Vec<u32>>,
+    /// The Windows listing worked but the HIP mask could not be resolved.
+    pub(crate) mask_unresolved: bool,
+    /// The upper bound on the index when `visible` is `None`: the `amd-smi`
+    /// count, and with an unresolved mask also the adapter count (the smaller of
+    /// the two). An index at or past it cannot exist whatever the mask says.
+    pub(crate) count: Option<usize>,
+}
+
+/// Combine the Linux visible set, the `amd-smi` count and the Windows adapter
+/// listing into one bound for an explicit index. The Windows listing may count
+/// an adapter HIP does not support, so it may refuse an index but never loosen
+/// a check another source makes: its set is cut to the `amd-smi` count when
+/// that is known (the stricter of the two). `windows` is only consulted when
+/// `visible` is `None`, so Linux never pays for it, and not when `amd-smi`
+/// already gave a count and no mask is set (`mask_set` false): the count alone
+/// bounds the index then, and the listing (a `pnputil` or PowerShell query)
+/// could only second-guess it.
+pub(crate) fn pinned_index_bound(
+    visible: Option<Vec<u32>>,
+    detected: Option<usize>,
+    mask_set: bool,
+    windows: impl FnOnce() -> rocm_core::WindowsGpuListing,
+) -> PinnedIndexBound {
+    if visible.is_some() || (detected.is_some() && !mask_set) {
+        return PinnedIndexBound {
+            visible,
+            mask_unresolved: false,
+            count: detected,
+        };
+    }
+    match windows() {
+        rocm_core::WindowsGpuListing::Indices(mut set) => {
+            if let Some(count) = detected {
+                set.retain(|index| (*index as usize) < count);
+            }
+            PinnedIndexBound {
+                visible: Some(set),
+                mask_unresolved: false,
+                count: detected,
+            }
+        }
+        // The mask cannot be read, but the adapters are known and no HIP device
+        // is outside them, so the adapter count still bounds the index.
+        rocm_core::WindowsGpuListing::MaskUnresolved { adapters } => PinnedIndexBound {
+            visible: None,
+            mask_unresolved: true,
+            count: Some(detected.map_or(adapters, |count| count.min(adapters))),
+        },
+        rocm_core::WindowsGpuListing::Unavailable => PinnedIndexBound {
+            visible: None,
+            mask_unresolved: false,
+            count: detected,
+        },
+    }
+}
+
 /// Validate an explicit `--gpu <index>` against the active visibility set,
 /// returning the single pinned ordinal. `visible` is the set of HIP ordinals
 /// still usable after the visibility mask (see
-/// [`rocm_core::usable_amd_gpu_indices`]) — already in the same space the index
+/// [`rocm_core::usable_amd_gpu_indices`], or on native Windows
+/// [`rocm_core::windows_amd_gpu_listing`]) — already in the same space the index
 /// is exported through — so it is the authoritative answer whenever it could be
 /// enumerated. `detected` is only a fallback range check for hosts where the
 /// visible set is unknown (`visible` is `None`). Both `None` (an unprobeable
-/// host) is allowed through so serving can still proceed.
+/// host) is allowed through so serving can still proceed, but with
+/// [`PinnedGpuIndex::unchecked_warning`] set.
 pub(crate) fn validate_pinned_gpu_index(
     index: u32,
     detected: Option<usize>,
     visible: Option<&[u32]>,
-    mask_active: bool,
-) -> Result<Vec<u32>> {
+    mask: Option<&str>,
+    mask_unresolved: bool,
+) -> Result<PinnedGpuIndex> {
     // Prefer the visibility-resolved set. It is authoritative and already in the
     // HIP-ordinal space `--gpu` is exported through, so it settles both range and
     // mask membership in one comparison — avoiding the earlier bug of checking
     // the index against `detected` (a differently-probed physical count) and
     // `visible` (HIP space) as if they shared one ordinal space.
     //
-    // `mask_active` only shapes the message, not the accept/reject decision: with
+    // `mask` only shapes the message, not the accept/reject decision: with
     // no mask set the visible set is just `0..present`, so an index outside it is
     // simply absent from the host, and blaming HIP/ROCR variables the user never
     // set sends them chasing an environment problem that does not exist.
@@ -207,10 +340,10 @@ pub(crate) fn validate_pinned_gpu_index(
             // serve()'s no-usable-GPU fail-fast normally reports this first with a
             // fuller message; reject here too so a bad `--gpu` can never slip
             // through.
-            if mask_active {
+            if let Some(vars) = mask {
                 bail!(
                     "no usable AMD GPU is available under the active visibility mask \
-                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); `--gpu {index}` cannot be honoured"
+                     ({vars}); `--gpu {index}` cannot be honoured"
                 );
             }
             bail!("no usable AMD GPU is present on this host; `--gpu {index}` cannot be honoured");
@@ -221,27 +354,57 @@ pub(crate) fn validate_pinned_gpu_index(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            if mask_active {
+            if let Some(vars) = mask {
                 bail!(
                     "--gpu index {index} is not available under the active visibility mask \
-                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
+                     ({vars}); usable GPU indices: [{list}]"
                 );
             }
             bail!("--gpu index {index} is not present on this host; usable GPU indices: [{list}]");
         }
-        return Ok(vec![index]);
+        return Ok(PinnedGpuIndex {
+            indices: vec![index],
+            unchecked_warning: None,
+        });
     }
-    // No visible set could be enumerated: fall back to the raw detected count so
-    // an obviously out-of-range index is still refused.
-    if let Some(count) = detected
-        && (index as usize) >= count
-    {
+    // No visible set could be enumerated: fall back to the count (`amd-smi`, and
+    // with an unresolved mask the adapter count too) so an obviously
+    // out-of-range index is still refused.
+    let Some(count) = detected else {
+        return Ok(PinnedGpuIndex {
+            indices: vec![index],
+            unchecked_warning: Some(unchecked_index_warning(index, mask_unresolved, mask)),
+        });
+    };
+    if count == 0 {
+        // Nothing to index into: an `0..0` range would wrongly suggest GPU 0 exists.
+        let unread_mask = if mask_unresolved {
+            " (HIP_VISIBLE_DEVICES could not be resolved to GPU ordinals)"
+        } else {
+            ""
+        };
+        bail!("--gpu index {index} cannot be honoured; no GPUs were detected{unread_mask}");
+    }
+    if (index as usize) >= count {
+        let unread_mask = if mask_unresolved {
+            "; HIP_VISIBLE_DEVICES could not be resolved to GPU ordinals, so the count is the \
+             only bound"
+        } else {
+            ""
+        };
         bail!(
-            "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
-            count - 1
+            "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices \
+             0..{}){unread_mask}",
+            count.saturating_sub(1)
         );
     }
-    Ok(vec![index])
+    // In range, but a mask that was set and not applied (unresolvable, or no GPU
+    // list to apply it to) may still hide this ordinal: say so.
+    Ok(PinnedGpuIndex {
+        indices: vec![index],
+        unchecked_warning: (mask_unresolved || mask.is_some())
+            .then(|| unchecked_index_warning(index, mask_unresolved, mask)),
+    })
 }
 
 /// The GPU count to rank `--gpu auto` candidates over. Prefers the `amd-smi`
@@ -831,6 +994,8 @@ mod tests {
     use crate::tests::ScopedTestEnv;
     use crate::tests::test_paths;
 
+    const TEST_MASK: &str = "HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES";
+
     /// Persist a live-looking managed record claiming `gpu` — the same shape a
     /// real launch writes, with the current process id as the supervisor so the
     /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
@@ -1226,27 +1391,393 @@ mod tests {
     #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
-        let error = validate_pinned_gpu_index(4, Some(4), None, false)
+        let error = validate_pinned_gpu_index(4, Some(4), None, None, false)
             .expect_err("index 4 is out of range");
         assert!(error.to_string().contains("out of range"));
-        assert!(validate_pinned_gpu_index(9, Some(2), None, false).is_err());
+        assert!(validate_pinned_gpu_index(9, Some(2), None, None, false).is_err());
     }
 
     #[test]
-    fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
+    fn validate_pinned_gpu_index_accepts_an_in_range_index() {
         // In-range index pins exactly that ordinal.
         assert_eq!(
-            validate_pinned_gpu_index(0, Some(1), None, false).unwrap(),
+            validate_pinned_gpu_index(0, Some(1), None, None, false)
+                .unwrap()
+                .indices,
             vec![0]
         );
         assert_eq!(
-            validate_pinned_gpu_index(3, Some(4), None, false).unwrap(),
+            validate_pinned_gpu_index(3, Some(4), None, None, false)
+                .unwrap()
+                .indices,
             vec![3]
         );
-        // Unknown count (amd-smi unavailable) is allowed through unvalidated.
+        // A checked index carries no warning.
         assert_eq!(
-            validate_pinned_gpu_index(7, None, None, false).unwrap(),
-            vec![7]
+            validate_pinned_gpu_index(0, Some(1), None, None, false)
+                .unwrap()
+                .unchecked_warning,
+            None
+        );
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_never_accepts_an_unchecked_index_silently() {
+        // ROCMAI-824: with neither a visible set nor a detected count (an
+        // unprobeable host), the index is allowed through, since nothing proves
+        // it absent. The warning that says so comes from that same branch, so
+        // it cannot appear on a checked index or go missing from an unchecked one.
+        let pinned = validate_pinned_gpu_index(7, None, None, None, false).unwrap();
+        assert_eq!(pinned.indices, vec![7]);
+        let warning = pinned
+            .unchecked_warning
+            .expect("an unchecked --gpu index must carry a warning");
+        assert!(
+            warning.contains("`--gpu 7` was not checked"),
+            "got: {warning}"
+        );
+        // Either source alone is enough to check it, and then no warning.
+        for pinned in [
+            validate_pinned_gpu_index(0, Some(1), None, None, false).unwrap(),
+            validate_pinned_gpu_index(0, None, Some(&[0]), None, false).unwrap(),
+        ] {
+            assert_eq!(pinned.unchecked_warning, None);
+        }
+    }
+
+    #[test]
+    fn the_unchecked_warning_is_printed_as_the_user_sees_it() {
+        // ROCMAI-824: README promises `rocm serve` warns on stderr when the index
+        // could not be checked. `serve()` prints through this same function, so
+        // the text read back here is the printed text; a checked index prints
+        // nothing.
+        let unchecked = validate_pinned_gpu_index(7, None, None, None, false).unwrap();
+        let mut printed = Vec::new();
+        write_unchecked_index_warning(&mut printed, &unchecked).unwrap();
+        assert_eq!(
+            String::from_utf8(printed).unwrap(),
+            "warning: could not list the AMD GPUs on this host, so `--gpu 7` was not checked \
+             against them\n"
+        );
+        let checked = validate_pinned_gpu_index(0, Some(1), None, None, false).unwrap();
+        let mut printed = Vec::new();
+        write_unchecked_index_warning(&mut printed, &checked).unwrap();
+        assert!(printed.is_empty());
+    }
+
+    #[test]
+    fn the_unchecked_warning_does_not_blame_the_listing_when_the_mask_was_unreadable() {
+        // Windows listed the adapter, but HIP_VISIBLE_DEVICES holds a token that
+        // cannot be read by ordinal, and amd-smi also fails: the listing did not
+        // fail, so the warning must not say it did.
+        let bound = pinned_index_bound(None, None, true, || {
+            rocm_core::WindowsGpuListing::MaskUnresolved { adapters: 1 }
+        });
+        assert!(bound.visible.is_none() && bound.mask_unresolved);
+        let pinned = validate_pinned_gpu_index(
+            0,
+            bound.count,
+            bound.visible.as_deref(),
+            Some("HIP_VISIBLE_DEVICES"),
+            bound.mask_unresolved,
+        )
+        .unwrap();
+        let warning = pinned.unchecked_warning.expect("the mask was not applied");
+        assert!(
+            warning.contains("HIP_VISIBLE_DEVICES could not be resolved"),
+            "got: {warning}"
+        );
+        assert!(!warning.contains("could not list"), "got: {warning}");
+        // And a genuinely failed listing keeps the listing wording.
+        let bound = pinned_index_bound(None, None, false, || {
+            rocm_core::WindowsGpuListing::Unavailable
+        });
+        assert!(!bound.mask_unresolved);
+        let pinned = validate_pinned_gpu_index(
+            7,
+            bound.count,
+            bound.visible.as_deref(),
+            None,
+            bound.mask_unresolved,
+        )
+        .unwrap();
+        assert!(
+            pinned
+                .unchecked_warning
+                .expect("unchecked")
+                .contains("could not list the AMD GPUs")
+        );
+    }
+
+    #[test]
+    fn a_zero_gpu_count_refuses_an_index_without_naming_a_range() {
+        let error = validate_pinned_gpu_index(0, Some(0), None, None, false)
+            .expect_err("no GPUs detected, so no index is valid");
+        let message = error.to_string();
+        assert!(message.contains("no GPUs were detected"), "got: {message}");
+        assert!(!message.contains("valid indices"), "got: {message}");
+        let masked = validate_pinned_gpu_index(0, Some(0), None, Some("HIP_VISIBLE_DEVICES"), true)
+            .expect_err("still refused with an unresolved mask");
+        assert!(
+            masked.to_string().contains("no GPUs were detected"),
+            "got: {masked}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_mask_still_refuses_an_index_past_the_adapters() {
+        // ROCMAI-824: one adapter, HIP_VISIBLE_DEVICES a token that cannot
+        // be read as an ordinal, amd-smi down. An index at or past the adapter
+        // count cannot exist whatever the mask says, so `--gpu 7` is refused; only
+        // `--gpu 0`, which the unreadable mask could still hide, is accepted, with
+        // the warning.
+        let bound = pinned_index_bound(None, None, true, || {
+            rocm_core::WindowsGpuListing::MaskUnresolved { adapters: 1 }
+        });
+        assert_eq!(bound.count, Some(1));
+        let refused = validate_pinned_gpu_index(
+            7,
+            bound.count,
+            bound.visible.as_deref(),
+            Some("HIP_VISIBLE_DEVICES"),
+            bound.mask_unresolved,
+        )
+        .expect_err("--gpu 7 cannot exist on a one-adapter host");
+        let message = refused.to_string();
+        assert!(
+            message.contains("--gpu index 7 is out of range")
+                && message.contains("1 GPU(s) detected (valid indices 0..0)")
+                && message.contains("HIP_VISIBLE_DEVICES could not be resolved"),
+            "got: {message}"
+        );
+        let accepted = validate_pinned_gpu_index(
+            0,
+            bound.count,
+            bound.visible.as_deref(),
+            Some("HIP_VISIBLE_DEVICES"),
+            bound.mask_unresolved,
+        )
+        .unwrap();
+        assert_eq!(accepted.indices, vec![0]);
+        let mut printed = Vec::new();
+        write_unchecked_index_warning(&mut printed, &accepted).unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        assert!(
+            printed.starts_with("warning: HIP_VISIBLE_DEVICES could not be resolved")
+                && printed.contains("`--gpu 0` was checked only against the GPU count"),
+            "got: {printed}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_mask_takes_the_smaller_of_the_adapter_and_amd_smi_counts() {
+        // pnputil lists 2 adapters, amd-smi sees 1: the stricter bound wins, as
+        // it does for a resolved listing.
+        let bound = pinned_index_bound(None, Some(1), true, || {
+            rocm_core::WindowsGpuListing::MaskUnresolved { adapters: 2 }
+        });
+        assert_eq!(bound.count, Some(1));
+        assert!(validate_pinned_gpu_index(1, bound.count, None, None, true).is_err());
+        // amd-smi seeing more than the adapters never widens it.
+        let bound = pinned_index_bound(None, Some(4), true, || {
+            rocm_core::WindowsGpuListing::MaskUnresolved { adapters: 2 }
+        });
+        assert_eq!(bound.count, Some(2));
+    }
+
+    #[test]
+    fn a_hip_mask_cut_to_nothing_by_the_amd_smi_count_still_names_the_mask() {
+        // ROCMAI-824: the mask names ordinal 1 (a real adapter) and amd-smi
+        // reports one GPU, so the cut set is empty. The refusal must blame the
+        // mask the user set, not claim no GPU is present.
+        let bound = pinned_index_bound(None, Some(1), true, || {
+            rocm_core::WindowsGpuListing::Indices(vec![1])
+        });
+        assert_eq!(bound.visible, Some(Vec::new()));
+        let error = validate_pinned_gpu_index(
+            1,
+            bound.count,
+            bound.visible.as_deref(),
+            Some("HIP_VISIBLE_DEVICES"),
+            bound.mask_unresolved,
+        )
+        .expect_err("every GPU is masked out");
+        let message = error.to_string();
+        assert!(
+            message.contains("under the active visibility mask (HIP_VISIBLE_DEVICES)"),
+            "got: {message}"
+        );
+        assert!(!message.contains("is present"), "got: {message}");
+    }
+
+    #[test]
+    fn the_windows_adapter_listing_never_loosens_the_amd_smi_count() {
+        // ROCMAI-824: pnputil counts an iGPU + dGPU pair, but amd-smi (which
+        // works here) sees only the one HIP supports. amd-smi alone refuses
+        // index 1, and adding the Windows listing must not loosen that.
+        let bound = pinned_index_bound(None, Some(1), true, || {
+            rocm_core::WindowsGpuListing::Indices(vec![0, 1])
+        });
+        assert_eq!(bound.visible, Some(vec![0]));
+        let error = validate_pinned_gpu_index(1, Some(1), bound.visible.as_deref(), None, false)
+            .expect_err("amd-smi sees one GPU, so --gpu 1 stays refused");
+        assert!(
+            error.to_string().contains("usable GPU indices: [0]"),
+            "got: {error}"
+        );
+        // The listing still bounds when amd-smi cannot answer, and amd-smi's
+        // larger count never widens the listing.
+        let bound = pinned_index_bound(None, None, false, || {
+            rocm_core::WindowsGpuListing::Indices(vec![0])
+        });
+        assert_eq!(bound.visible, Some(vec![0]));
+        let bound = pinned_index_bound(None, Some(4), true, || {
+            rocm_core::WindowsGpuListing::Indices(vec![0])
+        });
+        assert_eq!(bound.visible, Some(vec![0]));
+    }
+
+    #[test]
+    fn the_windows_listing_is_not_read_when_a_visible_set_exists() {
+        // Linux: the visible set is authoritative and the Windows listing is
+        // never consulted.
+        let bound = pinned_index_bound(Some(vec![2, 3]), Some(4), false, || {
+            panic!("the Windows listing must not be read when a visible set exists")
+        });
+        assert_eq!(bound.visible, Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn the_windows_listing_is_not_read_when_amd_smi_gave_a_count_and_no_mask_is_set() {
+        // The count alone bounds the index, so the pnputil/PowerShell query is
+        // skipped; the check is the same range check amd-smi alone makes.
+        let bound = pinned_index_bound(None, Some(1), false, || {
+            panic!("the Windows listing must not be read when amd-smi gave a count")
+        });
+        assert!(bound.visible.is_none() && !bound.mask_unresolved);
+        assert_eq!(bound.count, Some(1));
+        let error = validate_pinned_gpu_index(7, bound.count, None, None, false)
+            .expect_err("--gpu 7 is past the amd-smi count");
+        assert!(
+            error.to_string().contains("is out of range"),
+            "got: {error}"
+        );
+        // With a mask set the listing is needed to apply it, so it is read.
+        let bound = pinned_index_bound(None, Some(1), true, || {
+            rocm_core::WindowsGpuListing::Indices(vec![0])
+        });
+        assert_eq!(bound.visible, Some(vec![0]));
+    }
+
+    #[test]
+    fn a_mask_with_no_gpu_list_still_warns_when_only_the_amd_smi_count_bounds_the_index() {
+        // Linux shape: the KFD/DRM probe failed (no visible set), amd-smi answers,
+        // and a mask is set that could not be applied. An index below the count
+        // is accepted, but never silently.
+        let pinned = validate_pinned_gpu_index(
+            0,
+            Some(2),
+            None,
+            Some("HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES"),
+            false,
+        )
+        .expect("below the count");
+        let warning = pinned.unchecked_warning.expect("the mask was not applied");
+        assert!(
+            warning.contains("HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES is set")
+                && warning.contains("`--gpu 0` was checked only against the GPU count"),
+            "got: {warning}"
+        );
+        // Past the count it is still refused.
+        assert!(
+            validate_pinned_gpu_index(
+                2,
+                Some(2),
+                None,
+                Some("HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES"),
+                false
+            )
+            .is_err()
+        );
+        // No mask, in range: the amd-smi count fully checks it, so no warning.
+        let pinned = validate_pinned_gpu_index(0, Some(2), None, None, false).unwrap();
+        assert_eq!(pinned.unchecked_warning, None);
+    }
+
+    #[test]
+    fn the_windows_adapter_fallback_composes_on_any_host() {
+        // The composition serve() runs on native Windows, simulated here so a
+        // Linux runner exercises it: no Linux visible set, amd-smi unusable, a
+        // one-adapter listing.
+        let bound = pinned_index_bound(None, None, false, || {
+            rocm_core::WindowsGpuListing::Indices(vec![0])
+        });
+        let error = validate_pinned_gpu_index(7, None, bound.visible.as_deref(), None, false)
+            .expect_err("--gpu 7 on a one-adapter host");
+        assert!(error.to_string().contains("not present on this host"));
+        // No source at all: nothing bounds it.
+        let bound = pinned_index_bound(None, None, false, || {
+            rocm_core::WindowsGpuListing::Unavailable
+        });
+        assert!(bound.visible.is_none() && !bound.mask_unresolved);
+    }
+
+    #[test]
+    fn the_refusal_names_only_the_visibility_variable_that_acts_on_the_platform() {
+        // Native Windows HIP has no ROCr layer: ROCR_VISIBLE_DEVICES alone is no
+        // mask there, so the refusal says the index is not on the host.
+        assert_eq!(active_visibility_mask(true, false, true), None);
+        let error = validate_pinned_gpu_index(
+            7,
+            None,
+            Some(&[0]),
+            active_visibility_mask(true, false, true),
+            false,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("not present on this host"));
+        assert!(!error.to_string().contains("ROCR_VISIBLE_DEVICES"));
+        // HIP_VISIBLE_DEVICES does act there, and is the only one named.
+        assert_eq!(
+            active_visibility_mask(true, true, true),
+            Some("HIP_VISIBLE_DEVICES")
+        );
+        let error = validate_pinned_gpu_index(
+            7,
+            None,
+            Some(&[0]),
+            active_visibility_mask(false, true, true),
+            false,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("(HIP_VISIBLE_DEVICES)"));
+        assert!(!error.to_string().contains("ROCR_VISIBLE_DEVICES"));
+        // Linux keeps both, and either one counts.
+        for (rocr, hip) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                active_visibility_mask(rocr, hip, false),
+                Some("HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES")
+            );
+        }
+        assert_eq!(active_visibility_mask(false, false, false), None);
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_refuses_an_index_past_the_windows_adapter_set() {
+        // ROCMAI-824: native Windows, one Strix Halo iGPU, amd-smi unusable
+        // (`detected` is `None`). The adapter set from
+        // `rocm_core::windows_amd_gpu_listing` yields `[0]`, so `--gpu 7` is refused
+        // and the refusal lists the GPU that does exist.
+        let error = validate_pinned_gpu_index(7, None, Some(&[0]), None, false)
+            .expect_err("--gpu 7 must be refused on a one-GPU host");
+        let message = error.to_string();
+        assert!(
+            message.contains("--gpu index 7 is not present on this host"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("usable GPU indices: [0]"),
+            "got: {message}"
         );
     }
 
@@ -1276,21 +1807,23 @@ mod tests {
         // The visible set is authoritative: an index outside it is rejected early
         // with the usable set, rather than deferring to a late engine error. A
         // mask is set here, so the message names the visibility variables.
-        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]), true)
+        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]), Some(TEST_MASK), false)
             .expect_err("masked-out device must be rejected");
         let message = error.to_string();
         assert!(message.contains("not available under the active visibility mask"));
         assert!(message.contains("[2, 3]"));
         // A visible index still pins exactly that ordinal.
         assert_eq!(
-            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3]), true).unwrap(),
+            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3]), Some(TEST_MASK), false)
+                .unwrap()
+                .indices,
             vec![2]
         );
         // An empty visible set is authoritative "no GPU usable" (every device
         // masked out), not "could not enumerate" — the latter is `None`, per the
         // `usable_amd_gpu_indices` contract. So it rejects rather than falling
         // through to the count check; the detected count must not override it.
-        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]), true)
+        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]), Some(TEST_MASK), false)
             .expect_err("an all-masked host must reject an explicit --gpu index");
         assert!(
             masked_out
@@ -1307,7 +1840,7 @@ mod tests {
         // the host — the rejection must say so and must NOT blame HIP/ROCR
         // variables the user never set (that message sends them debugging a mask
         // that does not exist).
-        let error = validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), false)
+        let error = validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), None, false)
             .expect_err("an index past the visible set must be refused");
         let message = error.to_string();
         assert!(
@@ -1322,7 +1855,7 @@ mod tests {
 
         // The all-empty visible set with no mask is a not-present message too,
         // never a spurious mask advisory.
-        let empty = validate_pinned_gpu_index(0, Some(2), Some(&[]), false)
+        let empty = validate_pinned_gpu_index(0, Some(2), Some(&[]), None, false)
             .expect_err("no present GPU must refuse an explicit --gpu index");
         assert!(empty.to_string().contains("present on this host"));
         assert!(!empty.to_string().contains("visibility mask"));
@@ -1335,11 +1868,13 @@ mod tests {
         // HIP-visible set is still rejected (and vice versa), instead of the two
         // being compared as one ordinal space.
         assert_eq!(
-            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1]), true).unwrap(),
+            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1]), Some(TEST_MASK), false)
+                .unwrap()
+                .indices,
             vec![1]
         );
         assert!(
-            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), true).is_err(),
+            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), Some(TEST_MASK), false).is_err(),
             "index within the detected count but outside the visible set must reject"
         );
     }

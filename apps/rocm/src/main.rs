@@ -579,7 +579,13 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long)]
         device: Option<DevicePolicyArg>,
         /// GPU device to serve on: `auto` (default; first free GPU) or a single
-        /// index like `1`.
+        /// index like `1`. An index the machine does not have is refused, and
+        /// the error lists the indices that exist. If the GPUs cannot be listed,
+        /// the index is used with a warning that it was not checked. If a
+        /// visibility mask cannot be applied (`HIP_VISIBLE_DEVICES` cannot be
+        /// read as ordinals, or no GPU list was available to apply it to), an
+        /// index at or past the GPU count is still refused, and a lower one is
+        /// used with a warning that the mask was not checked.
         #[arg(long, value_name = "INDEX|auto")]
         gpu: Option<String>,
         /// ROCm runtime key to use for this server.
