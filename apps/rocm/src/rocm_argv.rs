@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Argv helpers shared by the chat tool-call policy and the freeform planner:
+//! Argv helpers shared by `chat.rs`, `tool_policy.rs` and the freeform planner:
 //! reading an option's value out of an argv slice (`chat_cli_arg_value`,
 //! `chat_cli_arg_value_checked`, `chat_cli_has_flag`), appending a flag at
 //! most once (`ensure_flag`), recognising a CPU device request in `serve`
@@ -10,9 +10,9 @@
 //! quoted one-line command shown in plans and prompts
 //! (`format_structured_tool_call`).
 //!
-//! A leaf module with no `crate::` dependencies: `chat.rs` and
-//! `freeform_planner.rs` both call into it, so neither has to import the other
-//! for these helpers. They were relocated verbatim from `chat.rs` and
+//! A leaf module with no `crate::` dependencies: `chat.rs`, `tool_policy.rs`
+//! and `freeform_planner.rs` all call into it, so the planner does not have to
+//! import `chat` for these helpers. They were relocated verbatim from `chat.rs` and
 //! `freeform_planner.rs`, which re-export the items other modules still reach
 //! as `chat::ensure_flag` and `freeform_planner::format_structured_tool_call`.
 
