@@ -2,111 +2,59 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Examine/model-catalog/engine-inventory rendering: the `rocm examine`
-//! report (both its JSON-adjacent text path and its plain-language human
-//! report), the `rocm engines`/`examine` engine-inventory listing, and the
-//! `rocm model` (alias `models`) model-catalog rendering (built-in recipe
-//! listing, verbose per-recipe diagnostics, artifact/source-policy
-//! metadata, host-RAM/GPU fit, manual-alternative recommendations, and
-//! per-engine support/adapter-availability notes).
+//! Examine and engine-inventory rendering: the `rocm examine` report (both
+//! its JSON-adjacent text path and its plain-language human report) and the
+//! `rocm engines`/`examine` engine-inventory listing.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-208), the last sub-phase of this split, folding the
-//! `main.rs` modularization epic (ROCMAI-27/ROCMAI-86) closed (see
-//! `docs/architecture.md`).
+//! Relocated from `main.rs` with no behavior change (see
+//! `docs/architecture.md`). The `rocm model` catalog renderer used to live
+//! here too; it moved to `model_catalog_text.rs`, which this module does not
+//! call into outside its own tests.
 //!
 //! This module owns: the launch-summary/examine text surfaces
 //! (`render_launch_summary`, `render_examine_text`,
 //! `render_examine_text_with_paths`, `examine_human_report`,
-//! `render_examine_plain_header`, `plain_status_label`), the engine-inventory
-//! listing shared by `rocm engines` and `rocm examine`
+//! `render_examine_plain_header`, `plain_status_label`) and the
+//! engine-inventory listing shared by `rocm engines` and `rocm examine`
 //! (`write_default_engine_legend`, the `DEFAULT_ENGINE_MARKER` constant,
 //! `render_engine_inventory_text_with_paths`, `append_examine_runtime_state`,
-//! `append_examine_engine_inventory`), and the model-catalog rendering
-//! (`model_catalog_platform_heading`,
-//! `render_model_registry_text_with_context_and_host`,
-//! `model_recipe_memory_label`, `model_recipe_gpu_fit_label`,
-//! `render_model_registry_verbose_text_with_context_and_host`,
-//! `model_catalog_header`, `append_model_recipe_registry_source`,
-//! `append_model_recipe_metadata_lines`,
-//! `append_model_engine_recipe_settings_lines`,
-//! `append_model_recipe_staleness_lines`, `format_list_or_none`,
-//! `format_string_map_or_none`, `append_model_artifact_lines`,
-//! `append_artifact_source_policy_lines`, `artifact_source_policy_label`,
-//! `format_bytes`, `append_model_host_ram_fit_lines`,
-//! `append_model_fit_lines`, `append_manual_alternative_lines`,
-//! `manual_alternative_recommendations`, `recipe_is_manual_fit`,
-//! `append_model_engine_support_lines`, `recipe_display_ref`,
-//! `preferred_engine_action_target`, `once_per_call`, `model_registry_reason`, `format_gib`,
-//! `append_engine_detect_summary`, `friendly_engine_runtime_kind`,
-//! `friendly_engine_detect_notes`, `friendly_engine_detect_note_fallback`,
-//! and `engine_runtime_status_label`).
+//! `append_examine_engine_inventory`, `append_engine_detect_summary`,
+//! `friendly_engine_runtime_kind`, `friendly_engine_detect_notes`,
+//! `friendly_engine_detect_note_fallback`, `engine_runtime_status_label` and
+//! `runtime_status_label_for`). `DEFAULT_ENGINE_MARKER` is shared by both
+//! engine-inventory renderers so the two copies cannot drift apart.
 //!
-//! Two items physically interleaved in this span in `main.rs` moved with it
-//! rather than staying behind, since neither has a caller outside this
-//! cluster: the `DEFAULT_ENGINE_MARKER` constant (shared by both
-//! engine-inventory renderers so the two copies cannot drift apart) and
-//! `model_registry_adapter_availability_note` (read only from
-//! `append_model_engine_support_lines` and this module's own test). Both
-//! stay private.
-//!
-//! `render_config_text` and `telemetry_policy_summary` sat immediately
-//! adjacent to this cluster's end boundary in `main.rs` (they render the
-//! `rocm config` command's own output) but were explicitly out of scope —
-//! they didn't fit any of the 8 named Phase 6f clusters — so this split
-//! left them where they were. They now live in `config_cmd.rs`.
-//!
-//! `dispatch()` calls directly into this module at two points — the
-//! `Command::Model` arm's calls to
-//! `render_model_registry_verbose_text_with_context_and_host` (with
-//! `--verbose`) and `render_model_registry_text_with_context_and_host` —
-//! re-imported via `use crate::examine_report_text::{...};`; `examine_cmd.rs`'s
-//! `examine()`, which the `Command::Examine` arm calls, imports and calls
-//! `examine_human_report` itself. `main.rs`'s own `launch_default` calls
-//! `render_launch_summary` directly, also re-imported there.
-//! `render_examine_text`, `render_examine_text_with_paths`, and
-//! `render_model_registry_verbose_text_with_context_and_host` are also
-//! `pub(crate)`, read from [`chat.rs`](../apps/rocm/src/chat.rs)'s
-//! deterministic tool-output summaries; `render_engine_inventory_text_with_paths`
-//! is also read from `chat.rs` and from
+//! Callers: `examine_cmd.rs`'s `examine()`, which the `Command::Examine` arm
+//! calls, imports and calls `examine_human_report`; `main.rs`'s own
+//! `launch_default` calls `render_launch_summary`, re-imported there.
+//! `render_examine_text`, `render_examine_text_with_paths` and
+//! `render_engine_inventory_text_with_paths` are `pub(crate)`, read from
+//! [`chat.rs`](../apps/rocm/src/chat.rs)'s deterministic tool-output
+//! summaries; `render_engine_inventory_text_with_paths` is also read from
 //! [`engines_cmd.rs`](../apps/rocm/src/engines_cmd.rs)'s
-//! `render_engine_inventory_text`;
-//! `append_examine_runtime_state` is also `pub(crate)`, read only from
-//! [`runtimes_cmd.rs`](../apps/rocm/src/runtimes_cmd.rs)'s own test module —
+//! `render_engine_inventory_text`. `append_examine_runtime_state` is also
+//! `pub(crate)`, read only from
+//! [`runtimes_cmd.rs`](../apps/rocm/src/runtimes_cmd.rs)'s own test module, so
 //! `main.rs`'s re-import of it is itself `#[cfg(test)]`, since it would
-//! otherwise be an unused import in a non-test build; `format_bytes` is also
-//! `pub(crate)`, read from
-//! [`storage.rs`](../apps/rocm/src/storage.rs)'s cache-size reporting and
-//! [`automations.rs`](../apps/rocm/src/automations.rs)'s plain-language
-//! summaries. Every other item in this list has no caller outside this
-//! module and stays private.
+//! otherwise be an unused import in a non-test build. Every other item in this
+//! list has no caller outside this module and stays private.
 //!
-//! This cluster reaches three items that stayed behind in `main.rs` because
-//! they already had callers outside it: `engine_inventory()` (the built-in
-//! engine list, also read from `update_cmd.rs`),
-//! `engine_ruled_out_by_platform` (also read from `assess_model_for_host` and
-//! from `main.rs`'s `ensure_engine_allowed_on_platform`; it and the
-//! `PlatformRuleOut` enum it returns, which
-//! `model_registry_adapter_availability_note` and `engine_runtime_status_label`
-//! match on, have since moved to `model_fit.rs` and are re-imported in
-//! `main.rs`, so they are reached the same way), and
-//! `missing_packaged_engine_reason` (already noted in
-//! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
-//! callers outside that cluster, plus its own test — this cluster is one of
-//! them) — all three reached via `use crate::{...};`, the same way other
-//! mechanically relocated modules reach a left-behind crate-root item.
+//! This module reaches three items that live at the crate root because they
+//! have other callers: `engine_inventory()` (the built-in engine list, also
+//! read from `update_cmd.rs`), `PlatformRuleOut` (which
+//! `engine_runtime_status_label` matches on) and
+//! `engine_ruled_out_by_platform` (both defined in `model_fit.rs` and
+//! re-imported in `main.rs`), and `missing_packaged_engine_reason` (also read
+//! from `model_catalog_text.rs`) — all reached via `use crate::{...};`.
 //!
-//! The cluster's regression tests live in this module's own `mod tests`,
-//! reaching the shared `test_paths` fixture through `crate::tests::` and
-//! `write_test_pip_runtime` through `crate::test_support::`, the same way
-//! other mechanically relocated modules do. Two tests interleaved among
-//! this cluster's tests in `main.rs`'s old shared `mod tests` stayed behind
-//! because their primary subject is unrelated: `missing_packaged_engine_reason`'s
-//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`)
-//! and the whole-command-tree ASCII-help walk
-//! (`every_help_text_in_the_command_tree_is_ascii`). Two further such tests, for
-//! the CLI audit/lifecycle log, stayed there when this module was split out and
-//! have since moved to `cli_audit.rs`.
+//! The regression tests for these surfaces live in this module's own
+//! `mod tests`, reaching the shared `test_paths` fixture through
+//! `crate::tests::` and `write_test_pip_runtime` through
+//! `crate::test_support::`. One of them,
+//! `linux_only_engine_runtime_status_is_explicit_on_native_windows`, also
+//! calls `model_catalog_text.rs`'s `model_registry_adapter_availability_note`,
+//! which is `pub(crate)` for that reason; its primary subject is
+//! `engine_runtime_status_label`, so it stays here.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

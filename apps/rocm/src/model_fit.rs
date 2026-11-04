@@ -17,13 +17,14 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. It is a module of its own, rather than part of the
-//! `rocm diagnose` handler, so `examine_report_text.rs`, which reads
-//! `PlatformRuleOut` and `engine_ruled_out_by_platform`, does not have to
-//! depend on a command module. Its own dependencies are `serve_cmd.rs` and
+//! `rocm diagnose` handler, so `examine_report_text.rs` and
+//! `model_catalog_text.rs`, which read `PlatformRuleOut` and
+//! `engine_ruled_out_by_platform`, do not have to depend on a command module. Its own dependencies are `serve_cmd.rs` and
 //! `gpu_policy.rs`; neither depends on this module. `assess_model_on_this_host`
 //! (called from `diagnose()` in `diagnose_cmd.rs`), `PlatformRuleOut` and
 //! `engine_ruled_out_by_platform` are `pub(crate)`; `main.rs` re-imports the
-//! last two so `examine_report_text.rs` keeps reaching them as `crate::<name>`.
+//! last two so `examine_report_text.rs` and `model_catalog_text.rs` keep
+//! reaching them as `crate::<name>`.
 //! Every other item has no caller outside this module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
