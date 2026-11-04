@@ -222,6 +222,13 @@ pub struct Examination {
     /// (`/sys/bus/pci/drivers/amdgpu`), which it is whether amdgpu is loaded
     /// as a module or built into the kernel (where it never appears in
     /// `lsmod`), or kfd is present on the host (kfd is linked into amdgpu).
+    ///
+    /// This is the driver being present, not a GPU being bound to it: a
+    /// built-in driver registers at boot with or without a matching GPU, as a
+    /// loaded module does when `modprobe`d on any machine. Whether there is an
+    /// AMD GPU is `has_amd_gpu`. `diagnose` reads only `Some(false)`, as a
+    /// module that failed to load (DKMS, a blacklist, Secure Boot), none of
+    /// which can stop a driver that is present.
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
     /// kfd is available: as a separate `amdkfd` module on kernels before 4.20

@@ -35,6 +35,11 @@ fn amdgpu_present_on_host() -> bool {
 /// registered, or kfd is present. kfd is linked into amdgpu, so kfd on the
 /// host proves amdgpu too: a container that passes `/dev/kfd` through without
 /// `/sys/bus/pci` must not report amdkfd up and amdgpu down.
+///
+/// Neither signal means a GPU is bound. `amdgpu_init` creates kfd's device
+/// before it calls `pci_register_driver`, and the PCI driver directory exists
+/// once registration succeeds, before any device is probed. Both prove the
+/// driver is present, which is what `amdgpu_loaded` reports.
 fn amdgpu_implied_by_host() -> bool {
     amdgpu_present_on_host() || kfd_present_on_host()
 }

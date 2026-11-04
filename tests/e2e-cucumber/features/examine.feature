@@ -475,6 +475,8 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as loaded
 
+  # A negative control for examine-31, not proof of the fix: it passes with
+  # the fix reverted too, and fails if the kfd check reports true regardless.
   @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
   Scenario: examine-32 - The inspection reports kfd as not loaded on a machine without it
     Given a machine whose kernel has no kfd and lists no amdkfd module
