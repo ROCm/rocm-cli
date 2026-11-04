@@ -12,7 +12,8 @@
 //! reads `OpenAiSseEmitter`; that is the only edge back into `providers`
 //! besides its shared types.
 
-use super::{OpenAiSseEmitter, ProviderStreamEvent, SseBytesEmitter};
+use super::wire::OpenAiSseEmitter;
+use super::{ProviderStreamEvent, SseBytesEmitter};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     connect_tcp_stream, format_host_port, read_http_response_bounded, write_all_tcp_stream,
