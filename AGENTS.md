@@ -119,7 +119,7 @@ resulting state in the same test. Three shapes need this:
 A test that only pins the wording certifies the string, not the truth of it, and a pin
 over a false claim holds the claim in place. Where the text genuinely has to be pinned on
 its own, the assertion carries a comment naming the test that proves the behavior — see
-`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in [`apps/rocm/src/setup_cmd.rs`](apps/rocm/src/setup_cmd.rs),
 which pins the onboarding line and points at
 `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
 itself.
@@ -252,6 +252,7 @@ CLI:
 
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtimes list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
@@ -259,7 +260,8 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
 - **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
-- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. `BoxRole::from_tone` in [`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs) derives a card border from the same tone. To color a new status enum, add its tone function there rather than a bespoke match per screen
+- **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
@@ -287,7 +289,7 @@ Guardrails:
   - do not pair two independently ordered lists by index when they share an id;
     correlate by id. Where no id exists, positional pairing is allowed only as the last
     resort after every stronger identifier (device id, name) has been tried, as
-    `fill_unidentified_gpus_from_hipinfo` in [examine.rs](crates/rocm-core/src/examine.rs) does;
+    `fill_unidentified_gpus_from_hipinfo` in [windows.rs](crates/rocm-core/src/examine/windows.rs) does;
     otherwise degrade to "unknown", never to a guess on multi-adapter hosts
   - check the documented width and range of every WMI or Win32 field before trusting
     it (a 32-bit field saturates at 4 GiB)

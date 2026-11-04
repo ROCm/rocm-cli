@@ -36,7 +36,8 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{StatusTone, Theme};
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened registered-runtime entry for the list.
 ///
@@ -58,6 +59,18 @@ pub struct RuntimeSummary {
     pub active: bool,
     /// Whether this runtime is the rollback target (`previous_runtime_key`).
     pub rollback: bool,
+}
+
+/// Tone of a runtime's list marker: the active default wins over the rollback
+/// target, and every other runtime is muted.
+const fn runtime_marker_tone(rt: &RuntimeSummary) -> StatusTone {
+    if rt.active {
+        StatusTone::Success
+    } else if rt.rollback {
+        StatusTone::Warning
+    } else {
+        StatusTone::Muted
+    }
 }
 
 /// Marker shown beside the active runtime in the list. Every place *in this
@@ -188,9 +201,6 @@ pub fn on_key(
     if let Some(input) = r.import_input.as_mut() {
         match key.code {
             KeyCode::Esc => r.import_input = None,
-            KeyCode::Backspace => {
-                input.pop();
-            }
             KeyCode::Enter => {
                 let path = input.trim().to_string();
                 if path.is_empty() {
@@ -202,8 +212,9 @@ pub fn on_key(
                     stage_approval(r, RuntimeAction::Import, args);
                 }
             }
-            KeyCode::Char(c) => input.push(c),
-            _ => {}
+            code => {
+                apply_char_key(input, code);
+            }
         }
         return Vec::new();
     }
@@ -392,10 +403,16 @@ pub fn draw_runtime_manager(
     if any_marked {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(ACTIVE_MARKER, Style::default().fg(theme.ok)),
+                Span::styled(
+                    ACTIVE_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Success)),
+                ),
                 Span::styled("= active", Style::default().fg(theme.muted)),
                 Span::styled(" · ", Style::default().fg(theme.muted)),
-                Span::styled(ROLLBACK_MARKER, Style::default().fg(theme.warn)),
+                Span::styled(
+                    ROLLBACK_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Warning)),
+                ),
                 Span::styled("= rollback target", Style::default().fg(theme.muted)),
             ])),
             rows[0],
@@ -422,13 +439,7 @@ pub fn draw_runtime_manager(
                 } else {
                     "  "
                 };
-                let marker_color = if rt.active {
-                    theme.ok
-                } else if rt.rollback {
-                    theme.warn
-                } else {
-                    theme.muted
-                };
+                let marker_color = theme.tone_color(runtime_marker_tone(rt));
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, Style::default().fg(marker_color)),
                     Span::styled(
@@ -575,6 +586,23 @@ mod tests {
     }
 
     #[test]
+    fn marker_color_distinguishes_active_rollback_and_other_runtimes() {
+        let theme = Theme::from_name("default-dark");
+        let rt = |active, rollback| RuntimeSummary {
+            active,
+            rollback,
+            ..RuntimeSummary::default()
+        };
+        let color = |r: &RuntimeSummary| theme.tone_color(runtime_marker_tone(r));
+        assert_eq!(color(&rt(true, false)), theme.ok);
+        assert_eq!(color(&rt(false, true)), theme.warn);
+        assert_eq!(color(&rt(false, false)), theme.muted);
+        // A runtime that is both the active default and the rollback target
+        // reads as active.
+        assert_eq!(color(&rt(true, true)), theme.ok);
+    }
+
+    #[test]
     fn refresh_is_read_only_and_spawns_without_approval() {
         let mut rm = Some(RuntimeManagerState::default());
         let mut jobs = State::default();
@@ -695,6 +723,18 @@ mod tests {
         let pending = rm.as_ref().unwrap().approval.as_ref().unwrap();
         assert_eq!(pending.action, RuntimeAction::Import);
         assert_eq!(pending.args, vec!["runtimes", "import", "/tmp/m.json"]);
+    }
+
+    #[test]
+    fn backspace_edits_the_import_path() {
+        let mut rm = Some(RuntimeManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char('i')));
+        for c in "ab".chars() {
+            on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(rm.as_ref().unwrap().import_input.as_deref(), Some("a"));
     }
 
     #[test]

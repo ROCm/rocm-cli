@@ -727,3 +727,24 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine with ROCm missing from PATH
     When the user diagnoses that machine with a rocminfo not found symptom
     Then the PATH cause prints a verify line that shows the GPU with rocminfo alone
+
+  # A missing system HIP SDK is a fault only when something on the machine calls
+  # into it: a HIP-built PyTorch from outside a managed runtime, or a HIP-built
+  # llama.cpp on PATH. Lemonade's bundled llama.cpp does not, and a managed
+  # TheRock runtime brings its own HIP. On v0.2.1 a healthy Windows Strix Halo
+  # serving through Lemonade was still told "install the HIP SDK" as its #1
+  # cause, before and after `rocm install sdk`. Like diagnose-41 the scenario
+  # names no host shape: it holds `diagnose` to what `rocm examine --json`
+  # reports on the same machine, so on the self-hosted Windows GPU lanes (Strix
+  # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
+  # an ambient HIP framework needs the SDK is held by the unit test
+  # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # (below the match threshold) as present, which is what production does for
+  # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
+  # bonus wrong, so whoever changes it must update this scenario's oracle too.
+  @id:diagnose-windows-hip-sdk-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-48 - On Windows the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it

@@ -77,13 +77,28 @@ async fn cache_behind_looping_link(world: &mut E2eWorld) {
 }
 
 fn run_uninstall(world: &mut E2eWorld, keep: &[&str], settings: &[(&str, &str)]) {
+    run_uninstall_with(world, true, keep, settings);
+}
+
+/// `confirmed: false` leaves `--yes` off, so the run reaches the confirmation
+/// gate; the harness gives the binary no terminal, which is the case the gate
+/// has to refuse.
+fn run_uninstall_with(
+    world: &mut E2eWorld,
+    confirmed: bool,
+    keep: &[&str],
+    settings: &[(&str, &str)],
+) {
     let root = root(world).to_path_buf();
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
     let home = home.display().to_string();
     let uv = root.join("uv-cache").display().to_string();
     let hf = root.join("hf-home").display().to_string();
-    let mut args = vec!["uninstall", "--yes", "--keep-binaries"];
+    let mut args = vec!["uninstall", "--keep-binaries"];
+    if confirmed {
+        args.push("--yes");
+    }
     args.extend_from_slice(keep);
     let mut envs = vec![
         ("HOME", home.as_str()),
@@ -128,6 +143,143 @@ async fn uninstall_config_and_cache(world: &mut E2eWorld) {
             ("ROCM_CLI_CONFIG_DIR", &config),
             ("ROCM_CLI_CACHE_DIR", &cache),
         ],
+    );
+}
+
+#[when("the user uninstalls the config without confirming")]
+async fn uninstall_config_unconfirmed(world: &mut E2eWorld) {
+    let config = config_dir(world).display().to_string();
+    run_uninstall_with(
+        world,
+        false,
+        &["--keep-data", "--keep-cache"],
+        &[("ROCM_CLI_CONFIG_DIR", &config)],
+    );
+}
+
+/// The scenario's own home folder, standing in for the user's.
+fn home_dir(world: &E2eWorld) -> PathBuf {
+    root(world).join("home")
+}
+
+/// The cache folder a default install in [`home_dir`] uses (`~/.rocm/cache`).
+fn default_cache(world: &E2eWorld) -> PathBuf {
+    home_dir(world).join(".rocm").join("cache")
+}
+
+/// Where the cache folder belongs when only the config and data folders are
+/// set: inside the scenario's data folder, the one `isolate_env` hands the CLI.
+fn data_cache(world: &E2eWorld) -> PathBuf {
+    world.app_paths().data_dir.join("cache")
+}
+
+/// Run `rocm` with the config and data folders set but no cache folder, as an
+/// install isolated by `ROCM_CLI_CONFIG_DIR` and `ROCM_CLI_DATA_DIR` alone is.
+/// HOME (and USERPROFILE, which is where Windows finds it) is the scenario's
+/// own, so a cache resolved to the default lands in [`default_cache`], not the
+/// runner's.
+fn run_without_cache_setting(world: &mut E2eWorld, args: &[&str]) {
+    let root = root(world).to_path_buf();
+    let home = home_dir(world);
+    std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
+    let home = home.display().to_string();
+    let uv = root.join("uv-cache").display().to_string();
+    let hf = root.join("hf-home").display().to_string();
+    let envs = [
+        ("HOME", home.as_str()),
+        ("USERPROFILE", home.as_str()),
+        ("UV_CACHE_DIR", uv.as_str()),
+        ("HF_HOME", hf.as_str()),
+    ];
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_env_and_unset(world, args, &envs, &["ROCM_CLI_CACHE_DIR"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[given("a default install's cache folder in the user's home holds the user's files")]
+async fn default_cache_holds_user_files(world: &mut E2eWorld) {
+    let cache = default_cache(world);
+    std::fs::create_dir_all(&cache).expect("failed to create the default cache folder");
+    std::fs::write(cache.join(USER_FILE), "user data").expect("failed to write user file");
+}
+
+#[given("the data folder's own cache folder holds a cache file")]
+async fn data_cache_holds_file(world: &mut E2eWorld) {
+    let cache = data_cache(world);
+    std::fs::create_dir_all(&cache).expect("failed to create the data folder's cache folder");
+    std::fs::write(cache.join("cached.bin"), "cached").expect("failed to write cache file");
+}
+
+#[when("the user asks what ROCm CLI keeps on disk with only the config and data folders set")]
+async fn storage_without_cache_setting(world: &mut E2eWorld) {
+    run_without_cache_setting(world, &["storage", "report"]);
+}
+
+#[when("the user uninstalls with only the config and data folders set")]
+async fn uninstall_without_cache_setting(world: &mut E2eWorld) {
+    run_without_cache_setting(world, &["uninstall", "--yes", "--keep-binaries"]);
+}
+
+#[then("the storage report names the cache folder inside the data folder")]
+async fn storage_names_data_cache(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    let stdout = output(world);
+    assert_eq!(rc, 0, "storage report must exit 0:\n{stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("- ROCm CLI cache folder:"))
+        .unwrap_or_else(|| panic!("the report must name the cache folder:\n{stdout}"));
+    let expected = format!("({})", data_cache(world).display());
+    assert!(
+        row.ends_with(&expected),
+        "the cache folder must be the one inside the data folder {expected}, got `{row}`:\n{stdout}"
+    );
+}
+
+#[then("the uninstall does not name the default install's cache folder")]
+async fn uninstall_skips_default_cache(world: &mut E2eWorld) {
+    let stdout = output(world);
+    let default = default_cache(world).display().to_string();
+    assert!(
+        !stdout.contains(&default),
+        "an uninstall of an isolated install must not touch {default}:\n{stdout}"
+    );
+    // It removed exactly one cache folder, and that one is the isolated
+    // install's own; zero removals must not pass.
+    let expected = format!("removed cache {}", data_cache(world).display());
+    let removals: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("removed cache "))
+        .collect();
+    assert_eq!(
+        removals,
+        vec![expected.as_str()],
+        "the uninstall must report removing exactly the data folder's cache:\n{stdout}"
+    );
+}
+
+#[then("the data folder's own cache folder is gone")]
+async fn data_cache_gone(world: &mut E2eWorld) {
+    let cache = data_cache(world);
+    assert!(
+        !cache.exists(),
+        "the uninstall left {} behind:
+{}",
+        cache.display(),
+        output(world)
+    );
+}
+
+#[then("the default install's cache folder still holds the user's files")]
+async fn default_cache_intact(world: &mut E2eWorld) {
+    let file = default_cache(world).join(USER_FILE);
+    assert!(
+        file.is_file(),
+        "uninstalling the isolated install deleted {}:\n{}",
+        file.display(),
+        output(world)
     );
 }
 
@@ -190,6 +342,30 @@ async fn uninstall_fails(world: &mut E2eWorld) {
     assert!(
         rc != 0,
         "uninstall must fail, got exit 0\nstdout:\n{}",
+        output(world)
+    );
+}
+
+#[then("the uninstall is refused and the user is told to confirm explicitly")]
+async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        rc,
+        1,
+        "a refused uninstall must exit 1\nstdout:\n{}\nstderr:\n{stderr}",
+        output(world)
+    );
+    assert!(
+        stderr.contains("uninstall requires --yes outside an interactive terminal"),
+        "expected the --yes refusal on stderr:\n{stderr}"
+    );
+    // The help promises the plan is printed before the refusal, so the person
+    // who is refused can see what `--yes` would have removed.
+    let config = config_dir(world).display().to_string();
+    assert!(
+        output(world).contains(&config),
+        "the plan must name the config folder ({config}) before refusing:\n{}",
         output(world)
     );
 }
