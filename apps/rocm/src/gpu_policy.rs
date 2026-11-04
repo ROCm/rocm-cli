@@ -520,7 +520,14 @@ fn select_auto_gpu_index(
 ///
 /// Before this bound existed both probes called `.output()` with no timeout at
 /// all, so a stalling host hung indefinitely; ~24s is the ceiling replacing
-/// "forever", not a new cost. Running them concurrently is not free:
+/// "forever", not a new cost.
+///
+/// It is a ceiling on *this* hazard, not on every one. It holds when the
+/// `open` is what hangs, which is what the pre-flight bounds. If `amd-smi`
+/// gets past the open and a later ioctl wedges it into uninterruptible sleep,
+/// `run_with_timeout`'s post-kill `wait` does not return either, and no number
+/// quoted here applies — the pre-flight is a mitigation for the reachable
+/// case, not a proof about the whole call. Running them concurrently is not free:
 /// `detect_gpu_count` is invoked inside [`select_gpu_indices_under_launch_lock`]
 /// precisely so the cpu-only and pinned paths never pay for the subprocess, and
 /// hoisting it out to overlap with the VRAM probe would make every
@@ -594,10 +601,17 @@ fn gpu_vram_usage_amd_smi() -> Option<Vec<GpuVramUsage>> {
 /// healthy), and an `amd-smi` that ran and failed. "Why did `--gpu auto` not
 /// rank my GPUs?" had no answer anywhere.
 ///
-/// `debug!` and not `warn!`: on a GPU-less host this fires on every `serve`,
-/// where it is the expected outcome and not a problem, so at `warn` it would be
-/// noise that trains people to ignore the level. `RUST_LOG=debug`, or the CLI's
-/// own log file, is where someone looking for this goes.
+/// `info!` and not `warn!` or `debug!`. Not `warn!`: on a GPU-less host this
+/// fires on every `serve`, where it is the expected outcome and not a problem,
+/// so at `warn` it would be noise that trains people to ignore the level. Not
+/// `debug!` either, which is where this started: the default filter is
+/// `warn,rocm=info`, so a `debug!` line in this crate is invisible unless
+/// someone already suspected it and re-ran with `RUST_LOG`. That is the wrong
+/// way round for the case that actually needs explaining — the 2s open bound
+/// tripping on a slow but healthy host, or an exhausted probe budget — where
+/// the decline is indistinguishable from "no GPU" and the user has no reason
+/// to go looking. `rocm=info` is on by default, so the reason is there the
+/// first time.
 ///
 /// `{error:#}` rather than `to_string()`, matching `rocmd`'s bridge-snapshot
 /// note: the outermost context says "failed to launch amd-smi ...", which names
@@ -607,7 +621,7 @@ fn amd_smi_probe_json(args: &[&str], purpose: &str) -> Option<serde_json::Value>
     match rocm_core::amd_smi_json(args, AMD_SMI_SERVE_PROBE_TIMEOUT) {
         Ok(value) => Some(value),
         Err(error) => {
-            tracing::debug!(
+            tracing::info!(
                 probe = purpose,
                 args = args.join(" "),
                 error = format!("{error:#}"),

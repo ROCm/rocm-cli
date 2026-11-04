@@ -534,6 +534,22 @@ fn render_service_logs_text_with_options(
     Ok(output)
 }
 
+/// [`render_service_action_result`], plus — for a stop — the note about the
+/// background automation helper when it outlives the stopped service.
+pub(crate) fn render_service_action_result_with_helper_note(
+    paths: &AppPaths,
+    tool: &str,
+    value: &serde_json::Value,
+) -> String {
+    let mut text = render_service_action_result(tool, value);
+    if tool == "stop_server"
+        && let Some(note) = crate::service_launch::background_helper_note(paths)
+    {
+        let _ = writeln!(text, "  note: {}", note.text);
+    }
+    text
+}
+
 pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String {
     let output = value.get("output").unwrap_or(value);
     let action = service_action_past_tense(tool);

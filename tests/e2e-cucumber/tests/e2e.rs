@@ -169,6 +169,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The background helper (`rocm daemon`) a scenario saw running, captured
+    /// while it was known live, so `Drop` can stop it by a verified identity if
+    /// an earlier step failed before the scenario disabled the watcher.
+    pub helper_identity: Option<rocm_core::ProcessIdentity>,
     /// A live process a scenario recorded as a managed server's own, so a stop
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
@@ -338,6 +342,7 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
         }
@@ -602,10 +607,17 @@ impl E2eWorld {
     /// on every platform, instead of depending on an ambient system `/opt/rocm`
     /// that exists on the MI300X box but not on the Strix Windows runner.
     pub fn plant_unmanaged_rocm(&mut self) {
+        self.plant_unmanaged_rocm_reporting("6.0.0");
+    }
+
+    /// [`Self::plant_unmanaged_rocm`], with the version its `.info/version`
+    /// reports chosen by the scenario — for the install preview's note about a
+    /// host ROCm newer than the SDK it selects.
+    pub fn plant_unmanaged_rocm_reporting(&mut self, version: &str) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let rocm = root.path().join("legacy-rocm");
         std::fs::create_dir_all(rocm.join(".info")).expect("failed to create legacy rocm dir");
-        std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
+        std::fs::write(rocm.join(".info").join("version"), format!("{version}\n"))
             .expect("failed to write legacy rocm marker");
         self.legacy_rocm_path = Some(rocm);
     }
@@ -673,6 +685,16 @@ impl Drop for E2eWorld {
         if let Some(mut process) = self.recorded_process.take() {
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // A scenario that enabled a watcher started a real detached `rocm daemon`,
+        // which only exits once the watcher is disabled. If a step failed first,
+        // nothing else would stop it, and it would keep polling a config dir
+        // that is about to be deleted.
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::stop_leftover_helper(
+                &self.app_paths(),
+                self.helper_identity.take(),
+            );
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();

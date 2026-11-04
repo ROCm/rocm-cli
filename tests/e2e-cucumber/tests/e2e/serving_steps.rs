@@ -173,14 +173,21 @@ fn serve_failure_evidence(
 /// dropped before the panic, which is why #260 could not be root-caused from a
 /// CI artifact. A non-zero exit is reported the same way rather than through
 /// `run_rocm_ok`, since the engine log explains those launches too.
-async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_substr: &str) {
+///
+/// Returns the serve command's stdout, for a scenario that checks what it printed.
+async fn serve_and_wait(
+    world: &mut E2eWorld,
+    args: &[&str],
+    model: &str,
+    ready_substr: &str,
+) -> String {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
     let (stdout, stderr, rc) = crate::run_rocm(world, args);
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
-        return;
+        return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
     let headline = if rc == 0 {
@@ -641,6 +648,62 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
         "Qwen3-0.6B",
     )
     .await;
+}
+
+/// ROCMAI-827: serve the same small GGUF model as `setup_lemonade_model`, from
+/// the scenario's fresh config (every automation watcher off), keeping what the
+/// serve printed so the Then can check it against the helper's runtime state.
+#[when("the user serves a GGUF model on lemonade with no automation enabled")]
+async fn serve_lemonade_without_automations(world: &mut E2eWorld) {
+    let stdout = serve_and_wait(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+        "Qwen3-0.6B-GGUF",
+        "Qwen3-0.6B",
+    )
+    .await;
+    world.cli_output = Some(stdout);
+}
+
+#[then("serving started no background helper")]
+async fn serving_started_no_background_helper(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        !out.contains("background automation daemon"),
+        "with no watcher enabled, serve must not start (or try to start) the helper, got:
+{out}"
+    );
+    // The printed line is checked together with the state: the helper never
+    // published a runtime state, and its status reports it not running.
+    // A helper spawned a moment ago may not have published its runtime state
+    // yet, so the state alone can pass vacuously. The spawn records its
+    // autostart claim synchronously, before the CLI returns, so a claim file is
+    // proof a helper was started.
+    let claim = world.app_paths().automation_autostart_claim_path();
+    assert!(
+        !claim.exists(),
+        "serve spawned a background helper (autostart claim {} exists: {:?})",
+        claim.display(),
+        std::fs::read_to_string(&claim)
+    );
+    let state = rocm_core::AutomationRuntimeState::load(&world.app_paths())
+        .expect("failed to read the helper's runtime state");
+    assert!(
+        state.as_ref().is_none_or(|state| !state.running),
+        "serve left a background helper recorded running: {state:?}"
+    );
+    let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+    assert!(
+        status.contains("Status: not running"),
+        "expected `rocm daemon --status` to report no helper, got:
+{status}"
+    );
 }
 
 #[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]

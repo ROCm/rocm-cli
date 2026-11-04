@@ -58,7 +58,7 @@ use crate::managed_service_status::existing_live_managed_service;
 use crate::service_hints;
 #[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
-use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::services_text::run_internal_sandbox_tool;
 use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
@@ -837,12 +837,77 @@ fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
         .is_some_and(|state| state.running && rocm_core::process_is_running(state.daemon_pid)))
 }
 
+/// What the user should be told about the background automation helper
+/// (`rocm daemon`) after stopping a service or when planning an uninstall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelperNote {
+    /// The sentence to print.
+    pub(crate) text: String,
+    /// The helper is running right now.
+    pub(crate) running: bool,
+    /// An automation watcher is enabled, so the helper stays up on its own.
+    pub(crate) outlives: bool,
+}
+
+/// The note for one combination of the two facts the helper itself acts on:
+/// whether a watcher is enabled
+/// ([`rocm_core::RocmCliConfig::automation_daemon_enabled`] gates both the spawn
+/// and the helper's exit) and whether it is running. `None` for neither.
+fn helper_note_for(enabled: &[&str], running: bool) -> Option<HelperNote> {
+    let text = match (enabled.is_empty(), running) {
+        (true, false) => return None,
+        (true, true) => "the background automation helper (`rocm daemon`) is still running; no automation is enabled, so it exits on its own within a few seconds".to_owned(),
+        (false, true) => {
+            let disable = enabled
+                .iter()
+                .map(|id| format!("`rocm automations disable {id}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "the background automation helper (`rocm daemon`) keeps running while an automation is enabled ({}); to stop it, run {disable}, after which it exits on its own within a few seconds",
+                enabled.join(", ")
+            )
+        }
+        (false, false) => format!(
+            "an automation is enabled ({}) but the background automation helper (`rocm daemon`) is not running; `rocm serve` or `rocm automations enable` starts it",
+            enabled.join(", ")
+        ),
+    };
+    Some(HelperNote {
+        text,
+        running,
+        outlives: !enabled.is_empty() && running,
+    })
+}
+
+/// [`helper_note_for`] over the facts on disk. An unreadable config counts as
+/// "no watcher enabled".
+pub(crate) fn background_helper_note(paths: &AppPaths) -> Option<HelperNote> {
+    let config = rocm_core::RocmCliConfig::load(paths).unwrap_or_default();
+    let enabled: Vec<&str> = config
+        .automations
+        .watchers
+        .iter()
+        .filter(|(_, watcher)| watcher.enabled)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let running = background_helper_already_running(paths).unwrap_or(false);
+    helper_note_for(&enabled, running)
+}
+
 /// Shared daemon-lifecycle entrypoint: ensures the background automation helper
-/// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
-/// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
-/// both the `serve --managed` path and `automations enable`. Only the spawn result
-/// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
-/// propagated; setup errors (path discovery, stdio attach) still return `Err`.
+/// (`rocm daemon`) is running when an automation watcher needs it, spawning it
+/// detached if not. Liveness is read from the file-based automation runtime
+/// state. Intentionally `pub(crate)` — reused by both the `serve --managed` path
+/// and `automations enable`. Only the spawn result itself (`command.spawn()` /
+/// `spawn_detached_no_inherit`) is logged rather than propagated; setup errors
+/// (path discovery, config load, stdio attach) still return `Err`.
+///
+/// The daemon's only work is running enabled automation watchers (server
+/// recovery included — `server-recover` is one of them and is off by default),
+/// and it exits on its own once none is enabled. So with no watcher enabled
+/// nothing is spawned: a `serve` would otherwise leave a no-op daemon running
+/// long after its service was stopped (ROCMAI-827).
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
     ensure_background_helper_running_quiet(false)
 }
@@ -852,18 +917,52 @@ pub(crate) fn ensure_background_helper_running() -> Result<()> {
 /// the daemon-spawn note does not appear above the deployment summary table.
 pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if background_helper_already_running(&paths)? {
+    ensure_background_helper_running_with(&paths, quiet, spawn_background_helper, &|| {})
+}
+
+/// The body of [`ensure_background_helper_running_quiet`], with the actual
+/// process spawn injected so the decision around it is testable without
+/// launching a daemon. `spawn` returns `Err` for a setup failure (propagated)
+/// and `Ok(Err(..))` for a failed spawn (reported, not fatal). `on_lock_busy` is
+/// called each time the autostart lock is found held by another process, which
+/// lets a test wait for this call to be genuinely queued behind it.
+fn ensure_background_helper_running_with(
+    paths: &AppPaths,
+    quiet: bool,
+    spawn: impl FnOnce(&AppPaths) -> Result<Result<u32>>,
+    on_lock_busy: &dyn Fn(),
+) -> Result<()> {
+    // An unreadable config is "no watcher": this also runs after `serve` has
+    // already launched its child, where failing would report a launch that
+    // happened as an error.
+    if !rocm_core::RocmCliConfig::load(paths).is_ok_and(|config| config.automation_daemon_enabled())
+    {
         return Ok(());
     }
 
-    // The check above and the spawn below are a TOCTOU window: two concurrent
-    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
-    // a daemon. Serialize the decision on a lock file and re-check under it — the
-    // first holder spawns, later holders observe the now-running daemon and
-    // return without spawning. The unlocked pre-check above keeps the common
-    // already-running case lock-free.
-    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
-    if background_helper_already_running(&paths)? {
+    // Two concurrent callers (e.g. two `rocm serve`) can both read "not running"
+    // and each spawn a daemon. Serialize the decision on a lock file — the first
+    // holder spawns, later holders observe the now-running daemon and return
+    // without spawning.
+    //
+    // The "already running" read is deliberately made only under the lock, with
+    // no lock-free fast path. The daemon exits by itself once the last watcher
+    // is disabled, and it decides that under this same lock and publishes
+    // `running = false` before releasing it. Caller order is: save the enabling
+    // config, then come here. A lock-free read could still see the daemon that is
+    // about to exit as running, spawn nothing, and leave a watcher enabled with
+    // no daemon; under the lock the daemon has either seen the new config and
+    // stays, or has already published that it stopped.
+    let _autostart_lock = loop {
+        if let Some(lock) =
+            rocm_core::FileLock::try_acquire(paths.automation_autostart_lock_path())?
+        {
+            break lock;
+        }
+        on_lock_busy();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if background_helper_already_running(paths)? {
         return Ok(());
     }
 
@@ -883,25 +982,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
-    let exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let args = vec!["daemon".to_owned()];
-    #[cfg(windows)]
-    let spawn_result = {
-        let env_values = app_path_env_var_values(&paths, None);
-        let env_refs = app_path_env_var_refs(&env_values);
-        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
-    };
-    #[cfg(not(windows))]
-    let spawn_result = {
-        let mut command = managed_service_process_command(&exe, &args);
-        command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, None)?;
-        detach_background_command(&mut command);
-        apply_app_path_env(&mut command, &paths);
-        command.spawn().map(|child| child.id())
-    };
-    match spawn_result {
+    match spawn(paths)? {
         Ok(daemon_pid) => {
             // Record the claim before returning (and thus releasing the lock) so a
             // concurrent holder in the spawn→publish window defers. Best-effort: a
@@ -923,6 +1004,34 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         Err(_) => {}
     }
     Ok(())
+}
+
+/// Spawn `rocm daemon` detached from this process. The outer `Result` is a setup
+/// failure (resolving the executable, attaching stdio); the inner one is the
+/// spawn itself.
+fn spawn_background_helper(paths: &AppPaths) -> Result<Result<u32>> {
+    let exe = managed_service_launcher_path()
+        .context("failed to resolve current rocm executable path")?;
+    let args = vec!["daemon".to_owned()];
+    #[cfg(windows)]
+    let spawn_result = {
+        let env_values = app_path_env_var_values(paths, None);
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
+    };
+    #[cfg(not(windows))]
+    let spawn_result = {
+        let mut command = managed_service_process_command(&exe, &args);
+        command.stdin(Stdio::null());
+        attach_background_stdio(&mut command, None)?;
+        detach_background_command(&mut command);
+        apply_app_path_env(&mut command, paths);
+        command
+            .spawn()
+            .map(|child| child.id())
+            .map_err(anyhow::Error::from)
+    };
+    Ok(spawn_result)
 }
 
 /// How long an autostart claim is honoured before it is treated as stale even if
@@ -1066,12 +1175,17 @@ pub(crate) fn run_attached_service(
         }
     };
 
-    // The child is a managed service that outlives this session once detached, so
-    // it needs the same supervision the background path gives it: the daemon
-    // health-checks and auto-recovers managed servers, reconciles a self-exited
-    // server's record, and feeds the dashboard. Match the background ordering
-    // (spawn, then ensure the helper) and keep it quiet so no status line breaks
-    // into the log stream.
+    // The child is a managed service that outlives this session once detached.
+    // The background helper adds one thing for it: with the `server-recover`
+    // watcher enabled, it health-checks managed servers and restarts failed ones.
+    // Every duty of the helper is watcher-gated, so with no watcher enabled no
+    // helper is started. Nothing else depends on it: a self-exited server's
+    // record is settled by its own supervisor (`supervise_service` writes the
+    // exit via `record_supervised_exit` in `apps/rocmd/src/supervise.rs`) and on
+    // every read (`refresh_managed_service_runtime_liveness`), and the dashboard
+    // has its own embedded daemon. Match the background ordering (spawn, then
+    // ensure the helper) and keep it quiet so no status line breaks into the
+    // log stream.
     ensure_background_helper_running_quiet(true)?;
 
     // The resolution detail (model, engine, runtime, GPU, warnings) was already
@@ -1118,7 +1232,14 @@ pub(crate) fn run_attached_service(
                 Some(service_id.clone()),
                 true,
             ) {
-                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
+                Ok(result) => print!(
+                    "{}",
+                    crate::services_text::render_service_action_result_with_helper_note(
+                        &paths,
+                        "stop_server",
+                        &result
+                    )
+                ),
                 Err(error) => {
                     // Best-effort direct signal so Ctrl-C never leaves the model
                     // orphaned when the sandbox stop path fails.
@@ -1928,6 +2049,266 @@ mod tests {
             "running=false ⇒ not running even with a live pid"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-827: `rocm serve` started the background daemon on every launch,
+    /// and with no automation watcher enabled that daemon had nothing to do yet
+    /// kept running after every service was stopped. With the default config
+    /// (no watcher enabled) the helper must not be spawned at all.
+    #[test]
+    fn background_helper_not_spawned_when_no_automation_is_enabled() {
+        let (root, paths) = test_paths("helper-no-automation");
+        paths.ensure().expect("create app dirs");
+        // The stored flag alone is not "a watcher is enabled": nothing would run.
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.automations.daemon_enabled = true;
+        config.save(&paths).expect("save default config");
+
+        let mut spawned = false;
+        ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawned = true;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        )
+        .expect("ensure helper");
+
+        let claim_written = paths.automation_autostart_claim_path().exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !spawned,
+            "no watcher enabled ⇒ the daemon has no work and must not be started"
+        );
+        assert!(!claim_written, "no spawn ⇒ no autostart claim");
+    }
+
+    /// The other half of the gate: once a watcher is enabled the helper is still
+    /// started (exactly once) and its autostart claim recorded.
+    #[test]
+    fn background_helper_spawned_when_an_automation_is_enabled() {
+        let (root, paths) = test_paths("helper-automation-enabled");
+        paths.ensure().expect("create app dirs");
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = true;
+        config.save(&paths).expect("save config");
+
+        let mut spawns = 0;
+        ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawns += 1;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        )
+        .expect("ensure helper");
+
+        let claim = read_autostart_claim(&paths.automation_autostart_claim_path());
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(spawns, 1, "an enabled watcher needs the daemon");
+        assert_eq!(claim.map(|claim| claim.daemon_pid), Some(4242));
+    }
+
+    /// ROCMAI-827 race, enable side: the daemon that is about to exit still has
+    /// `running = true` and a live pid in its state when `automations enable`
+    /// (config already saved) asks for a helper. It decides under the autostart
+    /// lock and publishes "stopped" before releasing it, so the enable must wait
+    /// on that lock and then start a new helper. A lock-free "already running"
+    /// read would return here without spawning, leaving a watcher with no daemon.
+    #[test]
+    fn background_helper_is_started_when_the_exiting_daemon_publishes_stopped() {
+        let (root, paths) = test_paths("helper-exit-window");
+        paths.ensure().expect("create app dirs");
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = true;
+        config.save(&paths).expect("save config");
+        // The old daemon: alive (this process stands in) and still `running`.
+        runtime_state(true, std::process::id())
+            .write(&paths)
+            .expect("write runtime state");
+
+        // The exiting daemon holds the autostart lock while it decides.
+        let exiting_daemon_lock =
+            rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())
+                .expect("hold the lock");
+        let enable_paths = paths.clone();
+        let queued_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = queued_flag.clone();
+        let enable = std::thread::spawn(move || {
+            let mut spawns = 0;
+            ensure_background_helper_running_with(
+                &enable_paths,
+                true,
+                |_| {
+                    spawns += 1;
+                    Ok(Ok(4242))
+                },
+                &|| queued.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("ensure helper");
+            spawns
+        });
+        // Wait until the enable path has actually found the lock held and queued
+        // behind it, rather than assuming how long that takes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        // A caller that skipped the lock finishes without ever queuing.
+        while !queued_flag.load(std::sync::atomic::Ordering::SeqCst) && !enable.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "enable never queued");
+            std::thread::yield_now();
+        }
+        runtime_state(false, std::process::id())
+            .write(&paths)
+            .expect("daemon publishes stopped");
+        drop(exiting_daemon_lock);
+
+        let spawns = enable.join().expect("enable thread");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            spawns, 1,
+            "the enable must start a helper once the old one has published it stopped"
+        );
+    }
+
+    fn stop_result() -> serde_json::Value {
+        serde_json::json!({"output": {"result": {
+            "service": {"service_id": "svc-a", "status": "stopped"},
+            "signaled_pids": [1]
+        }}})
+    }
+
+    /// Put the on-disk facts in one of the four combinations: whether a watcher
+    /// is enabled, and whether the helper is running (this process stands in for
+    /// a live daemon).
+    fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = watcher_enabled;
+        config.save(paths).expect("save config");
+        runtime_state(helper_running, std::process::id())
+            .write(paths)
+            .expect("write runtime state");
+    }
+
+    /// ROCMAI-827: the helper note is derived from both facts, so it cannot
+    /// disagree with the state it describes. Each combination: the exact wording,
+    /// and the running/outlives flags the uninstall plan acts on.
+    #[test]
+    fn helper_note_follows_watcher_enabled_and_helper_running() {
+        let (root, paths) = test_paths("helper-note-combos");
+        paths.ensure().expect("create app dirs");
+
+        set_helper_facts(&paths, false, false);
+        let neither = background_helper_note(&paths);
+        set_helper_facts(&paths, false, true);
+        let idle_running = background_helper_note(&paths).expect("note");
+        set_helper_facts(&paths, true, false);
+        let enabled_dead = background_helper_note(&paths).expect("note");
+        set_helper_facts(&paths, true, true);
+        let enabled_running = background_helper_note(&paths).expect("note");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(neither, None);
+        assert_eq!(
+            idle_running.text,
+            "the background automation helper (`rocm daemon`) is still running; no automation is enabled, so it exits on its own within a few seconds"
+        );
+        assert!(idle_running.running && !idle_running.outlives);
+        assert_eq!(
+            enabled_dead.text,
+            "an automation is enabled (server-recover) but the background automation helper (`rocm daemon`) is not running; `rocm serve` or `rocm automations enable` starts it"
+        );
+        assert!(!enabled_dead.running && !enabled_dead.outlives);
+        assert_eq!(
+            enabled_running.text,
+            "the background automation helper (`rocm daemon`) keeps running while an automation is enabled (server-recover); to stop it, run `rocm automations disable server-recover`, after which it exits on its own within a few seconds"
+        );
+        assert!(enabled_running.running && enabled_running.outlives);
+    }
+
+    /// `rocm services stop` prints the note for a stop only, and only the variant
+    /// that matches the state.
+    #[test]
+    fn stop_output_carries_the_helper_note_that_matches_the_state() {
+        use crate::services_text::render_service_action_result_with_helper_note as render;
+
+        let (root, paths) = test_paths("stop-helper-note");
+        paths.ensure().expect("create app dirs");
+        set_helper_facts(&paths, false, false);
+        let quiet = render(&paths, "stop_server", &stop_result());
+        set_helper_facts(&paths, true, true);
+        let outlives = render(&paths, "stop_server", &stop_result());
+        let restart = render(&paths, "restart_server", &stop_result());
+        set_helper_facts(&paths, true, false);
+        let not_running = render(&paths, "stop_server", &stop_result());
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!quiet.contains("background automation helper"), "{quiet}");
+        assert!(
+            outlives.contains("stopped processes: 1")
+                && outlives.contains("keeps running while an automation is enabled")
+                && outlives.contains("`rocm automations disable server-recover`"),
+            "{outlives}"
+        );
+        assert!(
+            not_running.contains("is not running") && !not_running.contains("keeps running"),
+            "{not_running}"
+        );
+        assert!(
+            !restart.contains("background automation helper"),
+            "{restart}"
+        );
+    }
+
+    /// The command the note names must exist and accept exactly those arguments,
+    /// and its effect (the helper exiting once the last watcher is off) is
+    /// `automations-11` in `features/automations.feature` plus the rocmd
+    /// `automation_loop_` tests.
+    #[test]
+    fn the_command_named_by_the_helper_note_parses() {
+        use clap::Parser as _;
+
+        let (root, paths) = test_paths("helper-note-command");
+        paths.ensure().expect("create app dirs");
+        set_helper_facts(&paths, true, true);
+        let note = background_helper_note(&paths).expect("a note");
+        let _ = fs::remove_dir_all(&root);
+
+        let command = note
+            .text
+            .split('`')
+            .find(|part| part.starts_with("rocm automations disable"))
+            .expect("the note names the disable command");
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(argv).is_ok(), "{command}");
+    }
+
+    /// `serve` calls the helper autostart after its child is already running. An
+    /// unreadable config must not turn that launch into an error: it reads as "no
+    /// watcher enabled" and nothing is spawned.
+    #[test]
+    fn background_helper_autostart_treats_an_unreadable_config_as_no_watcher() {
+        let (root, paths) = test_paths("helper-bad-config");
+        paths.ensure().expect("create app dirs");
+        fs::write(paths.config_path(), b"{ this is not json").expect("write bad config");
+        assert!(rocm_core::RocmCliConfig::load(&paths).is_err());
+
+        let mut spawned = false;
+        let result = ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawned = true;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!spawned);
     }
 
     #[test]

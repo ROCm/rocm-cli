@@ -7,7 +7,7 @@
 //! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
 //! module-private except `ChatToolApprovalRequest`, reached by
 //! `dash_seam.rs` as `chat_tool_approval_request`'s return type, and
-//! `ChatRocmCommandAction`, read by `driver_install.rs`'s test module), its
+//! `ChatRocmCommandAction`, read by `driver_plan.rs`'s test module), its
 //! tool-call validation/approval/execution logic (`validate_chat_tool_call`
 //! and the `validate_chat_*_tool_call` family), deterministic tool-output
 //! summarization, and the MCP tool-bridge entry points

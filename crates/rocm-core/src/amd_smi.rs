@@ -234,10 +234,26 @@ fn preflight_kfd_device() -> PathBuf {
 fn kfd_readable(device: &Path) -> bool {
     kfd_readable_with(
         // `&&` short-circuits: `has_usable_amd_gpu` runs on WSL only.
-        is_wsl_host() && has_usable_amd_gpu(),
+        wsl_wave_through(is_wsl_host(), has_usable_amd_gpu()),
         device,
         &host_path(device),
     )
+}
+
+/// The WSL wave-through's own condition: a WSL host **and** a reachable GPU.
+///
+/// Extracted so it can be pinned by a truth table. The tests below drive
+/// [`kfd_readable_with`] with literal booleans, which says nothing about how
+/// the caller computes that argument — `&&` could become `||`, or
+/// `has_usable_amd_gpu()` could be dropped entirely, and every one of them
+/// would stay green on a GPU-less lane. Both conjuncts are load-bearing in
+/// opposite directions: without `is_wsl_host` a bare-metal host with a GPU
+/// would skip the device check the gate exists for, and without
+/// `has_usable_amd_gpu` an unready WSL host would be waved through to an
+/// `amd-smi` that cannot work.
+#[cfg(target_os = "linux")]
+const fn wsl_wave_through(is_wsl: bool, has_usable_gpu: bool) -> bool {
+    is_wsl && has_usable_gpu
 }
 
 /// [`kfd_readable`] with its two non-syscall inputs injected, so the
@@ -428,17 +444,23 @@ fn device_readable_within_budget(
 ///
 /// Off Linux this is a direct open, matching [`kfd_readable`]'s wave-through:
 /// there is no `/dev/kfd` to wedge, and the bound would buy nothing.
+#[cfg(target_os = "linux")]
 pub fn device_readable_bounded(device: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        device_readable(device)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Fully qualified: the `fs` import is Linux-gated, since the bounded
-        // probe is the only other user of it.
-        std::fs::OpenOptions::new().read(true).open(device).is_ok()
-    }
+    device_readable(device)
+}
+
+/// Off-Linux counterpart of [`device_readable_bounded`]: waves through, like
+/// [`kfd_readable`] does, because there is no `/dev/kfd` on these platforms to
+/// decline about.
+///
+/// `const` because it has to be, and split for the same reason `kfd_readable`
+/// is: the Windows lane builds with `-D warnings`, so
+/// `clippy::missing_const_for_fn` makes a non-`const` body that only returns a
+/// literal a hard error there, while the Linux body opens a device and cannot
+/// be `const`. A `cfg`-selected pair is linted per branch, not per name.
+#[cfg(not(target_os = "linux"))]
+pub const fn device_readable_bounded(_device: &Path) -> bool {
+    true
 }
 
 /// Off-Linux counterpart of [`kfd_readable`]: see that function's docs for why
@@ -524,15 +546,14 @@ fn amd_smi_json_with(
         // The stderr-then-stdout precedence is `command_failure_detail`'s, taken
         // from the shared helper rather than re-spelled here; only the
         // both-blank fallback differs, naming the exit status instead of the
-        // generic "no output".
+        // generic "no output". `ExitStatus`'s own `Display` already reads
+        // "exit status: 1" (and "exit code: 1" on Windows), so prefixing it
+        // again produced "exit status exit status: 1".
         bail!(
             "amd-smi {} failed: {}",
             args.join(" "),
             crate::probe_exec::truncate_to_chars(
-                crate::command_failure_detail_or_else(&output, || format!(
-                    "exit status {}",
-                    output.status
-                )),
+                crate::command_failure_detail_or_else(&output, || output.status.to_string()),
                 crate::process::MAX_QUOTED_OUTPUT_CHARS,
             )
         );
@@ -702,6 +723,30 @@ mod tests {
         );
     }
 
+    /// The conjunction `kfd_readable` hands to the wave-through, as a truth
+    /// table.
+    ///
+    /// The test above drives `kfd_readable_with` with literal booleans, so it
+    /// cannot see how that argument is produced: `&&` to `||`, or dropping
+    /// `has_usable_amd_gpu()`, leaves it green on a GPU-less lane. Only the
+    /// `(true, false)` and `(false, true)` rows here fail for those mutations.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_wsl_wave_through_needs_both_a_wsl_host_and_a_reachable_gpu() {
+        assert!(wsl_wave_through(true, true), "ready WSL host waves through");
+        assert!(
+            !wsl_wave_through(true, false),
+            "a WSL host with no reachable GPU must not wave through: amd-smi \
+             cannot work there, and `||` would allow it"
+        );
+        assert!(
+            !wsl_wave_through(false, true),
+            "bare metal must reach the device check even with a usable GPU, or \
+             the gate this whole module exists for is skipped"
+        );
+        assert!(!wsl_wave_through(false, false));
+    }
+
     /// The simulated-root routing, which `kfd_readable` applies to the real
     /// `/dev/kfd` on the production path.
     ///
@@ -868,6 +913,61 @@ mod tests {
             "the same readable device must pass when a slot is free, or the decline above \
              proves nothing about the budget"
         );
+        Ok(())
+    }
+
+    /// A probe that returns must give its slot back — eventually.
+    ///
+    /// Nothing else asserts this. The budget test above only shows that an
+    /// exhausted budget declines; a `ProbeSlot::drop` that forgot to decrement
+    /// would satisfy it too, and would then decline every probe after the first
+    /// eight for the life of the process — the gate silently becoming "no GPU,
+    /// ever".
+    ///
+    /// "Eventually" is the honest invariant, and writing this test is what
+    /// showed why. The slot is released when the probe *thread* drops it, not
+    /// when the caller returns: `device_readable_within_budget` returns as soon
+    /// as `recv_timeout` has the answer, and the thread may not have unwound
+    /// yet. A first draft reused a one-slot budget back-to-back and failed on
+    /// the second call for exactly that reason — a real race, not a flake. The
+    /// bound below is therefore a poll, and the budget is sized so the test
+    /// cannot depend on the timing it just discovered.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_completed_probe_frees_its_slot() -> Result<()> {
+        static REUSED: ProbeBudget = ProbeBudget::new(1);
+
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-kfd-slot-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let readable = temp_root.join("readable");
+        fs::write(&readable, b"")?;
+
+        assert!(
+            device_readable_within_budget(&readable, KFD_OPEN_TIMEOUT, &REUSED),
+            "a readable file must probe true"
+        );
+
+        // Poll rather than assert immediately: release happens on the probe
+        // thread's unwind. A `drop` that never decrements never reaches zero,
+        // which is the mutation this exists to catch.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while REUSED.in_flight.load(Ordering::Acquire) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot was never released: in_flight stayed at {}",
+                REUSED.in_flight.load(Ordering::Acquire)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // The budget is genuinely reusable once released, which is the point.
+        assert!(
+            device_readable_within_budget(&readable, KFD_OPEN_TIMEOUT, &REUSED),
+            "the one slot must serve a second probe after the first released"
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
         Ok(())
     }
 

@@ -27,6 +27,7 @@ mod dash_seam;
 mod deletion_properties;
 mod diagnose_cmd;
 mod driver_install;
+mod driver_plan;
 mod endpoint_keys;
 mod engine_ipc;
 mod engine_runtime_select;
@@ -44,9 +45,11 @@ mod model_fit;
 mod provider_keys;
 mod providers;
 mod remote;
+mod runtime_adopt;
 mod runtime_install_finalize;
 mod runtime_registry;
 mod runtime_services;
+mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_summary;
@@ -57,6 +60,7 @@ mod services_cmd;
 mod services_text;
 mod setup_cmd;
 mod storage;
+mod system_packages;
 #[cfg(test)]
 mod test_support;
 mod therock;
@@ -690,21 +694,28 @@ rocm logs --search error timeout")]
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
     },
-    /// Run the background supervisor that powers automations, managed servers, and the dashboard.
+    /// Run the background supervisor that runs enabled automation watchers.
     ///
-    /// The daemon is a multi-role helper that, while running:
-    ///   - executes enabled automation watchers (update checks, driver-plan
-    ///     checks, artifact prefetch) on a 5s tick in a sandboxed subprocess
+    /// The daemon runs enabled automation watchers, and only while at least one
+    /// is enabled (all are off by default). While running it:
+    ///   - executes the enabled watchers (update checks, driver-plan checks,
+    ///     artifact prefetch) on a 5s tick in a sandboxed subprocess
     ///   - health-checks and auto-recovers managed local model servers
-    ///     (Lemonade, vLLM)
-    ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
-    ///   - listens on a local webhook port for automation events from other
-    ///     `rocm` commands
+    ///     (Lemonade, vLLM) when the `server-recover` watcher is enabled
+    ///   - records GPU metrics roughly every 60s when the `gpu-metrics` or
+    ///     `gpu-thermal-protect` watcher is enabled
+    ///   - opens no webhook listener: that exists only when `rocmd run` is
+    ///     started directly with `--local-webhook-port`, which `rocm daemon`
+    ///     does not pass
     ///
-    /// It is normally started on demand by `rocm automations enable` and
-    /// `rocm serve --managed`, so you rarely need to launch it yourself. Run it
-    /// directly only when you want to observe its behavior in the foreground,
-    /// e.g. for debugging.
+    /// The dashboard does not need it: `rocm dash` has its own embedded daemon.
+    ///
+    /// It is started on demand by `rocm automations enable`, and by
+    /// `rocm serve --managed` when an automation watcher is enabled, so you
+    /// rarely need to launch it yourself. It exits on its own once no watcher
+    /// is enabled: `rocm automations disable <watcher>` for each enabled one
+    /// stops it. Run it directly only when you want to observe its behavior in
+    /// the foreground, e.g. for debugging.
     #[command(verbatim_doc_comment)]
     Daemon {
         /// Print a one-shot snapshot of automation/watcher status, then exit without starting the supervisor loop.

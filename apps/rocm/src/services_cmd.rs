@@ -36,7 +36,7 @@ use crate::service_records::{
     prune_managed_service_records, remove_managed_service_record, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    render_service_action_result, render_service_logs_text, render_services_json,
+    render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
     render_services_text, run_internal_sandbox_tool, validate_service_id,
 };
 
@@ -134,7 +134,10 @@ pub(crate) fn run_approved_service_action(
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
     let result = run_internal_sandbox_tool(paths, sandbox_tool, Some(service_id.to_owned()), true)?;
-    print!("{}", render_service_action_result(tool, &result));
+    print!(
+        "{}",
+        render_service_action_result_with_helper_note(paths, tool, &result)
+    );
     record_cli_audit_event(
         paths,
         "service",
@@ -163,7 +166,7 @@ mod tests {
         assert!(error.contains("requires --yes"));
         assert!(error.contains("rocm services stop svc-qwen --yes"));
 
-        let rendered = render_service_action_result(
+        let rendered = crate::services_text::render_service_action_result(
             "stop_server",
             &serde_json::json!({
                 "output": {
