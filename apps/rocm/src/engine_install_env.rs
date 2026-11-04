@@ -16,19 +16,22 @@
 //! runtime, and `runtime_key_for_python` attributes an interpreter to the
 //! runtime whose install root contains it.
 //!
-//! Relocated from `engines_cmd.rs` with no behavior change. It calls into
-//! `runtimes_cmd.rs` for registry selection and validation, and nothing in
-//! `runtimes_cmd.rs` calls back here.
+//! Relocated from `engines_cmd.rs` with no behavior change. It imports
+//! `recover_setup_runtime_registration` from `runtime_adopt.rs`,
+//! `select_runtime_manifest` and `validate_runtime_manifest_for_activation`
+//! from `runtime_registry.rs`, and the runtime-manifest model from
+//! `therock.rs`. It does not import `runtimes_cmd.rs`, `engines_cmd.rs`,
+//! `runtime_install_finalize.rs` or `runtime_services.rs`, and none of the
+//! modules it does import leads back to them, so it adds no production import
+//! cycle.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rocm_core::{AppPaths, RocmCliConfig};
 
-use crate::runtimes_cmd::{
-    recover_setup_runtime_registration, select_runtime_manifest,
-    validate_runtime_manifest_for_activation,
-};
+use crate::runtime_adopt::recover_setup_runtime_registration;
+use crate::runtime_registry::{select_runtime_manifest, validate_runtime_manifest_for_activation};
 use crate::therock;
 
 pub(crate) fn engine_manages_own_runtime(engine: &str) -> bool {
