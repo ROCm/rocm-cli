@@ -32,16 +32,24 @@
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
-# --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
+# --- EAI-7219: short-name expansion (vLLM does not resolve the alias) ---
+# What the lane logs show, so the scope below is not read as more than it is:
+# lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
+# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
+# stopped before it printed a serve plan, so the plan's name line was never
+# reached. Whether that stop is the bug above or an earlier refusal (a missing
+# active runtime, a no-GPU bail, native Windows refusing vLLM since ROCMAI-823) is
+# not known: the steps used to discard stderr. They now report it, so the next lane
+# run says which. Until then the rows keep their all-hosts scope.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
-reason = "Serve output does not surface the expanded full model name for a short name."
+reason = "A vLLM serve of a short name prints no serve plan, so no expanded full model name is shown."
 
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "Engines do not report a consistent resolved model name for a short name."
+reason = "A vLLM serve of a short name prints no serve plan, so its resolved model name cannot match lemonade's."
 
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run

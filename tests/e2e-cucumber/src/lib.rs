@@ -21,6 +21,7 @@ pub mod quit_and_wait;
 pub mod reader_failure;
 pub mod send_until;
 pub mod serve_log;
+pub mod serve_plan;
 pub mod shared_runtime;
 
 use std::path::{Path, PathBuf};
