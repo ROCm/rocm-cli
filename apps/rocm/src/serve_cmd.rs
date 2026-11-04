@@ -65,10 +65,10 @@ use crate::gpu_policy::{
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_summary;
 use crate::service_launch::{
-    drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
-    ensure_public_bind_engine_supported, managed_service_reuse_refusal, no_usable_gpu_refusal,
-    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
-    validate_bind_host,
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
+    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
 };
 use crate::{
     GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
@@ -1254,10 +1254,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // launched); permissive when availability cannot be probed on this platform
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
-    if !cpu_only && !scripted_backend_failure && !reuse_existing && host_has_no_usable_gpu {
+    if !cpu_only
+        && !scripted_backend_failure
+        && !e2e_simulate_oom_launch()
+        && !reuse_existing
+        && host_has_no_usable_gpu
+    {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
     // The Docker probe comes after every refusal that needs no daemon (the AIM
@@ -1502,7 +1509,27 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             gpu_refusal_waived_for_reuse,
             &mut |_elapsed| spinner.tick(),
         )?;
-        ensure_background_helper_running_quiet(summary_mode)?;
+        // Not when the launch was fabricated. `simulate_oom_managed_launch`
+        // writes a `starting` record for a process that never existed, so the
+        // helper would be left watching a pid that will never appear, with
+        // nothing in the scenario's teardown to stop it: observed as `rocm
+        // daemon` processes outliving their e2e checkout by days, still
+        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // supervising a real spawned server, and there is none here.
+        //
+        // That — not ordering — is the whole justification. This suppression
+        // runs *before* the OOM note is computed in the `summary_mode` block
+        // below, so the previous claim here, that the note "is computed before
+        // it would have run", was backwards and could not have excused it.
+        // serve-40's `no background automation daemon was left behind` is what
+        // holds the branch: deleting it left the scenario green with a `rocm
+        // daemon` still running.
+        //
+        // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
+        // the test-only feature, so this branch folds away in shipped builds.
+        if !e2e_simulate_oom_launch() {
+            ensure_background_helper_running_quiet(summary_mode)?;
+        }
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1549,6 +1576,33 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine_serves_vllm,
             );
             notes.extend(engine_env_notes.iter().cloned());
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which ends at `readiness: {status}`
+            // and carries no *post-launch* note. It is not noteless: the
+            // `!summary_mode` branch above still prints the pre-launch planning
+            // lines, low-VRAM `note:` included, so the asymmetry is precisely
+            // that the OOM confirmation and the `rocm diagnose --symptom`
+            // command are missing — not that the path prints nothing. That path
+            // is machine-readable by design and is not the place to grow prose,
+            // but it does mean the same failed launch is explained in one
+            // invocation and not the other.
+            // The engine *name*, not `engine_serves_vllm`: the note's gate is
+            // derived inside `append_oom_serve_note` from the value it is about,
+            // because a boolean here was a call-site seam no test could hold.
+            let notes = serve_summary::append_oom_serve_note(
+                notes,
+                &selected_engine,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
+            );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,

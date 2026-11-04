@@ -447,7 +447,8 @@ jobs:
 
           # Build both binaries once; reuse them for pre-warm + suite.
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -537,7 +538,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -613,7 +615,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -695,7 +698,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -797,7 +801,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -1054,7 +1059,8 @@ jobs:
           $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
@@ -1482,7 +1488,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          # e2e-test-hooks feature is the floor a pre-built binary must carry
+          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"

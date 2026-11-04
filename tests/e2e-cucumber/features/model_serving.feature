@@ -627,8 +627,6 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
-
-
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -640,3 +638,28 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
+
+  # The positive case for the OOM note (EAI-8059 review asked for it
+  # explicitly, alongside the withholding the unit tests pin): when
+  # THIS invocation launches a managed vLLM serve that OOMs and never becomes
+  # ready, the summary MUST name the memory knobs. A real launch cannot run on a
+  # GPU-less host, so the mock lane build compiles in a test-only fault-injection
+  # hook (feature `e2e-oom-fault-injection`, armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+  # that fabricates exactly that failed-launch state — an owned log carrying a real
+  # allocator OOM signature, status "starting", nothing reused. The hook is absent
+  # from shipped binaries, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane,
+  # where xtask builds the binary with the feature. @requires-no-gpu because the
+  # fabricated launch stands in for the GPU the mock lane does not have.
+  @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-41 - A launch that runs out of GPU memory names the memory knobs
+    Given a managed vLLM launch will run out of GPU memory
+    When the user opens the interactive serve summary for that launch
+    Then the deployment summary blames this launch for GPU memory
+    And the deployment summary names the GPU memory knobs
+    And the deployment summary quotes the engine's own failing line
+    # The fabricated launch has no process behind it, so `rocm serve` must not
+    # start the background automation daemon to supervise one. Without this the
+    # suppression was untested: deleting the guard left the scenario green and a
+    # `rocm daemon` outliving the checkout.
+    And no background automation daemon was left behind

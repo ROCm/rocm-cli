@@ -550,6 +550,21 @@ rocm model --verbose"
     /// before the refusal.
     /// With an explicit --gpu the index is still validated after the exception, so a
     /// pinned GPU that is not visible is refused even when a reusable server exists.
+    ///
+    /// When a vLLM server THIS command launched fails to become ready and its engine log
+    /// shows an out-of-memory failure, the deployment summary adds a note naming
+    /// --gpu-memory-utilization and --gpu, warning that lowering the reservation will not
+    /// help if the model does not fit, and printing a `rocm diagnose --symptom` command
+    /// for your own failing line -- or, when that line carries an apostrophe or terminal
+    /// control bytes and so cannot be rendered as one intact single-quoted argument, for a
+    /// canonical vLLM out-of-memory symptom instead, so the printed command is always
+    /// runnable and always reports a cause. That note belongs to the interactive summary only: a
+    /// piped or redirected run prints the plain machine-readable form, which carries no
+    /// post-launch notes (it still prints the pre-launch planning ones), and --verbose
+    /// streams the traceback itself. It is never shown for a healthy or
+    /// still-loading server, for a non-memory failure, or for a run that reused an
+    /// already-running server rather than launching one; read that server's own log with
+    /// `rocm services logs <service-id>`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
