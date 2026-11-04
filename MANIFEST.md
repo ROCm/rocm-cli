@@ -36,6 +36,7 @@ repository.
 | Inflector | 0.11.4 | BSD-2-Clause |
 | addr2line | 0.25.1 | Apache-2.0 OR MIT |
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| adlx | 0.0.0-alpha.1 | MIT |
 | aes | 0.8.4 | MIT OR Apache-2.0 |
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
@@ -258,6 +259,7 @@ repository.
 | lab | 0.11.0 | MIT |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 |
 | libc | 0.2.191 | MIT OR Apache-2.0 |
+| libloading | 0.8.9 | ISC |
 | libm | 0.2.16 | MIT |
 | libredox | 0.1.17 | MIT |
 | line-clipping | 0.3.7 | MIT OR Apache-2.0 |

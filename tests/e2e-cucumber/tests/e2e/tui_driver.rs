@@ -430,6 +430,38 @@ impl TuiSession {
         cell.bgcolor() == WASH
     }
 
+    /// The foreground color of `needle` on every screen row that contains both
+    /// `anchor` and `needle`, in row order; empty if there is no such row. A row
+    /// that carries the anchor but not the needle is never read, so the result
+    /// does not depend on which panel draws the anchor first. Matches cell by
+    /// cell, so a wide glyph earlier in the row cannot shift the column.
+    /// Style-aware, unlike `screen_text`.
+    pub fn foregrounds_in_rows_with(&self, anchor: &str, needle: &str) -> Vec<vt100::Color> {
+        let wanted: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = p.screen();
+        let (_, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .enumerate()
+            .filter(|(_, text)| text.contains(anchor) && text.contains(needle))
+            .filter_map(|(row, _)| {
+                let row = row as u16;
+                (0..cols).find_map(|col| {
+                    let matches = wanted.iter().enumerate().all(|(i, ch)| {
+                        screen
+                            .cell(row, col + i as u16)
+                            .is_some_and(|cell| cell.contents() == *ch)
+                    });
+                    matches.then(|| screen.cell(row, col).map(vt100::Cell::fgcolor))?
+                })
+            })
+            .collect()
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while

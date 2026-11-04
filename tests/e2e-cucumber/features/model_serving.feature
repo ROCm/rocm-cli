@@ -345,17 +345,27 @@ Feature: Model serving
   # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
   # serves via the raw AIM Docker image reference rather than the catalog
   # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
-  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # exact image/profile, not a catalog-discovery test. Because it names the raw
+  # image, the catalog's GPU-family refusal (no profile for Strix Halo) does not
+  # apply to it. `@requires-engine:aim`
   # skips here when Docker is unreachable OR the gfx family isn't one aim is
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
+  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
+  # image and a 9B checkpoint on a cold runner and may wait out the full
+  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. They run only when
+  # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
+  # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
+  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
+  # skip every night (the nightly job logs whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -370,7 +380,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -379,3 +389,254 @@ Feature: Model serving
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+  # Regression test for the reuse exemption (ROCMAI-419 review). Under the
+  # default `gpu_required` policy a host with no usable AMD GPU refuses `rocm
+  # serve` outright, before any engine work. Re-issuing `serve` against a managed
+  # service that is *already running* for the same engine and model launches
+  # nothing and pins no GPU, so it is exempt: the pre-gate opens and the run
+  # reaches the reuse short-circuit even on a GPU-less host.
+  #
+  # This is the only scenario that proves the exemption's happy path end to end,
+  # and the only one of the five that can: serve-27 plants a record for a
+  # different model, serve-28 and serve-30 each plant one this invocation cannot
+  # actually reuse, and serve-29 runs on a host that *has* a GPU. It runs on the
+  # no-GPU mock host, so it gates every PR and allocates no GPU memory.
+  @id:serve-reuse-exempt-from-no-gpu-refusal @requires-no-gpu @requires-os:linux
+  Scenario: serve-28 - Reuse succeeds on a GPU-less host
+    Given a live managed vLLM serve is already running
+    When the user opens its interactive serve summary
+    Then the summary reflects the reused already-running service
+
+  # Regression test for the GPU fail-fast contract (EAI-8059 review). The reuse
+  # pre-gate that lets an already-running service skip the no-usable-GPU bail used
+  # to key on the ENGINE alone, so any live managed service was enough to pull the
+  # reuse probe's engine work — for a self-managing engine, an
+  # `ensure_self_managed_engine_ready` that prints "Preparing <engine> for GPU
+  # serving..." and downloads an install — in front of the bail. On a GPU-less
+  # host that is exactly backwards: the invocation can never reuse a service for a
+  # DIFFERENT model, so it must refuse first and prepare nothing.
+  #
+  # Lemonade specifically, because it is the engine that manages its own runtime
+  # and therefore the one whose preparation is user-visible; the planted record
+  # names lemonade too, so the engine matches and the MODEL is the only thing
+  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
+  # no service planted at all, and serve-28 plants the SAME model, so neither
+  # discriminates the model keying — this one does.
+  #
+  # The second premise makes the refusal's ORDERING observable. `rocm serve`
+  # resolves its runtime selection below the bail on purpose: that resolution
+  # reaches `recover_setup_runtime_registration`, which writes a runtime registry
+  # manifest and can fail with a manifest error in place of the no-GPU message.
+  # Nothing enforced the ordering, because recovery returns early when no setup
+  # venv is configured and the e2e roots carry none — so moving the call above
+  # the bail left all three refusal scenarios green. Planting a configured setup
+  # venv that the registry has not yet recorded is what makes the write reachable,
+  # and the last Then is what refuses it.
+  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
+  Scenario: serve-29 - A live service for another model does not soften the no-GPU refusal
+    Given a live managed Lemonade serve for an unrelated model
+    And setup names an unregistered runtime folder
+    When the user serves a different model with Lemonade under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And no engine was prepared for GPU serving
+    And no runtime registry manifest was written
+
+  # Regression test for the reuse pre-gate's *acceptance* term (EAI-8059
+  # review). serve-28 plants a record this invocation really can reuse, and
+  # serve-29 plants one for a different model, so the gate's outer condition is
+  # false there. Neither reaches the case this one does: a live service that
+  # matches on liveness, engine and canonical model id — so the outer condition
+  # holds — but that `spawn_managed_engine_child` would still refuse. Deciding
+  # the no-GPU bypass on the weaker test sent the user to a dead end: the bail
+  # was skipped, the spawn told them to stop the running server and re-run, and
+  # the re-run — with nothing left to reuse — hit the no-GPU refusal the first
+  # run had bypassed. The advice named a command that could not clear the
+  # condition.
+  #
+  # `--require-api-key` against a service that has no key is the cheapest way to
+  # make `managed_service_reuse_refusal` answer Some on a record that is
+  # otherwise a perfect match. The discriminating assertion is the absence of
+  # the stop advice: with the gate back on
+  # `existing_live_managed_service(..).is_some()` the run reaches the spawn and
+  # prints it. `--env-id` satisfies model resolution without installing a
+  # runtime, exactly as serve-28 does. The recipe term is a separate argument of
+  # the same predicate and is not covered here — serve-32 covers it.
+  @id:serve-unreusable-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
+  Scenario: serve-30 - A live service this invocation cannot reuse does not soften the no-GPU refusal
+    Given a live managed vLLM serve is already running
+    When the user serves that same model with --require-api-key under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the user is not told to stop the running server
+
+  # The reuse pre-gate's OTHER half, and the only lane that can see it. serve-28,
+  # 27, 28 and 30 all run on GPU-less hosts, where `host_has_no_usable_gpu` is
+  # true and the gate's outcome is decided entirely by the live-service term — so
+  # none of them can tell the current gate from the one it replaced. Neither can the
+  # unit test (`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu`):
+  # it calls `reuse_pregate_opens` directly, so it pins the helper but not
+  # `serve()`'s decision to pass the host predicate into it. Drop that argument
+  # at the call site and the whole suite stays green.
+  #
+  # This scenario is the discriminator, and it needs a real GPU: on a host that
+  # HAS one the gate must stay shut, so `--gpu` validation keeps the position
+  # #267 (`945d81b`) gave it and an out-of-range ordinal is refused before any
+  # engine or registry work. The planted record matches on liveness, engine and
+  # model, so the live-service term is TRUE here — the host predicate is the only
+  # thing holding the gate shut, which is exactly what makes the mutation visible.
+  #
+  # `setup names an unregistered runtime folder` is what makes the ordering
+  # observable, the same way it does in serve-29: it plants the one state that
+  # makes `recover_setup_runtime_registration`'s write reachable. No `--env-id`
+  # here, deliberately — `validate_engine_selection_runtime` only reaches that
+  # recovery when neither `--runtime-id` nor `--env-id` is given, so passing one
+  # would make the last Then vacuous. With the gate wrongly open the manifest is
+  # re-filed before the refusal and that Then goes red; with it shut the registry
+  # is still empty.
+  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-gpu @requires-os:linux
+  Scenario: serve-31 - A reusable live service does not pull engine work ahead of --gpu validation
+    Given a live managed vLLM serve is already running
+    And setup names an unregistered runtime folder
+    When the user serves that same model pinned to a GPU index that does not exist
+    Then serving is refused before any engine starts
+    And the user is told that GPU index is unavailable
+    And no runtime registry manifest was written
+
+  # The recipe argument of the reuse decision, and the only check in the repo
+  # that fails when `serve()` stops passing it. serve-30 is the same shape for
+  # `--require-api-key`, but it cannot stand in for this one: the two arguments
+  # are independent, and the record every other scenario plants carries no
+  # recipe at all (`engine_recipe_json: null`), which is exactly what a serve
+  # with no recipe-bearing flags asks for — so the recipe argument matches
+  # whether `serve()` passes it or passes nothing, and dropping it changed no
+  # outcome anywhere.
+  #
+  # `--tool-call-parser hermes` is the cheapest way to make the requested recipe
+  # non-null without a catalog entry: on vLLM it synthesizes a recipe hint even
+  # for a model that has none, so `managed_service_reuse_refusal` sees a
+  # mismatch against the planted record's null and refuses reuse. This
+  # invocation therefore earns no bypass and must still get the no-GPU refusal.
+  # Pass `None` for that argument at the call site and the mismatch disappears,
+  # the bypass is granted, and the run reaches the spawn — which refuses with
+  # the recipe-mismatch message instead, so the no-GPU assertion goes red.
+  # `--env-id` satisfies model resolution without installing a runtime, exactly
+  # as serve-28 and serve-30 do.
+  @id:serve-recipe-mismatched-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
+  Scenario: serve-32 - A live service with a different recipe does not soften the no-GPU refusal
+    Given a live managed vLLM serve is already running
+    When the user serves that same model with a tool-call parser under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the user is not told to relaunch the server with different options
+
+  # Native-Windows platform gate (ROCMAI-823). `rocm engines list` already
+  # reports vLLM as `runtime: unsupported_native_windows`; `serve` takes the
+  # same decision (`engine_ruled_out_by_platform`) and refuses before runtime
+  # resolution or any launch. Before the gate, an active runtime let this print
+  # "managed service launched" and exit 0 while the engine died with no output.
+  # Hermetic (a planted read-only runtime, no GPU, no network, no engine, no
+  # `e2e-test-hooks`), so the required `windows-build-and-test` lane selects it
+  # via `E2E_ALSO_RUN_IDS`.
+  @id:serve-vllm-refused-on-native-windows @requires-os:windows
+  Scenario: serve-33 - Serving with vLLM on native Windows is refused before anything launches
+    Given a registered read-only runtime
+    And the first runtime is active
+    When the user serves a model with the vLLM engine
+    Then serving is refused before any engine starts
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to serve
+    And no local server was recorded
+
+  # The install half of the same gate. Without it `rocm engines install vllm`
+  # either failed on an unrelated "no active ROCm runtime" error (as here, with
+  # no runtime) or went on to run the install. Hermetic, and selected into the
+  # required Windows lane for the same reason as serve-33.
+  @id:serve-vllm-install-refused-on-native-windows @requires-os:windows
+  Scenario: serve-34 - Installing vLLM on native Windows is refused with the platform reason
+    When the user installs the vLLM engine
+    Then the install is refused
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # The same refusal with a runtime present, which is the case that used to go
+  # on to install. The runtime resolves as a managed Python environment and a
+  # recording stand-in replaces `uv`, so an install that was NOT refused would
+  # run `uv pip install vllm`; nothing fetched is shown by that never happening,
+  # not only by the exit message.
+  @id:serve-vllm-install-with-runtime-refused-on-native-windows @requires-os:windows
+  Scenario: serve-35 - Installing vLLM on native Windows with an active runtime never starts the install
+    Given a registered read-only runtime
+    And the first runtime is active
+    And the runtime has a Python interpreter and uv is a recording stand-in
+    When the user installs the vLLM engine
+    Then the install is refused
+    And no vLLM install was started
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
+  # Hugging Face token was passed. The check runs ahead of GPU detection and
+  # Docker, so it needs neither and gates every PR (ungated). The refusal names
+  # the remedy and leaves no service record behind; serve-37 proves the named
+  # remedy clears the condition. A Docker that logs its calls shows that nothing
+  # was pulled. serve-38 and serve-39 cover the GPU-dependent refusals.
+  @id:serve-gated-aim-refused-without-hf-token
+  Scenario: serve-36 - A gated AIM image is refused without a Hugging Face token
+    Given Docker is watched for any call
+    When the user serves a gated AIM model without passing a Hugging Face token
+    Then serving is refused before any engine starts
+    And the CLI explains that the model needs a Hugging Face token
+    And no service was started
+    And Docker was never called
+
+  # The remedy printed by serve-36 (`export HF_TOKEN`, then `--engine-env
+  # HF_TOKEN`) must actually clear that refusal. The host's one GPU is one the
+  # image supports and every GPU is masked, so the serve passes the token and
+  # GPU-family gates and stops at the GPU pre-flight, still before anything is
+  # pulled. The GPU is planted, so the outcome does not depend on the runner.
+  # Linux only: the empty `HIP_VISIBLE_DEVICES` mask and the planted kernel
+  # topology are Linux mechanisms.
+  @id:serve-gated-aim-token-remedy-clears-refusal @requires-os:linux
+  Scenario: serve-37 - Passing the exported Hugging Face token clears the gated AIM refusal
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Radeon PRO W7900
+    When the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked
+    Then serving is refused before any engine starts
+    And the refusal is that no usable GPU is visible
+    And Docker was never called
+
+  # An AIM image only carries profiles for some GPUs. On a GPU it has none for,
+  # `rocm serve --engine aim` is refused up front and names what the image does
+  # support, rather than pulling a container that fails inside. The detected GPU
+  # is planted (an Instinct card against a Radeon-only image), so this needs no
+  # AMD hardware and runs on every Linux lane.
+  @id:serve-aim-refused-on-unsupported-gpu @requires-os:linux
+  Scenario: serve-38 - An AIM image is refused on a GPU it has no profile for
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves a Radeon-only AIM image
+    Then serving is refused before any engine starts
+    And the CLI says the image has no profile for this GPU and names the GPUs it supports
+    And Docker was never called
+
+  # `rocm serve` gives an engine one GPU, so an AIM image whose smallest profile
+  # needs several is refused before launch instead of starting with too few.
+  @id:serve-aim-refused-when-it-needs-several-gpus @requires-os:linux
+  Scenario: serve-39 - An AIM image that needs several GPUs is refused
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves an AIM image that needs eight GPUs
+    Then serving is refused before any engine starts
+    And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
+    And Docker was never called
+
+
+  # ROCMAI-827: `rocm serve` started the background automation helper
+  # (`rocm daemon`) on every launch, even with every automation watcher off —
+  # when it has nothing to do — and that helper outlived the service. With no
+  # watcher enabled, serve now starts no helper; the scenario's fresh config
+  # has none enabled. The helper's own lifecycle once a watcher is on is
+  # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
+  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
+    Given a managed runtime is active
+    When the user serves a GGUF model on lemonade with no automation enabled
+    Then serving started no background helper

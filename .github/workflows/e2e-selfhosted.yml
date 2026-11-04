@@ -420,7 +420,10 @@ jobs:
     # this replaced, and a run took 26m54s against the old 35min cap (run
     # 34489547654) versus 18-19m on a warm static host — keep the same headroom
     # ratio the 35 was chosen for.
-    timeout-minutes: 45
+    # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
+    # @nightly, up to 1200s readiness each on a cold pull) and the large-model
+    # serve, which cannot fit the per-PR 45min budget.
+    timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
@@ -564,8 +567,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
-  # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
-  # no GPU. Non-blocking so it never gates the PR.
+  # existing windows-debug/windows-release jobs use GitHub-hosted windows-latest,
+  # which has no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario

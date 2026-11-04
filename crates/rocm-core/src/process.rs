@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::examine::truncate_to_chars;
+use crate::probe_exec::truncate_to_chars;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -409,7 +409,27 @@ impl FileLock {
     /// The lock file itself carries no data; it is a rendezvous point, so an
     /// existing file is reused (never truncated) and its contents are ignored.
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -421,9 +441,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.
@@ -2010,9 +2028,11 @@ mod tests {
         // pre-setting it to the marker is cmd's equivalent of the unix
         // `read || echo`. A stdin left open blocks in `set /p` instead.
         //
-        // Both callers in `apps/rocmd/src/common.rs` run on Windows, and
-        // `run_with_timeout` has no `cfg(windows)` branch, so this covers the
-        // same promise with the same two-sidedness as the unix case.
+        // Both callers in `rocmd` run on Windows -- the amd-smi probe in
+        // `apps/rocmd/src/host_snapshot.rs` and the `rocm` capture that
+        // `apps/rocmd/src/common.rs` makes through `run_rocm_capture_with_env`
+        // -- and `run_with_timeout` has no `cfg(windows)` branch, so this covers
+        // the same promise with the same two-sidedness as the unix case.
         let fixture = WindowsFixture::script(
             "stdin",
             &format!(

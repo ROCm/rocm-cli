@@ -41,6 +41,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod service_stop_steps;
+    pub mod service_unknown_id_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
@@ -168,6 +169,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The background helper (`rocm daemon`) a scenario saw running, captured
+    /// while it was known live, so `Drop` can stop it by a verified identity if
+    /// an earlier step failed before the scenario disabled the watcher.
+    pub helper_identity: Option<rocm_core::ProcessIdentity>,
     /// A live process a scenario recorded as a managed server's own, so a stop
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
@@ -337,6 +342,7 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
         }
@@ -673,6 +679,16 @@ impl Drop for E2eWorld {
             let _ = process.kill();
             let _ = process.wait();
         }
+        // A scenario that enabled a watcher started a real detached `rocm daemon`,
+        // which only exits once the watcher is disabled. If a step failed first,
+        // nothing else would stop it, and it would keep polling a config dir
+        // that is about to be deleted.
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::stop_leftover_helper(
+                &self.app_paths(),
+                self.helper_identity.take(),
+            );
+        }
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
@@ -944,10 +960,27 @@ pub fn run_rocm_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (String, String, i32) {
+    run_rocm_with_env_and_unset(world, args, envs, &[])
+}
+
+/// Like [`run_rocm_with_env`], but first removes each of `unset` from the env.
+///
+/// For a scenario about what the CLI resolves when one of the
+/// `ROCM_CLI_*_DIR` settings is left out. Everything the scenario keeps set
+/// still points inside its isolated root.
+pub fn run_rocm_with_env_and_unset(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    unset: &[&str],
+) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }

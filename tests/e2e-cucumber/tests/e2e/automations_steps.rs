@@ -20,7 +20,7 @@
 //! is covered separately.
 //!
 //! Two slices live here. The enable/disable/mode steps act on a watcher id the
-//! test already knows. The listing steps (scenario 11) assert the complementary
+//! test already knows. The listing steps (scenario 12) assert the complementary
 //! discoverability contract: everything the listing shows a user must also be
 //! able to act on, so they derive each check's identifier FROM the listing rather
 //! than knowing it in advance — hard-coding the real ids would keep passing
@@ -232,6 +232,13 @@ fn refresh_harness_autostart_claim(world: &E2eWorld) {
 #[given("a daemon spawn is already in flight")]
 async fn daemon_spawn_in_flight(world: &mut E2eWorld) {
     plant_inflight_autostart_claim(world);
+}
+
+#[given("no automation watcher is enabled")]
+async fn no_watcher_enabled(_world: &mut E2eWorld) {
+    // The World already gives each scenario an isolated, empty config dir, where
+    // every watcher is off. Deliberately plants NO spawn-suppression marker: the
+    // scenario drives the real daemon spawn.
 }
 
 #[given("a pending artifact-download proposal approved for a size just under 1 MiB")]
@@ -679,6 +686,125 @@ async fn no_second_daemon(world: &mut E2eWorld) {
         "expected the enable to defer to the in-flight spawn without launching a \
          second daemon, but it reached the spawn:\n{combined}"
     );
+}
+
+/// How long the helper gets to publish its runtime state after the spawn, or
+/// to exit after its last watcher is disabled (it re-reads the config on a 5 s
+/// tick). Generous because the mock lane runs many scenarios at once.
+const HELPER_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The helper's recorded pid and `running` flag, read from the runtime state
+/// the daemon itself publishes — the same file `rocm daemon --status` reads.
+fn helper_runtime_state(world: &E2eWorld) -> Option<(u32, bool)> {
+    rocm_core::AutomationRuntimeState::load(&world.app_paths())
+        .ok()
+        .flatten()
+        .map(|state| (state.daemon_pid, state.running))
+}
+
+/// Teardown for a scenario that started a real helper: stop it if it is still
+/// alive, whatever step failed. The helper is found from the runtime state it
+/// published (when it says `running`) or, if it never got that far, from the
+/// autostart claim the spawn writes synchronously (honoured for the CLI's own
+/// 30 s). It is signalled only through `terminate_verified`, against the identity
+/// captured when the scenario saw it live, or captured now where the state or
+/// claim names a live pid — never by a bare pid. Best-effort: teardown must not
+/// panic.
+pub(crate) fn stop_leftover_helper(
+    paths: &rocm_core::AppPaths,
+    seen: Option<rocm_core::ProcessIdentity>,
+) {
+    let from_state = rocm_core::AutomationRuntimeState::load(paths)
+        .ok()
+        .flatten()
+        .filter(|state| state.running)
+        .map(|state| state.daemon_pid);
+    let from_claim = || {
+        let text = std::fs::read_to_string(paths.automation_autostart_claim_path()).ok()?;
+        let mut parts = text.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        let at_ms: u128 = parts.next()?.parse().ok()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        (now_ms.saturating_sub(at_ms) < 30_000).then_some(pid)
+    };
+    let identity = seen.or_else(|| {
+        from_state
+            .or_else(from_claim)
+            // Scenarios that suppress the spawn plant a state and claim naming
+            // this very harness; it is never the helper.
+            .filter(|pid| *pid != std::process::id())
+            .filter(|pid| rocm_core::process_is_running(*pid))
+            .map(rocm_core::ProcessIdentity::capture)
+    });
+    if let Some(identity) = identity {
+        let _ = rocm_core::terminate_verified(
+            &identity,
+            rocm_core::KillScope::Single,
+            std::time::Duration::from_secs(5),
+            true,
+        );
+    }
+}
+
+#[then("the CLI reports starting the background helper and it is running")]
+async fn helper_started_and_running(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("helper: started background automation daemon"),
+        "expected the enable to report starting the helper, got:
+{}",
+        combined(world)
+    );
+    // The claim is checked against the process: the helper publishes a running
+    // state under its own pid, and that pid is a live process.
+    let deadline = std::time::Instant::now() + HELPER_LIFECYCLE_TIMEOUT;
+    loop {
+        if let Some((pid, true)) = helper_runtime_state(world)
+            && rocm_core::process_is_running(pid)
+        {
+            world.helper_identity = Some(rocm_core::ProcessIdentity::capture(pid));
+            let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+            assert!(
+                status.contains("Status: running"),
+                "expected `rocm daemon --status` to report the helper running, got:
+{status}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper never published a running state under a live pid; state: {:?}",
+            helper_runtime_state(world)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[then("the background helper stops on its own")]
+async fn helper_stops_on_its_own(world: &mut E2eWorld) {
+    let (pid, _) = helper_runtime_state(world).expect("the helper recorded no runtime state");
+    let deadline = std::time::Instant::now() + HELPER_LIFECYCLE_TIMEOUT;
+    loop {
+        let running = helper_runtime_state(world).is_some_and(|(_, running)| running);
+        if !running && !rocm_core::process_is_running(pid) {
+            let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+            assert!(
+                status.contains("Status: not running"),
+                "expected `rocm daemon --status` to report the helper stopped, got:
+{status}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper (pid {pid}) was still running {}s after its last watcher was disabled",
+            HELPER_LIFECYCLE_TIMEOUT.as_secs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 #[then("the CLI confirms the watcher is disabled")]

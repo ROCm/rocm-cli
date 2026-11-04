@@ -31,16 +31,17 @@ for Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory but not the serving-instance registry; no vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
-only (see [docs/vllm.md](docs/vllm.md)).
+Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
+the serving-instance registry view needs the `rocmdashd` unix socket, so it's
+Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
@@ -226,9 +227,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode reads telemetry over a Unix domain socket, so it requires Linux or
-WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
-GPU or daemon.
+Live mode works on Windows too, but shows only GPU/CPU/memory — the
+serving-instance registry needs the Unix domain socket telemetry, so that view
+is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+anywhere without a GPU or daemon.
 
 ## Configure ROCm and serve a model
 
@@ -428,7 +430,11 @@ hardware, not something an install or a setting can put right.
 `rocm fix` takes these flags:
 
 - `--dry-run` shows any fix's plan without changing anything.
-- `--yes` skips the interactive confirmation once you've reviewed it.
+- `--yes` skips the interactive confirmation once you've reviewed it. Without
+  it, a fix that changes files or settings asks `[y/N]` (default: no). When
+  stdin is not a terminal it prints the plan and refuses with exit code 5,
+  changing nothing; answering no also exits 5. Fixes that only print steps
+  never ask.
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
@@ -587,6 +593,10 @@ Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits
 non-zero, after printing the plan.
 
+`install driver` never asks for confirmation. Without `--yes`, in a terminal or
+not, it prints the plan, changes nothing, and exits 0. A plan that would install
+something is marked `approval: required`.
+
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first
@@ -695,8 +705,9 @@ reported as stopped by the attempt. The error says which is which. Read
 to fail the same way again — then start a stopped server with
 `rocm services restart <service-id> --yes` once the cause is fixed.
 
-`uninstall` prompts for confirmation unless `--yes` is passed; outside an
-interactive terminal `--yes` is required. `--dry-run` prints the plan and
+`runtimes uninstall` prompts `[y/N]` (default: no) unless `--yes` is passed.
+Outside an interactive terminal it prints the plan and refuses with exit code 1,
+removing nothing, so `--yes` is required there. `--dry-run` prints the plan and
 exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
@@ -714,6 +725,11 @@ rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
+
+Both removal commands list what they would remove, then ask `[y/N]` (default:
+no) unless `--yes` is passed. Outside an interactive terminal, when there is
+something to remove, they refuse with exit code 1 and remove nothing, so `--yes`
+is required there. `--dry-run` never asks.
 
 `remove-old-installs` keeps the two most recent installs for each channel,
 format, GPU family, and toolchain choice, and never touches the install in use,
@@ -763,8 +779,13 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
-`--yes` approves required system-package installs, such as OpenMPI for vLLM,
-without asking.
+`--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
+libnuma), including a `sudo` password prompt. `engines install` never asks for
+confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
+installs a missing package anyway, and one that would need a password prints the
+commands to run while the install continues. With `--yes`, a failed OpenMPI
+install is an error; a failed libatomic or libnuma install only warns. On
+Windows these installs are skipped.
 
 ### Will a model run here?
 
@@ -802,7 +823,14 @@ rocm model [--verbose]
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines.
+GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+images are among the hidden recipes: `--verbose` shows each one's supported GPU
+families, the GPU count it needs per family, and whether it needs a Hugging Face
+token (`requires_hf_token=yes`), and
+`rocm serve <model> --engine aim` runs it (needs a reachable Docker daemon).
+AIM entries are hand-maintained and record when they were last verified;
+`rocm model --verbose` warns when one is over 180 days old (see
+`docs/aim-catalog.md`).
 
 ### Model serving
 
@@ -830,9 +858,10 @@ own process/container (repeatable); currently only `aim` consumes these (e.g.
 argv and in `rocm services list --json`, so do not put secrets there; pass a
 bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
 current environment without storing it. A service restarted by the daemon
-after a crash inherits the daemon's environment, not yours, so a forwarded
-secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
-5-minute readiness wait for a cold-start model download.
+after a crash (with the `server-recover` automation enabled) inherits the
+daemon's environment, not yours, so a forwarded secret must also be set
+there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
+for a cold-start model download.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -893,7 +922,10 @@ instead of silently substituting a different model.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
-before serving gated models.
+before serving gated models. The exception is `--engine aim`, whose container
+does not read your environment on its own: export `HF_TOKEN` and pass
+`--engine-env HF_TOKEN` (see above), or `rocm serve` refuses a gated AIM image
+before pulling anything.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
 per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
@@ -906,6 +938,60 @@ The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied through `HIP_VISIBLE_DEVICES`, ROCm CLI warns
 when `ROCR_VISIBLE_DEVICES` is set, because the two orderings can diverge.
+
+#### Reuse is exempt from the no-GPU refusal
+
+Under the default `gpu_required` policy, `rocm serve` on a host with no usable
+AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
+prepared or downloaded. A `rocm serve` that matches an **already-running
+managed service for the same engine and model** now skips that refusal and
+prints the reuse summary instead. This is a real change to a refusal you may be
+relying on: on a GPU-less host, `rocm serve <model>` can now succeed where it
+previously always failed.
+
+The exemption is limited to that case, and nothing else about `gpu_required`
+changes. The reused service was vetted against the policy at its own launch,
+and the reusing invocation launches no process and does no GPU work. A live
+service for a different engine does not soften the refusal, and neither does one
+for a model whose name does not overlap — those still fail fast with the usual
+message and prepare nothing.
+
+Matching the engine and model is necessary but not sufficient. The exemption
+applies only when the service would *actually* be reused, and that is decided by
+exactly the predicate the launch itself applies: the recipe settings must match
+(the sampling-control rule under [Model serving](#model-serving) above), a
+`--require-api-key` request must be satisfiable by a service that already has a
+key, and the service's recorded device policy must satisfy this one — a
+`gpu_required` serve is not reused from a service recorded as `cpu_only`. That
+is the only policy pair refused; any other combination, including a record that
+predates the field and so names no policy at all, is accepted. (No `rocm serve`
+can record a `cpu_only` service today — `--device cpu_only` is refused outright,
+since CPU is not a fallback path here — so that term is a guard, not a refusal
+you will meet.) A live service that fails any of those is not reusable, so it
+buys no bypass: `rocm serve` refuses on the GPU instead, which is the accurate
+message and leaves your running server alone. (Telling you to stop it and re-run
+would not help: the re-run would have nothing left to reuse and would hit the
+same GPU refusal.)
+
+Two limits are worth stating exactly, because they are easy to read as stronger
+than they are:
+
+- **Model names are matched leniently.** The check that decides whether reuse is
+  even worth asking about uses the same two-way substring match the service
+  listings use, so a live `qwen3-8b-instruct` service opens it for
+  `rocm serve qwen`. On a GPU-less host that invocation then does engine
+  preparation — possibly printing `Preparing <engine> for GPU serving...` and
+  installing — *before* the refusal it ultimately gets, and if that preparation
+  fails you get its error rather than the GPU one. Leniency is deliberate:
+  tightening it would silently break legitimate reuse by short name. Only a
+  model name that does not overlap is guaranteed to refuse first with nothing
+  prepared.
+- **The exemption does not apply with an explicit `--gpu <index>`.** It skips
+  the no-usable-GPU bail, not the pinned-index check that follows it — and that
+  check refuses *every* index on a host with no usable GPU, because there is no
+  visible ordinal for one to name. So `rocm serve <model> --gpu 0` is refused on
+  a GPU-less host whether or not a reusable service is running, and so is
+  `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
 
 Manage background servers started with `--managed`:
 
@@ -1004,7 +1090,9 @@ For `rocm dash`:
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode requires Unix domain sockets (Linux and WSL2 only).
+- Live mode works on Windows too, but shows only GPU/CPU/memory — there's no
+  `rocmdashd` unix socket to connect to there, so the serving-instance
+  registry view stays empty (Linux and WSL2 get the full live view).
 
 ### Bench
 
@@ -1153,6 +1241,14 @@ apply changes automatically. `list` shows the available watchers and their IDs.
   `server-recover` does: it restarts a managed service that failed. The other
   watchers stay review-gated or record only in this mode.
 
+Enabled watchers run in a background helper process (`rocm daemon`), which
+`enable` starts, and `rocm serve` starts too while any watcher is on. All
+watchers are off by default, so serving a model starts no helper. The helper
+exits on its own within a few seconds once no watcher is enabled; disable each
+enabled watcher to stop it. `rocm daemon --status` shows whether it is running.
+The helper is not tied to a service: while a watcher is enabled it outlives
+`rocm services stop`, and that command, like `rocm uninstall`, says so.
+
 ### Configuration
 
 Show or change ROCm CLI's saved settings: the default engine and runtime,
@@ -1201,8 +1297,10 @@ rocm uninstall [--yes] [--dry-run]
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks before doing it. Use `--dry-run` to only list, and `--yes` to skip
-the confirmation. Each `--keep-*` flag skips the removal of one category:
+do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
+and `--yes` to skip the confirmation. Outside an interactive terminal, when there
+is something to remove, it refuses with exit code 1 and removes nothing unless
+you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
@@ -1212,7 +1310,12 @@ the confirmation. Each `--keep-*` flag skips the removal of one category:
   the managed `uv` package cache, which `--keep-data` controls.
 
 By default, the configuration and data directories are both `~/.rocm`, and the
-cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+cache directory is `~/.rocm/cache`. The `ROCM_CLI_CONFIG_DIR`,
+`ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR` environment variables move them;
+when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
+`<data directory>/cache`. A cache that an earlier version kept at `~/.rocm/cache`
+while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by `rocm
+uninstall`; delete it by hand if you don't need it. `uninstall` removes a category's directory
 unless you keep that category, so on a default installation a flag doesn't
 protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.

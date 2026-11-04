@@ -436,7 +436,7 @@ pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> St
     let _ = writeln!(output, "Startup: on demand");
     let _ = writeln!(
         output,
-        "Why it runs: automation checks and local model servers use it when needed."
+        "Why it runs: enabled automation checks (server recovery is one) need it; it stops on its own when none is on."
     );
     let _ = writeln!(
         output,
