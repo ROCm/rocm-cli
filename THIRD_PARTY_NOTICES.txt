@@ -8358,7 +8358,7 @@ The following component(s) are licensed under Apache License 2.0:
   - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - directories 6.0.0 <https://github.com/soc/directories-rs>
   - dirs-sys 0.5.0 <https://github.com/dirs-dev/dirs-sys-rs>
-  - dirs 6.0.0 <https://github.com/soc/dirs-rs>
+  - dirs 7.0.0 <https://codeberg.org/dirs/dirs-rs>
   - document-features 0.2.12 <https://github.com/slint-ui/document-features>
   - dyn-clone 1.0.20 <https://github.com/dtolnay/dyn-clone>
   - eventsource-stream 0.2.3 <https://github.com/jpopesculian/eventsource-stream>
