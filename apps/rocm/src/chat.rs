@@ -7,7 +7,7 @@
 //! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
 //! module-private except `ChatToolApprovalRequest`, reached by
 //! `dash_seam.rs` as `chat_tool_approval_request`'s return type, and
-//! `ChatRocmCommandAction`, read by `driver_install.rs`'s test module), its
+//! `ChatRocmCommandAction`, read by `driver_plan.rs`'s test module), its
 //! tool-call validation/approval/execution logic (`validate_chat_tool_call`
 //! and the `validate_chat_*_tool_call` family), deterministic tool-output
 //! summarization, and the MCP tool-bridge entry points
@@ -3794,35 +3794,6 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
     }
 }
 
-/// Map the parsed `install sdk` arguments onto the install request.
-///
-/// Extracted from the command arm so this mapping has a seam. `include_devel`
-/// is the field that most needs one: nothing downstream re-derives it, so if
-/// the flag stopped being forwarded here the install would silently go back to
-/// pulling the compiler toolchain and every other assertion would still pass.
-#[allow(clippy::too_many_arguments)]
-pub(crate) const fn sdk_install_request<'a>(
-    channel: &'a str,
-    format: &'a str,
-    prefix: Option<PathBuf>,
-    version_selector: Option<therock::RuntimeVersionSelector>,
-    family_override: Option<&'a str>,
-    dry_run: bool,
-    devel: bool,
-    consent: therock::SdkInstallConsent,
-) -> therock::SdkInstallRequest<'a> {
-    therock::SdkInstallRequest {
-        channel,
-        format,
-        prefix,
-        version_selector,
-        family_override,
-        dry_run,
-        include_devel: devel,
-        consent,
-    }
-}
-
 fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Result<String> {
     let channel = chat_cli_arg_value(args, "--channel").unwrap_or("release");
     let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
@@ -7280,80 +7251,6 @@ install therock";
         assert!(error.contains("cloud provider `anthropic` is disabled"));
         assert!(error.contains("rocm config enable-provider anthropic"));
         assert!(!error.contains("OpenAI-compatible provider"));
-    }
-
-    /// The half the parse test above cannot reach: that the parsed flag is what
-    /// the install request carries.
-    ///
-    /// `install()` is not callable here — it needs `uv`, a live index and a real
-    /// probe — so the mapping is extracted into `sdk_install_request` and pinned
-    /// directly. Hardcoding `include_devel` at that mapping is the change this
-    /// catches and the clap test does not.
-    #[test]
-    fn install_sdk_request_forwards_the_parsed_devel_flag() {
-        for devel in [false, true] {
-            let request = sdk_install_request(
-                "release",
-                "wheel",
-                None,
-                None,
-                None,
-                false,
-                devel,
-                therock::SdkInstallConsent::Ask,
-            );
-            assert_eq!(
-                request.include_devel, devel,
-                "the parsed --devel flag must reach the install request"
-            );
-        }
-
-        // And the flag must not be confused with the neighbouring bool.
-        let dry_run_only = sdk_install_request(
-            "release",
-            "wheel",
-            None,
-            None,
-            None,
-            true,
-            false,
-            therock::SdkInstallConsent::Ask,
-        );
-        assert!(dry_run_only.dry_run);
-        assert!(!dry_run_only.include_devel);
-    }
-
-    /// End to end across the two seams a `rocm install sdk --devel` traverses:
-    /// clap parse, then the request mapping. Neither alone proves the flag
-    /// survives the trip.
-    #[test]
-    fn parsed_install_sdk_arguments_reach_the_request_with_devel_intact() {
-        for (args, expected) in [
-            (vec!["rocm", "install", "sdk"], false),
-            (vec!["rocm", "install", "sdk", "--devel"], true),
-        ] {
-            let cli = Cli::try_parse_from(&args).expect("install sdk should parse");
-            let Some(Command::Install {
-                target: InstallTarget::Sdk { devel, .. },
-            }) = cli.command
-            else {
-                panic!("expected an install sdk target for {args:?}");
-            };
-            let request = sdk_install_request(
-                "release",
-                "wheel",
-                None,
-                None,
-                None,
-                false,
-                devel,
-                therock::SdkInstallConsent::Ask,
-            );
-            assert_eq!(
-                request.include_devel, expected,
-                "--devel did not survive parse -> request for {args:?}"
-            );
-        }
     }
 
     /// The same question — "is this a system location?" — also keeps the local

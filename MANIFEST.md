@@ -36,6 +36,7 @@ repository.
 | Inflector | 0.11.4 | BSD-2-Clause |
 | addr2line | 0.25.1 | Apache-2.0 OR MIT |
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| adlx | 0.0.0-alpha.1 | MIT |
 | aes | 0.8.4 | MIT OR Apache-2.0 |
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
@@ -72,6 +73,7 @@ repository.
 | axum-core | 0.5.6 | MIT |
 | backtrace | 0.3.76 | MIT OR Apache-2.0 |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
+| base64 | 0.23.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
 | bit-set | 0.5.3 | MIT/Apache-2.0 |
 | bit-vec | 0.6.3 | MIT/Apache-2.0 |
@@ -91,7 +93,7 @@ repository.
 | bytes | 1.12.0 | MIT |
 | castaway | 0.2.4 | MIT |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
-| cc | 1.9.0 | MIT OR Apache-2.0 |
+| cc | 1.10.0 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | cfg_aliases | 0.1.1 | MIT |
 | cfg_aliases | 0.2.1 | MIT |
@@ -148,7 +150,7 @@ repository.
 | derive_more-impl | 2.1.1 | MIT |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
 | directories | 6.0.0 | MIT OR Apache-2.0 |
-| dirs | 6.0.0 | MIT OR Apache-2.0 |
+| dirs | 7.0.0 | MIT OR Apache-2.0 |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
 | dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT |
 | displaydoc | 0.2.6 | MIT OR Apache-2.0 |
@@ -258,6 +260,7 @@ repository.
 | lab | 0.11.0 | MIT |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 |
 | libc | 0.2.191 | MIT OR Apache-2.0 |
+| libloading | 0.8.9 | ISC |
 | libm | 0.2.16 | MIT |
 | libredox | 0.1.17 | MIT |
 | line-clipping | 0.3.7 | MIT OR Apache-2.0 |
@@ -417,7 +420,7 @@ repository.
 | security-framework | 2.11.1 | MIT OR Apache-2.0 |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 |
-| self-replace | 1.5.0 | Apache-2.0 |
+| self-replace | 1.5.1 | Apache-2.0 |
 | semver | 1.0.28 | MIT OR Apache-2.0 |
 | serde | 1.0.229 | MIT OR Apache-2.0 |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 |
@@ -489,7 +492,7 @@ repository.
 | tinystr | 0.8.3 | Unicode-3.0 |
 | tinyvec | 1.11.0 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tokio | 1.53.3 | MIT |
+| tokio | 1.54.1 | MIT |
 | tokio-macros | 2.7.0 | MIT |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-tungstenite | 0.28.0 | MIT |
@@ -517,7 +520,7 @@ repository.
 | tungstenite | 0.28.0 | MIT OR Apache-2.0 |
 | typed-builder | 0.23.2 | MIT OR Apache-2.0 |
 | typed-builder-macro | 0.23.2 | MIT OR Apache-2.0 |
-| typed-path | 0.12.3 | MIT OR Apache-2.0 |
+| typed-path | 0.13.0 | MIT OR Apache-2.0 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucd-trie | 0.1.7 | MIT OR Apache-2.0 |
 | uds_windows | 1.2.1 | MIT |
@@ -621,7 +624,7 @@ repository.
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
-| zip | 9.0.5 | MIT |
+| zip | 9.1.2 | MIT |
 | zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.21 | MIT |
 | zopfli | 0.8.3 | Apache-2.0 |

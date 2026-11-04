@@ -119,7 +119,7 @@ resulting state in the same test. Three shapes need this:
 A test that only pins the wording certifies the string, not the truth of it, and a pin
 over a false claim holds the claim in place. Where the text genuinely has to be pinned on
 its own, the assertion carries a comment naming the test that proves the behavior — see
-`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in [`apps/rocm/src/setup_cmd.rs`](apps/rocm/src/setup_cmd.rs),
 which pins the onboarding line and points at
 `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
 itself.
@@ -127,8 +127,8 @@ itself.
 The message and the code it describes are usually in different functions and often
 different files, so nothing links them by construction. Where the printed line can be
 derived from the same value the branch is taken on — as `preapproved_install_line` in
-`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
-computed from the decision cannot disagree with it.
+`apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
+message computed from the decision cannot disagree with it.
 
 **A new test is shown to fail when the code it covers is broken.** Before pushing, break
 the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
@@ -246,7 +246,7 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`therock.rs`](apps/rocm/src/therock.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
 
 CLI:
 
@@ -260,7 +260,7 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
 - **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
-- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. `BoxRole::from_tone` in [`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs) derives a card border from the same tone. To color a new status enum, add its tone function there rather than a bespoke match per screen
 - **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
