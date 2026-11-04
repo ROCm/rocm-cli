@@ -1382,8 +1382,8 @@ async fn home_view_displayed(world: &mut E2eWorld) {
 #[then("the hero reports no GPU telemetry available")]
 async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     let tui = session(world);
-    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
-    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    // The VRAM/TEMP/POWER/T/S rows sit low in the hero, and a short pty
+    // squeezes the hero until `hero_rows` drops its bottom rows; enlarge first.
     tui.use_wide_size()
         .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
 

@@ -719,6 +719,9 @@ Expected result:
   sidebar, never `0.0%`.
 - The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
   serving-instance view, so no throughput is ever measured there.
+- In a short terminal (about 22 rows, e.g. the VS Code panel) the hero still
+  shows utilization, VRAM, temperature and power; only its lowest rows drop
+  off. It never renders as an empty box.
 - Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
   back when it ends.
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves

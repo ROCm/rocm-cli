@@ -284,7 +284,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let title = node_throughput_title(state);
     let hero = card(f, area, &title, BoxRole::Secondary, theme);
-    if hero.width >= 8 && hero.height >= 6 {
+    if hero.width >= 8 && hero.height >= 1 {
         let hcols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -295,11 +295,22 @@ fn draw_hero_band(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 }
 
+/// One-row slots for a hero column, top to bottom. Slots past the column's
+/// height come back zero-height, so a short terminal drops the bottom rows
+/// (the legends first) rather than the whole hero.
+fn hero_rows(area: Rect) -> [Rect; 6] {
+    std::array::from_fn(|i| {
+        let i = u16::try_from(i).unwrap_or(u16::MAX);
+        if i < area.height {
+            Rect::new(area.x, area.y + i, area.width, 1)
+        } else {
+            Rect::new(area.x, area.y, area.width, 0)
+        }
+    })
+}
+
 fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let lh = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 6])
-        .split(area);
+    let lh = hero_rows(area);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "GPU UTILIZATION",
@@ -381,10 +392,7 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rh = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 6])
-        .split(area);
+    let rh = hero_rows(area);
     // In demo/replay this is not a live feed — say so rather than "LIVE".
     let (feed_label, feed_color) = if state.simulated {
         ("SIMULATED · last 60s", theme.warn)
@@ -1002,6 +1010,23 @@ mod tests {
         let s = state_with_gpu();
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
+        }
+    }
+
+    #[test]
+    fn hero_keeps_its_readings_in_a_short_terminal() {
+        // A ~22-row terminal leaves the Home tab ~14 rows, which squeezes the
+        // hero card below the six rows its columns ask for. The readings must
+        // still draw (the bottom rows go first), not leave an empty card.
+        let s = state_with_gpu();
+        for h in 12u16..=18 {
+            let out = render(&s, 72, h);
+            for label in ["GPU UTILIZATION", "VRAM", "TEMP"] {
+                assert!(
+                    out.contains(label),
+                    "{label} missing from the hero at height {h}:\n{out}"
+                );
+            }
         }
     }
 
