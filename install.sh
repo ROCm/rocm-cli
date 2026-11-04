@@ -11,7 +11,7 @@ INSTALL_DIR="${ROCM_CLI_INSTALL_DIR:-${HOME}/.local/bin}"
 UPDATE_SHELL_PATH="${ROCM_CLI_UPDATE_SHELL_PATH:-1}"
 
 fail() {
-  echo "rocm-cli installer: $*" >&2
+  printf '%s\n' "${C_ERR}!!${C_RESET} rocm-cli installer: $*" >&2
   exit 1
 }
 
@@ -35,6 +35,39 @@ truthy() {
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+use_color=0
+# Both stdout and stderr must be TTYs: step()/ok() only ever color stdout
+# and fail() only stderr, and gating on stdout alone would leak raw ANSI
+# escapes into a redirected stderr (e.g. `sh install.sh 2>error.log`, stdout
+# still attached to a terminal) — dropping color entirely is simpler and
+# safer than tracking which fd each helper writes to.
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  use_color=1
+fi
+if [ "${use_color}" -eq 1 ]; then
+  C_STEP=$(printf '\033[1;36m')
+  C_OK=$(printf '\033[32m')
+  C_ERR=$(printf '\033[31m')
+  C_RESET=$(printf '\033[0m')
+else
+  C_STEP=""
+  C_OK=""
+  C_ERR=""
+  C_RESET=""
+fi
+
+step() {
+  printf '%s\n' "${C_STEP}==>${C_RESET} $*"
+}
+
+info() {
+  printf '%s\n' "  $*"
+}
+
+ok() {
+  printf '%s\n' "${C_OK}::${C_RESET} $*"
 }
 
 fetch() {
@@ -155,7 +188,7 @@ write_minimal_config_if_missing() {
   config_dir="$(installer_config_dir)"
   config_path="${config_dir}/config.json"
   if [ -f "${config_path}" ]; then
-    echo "config: existing ${config_path}"
+    info "config: existing ${config_path}"
     return
   fi
 
@@ -179,7 +212,7 @@ write_minimal_config_if_missing() {
 }
 JSON
   install -m 0600 "${config_tmp}" "${config_path}"
-  echo "config: created ${config_path}"
+  info "config: created ${config_path}"
 }
 
 need_cmd tar
@@ -333,6 +366,38 @@ ensure_installer_process_path() {
   esac
 }
 
+print_completion_banner() {
+  cmd="$1"
+  next_hint="$2"
+  # The box-drawing art is only for an interactive terminal on a UTF-8 locale;
+  # piped, logged, or non-UTF-8 output gets the plain "Get started" block only.
+  if [ -t 1 ]; then
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+      *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*)
+        printf '%s' "${C_STEP}"
+        cat <<'ROCM_CLI_BANNER'
+ ██████╗  ██████╗  ██████╗███╗   ███╗     ██████╗██╗     ██╗
+ ██╔══██╗██╔═══██╗██╔════╝████╗ ████║    ██╔════╝██║     ██║
+ ██████╔╝██║   ██║██║     ██╔████╔██║    ██║     ██║     ██║
+ ██╔══██╗██║   ██║██║     ██║╚██╔╝██║    ██║     ██║     ██║
+ ██║  ██║╚██████╔╝╚██████╗██║ ╚═╝ ██║    ╚██████╗███████╗██║
+ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝     ╚═╝     ╚═════╝╚══════╝╚═╝
+
+        Local AI on AMD GPUs — one binary, zero setup
+ROCM_CLI_BANNER
+        printf '%s\n' "${C_RESET}"
+        ;;
+      *) ;;
+    esac
+  fi
+  echo "Get started:"
+  printf '  %-20s # %s\n' "${cmd} install sdk" "set up a managed ROCm runtime"
+  printf '  %-20s # %s\n' "${cmd} serve qwen" "serve a small built-in assistant model"
+  printf '  %-20s # %s\n' "${cmd}" "open the launcher"
+  echo
+  echo "${next_hint}"
+}
+
 # Which machine the artifact is *for*. Normally this machine, but the target can
 # be named explicitly so an artifact can be fetched here on behalf of a different
 # one -- see ROCM_CLI_DOWNLOAD_ONLY below. Detection is the only thing that
@@ -409,18 +474,18 @@ archive_path="${tmp_dir}/${asset_base}"
 sha_path="${archive_path}.sha256"
 sig_path="${archive_path}.sig"
 
-echo "rocm-cli installer"
-echo "  repo: ${REPO}"
-echo "  channel: ${CHANNEL}"
-echo "  platform: ${platform_os}-${platform_arch}"
+step "rocm-cli installer"
+info "repo: ${REPO}"
+info "channel: ${CHANNEL}"
+info "platform: ${platform_os}-${platform_arch}"
 if [ -n "${LOCAL_ARCHIVE}" ]; then
-  echo "  archive: ${LOCAL_ARCHIVE}"
+  info "archive: ${LOCAL_ARCHIVE}"
 elif [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
-  echo "  download_only: ${DOWNLOAD_DIR}"
-  echo "  download: ${archive_url}"
+  info "download_only: ${DOWNLOAD_DIR}"
+  info "download: ${archive_url}"
 else
-  echo "  install_dir: ${INSTALL_DIR}"
-  echo "  download: ${archive_url}"
+  info "install_dir: ${INSTALL_DIR}"
+  info "download: ${archive_url}"
 fi
 
 if [ -n "${LOCAL_ARCHIVE}" ]; then
@@ -466,7 +531,7 @@ if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
     fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"
   fi
   verify_signature "${archive_path}" "${sig_path}" "${public_keys}"
-  echo "signature verified"
+  ok "signature verified"
 fi
 
 # Everything above ran unchanged. Only now, with the artifact proven, is it
@@ -498,7 +563,7 @@ mkdir -p "${INSTALL_DIR}"
 write_minimal_config_if_missing
 
 if [ -f "${manifest_path}" ]; then
-  echo "removing previous rocm-cli install"
+  step "removing previous rocm-cli install"
   while IFS= read -r installed_path; do
     [ -n "${installed_path}" ] || continue
     case "${installed_path}" in
@@ -524,10 +589,10 @@ for bin_path in "${bundle_dir}"/bin/*; do
 done
 install -m 0644 "${manifest_tmp}" "${manifest_path}"
 
-echo "installed:"
+step "installed:"
 while IFS= read -r installed_path; do
   [ -n "${installed_path}" ] || continue
-  echo "  ${installed_path}"
+  info "${installed_path}"
 done < "${manifest_path}"
 
 ensure_installer_process_path
@@ -550,33 +615,35 @@ case ":${PATH}:" in
       fi
       case "${profile_result}" in
         updated:*)
-          echo "shell profile updated:"
-          echo "  profile: ${profile_result#updated:}"
-          echo "  new terminals can run: rocm"
+          ok "shell profile updated:"
+          info "profile: ${profile_result#updated:}"
+          info "new terminals can run: rocm"
           ;;
         unchanged:*)
-          echo "shell profile already configured:"
-          echo "  profile: ${profile_result#unchanged:}"
+          info "shell profile already configured:"
+          info "profile: ${profile_result#unchanged:}"
           ;;
         *)
-          echo "note: ${INSTALL_DIR} is not saved in your shell profile"
-          echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
+          info "note: ${INSTALL_DIR} is not saved in your shell profile"
+          info "rocm is installed here: ${INSTALL_DIR}/rocm"
           ;;
       esac
     else
-      echo "shell profile update skipped"
-      echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
+      info "shell profile update skipped"
+      info "rocm is installed here: ${INSTALL_DIR}/rocm"
     fi
     ;;
   *)
-    echo "note: rocm is installed but this shell could not update PATH"
-    echo "  run: ${INSTALL_DIR}/rocm examine"
+    info "note: rocm is installed but this shell could not update PATH"
+    info "run: ${INSTALL_DIR}/rocm examine"
     ;;
 esac
 
-echo "next:"
 if [ "${UPDATE_SHELL_PATH}" = "1" ]; then
-  echo "  open a new terminal, then run: rocm examine"
+  cmd="rocm"
+  next_hint="Open a new terminal, then run: rocm examine"
 else
-  echo "  ${INSTALL_DIR}/rocm examine"
+  cmd="${INSTALL_DIR}/rocm"
+  next_hint="Run: ${cmd} examine"
 fi
+print_completion_banner "${cmd}" "${next_hint}"

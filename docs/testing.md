@@ -845,6 +845,7 @@ cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
 cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
+cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
@@ -1123,7 +1124,7 @@ would simply deadlock. Both tests therefore stage the launch from a second
 thread and let the code under test block on it.
 
 - `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
-  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  ([`apps/rocm/src/service_records.rs`](../apps/rocm/src/service_records.rs)) holds the lock on the main thread with only the key
   written, runs `prune` on a worker, asserts the worker does *not* report
   completion while the lock is held, then publishes the record and releases.
   Two assertions fail independently if the acquire is removed: that negative
@@ -1796,7 +1797,10 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; cover generated private-key PEM packaging and
+sidecars before activation; assert the installer's get-started block (banner art
+only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+piped or `NO_COLOR` output (the colored TTY branch is not driven by any
+scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config

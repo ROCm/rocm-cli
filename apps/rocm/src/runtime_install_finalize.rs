@@ -7,7 +7,7 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change.
 //!
-//! Called from `main.rs`'s `install()` (the SDK-install path), from
+//! Called from `install_cmd.rs`'s `install()` (the SDK-install path), from
 //! `engines_cmd.rs` (engine install) and, for `real_os_release`, from
 //! `driver_install.rs`.
 //!

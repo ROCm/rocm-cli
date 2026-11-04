@@ -55,8 +55,9 @@
 //! `drm_device_is_amd`, `parse_gpu_vram_usage`, `gpu_low_memory_warning`, and
 //! `busy_gpu_indices` have no callers outside this module and stay private;
 //! `GpuVramUsage` and its fields are `pub(crate)` for the same reason —
-//! `main.rs`'s `classify_accelerator_memory`/`collect_serve_notes` and their
-//! own tests construct and read them directly.
+//! `model_fit.rs`'s `classify_accelerator_memory`, `serve_cmd.rs`'s
+//! `collect_serve_notes`, and their own tests construct and read them
+//! directly.
 //!
 //! `gpu_vram_usage_sysfs` has two definitions, `#[cfg(target_os = "linux")]`
 //! and `#[cfg(not(target_os = "linux"))]` — both moved intact, cfg-gates
@@ -149,7 +150,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// That span is relied on by a second caller: because the guard outlives both
 /// `store_endpoint_api_key` and the first `record.write()`, it also covers the
 /// interval in which a launch's 0600 endpoint key sits on disk with no manifest
-/// beside it. [`prune_managed_service_records`] acquires the same lock so its
+/// beside it. [`crate::service_records::prune_managed_service_records`] acquires the same lock so its
 /// leftover sweep cannot read the directory in that state. Shortening the
 /// guard's life — releasing it before the record is persisted — would silently
 /// reopen that window as well as the GPU double-booking one.
@@ -739,7 +740,7 @@ fn drm_device_is_amd(device_dir: &Path) -> bool {
 /// GPU), and every other reader of this figure already treats zero as "not a
 /// real reading": [`GpuVramUsage::free_fraction`] returns `None` on it rather
 /// than reporting the GPU fully occupied. Keeping the row here would let
-/// [`host_accelerator_memory`] construct `AcceleratorMemory::Dedicated(0.0)`,
+/// `model_fit.rs`'s `host_accelerator_memory` construct `AcceleratorMemory::Dedicated(0.0)`,
 /// which reads as "measured, and it is nothing" rather than "could not
 /// measure" -- turning a diagnostic gap into a confident `Blocked` verdict.
 fn parse_gpu_vram_usage(value: &serde_json::Value) -> Vec<GpuVramUsage> {

@@ -789,6 +789,23 @@ async fn install_with_key_file_shell_profile(world: &mut E2eWorld) {
     state_mut(world).last_output = out;
 }
 
+#[when("the signed bundle is installed with the public key file and NO_COLOR set")]
+async fn when_install_key_file_no_color(world: &mut E2eWorld) {
+    let st = state(world);
+    let install_dir = st.install_dir.clone();
+    let download_base = st.download_base.clone();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        st.public_key.to_string_lossy().into_owned(),
+    )];
+    let extra = [
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("NO_COLOR", "1".to_string()),
+    ];
+    let (out, _ok) = run_installer(world, &install_dir, &download_base, &key_env, &extra);
+    state_mut(world).last_output = out;
+}
+
 const MALFORMED_PUBLIC_KEY: &str =
     "-----BEGIN PUBLIC KEY-----\nnot-valid-base64\n-----END PUBLIC KEY-----";
 
@@ -1173,6 +1190,76 @@ async fn then_signature_verified(world: &mut E2eWorld) {
     assert!(
         out.contains("signature verified"),
         "installer did not report signature verification:\n{out}"
+    );
+}
+
+#[then("the installer prints the get-started block")]
+async fn then_get_started_block(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    for needle in ["Get started:", "install sdk", "serve qwen", "examine"] {
+        assert!(
+            out.contains(needle),
+            "installer output is missing {needle:?}:\n{out}"
+        );
+    }
+}
+
+#[then("the installer next-step hint names the installed rocm binary")]
+async fn then_hint_names_binary(world: &mut E2eWorld) {
+    // ROCM_CLI_UPDATE_SHELL_PATH=0 and the install dir is not on the caller's
+    // PATH, so bare `rocm` would not work: the hint and every example must
+    // name the binary by path. PowerShell invokes a quoted path with `&`.
+    let st = state(world);
+    let rocm = installed_binary(&st.install_dir, "rocm")
+        .display()
+        .to_string();
+    let cmd = if cfg!(windows) {
+        format!("& \"{rocm}\"")
+    } else {
+        rocm
+    };
+    let lines: Vec<&str> = st.last_output.lines().map(str::trim).collect();
+    let hint = format!("Run: {cmd} examine");
+    assert_eq!(
+        lines.iter().rev().find(|l| !l.is_empty()),
+        Some(&hint.as_str()),
+        "installer's last line is not the next-step hint:\n{}",
+        st.last_output
+    );
+    for example in ["install sdk", "serve qwen"] {
+        let want = format!("{cmd} {example}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&want)),
+            "no get-started example starts with {want:?}:\n{}",
+            st.last_output
+        );
+    }
+}
+
+#[then("the installer output has no banner art")]
+async fn then_no_banner_art(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{2588}'),
+        "piped installer output contains the box-drawing banner:\n{out}"
+    );
+}
+
+#[then("the installer output has no ANSI escapes")]
+async fn then_no_ansi(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        !out.contains('\u{1b}'),
+        "piped installer output contains an escape byte:\n{out:?}"
+    );
+}
+
+#[then("the installer failure line is marked with the !! prefix")]
+async fn then_failure_marker(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("!! rocm-cli installer:"),
+        "installer failure line has no !! marker:\n{out}"
     );
 }
 
