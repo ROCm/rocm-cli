@@ -1226,12 +1226,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "out-of-scope report prose",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: out of scope for this platform.",
         "report heading",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: no known misconfiguration matched.",
         "report heading",
     ),
