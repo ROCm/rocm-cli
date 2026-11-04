@@ -1307,7 +1307,9 @@ rocm uninstall [--yes] [--dry-run]
 
 `--follow` (`-f`) keeps printing a server's new log output, such as a model
 download's progress, until the server stops. Ctrl-C ends the follow and leaves
-the server running.
+the server running. On a terminal, a `Following <id> - Ctrl-C stops following ...`
+line stays on the row under the newest output; piped or redirected output prints
+it once.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will

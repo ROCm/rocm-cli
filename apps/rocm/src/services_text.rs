@@ -650,7 +650,13 @@ impl LogTail {
     }
 }
 
-fn write_log_segments(out: &mut impl io::Write, segments: &[LogSegment], tty: bool) -> Result<()> {
+/// Writes `segments`; returns whether the last one was a redraw, which leaves the
+/// cursor on that row (the next segment erases it first) instead of a fresh one.
+fn write_log_segments(
+    out: &mut impl io::Write,
+    segments: &[LogSegment],
+    tty: bool,
+) -> Result<bool> {
     for segment in segments {
         match (tty, segment.redraw) {
             // Redraw the same terminal row, as the engine's own bar does.
@@ -660,7 +666,87 @@ fn write_log_segments(out: &mut impl io::Write, segments: &[LogSegment], tty: bo
         }
     }
     out.flush()?;
-    Ok(())
+    Ok(tty && segments.last().is_some_and(|segment| segment.redraw))
+}
+
+/// The "how to stop" hint kept on the row just below the newest log output of a
+/// terminal follow, so it stays in view however much the log scrolls.
+///
+/// While drawn, the cursor sits on the footer row. [`Self::erase`] puts it back
+/// where the log output left off: on a fresh row, or, after a redraw segment
+/// (a download bar), at the end of that still-open row, one row up.
+struct FollowFooter {
+    text: String,
+    drawn: bool,
+    /// The row above the footer is an unfinished redraw row.
+    open_row: bool,
+}
+
+impl FollowFooter {
+    fn new(service_id: &str) -> Self {
+        Self {
+            text: format!(
+                "Following {service_id} - Ctrl-C stops following and leaves the server running."
+            ),
+            drawn: false,
+            open_row: false,
+        }
+    }
+
+    fn erase(&mut self, out: &mut impl io::Write) -> Result<()> {
+        if self.drawn {
+            write!(out, "\r\x1b[2K")?;
+            if self.open_row {
+                write!(out, "\x1b[1A")?;
+            }
+            self.drawn = false;
+        }
+        Ok(())
+    }
+
+    /// `cols` truncates the text so it never wraps onto a second row, which the
+    /// one-row erase could not clear.
+    fn draw(
+        &mut self,
+        out: &mut impl io::Write,
+        open_row: bool,
+        cols: Option<usize>,
+    ) -> Result<()> {
+        if open_row {
+            writeln!(out)?;
+        }
+        let shown: String = match cols {
+            Some(cols) => self.text.chars().take(cols.saturating_sub(1)).collect(),
+            None => self.text.clone(),
+        };
+        write!(out, "\r\x1b[2K{shown}")?;
+        out.flush()?;
+        self.drawn = true;
+        self.open_row = open_row;
+        Ok(())
+    }
+
+    /// Write a batch of new output with the footer kept below it. A batch with
+    /// nothing in it leaves the screen alone (no flicker on an idle log).
+    fn write_batch(
+        &mut self,
+        out: &mut impl io::Write,
+        segments: &[LogSegment],
+        cols: Option<usize>,
+    ) -> Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        self.erase(out)?;
+        let open_row = write_log_segments(out, segments, true)?;
+        self.draw(out, open_row, cols)
+    }
+}
+
+fn terminal_cols() -> Option<usize> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, _)| usize::from(cols))
 }
 
 /// `rocm logs --service <id> --follow`: print the recent output, then keep
@@ -677,6 +763,7 @@ pub(crate) fn follow_service_logs(paths: &AppPaths, service_id: &str) -> Result<
         tty,
         LOG_FOLLOW_POLL,
         LOG_FOLLOW_LIVENESS_EVERY,
+        &terminal_cols,
     )
 }
 
@@ -687,6 +774,7 @@ fn follow_service_logs_with(
     tty: bool,
     poll: Duration,
     liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
 ) -> Result<()> {
     let record = load_managed_service(paths, service_id)?;
     // Open the tail before the snapshot so output written in between is not lost.
@@ -700,16 +788,27 @@ fn follow_service_logs_with(
         )?;
         return Ok(());
     }
-    writeln!(
-        out,
-        "\nFollowing {service_id} - Ctrl-C stops following and leaves the server running."
-    )?;
+    // On a terminal the hint is a footer that stays under the newest output; a
+    // pipe or log file gets it once, since it has no row to keep it on.
+    let mut footer = tty.then(|| FollowFooter::new(service_id));
+    match footer.as_mut() {
+        Some(footer) => footer.draw(out, false, cols())?,
+        None => writeln!(
+            out,
+            "\nFollowing {service_id} - Ctrl-C stops following and leaves the server running."
+        )?,
+    }
     out.flush()?;
 
     let mut since_check = Duration::ZERO;
     loop {
         thread::sleep(poll);
-        write_log_segments(out, &tail.poll(), tty)?;
+        match footer.as_mut() {
+            Some(footer) => footer.write_batch(out, &tail.poll(), cols())?,
+            None => {
+                write_log_segments(out, &tail.poll(), tty)?;
+            }
+        }
         since_check += poll;
         if since_check < liveness_every {
             continue;
@@ -720,8 +819,13 @@ fn follow_service_logs_with(
             // Output written between the last poll and the exit.
             let mut last = tail.poll();
             last.extend(tail.finish());
-            write_log_segments(out, &last, tty)?;
-            if tty {
+            let mut open_row = false;
+            if let Some(footer) = footer.as_mut() {
+                footer.erase(out)?;
+                open_row = footer.open_row;
+            }
+            open_row = write_log_segments(out, &last, tty)? || (open_row && last.is_empty());
+            if open_row {
                 writeln!(out)?;
             }
             writeln!(
@@ -1957,6 +2061,251 @@ mod tests {
         Ok(())
     }
 
+    fn seg(text: &str, redraw: bool) -> LogSegment {
+        LogSegment {
+            text: text.into(),
+            redraw,
+        }
+    }
+
+    const ERASE: &str = "\r\x1b[2K";
+
+    #[test]
+    fn follow_footer_is_redrawn_under_each_batch_of_new_lines() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let hint = footer.text.clone();
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        assert_eq!(String::from_utf8(out.clone())?, format!("{ERASE}{hint}"));
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("one", false), seg("two", false)], None)?;
+        // Footer row cleared, lines written over it, footer redrawn on the next row.
+        assert_eq!(
+            String::from_utf8(out)?,
+            format!("{ERASE}{ERASE}one\n{ERASE}two\n{ERASE}{hint}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_leaves_an_idle_screen_alone() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        out.clear();
+        footer.write_batch(&mut out, &[], None)?;
+        assert!(out.is_empty(), "{out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_keeps_a_download_bar_on_its_own_row_above_it() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let hint = footer.text.clone();
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, None)?;
+        out.clear();
+
+        footer.write_batch(&mut out, &[seg("28%", true)], None)?;
+        // The bar row stays open; the footer goes on the row below it.
+        assert_eq!(
+            String::from_utf8(out.clone())?,
+            format!("{ERASE}{ERASE}28%\n{ERASE}{hint}")
+        );
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("43%", true)], None)?;
+        // Erase the footer, step back up onto the bar row, redraw it in place.
+        assert_eq!(
+            String::from_utf8(out.clone())?,
+            format!("{ERASE}\x1b[1A{ERASE}43%\n{ERASE}{hint}")
+        );
+
+        out.clear();
+        footer.write_batch(&mut out, &[seg("done", false)], None)?;
+        // A finished line replaces the bar, and the footer is back on a fresh row.
+        assert_eq!(
+            String::from_utf8(out)?,
+            format!("{ERASE}\x1b[1A{ERASE}done\n{ERASE}{hint}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_footer_is_cut_to_one_terminal_row() -> Result<()> {
+        let mut footer = FollowFooter::new("svc_a");
+        let mut out = Vec::new();
+        footer.draw(&mut out, false, Some(11))?;
+        // One column short of the width, so it never wraps.
+        assert_eq!(String::from_utf8(out)?, format!("{ERASE}Following "));
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_keeps_the_hint_under_new_output_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_tty",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11438,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_tty")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            appended
+        });
+        let mut out = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_tty",
+            &mut out,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        let hint = FollowFooter::new("svc_follow_tty").text;
+        // The hint is drawn again right under the line that scrolled it away,
+        // and only the stop message follows it, after the footer row is cleared.
+        assert!(
+            out.contains(&format!("Downloading 43%\n{ERASE}{hint}")),
+            "{out:?}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "{hint}{ERASE}Service svc_follow_tty is stopped; stopped following.\n"
+            )),
+            "{out:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_ends_an_open_download_bar_row_before_the_stop_message() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty-bar");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_bar",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11440,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let appended = (|| -> Result<()> {
+                thread::sleep(Duration::from_millis(150));
+                let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+                std::io::Write::write_all(&mut file, b"28%\r43%\r\r")?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })();
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_bar")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            appended
+        });
+        let mut out = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_bar",
+            &mut out,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        // The footer is erased and the cursor goes back up onto the bar's row; that row
+        // is then ended with a newline so the stop message starts on its own row.
+        assert!(
+            out.ends_with(&format!(
+                "{ERASE}\x1b[1A\nService svc_follow_bar is stopped; stopped following.\n"
+            )),
+            "{out:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_draws_no_footer_for_a_stopped_service_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-tty-stopped");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_tty_stopped",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11439,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write()?;
+        let mut out = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_tty_stopped",
+            &mut out,
+            true,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &|| None,
+        )?;
+        let out = String::from_utf8(out)?;
+        assert!(!out.contains("Following"), "{out:?}");
+        assert!(out.contains("not following."), "{out:?}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn follow_service_logs_prints_snapshot_and_returns_for_a_stopped_service() -> Result<()> {
         let (root, paths) = test_paths("follow-stopped");
@@ -1987,6 +2336,7 @@ mod tests {
             false,
             Duration::from_millis(1),
             Duration::from_millis(1),
+            &|| None,
         )?;
         let out = String::from_utf8(out)?;
         assert!(out.contains("Downloading 86%"), "{out}");
@@ -2045,6 +2395,7 @@ mod tests {
             false,
             Duration::from_millis(20),
             Duration::from_millis(40),
+            &|| None,
         )?;
         writer.join().expect("writer thread")?;
         let out = String::from_utf8(out)?;

@@ -387,6 +387,9 @@ Expected result:
   output as it arrives (a download bar redraws on one terminal row), and returns
   by itself with `Service <id> is <status>; stopped following.` once the server
   stops; Ctrl-C ends the follow and the server keeps running.
+  On a terminal, a `Following <id> - Ctrl-C stops following ...` line stays on the
+  row directly under the newest output (and under the download bar) as the log
+  grows; with output piped to a file it is printed once instead.
 - `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
   server answers. If the server is killed or stopped meanwhile, it exits non-zero
   with `the server exited before it became ready` and a `rocm logs --service`
