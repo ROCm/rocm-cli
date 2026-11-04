@@ -12,8 +12,8 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::device_memory::{
-    DeviceMemory, DrainTarget, PoolKind, Probe, SMI_PROBE_TIMEOUT, bounded_stdout,
-    parse_rocm_smi_csv_pool, sample_device_memory, select_drain_target,
+    DeviceMemory, DrainTarget, Judgement, PoolKind, Probe, SMI_PROBE_TIMEOUT, bounded_stdout,
+    judge, parse_rocm_smi_csv_pool, sample_device_memory,
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
@@ -278,17 +278,17 @@ const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 async fn wait_for_free_vram() -> String {
     // Started before the first probe so that probe counts against the wait.
     let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
-    let mut sample = probe_device_memory().await;
+    let mut judgement = judge(probe_device_memory().await);
     // No GPU tooling installed → nothing to wait on (mock/local). A tool that is
     // present but gave no reading is a different case: it keeps waiting, and
     // says so if it never reads.
-    if sample == Probe::Absent {
+    if judgement == Judgement::NoTooling {
         return "device state: no GPU tooling (mock/local run)".to_owned();
     }
     loop {
-        let target = match sample {
-            Probe::Read(memory) => Some(select_drain_target(memory)),
-            Probe::Absent | Probe::Unreadable => None,
+        let target = match judgement {
+            Judgement::Target(target) => Some(target),
+            Judgement::NoTooling | Judgement::Unreadable => None,
         };
         if let Some(target) = target
             && target.drained()
@@ -307,7 +307,7 @@ async fn wait_for_free_vram() -> String {
             );
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
-        sample = probe_device_memory().await;
+        judgement = judge(probe_device_memory().await);
     }
 }
 

@@ -107,8 +107,12 @@ pub struct Pool {
     pub free_mib: u64,
 }
 
-/// What the device tooling reported for GPU 0. `gtt` is `None` when the tool
-/// that answered has no GTT figure (or none was readable).
+/// What the device tooling reported for GPU 0.
+///
+/// `gtt` is `None` when GTT was not read: a discrete card, or a host with no
+/// tool that reports it. A GTT read
+/// that failed never gets here (the sample is `Unreadable`, see
+/// [`sample_device_memory`]), so a `Some` pool always has a non-zero total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceMemory {
     pub vram: Pool,
@@ -144,6 +148,28 @@ impl DrainTarget {
 #[must_use]
 pub fn required_free_mib(total_mib: u64) -> u64 {
     MAX_FREE_FLOOR_MIB.min(total_mib / 100 * 90)
+}
+
+/// What one sample means for the drain wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judgement {
+    /// No device tool is installed: nothing to wait on (mock/local run).
+    NoTooling,
+    /// A tool is present but gave no usable reading. This is not "no tooling"
+    /// and not "drained": the wait keeps trying.
+    Unreadable,
+    /// A reading, and the pool and floor it is held to.
+    Target(DrainTarget),
+}
+
+/// Turn a sample into what the wait does with it.
+#[must_use]
+pub fn judge(sample: Probe<DeviceMemory>) -> Judgement {
+    match sample {
+        Probe::Absent => Judgement::NoTooling,
+        Probe::Unreadable => Judgement::Unreadable,
+        Probe::Read(memory) => Judgement::Target(select_drain_target(memory)),
+    }
 }
 
 /// Choose the pool the engine allocates from and the floor to hold it to.
@@ -477,6 +503,20 @@ mod tests {
         assert_eq!(
             sample(Probe::Unreadable, Probe::Read((102_400, 102_360))),
             (Probe::Unreadable, false)
+        );
+    }
+
+    #[test]
+    fn an_absent_tool_is_no_tooling_but_an_unreadable_one_is_not() {
+        assert_eq!(judge(Probe::Absent), Judgement::NoTooling);
+        assert_eq!(judge(Probe::Unreadable), Judgement::Unreadable);
+    }
+
+    #[test]
+    fn a_reading_is_judged_against_the_pool_the_engine_allocates_from() {
+        assert_eq!(
+            judge(Probe::Read(strix_halo())),
+            Judgement::Target(select_drain_target(strix_halo()))
         );
     }
 
