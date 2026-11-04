@@ -347,7 +347,7 @@ pub struct Examination {
     /// the distinction decides whether comparing it against the *system* ROCm
     /// means anything. A managed runtime ships its own ROCm and never loads the
     /// system's, so for it the comparison is meaningless. See
-    /// `check_8_wheel_rocm_mismatch` in `diagnose.rs`.
+    /// `check_8_wheel_rocm_mismatch` in `diagnose/host.rs`.
     pub framework_source: String,
 
     // environment

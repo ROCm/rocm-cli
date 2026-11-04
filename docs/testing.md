@@ -1607,7 +1607,7 @@ also must exit non-zero when their DLL is missing, fix-15 in
 `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
 that only `rocm diagnose` prints
 (`the_igpu_verify_pins_the_variable_it_names` in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
 (`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
@@ -1634,7 +1634,7 @@ in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
 the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
 Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
 GPU or not, and are skipped on Windows. The arms are also checked against the
-catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 (`the_override_fix_verify_matches_the_catalog_copy`,
 `the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
 `the_path_fix_verify_passes_on_a_runtime_only_linux_install` and

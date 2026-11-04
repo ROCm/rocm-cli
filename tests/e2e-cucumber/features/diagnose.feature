@@ -709,7 +709,7 @@ Feature: Diagnosing failures and listing fixes
   # the binary. The exact line is asserted, and that it names `python3`: a stock
   # Ubuntu has no `python`. Text only: the line is run by
   # `the_override_fix_verify_runs_where_only_python3_exists` in
-  # crates/rocm-core/src/diagnose.rs, on Unix hosts. The Windows arms of these
+  # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
   # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
   # (text) and the Windows-only `*_verify_runs_*` tests in
   # crates/rocm-core/src/fix.rs (run); there is no Windows scenario for them.
