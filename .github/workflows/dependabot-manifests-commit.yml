@@ -26,7 +26,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.actor.login == 'dependabot[bot]'
       && github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: commits generated files
     permissions:
       actions: read
       contents: write

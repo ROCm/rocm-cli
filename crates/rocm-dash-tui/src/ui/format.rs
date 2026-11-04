@@ -337,6 +337,33 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
     }
 }
 
+/// Instances that belong in a "running" listing: serving or still starting.
+///
+/// Serving ones come first, with a stable order within each group (model name,
+/// then container id) so rows do not reshuffle with `HashMap` iteration order.
+#[must_use]
+pub fn running_instances(state: &crate::app::AppState) -> Vec<&rocm_dash_core::metrics::Instance> {
+    let mut running: Vec<_> = state
+        .instances
+        .values()
+        .filter(|i| i.status.counts_as_running())
+        .collect();
+    running.sort_by(|a, b| {
+        (!a.status.is_serving(), &a.model_name, &a.container_id).cmp(&(
+            !b.status.is_serving(),
+            &b.model_name,
+            &b.container_id,
+        ))
+    });
+    running
+}
+
+/// Lowercase stage text for a starting instance (`loading`, `starting`, ...).
+#[must_use]
+pub fn stage_text(status: rocm_dash_core::metrics::InstanceStatus) -> String {
+    status.label().to_lowercase()
+}
+
 /// The "…and N more" summary line for a list capped to its first `cap`
 /// items, or `None` when `len` doesn't exceed `cap`.
 ///

@@ -27,6 +27,11 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+# Test-only: `write_fake_executable` plants the fake `amd-smi` the timeout tests
+# run without the intermittent "Text file busy" failure that `std::fs::write`
+# followed by a chmod hits. Dev-dependencies are exempt from the layering
+# allowlist, so the collectors keep no normal dependency on `rocm-core`.
+rocm-core = { path = "../rocm-core" }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 wiremock = "0.6"
