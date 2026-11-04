@@ -627,3 +627,16 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
+
+  # ROCMAI-827: `rocm serve` started the background automation helper
+  # (`rocm daemon`) on every launch, even with every automation watcher off —
+  # when it has nothing to do — and that helper outlived the service. With no
+  # watcher enabled, serve now starts no helper; the scenario's fresh config
+  # has none enabled. The helper's own lifecycle once a watcher is on is
+  # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
+  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
+    Given a managed runtime is active
+    When the user serves a GGUF model on lemonade with no automation enabled
+    Then serving started no background helper
