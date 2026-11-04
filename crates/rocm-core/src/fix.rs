@@ -4256,7 +4256,7 @@ mod tests {
             .collect();
         assert_eq!(
             actual, expected,
-            "the catalog's needs_reboot:true set has changed -- update diagnose.rs's \
+            "the catalog's needs_reboot:true set has changed -- update the diagnose modules' \
              matching literals and this test's expected set together"
         );
     }
@@ -4788,7 +4788,7 @@ mod tests {
             .expect("recipe must have a commented apt list line");
         assert_eq!(
             recipe_apt_list_cmd, diagnose_apt_list_cmd,
-            "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
+            "this recipe's apt list command must match what diagnose/linux.rs's apt family actually emits for fix-7-stale-repos"
         );
 
         // `verify` must also track diagnose/linux.rs's per-family text, not just
@@ -4835,7 +4835,7 @@ mod tests {
                 );
             assert_eq!(
                 recipe_list_cmd, diagnose_list_cmd,
-                "this recipe's {marker} list command must match what diagnose.rs emits for fix-7-stale-repos"
+                "this recipe's {marker} list command must match what diagnose/linux.rs emits for fix-7-stale-repos"
             );
 
             let recipe_verify_line = recipe
@@ -4848,7 +4848,7 @@ mod tests {
                 );
             assert_eq!(
                 recipe_verify_line, diagnose_verify,
-                "this recipe's {marker} verify line must match what diagnose.rs emits for fix-7-stale-repos"
+                "this recipe's {marker} verify line must match what diagnose/linux.rs emits for fix-7-stale-repos"
             );
         }
     }
@@ -4898,7 +4898,7 @@ mod tests {
         // No drift guard previously existed between this recipe and
         // diagnose/linux.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
         // fix-7/fix-12's `commands`, fix-3's `commands` legitimately differ --
-        // diagnose.rs injects the host's live kernel/distro/rocm values into a
+        // diagnose/linux.rs injects the host's live kernel/distro/rocm values into a
         // comment this host-unaware recipe can't know -- but `verify` has no
         // such excuse to diverge).
         let e = crate::examine::Examination {
@@ -4921,7 +4921,7 @@ mod tests {
             .expect("fix-3-rocm-kernel recipe must exist");
         assert_eq!(
             recipe.verify, diagnose_verify,
-            "this recipe's verify step must match what diagnose.rs emits for fix-3-rocm-kernel"
+            "this recipe's verify step must match what diagnose/linux.rs emits for fix-3-rocm-kernel"
         );
     }
 
@@ -4974,7 +4974,7 @@ mod tests {
             .collect();
         assert_eq!(
             apt_commands_without_trailing_comment, diagnose_apt_commands,
-            "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
+            "this recipe's apt lines must match what diagnose/linux.rs's apt family actually emits for fix-12-installer"
         );
     }
 

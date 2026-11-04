@@ -325,7 +325,7 @@ on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
 assertion either way would encode one runner's state.
 
 Claims about *whether* a cause was established therefore live in
-`crates/rocm-core/src/diagnose.rs` and the modules under
-`crates/rocm-core/src/diagnose/`, where the `Examination` is constructed rather
-than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+[diagnose.rs](../../crates/rocm-core/src/diagnose.rs) and the modules it
+declares, such as [catalog.rs](../../crates/rocm-core/src/diagnose/catalog.rs),
+where the `Examination` is constructed rather than probed. What this feature asserts holds on any host, so it is clean on WSL2,
 the no-GPU lane, and the GPU lanes alike.

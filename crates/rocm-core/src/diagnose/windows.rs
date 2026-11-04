@@ -846,7 +846,8 @@ mod tests {
 
     #[test]
     fn windows_missing_dll_pair_still_reaches_the_msvc_redist_fix() {
-        // The user-visible half of the guard above: with no PATH probe result
+        // The user-visible half of the guard in `scoring.rs`
+        // (`overlap_dedup_does_not_demote_other_catalog_keyword_tables`): with no PATH probe result
         // (`msvc_redist_present == None`) the keyword score alone decides, so a
         // demoted table makes fix-15 vanish from the report entirely.
         let e = Examination {

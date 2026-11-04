@@ -1129,7 +1129,7 @@ mod tests {
         );
     }
 
-    /// The Windows `Fix` for fix-9, which only `diagnose.rs` prints: its verify
+    /// The Windows `Fix` for fix-9, which only `rocm diagnose` prints: its verify
     /// differs from the catalog's because it has to run in PowerShell.
     fn windows_igpu_fix() -> Fix {
         check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "torch crashes with a segfault")
@@ -1205,14 +1205,15 @@ mod tests {
     }
 
     /// fix-6's verify line lives in the `rocm fix` catalog and in the Fix that
-    /// `check_6_path_missing` builds. The shared-id guard above covers fix-13,
-    /// fix-14, fix-15 and fix-16; this one keeps fix-6's two copies from drifting.
+    /// `check_6_path_missing` builds. The shared-id guard in `catalog.rs`
+    /// (`diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`)
+    /// covers fix-13, fix-14, fix-15 and fix-16; this one keeps fix-6's two copies from drifting.
     ///
     /// The Windows arm of the checker is not compared with the catalog on
     /// purpose. It names the SDK's own `hipInfo.exe` in a PowerShell command,
     /// which the single catalog line cannot do, so it is checked for being a
-    /// PowerShell command instead. Its text is also covered by the Windows sweep
-    /// above.
+    /// PowerShell command instead. Its text is also covered by the Windows sweep in
+    /// `catalog.rs` (`windows_diagnosis_remediation_passes_the_powershell_text_rule`).
     #[test]
     fn the_path_fix_verify_matches_the_catalog_copy() {
         let (verify, _, _) = crate::fix::recipe_verify_notes_and_run_commands("fix-6-path")
@@ -1290,7 +1291,8 @@ mod tests {
     /// runs it and then the GPU check the catalog line cannot carry (it is
     /// shared with Windows and cannot assume torch). Neither may need `python`:
     /// a stock Ubuntu has `python3` only. The Windows arm names the User scope
-    /// in a PowerShell command and is covered by the Windows sweep above.
+    /// in a PowerShell command and is covered by the Windows sweep in `catalog.rs`
+    /// (`windows_diagnosis_remediation_passes_the_powershell_text_rule`).
     #[test]
     fn the_override_fix_verify_matches_the_catalog_copy() {
         let catalog_linux = crate::fix::recipe_linux_verify("fix-2-unset-override")
