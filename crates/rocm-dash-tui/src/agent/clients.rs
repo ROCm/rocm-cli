@@ -263,7 +263,7 @@ where
     let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
     let agent = apply_inference_params(agent, params);
-    // Telemetry + skill registry tools (shared registration site).
+    // Telemetry tools (shared registration site).
     let agent = register_telemetry_tools(agent, &snap, &fired);
     // Read-only ROCm machine-inspection tools (forward across the seam).
     let agent = register_rocm_read_tools(agent, executor, &fired);
@@ -1803,23 +1803,20 @@ mod tests {
             .iter()
             .map(|t| t.name.as_str())
             .collect();
-        for expected in SKILL_NAMES
+        // Exactly the canonical registry reaches the model: nothing registered
+        // outside the three name tables (the retired `list_skills` and
+        // `skill_plan` included), and nothing in them left unregistered. A new
+        // tool is added to its table in the same change, which keeps this true.
+        let expected_tool_names: std::collections::BTreeSet<&str> = SKILL_NAMES
             .iter()
             .chain(ROCM_READ_TOOL_NAMES.iter())
             .chain(ROCM_MUTATING_TOOL_NAMES.iter())
-        {
-            assert!(
-                sent_tool_names.contains(expected),
-                "registered tool {expected} missing from the wire request"
-            );
-        }
-        // The retired skill-registry tools are not offered to the model.
-        for gone in ["list_skills", "skill_plan"] {
-            assert!(
-                !sent_tool_names.contains(gone),
-                "retired tool {gone} was sent on the wire request"
-            );
-        }
+            .copied()
+            .collect();
+        assert_eq!(
+            sent_tool_names, expected_tool_names,
+            "the tool names sent on the wire must equal the canonical registry"
+        );
 
         // Sanity bound on the request count: enough to have tried every
         // scripted turn up to the limit, not an early bail-out or a runaway
