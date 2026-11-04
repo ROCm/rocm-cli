@@ -430,12 +430,7 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
         KeyAction::OpenServices => {
             // Starting services are listed (with their stage) so a fresh serve
             // is visible before it passes its readiness probe.
-            let mut running: Vec<_> = state
-                .instances
-                .values()
-                .filter(|i| i.status.is_live())
-                .collect();
-            running.sort_by_key(|i| !i.status.is_serving());
+            let running = format::running_instances(state);
             let mut lines = vec![head(format!("Running now — {}", running.len()))];
             let mut any_held = false;
             if running.is_empty() {
@@ -445,6 +440,19 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                 )));
             } else {
                 for i in running.iter().take(5) {
+                    let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
+                    if !i.status.is_serving() {
+                        lines.push(Line::from(vec![
+                            Span::styled("◌ ", Style::default().fg(theme.warn)),
+                            Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
+                            Span::styled(port, Style::default().fg(theme.muted)),
+                            Span::styled(
+                                format!("  {}", format::stage_text(i.status)),
+                                Style::default().fg(theme.muted),
+                            ),
+                        ]));
+                        continue;
+                    }
                     // `gen_tps_compact` only ever prints HELD_MARKER for a
                     // finite `Some` gen_tps — mirror that condition here so
                     // held metadata on a `None`/non-finite value (rendered
@@ -454,19 +462,6 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                         && i.gen_tps_observation
                             .as_ref()
                             .is_some_and(|m| m.freshness == ObservationFreshness::Held);
-                    let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
-                    if !i.status.is_serving() {
-                        lines.push(Line::from(vec![
-                            Span::styled("◌ ", Style::default().fg(theme.warn)),
-                            Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
-                            Span::styled(port, Style::default().fg(theme.muted)),
-                            Span::styled(
-                                format!("  {}", i.status.label().to_lowercase()),
-                                Style::default().fg(theme.muted),
-                            ),
-                        ]));
-                        continue;
-                    }
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
                         Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),

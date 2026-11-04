@@ -268,6 +268,103 @@ mod tests {
         assert!(!out.contains("Dead-Model"), "{out:?}");
     }
 
+    fn starting_inst(
+        name: &str,
+        phase: Option<rocm_dash_core::metrics::StartupPhase>,
+    ) -> rocm_dash_core::metrics::Instance {
+        rocm_dash_core::metrics::Instance {
+            container_name: name.into(),
+            model_name: name.into(),
+            status: rocm_dash_core::metrics::InstanceStatus::Starting { phase },
+            ..Default::default()
+        }
+    }
+
+    fn running_now_state() -> AppState {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2;
+        s
+    }
+
+    #[test]
+    fn running_now_starting_without_phase_says_starting() {
+        let mut s = running_now_state();
+        s.instances
+            .insert("a".into(), starting_inst("Docker-Model", None));
+        let out = render(&s, 120, 28);
+        assert!(out.contains("Running now — 1"), "{out:?}");
+        assert!(
+            out.contains("docker-model") || out.contains("Docker-Model"),
+            "{out:?}"
+        );
+        assert!(out.contains("starting"), "{out:?}");
+    }
+
+    #[test]
+    fn running_now_starting_in_warmup_says_warmup() {
+        use rocm_dash_core::metrics::StartupPhase;
+        let mut s = running_now_state();
+        s.instances.insert(
+            "a".into(),
+            starting_inst("Warm-Model", Some(StartupPhase::Warmup)),
+        );
+        let out = render(&s, 120, 28);
+        assert!(out.contains("warmup"), "{out:?}");
+    }
+
+    #[test]
+    fn running_now_lists_serving_before_starting() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = running_now_state();
+        // Names chosen so alphabetical order would put the starting one first.
+        s.instances
+            .insert("a".into(), starting_inst("A-Starting", None));
+        s.instances.insert(
+            "b".into(),
+            Instance {
+                container_name: "Z-Serving".into(),
+                model_name: "Z-Serving".into(),
+                status: InstanceStatus::Ready,
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        let serving = out.find("Z-Serving").expect("serving row");
+        let starting = out.find("A-Starting").expect("starting row");
+        assert!(serving < starting, "serving must precede starting: {out:?}");
+    }
+
+    #[test]
+    fn running_now_caps_rows_and_counts_starting_overflow() {
+        let mut s = running_now_state();
+        for n in 0..7u8 {
+            s.instances
+                .insert(format!("s{n}"), starting_inst(&format!("Start-{n}"), None));
+        }
+        let out = render(&s, 120, 40);
+        assert!(out.contains("Running now — 7"), "{out:?}");
+        assert!(out.contains("…and 2 more"), "{out:?}");
+    }
+
+    #[test]
+    fn running_now_held_metadata_on_starting_row_adds_no_legend() {
+        // A starting row never prints a gen value, so held metadata on it must
+        // not summon a legend that explains nothing on screen.
+        use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
+        let mut s = running_now_state();
+        let mut i = starting_inst("Held-Starting", None);
+        i.gen_tps = Some(42.0);
+        i.gen_tps_observation = Some(ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        });
+        s.instances.insert("a".into(), i);
+        let out = render(&s, 120, 28);
+        assert!(out.contains("Held-Starting"), "{out:?}");
+        assert!(!out.contains(format::HELD_LEGEND), "{out:?}");
+    }
+
     #[test]
     fn serving_detail_shows_held_legend_when_gen_tps_held() {
         use rocm_dash_core::metrics::{

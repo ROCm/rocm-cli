@@ -229,18 +229,27 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let feed = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
     let mut lines: Vec<Line> = Vec::new();
     // Running services first (most relevant "what's live now").
-    for inst in state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
+    for inst in format::running_instances(state)
+        .into_iter()
         .take(feed.height as usize)
     {
         let port = inst.port.map_or_else(String::new, |p| format!(" on :{p}"));
-        lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(theme.ok)),
-            Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
-            Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
-        ]));
+        if inst.status.is_serving() {
+            lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(theme.ok)),
+                Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
+                Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("◌ ", Style::default().fg(theme.warn)),
+                Span::styled(inst.model_name.clone(), Style::default().fg(theme.fg)),
+                Span::styled(
+                    format!("{port} {}", format::stage_text(inst.status)),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
     }
     // Then recent jobs (tools run), newest-relevant first. The Home tab's own
     // update-check job is plumbing, not user activity — never show it here.
@@ -516,12 +525,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     // Starting services count too: until the readiness probe passes they are
     // the only sign the serve command did something.
-    let mut live: Vec<_> = state
-        .instances
-        .values()
-        .filter(|i| i.status.is_live())
-        .collect();
-    live.sort_by_key(|i| !i.status.is_serving());
+    let live = format::running_instances(state);
     let running = card(
         f,
         mid[0],
@@ -557,13 +561,15 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     } else {
                         Line::from(vec![
                             Span::styled("◌ ", Style::default().fg(theme.warn)),
+                            // Stage first so a long model id cannot push it off
+                            // a narrow tile.
+                            Span::styled(
+                                format!("{} ", format::stage_text(i.status)),
+                                Style::default().fg(theme.muted),
+                            ),
                             Span::styled(
                                 i.model_name.clone(),
                                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!("  {}", i.status.label().to_lowercase()),
-                                Style::default().fg(theme.muted),
                             ),
                         ])
                     }
@@ -1038,6 +1044,98 @@ mod tests {
         assert!(out.contains("loading"), "{out:?}");
         assert!(!out.contains("Nothing running"), "{out:?}");
         assert!(!out.contains("Dead-Model"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_starting_without_phase_says_starting() {
+        use rocm_dash_core::metrics::Instance;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Docker-Model".into(),
+                status: InstanceStatus::Starting { phase: None },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 1"), "{out:?}");
+        assert!(out.contains("starting"), "{out:?}");
+        assert!(out.contains("Docker-Model"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_starting_in_warmup_says_warmup() {
+        use rocm_dash_core::metrics::{Instance, StartupPhase};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Warm-Model".into(),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Warmup),
+                },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 30);
+        assert!(out.contains("warmup"), "{out:?}");
+    }
+
+    #[test]
+    fn running_tile_lists_serving_before_starting() {
+        use rocm_dash_core::metrics::Instance;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        // Names chosen so alphabetical order would put the starting one first.
+        for (id, name, status) in [
+            ("a", "A-Starting", InstanceStatus::Starting { phase: None }),
+            ("b", "Z-Serving", InstanceStatus::Ready),
+        ] {
+            s.instances.insert(
+                id.into(),
+                Instance {
+                    container_id: id.into(),
+                    model_name: name.into(),
+                    status,
+                    ..Default::default()
+                },
+            );
+        }
+        let out = render(&s, 160, 30);
+        assert!(out.contains("Running · 2"), "{out:?}");
+        let serving = out.find("Z-Serving").expect("serving row");
+        let starting = out.find("A-Starting").expect("starting row");
+        assert!(serving < starting, "serving must precede starting: {out:?}");
+    }
+
+    #[test]
+    fn activity_feed_lists_starting_service_with_stage() {
+        use rocm_dash_core::metrics::{Instance, StartupPhase};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.instances.insert(
+            "a".into(),
+            Instance {
+                container_id: "a".into(),
+                model_name: "Feed-Model".into(),
+                port: Some(8123),
+                status: InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading),
+                },
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 160, 40);
+        assert!(
+            out.contains("on :8123 loading"),
+            "feed row missing stage: {out:?}"
+        );
+        assert!(!out.contains("no recent activity"), "{out:?}");
     }
 
     #[test]

@@ -140,7 +140,7 @@ impl InstanceStatus {
     /// its way there (`Starting`). A starting service is otherwise invisible
     /// until its readiness probe passes.
     #[must_use]
-    pub const fn is_live(self) -> bool {
+    pub const fn counts_as_running(self) -> bool {
         self.is_serving() || self.is_starting()
     }
 
@@ -294,11 +294,11 @@ mod tests {
             .is_serving()
         );
         assert!(!InstanceStatus::Stopped.is_serving());
-        assert!(InstanceStatus::Starting { phase: None }.is_live());
-        assert!(InstanceStatus::Ready.is_live());
+        assert!(InstanceStatus::Starting { phase: None }.counts_as_running());
+        assert!(InstanceStatus::Ready.counts_as_running());
         assert!(!InstanceStatus::Starting { phase: None }.is_serving());
-        assert!(!InstanceStatus::Stopped.is_live());
-        assert!(!InstanceStatus::Error.is_live());
+        assert!(!InstanceStatus::Stopped.counts_as_running());
+        assert!(!InstanceStatus::Error.counts_as_running());
         assert!(!InstanceStatus::Error.is_serving());
         assert!(!InstanceStatus::Unknown.is_serving());
     }
