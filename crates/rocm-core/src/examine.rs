@@ -287,7 +287,7 @@ pub struct Examination {
     /// installation as the selected HIP runtime.
     ///
     /// Computed by [`comgr_matches_runtime`], the same function
-    /// `check_18_comgr_conflict` in `diagnose.rs` uses to decide whether to
+    /// `check_18_comgr_conflict` in `diagnose/engine.rs` uses to decide whether to
     /// report a conflict -- so this field and that finding cannot disagree
     /// about one machine.
     ///

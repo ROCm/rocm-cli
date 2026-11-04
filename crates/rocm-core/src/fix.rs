@@ -29,7 +29,7 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Shared verbatim by this recipe's own note and `diagnose.rs`'s
+/// Shared verbatim by this recipe's own note and `diagnose/engine.rs`'s
 /// `check_18_comgr_conflict` evidence, which states the same claim in its own
 /// words at the point the real paths are known. A second statement of one
 /// claim is a second thing to keep correct, and the two had already drifted

@@ -1131,12 +1131,12 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     // Prose that happens to begin with the program name.
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat would see this result, a plain shell might not",
         "note naming the two commands a managed runtime affects, not advice",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat prepend the active managed runtime's own directories ahead of LD_LIBRARY_PATH, so the export below may not change what they load; reinstalling or repairing that runtime so it ships its own code object manager is the fix that reaches it directly.",
         "explanation of what the two commands load, not advice",
     ),
