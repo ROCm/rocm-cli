@@ -4966,17 +4966,39 @@ mod tests {
         bare: Vec<String>,
     }
 
-    /// Whether `attrs` carry a `#[cfg(..)]` that mentions `test`, such as
-    /// `#[cfg(test)]` or `#[cfg(all(test, windows))]`.
+    /// Whether a `cfg` predicate holds only in test builds: `test`, or an
+    /// `all(..)` with such a member, or an `any(..)` of which every member is
+    /// such. `not(..)` and every other predicate are not.
+    fn cfg_requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) => {
+                let Ok(members) = syn::parse::Parser::parse2(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    list.tokens.clone(),
+                ) else {
+                    return false;
+                };
+                if list.path.is_ident("all") {
+                    members.iter().any(cfg_requires_test)
+                } else if list.path.is_ident("any") {
+                    !members.is_empty() && members.iter().all(cfg_requires_test)
+                } else {
+                    false
+                }
+            }
+            syn::Meta::NameValue(_) => false,
+        }
+    }
+
+    /// Whether `attrs` carry a `#[cfg(..)]` that holds only in test builds, such
+    /// as `#[cfg(test)]` or `#[cfg(all(test, windows))]`.
     fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
-                && attr.meta.require_list().is_ok_and(|list| {
-                    list.tokens
-                        .to_string()
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|word| word == "test")
-                })
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_requires_test(&meta))
         })
     }
 
@@ -5125,7 +5147,7 @@ mod tests {
                 syn::Item::Fn(function) if !is_cfg_test(&function.attrs) => {
                     scan_function(&function.sig, &function.block, scan);
                 }
-                syn::Item::Impl(imp) => {
+                syn::Item::Impl(imp) if !is_cfg_test(&imp.attrs) => {
                     for item in &imp.items {
                         if let syn::ImplItem::Fn(method) = item {
                             scan_function(&method.sig, &method.block, scan);
@@ -5192,6 +5214,10 @@ mod tests {
             struct Runner;
             impl Runner { fn method(&self) -> i32 { 3 } }
             mod inner { pub fn nested() -> i32 { 5 } }
+            #[cfg(not(test))]
+            fn not_test() -> i32 { 3 }
+            #[cfg(any(test, windows))]
+            fn maybe_test() -> i32 { 3 }
             ",
         );
         assert_eq!(
@@ -5220,6 +5246,8 @@ mod tests {
                 "parenthesised_branch: 4",
                 "method: 3",
                 "nested: 5",
+                "not_test: 3",
+                "maybe_test: 3",
             ]
         );
     }
@@ -5253,6 +5281,10 @@ mod tests {
             mod windows_tests { fn in_tests() -> i32 { 3 } }
             #[cfg(test)]
             fn test_only() -> i32 { 3 }
+            #[cfg(test)]
+            struct TestRunner;
+            #[cfg(test)]
+            impl TestRunner { fn method(&self) -> i32 { 3 } }
             ",
         );
         assert_eq!(scan.bare, Vec::<String>::new());

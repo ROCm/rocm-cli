@@ -2304,6 +2304,15 @@ mod tests {
         Ok(())
     }
 
+    /// How many pending proposals to queue behind the one under test so it sits
+    /// beyond a recent-window read: more than the reviewed-retention cap, and
+    /// more than the 100 the code once read, so the tests keep guarding that
+    /// window even if the cap is ever lowered below it.
+    fn proposals_beyond_a_recent_window() -> usize {
+        const WINDOW_THE_CODE_ONCE_READ: usize = 100;
+        rocm_core::REVIEWED_PROPOSALS_RETAINED.max(WINDOW_THE_CODE_ONCE_READ) + 1
+    }
+
     #[test]
     fn gpu_thermal_protect_dedupe_sees_a_pending_stop_older_than_the_recent_window() -> Result<()> {
         let (root, paths) = temp_app_paths("gpu-thermal-protect-dedupe-old");
@@ -2345,7 +2354,7 @@ mod tests {
         // here, so none is compacted away), which puts the stop proposal beyond
         // a recent-window read the size of that cap. A pending proposal is
         // never dropped from the store, so it is still waiting for review.
-        for index in 0..=rocm_core::REVIEWED_PROPOSALS_RETAINED {
+        for index in 0..proposals_beyond_a_recent_window() {
             queue_proposal_with_arguments(
                 &paths,
                 "gpu-thermal-protect",
@@ -2485,7 +2494,7 @@ mod tests {
         // More newer proposals than the store keeps reviewed ones (all pending
         // here, so none is compacted away), which puts the restart proposal
         // beyond a recent-window read the size of that cap.
-        for index in 0..=rocm_core::REVIEWED_PROPOSALS_RETAINED {
+        for index in 0..proposals_beyond_a_recent_window() {
             queue_proposal_with_arguments(
                 &paths,
                 "gpu-thermal-protect",

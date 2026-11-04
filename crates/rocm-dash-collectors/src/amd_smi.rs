@@ -664,6 +664,13 @@ mod tests {
         assert!(parse_processes(&v).is_empty());
     }
 
+    /// The limit the timeout tests give the collector. The clock starts at the
+    /// call, not when the fake script has written its pid file, so a limit near
+    /// the time a loaded runner needs to start a shell would end the run before
+    /// the child existed and fail the test as "never started".
+    #[cfg(target_os = "linux")]
+    const TEST_LIMIT: Duration = Duration::from_secs(10);
+
     /// A fake `amd-smi` that records its own pid and then sleeps far past any
     /// limit a test sets. `exec` makes the recorded pid the sleeper's own, so
     /// the test watches the process the collector spawned and not a shell that
@@ -734,7 +741,7 @@ mod tests {
         };
 
         let err = collector
-            .run_json_within(Duration::from_secs(2), &["metric", "--json"])
+            .run_json_within(TEST_LIMIT, &["metric", "--json"])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -755,12 +762,7 @@ mod tests {
             binary: binary.into(),
         };
 
-        assert!(
-            collector
-                .probe_version(Duration::from_secs(2))
-                .await
-                .is_none()
-        );
+        assert!(collector.probe_version(TEST_LIMIT).await.is_none());
 
         let pid = recorded_pid(&pid_file);
         assert!(
