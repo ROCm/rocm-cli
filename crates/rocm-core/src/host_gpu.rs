@@ -61,11 +61,13 @@ pub use engine_default::{
 };
 
 pub use gpu_visibility::{has_usable_amd_gpu, usable_amd_gpu_indices};
+use linux::detect_linux_amdgpu_driver_version;
+#[cfg(target_os = "linux")]
+use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
-use linux::{detect_linux_amdgpu_driver_version, detect_linux_primary_gpu_name};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
