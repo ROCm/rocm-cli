@@ -697,6 +697,33 @@ Expected result:
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
 
+### 4b. An Attached Serve That Crashes (ROCMAI-541)
+
+Check that a managed engine dying under `--verbose` is reported rather than
+swallowed. This is the behavior that regressed on Windows, where the child's
+output reached nothing, so run it there if you can.
+
+```powershell
+rocm serve <model> --verbose
+```
+
+Kill the engine from a second shell while the first is still streaming — on
+Windows, end the `rocm` child running `__engine-serve-http` in Task Manager; on
+Linux, `kill -9` that same pid (`rocm services list --all` names it).
+
+Expected result:
+
+- the first shell prints why it stopped, quoting the end of the service log —
+  not a bare `server process exited`;
+- it exits **non-zero** (`$LASTEXITCODE`, or `echo $?`);
+- `rocm services list --all` shows the record as `failed`, and `rocm services
+  logs <service-id>` ends with the engine's own error.
+
+Then repeat, but stop it deliberately from the second shell with `rocm services
+stop <service-id>` instead of killing it. That is the control: the attached
+shell must exit **0**, report a stop rather than a crash, and leave the record
+**not** `failed`.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are

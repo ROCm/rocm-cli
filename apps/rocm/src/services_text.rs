@@ -106,7 +106,6 @@ use crate::engine_runtime_select::apply_app_path_env;
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
     http_post_local_service_json, managed_service_launcher_path, parse_engine_recipe_json_arg,
-    wait_for_service_http_ready,
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::gpu_policy::parse_device_policy;
@@ -1114,13 +1113,20 @@ fn restart_internal_managed_service_with(
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
-    let readiness = wait_for_service_http_ready(
+    // The progress-bearing variant purely for its per-tick hook: a stop landing
+    // inside this 45s window clears its own marker as soon as it confirms, so
+    // reading the marker only afterwards can miss it and stamp a deliberate stop
+    // `failed`. See `service_launch::StopWatch`. Nothing is rendered — a restart
+    // has no spinner — so the tick only samples.
+    let mut stop_watch = crate::service_launch::StopWatch::default();
+    let readiness = crate::engine_runtime_select::wait_for_service_http_ready_with_progress(
         &started.engine,
         &started.host,
         started.port,
-        started.served_model_name(),
+        &|| started.served_model_name().to_owned(),
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
+        &mut |_elapsed| stop_watch.sample(paths, &started.service_id),
     );
     // A readiness wait that never reaches `Serving` is ambiguous (still
     // loading vs. already dead) without checking whether the restarted child
@@ -1128,7 +1134,13 @@ fn restart_internal_managed_service_with(
     // closes on the launch path (N2). Backed by `liveness`, not a bare
     // `process_is_running` pid probe: see `ManagedChildLiveness`'s doc comment
     // for why a probe alone is inert against a zombie on Unix.
-    record_restart_readiness(paths, &started, readiness, || liveness.is_running())
+    record_restart_readiness(
+        paths,
+        &started,
+        readiness,
+        || liveness.is_running(),
+        stop_watch.stop_was_requested(),
+    )
 }
 
 /// Apply one of a restart's own changes to the record as it is on disk now,
@@ -1224,9 +1236,12 @@ fn record_restart_readiness(
     started: &ManagedServiceRecord,
     readiness: EndpointReadiness,
     mut child_is_alive: impl FnMut() -> bool,
+    stop_seen_while_waiting: bool,
 ) -> Result<ManagedServiceRecord> {
     if readiness != EndpointReadiness::Serving && !child_is_alive() {
-        if crate::service_launch::managed_service_stop_was_requested(paths, &started.service_id) {
+        if stop_seen_while_waiting
+            || crate::service_launch::managed_service_stop_was_requested(paths, &started.service_id)
+        {
             return Ok(read_managed_service_manifest(paths, &started.service_id)
                 .map_or_else(|_| started.clone(), |(record, _)| record));
         }
@@ -2488,9 +2503,14 @@ mod tests {
 
         // The restarted child is alive throughout: this test is about the stop
         // marker surviving the readiness write, not the dead-child branch.
-        let returned =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable, || true)
-                .unwrap();
+        let returned = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || true,
+            false,
+        )
+        .unwrap();
         let on_disk = raw_manifest(&paths, service_id);
         let _ = fs::remove_dir_all(root);
         assert_eq!(
@@ -2521,11 +2541,14 @@ mod tests {
         // `Serving` always short-circuits the liveness check (see
         // `record_restart_readiness`'s doc comment), so this never calls back
         // in here.
-        let returned =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Serving, || {
-                unreachable!("Serving must not consult liveness")
-            })
-            .unwrap();
+        let returned = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Serving,
+            || unreachable!("Serving must not consult liveness"),
+            false,
+        )
+        .unwrap();
         let on_disk = raw_manifest(&paths, service_id);
         let _ = fs::remove_dir_all(root);
         assert_eq!(on_disk.status, "stopped");
@@ -2552,8 +2575,13 @@ mod tests {
         fs::create_dir_all(started.log_path.parent().unwrap()).unwrap();
         fs::write(&started.log_path, "Model pulled successfully\n").unwrap();
 
-        let result =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable, || false);
+        let result = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
 
         let on_disk = raw_manifest(&paths, service_id);
         let engine_state: serde_json::Value =
@@ -2591,8 +2619,13 @@ mod tests {
         stopped_meanwhile.stop_requested_unix_ms = Some(4_321);
         stopped_meanwhile.write().unwrap();
 
-        let result =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable, || false);
+        let result = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
 
         let on_disk = raw_manifest(&paths, service_id);
         let _ = fs::remove_dir_all(root);

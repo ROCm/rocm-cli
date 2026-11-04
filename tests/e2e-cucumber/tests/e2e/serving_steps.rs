@@ -2732,7 +2732,17 @@ async fn assert_scripted_crash_marks_failed(world: &mut E2eWorld) {
         .clone()
         .expect("no scripted service_id captured from the serve's own output");
     let (record, engine_state) = scripted_engine_record_and_state_for(world, &service_id);
+    // These two halves pin DIFFERENT writers, and only the first is parent-side.
+    // The manifest is never touched by the engine child, so `failed` there can
+    // only have come from `run_attached_service`'s `ServerExited` branch and its
+    // `still_watching_this_supervisor` guard.
     assert_eq!(record["status"], "failed", "manifest: {record}");
+    // The engine state file, by contrast, is stamped by
+    // `record_engine_serve_http_failure` inside the child itself, so this half
+    // would stay green even if the parent-side write were deleted. It is kept
+    // deliberately: that in-child backstop is part of the same fix (it covers
+    // engines that error without updating their own state file), and is worth
+    // pinning — just not as evidence for the parent-side path.
     assert_eq!(
         engine_state["status"], "failed",
         "engine state: {engine_state}"
