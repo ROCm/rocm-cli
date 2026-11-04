@@ -25,7 +25,7 @@ use rocm_dash_core::protocol::Event;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 use rocm_dash_daemon::bench_ring::BenchRing;
 use rocm_dash_daemon::runner::{self, RunnerOptions};
@@ -223,6 +223,40 @@ async fn snapshot_where<T>(
     }
 }
 
+/// Feed events to `step` until it returns true, under ONE deadline for the whole
+/// observation. A loop that calls [`next_event`] repeatedly gets a fresh
+/// deadline per call, so a runner that keeps broadcasting events the loop does
+/// not count would spin forever; this fails at [`DEADLINE`] instead, naming what
+/// was being waited for and, through `progress`, how far it got.
+async fn observe<S>(
+    rx: &mut broadcast::Receiver<Event>,
+    waiting_for: &str,
+    state: &mut S,
+    mut step: impl FnMut(&mut S, &Event) -> bool,
+    progress: impl Fn(&S) -> String,
+) {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let Ok(received) = timeout_at(deadline, rx.recv()).await else {
+            panic!(
+                "timed out after {DEADLINE:?} waiting for {waiting_for}; seen so far: {}",
+                progress(state)
+            );
+        };
+        match received {
+            Ok(ev) => {
+                if step(state, &ev) {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => {
+                panic!("broadcast channel closed while waiting for {waiting_for}")
+            }
+        }
+    }
+}
+
 // ── Managed-service registry ────────────────────────────────────────────────
 
 /// Rediscovery runs every tick but the scrape only every second one, so on the
@@ -269,17 +303,29 @@ async fn managed_service_is_announced_once_across_rediscovery() {
     write_record(&services_dir, server.port);
     let (mut rx, _runner) = spawn_runner(managed_opts(services_dir));
 
-    let mut announced = 0usize;
-    let mut snapshots_with_instance = 0usize;
-    while snapshots_with_instance < 8 {
-        match next_event(&mut rx, |ev| Some(ev.clone())).await {
-            Event::InstanceDiscovered(inst) if inst.container_id == SVC_ID => announced += 1,
-            Event::Snapshot(snap) if instance(&snap, SVC_ID).is_some() => {
-                snapshots_with_instance += 1;
+    // (announcements of the service, snapshots that contain it)
+    let mut seen = (0usize, 0usize);
+    observe(
+        &mut rx,
+        "8 snapshots containing the managed service",
+        &mut seen,
+        |seen, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) if inst.container_id == SVC_ID => seen.0 += 1,
+                Event::Snapshot(snap) if instance(snap, SVC_ID).is_some() => seen.1 += 1,
+                _ => {}
             }
-            _ => {}
-        }
-    }
+            seen.1 >= 8
+        },
+        |seen| {
+            format!(
+                "{} snapshots containing it, {} announcements of it",
+                seen.1, seen.0
+            )
+        },
+    )
+    .await;
+    let (announced, _) = seen;
     assert_eq!(
         announced, 1,
         "the service must be announced exactly once, not once per discovery tick"
