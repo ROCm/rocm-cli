@@ -267,8 +267,9 @@ pub const SKILL_NAMES: [&str; 6] = [
 // ---------------------------------------------------------------------------
 // Read-only ROCm machine-inspection tools (group B). These forward the model's
 // tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
-// bin-supplied executor (live dash only). They are READ-ONLY: no mutating tool
-// is registered here (mutating tools + the approval UI land in Phase 4). The
+// bin-supplied executor (live dash only). They are READ-ONLY: nothing in this
+// group mutates anything (the mutating tools are group D below, and they only
+// surface an approval request rather than executing). The
 // boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
 // pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
