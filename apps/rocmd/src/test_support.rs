@@ -221,6 +221,15 @@ pub(crate) fn test_runtime_state(
     }
 }
 
+/// How many pending proposals to queue behind the one under test so it sits
+/// beyond a recent-window read: more than the reviewed-retention cap, and
+/// more than the 100 the code once read, so the tests keep guarding that
+/// window even if the cap is ever lowered below it.
+pub(crate) fn proposals_beyond_a_recent_window() -> usize {
+    const WINDOW_THE_CODE_ONCE_READ: usize = 100;
+    rocm_core::REVIEWED_PROPOSALS_RETAINED.max(WINDOW_THE_CODE_ONCE_READ) + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
