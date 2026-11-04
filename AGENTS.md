@@ -331,7 +331,7 @@ on two counts, and both change how you edit it:
   what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
-  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  The failure catalog itself is authoritative in `crates/rocm-core/src/fix/catalog.rs`
   (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
   checker and OS scoping) — adding, renaming, or re-scoping a failure mode
   means changing the CLI **first**, then the two docs. That feature is what

@@ -8,8 +8,8 @@
 //! none: it only reports), prints the exact change, honors `--dry-run`, asks
 //! for consent through [`confirm`] and returns an [`exit`] code. The `_linux`
 //! and `_windows` variants are plain functions that every platform compiles;
-//! the catalog in `fix.rs` names the entry point of each recipe's runner and
-//! the running OS decides which variant runs.
+//! the catalog in `fix/catalog.rs` names the entry point of each recipe's
+//! runner and the running OS decides which variant runs.
 
 use super::consent::{QUERY_TIMEOUT, RUN_TIMEOUT, confirm, fail, relay_output};
 use super::options::{FixOptions, exit};

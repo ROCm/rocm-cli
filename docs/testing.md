@@ -1526,7 +1526,7 @@ pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
 non-terminating error, so the line would print it and still exit 0). The `where`
 and `-Command` matches ignore case.
 `fails_in_windows_powershell` in
-[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) applies it to every catalog recipe that
 applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
 line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
 `diagnose-43`, `diagnose-44` and `diagnose-45` in
@@ -1542,7 +1542,7 @@ add a case there, and a rule that gets it wrong fails on its own side.
 The rule reads text; it does not prove a line runs. On Windows,
 `cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
 fix-22 into cmd and into Windows PowerShell and checks the exit code and
-output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+output (the tests in [fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) named
 `the_override_verify_runs_in_cmd_and_powershell`,
 `the_hip_sdk_verify_runs_the_exe_under_hip_path`,
 `the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
@@ -1587,7 +1587,7 @@ catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
 `the_override_fix_verify_runs_where_only_python3_exists` run the lines
 `rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
 `hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
-([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
 Provider audit focused test:

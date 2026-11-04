@@ -983,11 +983,11 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Remove amdgpu from any modprobe blacklist and load it.".to_owned(),
         commands,
         needs_sudo: true,
-        // Catalog-aligned, not state-derived: fix.rs's FixRecipe for this fix-id sets
+        // Catalog-aligned, not state-derived: fix/catalog.rs's FixRecipe for this fix-id sets
         // needs_reboot unconditionally. On this no-blacklist path the plan is just
         // `modprobe amdgpu` (or that plus a Secure Boot signing note, whose own
         // remedy can require a reboot) -- diagnose conforms to the catalog rather
-        // than the reverse (see fix.rs's assert_needs_reboot_matches_the_catalog) so
+        // than the reverse (see fix/catalog.rs's assert_needs_reboot_matches_the_catalog) so
         // `rocm diagnose` and `rocm fix` never disagree; over-warning is limited to
         // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
         needs_reboot: true,
@@ -7159,7 +7159,7 @@ mod tests {
             "",
         );
         // fix-13 and fix-14 print a Windows verify that the Windows-only tests
-        // in `fix.rs` run from the catalog copy, so this copy has to match it.
+        // in `fix/catalog.rs` run from the catalog copy, so this copy has to match it.
         let hip_sdk_missing = check_13_hip_sdk_missing(
             &Examination {
                 os_family: "windows".to_owned(),
@@ -7520,7 +7520,7 @@ mod tests {
         assert!(fix.verify.contains("msvcp140.dll") && fix.verify.contains("FileVersion"));
         // The plan promises it only prints. The class is checked against the
         // catalog by `the_outdated_runtime_recipe_is_print_only_on_windows` in
-        // fix.rs, which is what makes this sentence true.
+        // fix/catalog.rs, which is what makes this sentence true.
         assert!(
             fix.notes
                 .iter()
@@ -7551,13 +7551,13 @@ mod tests {
     /// The `Fix` that each checker builds for itself is shown to users of
     /// Windows PowerShell 5.1 as well as cmd, just like the `rocm fix` catalog.
     /// This runs every checker that answers on Windows and applies the same
-    /// rule as the catalog test in `fix.rs` (`fails_in_windows_powershell`), so a
+    /// rule as the catalog test in `fix/catalog.rs` (`fails_in_windows_powershell`), so a
     /// hand-built verify string or command that breaks one of the rule's known
     /// constructs fails here. A construct the rule does not list passes.
     ///
     /// Like that test it pins the text only. Nothing here runs a command in a
     /// shell. The Windows-only tests named on `fails_in_windows_powershell` in
-    /// `fix.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
+    /// `fix/catalog.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
     /// and `the_igpu_verify_pins_the_variable_it_names` runs fix-9's, all on
     /// Windows.
     #[test]

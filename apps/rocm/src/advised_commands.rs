@@ -1266,7 +1266,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "crates/rocm-core/src/fix.rs",
+        "crates/rocm-core/src/fix/render.rs",
         "rocm fix can run it",
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
