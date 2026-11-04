@@ -1587,9 +1587,7 @@ async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
     let host = root.join("host-root");
     std::fs::create_dir_all(host.join("sys/bus/pci/drivers/amdgpu"))
         .expect("failed to plant /sys/bus/pci/drivers/amdgpu");
-    let rocm = root.join("rocm");
-    std::fs::create_dir_all(rocm.join(".info")).expect("failed to plant a ROCm install");
-    std::fs::write(rocm.join(".info/version"), "6.4.1\n").expect("failed to plant its version");
+    world.plant_unmanaged_rocm();
     put_fake_executables_on_path(
         world,
         &[
@@ -1600,14 +1598,14 @@ async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
             ("mokutil", "#!/bin/sh\necho 'SecureBoot enabled'\n"),
         ],
     );
-    world.command_env.push(("ROCM_PATH", rocm.into_os_string()));
     world
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
 }
 
-/// Both commands read the same planted machine, so the scenario environment is
-/// restored between them: `run_rocm_with_scenario_env` consumes it.
+/// Both commands read the same planted machine, so the scenario environment
+/// (the host root and the fake executables on `PATH`) is restored between
+/// them: `run_rocm_with_scenario_env` consumes it.
 #[when("the user inspects and diagnoses that machine")]
 async fn user_inspects_and_diagnoses_planted_machine(world: &mut E2eWorld) {
     let env = world.command_env.clone();
