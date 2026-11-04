@@ -21,6 +21,7 @@ pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
 pub mod endpoint_key;
+mod endpoint_readiness;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
@@ -95,6 +96,12 @@ pub use disk_space::{
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
+pub use endpoint_readiness::{
+    EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
+    engine_state_inference_verified, managed_service_endpoint_model_ready,
+    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
+    openai_chat_completion_status, openai_models_endpoint_has_model,
+};
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
@@ -145,16 +152,11 @@ pub use model_catalog::{
 };
 pub use net::{
     Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
-    DownloadRequest, EndpointReadiness, EndpointReadinessOutcome, HttpResponseParts,
-    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL, INFERENCE_PROBE_TIMEOUT,
-    INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream, download_file_streaming,
+    DownloadRequest, HttpResponseParts, connect_tcp_stream, download_file_streaming,
     download_file_streaming_with_progress, download_file_to_path,
-    download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
-    format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
-    http_post_json_with_auth, managed_service_endpoint_model_ready,
-    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model, parse_http_endpoint,
-    read_http_response_bounded, write_all_tcp_stream,
+    download_file_to_path_with_progress, format_host_for_url, format_host_port,
+    format_http_base_url, http_get_text, http_get_text_with_auth, http_post_json_with_auth,
+    parse_http_endpoint, read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{
@@ -203,7 +205,9 @@ pub use runtime::{
 };
 pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{
-    ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
+    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
+    INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
+    engine_stop_decides_confirmation,
 };
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
