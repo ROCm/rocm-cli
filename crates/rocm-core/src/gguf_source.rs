@@ -1620,6 +1620,69 @@ mod tests {
         }
     }
 
+    /// A loopback server that answers every request with a `302` to the same
+    /// path on `target`, as the hub's `resolve/main` answers with a CDN host.
+    /// Counts the requests it redirected.
+    fn redirecting_server(target: String) -> (String, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let redirected = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&redirected);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&request).into_owned();
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                *counted.lock().unwrap() += 1;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {target}{path}\r\nContent-Length: \
+                     0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (base, redirected)
+    }
+
+    /// The hub answers `resolve/main` with a redirect to its CDN. The listing,
+    /// the `HEAD` and every range request follow it to the other host, and the
+    /// range requests still carry their `Range` there.
+    #[test]
+    fn a_redirect_to_another_host_is_followed_with_the_range_kept() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf"}]}"#.to_owned(),
+        );
+        let (front, redirected) = redirecting_server(hub.base.clone());
+        let mut opened = LiveGgufSource::with_hub(&front)
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        assert_eq!(
+            opened.size,
+            1 << 20,
+            "the HEAD's size, read after the redirect"
+        );
+        let header = parse_gguf_header(&mut opened.reader).unwrap();
+        assert_eq!(header.block_count, Some(32));
+        let ranges = hub.ranges.lock().unwrap().clone();
+        assert!(
+            !ranges.is_empty() && ranges.iter().all(|range| range != "none"),
+            "{ranges:?}"
+        );
+        // The listing, the HEAD and each range request went through the front.
+        assert!(*redirected.lock().unwrap() >= 2 + ranges.len());
+    }
+
     #[test]
     fn only_the_header_is_requested_from_a_file_far_larger_than_it() {
         // 40 000 tokens makes the header a few hundred KB: bigger than nothing,

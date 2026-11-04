@@ -241,6 +241,14 @@ fn classify_accelerator_memory(
     // read, this reports `UnifiedMemoryUnreadable`, so the verdict reads
     // `Undetermined` with no dead-end command attached, rather than a
     // confident wrong one.
+    //
+    // A mask that leaves the APU's one device out is "no GPU is visible", as
+    // for a discrete card above: that is the answer a command can change.
+    let masked_out = usable_indices
+        .is_some_and(|indices| !vram.iter().any(|usage| indices.contains(&usage.index)));
+    if masked_out {
+        return AcceleratorMemory::None;
+    }
     AcceleratorMemory::UnifiedMemoryUnreadable
 }
 
@@ -658,6 +666,16 @@ mod tests {
             AcceleratorMemory::UnifiedMemoryUnreadable,
             "an APU's memory pool must read UnifiedMemoryUnreadable, not a fabricated figure, \
              and not the generic Unknown either: {result:?}"
+        );
+        // A mask that leaves the APU visible changes nothing; one that hides it
+        // is "no GPU is visible", as for a discrete card.
+        assert_eq!(
+            classify_accelerator_memory(Some(&apu_carveout), Some("gfx1151"), true, Some(&[0])),
+            AcceleratorMemory::UnifiedMemoryUnreadable
+        );
+        assert_eq!(
+            classify_accelerator_memory(Some(&apu_carveout), Some("gfx1151"), true, Some(&[])),
+            AcceleratorMemory::None
         );
     }
 

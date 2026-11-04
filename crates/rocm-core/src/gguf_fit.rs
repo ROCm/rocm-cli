@@ -2083,6 +2083,20 @@ mod tests {
             Some(CannotEstimateReason::AcceleratorMemoryUnknown),
             "{layout}"
         );
+        // And with no GPU visible at all, the answer is that, with the figures.
+        let none = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::None,
+        );
+        assert_eq!(
+            none.cannot_estimate_reason,
+            Some(CannotEstimateReason::NoGpu),
+            "{layout}"
+        );
+        assert!(none.total_gib.is_some(), "{layout}: the figures are given");
     }
 
     #[test]

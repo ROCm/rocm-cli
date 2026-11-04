@@ -3423,7 +3423,8 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   read), and the text and JSON shapes.
 - [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
   `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
-  device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB),
+  device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB, on
+  a discrete card and on an APU alike),
   and the note for a mask on a host whose GPUs differ in memory. Both are unit
   tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
   lane has GPUs of different sizes.
