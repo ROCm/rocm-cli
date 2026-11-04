@@ -249,8 +249,22 @@ fn preflight_passes(
 /// as the one `amd-smi` launch site that can still block forever on a wedged
 /// device. The shared probe carries the 2s bound and the in-flight budget with
 /// it, so this site cannot drift away from the gate it is part of.
+///
+/// `cfg`-split for the same reason `rocm_core::device_readable_bounded` is:
+/// off Linux that probe waves through with a literal, so this wrapper becomes
+/// `const`-able and `clippy::missing_const_for_fn` is a hard error on the
+/// Windows lane's `-D warnings` build, while the Linux body opens a device and
+/// cannot be `const`. A `cfg`-selected pair is linted per branch, not per name.
+#[cfg(target_os = "linux")]
 fn device_accessible(path: &Path) -> bool {
     rocm_core::device_readable_bounded(path)
+}
+
+/// Off-Linux counterpart of [`device_accessible`]: see that function for why
+/// the pair is split rather than written once.
+#[cfg(not(target_os = "linux"))]
+const fn device_accessible(_path: &Path) -> bool {
+    true
 }
 
 fn val_u64(v: Option<&Value>) -> Option<u64> {
