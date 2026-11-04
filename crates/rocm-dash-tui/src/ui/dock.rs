@@ -198,11 +198,7 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         ))
     };
     let mut lines: Vec<Line> = vec![header("RUNNING SERVICES")];
-    let running: Vec<_> = state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
-        .collect();
+    let running = format::running_instances(state);
     if running.is_empty() {
         lines.push(Line::from(Span::styled(
             "  none",
@@ -211,10 +207,19 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     } else {
         for i in running.iter().take(4) {
             let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
+            let (glyph, color, stage) = if i.status.is_serving() {
+                ("● ", theme.ok, String::new())
+            } else {
+                (
+                    "◌ ",
+                    theme.warn,
+                    format!(" {}", format::stage_text(i.status)),
+                )
+            };
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme.ok)),
+                Span::styled(glyph, Style::default().fg(color)),
                 Span::styled(i.model_name.clone(), Style::default().fg(theme.fg)),
-                Span::styled(port, Style::default().fg(theme.muted)),
+                Span::styled(format!("{port}{stage}"), Style::default().fg(theme.muted)),
             ]));
         }
     }
@@ -515,6 +520,34 @@ mod tests {
         assert!(out.contains("GPU STATE"), "missing gpu state");
         assert!(out.contains("Qwen3-72B"), "running service not listed");
         assert!(!out.contains("Message"), "composer leaked into dock");
+    }
+
+    #[test]
+    fn context_rail_lists_starting_service_with_stage_after_serving() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        for (id, name, status) in [
+            ("a", "A-Starting", InstanceStatus::Starting { phase: None }),
+            ("b", "Z-Serving", InstanceStatus::Ready),
+        ] {
+            s.instances.insert(
+                id.into(),
+                Instance {
+                    container_id: id.into(),
+                    model_name: name.into(),
+                    status,
+                    ..Default::default()
+                },
+            );
+        }
+        let backend = TestBackend::new(DOCK_W, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = s.theme;
+        term.draw(|f| context_rail(f, f.area(), &s, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(out.contains("starting"), "stage missing: {out:?}");
+        let (serving, starting) = (out.find("Z-Serving"), out.find("A-Starting"));
+        assert!(serving < starting && serving.is_some(), "order: {out:?}");
     }
 
     #[test]

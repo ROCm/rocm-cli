@@ -16,9 +16,10 @@
 //! child modules hold no `AppState` methods: `app/types.rs` (shared type/enum
 //! defs and the menu data), `app/actions.rs` (`KeyAction` dispatch:
 //! `handle_key`, `apply_action`), `app/scrollbar.rs` (mouse hit-testing),
-//! `app/event_loop.rs` (the tick loop), `app/terminal.rs` (terminal restore,
-//! shutdown latch, signal watcher), `app/focus.rs` (focused-host policy),
-//! `app/update_check.rs` (the Updates-tile check) and `app/summary.rs`.
+//! `app/event_loop.rs` (the tick loop), `app/chat_runtime.rs` (the live chat
+//! backend the loop owns), `app/terminal.rs` (terminal restore, shutdown latch,
+//! signal watcher), `app/focus.rs` (focused-host policy), `app/update_check.rs`
+//! (the Updates-tile check) and `app/summary.rs`.
 //! `crate::app::*` paths for the public surface moved out are unchanged via
 //! the re-exports below.
 
@@ -35,6 +36,7 @@ use crate::ui::theme::Theme;
 // `crate::app::*` paths for the public surface are unchanged).
 mod actions;
 mod chat;
+mod chat_runtime;
 mod chat_state;
 mod event_loop;
 mod focus;
