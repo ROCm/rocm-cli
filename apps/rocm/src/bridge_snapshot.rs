@@ -9,7 +9,7 @@
 //! `builtin_codex_bridge_engine_inventory` its engine list, which it derives
 //! from `main.rs`'s `engine_inventory`, the single table of built-in engine
 //! ids and summaries that `rocm examine`, `rocm update` and the `main.rs`
-//! test checking `--engine`'s help read too.
+//! test checking `--engine`'s help reads too.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `dispatch()`'s `InternalBridgeSnapshot` arm calls
