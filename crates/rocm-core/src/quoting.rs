@@ -24,7 +24,7 @@
 //! `quote_display_arg` (a dry-run preview line, never executed),
 //! `apps/rocm/src/comfyui.rs`'s `quote_log_arg` (log text, Rust's own
 //! `{value:?}` Debug-format escaping, with the real unquoted args going to
-//! `Command::args` alongside it), `apps/rocm/src/freeform_planner.rs`'s
+//! `Command::args` alongside it), `apps/rocm/src/rocm_argv.rs`'s
 //! `quote_tool_arg` (rendered plan/LLM prompt text, never executed
 //! directly), and `crates/rocm-dash-tui/src/ui/exec.rs`'s own
 //! `quote_display_arg` (an approval-preview line, same display-only

@@ -33,6 +33,10 @@ use crate::freeform_planner::{
 use crate::managed_service_status::{
     friendly_engine_label, load_managed_services, managed_service_is_live,
 };
+// `ensure_flag` lives in `rocm_argv.rs` and stays reachable here as
+// `chat::ensure_flag` for `freeform_execution.rs`.
+pub(crate) use crate::rocm_argv::ensure_flag;
+use crate::rocm_argv::{chat_cli_arg_value, chat_cli_arg_value_checked, chat_cli_has_flag};
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
 use crate::services_text::{
@@ -2780,64 +2784,6 @@ pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn ensure_flag(args: &mut Vec<String>, flag: &str) {
-    if !args.iter().any(|arg| arg == flag) {
-        args.push(flag.to_owned());
-    }
-}
-
-pub(crate) fn chat_cli_arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if let Some((option, value)) = arg.split_once('=')
-            && option == name
-        {
-            return Some(value);
-        }
-        if arg == name {
-            return args.get(index + 1).map(String::as_str);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn chat_cli_arg_value_checked<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if let Some((option, value)) = arg.split_once('=')
-            && option == name
-        {
-            if value.trim().is_empty() {
-                bail!("local assistant provided empty value for {name}");
-            }
-            return Ok(Some(value));
-        }
-        if arg == name {
-            let Some(value) = args.get(index + 1).map(String::as_str) else {
-                bail!("local assistant omitted the value for {name}");
-            };
-            if value.starts_with("--") || value.trim().is_empty() {
-                bail!("local assistant omitted the value for {name}");
-            }
-            return Ok(Some(value));
-        }
-        index += 1;
-    }
-    Ok(None)
-}
-
-pub(crate) fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| {
-        arg == name
-            || arg
-                .strip_prefix(name)
-                .is_some_and(|rest| rest.starts_with('='))
-    })
 }
 
 fn chat_install_prefix_is_system(prefix: &Path) -> bool {

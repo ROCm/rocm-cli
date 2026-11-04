@@ -43,8 +43,13 @@ use rocm_core::{
 use serde::Deserialize;
 use std::fmt::Write as _;
 
+// Both helpers live in `rocm_argv.rs`; they stay reachable here as
+// `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
+// `freeform_execution.rs`, `chat.rs` and `providers.rs`'s tests) and
+// `freeform_planner::serve_args_request_cpu_device` (read by `chat.rs`).
+pub(crate) use crate::rocm_argv::{format_structured_tool_call, serve_args_request_cpu_device};
 use crate::service_launch::is_loopback_host;
-use crate::{Cli, chat, providers};
+use crate::{Cli, chat, providers, rocm_argv};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
 /// below; production code calls [`plan_freeform_request_with_context`]
@@ -375,7 +380,7 @@ fn build_freeform_plan_on(
                 .as_ref()
                 .map(|recipe| recipe.device_policy.as_str())
         });
-        if device_policy.is_some_and(device_policy_is_cpu_mode) {
+        if device_policy.is_some_and(rocm_argv::device_policy_is_cpu_mode) {
             let (parsed, confidence) = serve_plan_parsed_fields_and_confidence(
                 model,
                 engine,
@@ -718,31 +723,6 @@ fn planned_device_policy_without_fallback(policy: &str) -> &str {
     }
 }
 
-fn device_policy_is_cpu_mode(policy: &str) -> bool {
-    matches!(
-        policy.trim().to_ascii_lowercase().as_str(),
-        "cpu" | "cpu_only"
-    )
-}
-
-pub(crate) fn serve_args_request_cpu_device(args: &[String]) -> bool {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--device=")
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-        if arg == "--device"
-            && let Some(value) = iter.peek()
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn planner_resolve_model_recipe(
     model_ref: &str,
     recipes: Option<&[ModelRecipeRecord]>,
@@ -993,7 +973,7 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
         [command, ..] if command == "serve" => {
-            if chat::chat_cli_has_flag(&call.args, "--allow-public-bind") {
+            if rocm_argv::chat_cli_has_flag(&call.args, "--allow-public-bind") {
                 bail!("provider planner cannot request public network binding");
             }
             if serve_args_request_cpu_device(&call.args) {
@@ -1001,13 +981,13 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
                     "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution"
                 );
             }
-            if let Some(host) = chat::chat_cli_arg_value(&call.args, "--host")
+            if let Some(host) = rocm_argv::chat_cli_arg_value(&call.args, "--host")
                 && !is_loopback_host(host)
             {
                 bail!("provider planner cannot request non-local host `{host}`");
             }
-            if chat::chat_cli_has_flag(&call.args, "--foreground")
-                || !chat::chat_cli_has_flag(&call.args, "--managed")
+            if rocm_argv::chat_cli_has_flag(&call.args, "--foreground")
+                || !rocm_argv::chat_cli_has_flag(&call.args, "--managed")
             {
                 bail!("provider planner must request managed serving with --managed");
             }
@@ -1270,24 +1250,6 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
         Some("gpu")
     } else {
         None
-    }
-}
-
-pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
-    parts.join(" ")
-}
-
-/// Quotes `value` for rendered plan text and LLM prompt text only -- never
-/// executed directly. Deliberately kept separate from `rocm_core::quoting`
-/// (ROCMAI-727); see that module's doc comment for why.
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
     }
 }
 
