@@ -100,14 +100,6 @@ pub fn pct(value: f32) -> String {
     }
 }
 
-/// `Option<f32>` percentage → `-` when None.
-pub fn pct_opt(value: Option<f32>) -> String {
-    match value {
-        Some(v) => pct(v),
-        None => "-".to_string(),
-    }
-}
-
 /// SI-suffixed number: 1234 → "1.23 k", 1_234_567 → "1.23 M".
 /// Below 1000 returns the raw integer with no suffix.
 pub fn si(value: f64) -> String {
@@ -198,15 +190,6 @@ pub fn duration(seconds: f64) -> String {
         format!("{m}m {s}s")
     } else {
         format!("{s}s")
-    }
-}
-
-/// Request counter rendered with SI suffix for big numbers and `-` for None.
-pub fn reqs_opt(value: Option<u32>) -> String {
-    match value {
-        Some(v) if v >= 1_000 => si(f64::from(v)),
-        Some(v) => v.to_string(),
-        None => "-".to_string(),
     }
 }
 
@@ -515,12 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn pct_opt_handles_none() {
-        assert_eq!(pct_opt(None), "-");
-        assert_eq!(pct_opt(Some(75.0)), "75.0%");
-    }
-
-    #[test]
     fn si_scales_into_k_m_b() {
         assert_eq!(si(0.0), "0");
         assert_eq!(si(123.0), "123");
@@ -584,13 +561,6 @@ mod tests {
         assert_eq!(duration(1.0), "1s");
         assert_eq!(duration(75.0), "1m 15s");
         assert_eq!(duration(3700.0), "1h 1m 40s");
-    }
-
-    #[test]
-    fn reqs_opt_collapses_big_counts() {
-        assert_eq!(reqs_opt(None), "-");
-        assert_eq!(reqs_opt(Some(5)), "5");
-        assert_eq!(reqs_opt(Some(12_000)), "12.00 k");
     }
 
     #[test]
