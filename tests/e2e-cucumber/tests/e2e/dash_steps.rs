@@ -52,6 +52,38 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
         .expect("no interactive TUI session is open for this scenario")
 }
 
+/// Wait until every marker is on the screen at once, and return the frame that
+/// satisfied the wait. The TUI writes a frame in several pty chunks, so a step
+/// that waits on one marker and then reads the screen again can read a frame
+/// that is still being drawn; asserting on the frame that ended the wait cannot.
+/// On failure the panic names the markers the last frame lacked.
+async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]) -> String {
+    let wanted = markers
+        .iter()
+        .map(|marker| format!("{marker:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut last_frame = String::new();
+    let outcome = tui
+        .wait_for_screen_where(
+            &format!("{what} shows all of {wanted}"),
+            |screen| {
+                screen.clone_into(&mut last_frame);
+                markers.iter().all(|marker| screen.contains(marker))
+            },
+            default_timeout(),
+        )
+        .await;
+    if let Err(error) = outcome {
+        let missing: Vec<&&str> = markers
+            .iter()
+            .filter(|marker| !last_frame.contains(**marker))
+            .collect();
+        panic!("{what}: the last frame read lacked {missing:?}: {error}");
+    }
+    last_frame
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("interactive chat uses an offline assistant")]
@@ -1366,17 +1398,14 @@ async fn told_replay_file_not_found(world: &mut E2eWorld) {
 
 #[then("the dashboard home view is displayed")]
 async fn home_view_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
     // The Home tab's summary cards (Running / Health / Updates) are drawn at any
     // size; the wider "GPU UTILIZATION" hero is not, so assert on the cards.
-    tui.wait_for_screen("Updates", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the home view did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Running") && screen.contains("Health"),
-        "home summary cards missing:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the home summary cards",
+        &["Running", "Health", "Updates"],
+    )
+    .await;
 }
 
 #[then("the hero reports no GPU telemetry available")]
@@ -1465,13 +1494,14 @@ async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
 
 #[then("the diagnose action says it runs rocm examine")]
 async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Runs: rocm examine", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the diagnose action's `Runs:` line did not appear: {e}"));
-    let screen = tui.screen_text();
+    let screen = wait_for_all_markers(
+        session(world),
+        "the diagnose action",
+        &["Diagnose & fix", "Runs: rocm examine"],
+    )
+    .await;
     assert!(
-        screen.contains("Diagnose & fix") && !screen.contains("rocm doctor"),
+        !screen.contains("rocm doctor"),
         "the `Runs:` line must belong to the diagnose action and name a real \
          subcommand, not `rocm doctor`:\n{screen}"
     );
@@ -1495,15 +1525,16 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
 
 #[then("a tool approval prompt is displayed")]
 async fn approval_prompt_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Review: Install TheRock ROCm SDK?", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the approval prompt did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Approve (y)") && screen.contains("Deny (n)"),
-        "approval prompt is missing its Approve/Deny buttons:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the approval prompt",
+        &[
+            "Review: Install TheRock ROCm SDK?",
+            "Approve (y)",
+            "Deny (n)",
+        ],
+    )
+    .await;
 }
 
 #[then("the tool call is shown as declined")]
@@ -1694,11 +1725,12 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
     // the selected instance exposes the status a user uses to diagnose startup.
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open instance details: {e}"));
-    tui.wait_for_screen("LOADING", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the loading state did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains(&model), "managed model missing:\n{screen}");
+    let screen = wait_for_all_markers(
+        tui,
+        "the loading instance details",
+        &["LOADING", model.as_str()],
+    )
+    .await;
     assert!(
         !screen
             .lines()
@@ -1714,34 +1746,47 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     tui.wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
-    tui.wait_for_screen("50ms", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("TTFT metrics did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains("20ms"), "TPOT metrics missing:\n{screen}");
-    let row = screen
-        .lines()
-        .find(|line| line.contains(&model))
-        .unwrap_or_default();
-    assert!(
-        row.contains("50ms") && row.contains("20ms") && row.contains("1/0") && row.contains("25%"),
-        "managed serving metrics were incomplete:\n{screen}"
-    );
+    // Wait for the whole row, not its first cell: the cells are drawn left to
+    // right, so "50ms" can be on screen while "20ms", "1/0" and "25%" are not.
+    let mut last_frame = String::new();
+    let outcome = tui
+        .wait_for_screen_where(
+            "the managed model's row shows TTFT, TPOT, queue and KV cache",
+            |screen| {
+                screen.clone_into(&mut last_frame);
+                screen
+                    .lines()
+                    .find(|line| line.contains(&model))
+                    .is_some_and(|row| {
+                        row.contains("50ms")
+                            && row.contains("20ms")
+                            && row.contains("1/0")
+                            && row.contains("25%")
+                    })
+            },
+            default_timeout(),
+        )
+        .await;
+    if let Err(error) = outcome {
+        panic!("managed serving metrics were incomplete: {error}\nlast frame read:\n{last_frame}");
+    }
 }
 
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("toggle this help", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("next / previous tab")
-            && screen.contains("Home tab")
-            && screen.contains("jump ±60s"),
-        "navigation or contextual guidance missing:\n{screen}"
-    );
+    // The three lines sit at different depths of the help popup, so the first
+    // one on screen does not mean the popup is fully drawn.
+    wait_for_all_markers(
+        session(world),
+        "the dashboard help",
+        &[
+            "toggle this help",
+            "next / previous tab",
+            "Home tab",
+            "jump ±60s",
+        ],
+    )
+    .await;
 }
 
 #[then("the services manager is displayed")]
@@ -1758,11 +1803,9 @@ async fn services_manager_closed(world: &mut E2eWorld) {
     tui.wait_until_gone("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager is still open after Escape: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("● Observe"),
-        "Escape left the Observe tab entirely, not just the manager:\n{screen}"
-    );
+    // The manager's text can be erased before the tab bar under it is redrawn,
+    // so wait for the tab marker rather than reading the screen once.
+    let screen = wait_for_all_markers(tui, "the Observe tab after Escape", &["● Observe"]).await;
     // Belt-and-suspenders: `wait_until_gone` above is the primary regression
     // check (the manager itself closed). This additionally guards against
     // Esc falling through to open the main menu instead — "Options"/"Quit"
@@ -1832,15 +1875,12 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
 
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Go to", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("command palette did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Home") && screen.contains("Serving") && screen.contains("Observe"),
-        "command-palette destinations missing:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the command palette",
+        &["Go to", "Home", "Serving", "Observe"],
+    )
+    .await;
 }
 
 #[then("the dashboard menu is displayed")]
@@ -2127,14 +2167,12 @@ async fn launcher_shows_serving(world: &mut E2eWorld) {
     // The front door's status strip renders "Serving <model>" for a live
     // registry instance; wait on the model name to synchronise with the first
     // paint before inspecting the whole screen.
-    tui.wait_for_screen(&model, default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the launcher never showed the serving model: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Serving"),
-        "launcher did not show the model as serving:\n{screen}"
-    );
+    let screen = wait_for_all_markers(
+        tui,
+        "the launcher's status strip",
+        &[model.as_str(), "Serving"],
+    )
+    .await;
     assert!(
         !screen.contains("Idle — nothing serving"),
         "launcher still reported idle despite a live registry instance:\n{screen}"
