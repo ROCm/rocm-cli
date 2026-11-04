@@ -7,7 +7,7 @@
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use rocm_dash_core::metrics::{GpuMetrics, Instance};
+use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
 
 use crate::ui::theme::Theme;
 
