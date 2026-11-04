@@ -65,7 +65,7 @@ Feature: Benchmarking a served endpoint
   # through vLLM under a `gpu_required` device policy and is refused outright
   # without an active ROCm runtime. Lemonade hosts do not need it, so omitting it
   # fails on Instinct alone — mirror the sibling GPU serve scenarios and keep it.
-  @id:bench-load-real-serve @requires-gpu
+  @id:bench-load-real-serve @requires-real-gpu
   Scenario: bench-06 - Benchmarking a really served model reports throughput
     Given a managed runtime is active
     And a model is being served on GPU

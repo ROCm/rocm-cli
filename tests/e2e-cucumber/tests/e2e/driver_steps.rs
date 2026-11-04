@@ -9,8 +9,8 @@ use crate::E2eWorld;
 #[when("the user previews driver installation on this WSL host")]
 async fn preview_wsl_driver_install(world: &mut E2eWorld) {
     // No env signal: `is_wsl_host()` reads `/dev/dxg` and `/proc/version` and
-    // does not trust `$WSL_DISTRO_NAME`, so the scenario relies on the
-    // `@requires-wsl` gate having put it on a real WSL host.
+    // does not trust `$WSL_DISTRO_NAME`, so the scenario's Given plants a
+    // simulated WSL2 machine carrying exactly those.
     let (stdout, stderr, rc) =
         crate::run_rocm_with_env(world, &["install", "driver", "--dry-run"], &[]);
     world.cli_output = Some(stdout);
