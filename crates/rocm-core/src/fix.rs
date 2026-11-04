@@ -4896,7 +4896,7 @@ mod tests {
     #[test]
     fn fix_3_verify_matches_the_diagnose_copy_verbatim() {
         // No drift guard previously existed between this recipe and
-        // diagnose.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
+        // diagnose/linux.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
         // fix-7/fix-12's `commands`, fix-3's `commands` legitimately differ --
         // diagnose.rs injects the host's live kernel/distro/rocm values into a
         // comment this host-unaware recipe can't know -- but `verify` has no
