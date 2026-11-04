@@ -14,6 +14,12 @@
 //! never be met and every GPU serve spent its whole drain deadline waiting.
 //! `.github/scripts/gpu-preflight.sh` makes the same switch for the same reason.
 
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
 /// Upper bound on the free-memory floor (MiB).
 ///
 /// Sized so the largest single
@@ -130,6 +136,64 @@ pub fn parse_rocm_smi_csv_pool(
     let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
     let mib = 1024 * 1024;
     Some((total / mib, total.saturating_sub(used) / mib))
+}
+
+/// How long one `amd-smi` or `rocm-smi` call may run before it is an unreadable sample.
+///
+/// These tools can stall on a wedged driver, and the drain wait is best-effort:
+/// a stalled probe must cost one sample, not the worker.
+pub const SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const SMI_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long to wait for the reader after the child has exited. A grandchild
+/// that inherited the pipe can keep it open, so the reader is abandoned
+/// rather than joined.
+const SMI_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+/// Run `command` and return its stdout if it exits successfully within `timeout`.
+///
+/// A spawn failure, a non-zero exit, or a timeout is `None`; on a timeout the
+/// child is killed and reaped before this returns.
+///
+/// Written against `std` alone because `rocm_core::process::run_with_timeout`
+/// is reachable here only as a dev-dependency, and this module is library code.
+pub fn bounded_stdout(mut command: Command, timeout: Duration) -> Option<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(SMI_POLL_INTERVAL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let bytes = receiver.recv_timeout(SMI_DRAIN_GRACE).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -270,5 +334,75 @@ mod tests {
             parse_rocm_smi_csv_pool("", "Total Memory", "Total Used Memory"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str, args: &[&str]) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).arg("sh").args(args);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_succeeds_returns_its_stdout() {
+        let out = bounded_stdout(shell("echo hello", &[]), Duration::from_secs(30));
+        assert_eq!(out.as_deref(), Some("hello\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_exits_non_zero_is_unreadable() {
+        let out = bounded_stdout(shell("echo hello; exit 3", &[]), Duration::from_secs(30));
+        assert_eq!(out, None);
+    }
+
+    /// The Copilot finding on the GTT probe: a tool that never returns must cost
+    /// one sample, not the worker, and the child must not be left running or
+    /// unreaped. A zombie still answers `kill -0`, so a failing `kill -0` shows
+    /// the child was reaped, not merely signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_outlives_its_deadline_is_killed_reaped_and_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let started = Instant::now();
+        let out = bounded_stdout(
+            shell(
+                "echo $$ > \"$1\"; exec sleep 60",
+                &[pid_file.to_str().expect("utf-8 path")],
+            ),
+            Duration::from_millis(1500),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(out, None, "a timed-out probe is an unreadable sample");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "returned after {elapsed:?}, far past the 1.5s deadline"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the child wrote its pid before the deadline")
+            .trim()
+            .to_owned();
+        let still_there = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill runs")
+            .success();
+        assert!(!still_there, "child {pid} was left running or unreaped");
+    }
+
+    /// Windows runs only the deadline half; the reaped-child check above needs
+    /// `kill -0`.
+    #[cfg(windows)]
+    #[test]
+    fn a_probe_that_outlives_its_deadline_returns_unreadable_in_time() {
+        let mut command = Command::new("ping.exe");
+        command.args(["-n", "60", "127.0.0.1"]);
+        let started = Instant::now();
+        let out = bounded_stdout(command, Duration::from_millis(1500));
+        assert_eq!(out, None);
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

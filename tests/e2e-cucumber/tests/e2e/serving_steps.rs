@@ -12,8 +12,8 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::device_memory::{
-    CARVEOUT_MAX_MIB, DeviceMemory, DrainTarget, Pool, PoolKind, parse_rocm_smi_csv_pool,
-    select_drain_target,
+    CARVEOUT_MAX_MIB, DeviceMemory, DrainTarget, Pool, PoolKind, SMI_PROBE_TIMEOUT, bounded_stdout,
+    parse_rocm_smi_csv_pool, select_drain_target,
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
@@ -276,13 +276,14 @@ const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 /// single most likely reason the serve that follows never becomes ready, and
 /// without it the failure looks identical to a genuinely broken serve.
 async fn wait_for_free_vram() -> String {
+    // Started before the first probe so that probe counts against the wait.
+    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
     // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
-    if device_memory_mib().is_none() {
+    if probe_device_memory().await.is_none() {
         return "device state: no GPU tooling (mock/local run)".to_owned();
     }
-    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
     loop {
-        let target = device_memory_mib().map(select_drain_target);
+        let target = probe_device_memory().await.map(select_drain_target);
         if let Some(target) = target
             && target.drained()
         {
@@ -317,6 +318,15 @@ fn describe_target(target: DrainTarget) -> String {
     )
 }
 
+/// [`device_memory_mib`] off the async worker: it runs subprocesses, each bounded
+/// by [`SMI_PROBE_TIMEOUT`], so the blocking thread it occupies is released.
+async fn probe_device_memory() -> Option<DeviceMemory> {
+    tokio::task::spawn_blocking(device_memory_mib)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Device memory for GPU 0: VRAM via `amd-smi` (then `rocm-smi`), plus the GTT
 /// pool from `rocm-smi`. `None` when no tool reports VRAM or its output can't
 /// be parsed. GTT is read only when VRAM is small enough to be an APU's
@@ -328,18 +338,11 @@ fn device_memory_mib() -> Option<DeviceMemory> {
     use std::process::Command;
     let (vram_total, vram_free) = vram_mib()?;
     let gtt = if vram_total < CARVEOUT_MAX_MIB {
-        Command::new("rocm-smi")
-            .args(["--showmeminfo", "gtt", "--csv"])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| {
-                parse_rocm_smi_csv_pool(
-                    &String::from_utf8_lossy(&out.stdout),
-                    "GTT Total Memory",
-                    "GTT Total Used Memory",
-                )
-            })
+        let mut command = Command::new("rocm-smi");
+        command.args(["--showmeminfo", "gtt", "--csv"]);
+        bounded_stdout(command, SMI_PROBE_TIMEOUT).and_then(|text| {
+            parse_rocm_smi_csv_pool(&text, "GTT Total Memory", "GTT Total Used Memory")
+        })
     } else {
         None
     };
@@ -360,10 +363,9 @@ fn device_memory_mib() -> Option<DeviceMemory> {
 fn vram_mib() -> Option<(u64, u64)> {
     use std::process::Command;
     // amd-smi: lines like "        TOTAL_VRAM: 196592 MB" / "FREE_VRAM: 196309 MB".
-    if let Ok(out) = Command::new("amd-smi").args(["metric", "-m"]).output()
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let mut amd_smi = Command::new("amd-smi");
+    amd_smi.args(["metric", "-m"]);
+    if let Some(text) = bounded_stdout(amd_smi, SMI_PROBE_TIMEOUT) {
         let field = |name: &str| {
             text.lines()
                 .find_map(|l| l.trim().strip_prefix(name))
@@ -375,17 +377,11 @@ fn vram_mib() -> Option<(u64, u64)> {
         }
     }
     // rocm-smi fallback: `--showmeminfo vram --csv` → vram total/used per card.
-    if let Ok(out) = Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram", "--csv"])
-        .output()
-        && out.status.success()
-    {
+    let mut rocm_smi = Command::new("rocm-smi");
+    rocm_smi.args(["--showmeminfo", "vram", "--csv"]);
+    if let Some(text) = bounded_stdout(rocm_smi, SMI_PROBE_TIMEOUT) {
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
-        return parse_rocm_smi_csv_pool(
-            &String::from_utf8_lossy(&out.stdout),
-            "Total Memory",
-            "Total Used Memory",
-        );
+        return parse_rocm_smi_csv_pool(&text, "Total Memory", "Total Used Memory");
     }
     None
 }
