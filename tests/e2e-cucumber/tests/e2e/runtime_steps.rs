@@ -751,9 +751,23 @@ async fn user_dry_runs_release_sdk(world: &mut E2eWorld) {
     // Deliberately no `--family`: the device payload is chosen from the chip the
     // CLI detects, so passing a family would override the thing under test.
     // `--dry-run` keeps it to a plan — no venv, no download.
-    let stdout = crate::run_rocm_ok(
+    //
+    // The scenario asserts the source the CLI resolves by default, so it must not
+    // inherit a base override from the machine it runs on: a self-hosted runner
+    // that sets a mirror for every job would otherwise be reported back as the
+    // "canonical" source. Only this step drops them. Scenarios that point a
+    // channel at a fixture server push their own overrides through `command_env`.
+    let args = ["install", "sdk", "--channel", "release", "--dry-run"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_env_and_unset(
         world,
-        &["install", "sdk", "--channel", "release", "--dry-run"],
+        &args,
+        &[],
+        &e2e_cucumber::therock_env::THEROCK_BASE_OVERRIDE_VARS,
+    );
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
     );
     world.cli_output = Some(stdout);
 }
