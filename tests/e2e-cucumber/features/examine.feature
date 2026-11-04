@@ -77,7 +77,10 @@ Feature: GPU detection and system inspection
   # load-bearing: every host capability the suite resolves comes from scraped
   # text, so if the two forms ever diverge again, every capability-keyed
   # expectation silently resolves against the wrong host. Since fixed; this is
-  # the guard that keeps it fixed.
+  # the guard that keeps it fixed. On WSL2 the same disagreement came from the
+  # skipped hardware probes (the machine-readable form said no GPU beside a
+  # human report naming a gfx target); `has_amd_gpu` now follows that target
+  # there, so this runs on WSL2 hosts too and is no longer an expected failure.
   @id:examine-both-forms-agree-on-gpu
   Scenario: examine-08 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting

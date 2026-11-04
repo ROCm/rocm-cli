@@ -51,8 +51,16 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # Archive-extraction property tests (`src/archive_props.rs`) build hostile
 # archives byte-by-byte and judge the result on the filesystem.
 flate2 = "1"
+# The exit-code lint in `fix.rs` parses the source rather than pattern-matching
+# its text, so the spelling and layout of a literal do not matter to it (its doc
+# comment lists what it still cannot see). Test-only; already in the lockfile
+# through the derive macros.
+syn = { version = "2", features = ["full", "visit"] }
 tar = "0.4"
 tempfile = "3"
+# `report_trend` writes its own civil calendar so the shipped crate needs no date
+# library; a test checks it against this for every day from 2000 to 2100.
+chrono.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
