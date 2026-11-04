@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 //! `rocm runtimes` command: activate/rollback/uninstall/import/adopt, and
-//! runtime manifest validation/registry.
+//! the runtime list rendering. Registry selection and manifest validation
+//! live in `runtime_registry.rs`; the names other modules import from here
+//! (`current_runtime_manifest`, `select_runtime_manifest`,
+//! `validate_runtime_manifest_for_activation`, `runtime_usability_status`,
+//! and the registry path helpers) are re-exported from this module.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`runtimes(command)`,
@@ -14,10 +18,9 @@
 //! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` and
 //! `ActiveRuntimeMarker` stay `pub(crate)`: the former is read by
 //! `append_update_activate_summary` in `update_cmd.rs`'s
-//! `apply_runtime_update` flow, the latter by `storage.rs`. `select_runtime_manifest`,
-//! `validate_runtime_manifest_for_activation`, `normalize_path_for_compare`,
-//! `recover_setup_runtime_registration`, `active_runtime_marker_path`,
-//! `should_remove_runtime_install_root`, and `runtime_usability_status` are
+//! `apply_runtime_update` flow, the latter by `storage.rs`.
+//! `normalize_path_for_compare`, `recover_setup_runtime_registration`,
+//! `active_runtime_marker_path`, and `should_remove_runtime_install_root` are
 //! also `pub(crate)` and read from `engines_cmd.rs`, `storage.rs`, and
 //! `comfyui.rs`. The SDK-install-finalization/torch-alignment/dependency bundle
 //! (`finish_sdk_install` and friends) lives in the sibling
@@ -37,6 +40,11 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub(crate) use crate::runtime_registry::{
+    current_runtime_manifest, default_runtime_id_matches, runtime_keys_text, runtime_manifest_path,
+    runtime_registry_dir, runtime_usability_status, select_runtime_manifest,
+    validate_runtime_manifest_for_activation,
+};
 use crate::therock;
 use crate::uninstall_plan::confirm_uninstall;
 use crate::{
@@ -645,11 +653,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            ACTIVE_RUNTIME_MARKER
+            Some(ACTIVE_RUNTIME_MARKER)
         } else if rollback {
-            ROLLBACK_RUNTIME_MARKER
+            Some(ROLLBACK_RUNTIME_MARKER)
         } else {
-            " "
+            None
         };
         let status = runtime_usability_status(&manifest);
         let mode = if manifest.read_only {
@@ -661,17 +669,21 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         // says, so an install missing it should not be silent about that.
         // `rocm examine` reports the same thing for the active runtime.
         let toolchain = toolchain_state_text(manifest.includes_devel());
-        let _ = writeln!(
-            output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
-            manifest.runtime_key,
-            manifest.runtime_id,
-            therock::runtime_version_display(&manifest.version),
-            manifest.format,
-            manifest.family,
-            mode,
-            status,
-            toolchain
+        cli_report::write_marked_row(
+            &mut output,
+            "  ",
+            marker,
+            format_args!(
+                "{} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
+                manifest.runtime_key,
+                manifest.runtime_id,
+                therock::runtime_version_display(&manifest.version),
+                manifest.format,
+                manifest.family,
+                mode,
+                status,
+                toolchain
+            ),
         );
         let _ = writeln!(
             output,
@@ -1589,120 +1601,6 @@ pub(crate) fn setup_runtime_paths(config: &RocmCliConfig) -> Option<(&Path, Path
     Some((root, managed_pip_cache_dir(root)))
 }
 
-pub(crate) fn current_runtime_manifest<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Option<&'a therock::InstalledRuntimeManifest> {
-    if let Some(active_key) = config.active_runtime_key.as_deref()
-        && let Some(manifest) = manifests
-            .iter()
-            .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(active_key))
-    {
-        return Some(manifest);
-    }
-
-    let matches = default_runtime_id_matches(config, manifests);
-    match matches.as_slice() {
-        [manifest] => Some(*manifest),
-        _ => None,
-    }
-}
-
-pub(crate) fn default_runtime_id_matches<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Vec<&'a therock::InstalledRuntimeManifest> {
-    let Some(default_runtime_id) = config.default_runtime_id.as_deref() else {
-        return Vec::new();
-    };
-    manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id))
-        .collect()
-}
-
-pub(crate) fn runtime_keys_text(manifests: &[&therock::InstalledRuntimeManifest]) -> String {
-    manifests
-        .iter()
-        .map(|manifest| manifest.runtime_key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Resolves a user-typed selector to the one installed runtime it names.
-///
-/// Matching a `runtime_key` regardless of letter case is a deliberate
-/// convenience, but it only names one runtime while no two installed keys
-/// differ just in case — and they can. Generated keys are slugified to lower
-/// case, while `runtimes adopt --runtime-key` takes the key the user typed and
-/// `runtimes import` takes it from the supplied manifest; neither slugifies,
-/// so the key is stored verbatim. The registry keeps one file per key, so
-/// `ABC.json` and `abc.json` are two entries on a case-sensitive filesystem
-/// and nothing rejects the pair.
-///
-/// So an exact key match is taken first and wins outright: it is the one
-/// reading of the selector that cannot be mistaken. The case-insensitive
-/// fallback applies only when it lands on a single record; two case twins are
-/// reported as the ambiguity they are, the same way a `runtime_id` naming
-/// several installs already is.
-///
-/// Callers rely on that being a function of the key alone, because several of
-/// them resolve the same key more than once and must land on the same record
-/// every time: `storage remove-old-installs` decides about a manifest and then
-/// names it to the deleter by key, and the uninstall revalidation re-derives
-/// its plan from disk after the confirmation prompt. Resolving by "newest
-/// case-insensitive match" made that decide about one install and act on
-/// another.
-pub(crate) fn select_runtime_manifest<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    selector: &str,
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        bail!("runtime selector must not be empty");
-    }
-
-    if let Some(manifest) = manifests
-        .iter()
-        .find(|manifest| manifest.runtime_key == selector)
-    {
-        return Ok(manifest);
-    }
-
-    let key_matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-        .collect::<Vec<_>>();
-    match key_matches.as_slice() {
-        [manifest] => return Ok(manifest),
-        [] => {}
-        _ => bail!(
-            "runtime selector `{selector}` matches several installed runtime keys that differ only in letter case; name one of them exactly: {}",
-            runtime_keys_text(&key_matches)
-        ),
-    }
-
-    let id_matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
-        .collect::<Vec<_>>();
-    match id_matches.as_slice() {
-        [manifest] => Ok(manifest),
-        [] => bail!("installed runtime not found: {selector}"),
-        _ => bail!(
-            "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {}",
-            runtime_keys_text(&id_matches)
-        ),
-    }
-}
-
-pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManifest) -> String {
-    match validate_runtime_manifest_for_activation(manifest) {
-        Ok(()) => "ready".to_owned(),
-        Err(error) => format!("unusable ({error})"),
-    }
-}
-
 /// How the CLI names the toolchain state of a runtime.
 ///
 /// `rocm runtimes list` reports it per runtime and `rocm examine` reports it
@@ -1715,81 +1613,6 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
     } else {
         "excluded"
     }
-}
-
-pub(crate) fn validate_runtime_manifest_for_activation(
-    manifest: &therock::InstalledRuntimeManifest,
-) -> Result<()> {
-    if manifest.runtime_key.trim().is_empty() {
-        bail!("manifest runtime_key is empty");
-    }
-    if manifest.runtime_id.trim().is_empty() {
-        bail!("manifest runtime_id is empty");
-    }
-    if !manifest.install_root.is_dir() {
-        bail!(
-            "install root is missing: {}",
-            manifest.install_root.display()
-        );
-    }
-    let local_manifest = manifest.install_root.join(".rocm-cli-runtime.json");
-    if !manifest.read_only && !local_manifest.is_file() {
-        bail!(
-            "local runtime manifest is missing: {}",
-            local_manifest.display()
-        );
-    }
-
-    match manifest.format.as_str() {
-        "wheel" => validate_wheel_runtime_manifest(manifest),
-        "tarball" => validate_tarball_runtime_manifest(manifest),
-        other => bail!("unsupported runtime format in manifest: {other}"),
-    }
-}
-
-fn validate_wheel_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
-    let python_executable = manifest
-        .python_executable
-        .as_deref()
-        .context("pip runtime manifest is missing python_executable")?;
-    if !Path::new(python_executable).is_file() {
-        bail!("runtime Python executable is missing: {python_executable}");
-    }
-    let probe = manifest
-        .rocm_sdk
-        .as_ref()
-        .context("pip runtime manifest is missing rocm_sdk probe data")?;
-    therock::validate_rocm_sdk_runtime_probe(probe)?;
-    Ok(())
-}
-
-fn validate_tarball_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
-    if runtime_install_root_has_payload(&manifest.install_root)? {
-        Ok(())
-    } else {
-        bail!(
-            "tarball runtime install root has no payload files: {}",
-            manifest.install_root.display()
-        )
-    }
-}
-
-fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn runtime_registry_dir(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("runtimes").join("registry")
-}
-
-pub(crate) fn runtime_manifest_path(paths: &AppPaths, runtime_key: &str) -> PathBuf {
-    runtime_registry_dir(paths).join(format!("{runtime_key}.json"))
 }
 
 pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
@@ -2028,6 +1851,38 @@ pub(crate) mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn render_runtimes_text_keeps_every_row_in_the_marker_layout() -> Result<()> {
+        let (root, paths) = test_paths("runtime-row-layout");
+        for (key, version, build) in [
+            ("rt-active", "7.13.0", 30),
+            ("rt-rollback", "7.12.0", 20),
+            ("rt-idle", "7.11.0", 10),
+        ] {
+            write_test_pip_runtime(&paths, key, "therock-release:gfx120X-all", version, build)?;
+        }
+        let config = RocmCliConfig {
+            active_runtime_key: Some("rt-active".to_owned()),
+            previous_runtime_key: Some("rt-rollback".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let _ = fs::remove_dir_all(root);
+
+        for expected in [
+            format!("  {ACTIVE_RUNTIME_MARKER} rt-active runtime_id="),
+            format!("  {ROLLBACK_RUNTIME_MARKER} rt-rollback runtime_id="),
+            "    rt-idle runtime_id=".to_owned(),
+        ] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
         Ok(())
     }
 
@@ -3151,71 +3006,6 @@ pub(crate) mod tests {
         assert!(error.contains("matches multiple installed runtimes"));
         assert!(error.contains("release-pip-gfx120x-all-7-12-0"));
         assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    /// Matching a key regardless of case is a convenience for a user who typed
-    /// the wrong one; it must not quietly pick between two installs whose keys
-    /// differ only in case. `runtimes adopt --runtime-key` stores the key
-    /// verbatim while generated keys are lower-cased, so such a pair is
-    /// reachable, and a caller that resolves the same key twice — prune decides
-    /// about a manifest and then names it to the deleter by key — has to get
-    /// the same install both times.
-    ///
-    /// No registry is involved here: the manifests are handed straight to the
-    /// resolver, so this holds on every platform even though only a
-    /// case-sensitive filesystem can store such a pair.
-    #[test]
-    fn runtime_selector_prefers_the_exact_key_over_a_case_twin() -> Result<()> {
-        let (root, paths) = test_paths("runtime-case-twin");
-        let base = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        // Newest first, as `load_runtime_manifests` hands them over. The
-        // adopted twin is stamped with the moment it was adopted, so it leads.
-        let manifests = vec![
-            therock::InstalledRuntimeManifest {
-                runtime_key: "RELEASE-PIP-GFX120X-ALL-7-13-0".to_owned(),
-                installed_at_unix_ms: 99,
-                read_only: true,
-                ..base.clone()
-            },
-            base.clone(),
-        ];
-
-        let exact = select_runtime_manifest(&manifests, &base.runtime_key)?;
-        assert_eq!(
-            exact.runtime_key, base.runtime_key,
-            "the key as stored resolves to its own record, not to the newer twin"
-        );
-        let twin = select_runtime_manifest(&manifests, "RELEASE-PIP-GFX120X-ALL-7-13-0")?;
-        assert_eq!(twin.runtime_key, "RELEASE-PIP-GFX120X-ALL-7-13-0");
-
-        // Neither key matches exactly, so the selector genuinely names both.
-        // Reported as the ambiguity it is, like a runtime_id naming several.
-        let error = select_runtime_manifest(&manifests, "Release-Pip-Gfx120X-All-7-13-0")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("differ only in letter case"),
-            "an ambiguous selector must be refused, not silently resolved: {error}"
-        );
-        assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
-        assert!(error.contains("RELEASE-PIP-GFX120X-ALL-7-13-0"));
-
-        // The convenience itself is untouched: with one candidate, any casing
-        // still resolves.
-        let only = vec![base.clone()];
-        assert_eq!(
-            select_runtime_manifest(&only, "Release-Pip-Gfx120X-All-7-13-0")?.runtime_key,
-            base.runtime_key
-        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())

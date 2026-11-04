@@ -15,8 +15,10 @@
 //! read would freeze out two real cases: a model started mid-session via the
 //! Serve wizard (its id would never be in a launch-time snapshot, so it would
 //! never get a stop command or the `s`-to-open-Services hint), and a host
-//! whose dashboard-embedded daemon client never connects at all (Windows —
-//! `has_received_snapshot` never flips, so `AppState::instances` stays empty
+//! whose daemon client never sends an instance snapshot (Windows — it
+//! connects and streams live GPU/CPU/memory every tick, but has no
+//! `rocmdashd` socket to source an instance list from, so
+//! `has_received_snapshot` never flips and `AppState::instances` stays empty
 //! for the life of the session). A live probe has neither problem — there is
 //! no window for it to go stale in.
 

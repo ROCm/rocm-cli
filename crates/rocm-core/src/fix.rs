@@ -14,7 +14,7 @@
 //! the number, its meaning, and what a reader is told it means all come from one
 //! place.
 
-use crate::examine::{run, which};
+use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
 #[cfg(test)]
 use crate::rocm_install::{

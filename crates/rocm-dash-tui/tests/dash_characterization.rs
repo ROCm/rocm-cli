@@ -7,7 +7,9 @@
 //! Freezes `ui::draw` behaviour for every tab in the 5-tab IA
 //! (Home / ROCm / Serving / Observe / Chat) as TestBackend buffer-text
 //! assertions, plus a squeezed-height no-panic sweep and the Phase-3 inline-
-//! manager (de-modal) rendering contract.
+//! manager (de-modal) rendering contract. Two tests at the end pin that the
+//! popup helpers and the Modal renderers stay reachable through their
+//! pre-split `ui::modal` paths.
 //!
 //! Ponytail: reuse the existing `TestBackend` → `Terminal` → `ui::draw` →
 //! flatten-buffer pattern; no new test framework, no demo NDJSON.
@@ -608,4 +610,105 @@ fn demo_buffer_dump_all_tabs_inline_details_and_heroes() {
         "honest placeholder for cold instance missing"
     );
     println!("DEMO_DUMP Observe: heroes + tok/watt + live TTFT 150ms + honest — ✓");
+}
+
+/// The popup helpers moved into `ui::panel`, but `rocm_dash_tui::ui::modal::*`
+/// was their public path first. Naming them through `modal` from an external
+/// crate fails to compile if that re-export is dropped, which is what this
+/// test pins; the assertions on top check the geometry values of
+/// `centered_rect` and `centered_width` and the inner rect of
+/// `draw_popup_frame`, and `grey_overlay` is only checked for reachability.
+#[test]
+fn popup_helpers_stay_reachable_through_ui_modal() {
+    use ratatui::layout::Rect;
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert_eq!(
+        ui::modal::centered_rect(50, 50, 200, 200, area),
+        Rect::new(20, 6, 40, 12)
+    );
+    assert_eq!(ui::modal::centered_width(50, 200, area), 40);
+
+    let theme = ui::theme::Theme::default();
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut via_modal = Rect::default();
+    let mut via_panel = Rect::default();
+    term.draw(|f| {
+        via_modal = ui::modal::draw_popup_frame(f, area, " Help ", &theme);
+        via_panel = ui::panel::draw_popup_frame(f, area, " Help ", &theme);
+        ui::modal::grey_overlay(f);
+    })
+    .unwrap();
+    assert_eq!(via_modal, via_panel);
+    assert_eq!(via_modal, Rect::new(1, 1, 78, 22));
+}
+
+/// The Modal renderers that were public at `rocm_dash_tui::ui::modal::*` before
+/// they moved into private modules of `ui`. Each is called through the `modal`
+/// path from an external crate, which fails to compile if a re-export is
+/// dropped, and its painted output is checked for a value only that renderer
+/// draws, so a re-export of the wrong function would fail too.
+#[test]
+fn modal_renderers_stay_reachable_through_ui_modal() {
+    use ratatui::Frame;
+    use ratatui::layout::Rect;
+
+    let theme = ui::theme::Theme::from_name("default-dark");
+    let area = Rect::new(0, 0, 120, 30);
+    let render = |draw: &dyn Fn(&mut Frame)| -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    };
+
+    let help = render(&|f| ui::modal::draw_help(f, area, ActiveTab::Home, &theme));
+    assert!(help.contains("Help"), "draw_help: {help:?}");
+    let global = render(&|f| ui::modal::draw_global_help(f, area, &theme));
+    assert!(global.contains("Keyboard"), "draw_global_help: {global:?}");
+
+    let warnings = render(&|f| ui::modal::draw_warnings(f, area, &["gpu is hot".into()], &theme));
+    assert!(warnings.contains("Warnings (1)"), "title: {warnings:?}");
+    assert!(warnings.contains("gpu is hot"), "body: {warnings:?}");
+
+    let picker = render(&|f| ui::modal::draw_theme_picker(f, area, 0, "default-dark", &theme));
+    assert!(
+        picker.contains("Theme — j/k select, Enter apply, Esc cancel"),
+        "draw_theme_picker: {picker:?}"
+    );
+    let preview = render(&|f| {
+        ui::modal::draw_theme_preview(f, Rect::new(0, 0, 40, 12), &theme, &theme);
+    });
+    assert!(
+        preview.contains("preview"),
+        "draw_theme_preview: {preview:?}"
+    );
+
+    let menu = render(&|f| ui::modal::draw_menu(f, area, 0, &theme));
+    assert!(menu.contains("Quit"), "draw_menu: {menu:?}");
+    let palette = render(&|f| ui::modal::draw_palette(f, area, 0, &theme));
+    assert!(palette.contains("Go to"), "draw_palette: {palette:?}");
+    let state = AppState::new("t".into(), "default-dark".into());
+    let options = render(&|f| ui::modal::draw_options(f, area, &state, &theme));
+    assert!(options.contains("General"), "draw_options: {options:?}");
+
+    let logo = render(&|f| ui::modal::draw_logo(f, 0, 0, &theme));
+    assert!(logo.contains("██████"), "draw_logo: {logo:?}");
+    let row = render(&|f| {
+        ui::modal::opt_row(
+            f,
+            Rect::new(0, 0, 60, 1),
+            "Label",
+            "val",
+            "ctl",
+            true,
+            &theme,
+        );
+    });
+    assert!(row.contains("▸ Label"), "opt_row label: {row:?}");
+    assert!(row.contains("val"), "opt_row value: {row:?}");
 }

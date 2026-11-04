@@ -28,6 +28,33 @@ const HEADER: &str = "cell,run,wall_s,n_requests,main_prompt_n,prompt_tokens,pro
 const ROW: &str = "O-arch,1,42.3,8,512,4096,1240.5,2048,68.2,8,2,8192,0,true,0,all-pass,\
     4.5,pass,claude,deepseek-r1,http://vllm:8000,8,1,fp8,32,triton,1,,true,0\n";
 
+/// How long to wait for the runner's first snapshot.
+///
+/// A liveness bound, not a latency budget. `run_loop` builds a
+/// `HostCollector` before its first tick, and on Windows the first one in a
+/// process spends about 1.4s initialising the CPU counters on an idle machine
+/// (later ones take about 1ms). Each test gets a fresh process under nextest,
+/// so every test pays that, and more under load.
+const FIRST_SNAPSHOT_BOUND: Duration = Duration::from_secs(30);
+
+/// Wait until the runner has put its first snapshot in `ring`.
+///
+/// Bounded by [`FIRST_SNAPSHOT_BOUND`] and nothing else, so a test that waits
+/// on later ticks can give those their own short deadline: a runner that
+/// starts and then stalls still fails quickly.
+async fn wait_for_first_snapshot(ring: &Mutex<SnapshotRing>) {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + FIRST_SNAPSHOT_BOUND;
+    while ring.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() <= deadline,
+            "the runner produced no snapshot within {FIRST_SNAPSHOT_BOUND:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn runner_broadcasts_snapshots_and_bench_rows() {
     let mut path = std::env::temp_dir();
@@ -62,8 +89,7 @@ async fn runner_broadcasts_snapshots_and_bench_rows() {
         .await;
     });
 
-    // First Snapshot should land within ~500ms.
-    let first = timeout(Duration::from_secs(2), rx.recv())
+    let first = timeout(FIRST_SNAPSHOT_BOUND, rx.recv())
         .await
         .expect("snapshot timeout")
         .expect("recv");
@@ -121,6 +147,9 @@ async fn ring_accumulates_snapshots_for_replay() {
         .await;
     });
 
+    wait_for_first_snapshot(&ring).await;
+
+    // Two more 100ms ticks after the first snapshot.
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let n = ring.lock().unwrap().len();
@@ -181,8 +210,8 @@ async fn bench_ring_accumulates_rows_for_replay() {
         .await;
     });
 
-    // Let the runner take at least one tick so the tailer is initialized.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the runner take its first tick so the tailer is initialized.
+    wait_for_first_snapshot(&ring).await;
 
     {
         use std::io::Write;

@@ -43,15 +43,16 @@
 //!
 //! `dispatch()` calls directly into this module at several points —
 //! `render_internal_status_text`, `run_internal_sandbox_tool`,
-//! `render_service_logs_text`, `render_logs_browser_text`, `render_logs_text`,
-//! `render_services_text`, and `render_services_json` — re-imported via `use
-//! crate::services_text::{...};`. `render_service_action_result`,
-//! `run_internal_sandbox_tool`, and `validate_service_id` are also read from
-//! `main.rs`'s own `run_approved_service_action` (dispatch-adjacent, but not
-//! itself part of this cluster — see `service_launch.rs`'s doc comment for
-//! why the broader service-record-management cluster stays at the crate
-//! root); `validate_service_id` and `load_managed_service` are also read from
-//! `main.rs`'s `remove_managed_service_record`/`apply_service_prune_plan`.
+//! `render_service_logs_text`, `render_logs_browser_text`, and
+//! `render_logs_text` — re-imported via `use crate::services_text::{...};`.
+//! `services_cmd.rs`'s `services()` calls `render_services_text`,
+//! `render_services_json` and `render_service_logs_text` through its own
+//! imports, and its `run_approved_service_action` also reads
+//! `render_service_action_result`, `run_internal_sandbox_tool`, and
+//! `validate_service_id`. `service_records.rs` reads `validate_service_id`
+//! (in `service_record_artifacts` and `remove_managed_service_record`) and
+//! `load_managed_service` (in `remove_managed_service_record` and
+//! `apply_service_prune_plan`).
 //! `load_managed_service` and `restart_internal_managed_service` are
 //! `pub(crate)` and read from `runtime_services.rs` (reconciling live servers
 //! against a runtime activation) and from `managed_service_status.rs`'s own
@@ -76,13 +77,13 @@
 //! other mechanically relocated modules do, and `runtime_services::` through
 //! its own `use crate::runtime_services;` for the handful of tests that drive
 //! this cluster's restart/stop behavior through `runtime_services`'s public
-//! entry points rather than calling it directly. Three tests that call this
-//! cluster's `load_managed_service`/`render_service_action_result` only
-//! incidentally — their primary subject is `runtime_services::
-//! pin_service_record_to_runtime`/`restore_service_record_pin`,
+//! entry points rather than calling it directly. Two tests that call this
+//! cluster's `load_managed_service` only incidentally — their primary subject
+//! is `runtime_services::pin_service_record_to_runtime`/
+//! `restore_service_record_pin` and
 //! `runtime_services::restart_service_onto_runtime_with`'s outcome
-//! classification, and `main.rs`'s own `run_approved_service_action`
-//! respectively — stay in `main.rs`'s shared `mod tests` instead.
+//! classification respectively — stay in `main.rs`'s shared `mod tests`
+//! instead.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -114,16 +115,14 @@ use crate::managed_service_status::{
     load_managed_services, local_server_sidebar_status, managed_service_is_live,
     managed_service_sidebar_counts, refresh_managed_service_runtime_liveness,
 };
-use crate::service_hints;
+use crate::service_hints::{self, service_action_past_tense};
 use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
     managed_service_process_command,
 };
-use crate::{
-    SandboxToolArg, cli_lifecycle_log_path, service_action_past_tense, status_for_readiness,
-};
+use crate::{SandboxToolArg, cli_lifecycle_log_path, status_for_readiness};
 
 pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
     render_logs_browser_text(paths, None)
@@ -581,14 +580,7 @@ fn read_managed_service_manifest(
 ) -> Result<(ManagedServiceRecord, PathBuf)> {
     validate_service_id(service_id)?;
     let manifest_path = paths.service_manifest_path(service_id);
-    let bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "managed service `{service_id}` not found at {}",
-            manifest_path.display()
-        )
-    })?;
-    let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let mut record = ManagedServiceRecord::read_manifest(paths, service_id)?;
     record.normalize_paths_for_host();
     Ok((record, manifest_path))
 }
@@ -1604,6 +1596,51 @@ mod tests {
         );
 
         assert_eq!(rendered, "Install (error): line one");
+    }
+
+    /// `logs`, `stop` and `restart` for an id with no record all fail with the
+    /// shared not-found error alone — one plain line, no OS cause under it.
+    /// `remove` and `rocm logs --service` reach the same `load_managed_service`.
+    #[test]
+    fn service_commands_report_an_unknown_id_without_an_os_cause() -> Result<()> {
+        let (root, paths) = test_paths("service-unknown-id");
+        paths.ensure()?;
+        let expected = "No local server named `nope`. See `rocm services list --all`.";
+        let errors = [
+            render_service_logs_text(&paths, "nope").map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::StopServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::RestartServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+        ];
+        for error in errors {
+            let error = error.expect_err("no record exists for `nope`");
+            assert!(
+                error
+                    .downcast_ref::<rocm_core::ManagedServiceNotFound>()
+                    .is_some(),
+                "{error:?}"
+            );
+            // anyhow appends a backtrace when RUST_BACKTRACE is set, as CI does.
+            let rendered = format!("{error:?}");
+            let rendered = rendered
+                .split_once("\n\nStack backtrace:")
+                .map_or(rendered.as_str(), |(message, _)| message);
+            assert_eq!(rendered, expected);
+        }
+        assert!(!paths.service_manifest_path("nope").exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

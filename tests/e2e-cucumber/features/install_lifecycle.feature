@@ -355,10 +355,61 @@ Feature: Release install lifecycle
     And the shell profile is back to the user's own settings
     And the record of the installer's PATH change is gone
 
+  # ── Installer output: banner, hint, markers, color gating ───────────────
+  # The harness captures the installer through pipes, so these prove the piped
+  # (no-color) contract. The colored TTY branch is not driven here: the PTY
+  # driver exposes the emulated screen, which has already resolved escape
+  # sequences, so it cannot assert on raw ANSI bytes.
+
+  @id:lifecycle-linux-install-output-banner-and-hint @lifecycle @requires-os:linux
+  Scenario: lifecycle-28 - Linux - a piped install prints the get-started block without the art, and a hint that names the installed binary, with no ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file
+    Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer next-step hint names the installed rocm binary
+    And the installer output has no ANSI escapes
+
+  # Regression guard only: piped output already disables color before NO_COLOR
+  # is consulted, so this does not exercise the NO_COLOR check itself.
+  @id:lifecycle-linux-install-output-no-color-env @lifecycle @requires-os:linux
+  Scenario: lifecycle-29 - Linux - NO_COLOR keeps the installer output free of ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file and NO_COLOR set
+    Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer output has no ANSI escapes
+
+  @id:lifecycle-linux-install-failure-marker @lifecycle @requires-os:linux
+  Scenario: lifecycle-30 - Linux - an installer failure is marked with the !! prefix and carries no ANSI escapes when piped
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the bundle checksum sidecar is corrupted
+    And the signed bundle is installed with the public key file
+    Then the install fails reporting checksum verification failed
+    And the installer failure line is marked with the !! prefix
+    And the installer output has no ANSI escapes
+
+  @id:lifecycle-windows-install-output-banner @lifecycle @requires-os:windows
+  Scenario: lifecycle-31 - Windows - a piped install prints the get-started block with a hint that names the installed binary, and no ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file
+    Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer next-step hint names the installed rocm binary
+    And the installer output has no ANSI escapes
+
   # ── Download progress rendering ────────────────────────────────────────
 
   @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
-  Scenario: lifecycle-28 - Linux - a download draws one progress bar that stays inside the terminal
+  Scenario: lifecycle-32 - Linux - a download draws one progress bar that stays inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -368,7 +419,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-29 - Linux - a terminal too narrow for a bar downloads quietly and says why
+  Scenario: lifecycle-33 - Linux - a terminal too narrow for a bar downloads quietly and says why
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -377,7 +428,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
-  Scenario: lifecycle-30 - Linux - the wget fallback keeps its progress bar inside the terminal
+  Scenario: lifecycle-34 - Linux - the wget fallback keeps its progress bar inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file

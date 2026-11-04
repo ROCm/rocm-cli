@@ -41,6 +41,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod service_stop_steps;
+    pub mod service_unknown_id_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
@@ -690,6 +691,12 @@ impl Drop for E2eWorld {
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
         }
+        // A scenario that made the audit directory read-only must give it back
+        // before the TempDir below tries to remove it, even if a step panicked.
+        #[cfg(unix)]
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
+        }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
 }
@@ -938,10 +945,27 @@ pub fn run_rocm_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (String, String, i32) {
+    run_rocm_with_env_and_unset(world, args, envs, &[])
+}
+
+/// Like [`run_rocm_with_env`], but first removes each of `unset` from the env.
+///
+/// For a scenario about what the CLI resolves when one of the
+/// `ROCM_CLI_*_DIR` settings is left out. Everything the scenario keeps set
+/// still points inside its isolated root.
+pub fn run_rocm_with_env_and_unset(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    unset: &[&str],
+) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -1283,7 +1307,7 @@ async fn main() {
     // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
     // at one persistent dir (see `isolate_env`): readers extracting an archive
     // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
-    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // runtime tree after another scenario's extract (`uv.rs`, `therock/process.rs`,
     // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
     // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
     // lane actually exports (e.g. a missing GPU driver reads `false` while a

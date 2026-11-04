@@ -13,8 +13,12 @@ The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
 `vllm` command visible to ROCm CLI.
 
-Native Windows vLLM serving is skipped in this adapter. Use WSL or Linux for vLLM
-ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
+Native Windows vLLM serving is skipped in this adapter. On native Windows,
+`rocm serve --engine vllm`, `rocm engines install vllm` and
+`rocm engines shell vllm` refuse up front with a non-zero exit, before any
+runtime check, download, or launch; `rocm engines list` shows the same decision
+as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
+serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
