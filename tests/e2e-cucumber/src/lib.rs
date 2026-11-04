@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod chat_request;
+pub mod device_memory;
 pub mod expectation;
 pub mod fixture_binary;
 pub mod harness_diagnostics;

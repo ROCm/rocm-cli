@@ -11,6 +11,10 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+use e2e_cucumber::device_memory::{
+    CARVEOUT_MAX_MIB, DeviceMemory, DrainTarget, Pool, PoolKind, parse_rocm_smi_csv_pool,
+    select_drain_target,
+};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
@@ -256,37 +260,15 @@ async fn ensure_serve_port_free() -> String {
     wait_for_free_vram().await
 }
 
-/// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
-/// scenario model can allocate its engine's memory share without tripping its
-/// startup check: Qwen3.6-27B plus vLLM's default fraction-of-total KV
-/// reservation needs the MI300X mostly clear. Only a data-center GPU has this
-/// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
-/// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
-/// otherwise the check could never pass. Note the cap no longer sits above what
-/// vLLM asks for: rocm-cli used to pin utilization below it, and now defers to
-/// vLLM's own (higher) default, so the wait has little headroom left and can
-/// time out on a device that is merely holding display memory. The wait is
-/// best-effort and the serve proceeds regardless, so this costs time rather
-/// than correctness; sizing a deliberate margin is follow-up work.
-const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
-
-/// The free-VRAM floor to wait for on this host: the model-sized ceiling, but
-/// never more than 90% of the device's total VRAM. A hardcoded 150 GiB floor is
-/// unreachable on a small card (e.g. Strix Halo's ~48 GiB unified VRAM), so
-/// `wait_for_free_vram` would burn its full deadline on every serve scenario;
-/// scaling to the device keeps the drain-check meaningful everywhere.
-fn required_free_vram_mib(total_mib: u64) -> u64 {
-    MAX_FREE_VRAM_FLOOR_MIB.min(total_mib / 100 * 90)
-}
-
 /// How long to wait for a stopped engine to hand its device memory back.
 const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
-/// Best-effort: wait until the GPU reports enough free VRAM (see
-/// [`required_free_vram_mib`]), so a just-killed serve's memory is actually
-/// reclaimed before the next serve starts. Queries `amd-smi` then `rocm-smi`;
-/// if neither is present (mock/local, no ROCm), returns immediately so non-GPU
-/// runs are unaffected.
+/// Best-effort: wait until the pool the engine allocates from reports enough
+/// free memory (see [`select_drain_target`]: VRAM on a discrete card, GTT on an
+/// APU whose VRAM is only a BIOS carveout), so a just-killed serve's memory is
+/// actually reclaimed before the next serve starts. Queries `amd-smi` then
+/// `rocm-smi`; if neither is present (mock/local, no ROCm), returns immediately
+/// so non-GPU runs are unaffected.
 ///
 /// The wait is bounded and best-effort: on timeout the serve still starts,
 /// because a stale reading must not turn a slow drain into a hard failure. The
@@ -295,25 +277,25 @@ const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 /// without it the failure looks identical to a genuinely broken serve.
 async fn wait_for_free_vram() -> String {
     // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
-    let Some(total) = total_vram_mib() else {
+    if device_memory_mib().is_none() {
         return "device state: no GPU tooling (mock/local run)".to_owned();
-    };
-    let floor = required_free_vram_mib(total);
+    }
     let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
     loop {
-        let free = free_vram_mib();
-        if let Some(free) = free
-            && free >= floor
+        let target = device_memory_mib().map(select_drain_target);
+        if let Some(target) = target
+            && target.drained()
         {
-            return format!(
-                "device state: drained ({free} MiB free of {total} MiB, floor {floor} MiB)"
-            );
+            return format!("device state: drained ({})", describe_target(target));
         }
         if Instant::now() >= deadline {
-            let free = free.map_or_else(|| "unreadable".to_owned(), |mib| format!("{mib} MiB"));
+            let held = target.map_or_else(
+                || "the memory reading was unreadable".to_owned(),
+                describe_target,
+            );
             return format!(
-                "device state: NOT drained after {}s ({free} free of {total} MiB, floor \
-                 {floor} MiB) — a previous engine is still holding the GPU",
+                "device state: NOT drained after {}s ({held}) — a previous engine may still \
+                 be holding the GPU",
                 VRAM_DRAIN_DEADLINE.as_secs()
             );
         }
@@ -321,16 +303,56 @@ async fn wait_for_free_vram() -> String {
     }
 }
 
-/// Free device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`). `None`
-/// when no such tool exists or its output can't be parsed.
-fn free_vram_mib() -> Option<u64> {
-    vram_mib().map(|(_total, free)| free)
+/// `"<free> MiB free of <total> MiB[ GTT], floor <floor> MiB"`. VRAM is the
+/// unlabelled default, so the line keeps the shape it always had on discrete
+/// cards; only the GTT pool is named.
+fn describe_target(target: DrainTarget) -> String {
+    let pool = match target.kind {
+        PoolKind::Vram => "",
+        PoolKind::Gtt => " GTT",
+    };
+    format!(
+        "{} MiB free of {} MiB{pool}, floor {} MiB",
+        target.free_mib, target.total_mib, target.floor_mib
+    )
 }
 
-/// Total device VRAM in MiB for GPU 0. `None` when no GPU tool is available —
-/// used as the "is there a GPU to wait on at all?" probe in mock/local runs.
-fn total_vram_mib() -> Option<u64> {
-    vram_mib().map(|(total, _free)| total)
+/// Device memory for GPU 0: VRAM via `amd-smi` (then `rocm-smi`), plus the GTT
+/// pool from `rocm-smi`. `None` when no tool reports VRAM or its output can't
+/// be parsed. GTT is read only when VRAM is small enough to be an APU's
+/// carveout (see [`CARVEOUT_MAX_MIB`]), so a discrete-card host never makes the
+/// extra call. `amd-smi` is not asked for GTT: its output has no field this
+/// harness has been checked against, whereas the preflight step already reads
+/// `rocm-smi`'s GTT rows on these hosts.
+fn device_memory_mib() -> Option<DeviceMemory> {
+    use std::process::Command;
+    let (vram_total, vram_free) = vram_mib()?;
+    let gtt = if vram_total < CARVEOUT_MAX_MIB {
+        Command::new("rocm-smi")
+            .args(["--showmeminfo", "gtt", "--csv"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| {
+                parse_rocm_smi_csv_pool(
+                    &String::from_utf8_lossy(&out.stdout),
+                    "GTT Total Memory",
+                    "GTT Total Used Memory",
+                )
+            })
+    } else {
+        None
+    };
+    Some(DeviceMemory {
+        vram: Pool {
+            total_mib: vram_total,
+            free_mib: vram_free,
+        },
+        gtt: gtt.map(|(total_mib, free_mib)| Pool {
+            total_mib,
+            free_mib,
+        }),
+    })
 }
 
 /// `(total, free)` device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`).
@@ -358,20 +380,12 @@ fn vram_mib() -> Option<(u64, u64)> {
         .output()
         && out.status.success()
     {
-        let text = String::from_utf8_lossy(&out.stdout);
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
-        // Parse the first data row's total and used to derive free.
-        let mut lines = text.lines();
-        let header = lines.next()?;
-        let cols: Vec<&str> = header.split(',').collect();
-        let total_idx = cols.iter().position(|c| c.contains("Total Memory"))?;
-        let used_idx = cols.iter().position(|c| c.contains("Total Used Memory"))?;
-        let row = lines.next()?;
-        let vals: Vec<&str> = row.split(',').collect();
-        let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
-        let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
-        let mib = 1024 * 1024;
-        return Some((total / mib, total.saturating_sub(used) / mib));
+        return parse_rocm_smi_csv_pool(
+            &String::from_utf8_lossy(&out.stdout),
+            "Total Memory",
+            "Total Used Memory",
+        );
     }
     None
 }
