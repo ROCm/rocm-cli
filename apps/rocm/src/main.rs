@@ -73,16 +73,16 @@ mod update_cmd;
 // types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
 // mergeability); several helpers are re-imported for reasons other than
-// dispatch: `env_root_for_engine_install`, `runtime_manifest_for_selector`,
-// `engine_manages_own_runtime`, and `runtime_key_for_python` because other
-// root-level commands outside `dispatch()` call them directly.
-// `prepare_freeform_execution`/`render_freeform_execution_header` are
-// re-imported for the same reason: `execute_freeform_next_action` (itself only
-// called from `run_freeform`, outside `dispatch()`) calls them. Several
-// root-level chat/examine helpers call into `runtimes_cmd` directly for the
-// same reason `engines_cmd`'s runtime-resolution helpers are re-imported;
-// `current_runtime_manifest` stays re-imported here for other root-level
-// commands outside `dispatch()` that call it directly. `select_runtime_manifest`
+// dispatch: `prepare_freeform_execution`/`render_freeform_execution_header`
+// because `execute_freeform_next_action` (itself only called from
+// `run_freeform`, outside `dispatch()`) calls them. The engine runtime and
+// env-root helpers (`engine_manages_own_runtime`,
+// `runtime_manifest_for_selector` and the rest) are no longer re-imported at
+// the crate root: they live in `engine_install_env.rs`, and each caller imports
+// them from there. Several root-level chat/examine helpers call into
+// `runtimes_cmd` directly; `current_runtime_manifest` stays re-imported here
+// for other root-level commands outside `dispatch()` that call it directly.
+// `select_runtime_manifest`
 // is no longer needed here: `single_ready_runtime_key`/
 // `resolve_runtime_selector_to_exact_key` moved out to
 // `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that

@@ -2,25 +2,21 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm engines` command handlers and env-root/runtime resolution.
+//! `rocm engines` command handlers.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`engines(command)`,
-//! re-imported via `use crate::engines_cmd::{engine_manages_own_runtime,
-//! engines, env_root_for_engine_install, env_root_for_service,
-//! runtime_key_for_python, runtime_manifest_for_selector};`). `EnginesCommand`
+//! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
 //! remains in the crate root and is reached via `use crate::EnginesCommand`;
-//! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
-//! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
-//! only caller is `serve_cmd.rs`; `env_root_for_service` and
-//! `runtime_key_for_python` are used only from other root-level commands in
-//! `main.rs`, while `env_root_for_engine_install` and
-//! `runtime_manifest_for_selector` are also called within this file, in
-//! addition to other root-level commands in `main.rs`; all four stay
-//! `pub(crate)` rather than private.
-//! `render_engine_inventory_text` is also `pub(crate)`, but its caller is an
-//! exception to the others: its only caller is `engines()` in this same
-//! file, not `main.rs`.
+//! `Cli` is not referenced from this file.
+//!
+//! Which runtime an engine installs into and where its environment lives is
+//! answered in `engine_install_env.rs`, which this module imports from;
+//! `runtime_install_finalize.rs` imports from it too, so neither of the two
+//! imports the other for those helpers. `ensure_self_managed_engine_ready` and
+//! `env_root_for_service` stay here and are `pub(crate)` for their callers in
+//! other modules. `render_engine_inventory_text` is `pub(crate)` too, but is
+//! called only from `engines()` in this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
