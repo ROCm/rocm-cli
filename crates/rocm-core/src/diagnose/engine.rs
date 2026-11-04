@@ -4,15 +4,16 @@
 
 //! The checks on the engine runtime that run on Linux and WSL2: the vLLM
 //! out-of-memory and import failures, a second copy of the code object manager,
-//! and a `/dev/shm` too small for a serving workload. Also the classifiers the
-//! vLLM engine calls to decide whether a failing line is worth printing as a
-//! `--symptom` example.
+//! and a `/dev/shm` too small for a serving workload, with the two canonical
+//! symptom strings the vLLM engine falls back to. The classifiers the engine
+//! calls (`vllm_oom_symptom_is_diagnosable` and its import sibling) run the whole
+//! catalog, so they live in the module root rather than here.
 
 use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
     KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, zero,
 };
-use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH, run_all_checks};
+use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH};
 use crate::examine::Examination;
 use regex::Regex;
 
@@ -122,23 +123,6 @@ fn vllm_anchored_lines(symptom: &str) -> String {
         .filter(|line| anchor.is_match(&line.to_lowercase()))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
-/// mode.
-///
-/// This is the OOM *classifier* the whole stack scores against. It is not what
-/// the engine calls directly any more: `rocm_core::vllm_oom_diagnose_symptom`
-/// owns line selection for both surfaces and reaches this per rendered row, and
-/// what those surfaces then branch on before printing is
-/// `quotable_in_single_quotes` — a line this function accepts is still replaced
-/// by [`VLLM_OOM_CANONICAL_SYMPTOM`] when it cannot be rendered as one intact
-/// single-quoted argument. Scoring here and admissibility there are deliberately
-/// separate questions; keeping them straight is what stops a colourised line
-/// being printed as a runnable lookalike of the user's error.
-#[must_use]
-pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", run_all_checks)
 }
 
 /// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
@@ -344,29 +328,11 @@ pub(super) fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnos
 pub const VLLM_IMPORT_CANONICAL_SYMPTOM: &str =
     "OSError: libtorch_cuda.so: cannot open shared object file";
 
-/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the engine-startup
-/// import failure.
-///
-/// The vLLM engine calls this to decide whether the user's actual failing line
-/// is worth routing into a `--symptom` example, or whether to fall back to
-/// [`VLLM_IMPORT_CANONICAL_SYMPTOM`] so the printed command is guaranteed to
-/// report a cause rather than reading as "the tool checked and found nothing".
-///
-/// The hint fires on every host the vLLM engine runs on, which is Linux and
-/// WSL2. The symptom therefore has to clear the threshold on each of those
-/// families, run through the same registry `rocm diagnose` uses, so a check
-/// that is registered for one family and not the other cannot make the engine
-/// name a command that finds nothing.
-#[must_use]
-pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
-}
-
 /// Whether the entry `id` clears [`MIN_SCORE_FOR_MATCH`] for `symptom` on every
 /// host family the vLLM engine runs on (Linux and WSL2). `run` is the registry
 /// run for one host. It is a parameter so a test can hand in a registry where
 /// the entry is missing on one family.
-fn scores_on_every_engine_host(
+pub(super) fn scores_on_every_engine_host(
     symptom: &str,
     id: &str,
     run: impl Fn(&Examination, &str) -> Vec<Diagnosis>,
@@ -1626,21 +1592,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_vllm_import_symptom_is_diagnosable() {
-        // The engine's fallback symptom must always clear the threshold, so the
-        // `rocm diagnose` command it prints never reports nothing.
-        assert!(vllm_import_symptom_is_diagnosable(
-            VLLM_IMPORT_CANONICAL_SYMPTOM
-        ));
-        // A frame that names only the shim's module, and not the missing library,
-        // is not enough on its own, and the engine has to know that.
-        assert!(!vllm_import_symptom_is_diagnosable(
-            "File \"tvm_ffi/_optional_torch_c_dlpack.py\", line 42, in <module>"
-        ));
-        assert!(!vllm_import_symptom_is_diagnosable("an ordinary failure"));
-    }
-
-    #[test]
     fn vllm_import_keyword_diagnosis_is_available_on_wsl() {
         // The engine's import hint fires on WSL2 too, so `rocm diagnose
         // --symptom` has to answer there. Check 17 used to be registered for
@@ -1649,63 +1600,5 @@ mod tests {
         assert!(report.out_of_scope.is_none());
         assert!(report.has_match());
         assert_eq!(report.matched[0].id, "fix-17-torch-dlpack");
-    }
-
-    #[test]
-    fn the_engine_host_guard_requires_the_entry_to_score_on_every_host_family() {
-        // A registry stand-in: `listed_on` says which hosts list the entry.
-        fn registry(
-            id: &'static str,
-            listed_on_wsl: bool,
-            listed_on_linux: bool,
-        ) -> impl Fn(&Examination, &str) -> Vec<Diagnosis> {
-            move |host, _symptom| {
-                let listed = if host.is_wsl {
-                    listed_on_wsl
-                } else {
-                    listed_on_linux
-                };
-                if !listed {
-                    return Vec::new();
-                }
-                vec![Diagnosis {
-                    id: id.to_owned(),
-                    score: 100,
-                    ..Diagnosis::default()
-                }]
-            }
-        }
-        let guard = |run| scores_on_every_engine_host("x", "fix-17-torch-dlpack", run);
-        assert!(guard(registry("fix-17-torch-dlpack", true, true)));
-        assert!(
-            !guard(registry("fix-17-torch-dlpack", false, true)),
-            "an entry missing on WSL must not count"
-        );
-        assert!(
-            !guard(registry("fix-17-torch-dlpack", true, false)),
-            "an entry missing on Linux must not count"
-        );
-        assert!(
-            !guard(registry("fix-16-vllm-oom", true, true)),
-            "a different entry scoring is not this entry scoring"
-        );
-        // And the real registry lists both entries on both families.
-        assert!(vllm_import_symptom_is_diagnosable(
-            VLLM_IMPORT_CANONICAL_SYMPTOM
-        ));
-        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
-        // An ISA error scores on another check, not on this one.
-        assert!(!vllm_import_symptom_is_diagnosable(
-            "hipErrorNoBinaryForGpu: Unable to find code object for all current devices"
-        ));
-    }
-
-    #[test]
-    fn canonical_vllm_oom_symptom_is_diagnosable() {
-        // The engine's fallback symptom must always clear the threshold, so the
-        // `rocm diagnose` command it prints never reports nothing.
-        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
-        // And a bare framework mention the engine would reject is not diagnosable.
-        assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
     }
 }
