@@ -1148,7 +1148,6 @@ fn enrich_instance_vram(
     }
 }
 
-/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 /// Broadcast `ev` to subscribers and, if a session writer is wired, append
 /// the same event to disk for `--replay`. Persistence is best-effort — a
 /// write failure logs at warn level but does not interrupt the loop.
@@ -1166,6 +1165,7 @@ fn broadcast_and_persist(
     let _ = tx.send(ev);
 }
 
+/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 fn ticks_per(period: Duration, tick: Duration) -> u64 {
     let n = (period.as_secs_f64() / tick.as_secs_f64()).round() as i64;
     n.max(1) as u64
