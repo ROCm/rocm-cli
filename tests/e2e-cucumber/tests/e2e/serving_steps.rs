@@ -2169,6 +2169,142 @@ async fn assert_lemonade_recovery_guidance(world: &mut E2eWorld) {
     );
 }
 
+/// The Anthropic endpoint `rocm services list` shows for the first service that
+/// has one, waiting for it to appear.
+///
+/// The serving process publishes the endpoint a moment after the engine lists its
+/// model, so a service the CLI already calls ready may not show it on the first
+/// listing.
+async fn listed_anthropic_endpoint(world: &mut E2eWorld) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+        let found = stdout.lines().find_map(|line| {
+            line.trim_start()
+                .strip_prefix("anthropic endpoint: ")
+                .map(str::to_owned)
+        });
+        world.cli_output = Some(stdout);
+        if found.is_some() || Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[then("the service details include an Anthropic-compatible messages endpoint")]
+async fn assert_service_lists_anthropic_endpoint(world: &mut E2eWorld) {
+    let listed = listed_anthropic_endpoint(world).await;
+    let output = world.cli_output.clone().unwrap_or_default();
+    let endpoint = listed
+        .unwrap_or_else(|| panic!("no `anthropic endpoint:` row in `services list`:\n{output}"));
+    assert!(
+        endpoint.starts_with("http://") && !endpoint.contains("/v1"),
+        "the Anthropic endpoint is a base URL clients append `/v1/messages` to, got `{endpoint}`"
+    );
+}
+
+#[then("the service details still include the existing OpenAI-compatible endpoint")]
+async fn assert_service_still_lists_openai_endpoint(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim_start().starts_with("endpoint: http") && line.ends_with("/v1")),
+        "the OpenAI-compatible `endpoint:` row is missing from `services list`:\n{output}"
+    );
+}
+
+#[when("the user sends a request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+    let base = listed_anthropic_endpoint(world)
+        .await
+        .expect("no Anthropic endpoint is listed for the served model");
+    let budget = Duration::from_secs(crate::inference_timeout_for(world));
+    // Sent under a Claude model name on purpose: an Anthropic client names a
+    // Claude model, and the endpoint answers for the model that is served.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    let reply = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .timeout(budget)
+            .build()
+            .expect("failed to build HTTP client")
+            .post(format!("{base}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"))
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages returned non-JSON: {error}"))
+    })
+    .await
+    .expect("the Anthropic request task panicked");
+    world.anthropic_response = Some(reply);
+}
+
+#[then("the response is a valid Anthropic Messages API response")]
+async fn assert_valid_anthropic_response(world: &mut E2eWorld) {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    assert_eq!(reply["type"], "message", "not a Message: {reply}");
+    assert_eq!(reply["role"], "assistant", "{reply}");
+    assert!(
+        reply["content"]
+            .as_array()
+            .and_then(|blocks| blocks.first())
+            .is_some_and(|block| block["type"] == "text"
+                && block["text"].as_str().is_some_and(|text| !text.is_empty())),
+        "no text content block in the reply: {reply}"
+    );
+    assert!(reply["stop_reason"].is_string(), "{reply}");
+    assert!(
+        reply["usage"]["input_tokens"].is_u64() && reply["usage"]["output_tokens"].is_u64(),
+        "usage is missing token counts: {reply}"
+    );
+}
+
+#[then("the Anthropic response identifies the correct model")]
+async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    let model = reply["model"].as_str().unwrap_or("");
+    let expected = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        model_ids_match(model, expected),
+        "the Anthropic response model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[then("both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy")]
+async fn assert_both_endpoints_healthy(world: &mut E2eWorld) {
+    // `services list` probes each endpoint it shows and marks one that does not
+    // answer with `(not responding)`; a healthy service carries neither mark.
+    let listed = listed_anthropic_endpoint(world).await;
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        listed.is_some(),
+        "no `anthropic endpoint:` row in `services list`:\n{output}"
+    );
+    assert!(
+        output.contains("status: ready"),
+        "the OpenAI-compatible endpoint is not reported ready:\n{output}"
+    );
+    assert!(
+        !output.contains("(not responding)"),
+        "the Anthropic-compatible endpoint is reported not responding:\n{output}"
+    );
+}
+
 #[then("an inference request succeeds immediately")]
 async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
     // No extra wait: the CLI already reported ready, so inference must work now.

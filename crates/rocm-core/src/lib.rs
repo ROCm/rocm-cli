@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod amd_smi;
+pub mod anthropic_endpoint;
 #[cfg(all(test, unix))]
 mod archive_props;
 pub mod atomic_write;
@@ -67,6 +68,11 @@ pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
+pub use anthropic_endpoint::{
+    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
+    anthropic_endpoint_ready, anthropic_messages_native_probe,
+    wait_for_published_anthropic_endpoint,
+};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
