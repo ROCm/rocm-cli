@@ -3911,11 +3911,12 @@ async fn assert_missing_gguf_plan_is_to_check_the_path(world: &mut E2eWorld) {
     let model = model_section(world);
     let path = missing_gguf_path(world);
     let fix = model_field(&model, "fix");
-    assert_eq!(
-        fix["verify"].as_str(),
-        Some(format!("rocm diagnose --model {path}").as_str()),
-        "{model:#}"
-    );
+    // The command names the path as given, quoted when the platform's shell
+    // would split or expand it (the scenario's temp directory decides which).
+    let verify = fix["verify"].as_str().unwrap_or("");
+    let bare = format!("rocm diagnose --model {path}");
+    let quoted = format!("rocm diagnose --model '{path}'");
+    assert!(verify == bare || verify == quoted, "{model:#}");
     assert!(
         !fix["verify"].as_str().unwrap_or("").contains("rocm serve"),
         "serving a file that is not there only repeats the error: {model:#}"

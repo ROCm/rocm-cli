@@ -3452,7 +3452,8 @@ Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independen
 the context options without `--model` (a usage error naming it), a curated model
 asked about a context size (told the options do not apply, no estimate), a
 `.gguf` path that does not exist (named as not opened, no upstream route, and a
-plan to ask again about that path), and a bare `owner/repo` with a context size
+plan to ask again about that path, the path quoted where the platform's shell
+needs it, so the step accepts it bare or quoted), and a bare `owner/repo` with a context size
 (told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
