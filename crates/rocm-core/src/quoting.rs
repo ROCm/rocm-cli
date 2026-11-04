@@ -15,7 +15,7 @@
 //! `powershell_quote`'s output is written into a `.ps1` script executed via
 //! `powershell.exe -File` (`apps/rocm/src/comfyui.rs`'s Windows runtime
 //! launch) or interpolated into a `-Command` string
-//! (`crate::fix::path_export_windows`, `crate::diagnose`'s matching
+//! (`crate::fix::runners::path_export_windows`, `crate::diagnose`'s matching
 //! printed copy). A mistake in either one is a real command-injection or
 //! script-corruption bug, which is why both carry direct unit coverage here
 //! (ROCMAI-727 consolidated them out of per-call-site near-duplicates).
@@ -45,7 +45,7 @@
 ///
 /// This matters for any value of filesystem/environment origin embedded into
 /// a generated PowerShell command -- for example
-/// `crate::fix::path_export_windows`'s write script, built from the real
+/// `crate::fix::runners::path_export_windows`'s write script, built from the real
 /// existing User PATH read back from the host, and `crate::diagnose`'s
 /// matching printed copy of that same command. A path containing an
 /// apostrophe (`C:\Users\O'Brien\bin` is an ordinary Windows path, not a
