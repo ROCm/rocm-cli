@@ -530,7 +530,10 @@ rocm model --verbose"
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
-    /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
+    /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
+    /// the server exited, it says so on stderr and exits with an error; if the stop itself
+    /// fails, it says why on stderr, signals the server process directly and exits 0,
+    /// noting on stderr if that signal fails too. Inspect or stop servers later with
     /// `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
@@ -547,6 +550,21 @@ rocm model --verbose"
     /// before the refusal.
     /// With an explicit --gpu the index is still validated after the exception, so a
     /// pinned GPU that is not visible is refused even when a reusable server exists.
+    ///
+    /// When a vLLM server THIS command launched fails to become ready and its engine log
+    /// shows an out-of-memory failure, the deployment summary adds a note naming
+    /// --gpu-memory-utilization and --gpu, warning that lowering the reservation will not
+    /// help if the model does not fit, and printing a `rocm diagnose --symptom` command
+    /// for your own failing line -- or, when that line carries an apostrophe or terminal
+    /// control bytes and so cannot be rendered as one intact single-quoted argument, for a
+    /// canonical vLLM out-of-memory symptom instead, so the printed command is always
+    /// runnable and always reports a cause. That note belongs to the interactive summary only: a
+    /// piped or redirected run prints the plain machine-readable form, which carries no
+    /// post-launch notes (it still prints the pre-launch planning ones), and --verbose
+    /// streams the traceback itself. It is never shown for a healthy or
+    /// still-loading server, for a non-memory failure, or for a run that reused an
+    /// already-running server rather than launching one; read that server's own log with
+    /// `rocm services logs <service-id>`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
@@ -561,7 +579,13 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long)]
         device: Option<DevicePolicyArg>,
         /// GPU device to serve on: `auto` (default; first free GPU) or a single
-        /// index like `1`.
+        /// index like `1`. An index the machine does not have is refused, and
+        /// the error lists the indices that exist. If the GPUs cannot be listed,
+        /// the index is used with a warning that it was not checked. If a
+        /// visibility mask cannot be applied (`HIP_VISIBLE_DEVICES` cannot be
+        /// read as ordinals, or no GPU list was available to apply it to), an
+        /// index at or past the GPU count is still refused, and a lower one is
+        /// used with a warning that the mask was not checked.
         #[arg(long, value_name = "INDEX|auto")]
         gpu: Option<String>,
         /// ROCm runtime key to use for this server.
@@ -1172,6 +1196,14 @@ enum ServicesCommand {
         service_id: String,
     },
     /// Stop a local model server.
+    ///
+    /// Reports the server stopped only once every process it recorded is
+    /// confirmed gone. Otherwise it reports on stderr that the stop was not
+    /// confirmed and exits with an error, keeping the record, which still names
+    /// the processes, and any endpoint key, which the server may still be
+    /// enforcing. It names each process that did not exit, and for one it could
+    /// not verify it signals nothing and names an operating-system command to
+    /// check on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
