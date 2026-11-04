@@ -19,6 +19,7 @@ pub mod polled_deadline;
 pub mod powershell_text_rule;
 pub mod quit_and_wait;
 pub mod reader_failure;
+pub mod runtime_root;
 pub mod send_until;
 pub mod serve_log;
 pub mod shared_runtime;

@@ -137,13 +137,6 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so t
 serve_timeout_secs = 90
 flaky = true
 
-# --- EAI-7384: re-provisioning nests the managed runtime path recursively
-# (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
-[["runtime-path-not-nested"]]
-when = {}
-bug = "EAI-7384"
-reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
-
 # The GPU-backed bench scenario benchmarks a really served model, so on a
 # lemonade LINUX host it inherits the same managed-serve bug as the sibling
 # serve/chat rows below `serve-default-engine-working-endpoint`: the serve
