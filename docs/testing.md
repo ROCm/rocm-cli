@@ -683,10 +683,11 @@ Windows-only:
 
 ```bash
 cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::install
 cargo test -p rocm --bin rocm comfyui::tests
 ```
 
-The second filter covers the install-level tests: `reinstall_*`,
+The last two filters cover the install-level tests: `reinstall_*`,
 `install_after_an_interrupted_reinstall_finishes_it`,
 `start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
 `a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
@@ -695,7 +696,11 @@ The second filter covers the install-level tests: `reinstall_*`,
 `swap_changes_summary_names_what_was_replaced_and_set_aside`,
 `a_plain_install_is_not_refused_while_comfyui_runs`,
 `plain_install_dry_run_previews_no_reinstall`,
-`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`.
+`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`. The
+second filter (`comfyui::install`) holds all of them except
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it` and
+`chat_status_answer_*`, which span `start`, `status` and `install` and stay under
+the third (`comfyui::tests`), with the fixtures both share.
 The running guard is tested against a ComfyUI answering on its port
 (`running`) and one whose process is up but whose port is not answering yet
 (`starting`).
