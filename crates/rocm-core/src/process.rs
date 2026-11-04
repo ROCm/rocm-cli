@@ -363,6 +363,20 @@ fn collect_process_tree(root: u32) -> Vec<u32> {
         }
     }
 
+    walk_process_tree(root, &children)
+}
+
+/// Walk `root` plus its transitive descendants over an already-built
+/// parent→children table.
+///
+/// `root` comes first, every other PID comes after its parent, and no PID is
+/// listed twice, so a cycle in the table ends the walk instead of looping it.
+///
+/// Split out of [`collect_process_tree`] so the traversal — the part that
+/// decides which PIDs get signalled — can be exercised against a synthetic
+/// table (cycles, self-parents, shared parents) without touching `/proc`.
+#[cfg(not(windows))]
+fn walk_process_tree(root: u32, children: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
@@ -523,7 +537,27 @@ impl FileLock {
     /// The lock file itself carries no data; it is a rendezvous point, so an
     /// existing file is reused (never truncated) and its contents are ignored.
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -535,9 +569,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.
@@ -1129,6 +1161,12 @@ fn assemble_output(
     Ok(output)
 }
 
+/// Property tests for [`walk_process_tree`]; a child module so it can reach
+/// the walk while it stays private.
+#[cfg(all(test, not(windows)))]
+#[path = "process_tree_properties.rs"]
+mod tree_properties;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,6 +1291,59 @@ mod tests {
             !liveness.is_running(),
             "a second call after reaping must still report dead, not panic or flip to `true`"
         );
+    }
+
+    /// The Windows counterpart, covering the arm that is the actual
+    /// crash-detection primitive on that platform (ROCMAI-541 review).
+    ///
+    /// The Unix case above cannot reach it — `ManagedChildLiveness::Windows`
+    /// cannot even be constructed off Windows — and the scripted-engine e2e
+    /// scenarios run on the Linux no-GPU lane, where the Unix arm does the
+    /// work. So without this, the half of the liveness check that decides
+    /// crash-vs-starting on the reported platform had nothing exercising it,
+    /// while its sibling (`spawn_detached_with_log`) did.
+    ///
+    /// No reaping is involved here: the Windows arm reads the real exit code
+    /// through `OpenProcess`/`GetExitCodeProcess`, so the contract is simply
+    /// "alive while running, dead once terminated, and still dead when asked
+    /// again".
+    #[cfg(windows)]
+    #[test]
+    fn managed_child_liveness_windows_tracks_a_real_child_through_termination() {
+        use std::time::{Duration, Instant};
+
+        // A child that outlives the assertions below without finishing on its
+        // own, so "still running" is a real observation rather than a race.
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let mut child = Command::new(&comspec)
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn a long-running child");
+        let pid = child.id();
+        let mut liveness = ManagedChildLiveness::from_pid(pid);
+
+        assert!(
+            liveness.is_running(),
+            "a child that has not been terminated must read as running"
+        );
+
+        terminate_process(pid).expect("terminate the fixture child");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while liveness.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "a terminated child must stop reading as running"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !liveness.is_running(),
+            "a second call must keep reporting dead"
+        );
+
+        let _ = child.wait();
     }
 
     /// The shells every grandchild case below is run against.

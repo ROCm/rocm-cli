@@ -6,8 +6,8 @@
 //!
 //! Originally a mechanical relocation from `main.rs` with no behavior change —
 //! the `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
-//! re-imported via `use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};`
-//! — `select_serve_engine` rides along for `assess_model_for_host`, not dispatch).
+//! re-imported via `use crate::serve_cmd::{ServeArgs, serve};`; `model_fit.rs`'s
+//! `assess_model_for_host` calls `select_serve_engine` directly).
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
@@ -17,8 +17,10 @@
 //! bail. Read the comment at the pre-gate, not this paragraph, for what the
 //! serve path does today.
 //!
-//! `collect_serve_notes` stays in `main.rs` (no entanglement; a later pass
-//! can relocate it). `detect_gpu_count`, `gpu_vram_usage`,
+//! `collect_serve_notes`, the GPU/device warnings folded into the interactive
+//! summary, was relocated here from `main.rs` verbatim, with its two tests and
+//! their `vram`/`host_gpu` fixtures; `serve` is its only production caller.
+//! `detect_gpu_count`, `gpu_vram_usage`,
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
@@ -57,20 +59,21 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::gpu_policy::{
-    detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
+    GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage, parse_device_policy,
+    parse_gpu_selection, pinned_index_bound, select_gpu_indices_under_launch_lock,
+    serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_summary;
 use crate::service_launch::{
-    drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
-    ensure_public_bind_engine_supported, managed_service_reuse_refusal, no_usable_gpu_refusal,
-    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
-    validate_bind_host,
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
+    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
 };
 use crate::{
-    GatedEngineAction, cli_progress, collect_serve_notes, device_policy_name,
-    ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
+    GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
+    ensure_engine_allowed_on_platform,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1252,7 +1255,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // launched); permissive when availability cannot be probed on this platform
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     // ROCMAI-541 (B3): the scripted-engine E2E scenario needs a real managed
@@ -1265,6 +1270,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !cpu_only
         && !scripted_backend_failure
         && !scripted_engine_death
+        && !e2e_simulate_oom_launch()
         && !reuse_existing
         && host_has_no_usable_gpu
     {
@@ -1285,14 +1291,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
-    // Whether *any* visibility mask is active. The visible set alone cannot say:
-    // with no mask it is just `0..present`, indistinguishable from a HIP mask
-    // that happens to list the low ordinals. `validate_pinned_gpu_index` uses
-    // this only to word its rejection — "under the active visibility mask" when a
-    // mask is set, "not present on this host" when none is — so an out-of-range
-    // `--gpu` on an unmasked host is not blamed on a mask the user never set.
-    let visibility_mask_active =
-        rocr_visible_devices_set || std::env::var_os("HIP_VISIBLE_DEVICES").is_some();
+    // Which visibility variables name a mask that acts on this platform, or
+    // `None` when none does. The visible set alone cannot say: with no mask it
+    // is just `0..present`, indistinguishable from a HIP mask that happens to
+    // list the low ordinals. `validate_pinned_gpu_index` uses this only to word
+    // its rejection — "under the active visibility mask" when a mask is set,
+    // "not present on this host" when none is — so an out-of-range `--gpu` on an
+    // unmasked host is not blamed on a mask the user never set. Native Windows
+    // HIP has no ROCr layer, so `ROCR_VISIBLE_DEVICES` is no mask there.
+    let visibility_mask = active_visibility_mask(
+        rocr_visible_devices_set,
+        std::env::var_os("HIP_VISIBLE_DEVICES").is_some(),
+        rocm_core::runtime_is_windows(),
+    );
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
     // Validate an explicit `--gpu <index>` up front — before engine/runtime
     // resolution — so an out-of-range or masked-out ordinal produces a
@@ -1307,13 +1318,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // The single exception is the reuse exemption, which by construction only
     // runs on a host the bail above already applies to — where `visible_gpu_indices`
     // is `Some([])` and so *every* `--gpu <index>` is out of range anyway.
+    //
+    // On native Windows `visible_gpu_indices` is always `None` and amd-smi is
+    // usually missing or unusable, so the index had nothing to be checked
+    // against and `--gpu 7` on a one-GPU machine was accepted (ROCMAI-824).
+    // There the AMD display adapters Windows lists bound the index instead.
+    // That listing is only queried here, for an explicit index: it can count an
+    // adapter HIP does not support, so it may refuse an index but must not pick
+    // one for `--gpu auto`.
     let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
-        Some(validate_pinned_gpu_index(
+        let detected = detect_gpu_count();
+        let bound = pinned_index_bound(
+            visible_gpu_indices.clone(),
+            detected,
+            visibility_mask.is_some(),
+            rocm_core::windows_amd_gpu_listing,
+        );
+        let pinned = validate_pinned_gpu_index(
             *index,
-            detect_gpu_count(),
-            visible_gpu_indices.as_deref(),
-            visibility_mask_active,
-        )?)
+            bound.count,
+            bound.visible.as_deref(),
+            visibility_mask,
+            bound.mask_unresolved,
+        )?;
+        write_unchecked_index_warning(&mut std::io::stderr(), &pinned).ok();
+        Some(pinned.indices)
     } else {
         None
     };
@@ -1516,7 +1545,27 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             gpu_refusal_waived_for_reuse,
             &mut |_elapsed| spinner.tick(),
         )?;
-        ensure_background_helper_running_quiet(summary_mode)?;
+        // Not when the launch was fabricated. `simulate_oom_managed_launch`
+        // writes a `starting` record for a process that never existed, so the
+        // helper would be left watching a pid that will never appear, with
+        // nothing in the scenario's teardown to stop it: observed as `rocm
+        // daemon` processes outliving their e2e checkout by days, still
+        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // supervising a real spawned server, and there is none here.
+        //
+        // That — not ordering — is the whole justification. This suppression
+        // runs *before* the OOM note is computed in the `summary_mode` block
+        // below, so the previous claim here, that the note "is computed before
+        // it would have run", was backwards and could not have excused it.
+        // serve-40's `no background automation daemon was left behind` is what
+        // holds the branch: deleting it left the scenario green with a `rocm
+        // daemon` still running.
+        //
+        // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
+        // the test-only feature, so this branch folds away in shipped builds.
+        if !e2e_simulate_oom_launch() {
+            ensure_background_helper_running_quiet(summary_mode)?;
+        }
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1563,6 +1612,33 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine_serves_vllm,
             );
             notes.extend(engine_env_notes.iter().cloned());
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which ends at `readiness: {status}`
+            // and carries no *post-launch* note. It is not noteless: the
+            // `!summary_mode` branch above still prints the pre-launch planning
+            // lines, low-VRAM `note:` included, so the asymmetry is precisely
+            // that the OOM confirmation and the `rocm diagnose --symptom`
+            // command are missing — not that the path prints nothing. That path
+            // is machine-readable by design and is not the place to grow prose,
+            // but it does mean the same failed launch is explained in one
+            // invocation and not the other.
+            // The engine *name*, not `engine_serves_vllm`: the note's gate is
+            // derived inside `append_oom_serve_note` from the value it is about,
+            // because a boolean here was a call-site seam no test could hold.
+            let notes = serve_summary::append_oom_serve_note(
+                notes,
+                &selected_engine,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
+            );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -1601,6 +1677,55 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         require_api_key,
         gpu_refusal_waived_for_reuse,
     )
+}
+
+/// GPU/device warnings folded into the interactive deployment summary. Mirrors the
+/// inline warnings printed in the plain serve plan, in the same order.
+#[allow(clippy::too_many_arguments)]
+fn collect_serve_notes(
+    cpu_only: bool,
+    gpu_selection: &GpuSelection,
+    rocr_visible_devices_set: bool,
+    gpu_indices: &[u32],
+    gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    engine_is_vllm: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
+    if cpu_only {
+        if matches!(gpu_selection, GpuSelection::Index(_)) {
+            notes.push(
+                "--gpu was ignored because --device cpu_only runs the model on CPU".to_owned(),
+            );
+        }
+    } else {
+        if rocr_visible_devices_set {
+            notes.push(
+                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
+                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
+                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
+                 ROCR_VISIBLE_DEVICES."
+                    .to_owned(),
+            );
+        }
+        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
+        {
+            notes.push(warning);
+            // vLLM's total-VRAM reservation is what turns a busy card into an OOM;
+            // pair the generic warning with the concrete knob that avoids it.
+            if engine_is_vllm {
+                notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
+            }
+        }
+    }
+    notes
 }
 
 #[cfg(test)]
@@ -2861,5 +2986,133 @@ mod tests {
         assert!(!engine_recipe_enables_tool_choice(Some(&without)));
         let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
         assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+    }
+
+    #[test]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            Some(note),
+            None,
+            false,
+        );
+        assert!(
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
+        );
+
+        let quiet = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214): both this test module
+    /// and `gpu_policy.rs`'s own build `GpuVramUsage` fixtures, and this helper
+    /// has no other home now that `gpu_policy.rs` owns the type.
+    fn vram(index: u32, used_mb: u64, total_mb: u64) -> GpuVramUsage {
+        GpuVramUsage {
+            index,
+            used_mb,
+            total_mb,
+        }
+    }
+
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214) for the same reason as
+    /// `vram` above.
+    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
+        rocm_core::HostGpuSummary {
+            gfx_target: Some(gfx_target.to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        }
+    }
+
+    #[test]
+    fn serve_notes_pair_low_vram_with_the_vllm_utilization_hint() {
+        // A busy discrete card that trips the low-VRAM warning: on vLLM the note
+        // must also carry the concrete `--gpu-memory-utilization` workaround, so
+        // the interactive summary tells the user how to avoid the OOM.
+        let busy = [vram(0, 182_000, 192_000)];
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            true,
+        );
+        assert!(
+            notes.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning must be present: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
+        );
+
+        // The literal fragments the GPU-lane scenario
+        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
+        // only where a real card exists, so pin the wording here too: a rename
+        // then fails on every lane rather than silently on the one lane that can
+        // observe it. `GPU 0 has only` is what makes the warning provably about
+        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
+        // pre-launch hint from any other line that merely names the flag.
+        assert!(
+            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
+            "the warning must name the selected GPU: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("vLLM reserves ~90%")),
+            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
+        );
+
+        // The same busy card on a non-vLLM engine keeps the warning but omits the
+        // vLLM-only knob, which that engine cannot honor.
+        let lemonade = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            false,
+        );
+        assert!(
+            lemonade.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning still fires for other engines: {lemonade:?}"
+        );
+        assert!(
+            !lemonade
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
+        );
     }
 }

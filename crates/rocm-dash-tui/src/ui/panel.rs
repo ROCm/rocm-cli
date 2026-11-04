@@ -21,8 +21,9 @@
 //!
 //! Popup geometry and framing live here too, beside [`popup`]: [`centered_rect`]
 //! (with [`centered_width`]), [`draw_popup_frame`] and [`grey_overlay`], shared by
-//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by
-//! `ui/modal.rs`.
+//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by the
+//! Modal renderers (`ui/help_modal.rs`, `ui/warnings_modal.rs`,
+//! `ui/theme_picker.rs` and `ui/menu.rs`).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -31,7 +32,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{StatusTone, Theme};
 
 /// Semantic role of a box. Drives the border color + tint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,26 @@ pub enum BoxRole {
 }
 
 impl BoxRole {
+    /// The role whose border color matches a [`StatusTone`], so a status-driven
+    /// card takes its border from the same tone as the status text instead of
+    /// a second, parallel status-to-role match.
+    ///
+    /// [`StatusTone::Neutral`] is the one exception: its text color is the
+    /// foreground (`theme.fg`), but no role draws a border in the foreground
+    /// color, so it maps to [`BoxRole::Neutral`] (generic chrome, `theme.border`).
+    #[must_use]
+    pub const fn from_tone(tone: StatusTone) -> Self {
+        match tone {
+            StatusTone::Neutral => Self::Neutral,
+            StatusTone::Muted => Self::Muted,
+            StatusTone::Info => Self::Secondary,
+            StatusTone::Accent => Self::Primary,
+            StatusTone::Warning => Self::Warning,
+            StatusTone::Success => Self::Success,
+            StatusTone::Error | StatusTone::Alert => Self::Danger,
+        }
+    }
+
     /// Base border color for this role.
     #[must_use]
     pub const fn color(self, theme: &Theme) -> Color {
@@ -362,7 +383,7 @@ pub fn horizontal_scrollbar(
 /// overflow a `u16`.
 ///
 /// `area.height * pct_y` overflows above 655 rows once `pct_y` is 100 — which
-/// [`draw_help`](crate::ui::modal::draw_help) now passes, to mean "the whole area when the content is taller
+/// [`draw_help`](crate::ui::help_modal::draw_help) now passes, to mean "the whole area when the content is taller
 /// than it". That is a debug-build panic on a terminal tall enough (tmux panes
 /// and some GUI terminals report large synthetic sizes), and a wrap-around in
 /// release. Widening here removes the ceiling for every caller rather than
@@ -771,5 +792,44 @@ mod tests {
             );
             assert_eq!(super::centered_width(100, u16::MAX, area), w);
         }
+    }
+
+    #[test]
+    fn from_tone_border_matches_the_tone_color() {
+        // A status-driven card's border must be the same color as the status
+        // text for every tone a status enum can map to.
+        let theme = Theme::default_dark();
+        for tone in [
+            StatusTone::Muted,
+            StatusTone::Info,
+            StatusTone::Accent,
+            StatusTone::Warning,
+            StatusTone::Success,
+            StatusTone::Error,
+            StatusTone::Alert,
+        ] {
+            assert_eq!(
+                BoxRole::from_tone(tone).color(&theme),
+                theme.tone_color(tone),
+                "{tone:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_tone_neutral_is_the_documented_exception() {
+        // `Neutral` text is `theme.fg`, but no border role is the foreground
+        // color, so the border falls back to generic chrome. Pinned so the
+        // exception in `from_tone`'s docs stays true.
+        let theme = Theme::default_dark();
+        assert_eq!(BoxRole::from_tone(StatusTone::Neutral), BoxRole::Neutral);
+        assert_eq!(
+            BoxRole::from_tone(StatusTone::Neutral).color(&theme),
+            theme.border
+        );
+        assert_ne!(
+            BoxRole::from_tone(StatusTone::Neutral).color(&theme),
+            theme.tone_color(StatusTone::Neutral)
+        );
     }
 }

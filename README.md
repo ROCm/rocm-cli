@@ -31,16 +31,17 @@ for Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory but not the serving-instance registry; no vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
-only (see [docs/vllm.md](docs/vllm.md)).
+Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
+the serving-instance registry view needs the `rocmdashd` unix socket, so it's
+Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
@@ -226,9 +227,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode reads telemetry over a Unix domain socket, so it requires Linux or
-WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
-GPU or daemon.
+Live mode works on Windows too, but shows only GPU/CPU/memory — the
+serving-instance registry needs the Unix domain socket telemetry, so that view
+is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+anywhere without a GPU or daemon.
 
 ## Configure ROCm and serve a model
 
@@ -856,9 +858,10 @@ own process/container (repeatable); currently only `aim` consumes these (e.g.
 argv and in `rocm services list --json`, so do not put secrets there; pass a
 bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
 current environment without storing it. A service restarted by the daemon
-after a crash inherits the daemon's environment, not yours, so a forwarded
-secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
-5-minute readiness wait for a cold-start model download.
+after a crash (with the `server-recover` automation enabled) inherits the
+daemon's environment, not yours, so a forwarded secret must also be set
+there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
+for a cold-start model download.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -902,7 +905,11 @@ can:
 
 - Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
   the server keeps running. Manage it afterward with `rocm services`.
-- Press **Ctrl-C** to stop the server instead.
+- Press **Ctrl-C** to stop the server instead. If the stop answers that it
+  could not confirm the server's process exited, the command prints the same
+  report as `rocm services stop` on stderr and exits with an error. If the stop
+  itself fails, the command says why on stderr, signals the server process
+  directly and exits 0; if that signal fails too, it says so on stderr.
 
 If the server dies on its own while you are attached, `rocm serve` exits
 **non-zero** and prints why, quoting the end of the service log, and the service
@@ -934,7 +941,20 @@ per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
 is not installed) and picks the lowest-numbered GPU that is idle and not already
 used by another ROCm CLI server (managed or foreground), falling back to the GPU
 with the most free memory. Pass a single index (`--gpu 1`) to pin a specific
-device.
+device. An index the machine does not have is refused before anything starts,
+and the error lists the indices that exist. On Windows the index is checked
+against the AMD display adapters Windows reports (and against the `amd-smi`
+count when that works, whichever is lower). That list can include an adapter the
+ROCm runtime does not support, so on Windows the check can still accept an index
+the runtime cannot use; it is a guard against a mistyped index, not a guarantee
+the device is usable. If neither the Windows list nor `amd-smi` can be read, the
+index is used unchecked and `rocm serve` prints a warning on stderr saying so.
+If a visibility mask is set but cannot be applied (on Windows `HIP_VISIBLE_DEVICES`
+holding an empty value, a UUID, or an ordinal past the adapters Windows lists; on
+Linux a mask when the GPU lists could not be read but `amd-smi` still gives a
+count), the index is still refused when it is at or past the GPU count, and one
+below the count is accepted with a warning that the mask was not applied. When
+`amd-smi` gives a count and no mask is set, the Windows list is not queried.
 
 The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
@@ -995,6 +1015,74 @@ than they are:
   a GPU-less host whether or not a reusable service is running, and so is
   `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
 
+#### When a serve runs out of GPU memory
+
+When a vLLM serve that **this command launched** fails to become ready and its
+engine log shows an out-of-memory failure, the deployment summary adds a note
+confirming the attempt ran out of GPU memory, naming the two knobs that can fix
+it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
+`--gpu <index>` — warning that lowering the reservation will not help if the
+model simply does not fit, and printing a
+`rocm diagnose --symptom '<your failing line>'` command for the full
+busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
+in a shell-quoted argument intact — one containing an apostrophe, for instance —
+is replaced by a canonical vLLM OOM symptom, which reports the same cause.
+
+A line carrying **terminal control bytes** that an *escape sequence* is part of
+— vLLM's colourised logger, or a repaint that moves the cursor with something
+like `ESC[1A` or clears the row with `ESC[2K` — is the one case where the two
+surfaces can print different commands for the same failure, and both are sound.
+(A bare carriage-return repaint is not that case: the log is split on `\r`, so
+the allocator line comes back as a clean segment carrying no escape and the two
+surfaces quote it identically.) The engine's own failure
+message refuses the raw line and falls back to the canonical symptom. The serve
+summary reads the log *after* the engine has echoed its tail into it as the rows
+a terminal would have drawn, so the note quotes that rendered row — real text the
+terminal printed, carrying no control bytes — instead. See
+[docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
+flag itself and the quoting rule each printed command follows.
+
+The note is deliberately narrow, so its absence is not evidence that memory was
+fine. It appears only when all of the following hold:
+
+- The engine is vLLM. It is the only engine with `--gpu-memory-utilization`.
+- You are looking at the **interactive deployment summary** — the default
+  background managed launch with a terminal on stdout. A piped, redirected, or
+  otherwise scripted run prints the plain machine-readable form
+  (`readiness: <status>`), which carries no *post-launch* notes — it still
+  prints the pre-launch planning lines, including the low-VRAM `note:` when
+  amd-smi reports a tight card, so a `note:` in piped output is never this one —
+  and `--verbose`/`--foreground` streams the engine log in your terminal instead,
+  where the traceback is already in front of you. Either way, the log is on
+  disk: `rocm services logs <service-id>`.
+- The service **failed to become ready** (recorded status `starting`). A `ready`
+  service, or a `running` one whose endpoint is up while the model is still
+  loading, is healthy and is never given memory advice.
+- The log tail carries a real allocator failure — `HIP out of memory`,
+  `CUDA out of memory`, `hipErrorOutOfMemory`, or a `torch.OutOfMemoryError`
+  corroborated by an allocator message. A bare "out of memory" phrase from the
+  kernel OOM killer or an unrelated subprocess does not qualify, and a failure
+  with no memory signature is never dressed up as one.
+- **This** invocation launched the process. A `rocm serve` that reuses an
+  already-running service launches nothing, and its summary carries no log path
+  at all, so the running service's log is never read and this invocation is
+  never blamed for another process's failure. Read that service's own log with
+  `rocm services logs <service-id>` instead.
+- **The failing line is still near the end of the log.** The summary reads a
+  fixed tail of the engine log, and it reads it *after* the engine has appended
+  its own failure message — which echoes that same tail back — to the file. A
+  launch that OOMs and then logs another ~80 lines of shutdown can therefore push
+  the allocator line out of the window the summary sees, and no note appears even
+  though the engine's own message (in `rocm services logs <service-id>`, or in
+  `--verbose`/`--foreground` output) names the OOM. The engine's message is the
+  authority on whether the launch ran out of memory; this note is the convenience
+  copy.
+
+If the pre-launch low-VRAM warning already printed the
+`--gpu-memory-utilization` advice for the selected GPU, the OOM note drops that
+one sentence rather than repeating it; the rest of the note — the confirmation,
+the model-too-large caveat, and the `diagnose` command — still appears.
+
 Manage background servers started with `--managed`:
 
 ```
@@ -1005,6 +1093,16 @@ rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`stop` reports a server stopped only once every recorded process is confirmed
+gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
+stderr and exits with an error. It keeps the record, which still names the
+processes, and any endpoint key, which the server may still be enforcing. It
+names each process that, or a process under it, did not exit after it was
+signaled; for a process it could not verify as the server's, it signals nothing
+and names an operating-system command to check on it. It does not suggest
+running the stop again: when only a process under the recorded one survived, a
+second stop can report the server stopped while that process still runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
@@ -1092,7 +1190,9 @@ For `rocm dash`:
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode requires Unix domain sockets (Linux and WSL2 only).
+- Live mode works on Windows too, but shows only GPU/CPU/memory — there's no
+  `rocmdashd` unix socket to connect to there, so the serving-instance
+  registry view stays empty (Linux and WSL2 get the full live view).
 
 ### Bench
 
@@ -1241,6 +1341,14 @@ apply changes automatically. `list` shows the available watchers and their IDs.
   `server-recover` does: it restarts a managed service that failed. The other
   watchers stay review-gated or record only in this mode.
 
+Enabled watchers run in a background helper process (`rocm daemon`), which
+`enable` starts, and `rocm serve` starts too while any watcher is on. All
+watchers are off by default, so serving a model starts no helper. The helper
+exits on its own within a few seconds once no watcher is enabled; disable each
+enabled watcher to stop it. `rocm daemon --status` shows whether it is running.
+The helper is not tied to a service: while a watcher is enabled it outlives
+`rocm services stop`, and that command, like `rocm uninstall`, says so.
+
 ### Configuration
 
 Show or change ROCm CLI's saved settings: the default engine and runtime,
@@ -1302,7 +1410,12 @@ you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
   the managed `uv` package cache, which `--keep-data` controls.
 
 By default, the configuration and data directories are both `~/.rocm`, and the
-cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+cache directory is `~/.rocm/cache`. The `ROCM_CLI_CONFIG_DIR`,
+`ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR` environment variables move them;
+when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
+`<data directory>/cache`. A cache that an earlier version kept at `~/.rocm/cache`
+while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by `rocm
+uninstall`; delete it by hand if you don't need it. `uninstall` removes a category's directory
 unless you keep that category, so on a default installation a flag doesn't
 protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
