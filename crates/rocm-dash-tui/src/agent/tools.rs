@@ -267,9 +267,22 @@ pub const SKILL_NAMES: [&str; 6] = [
 // ---------------------------------------------------------------------------
 // Read-only ROCm machine-inspection tools (group B). These forward the model's
 // tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
-// bin-supplied executor (live dash only). They are READ-ONLY: nothing in this
-// group mutates anything (the mutating tools are group D below, and they only
-// surface an approval request rather than executing). The
+// bin-supplied executor (live dash only). They are READ-ONLY in the approval
+// sense: none of them performs a mutating action (an install, start, stop,
+// uninstall, configuration change, or anything else that needs operator
+// approval). An intent the bin classifies as mutating comes back as
+// `ApprovalRequired` and [`run_rocm_read_tool`] turns it into an error, and the
+// mutating tools are group D below, which only surface an approval request
+// rather than executing. That is a narrower claim than "no side effects":
+// reading can still refresh local bookkeeping and caches. `services`,
+// `service_logs`, `port_status`, `bridge_snapshot` and the `rocm_command`
+// service views reload the managed-service records, which rewrites a record
+// whose state changed (and drops the endpoint key of a service whose requested
+// stop has finished). `doctor`/`examine` can re-register the configured setup
+// runtime in the runtime registry when its entry is missing. `update_check` and
+// `install_sdk_dry_run` cache package-index metadata under the cache folder
+// and, on a host with no usable Python on PATH, can download a managed `uv` and
+// Python into the data folder and record that Python in the saved config. The
 // boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
 // pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------

@@ -4,8 +4,11 @@
 
 //! The chat agent backend, built on **Rig**, plus the Rig tools it calls.
 //!
-//! The tools are read-only ones over cached telemetry and over the host's ROCm
-//! state, and mutating ROCm tools that only surface an approval request.
+//! The telemetry tools only read the cached in-memory snapshot. The read-only
+//! ROCm tools inspect the host and perform no action that needs operator
+//! approval (see the group B comment in `tools` for the bookkeeping writes
+//! reading can still trigger), and the mutating ROCm tools only surface an
+//! approval request.
 //!
 //! THE ONLY MODULE SUBTREE THAT NAMES `rig` TYPES — only `tools` and
 //! `clients` actually import `rig::*` (this file and `snapshot` do not); no
@@ -19,8 +22,8 @@
 //! (not the default Responses API), reached via `CompletionsClient`. Tool
 //! calling uses `agent.prompt(text).max_turns(N).with_history(history)` so the
 //! model can call tools and then answer — one final reply to the UI. A
-//! mutating tool never runs inside that loop: it posts its intent for operator
-//! approval and the model is told it was surfaced.
+//! mutating tool never runs inside that loop: it posts its intent on the
+//! approval channel for the operator and the model is told it was surfaced.
 //!
 //! Split into submodules mirroring the crate's `app/mod.rs` → `app/chat.rs`/
 //! `slash.rs`/`summary.rs` mechanical-relocation convention: this file holds
