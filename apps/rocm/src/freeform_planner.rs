@@ -43,13 +43,13 @@ use rocm_core::{
 use serde::Deserialize;
 use std::fmt::Write as _;
 
-// Both helpers live in `rocm_argv.rs`; they stay reachable here as
-// `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
-// `freeform_execution.rs`, `chat.rs` and `providers.rs`'s tests) and
-// `freeform_planner::serve_args_request_cpu_device` (read by `chat.rs`).
-pub(crate) use crate::rocm_argv::{format_structured_tool_call, serve_args_request_cpu_device};
+// `format_structured_tool_call` lives in `rocm_argv.rs` and stays reachable here
+// as `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
+// `freeform_execution.rs` and `providers.rs`'s tests).
+pub(crate) use crate::rocm_argv::format_structured_tool_call;
+use crate::rocm_argv::serve_args_request_cpu_device;
 use crate::service_launch::is_loopback_host;
-use crate::{Cli, chat, prompt_text, providers, rocm_argv};
+use crate::{Cli, prompt_text, providers, rocm_argv, tool_policy};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
 /// below; production code calls [`plan_freeform_request_with_context`]
@@ -968,7 +968,7 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
         [command] if command == "examine" => {}
         [command, subcommand] if command == "engines" && subcommand == "list" => {}
         [command, subcommand, ..] if command == "install" && subcommand == "sdk" => {
-            chat::validate_chat_rocm_command_safety(&call.args)?;
+            tool_policy::validate_chat_rocm_command_safety(&call.args)?;
         }
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
