@@ -414,8 +414,6 @@ pub(crate) struct TheRockSdkProbeManifest {
     #[serde(default)]
     pub(crate) import_ok: bool,
     #[serde(default)]
-    pub(crate) site_packages: Option<PathBuf>,
-    #[serde(default)]
     pub(crate) root_path: Option<PathBuf>,
     #[serde(default)]
     pub(crate) bin_path: Option<PathBuf>,
@@ -463,95 +461,11 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
         .filter_map(|(_, record)| {
             let sdk = record.rocm_sdk?;
             Some(TheRockSdkProbeCandidate {
-                site_packages: sdk.site_packages,
                 root_path: sdk.root_path?,
-                bin_path: sdk.bin_path?,
                 library_paths: sdk.library_paths,
             })
         })
         .collect()
-}
-
-pub(crate) fn managed_sdk_ld_library_path(
-    candidate: &TheRockSdkProbeCandidate,
-) -> Option<OsString> {
-    let mut paths = Vec::new();
-    collect_managed_runtime_library_paths(
-        &candidate.root_path,
-        candidate.site_packages.as_deref(),
-        &mut paths,
-    );
-    let wsl_lib = PathBuf::from("/usr/lib/wsl/lib");
-    if wsl_lib.is_dir() {
-        paths.push(wsl_lib);
-    }
-    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH")
-        && !existing.is_empty()
-    {
-        paths.extend(std::env::split_paths(&existing));
-    }
-    if paths.is_empty() {
-        None
-    } else {
-        std::env::join_paths(paths).ok()
-    }
-}
-
-/// Every library directory a managed runtime keeps, given its root and the
-/// `site-packages` its SDK recorded.
-///
-/// One description of the layout, deliberately. A wheel-format runtime does not
-/// keep its ROCm libraries under the root: they sit in a sibling `_rocm_sdk_*`
-/// package inside `site-packages`, and a caller that walks the root alone sees
-/// an empty runtime rather than a populated one. That is not a difference a
-/// caller should have to remember, so it lives here and every search shares it.
-pub(crate) fn collect_managed_runtime_library_paths(
-    root: &Path,
-    site_packages: Option<&Path>,
-    paths: &mut Vec<PathBuf>,
-) {
-    collect_sdk_library_paths(root, paths);
-    // Nothing to do when `site_packages` is `None`, and the absence of an
-    // `else` is deliberate rather than an oversight.
-    //
-    // `None` is not reachable from a real candidate today: `ROCM_SDK_PROBE_SCRIPT`
-    // has recorded `site_packages` unconditionally, outside its `try`, since the
-    // probe's initial version, so every manifest that parses at all carries
-    // `Some` here. `site_packages` stays `Option` because the field is
-    // `serde(default)` (a read-only probe cannot depend on a registry record
-    // being current), not because there is a real shape it needs to degrade
-    // gracefully for.
-    //
-    // There also is not a guess worth making if this were ever reached: `root`
-    // is one of the runtime's own `_rocm_sdk_*` package directories (the probe
-    // script's `_devel.get_devel_root()` result, or the first package root it
-    // found when there is no `devel` extra), never a venv root with a
-    // `root/lib/<python>/site-packages` layout underneath it to re-derive. A
-    // fallback that assumed that shape previously shipped here and could not
-    // have been exercised by any real record; removed along with its test
-    // rather than kept as a guess for a case that cannot arise.
-    if let Some(recorded) = site_packages {
-        collect_sdk_package_library_paths(recorded, paths);
-    }
-}
-
-/// Library directories of the `_rocm_sdk_*` packages inside `site_packages`.
-///
-/// They belong to the runtime that contains them, not to themselves.
-fn collect_sdk_package_library_paths(site_packages: &Path, paths: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(site_packages) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name.starts_with("_rocm_sdk_"))
-        {
-            collect_sdk_library_paths(&path, paths);
-        }
-    }
 }
 
 pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
@@ -569,9 +483,7 @@ pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TheRockSdkProbeCandidate {
-    site_packages: Option<PathBuf>,
     pub(crate) root_path: PathBuf,
-    pub(crate) bin_path: PathBuf,
     /// The SDK's own recorded library directories -- every package root the
     /// probe script actually imported and asked Python for (see
     /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
@@ -1213,14 +1125,14 @@ mod tests {
             }
 
             let candidates = managed_therock_sdk_probe_candidates(&registry_dir);
-            let expected_bin_path = temp_root.join("aaa").join("bin");
+            let expected_root_path = temp_root.join("aaa");
             let _ = fs::remove_dir_all(&temp_root);
 
             assert_eq!(
                 candidates
                     .first()
-                    .map(|candidate| candidate.bin_path.clone()),
-                Some(expected_bin_path),
+                    .map(|candidate| candidate.root_path.clone()),
+                Some(expected_root_path),
                 "files first={first_file_key}, second={second_file_key}"
             );
         }

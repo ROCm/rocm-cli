@@ -14,28 +14,14 @@ use super::windows_inventory::{
     parse_windows_examine_inventory,
 };
 use super::{DriverSummary, WslSummary};
-use crate::gfx_target::{parse_windows_display_gfx_target, parse_windows_display_name};
+use crate::gfx_target::parse_windows_display_gfx_target;
 use crate::{discover_rocm_installs, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
-
-pub(super) fn detect_wsl_windows_display_gfx_target(wsl: Option<&WslSummary>) -> Option<String> {
-    if !runtime_is_linux() || wsl.is_none() {
-        return None;
-    }
-
-    detect_wsl_windows_display_gfx_target_fast()
-}
 
 pub(super) fn detect_wsl_windows_display_gfx_target_fast() -> Option<String> {
     detect_wsl_windows_display_probe_text()
         .as_deref()
         .and_then(parse_windows_display_gfx_target)
-}
-
-pub(super) fn detect_wsl_windows_display_name_fast() -> Option<String> {
-    detect_wsl_windows_display_probe_text()
-        .as_deref()
-        .and_then(parse_windows_display_name)
 }
 
 /// What the guest was able to learn about the Windows host's AMD display driver.
