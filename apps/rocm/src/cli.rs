@@ -7,8 +7,8 @@
 //! `--provider`, `--device`, `--framework` and similar arguments.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change: attributes,
-//! help text, defaults, aliases and declaration order (which is help order) are
-//! unchanged. `main.rs` keeps the dispatch over `Command`, the process entry and
+//! help text, defaults, aliases and declaration order (which sets the order of
+//! the nested help lists) are unchanged. `main.rs` keeps the dispatch over `Command`, the process entry and
 //! the completion builder, and re-imports these types so every other module
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
