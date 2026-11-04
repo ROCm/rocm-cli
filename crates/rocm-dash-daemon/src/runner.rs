@@ -1812,6 +1812,11 @@ mod tests {
         assert_eq!(pass.announced(), ["discovered l2"]);
         assert_eq!(current.as_deref(), Some("l2"));
         assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
+        // Pins current behaviour, not a goal: the superseded instance stays in
+        // state (and so in every snapshot) because only its telemetry is purged.
+        // Retiring it later is a deliberate behaviour change, and this assertion
+        // is the one to update when that happens.
+        assert!(pass.state.instances.contains_key("l1"));
 
         pass.reconcile().reconcile_lemonade(None, &mut current);
         assert_eq!(pass.announced(), ["gone l2"]);

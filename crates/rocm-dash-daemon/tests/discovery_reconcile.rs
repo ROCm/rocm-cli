@@ -91,8 +91,8 @@ fn http(status: u16, content_type: &str, body: &str) -> String {
     )
 }
 
-/// A vLLM `/metrics` body with a growing token counter, one running request and
-/// a 25% KV cache.
+/// A vLLM `/metrics` body with a fixed token counter, one running request and a
+/// 25% KV cache.
 fn vllm_metrics() -> String {
     http(
         200,
@@ -149,12 +149,20 @@ fn lemonade_opts(port: u16) -> RunnerOptions {
     }
 }
 
+/// Write the service's registry record. The record is written to a sibling temp
+/// file and renamed into place, so the discovery tick can never read half a
+/// record: a torn read would look like the service vanishing and coming back,
+/// which is exactly what the tests below assert does not happen.
 fn write_record(services_dir: &std::path::Path, port: u16) {
     std::fs::create_dir_all(services_dir).unwrap();
     let json = format!(
         r#"{{"service_id":"{SVC_ID}","engine":"vllm","model_ref":"Reconcile/1B","canonical_model_id":"Reconcile/1B","host":"127.0.0.1","port":{port},"status":"ready","created_at_unix_ms":0}}"#
     );
-    std::fs::write(services_dir.join(format!("{SVC_ID}.json")), json).unwrap();
+    // The registry only reads `*.json`, so the `.tmp` suffix keeps the
+    // half-written file invisible to it.
+    let tmp = services_dir.join(format!("{SVC_ID}.json.tmp"));
+    std::fs::write(&tmp, json).unwrap();
+    std::fs::rename(&tmp, services_dir.join(format!("{SVC_ID}.json"))).unwrap();
 }
 
 /// Read events until `pick` returns a value, or fail at the deadline.
@@ -202,6 +210,10 @@ fn approx(value: Option<f32>, expected: f32) -> bool {
 
 /// The mock's `0.25` KV-cache fraction, which the collector reports as a percent.
 const KV_PCT: f32 = 25.0;
+
+/// Snapshots to keep watching after an event of interest, so an announcement
+/// that trails it by a tick or two is still seen.
+const SETTLE_SNAPSHOTS: usize = 3;
 
 /// Read snapshots until `pick` returns a value. Bounded as a whole, so a
 /// condition that never holds fails at [`DEADLINE`] instead of looping on fresh
@@ -332,6 +344,16 @@ async fn managed_service_is_announced_once_across_rediscovery() {
     );
 }
 
+/// What the stream showed from the moment a service's record changed port.
+#[derive(Default)]
+struct Change {
+    /// The instance as first seen on its new port.
+    moved: Option<Instance>,
+    snapshots_after_move: usize,
+    /// Every discovered/gone announcement for the service in the window.
+    announcements: Vec<&'static str>,
+}
+
 /// The registry's port is the authority: when it changes under the same service
 /// id, the live fields scraped from the old port must not leak onto the new
 /// endpoint, and the change must not be announced as a new service.
@@ -354,12 +376,52 @@ async fn managed_endpoint_change_starts_the_instance_clean() {
     .await;
 
     write_record(&services_dir, silent.port);
-    let moved = snapshot_where(&mut rx, |snap| {
-        instance(snap, SVC_ID)
-            .filter(|i| i.port == Some(silent.port))
-            .cloned()
-    })
+
+    // Watch the stream from the moment the record changes until the instance has
+    // been seen on its new port and has stayed there for a few snapshots, under
+    // one deadline. Any announcement or retirement of the service in that window
+    // means the change was treated as a different service rather than the same
+    // one moving.
+    let mut change = Change::default();
+    observe(
+        &mut rx,
+        "the managed service to appear on its new port",
+        &mut change,
+        |change, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) if inst.container_id == SVC_ID => {
+                    change.announcements.push("discovered");
+                }
+                Event::InstanceGone { container_id } if container_id == SVC_ID => {
+                    change.announcements.push("gone");
+                }
+                Event::Snapshot(snap) if change.moved.is_none() => {
+                    change.moved = instance(snap, SVC_ID)
+                        .filter(|i| i.port == Some(silent.port))
+                        .cloned();
+                }
+                Event::Snapshot(_) => change.snapshots_after_move += 1,
+                _ => {}
+            }
+            change.snapshots_after_move >= SETTLE_SNAPSHOTS
+        },
+        |change| {
+            format!(
+                "moved={}, {} snapshots after the move, announcements {:?}",
+                change.moved.is_some(),
+                change.snapshots_after_move,
+                change.announcements
+            )
+        },
+    )
     .await;
+
+    assert!(
+        change.announcements.is_empty(),
+        "an endpoint change must not announce the service as discovered or gone: {:?}",
+        change.announcements
+    );
+    let moved = change.moved.expect("observe returned before the move");
     assert_eq!(
         moved.kv_cache_usage_pct, None,
         "the old endpoint's kv cache leaked onto the new one"
@@ -411,17 +473,27 @@ async fn lemonade_endpoint_is_announced_scraped_and_announced_gone() {
     })
     .await;
 
-    // Rediscovery does not announce it again.
+    // Rediscovery does not announce it again. One deadline covers the whole
+    // watch, so a runner that stops broadcasting snapshots fails here instead of
+    // each wait starting its own.
     let mut snapshots = 0usize;
-    while snapshots < 6 {
-        match next_event(&mut rx, |ev| Some(ev.clone())).await {
-            Event::InstanceDiscovered(inst) if inst.container_id == id => {
-                panic!("a rediscovered Lemonade endpoint was announced a second time")
+    observe(
+        &mut rx,
+        "6 snapshots with no second announcement of the Lemonade endpoint",
+        &mut snapshots,
+        |snapshots, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) if inst.container_id == id => {
+                    panic!("a rediscovered Lemonade endpoint was announced a second time")
+                }
+                Event::Snapshot(_) => *snapshots += 1,
+                _ => {}
             }
-            Event::Snapshot(_) => snapshots += 1,
-            _ => {}
-        }
-    }
+            *snapshots >= 6
+        },
+        |snapshots| format!("{snapshots} snapshots"),
+    )
+    .await;
 
     server.down.store(true, Ordering::Relaxed);
     next_event(&mut rx, |ev| match ev {
