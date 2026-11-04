@@ -37,6 +37,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+mod package_plan;
 pub mod paths;
 pub mod placeholder;
 mod probe_exec;
