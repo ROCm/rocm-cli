@@ -5342,6 +5342,114 @@ fi
         ci_job(&ci, "clippy");
     }
 
+    /// The other half of the ordering above: with `clippy` no longer ahead of
+    /// `build-and-test`, a clippy-red run reaches the E2E job, so what keeps a
+    /// failed or skipped build from being read as a pass is the E2E job's own
+    /// gate. The job must need `build-and-test`, and every step after the gate step
+    /// must follow the gate's decision. What the gate decides is checked by
+    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict`.
+    #[test]
+    fn ci_e2e_steps_after_the_gate_follow_its_decision() {
+        let ci = read_workflow("ci.yml");
+        let e2e = ci_job(&ci, "e2e");
+        let needs = yaml_value_at(&e2e, 4, "needs").expect("e2e declares `needs:`");
+        assert_eq!(
+            flattened_list_items(&needs),
+            ["changes", "build-and-test"],
+            "the e2e job must need `build-and-test`, which it consumes"
+        );
+        let steps = job_steps(&e2e).expect("e2e has steps");
+        let gate_at = steps
+            .iter()
+            .position(|(name, _)| name == "Decide whether to run")
+            .expect("e2e has a gate step named `Decide whether to run`");
+        assert!(
+            steps.len() > gate_at + 1,
+            "the e2e job has steps after its gate"
+        );
+        for (name, step) in &steps[gate_at + 1..] {
+            assert!(
+                step_key(step, "if").contains("steps.gate.outputs.run == 'true'"),
+                "the e2e step `{name}` must follow the gate's decision, or a failed \
+                 build-and-test would still run it"
+            );
+        }
+    }
+
+    /// Run the e2e gate's own script, the way GitHub runs a step with no `shell:`
+    /// (`bash -e`), over every event and every `build-and-test` result. The gate
+    /// opens once `build-and-test` ran to a verdict, `success` or `failure`: it is
+    /// a matrix over both images and its result is the aggregate, so a failure on
+    /// one image must not skip the other's E2E. A `skipped` or `cancelled` build
+    /// never ran to a verdict, so it must not open the work on a push, a pull
+    /// request or a merge group; only a manual dispatch, which skips
+    /// `build-and-test` on purpose, opens it without one.
+    #[cfg(unix)]
+    #[test]
+    fn ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict() {
+        let ci = read_workflow("ci.yml");
+        let steps = job_steps(&ci_job(&ci, "e2e")).expect("e2e has steps");
+        let gate = steps
+            .iter()
+            .find(|(name, _)| name == "Decide whether to run")
+            .expect("e2e has a gate step named `Decide whether to run`");
+        let script = preflight_body_code(&gate.1);
+        let run = |event: &str, build: &str, heavy: &str| -> String {
+            let script = script
+                .replace("${{ github.event_name }}", event)
+                .replace("${{ needs.build-and-test.result }}", build)
+                .replace("${{ needs.changes.outputs.heavy }}", heavy);
+            assert!(
+                !script.contains("${{"),
+                "the gate reads an expression this test does not substitute: {script}"
+            );
+            let dir = tempfile::tempdir().expect("temp dir");
+            let output = dir.path().join("github_output");
+            std::fs::write(&output, "").expect("creating GITHUB_OUTPUT");
+            let out = std::process::Command::new("bash")
+                .args(["-e", "-c", &script])
+                .env("GITHUB_OUTPUT", &output)
+                .output()
+                .expect("running the e2e gate script");
+            assert_eq!(
+                exit_code(out.status, "the e2e gate script"),
+                0,
+                "the gate script must exit 0 for {event}/{build}/{heavy}"
+            );
+            std::fs::read_to_string(&output)
+                .expect("reading GITHUB_OUTPUT")
+                .trim()
+                .to_owned()
+        };
+
+        for event in ["push", "pull_request", "merge_group"] {
+            for ran in ["success", "failure"] {
+                assert_eq!(
+                    run(event, ran, "true"),
+                    "run=true",
+                    "{event}: a {ran} build-and-test ran to a verdict"
+                );
+                assert_eq!(
+                    run(event, ran, "false"),
+                    "run=false",
+                    "{event}: a {ran} build with no heavy change has no E2E work"
+                );
+            }
+            for bad in ["skipped", "cancelled"] {
+                assert_eq!(
+                    run(event, bad, "true"),
+                    "run=false",
+                    "{event}: a {bad} build-and-test never ran to a verdict and must not open the E2E work"
+                );
+            }
+        }
+        // build-and-test is skipped on a dispatch, so the dispatch opens the gate
+        // without it; the job-level platform gate decides whether the job runs.
+        for build in ["success", "skipped", "failure"] {
+            assert_eq!(run("workflow_dispatch", build, ""), "run=true", "{build}");
+        }
+    }
+
     /// Drive the aggregator's script the way GitHub runs a step with no `shell:`
     /// (`bash -e`) over every result a work job can finish with. A skipped
     /// required check counts as passing, so the dangerous outcomes are the ones
