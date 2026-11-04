@@ -40,21 +40,6 @@ pub const fn is_wide(cols: u16, rows: u16) -> bool {
     cols >= WIDE_COLS && rows >= WIDE_ROWS
 }
 
-/// Split a body rect into (left rail, center, right dock) for the wide layout.
-/// Returns `None` when the body is too narrow to host both rails + a center.
-#[must_use]
-pub const fn triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
-    let min_center = 40u16;
-    if body.width < RAIL_W + DOCK_W + min_center {
-        return None;
-    }
-    let left = Rect::new(body.x, body.y, RAIL_W, body.height);
-    let center_w = body.width - RAIL_W - DOCK_W;
-    let center = Rect::new(body.x + RAIL_W, body.y, center_w, body.height);
-    let right = Rect::new(body.x + RAIL_W + center_w, body.y, DOCK_W, body.height);
-    Some((left, center, right))
-}
-
 /// Draw the right dock appropriate for `tab`: a live LOGS stream for the
 /// operational tabs (Observe/ROCm/Serving), a CONTEXT rail for Home/Chat.
 pub fn draw_right_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -351,16 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn is_wide_and_triptych_extents() {
+    fn is_wide_extents() {
         assert!(!is_wide(160, 44));
         assert!(!is_wide(200, 40));
         assert!(is_wide(180, 45));
-        let (l, c, r) = triptych(Rect::new(0, 0, 200, 50)).unwrap();
-        assert_eq!(l.width, RAIL_W);
-        assert_eq!(r.width, DOCK_W);
-        assert_eq!(l.width + c.width + r.width, 200);
-        // A narrow body yields no triptych.
-        assert!(triptych(Rect::new(0, 0, 100, 50)).is_none());
     }
 
     #[test]

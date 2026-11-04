@@ -1488,6 +1488,22 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// Plant the stub `gh` the missing-report check calls: it prints the file
+    /// `$LISTING` when `lists_artifacts`, and otherwise fails the way an API
+    /// outage does.
+    #[cfg(unix)]
+    fn write_gh_stub(stub: &std::path::Path, lists_artifacts: bool) {
+        let body = if lists_artifacts {
+            "#!/bin/sh\ncat \"$LISTING\"\n"
+        } else {
+            "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n"
+        };
+        // Not `std::fs::write` plus a chmod: the stub is run straight away, which
+        // races other threads' spawns (see `rocm_core::fake_executable`; its own
+        // tests cover the helper, and the report-check tests run this stub).
+        rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
+    }
+
     /// Run a report job's missing-report check script under `bash -e`, as a
     /// `run:` step does, with a stub `gh` that lists `uploaded` (or fails when
     /// `uploaded` is `None`) and a `needs` context of `results`.
@@ -1497,8 +1513,6 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         results: &[(&str, &str)],
         uploaded: Option<&[&str]>,
     ) -> (i32, String, String) {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let script = dir.path().join("check.sh");
         let listing = dir.path().join("artifacts.txt");
@@ -1511,16 +1525,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         )
         .expect("write script");
         std::fs::write(&summary, "").expect("write summary");
-        match uploaded {
-            Some(names) => {
-                std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
-                std::fs::write(&stub, "#!/bin/sh\ncat \"$LISTING\"\n").expect("write gh stub");
-            }
-            None => std::fs::write(&stub, "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n")
-                .expect("write gh stub"),
+        if let Some(names) = uploaded {
+            std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
         }
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_gh_stub(&stub, uploaded.is_some());
 
         let needs: serde_json::Map<String, serde_json::Value> = results
             .iter()

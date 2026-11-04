@@ -2026,16 +2026,16 @@ fn run_render_group(opts: &FixOptions) -> i32 {
         .unwrap_or_default();
     if user.is_empty() {
         fail!("Could not determine current user from $USER/$LOGNAME.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     if !which("usermod") {
         fail!("`usermod` not on PATH; cannot add groups.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let root = is_root();
     if !which("sudo") && !root {
         fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let (program, args): (&str, Vec<String>) = if root {
         (
@@ -2062,23 +2062,23 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     println!("Will run: {program} {}", args.join(" "));
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Add user to render,video groups?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (rc, out, err) = run(program, &arg_refs, RUN_TIMEOUT);
     relay_output(&out, &err);
     if rc != 0 {
         fail!("usermod exited {rc}; group membership NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!("Added {user} to render,video.");
     println!(
         "IMPORTANT: log out and back in (or reboot) for the membership to take effect in new shells and services. `newgrp render` patches the current shell only."
     );
-    0
+    exit::OK
 }
 
 /// fix-2: help the user clear HSA_OVERRIDE_GFX_VERSION for future shells.
@@ -2101,7 +2101,7 @@ fn run_unset_override_linux() -> i32 {
         println!("(This command can't unset it in your parent shell; it only sees a copy.)");
     }
     let Some(home) = home_dir() else {
-        return 0;
+        return exit::OK;
     };
     report_persistent_override(&[
         home.join(".bashrc"),
@@ -2129,7 +2129,7 @@ fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
         .collect();
     if hits.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in your shell rc files.");
-        return 0;
+        return exit::OK;
     }
     println!("\nPersistent HSA_OVERRIDE_GFX_VERSION found in:");
     for f in &hits {
@@ -2144,7 +2144,7 @@ fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
             f.display()
         );
     }
-    0
+    exit::OK
 }
 
 fn run_unset_override_windows(opts: &FixOptions) -> i32 {
@@ -2178,7 +2178,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
 /// `5` as "user declined", and a caller (human or agent) relies on that to
 /// tell "nothing happened because you said no" apart from "nothing happened
 /// because there was nothing to do". Declining just the User scope can't
-/// short-circuit straight to `return 5`, though -- if the Machine scope is
+/// short-circuit straight to `return exit::DECLINED`, though -- if the Machine scope is
 /// also set, the guidance for clearing it (which needs an elevated shell)
 /// still has to print unconditionally, so the decline is recorded in a flag
 /// and checked only once both scopes have had their say.
@@ -2191,7 +2191,7 @@ fn report_and_clear_override_windows(
     if user_val.is_empty() && machine_val.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in either the User");
         println!("or Machine env scope. You're done after closing/reopening shells.");
-        return 0;
+        return exit::OK;
     }
     println!("\nPersistent HSA_OVERRIDE_GFX_VERSION found in:");
     if !user_val.is_empty() {
@@ -2221,7 +2221,7 @@ fn report_and_clear_override_windows(
             relay_output(&out, &err);
             if rc != 0 {
                 fail!("setx exited {rc}; User scope NOT changed.");
-                return 4;
+                return exit::FAILED;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
         } else {
@@ -2239,7 +2239,7 @@ fn report_and_clear_override_windows(
             "or remove it through System Properties -> Environment Variables -> System variables. This command does NOT elevate itself."
         );
     }
-    if declined { 5 } else { 0 }
+    if declined { exit::DECLINED } else { exit::OK }
 }
 
 /// fix-6: persist the ROCm/HIP bin directory on PATH (with consent).
@@ -2256,7 +2256,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
     let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
         fail!("No ROCm install found; nothing to add to PATH.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     let bin_path = install.path.join("bin");
     if !bin_path.is_dir() {
@@ -2264,13 +2264,13 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
             "{} does not exist; nothing to add to PATH.",
             bin_path.display()
         );
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir_owned = bin_path.to_string_lossy().into_owned();
     let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
         fail!("Could not determine your home directory.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
     if let Ok(existing) = std::fs::read_to_string(&rc_file)
@@ -2282,16 +2282,16 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
             "{} already adds {bin_dir} to PATH; no change.",
             rc_file.display()
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     if let Err(exc) = append_line(
         &rc_file,
@@ -2299,14 +2299,14 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         &export_line,
     ) {
         fail!("Failed to write {}: {exc}", rc_file.display());
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Appended to {}. Open a new shell or run `source {}` for the change to take effect.",
         rc_file.display(),
         rc_file.display()
     );
-    0
+    exit::OK
 }
 
 fn run_path_export_windows(opts: &FixOptions) -> i32 {
@@ -2316,7 +2316,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     }
     if sdk_path.is_empty() {
         fail!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir = Path::new(&sdk_path).join("bin");
     if !bin_dir.is_dir() {
@@ -2324,7 +2324,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
             "{} does not exist on disk; HIP SDK install looks incomplete.",
             bin_dir.display()
         );
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir = bin_dir.to_string_lossy().into_owned();
     path_export_windows(opts, &bin_dir, || ps_env_scope("PATH", "User"))
@@ -2370,11 +2370,11 @@ fn path_export_windows(
 ) -> i32 {
     let Some(user_path) = read_user_path() else {
         fail!("Could not read the current User PATH; User PATH NOT changed.");
-        return 4;
+        return exit::FAILED;
     };
     if !user_path.is_empty() && user_path.to_lowercase().contains(&bin_dir.to_lowercase()) {
         println!("User PATH already contains {bin_dir}; no change.");
-        return 0;
+        return exit::OK;
     }
     let new_path = windows_path_prepend(bin_dir, &user_path);
     // Escaped once here, before either the printed preview or the real
@@ -2387,10 +2387,10 @@ fn path_export_windows(
     println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Update User PATH?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     // PowerShell's SetEnvironmentVariable, not `setx`: `setx` silently
     // truncates values past 1024 characters while still exiting 0, which a
@@ -2405,19 +2405,19 @@ fn path_export_windows(
     relay_output(&out, &err);
     if rc != 0 {
         fail!("PowerShell exited {rc}; User PATH NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Added {bin_dir} to your User PATH. This only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
     );
-    0
+    exit::OK
 }
 
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
     if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
         fail!("--device-index must be >= 0 (got {idx}).");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     if runtime_is_windows() {
         run_hip_visible_devices_windows(opts)
@@ -2433,11 +2433,11 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         println!(
             "Run `rocminfo | grep -E 'Agent |Marketing|gfx'` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
         );
-        return 0;
+        return exit::OK;
     };
     let Some(rc_file) = shell_rc_file() else {
         fail!("Could not determine your home directory.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     pin_device_in_rc_file(&rc_file, idx, opts, || {
         confirm(&format!("Append to {}?", rc_file.display()), opts.yes)
@@ -2468,16 +2468,16 @@ fn pin_device_in_rc_file(
             "{} already sets HIP_VISIBLE_DEVICES; edit by hand rather than appending a second copy.",
             rc_file.display()
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !consent() {
-        return 5;
+        return exit::DECLINED;
     }
     if let Err(exc) = append_line(
         rc_file,
@@ -2485,13 +2485,13 @@ fn pin_device_in_rc_file(
         &export_line,
     ) {
         fail!("Failed to write {}: {exc}", rc_file.display());
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Appended to {}. Open a new shell for the change to take effect, then re-run your workload.",
         rc_file.display()
     );
-    0
+    exit::OK
 }
 
 fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
@@ -2505,7 +2505,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "Then re-run with --device-index N (the iGPU is typically device# 0; the dGPU is usually device# 1)."
         );
-        return 0;
+        return exit::OK;
     };
     // Out of scope for ROCMAI-449 (that fix is specific to fix-6-path's
     // read-then-overwrite-the-whole-PATH-value shape): a failed read here
@@ -2516,16 +2516,16 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "User scope already sets HIP_VISIBLE_DEVICES={existing:?}; remove or update it manually rather than overwriting from this command."
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: persist HIP_VISIBLE_DEVICES in the User env scope:");
     println!("  setx HIP_VISIBLE_DEVICES {idx}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     let (rc, out, err) = run(
         "setx",
@@ -2535,12 +2535,12 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     relay_output(&out, &err);
     if rc != 0 {
         fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "setx only takes effect in NEW shells -- close this terminal and reopen it before re-running your workload."
     );
-    0
+    exit::OK
 }
 
 /// Read a Windows environment variable from a given scope via PowerShell.
@@ -4954,5 +4954,391 @@ mod tests {
     fn indent_continuation_keeps_multi_line_verify_under_its_label() {
         assert_eq!(indent_continuation("a\nb\nc", "  "), "a\n  b\n  c");
         assert_eq!(indent_continuation("single", "  "), "single");
+    }
+
+    /// What [`scan_exit_code_literals`] found in a source file.
+    #[derive(Default)]
+    struct ExitCodeScan {
+        /// The `-> i32` functions it inspected, so a test can notice when a
+        /// reorder or rename leaves it looking at fewer of them than it should.
+        checked: Vec<String>,
+        /// `function: literal` for each integer literal reported as a result.
+        bare: Vec<String>,
+    }
+
+    /// Whether a `cfg` predicate holds only in test builds: `test`, or an
+    /// `all(..)` with such a member, or an `any(..)` of which every member is
+    /// such. `not(..)` and every other predicate are not.
+    fn cfg_requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) => {
+                let Ok(members) = syn::parse::Parser::parse2(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    list.tokens.clone(),
+                ) else {
+                    return false;
+                };
+                if list.path.is_ident("all") {
+                    members.iter().any(cfg_requires_test)
+                } else if list.path.is_ident("any") {
+                    !members.is_empty() && members.iter().all(cfg_requires_test)
+                } else {
+                    false
+                }
+            }
+            syn::Meta::NameValue(_) => false,
+        }
+    }
+
+    /// Whether `attrs` carry a `#[cfg(..)]` that holds only in test builds, such
+    /// as `#[cfg(test)]` or `#[cfg(all(test, windows))]`.
+    fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_requires_test(&meta))
+        })
+    }
+
+    /// The text of `expr` when it is an integer literal in any spelling
+    /// (`4`, `4_i32`, `0x4`, `-1`).
+    fn int_literal(expr: &syn::Expr) -> Option<String> {
+        match expr {
+            syn::Expr::Lit(lit) => match &lit.lit {
+                syn::Lit::Int(int) => Some(int.to_string()),
+                _ => None,
+            },
+            syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+                int_literal(&unary.expr).map(|text| format!("-{text}"))
+            }
+            syn::Expr::Paren(paren) => int_literal(&paren.expr),
+            _ => None,
+        }
+    }
+
+    /// Whether `expr` can evaluate to an integer literal: it is one, or an `if`,
+    /// `match` or block with a literal result in some branch.
+    fn yields_literal(expr: &syn::Expr) -> bool {
+        let mut branches = FunctionResults::default();
+        branches.result(expr);
+        !branches.literals.is_empty()
+    }
+
+    fn pattern_name(pat: &syn::Pat) -> Option<String> {
+        match pat {
+            syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+            syn::Pat::Type(typed) => pattern_name(&typed.pat),
+            _ => None,
+        }
+    }
+
+    /// The results of one function body: the integer literals it returns, and
+    /// the names it returns that were set to an integer literal.
+    #[derive(Default)]
+    struct FunctionResults {
+        literals: Vec<String>,
+        returned_names: Vec<String>,
+        literal_locals: std::collections::HashSet<String>,
+    }
+
+    impl FunctionResults {
+        /// Record `expr`, a value the function hands back: look through the
+        /// branches of an `if` or `match` and the block of a tail expression.
+        fn result(&mut self, expr: &syn::Expr) {
+            if let Some(text) = int_literal(expr) {
+                self.literals.push(text);
+                return;
+            }
+            match expr {
+                syn::Expr::Path(path) => {
+                    if let Some(name) = path.path.get_ident() {
+                        self.returned_names.push(name.to_string());
+                    }
+                }
+                syn::Expr::Paren(paren) => self.result(&paren.expr),
+                syn::Expr::Block(block) => self.tail(&block.block),
+                syn::Expr::Unsafe(block) => self.tail(&block.block),
+                syn::Expr::If(branch) => {
+                    self.tail(&branch.then_branch);
+                    if let Some((_, otherwise)) = &branch.else_branch {
+                        self.result(otherwise);
+                    }
+                }
+                syn::Expr::Match(matched) => {
+                    for arm in &matched.arms {
+                        self.result(&arm.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn tail(&mut self, block: &syn::Block) {
+            if let Some(syn::Stmt::Expr(expr, None)) = block.stmts.last() {
+                self.result(expr);
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FunctionResults {
+        fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
+            if let Some(expr) = &ret.expr {
+                self.result(expr);
+            }
+            syn::visit::visit_expr_return(self, ret);
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let (Some(name), Some(init)) = (pattern_name(&local.pat), &local.init)
+                && yields_literal(&init.expr)
+            {
+                self.literal_locals.insert(name);
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+            if let syn::Expr::Path(target) = &*assign.left
+                && let Some(name) = target.path.get_ident()
+                && yields_literal(&assign.right)
+            {
+                self.literal_locals.insert(name.to_string());
+            }
+            syn::visit::visit_expr_assign(self, assign);
+        }
+
+        // A `return` inside a closure or a nested function is that function's
+        // result, not this one's.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+
+        fn visit_item_fn(&mut self, _: &'ast syn::ItemFn) {}
+    }
+
+    fn scan_function(sig: &syn::Signature, body: &syn::Block, scan: &mut ExitCodeScan) {
+        let returns_i32 = matches!(
+            &sig.output,
+            syn::ReturnType::Type(_, ty)
+                if matches!(&**ty, syn::Type::Path(path) if path.path.is_ident("i32"))
+        );
+        if !returns_i32 {
+            return;
+        }
+        let name = sig.ident.to_string();
+        let mut results = FunctionResults::default();
+        syn::visit::Visit::visit_block(&mut results, body);
+        results.tail(body);
+        for literal in &results.literals {
+            scan.bare.push(format!("{name}: {literal}"));
+        }
+        for local in &results.returned_names {
+            if results.literal_locals.contains(local) {
+                scan.bare
+                    .push(format!("{name}: `{local}` is set to an integer literal"));
+            }
+        }
+        scan.checked.push(name);
+    }
+
+    fn scan_items(items: &[syn::Item], scan: &mut ExitCodeScan) {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) if !is_cfg_test(&function.attrs) => {
+                    scan_function(&function.sig, &function.block, scan);
+                }
+                syn::Item::Impl(imp) if !is_cfg_test(&imp.attrs) => {
+                    for item in &imp.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            scan_function(&method.sig, &method.block, scan);
+                        }
+                    }
+                }
+                syn::Item::Mod(module) if !is_cfg_test(&module.attrs) => {
+                    if let Some((_, items)) = &module.content {
+                        scan_items(items, scan);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Find the integer literals that a free or `impl` function returning `i32`
+    /// reports as its result, in `source`, wherever in the file it sits.
+    ///
+    /// It parses the source, so the spelling of the literal does not matter
+    /// (`4i32`, `4_i32`, `0x4`, `-1`), nor does the layout (a one-line `match`,
+    /// a `return 3` with no semicolon, a comment). A literal counts when it is
+    /// the operand of a `return`, the function's tail expression, an arm of a
+    /// tail `if` or `match`, or a local that was set to such a value and is then
+    /// returned by name (tracked by name, without scoping, so an unrelated local
+    /// of the same name can be flagged: a spurious failure, never a miss).
+    ///
+    /// What it does not see: trait default methods, a function nested in a
+    /// function body, a return type spelled through an alias, a literal reaching
+    /// the result through a cast or arithmetic, a helper that returns it, or a
+    /// value read from a struct. So this is a net under the `exit::` constants,
+    /// not a proof that no runner can return a number of its own.
+    fn scan_exit_code_literals(source: &str) -> ExitCodeScan {
+        let file = syn::parse_file(source).expect("the source parses");
+        let mut scan = ExitCodeScan::default();
+        scan_items(&file.items, &mut scan);
+        scan
+    }
+
+    #[test]
+    fn the_bare_exit_code_lint_flags_each_way_of_writing_one() {
+        let scan = scan_exit_code_literals(
+            r"
+            fn tail() -> i32 { 0 }
+            fn returned() -> i32 { return 3; }
+            fn no_semicolon(x: bool) -> i32 { if x { return 3 } exit::OK }
+            fn branches(x: bool) -> i32 { if x { 5 } else { exit::OK } }
+            fn one_line_match(r: Result<(), ()>) -> i32 { match r { Ok(_) => 0, Err(_) => 4 } }
+            fn suffixed() -> i32 { return 4i32; }
+            fn underscored() -> i32 { return 4_i32; }
+            fn hex() -> i32 { return 0x4; }
+            fn negative() -> i32 { return -1; }
+            fn via_local() -> i32 { let rc = 4; rc }
+            fn via_typed_local() -> i32 { let rc: i32 = 4; rc }
+            fn via_assignment() -> i32 { let mut rc = exit::OK; rc = 4; rc }
+            fn via_if_local(c: bool) -> i32 { let code = if c { 3 } else { exit::OK }; return code; }
+            fn via_match_local(rc: i32) -> i32 { let code = match rc { 1 => exit::OK, _ => 4 }; code }
+            fn in_else(c: bool) -> i32 { if c { exit::OK } else { 4 } }
+            fn in_block_arm(r: Result<(), ()>) -> i32 { match r { Ok(_) => exit::OK, Err(_) => { 4 } } }
+            fn in_unsafe() -> i32 { unsafe { 4 } }
+            fn parenthesised() -> i32 { (4) }
+            fn returned_parenthesised() -> i32 { return (4); }
+            fn parenthesised_branch(c: bool) -> i32 { (if c { 4 } else { exit::OK }) }
+            struct Runner;
+            impl Runner { fn method(&self) -> i32 { 3 } }
+            mod inner { pub fn nested() -> i32 { 5 } }
+            #[cfg(not(test))]
+            fn not_test() -> i32 { 3 }
+            #[cfg(any(test, windows))]
+            fn maybe_test() -> i32 { 3 }
+            ",
+        );
+        assert_eq!(
+            scan.bare,
+            [
+                "tail: 0",
+                "returned: 3",
+                "no_semicolon: 3",
+                "branches: 5",
+                "one_line_match: 0",
+                "one_line_match: 4",
+                "suffixed: 4i32",
+                "underscored: 4_i32",
+                "hex: 0x4",
+                "negative: -1",
+                "via_local: `rc` is set to an integer literal",
+                "via_typed_local: `rc` is set to an integer literal",
+                "via_assignment: `rc` is set to an integer literal",
+                "via_if_local: `code` is set to an integer literal",
+                "via_match_local: `code` is set to an integer literal",
+                "in_else: 4",
+                "in_block_arm: 4",
+                "in_unsafe: 4",
+                "parenthesised: 4",
+                "returned_parenthesised: 4",
+                "parenthesised_branch: 4",
+                "method: 3",
+                "nested: 5",
+                "not_test: 3",
+                "maybe_test: 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_bare_exit_code_lint_leaves_named_constants_and_unrelated_integers_alone() {
+        let scan = scan_exit_code_literals(
+            r"
+            fn named(x: bool) -> i32 { if x { return exit::FAILED; } exit::OK }
+            fn compares(rc: i32) -> i32 { if rc != 0 { return exit::FAILED; } exit::OK }
+            fn other_integers() -> i32 {
+                let width = 80;
+                let _ = width;
+                for _ in 0..3 {}
+                exit::OK
+            }
+            fn commented() -> i32 {
+                // return 5; is what this used to say
+                exit::OK
+            }
+            fn closure() -> i32 {
+                let f = |x: i32| { return 7; };
+                f(1);
+                exit::OK
+            }
+            fn not_a_runner() -> usize { 3 }
+            fn nested() -> i32 { fn inner() -> i32 { 7 } exit::OK }
+            #[cfg(test)]
+            mod tests { fn in_tests() -> i32 { 3 } }
+            #[cfg(all(test, windows))]
+            mod windows_tests { fn in_tests() -> i32 { 3 } }
+            #[cfg(test)]
+            fn test_only() -> i32 { 3 }
+            #[cfg(test)]
+            struct TestRunner;
+            #[cfg(test)]
+            impl TestRunner { fn method(&self) -> i32 { 3 } }
+            ",
+        );
+        assert_eq!(scan.bare, Vec::<String>::new());
+        assert_eq!(
+            scan.checked,
+            [
+                "named",
+                "compares",
+                "other_integers",
+                "commented",
+                "closure",
+                "nested"
+            ]
+        );
+    }
+
+    /// Every runner reports its result through `exit::`, so the published
+    /// manifest and the code that produces the codes are meant not to come to
+    /// disagree. [`scan_exit_code_literals`] says what the check can and cannot
+    /// see; `rc != 0` on a child's own status is not a runner result and is not
+    /// matched.
+    #[test]
+    fn fix_runners_return_named_exit_constants_not_integers() {
+        let scan = scan_exit_code_literals(include_str!("fix.rs"));
+        // A reorder or a rename must not leave the scan looking at fewer
+        // runners than it should without anyone noticing.
+        for runner in [
+            "apply",
+            "act_on",
+            "run_render_group",
+            "run_unset_override",
+            "run_unset_override_linux",
+            "report_persistent_override",
+            "run_unset_override_windows",
+            "report_and_clear_override_windows",
+            "run_path_export",
+            "run_path_export_linux",
+            "run_path_export_windows",
+            "path_export_windows",
+            "run_hip_visible_devices",
+            "run_hip_visible_devices_linux",
+            "pin_device_in_rc_file",
+            "run_hip_visible_devices_windows",
+        ] {
+            assert!(
+                scan.checked.iter().any(|name| name == runner),
+                "the scan no longer inspects `{runner}`; checked: {:?}",
+                scan.checked
+            );
+        }
+        assert_eq!(
+            scan.bare,
+            Vec::<String>::new(),
+            "use exit::OK, exit::NOT_APPLICABLE, exit::FAILED or exit::DECLINED"
+        );
     }
 }

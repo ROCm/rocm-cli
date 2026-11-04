@@ -189,6 +189,10 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// The `rocmd run` a daemon-driven automations scenario started, with the
+    /// local webhook it listens on. Held here so `Drop` can kill and reap it
+    /// whatever the scenario's outcome.
+    pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -345,6 +349,7 @@ impl Default for E2eWorld {
             helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
+            automation_daemon: None,
         }
     }
 }
@@ -669,6 +674,11 @@ impl Drop for E2eWorld {
         // removed — so it never outlives the scenario or races teardown.
         if let Some(tui) = self.tui.take() {
             drop(tui);
+        }
+        // Stop the automation daemon before the isolated directory it writes its
+        // state and logs into is removed, so it never outlives the scenario.
+        if let Some(daemon) = self.automation_daemon.take() {
+            drop(daemon);
         }
         // Let `service-cleanup-07`'s staged launch finish and join it, so its last
         // write lands while the isolated root still exists rather than panicking
