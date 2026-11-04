@@ -1219,7 +1219,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "log line",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/catalog.rs",
         "rocm diagnose covers Linux, Windows and WSL2. This host reports '{}', which the \
          catalog has no entries for, so nothing was checked -- this is not a clean bill of \
          health. Run `rocm examine --json` and report the platform upstream.",

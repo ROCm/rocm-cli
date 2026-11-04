@@ -684,7 +684,7 @@ Feature: Diagnosing failures and listing fixes
   # These three scenarios see what `rocm fix <id> --dry-run` prints from the
   # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
   # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
-  # in crates/rocm-core/src/diagnose.rs, and a printed line the rule passes is
+  # in crates/rocm-core/src/diagnose/catalog.rs, and a printed line the rule passes is
   # still not proven to run: the Windows-only tests named above do that.
   @id:diagnose-override-fix-lines-are-powershell-safe
   Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell

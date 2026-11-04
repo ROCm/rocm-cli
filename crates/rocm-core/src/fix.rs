@@ -582,7 +582,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        // See the matching comment on this fix's `verify` in diagnose.rs:
+        // See the matching comment on this fix's `verify` in diagnose/linux.rs:
         // must query the targeted amdgpu-dkms package's installed status
         // (not a bare rocm/amdgpu name grep), confirm dkms reports the
         // module built, and check rocminfo's own exit code directly.
@@ -1398,13 +1398,13 @@ fn command_argument(lowered: &str) -> Option<(usize, char, &str)> {
 /// `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`),
 /// `the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
 /// and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-9's Windows
-/// line, which only `diagnose.rs` prints, by
+/// line, which only the `diagnose` module prints, by
 /// `the_igpu_verify_pins_the_variable_it_names`.
-/// Some lines `diagnose.rs` prints are PowerShell-only by design, and are
+/// Some lines the `diagnose` module prints are PowerShell-only by design, and are
 /// checked as such where they are built.
 ///
 /// Shared by the checks on the `RECIPES` catalog here and on the `Fix` values
-/// that `diagnose.rs` builds. A copy of this rule lives in the e2e crate
+/// that the `diagnose` module builds. A copy of this rule lives in the e2e crate
 /// (`powershell_text_rule::refusal`), which cannot depend on rocm-core;
 /// `the_powershell_text_rule_agrees_with_the_shared_case_table` and the test
 /// next to that copy both read `tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt`,
@@ -3180,7 +3180,7 @@ mod tests {
     /// `fails_in_windows_powershell` run the verify lines of fix-2, fix-13,
     /// fix-14, fix-15, fix-21 and fix-22 in a shell; the other catalog lines
     /// are not run. The same
-    /// rule is applied to the `Fix` values that `diagnose.rs` builds, in
+    /// rule is applied to the `Fix` values that the `diagnose` module builds, in
     /// `windows_diagnosis_remediation_passes_the_powershell_text_rule`.
     #[test]
     fn windows_recipes_pass_the_powershell_text_rule() {
@@ -3521,7 +3521,7 @@ mod tests {
     /// name the file: `Get-Item` reports a missing path as a non-terminating
     /// error, so without `-ErrorAction Stop` the line exits 0 with no output
     /// (the case `the_msvc_verify_exits_nonzero_when_a_dll_is_missing` covers
-    /// for fix-15). `diagnose.rs` holds its copy of the line equal to this one.
+    /// for fix-15). `diagnose/windows.rs` holds its copy of the line equal to this one.
     /// Only compiled on Windows.
     #[cfg(windows)]
     #[test]
@@ -4234,10 +4234,10 @@ mod tests {
     fn needs_reboot_true_fix_ids_match_the_known_set() {
         // assert_needs_reboot_matches_the_catalog only ever runs for
         // fix-5-amdgpu-load, so every other fix-id's hardcoded needs_reboot
-        // literals in diagnose.rs have no guard against drifting from the
-        // catalog. This doesn't reach into diagnose.rs, but it does catch an
+        // literals in the `diagnose` modules have no guard against drifting from the
+        // catalog. This doesn't reach into the `diagnose` modules, but it does catch an
         // accidental catalog edit and pins the expected set by name so a
-        // deliberate catalog change forces a look at diagnose.rs's matching
+        // deliberate catalog change forces a look at the `diagnose` modules' matching
         // literals too.
         let expected: std::collections::BTreeSet<&str> = [
             "fix-3-rocm-kernel",
@@ -4749,9 +4749,9 @@ mod tests {
     #[test]
     fn fix_7_apt_commands_match_the_diagnose_copy_verbatim() {
         // Same drift guard as fix_12_apt_commands_match_the_diagnose_copy_verbatim:
-        // diagnose.rs builds its own per-family command list for fix-7 rather than
+        // diagnose/linux.rs builds its own per-family command list for fix-7 rather than
         // reusing this recipe, so drive diagnose() itself instead of comparing
-        // against a hardcoded literal that can't detect diagnose.rs drifting.
+        // against a hardcoded literal that can't detect diagnose/linux.rs drifting.
         let e = crate::examine::Examination {
             os_family: "linux".to_owned(),
             distro_id: "ubuntu".to_owned(),
@@ -4791,8 +4791,8 @@ mod tests {
             "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
         );
 
-        // `verify` must also track diagnose.rs's per-family text, not just
-        // `commands`: diagnose.rs varies `verify` by family too, so compare
+        // `verify` must also track diagnose/linux.rs's per-family text, not just
+        // `commands`: diagnose/linux.rs varies `verify` by family too, so compare
         // each family's line against what diagnose() actually emits for it.
         // The dnf/zypper `ls` lines get the same treatment as apt above --
         // only asserting the apt one left those two families' list commands
@@ -4932,7 +4932,7 @@ mod tests {
         // family, which this catalog entry cannot do -- it prints guidance for
         // every family at once). Drive `diagnose()` itself so a drift between
         // the two copies actually fails this test, rather than comparing
-        // against a hardcoded literal that can't detect diagnose.rs changing
+        // against a hardcoded literal that can't detect diagnose/linux.rs changing
         // out from under it.
         let e = crate::examine::Examination {
             os_family: "linux".to_owned(),

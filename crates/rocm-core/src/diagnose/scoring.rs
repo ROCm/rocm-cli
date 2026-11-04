@@ -176,10 +176,10 @@ pub(super) const KEYWORDS_MSVC_REDIST: KeywordTable = &[
     (r"msvcp140\.dll", 30, "error mentions msvcp140.dll"),
 ];
 
-/// Symptom text for [`check_21_msvc_redist_outdated`].
+/// Symptom text for [`check_21_msvc_redist_outdated`](super::windows::check_21_msvc_redist_outdated).
 ///
 /// An access violation is generic: any native crash prints one. So the code
-/// alone stays under [`MIN_SCORE_FOR_MATCH`] (25), the DLL name alone does too
+/// alone stays under [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) (25), the DLL name alone does too
 /// (30), and the two together (55) reach "likely". A crash report that names
 /// `msvcp140` as the faulting module is specific (55 alone), and with the
 /// exception code it reaches high confidence (80). This table is scored with
@@ -329,7 +329,7 @@ pub(super) const KEYWORDS_VLLM_OOM: KeywordTable = &[
 /// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
 /// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
 ///
-/// `libtorch_cuda.so` alone is worth exactly [`MIN_SCORE_FOR_MATCH`], on
+/// `libtorch_cuda.so` alone is worth exactly [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH), on
 /// purpose. It is the one token in that traceback that cannot mean anything
 /// else — a ROCm build of torch ships `libtorch_hip.so` and never that file —
 /// and a user who pastes only the `OSError` line still has to clear the bar, or
@@ -375,7 +375,7 @@ pub(super) fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<Str
 /// the last `.dll` on the line and covers an independent `msvcp140.dll`,
 /// `dkms .*failed` covers an independent `dpkg: error`, and so on. Since
 /// collapsing can only lower a score, applying it there would push real
-/// diagnoses below [`MIN_SCORE_FOR_MATCH`] and make them vanish
+/// diagnoses below [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) and make them vanish
 /// (`overlap_dedup_does_not_demote_other_catalog_keyword_tables` pins this).
 /// [`KEYWORDS_VLLM_OOM`] is safe because its overlaps are true nestings of
 /// literal phrases, not artifacts of a greedy wildcard.

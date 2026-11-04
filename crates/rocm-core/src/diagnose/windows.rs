@@ -33,7 +33,7 @@ use crate::examine::Examination;
 const MSVC_REDIST_MIN_VERSION: [u32; 2] = [14, 40];
 
 /// Score for a runtime older than [`MSVC_REDIST_MIN_VERSION`] with no symptom.
-/// Equal to [`HIGH_CONFIDENCE`]: the version is read from the machine and the
+/// Equal to [`HIGH_CONFIDENCE`](super::HIGH_CONFIDENCE): the version is read from the machine and the
 /// threshold is a known break, so no symptom is needed to act on it.
 const MSVC_REDIST_OUTDATED_SCORE: i32 = 75;
 
@@ -288,7 +288,7 @@ pub(super) fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> D
 
 /// The score for an old display driver.
 ///
-/// Below [`MIN_SCORE_FOR_MATCH`] on purpose. The entry is advice to look at the
+/// Below [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on purpose. The entry is advice to look at the
 /// driver, not a finding that anything is broken: AMD publishes no minimum
 /// driver version for the HIP SDK or for the Lemonade Vulkan backend. A WEAK
 /// row is shown by `rocm diagnose` and does not set `has_match`.
