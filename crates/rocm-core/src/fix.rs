@@ -813,17 +813,41 @@ mod tests {
     #[test]
     fn fix_runners_return_named_exit_constants_not_integers() {
         let mut scan = scan_exit_code_literals(include_str!("fix.rs"));
-        // The runners' module root and its children are one body of code: scan
-        // every file, so splitting a runner out of `fix.rs` cannot take it out
-        // of the net.
-        for source in [
-            include_str!("fix/options.rs"),
-            include_str!("fix/consent.rs"),
-            include_str!("fix/runners.rs"),
-            include_str!("fix/catalog.rs"),
-            include_str!("fix/render.rs"),
-            include_str!("fix/manifest.rs"),
-        ] {
+        // The module root and its children are one body of code, so the scan
+        // covers `fix.rs` and every file in `fix/`. The list below is held to
+        // the directory, so a child added without being listed fails the test
+        // rather than silently going unscanned.
+        let children: [(&str, &str); 6] = [
+            ("catalog.rs", include_str!("fix/catalog.rs")),
+            ("consent.rs", include_str!("fix/consent.rs")),
+            ("manifest.rs", include_str!("fix/manifest.rs")),
+            ("options.rs", include_str!("fix/options.rs")),
+            ("render.rs", include_str!("fix/render.rs")),
+            ("runners.rs", include_str!("fix/runners.rs")),
+        ];
+        let mut on_disk: Vec<String> =
+            std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fix"))
+                .expect("the fix/ directory is readable")
+                .map(|entry| {
+                    entry
+                        .expect("a directory entry is readable")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| {
+                    std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "rs")
+                })
+                .collect();
+        on_disk.sort();
+        let listed: Vec<&str> = children.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            on_disk, listed,
+            "every file in fix/ must be listed here, or the exit-code lint skips it"
+        );
+        for (_, source) in children {
             let more = scan_exit_code_literals(source);
             scan.checked.extend(more.checked);
             scan.bare.extend(more.bare);
