@@ -29,6 +29,7 @@ mod diagnose_cmd;
 mod driver_install;
 mod driver_plan;
 mod endpoint_keys;
+mod engine_install_env;
 mod engine_ipc;
 mod engine_runtime_select;
 mod engines_cmd;
@@ -117,7 +118,7 @@ use crate::config_cmd::{config, render_config_text};
 use crate::diagnose_cmd::{diagnose, fix};
 use crate::engine_ipc::{run_builtin_engine_serve_http, run_builtin_engine_stdio};
 use crate::engine_runtime_select::{daemon_run_argv, parse_engine_recipe_json_arg};
-use crate::engines_cmd::{engine_manages_own_runtime, engines, runtime_manifest_for_selector};
+use crate::engines_cmd::engines;
 use crate::examine_cmd::examine;
 // `append_examine_runtime_state` has no caller in `main.rs` itself — it is
 // re-imported only so `runtimes_cmd.rs`'s own test module can keep reaching it
