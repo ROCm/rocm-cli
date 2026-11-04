@@ -5322,6 +5322,26 @@ fi
         }
     }
 
+    /// `build-and-test` heads the Linux critical path (build, then the mock E2E
+    /// lane that needs it), so it waits for `prek`, the cheap hygiene gate, but not
+    /// for `clippy`: the two run in parallel and `clippy` stays a required check of
+    /// its own. Putting `clippy` back in `needs:` would silently add its whole
+    /// runtime to every run, so the list is pinned exactly. The `clippy` job must
+    /// still exist, otherwise dropping it from `needs:` would have dropped the check.
+    #[test]
+    fn ci_build_and_test_waits_for_prek_but_not_clippy() {
+        let ci = read_workflow("ci.yml");
+        let needs = yaml_value_at(&ci_job(&ci, "build-and-test"), 4, "needs")
+            .expect("build-and-test declares `needs:`");
+        assert_eq!(
+            flattened_list_items(&needs),
+            ["changes", "prek"],
+            "build-and-test must need `changes` and `prek` and not `clippy`, which runs \
+             alongside it; a lint failure is still caught by the required `clippy` check"
+        );
+        ci_job(&ci, "clippy");
+    }
+
     /// Drive the aggregator's script the way GitHub runs a step with no `shell:`
     /// (`bash -e`) over every result a work job can finish with. A skipped
     /// required check counts as passing, so the dangerous outcomes are the ones
