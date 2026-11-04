@@ -81,32 +81,27 @@
 //! summaries. Every other item in this list has no caller outside this
 //! module and stays private.
 //!
-//! This cluster reaches three items that stayed behind in `main.rs` because
+//! This cluster reaches two items that stayed behind in `main.rs` because
 //! they already had callers outside it: `engine_inventory()` (the built-in
-//! engine list, also read from `update_cmd.rs`),
+//! engine list, also read from `update_cmd.rs` and `bridge_snapshot.rs`) and
 //! `engine_ruled_out_by_platform` (also read from `assess_model_for_host` and
 //! from `main.rs`'s `ensure_engine_allowed_on_platform`; it and the
 //! `PlatformRuleOut` enum it returns, which
 //! `model_registry_adapter_availability_note` and `engine_runtime_status_label`
 //! match on, have since moved to `model_fit.rs` and are re-imported in
-//! `main.rs`, so they are reached the same way), and
-//! `missing_packaged_engine_reason` (already noted in
-//! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
-//! callers outside that cluster, plus its own test — this cluster is one of
-//! them) — all three reached via `use crate::{...};`, the same way other
-//! mechanically relocated modules reach a left-behind crate-root item.
+//! `main.rs`, so they are reached the same way) — both reached via
+//! `use crate::{...};`, the same way other mechanically relocated modules
+//! reach a left-behind crate-root item.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::` and
 //! `write_test_pip_runtime` through `crate::test_support::`, the same way
-//! other mechanically relocated modules do. Two tests interleaved among
+//! other mechanically relocated modules do. One test interleaved among
 //! this cluster's tests in `main.rs`'s old shared `mod tests` stayed behind
-//! because their primary subject is unrelated: `missing_packaged_engine_reason`'s
-//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`)
-//! and the whole-command-tree ASCII-help walk
-//! (`every_help_text_in_the_command_tree_is_ascii`). Two further such tests, for
-//! the CLI audit/lifecycle log, stayed there when this module was split out and
-//! have since moved to `cli_audit.rs`.
+//! because its primary subject is unrelated: the whole-command-tree
+//! ASCII-help walk (`every_help_text_in_the_command_tree_is_ascii`). Two
+//! further such tests, for the CLI audit/lifecycle log, stayed there when this
+//! module was split out and have since moved to `cli_audit.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -137,7 +132,7 @@ use crate::runtimes_cmd::{
 use crate::therock;
 use crate::{
     PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform,
-    engine_ruled_out_by_platform_with, missing_packaged_engine_reason,
+    engine_ruled_out_by_platform_with,
 };
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
@@ -1281,12 +1276,6 @@ fn append_model_engine_support_lines(
                     );
                 }
             }
-        } else if let Some(reason) = missing_packaged_engine_reason(engine) {
-            let _ = writeln!(
-                output,
-                "        {engine}: unavailable reason={}",
-                model_registry_reason(reason)
-            );
         } else {
             let _ = writeln!(output, "        {engine}: not_checked");
         }
@@ -1383,13 +1372,6 @@ fn append_engine_detect_summary(output: &mut String, engine: &str, paths: Option
         }
     };
     let _ = writeln!(output, "    {binary_status}");
-    if !builtin_engine_available(engine)
-        && engine_binary.is_err()
-        && let Some(reason) = missing_packaged_engine_reason(engine)
-    {
-        let _ = writeln!(output, "    note: {reason}");
-        return;
-    }
 
     let Ok(detect) = engine_request::<_, DetectResponse>(
         paths,

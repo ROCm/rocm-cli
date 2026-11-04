@@ -27,13 +27,11 @@
 //! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_request`,
 //! `run_builtin_engine_stdio`), and the built-in HTTP-serving path
 //! (`builtin_engine_available`, `run_builtin_engine_serve_http`,
-//! `builtin_engine_serve_http_args`). Two items sit physically inside this
-//! span in `main.rs` but stay there rather than moving: `const fn
-//! missing_packaged_engine_reason` has callers outside this cluster (and its
-//! own test) in addition to the one inside it, and `impl From<WatcherModeArg>
-//! for WatcherMode` is unrelated clap-arg-to-domain-type conversion that only
-//! happens to sit between `find_engine_plugin_binary` and `engine_request` in
-//! the original file.
+//! `builtin_engine_serve_http_args`). One item sits physically inside this
+//! span in `main.rs` but stays there rather than moving: `impl
+//! From<WatcherModeArg> for WatcherMode` is unrelated clap-arg-to-domain-type
+//! conversion that only happens to sit between `find_engine_plugin_binary` and
+//! `engine_request` in the original file.
 //!
 //! `main.rs` calls into it for `resolve_engine_binary_path`,
 //! `resolve_engine_binary_path_with_paths`, `engine_request`,
@@ -46,8 +44,8 @@
 //! `decode_engine_response`, `with_scoped_builtin_engine_env`,
 //! `builtin_engine_request`, and `ScopedEnvVar` have no callers outside this
 //! module and stay private. Shared helpers this module calls back into at the
-//! crate root — `with_sigpipe_ignored`, `device_policy_name`,
-//! `missing_packaged_engine_reason` — stay in `main.rs` and are reached
+//! crate root — `with_sigpipe_ignored` and `device_policy_name` — stay in
+//! `main.rs` and are reached
 //! unqualified via `use crate::{...}`, same as for other mechanically
 //! relocated modules. `parse_device_policy` moved out of `main.rs` into
 //! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via `use
@@ -76,7 +74,7 @@ use crate::engine_runtime_select::{
     app_path_env_vars, apply_app_path_env, engine_recipe_json_arg, optional_arg,
 };
 use crate::gpu_policy::parse_device_policy;
-use crate::{device_policy_name, missing_packaged_engine_reason, with_sigpipe_ignored};
+use crate::{device_policy_name, with_sigpipe_ignored};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -91,9 +89,6 @@ pub(crate) fn resolve_engine_binary_path_with_paths(
 ) -> Result<PathBuf> {
     if let Some(path) = find_engine_plugin_binary(engine, engine_plugin_dirs(paths))? {
         return Ok(path);
-    }
-    if let Some(reason) = missing_packaged_engine_reason(engine) {
-        bail!("{reason}");
     }
     engine_binary_path(engine)
 }
