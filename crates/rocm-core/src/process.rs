@@ -310,6 +310,20 @@ fn collect_process_tree(root: u32) -> Vec<u32> {
         }
     }
 
+    walk_process_tree(root, &children)
+}
+
+/// Walk `root` plus its transitive descendants over an already-built
+/// parent→children table.
+///
+/// `root` comes first, every other PID comes after its parent, and no PID is
+/// listed twice, so a cycle in the table ends the walk instead of looping it.
+///
+/// Split out of [`collect_process_tree`] so the traversal — the part that
+/// decides which PIDs get signalled — can be exercised against a synthetic
+/// table (cycles, self-parents, shared parents) without touching `/proc`.
+#[cfg(not(windows))]
+fn walk_process_tree(root: u32, children: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
@@ -409,7 +423,27 @@ impl FileLock {
     /// The lock file itself carries no data; it is a rendezvous point, so an
     /// existing file is reused (never truncated) and its contents are ignored.
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -421,9 +455,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.
@@ -1014,6 +1046,12 @@ fn assemble_output(
 
     Ok(output)
 }
+
+/// Property tests for [`walk_process_tree`]; a child module so it can reach
+/// the walk while it stays private.
+#[cfg(all(test, not(windows)))]
+#[path = "process_tree_properties.rs"]
+mod tree_properties;
 
 #[cfg(test)]
 mod tests {

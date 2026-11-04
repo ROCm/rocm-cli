@@ -21,7 +21,10 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     Run {
-        #[arg(long, help = "Enable the persistent watcher loop.")]
+        #[arg(
+            long,
+            help = "Run the watcher loop. It exits on its own once no automation watcher is enabled."
+        )]
         automations_enabled: bool,
         #[arg(
             long,

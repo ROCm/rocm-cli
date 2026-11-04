@@ -4,7 +4,9 @@
 
 //! `rocm services`: the command handler (`services`), which dispatches the
 //! `list`, `logs`, `stop`, `restart`, `remove` and `prune` subcommands, and
-//! `run_approved_service_action`, the approval-gated stop/restart path.
+//! `run_approved_service_action`, the approval-gated stop/restart path, with
+//! `finish_service_action`, which renders its result and fails a stop that
+//! could not confirm the server gone.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `ServicesCommand`, the clap enum it matches on,
@@ -18,7 +20,8 @@
 //! This module reads from `services_text.rs` (the status, logs and action-result
 //! text and the sandbox tool call), `service_records.rs` (remove and prune) and
 //! `service_hints.rs` (the advice text), and records its audit events through
-//! `cli_audit.rs`; none of those modules calls back into this one.
+//! `cli_audit.rs`; none of those modules calls back into this one outside
+//! tests (`services_text.rs`'s tests drive `finish_service_action` directly).
 //!
 //! The cluster's one regression test lives in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::`.
@@ -36,8 +39,9 @@ use crate::service_records::{
     prune_managed_service_records, remove_managed_service_record, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    render_service_action_result, render_service_logs_text, render_services_json,
-    render_services_text, run_internal_sandbox_tool, validate_service_id,
+    render_service_action_result, render_service_action_result_with_helper_note,
+    render_service_logs_text, render_services_json, render_services_text,
+    run_internal_sandbox_tool, service_stop_unconfirmed, validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -134,7 +138,39 @@ pub(crate) fn run_approved_service_action(
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
     let result = run_internal_sandbox_tool(paths, sandbox_tool, Some(service_id.to_owned()), true)?;
-    print!("{}", render_service_action_result(tool, &result));
+    print!(
+        "{}",
+        finish_service_action(paths, tool, service_id, &result)?
+    );
+    Ok(())
+}
+
+/// The text a completed `rocm services <action> --yes` prints, with its audit
+/// event. A stop that could not confirm every recorded process gone is an
+/// error, not a success with a caveat: the same verdict `rocmd`'s MCP
+/// `stop_server` reports as `isError`, and a script chaining on the exit status
+/// must not move on as if the service were down.
+pub(crate) fn finish_service_action(
+    paths: &AppPaths,
+    tool: &str,
+    service_id: &str,
+    result: &serde_json::Value,
+) -> Result<String> {
+    if tool == "stop_server" && service_stop_unconfirmed(result) {
+        record_cli_audit_event(
+            paths,
+            "service",
+            tool,
+            "error",
+            format!("stop of managed service {service_id} not confirmed"),
+            Some(service_id),
+        );
+        bail!("{}", render_service_action_result(tool, result).trim_end());
+    }
+    // The background-helper note describes what is left running after a stop,
+    // so it follows only a confirmed one; the unconfirmed report above already
+    // says what was kept.
+    let rendered = render_service_action_result_with_helper_note(paths, tool, result);
     record_cli_audit_event(
         paths,
         "service",
@@ -146,7 +182,7 @@ pub(crate) fn run_approved_service_action(
         ),
         Some(service_id),
     );
-    Ok(())
+    Ok(rendered)
 }
 
 #[cfg(test)]
@@ -163,7 +199,7 @@ mod tests {
         assert!(error.contains("requires --yes"));
         assert!(error.contains("rocm services stop svc-qwen --yes"));
 
-        let rendered = render_service_action_result(
+        let rendered = crate::services_text::render_service_action_result(
             "stop_server",
             &serde_json::json!({
                 "output": {

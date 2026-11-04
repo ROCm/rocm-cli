@@ -127,8 +127,8 @@ itself.
 The message and the code it describes are usually in different functions and often
 different files, so nothing links them by construction. Where the printed line can be
 derived from the same value the branch is taken on — as `preapproved_install_line` in
-`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
-computed from the decision cannot disagree with it.
+`apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
+message computed from the decision cannot disagree with it.
 
 **A new test is shown to fail when the code it covers is broken.** Before pushing, break
 the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
@@ -246,7 +246,7 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`therock.rs`](apps/rocm/src/therock.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
 
 CLI:
 

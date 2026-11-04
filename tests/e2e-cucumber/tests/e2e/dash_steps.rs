@@ -1759,6 +1759,31 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
     );
 }
 
+#[then("the Home view counts the managed model as running and shows it as loading")]
+async fn home_counts_loading_model_as_running(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let tui = session(world);
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen("Running · 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Home did not count the starting model: {e}"));
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the starting model did not appear on Home: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(&model) && l.contains("loading")),
+        "the loading stage is not on the model's row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Nothing running"),
+        "Home claims nothing is running:\n{screen}"
+    );
+}
+
 #[then("live serving metrics are displayed for the managed model")]
 async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");
