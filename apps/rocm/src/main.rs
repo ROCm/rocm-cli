@@ -82,10 +82,9 @@ mod update_cmd;
 // them from there. Several root-level chat/examine helpers call into
 // `runtimes_cmd` directly; `current_runtime_manifest` stays re-imported here
 // for other root-level commands outside `dispatch()` that call it directly.
-// `select_runtime_manifest`
-// is no longer needed here: `single_ready_runtime_key`/
-// `resolve_runtime_selector_to_exact_key` moved out to
-// `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
+// `select_runtime_manifest` is no longer needed here:
+// `single_ready_runtime_key`/`resolve_runtime_selector_to_exact_key` moved out
+// to `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
 // module's own grouped `use crate::runtimes_cmd::{...}` import instead.
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
