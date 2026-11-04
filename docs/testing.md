@@ -739,6 +739,24 @@ self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
 above, so on WSL2, Windows or a machine with no GPU it would still run the real
 install.
 
+`serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
+restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
+checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
+per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
+the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
+and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
+is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
+dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
+cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
+they stay reachable when the opt-in is set.
+
+Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
+`nightly.yml` installs or checks it). Without it these two scenarios skip on
+every nightly run, and only a manual `include_nightly` dispatch on a host with
+Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
+is reachable ("Report whether Docker is reachable"); check that line before
+relying on this coverage.
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
@@ -1561,6 +1579,36 @@ so it carries `@requires-dir-permissions` and resolves to a skip for a user the
 permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
 than pass without testing the fallback.
 
+Background helper (`rocm daemon`) lifecycle tests:
+
+```bash
+cargo nextest run -p rocm -E 'test(background_helper_not_spawned_when_no_automation_is_enabled) | test(background_helper_spawned_when_an_automation_is_enabled) | test(background_helper_is_started_when_the_exiting_daemon_publishes_stopped) | test(helper_note) | test(stop_output_carries) | test(plan_warns_about_a_helper) | test(unreadable_config)'
+cargo nextest run -p rocmd -E 'test(automation_loop_)'
+```
+
+The first command checks that the autostart shared by `serve` and
+`automations enable` spawns the helper only while an automation watcher is
+enabled, and that an enable racing the helper's exit still gets a helper (the
+decision is made under the autostart lock). The second drives the helper's loop
+with a fast injected tick: it exits on its own once no watcher is enabled,
+keeps running across several ticks while one is, stays when a watcher is
+re-enabled inside the exit window, and publishes "stopped" and clears its spawn
+claim under the autostart lock. The lock wait is its own select arm polled with
+try-lock, so it neither parks a thread nor delays webhook dispatch or shutdown
+(a test shuts the loop down while the lock is held) and gives up a stuck wait.
+The note that `services stop` and `rocm uninstall` print about the helper is
+derived from both whether a watcher is enabled and whether the helper is running:
+`helper_note_follows_watcher_enabled_and_helper_running` pins the exact text for
+all four combinations, `stop_output_carries_the_helper_note_...` and
+`plan_warns_about_a_helper_...` pin what each surface prints for them, and
+`background_helper_autostart_treats_an_unreadable_config_as_no_watcher` keeps a
+bad config from failing a `serve` after its launch. The user-visible side is `automations-11` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature)
+(mock lane: enable starts a live helper, disabling the last watcher makes it
+exit) and `serve-40` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+(GPU lane: serving with no watcher enabled starts no helper).
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -1943,7 +1991,7 @@ many proposals were queued after it:
 cargo test -p rocmd older_than_the_recent_window
 ```
 
-The user-visible side is `automations-11` in
+The user-visible side is `automations-12` in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature). It
 starts the real `rocmd run --automations-enabled --local-webhook-port 0`, posts
 the same thermal alert to its webhook twice with more proposals than the store

@@ -5,15 +5,15 @@
 //! The shared `[y/N]` confirmation prompt.
 //!
 //! Before this module existed, `fix.rs`, `apps/rocm/src/uninstall_plan.rs` and
-//! `apps/rocm/src/therock.rs` each hand-rolled the same print-prompt / flush
-//! stdout / read a line / normalize / match `"y"`/`"yes"` sequence. This is
-//! that sequence, split into the two fallible steps callers compose.
+//! `apps/rocm/src/therock/consent.rs` each hand-rolled the same print-prompt /
+//! flush stdout / read a line / normalize / match `"y"`/`"yes"` sequence. This
+//! is that sequence, split into the two fallible steps callers compose.
 //!
 //! [`print_prompt`] and [`read_answer`] stay two calls rather than one bundled
 //! "ask and read" function because `fix.rs`'s `confirm()` attempts the read
 //! even when the prompt couldn't be written — its behavior before this module
-//! existed — while `uninstall_plan.rs` and `therock.rs` treat a failed write
-//! as fatal, each with their own phase-specific message. A single
+//! existed — while `uninstall_plan.rs` and `therock/consent.rs` treat a failed
+//! write as fatal, each with their own phase-specific message. A single
 //! `Result`-returning function can't express "ignore this step's error and
 //! keep going"; only a caller holding a separate `Result` per step can.
 //!

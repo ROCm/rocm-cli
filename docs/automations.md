@@ -12,7 +12,10 @@ grant a new action, choose a tool, override watcher mode, or run shell.
 
 ## Local Webhook Source
 
-Start the persistent watcher loop with a loopback-only webhook source:
+Start the watcher loop with a loopback-only webhook source. The loop runs only
+while at least one watcher is enabled and exits on its own within a few seconds
+otherwise, so enable one first (for example `rocm automations enable
+gpu-metrics`):
 
 ```bash
 rocmd run --automations-enabled --local-webhook-port 18080
