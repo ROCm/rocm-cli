@@ -913,7 +913,9 @@ long a first-time model download takes, instead of returning `starting` after 45
 seconds; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
-in the background. It cannot be combined with `--foreground` or `--verbose`. Watch the download with
+in the background. It cannot be combined with `--foreground` or `--verbose`, and
+it applies only to a launch: when the model is already being served, `rocm serve`
+reports its current status and returns without waiting. Watch the download with
 `rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 

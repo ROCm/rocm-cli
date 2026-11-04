@@ -39,7 +39,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServiceRecord};
 use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
@@ -737,14 +737,42 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
 }
 
 /// Record a server that died mid-start as stopped, leaving a manifest that a
-/// `services stop` already settled untouched.
+/// `services stop` already settled untouched. A `failed` state the engine
+/// reported is persisted rather than overwritten, so the reason survives.
 fn settle_exited_service(paths: &AppPaths, service_id: &str) {
-    if let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id)
-        && crate::managed_service_status::managed_service_is_live(&latest)
-    {
+    let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
+        return;
+    };
+    let on_disk = latest.status.clone();
+    let _ = latest.refresh_from_engine_state();
+    if crate::managed_service_status::managed_service_is_live(&latest) {
         latest.status = "stopped".to_owned();
-        let _ = latest.write();
+    } else if latest.status == on_disk {
+        return;
     }
+    let _ = latest.write();
+}
+
+/// The failure a `--wait` ends with when the server died before it became
+/// ready, after recording the death in the manifest. `None` while the wait did
+/// not apply, the endpoint is serving, or the server is still alive.
+fn died_during_wait(
+    paths: &AppPaths,
+    service_id: &str,
+    wait_until_ready: bool,
+    readiness: EndpointReadiness,
+    pid_alive: impl Fn(u32) -> bool,
+) -> Option<anyhow::Error> {
+    if !wait_until_ready
+        || readiness == EndpointReadiness::Serving
+        || service_still_live(paths, service_id, pid_alive)
+    {
+        return None;
+    }
+    settle_exited_service(paths, service_id);
+    Some(anyhow!(
+        "the server exited before it became ready; see `rocm logs --service {service_id}` for its output"
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -819,14 +847,14 @@ pub(crate) fn start_managed_service(
     } else {
         probe(on_wait_tick)
     };
-    if wait_until_ready
-        && readiness != EndpointReadiness::Serving
-        && !service_still_live(&paths, service_id, service_pid_is_alive)
-    {
-        settle_exited_service(&paths, service_id);
-        bail!(
-            "the server exited before it became ready; see `rocm logs --service {service_id}` for its output"
-        );
+    if let Some(error) = died_during_wait(
+        &paths,
+        service_id,
+        wait_until_ready,
+        readiness,
+        service_pid_is_alive,
+    ) {
+        return Err(error);
     }
     let launch_status = status_for_readiness(readiness);
     record.status = launch_status.to_owned();
@@ -1636,13 +1664,51 @@ mod tests {
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "stopped");
 
-        // A stop that already settled the record keeps its own fields.
-        record.status = "stopped".to_owned();
-        record.stop_requested_unix_ms = Some(7);
+        // A record that already failed keeps its reason: the guard, not the
+        // overwrite, is what spares it (a `stopped` -> `stopped` rewrite would
+        // be invisible).
+        record.status = "failed".to_owned();
         record.write().expect("write");
         settle_exited_service(&paths, &record.service_id);
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
-        assert_eq!(after.stop_requested_unix_ms, Some(7));
+        assert_eq!(after.status, "failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn died_during_wait_fails_with_a_logs_pointer_and_records_the_death() {
+        let (root, paths) = test_paths("wait-died");
+        paths.ensure().expect("paths");
+        let record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.write().expect("write");
+        let id = record.service_id;
+        let status = || {
+            ManagedServiceRecord::read_manifest(&paths, &id)
+                .unwrap()
+                .status
+        };
+
+        // Not waiting, already serving, or still alive: no failure, no change.
+        let pending = EndpointReadiness::Unreachable;
+        assert!(died_during_wait(&paths, &id, false, pending, |_| false).is_none());
+        assert!(
+            died_during_wait(&paths, &id, true, EndpointReadiness::Serving, |_| false).is_none()
+        );
+        assert!(died_during_wait(&paths, &id, true, pending, |_| true).is_none());
+        assert_eq!(status(), "starting");
+
+        // Dead server: the error names the logs command and the record is settled.
+        let error = died_during_wait(&paths, &id, true, pending, |_| false).expect("died");
+        let message = error.to_string();
+        assert!(
+            message.contains("exited before it became ready"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("rocm logs --service {id}")),
+            "{message}"
+        );
+        assert_eq!(status(), "stopped");
         let _ = fs::remove_dir_all(root);
     }
 
