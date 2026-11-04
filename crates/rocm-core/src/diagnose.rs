@@ -15,8 +15,9 @@
 //! data; the per-check logic mirrors `diagnose.py` field-for-field so the two
 //! stay behaviorally identical.
 //!
-//! This file keeps the public types, the two score thresholds and [`diagnose`]
-//! itself. The rest is in child modules: `catalog` holds the `CHECKERS` table,
+//! This file keeps the public types, the two score thresholds, [`diagnose`]
+//! itself and the two `vllm_*_symptom_is_diagnosable` classifiers that run the
+//! whole catalog. The rest is in child modules: `catalog` holds the `CHECKERS` table,
 //! `scoring` the keyword tables and scoring helpers, `report` the routing and the
 //! text report, and `linux`, `windows`, `wsl`, `host` and `engine` the checks.
 
@@ -251,23 +252,32 @@ mod tests {
     #[test]
     fn no_checker_hand_sets_auto_applicable() {
         // The checkers live in this file and in the modules under `diagnose/`.
-        // The directory is read rather than listed, so a new child module is
-        // scanned without anyone remembering to add it here. Only the test-only
-        // `test_support.rs` is skipped: it builds `Examination` fixtures and no `Fix`.
-        let mut sources = vec![include_str!("diagnose.rs").to_owned()];
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/diagnose");
-        let mut scanned_children = 0;
-        for entry in std::fs::read_dir(dir).expect("the diagnose/ directory is readable") {
-            let path = entry.expect("a readable directory entry").path();
-            let is_rust = path.extension().is_some_and(|ext| ext == "rs");
-            let is_test_support = path
-                .file_name()
-                .is_some_and(|name| name == "test_support.rs");
-            if is_rust && !is_test_support {
-                sources.push(std::fs::read_to_string(&path).expect("a readable source file"));
-                scanned_children += 1;
+        // The directory is walked recursively rather than listed, so a new child
+        // module, nested or not, is scanned without anyone remembering to add it
+        // here. Only the test-only `test_support.rs` is skipped: it builds
+        // `Examination` fixtures and no `Fix`.
+        fn collect(dir: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("a readable directory") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    collect(&path, out);
+                    continue;
+                }
+                let is_rust = path.extension().is_some_and(|ext| ext == "rs");
+                let is_test_support = path
+                    .file_name()
+                    .is_some_and(|name| name == "test_support.rs");
+                if is_rust && !is_test_support {
+                    out.push(std::fs::read_to_string(&path).expect("a readable source file"));
+                }
             }
         }
+        let mut sources = vec![include_str!("diagnose.rs").to_owned()];
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/diagnose");
+        let mut children = Vec::new();
+        collect(std::path::Path::new(dir), &mut children);
+        let scanned_children = children.len();
+        sources.extend(children);
         assert!(
             scanned_children > 0,
             "no module under {dir} was scanned, so this guard would pass vacuously"
