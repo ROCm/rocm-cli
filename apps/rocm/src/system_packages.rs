@@ -13,7 +13,7 @@
 //! `rocm install sdk` (`SdkInstallConsents`) stays in `runtime_install_finalize.rs`,
 //! which passes the plain `system_packages` bool in. That module re-exports
 //! `ensure_openmpi_for_vllm`, `ensure_libatomic_for_torch` and
-//! `ensure_libnuma_for_torch` for `main.rs` and `engines_cmd.rs`, and
+//! `ensure_libnuma_for_torch` for `install_cmd.rs` and `engines_cmd.rs`, and
 //! `driver_install.rs` reads `real_os_release` from here directly.
 
 use std::process::{Command as ProcessCommand, Stdio};
