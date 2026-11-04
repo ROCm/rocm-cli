@@ -1577,36 +1577,10 @@ mod tests {
     use super::*;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
+        test_runtime_state, test_watcher_snapshot,
     };
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
     use std::fs;
-
-    fn test_watcher_snapshot(
-        id: &str,
-        mode: WatcherMode,
-        last_event_unix_ms: Option<u128>,
-    ) -> WatcherRuntimeSnapshot {
-        WatcherRuntimeSnapshot {
-            id: id.to_owned(),
-            enabled: true,
-            mode,
-            summary: "test watcher".to_owned(),
-            last_event: None,
-            last_event_unix_ms,
-        }
-    }
-
-    fn test_runtime_state(active_watchers: Vec<WatcherRuntimeSnapshot>) -> AutomationRuntimeState {
-        AutomationRuntimeState {
-            running: true,
-            automations_enabled: true,
-            daemon_pid: 1,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 1,
-            local_webhook_endpoint: None,
-            active_watchers,
-        }
-    }
 
     #[test]
     fn event_collector_emits_schedule_tick_for_due_update() -> Result<()> {

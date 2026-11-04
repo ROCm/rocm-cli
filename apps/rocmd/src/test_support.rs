@@ -11,7 +11,10 @@
 //! split into focused modules (see `docs/architecture.md`).
 
 use anyhow::Result;
-use rocm_core::{AppPaths, ManagedServiceRecord, unix_time_millis};
+use rocm_core::{
+    AppPaths, AutomationRuntimeState, ManagedServiceRecord, WatcherMode, WatcherRuntimeSnapshot,
+    unix_time_millis,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -184,6 +187,38 @@ pub(crate) fn assert_unconfirmed_stop_kept_the_service(
         "an unconfirmed stop must hand key cleanup to the liveness refresh"
     );
     assert!(key_kept, "an unconfirmed stop must keep the endpoint key");
+}
+
+/// One enabled watcher snapshot in `mode`, for tests that build an automation
+/// runtime state by hand.
+pub(crate) fn test_watcher_snapshot(
+    id: &str,
+    mode: WatcherMode,
+    last_event_unix_ms: Option<u128>,
+) -> WatcherRuntimeSnapshot {
+    WatcherRuntimeSnapshot {
+        id: id.to_owned(),
+        enabled: true,
+        mode,
+        summary: "test watcher".to_owned(),
+        last_event: None,
+        last_event_unix_ms,
+    }
+}
+
+/// A running automation runtime state carrying `active_watchers`.
+pub(crate) fn test_runtime_state(
+    active_watchers: Vec<WatcherRuntimeSnapshot>,
+) -> AutomationRuntimeState {
+    AutomationRuntimeState {
+        running: true,
+        automations_enabled: true,
+        daemon_pid: 1,
+        started_at_unix_ms: 1,
+        last_tick_unix_ms: 1,
+        local_webhook_endpoint: None,
+        active_watchers,
+    }
 }
 
 #[cfg(test)]
