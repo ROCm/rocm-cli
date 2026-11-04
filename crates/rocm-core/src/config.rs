@@ -542,7 +542,7 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Persist the config by replacing it via the shared `write_atomic`
+    /// Persist the config by replacing it via the shared `write_file_atomically`
     /// helper (write a sibling temp file, then rename it over `config.json`;
     /// see that helper's own doc for the write/rename/cleanup guarantees).
     ///
@@ -556,7 +556,7 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
-        crate::write_atomic(&path, &bytes, "json")
+        crate::write_file_atomically(&path, &bytes)
             .with_context(|| format!("failed to save rocm-cli config to {}", path.display()))
     }
 

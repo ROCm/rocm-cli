@@ -165,7 +165,7 @@ fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result
 /// server whose engine reported failure while its process is still up reads as
 /// removable, and deleting it takes the log and the 0600 endpoint key out from
 /// under a process that may still be serving.
-fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+pub(crate) fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
     managed_service_is_live(record)
         || recorded_service_pids(record)
             .iter()

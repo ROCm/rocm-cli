@@ -48,7 +48,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, daemon_binary_path};
 
 use crate::managed_service_status::load_managed_services;
-use crate::{remote, uninstall};
+use crate::{remote, uninstall, uninstall_gate};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UninstallOptions {
@@ -125,14 +125,14 @@ pub(crate) fn build_uninstall_plan(
         plan.warnings.push(note);
     }
 
-    let managed_services = load_managed_services(paths).unwrap_or_default();
-    if !managed_services.is_empty() {
-        plan.warnings.push(format!(
-            "{} managed service record(s) exist under {}; background processes are not stopped automatically in this pass",
-            managed_services.len(),
-            paths.services_dir().display()
-        ));
-    }
+    // The gate propagates this error while the plan does not, so a plan that
+    // silently read zero records would tell the operator "no managed services"
+    // about a run that is going to abort on exactly that failure. Keep the plan
+    // non-fatal (it is also the read-only dry-run path) but say what happened.
+    let (managed_services, services_read_error) = match load_managed_services(paths) {
+        Ok(records) => (records, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
 
     // Remote sessions are worse than local ones to drop silently. The model runs
     // on someone else's machine and its endpoint is published there, so removing
@@ -176,7 +176,122 @@ pub(crate) fn build_uninstall_plan(
     plan.actions
         .sort_by(|left, right| left.path.cmp(&right.path));
     plan.actions.dedup_by(|left, right| left.path == right.path);
+
+    if let Some(error) = &services_read_error {
+        // The refusal is real only where the stop pass runs, and that pass is
+        // skipped when the tooling is kept; promising it there would be wrong.
+        let consequence = if plan_removes_recovery_tooling(&plan, paths) {
+            "Uninstall will refuse to remove anything until they can be read"
+        } else {
+            "This run keeps the tooling, so it does not check them"
+        };
+        plan.warnings.push(format!(
+            "could not read the managed service records under {}: {error}. {consequence}",
+            paths.services_dir().display()
+        ));
+    }
+
+    // What the stop pass would refuse, decided by the very function it runs first
+    // (`uninstall_preflight`), so the lines below describe the run that will
+    // happen instead of a promise the gate then breaks. Only meaningful where the
+    // stop pass runs at all: a run that keeps the tooling does not check.
+    let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, paths);
+    let mut preflight_refusal: Option<String> = None;
+    let mut preflight_warnings: Vec<String> = Vec::new();
+    if removes_recovery_tooling && services_read_error.is_none() {
+        match uninstall_gate::uninstall_preflight(paths) {
+            Ok(report) => {
+                preflight_refusal = uninstall_gate::preflight_refusal_line(&report);
+                preflight_warnings = report.warnings;
+            }
+            Err(error) => {
+                preflight_refusal = Some(format!(
+                    "uninstall will refuse to remove anything, and will stop nothing, until the \
+                     managed service records under {} can be checked: {error:#}",
+                    paths.services_dir().display()
+                ));
+            }
+        }
+    }
+    let refusal_line_present = preflight_refusal.is_some();
+    let run_refuses = refusal_line_present || services_read_error.is_some();
+    if let Some(line) = preflight_refusal {
+        plan.warnings.push(line);
+    }
+    // The fail-open disclosures the stop pass would make, shown while the
+    // operator can still decline rather than only after they have confirmed.
+    plan.warnings.append(&mut preflight_warnings);
+
+    if !managed_services.is_empty() {
+        // Two independent conditions decide whether a server actually gets
+        // stopped, and the warning must reflect BOTH or it describes work
+        // uninstall never does: the record has to need stopping, and the plan has
+        // to be removing the tooling that stops it (`uninstall()` skips the whole
+        // stop pass otherwise). A run that will refuse stops nothing at all.
+        let in_use = managed_services
+            .iter()
+            .filter(|record| uninstall_gate::record_needs_stopping(record))
+            .count();
+        let services_dir = paths.services_dir().display().to_string();
+        let total = managed_services.len();
+        plan.warnings.push(if in_use == 0 {
+            // "none is in use", not "none has a running server": this counts
+            // statuses and recorded pids, and a record reads "stopped" the moment
+            // its supervisor is killed even if an engine grandchild kept the
+            // port. The stop pass probes for exactly that, so the plan must not
+            // promise it away — this line is the last thing read before
+            // confirming.
+            format!("{total} managed service record(s) exist under {services_dir}; none is recorded as running")
+        } else if !removes_recovery_tooling {
+            // Cache-only and other tooling-preserving runs: say what is true —
+            // the servers keep running, and they remain stoppable afterwards.
+            format!(
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); this removal keeps `rocm services stop` and the service records, so those servers are left running"
+            )
+        } else if run_refuses {
+            format!(
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); none of them will be stopped, because uninstall will refuse (see above)"
+            )
+        } else {
+            format!(
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); those servers will be stopped before removal"
+            )
+        });
+    }
+
+    // The helper is reported whether or not any service record exists: a live
+    // `rocmd` with an empty services directory still gets force-stopped.
+    if let Some(note) = uninstall_gate::background_helper_plan_note(
+        paths,
+        removes_recovery_tooling,
+        run_refuses,
+        refusal_line_present,
+    ) {
+        plan.warnings.push(note);
+    }
+
     Ok(plan)
+}
+
+/// Whether this plan removes what an operator would need to stop a managed
+/// server afterwards — the `rocm`/`rocmd` binaries, or the service records under
+/// the data directory.
+///
+/// The stop-before-remove gate exists only for that case. A `--keep-binaries
+/// --keep-data` run removes the cache alone: the binaries and every service
+/// record survive, so `rocm services stop` still works and force-stopping live
+/// GPU servers (or hard-aborting a cache cleanup because one will not stop)
+/// would be pure collateral damage.
+pub(crate) fn plan_removes_recovery_tooling(plan: &UninstallPlan, paths: &AppPaths) -> bool {
+    let services_dir = paths.services_dir();
+    // The running executable is not an action on Windows (it is deleted as the
+    // command exits), but it is still the `rocm` that stops servers.
+    plan.self_delete.is_some()
+        || plan.actions.iter().any(|entry| {
+            entry.kind == "binary"
+                || entry.path.starts_with(&services_dir)
+                || services_dir.starts_with(&entry.path)
+        })
 }
 
 /// Plan removing the installed binaries beside the running one, which

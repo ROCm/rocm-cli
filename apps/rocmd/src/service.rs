@@ -336,14 +336,10 @@ fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::T
     // it through an `__engine-serve-http` process. A root-only kill would leave
     // the engine running and still holding the device.
     //
-    // Identity verification does not apply on Windows. `process_start_ticks`
-    // has no `/proc` to read there and returns `None`, so no recorded identity
-    // can be refuted and the gate below only ever turns away a PID that is not
-    // running at all. A recorded PID that has been recycled by an unrelated
-    // process still passes it, and `taskkill /T /F` then takes that process and
-    // its whole subtree: the stale-PID hazard is unchanged on Windows, exactly
-    // as it was before this gate existed. Closing it needs `rocm_core` to read a
-    // Windows process creation time.
+    // Identity verification applies on Windows too: `process_start_ticks` reads
+    // the process creation time there, so a recycled PID is refuted before
+    // `taskkill /T /F` can take an unrelated process and its subtree. Only a
+    // record with no recorded start time has nothing to be refuted against.
     #[cfg(windows)]
     if matches!(
         rocm_core::identity_state(identity),

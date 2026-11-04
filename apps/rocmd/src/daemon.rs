@@ -268,6 +268,9 @@ fn build_runtime_state(
         running: automations_enabled,
         automations_enabled,
         daemon_pid: std::process::id(),
+        // Captured while this process is alive so a later `rocm uninstall` can
+        // tell this daemon from an unrelated process that inherited the PID.
+        daemon_start_ticks: rocm_core::ProcessIdentity::capture(std::process::id()).start_ticks,
         started_at_unix_ms: now,
         last_tick_unix_ms: now,
         local_webhook_endpoint: None,
@@ -294,6 +297,23 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_fresh_runtime_state_records_this_daemons_start_time() {
+        // `rocm uninstall` refuses to signal a daemon pid it cannot prove is
+        // rocmd, and the proof is this field: `None` here would make every
+        // record look pre-upgrade and abort every uninstall that finds a daemon.
+        let state = build_runtime_state(&RocmCliConfig::default(), true);
+        assert_eq!(state.daemon_pid, std::process::id());
+        let recorded = state
+            .daemon_start_ticks
+            .expect("a live daemon must record its own start-time");
+        assert_eq!(
+            Some(recorded),
+            rocm_core::process_start_ticks(std::process::id())
+        );
+    }
 
     #[tokio::test]
     async fn local_webhook_requires_enabled_automation_loop() {
