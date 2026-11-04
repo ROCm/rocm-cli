@@ -739,6 +739,24 @@ self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
 above, so on WSL2, Windows or a machine with no GPU it would still run the real
 install.
 
+`serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
+restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
+checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
+per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
+the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
+and a Radeon or Strix Halo GPU, so they run only where `E2E_INCLUDE_NIGHTLY=1`
+is set on such a host: the nightly Strix Halo lane, or an `include_nightly`
+dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then gets a 105 minute
+cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
+they stay reachable when the opt-in is set.
+
+Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
+`nightly.yml` installs or checks it). Without it these two scenarios skip on
+every nightly run, and only a manual `include_nightly` dispatch on a host with
+Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
+is reachable ("Report whether Docker is reachable"); check that line before
+relying on this coverage.
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
@@ -845,6 +863,7 @@ cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
 cargo test -p rocm --bin rocm logs
 cargo test -p rocm-core model_recipe
+cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
@@ -1123,7 +1142,7 @@ would simply deadlock. Both tests therefore stage the launch from a second
 thread and let the code under test block on it.
 
 - `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
-  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  ([`apps/rocm/src/service_records.rs`](../apps/rocm/src/service_records.rs)) holds the lock on the main thread with only the key
   written, runs `prune` on a worker, asserts the worker does *not* report
   completion while the lock is held, then publishes the record and releases.
   Two assertions fail independently if the acquire is removed: that negative
@@ -1560,6 +1579,36 @@ so it carries `@requires-dir-permissions` and resolves to a skip for a user the
 permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
 than pass without testing the fallback.
 
+Background helper (`rocm daemon`) lifecycle tests:
+
+```bash
+cargo nextest run -p rocm -E 'test(background_helper_not_spawned_when_no_automation_is_enabled) | test(background_helper_spawned_when_an_automation_is_enabled) | test(background_helper_is_started_when_the_exiting_daemon_publishes_stopped) | test(helper_note) | test(stop_output_carries) | test(plan_warns_about_a_helper) | test(unreadable_config)'
+cargo nextest run -p rocmd -E 'test(automation_loop_)'
+```
+
+The first command checks that the autostart shared by `serve` and
+`automations enable` spawns the helper only while an automation watcher is
+enabled, and that an enable racing the helper's exit still gets a helper (the
+decision is made under the autostart lock). The second drives the helper's loop
+with a fast injected tick: it exits on its own once no watcher is enabled,
+keeps running across several ticks while one is, stays when a watcher is
+re-enabled inside the exit window, and publishes "stopped" and clears its spawn
+claim under the autostart lock. The lock wait is its own select arm polled with
+try-lock, so it neither parks a thread nor delays webhook dispatch or shutdown
+(a test shuts the loop down while the lock is held) and gives up a stuck wait.
+The note that `services stop` and `rocm uninstall` print about the helper is
+derived from both whether a watcher is enabled and whether the helper is running:
+`helper_note_follows_watcher_enabled_and_helper_running` pins the exact text for
+all four combinations, `stop_output_carries_the_helper_note_...` and
+`plan_warns_about_a_helper_...` pin what each surface prints for them, and
+`background_helper_autostart_treats_an_unreadable_config_as_no_watcher` keeps a
+bad config from failing a `serve` after its launch. The user-visible side is `automations-11` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature)
+(mock lane: enable starts a live helper, disabling the last watcher makes it
+exit) and `serve-40` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+(GPU lane: serving with no watcher enabled starts no helper).
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -1796,7 +1845,10 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; cover generated private-key PEM packaging and
+sidecars before activation; assert the installer's get-started block (banner art
+only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+piped or `NO_COLOR` output (the colored TTY branch is not driven by any
+scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config
@@ -1929,6 +1981,23 @@ exact event kinds accepted by that watcher, and then dispatches through the
 same watcher policy paths as scheduler, managed-service recovery, GPU
 telemetry, and cache-warm proposal events. See `docs/automations.md` for the
 local curl smoke and accepted fields.
+
+The check that keeps a repeated alert from queueing a second request while the
+first still waits (`gpu-thermal-protect` stop requests, `server-recover` restart
+requests) reads the whole proposal store, so a pending request is found however
+many proposals were queued after it:
+
+```bash
+cargo test -p rocmd older_than_the_recent_window
+```
+
+The user-visible side is `automations-12` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature). It
+starts the real `rocmd run --automations-enabled --local-webhook-port 0`, posts
+the same thermal alert to its webhook twice with more proposals than the store
+keeps of reviewed ones queued in between (beyond a recent-window read of that
+size), and checks that one stop request is left waiting. It is Linux only (`@requires-os:linux`): the managed server's
+recorded process is a disposable `sleep`.
 
 vLLM TheRock GPU acceptance:
 
@@ -2223,7 +2292,7 @@ override that isn't a plain version token is refused rather than silently
 falling back, since it is interpolated into privileged shell commands:
 
 ```bash
-cargo test -p rocm --bin rocm driver_install
+cargo test -p rocm --bin rocm -- driver_install driver_plan
 ```
 
 `driver-install-06` in
@@ -2233,14 +2302,14 @@ repo file and signing key with the host's own suite (`noble` on 24.04,
 `resolute` on 26.04), and the previous-driver warning. The warning command is
 also run against a stubbed `dpkg-query` by
 `previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
-[driver_install.rs](../apps/rocm/src/driver_install.rs).
+[driver_plan.rs](../apps/rocm/src/driver_plan.rs).
 
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with
 [`os_release.rs`](../crates/rocm-core/src/os_release.rs), which returns the
 value `sh` would assign or nothing: the driver plan
-([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
+([`driver_plan.rs`](../apps/rocm/src/driver_plan.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
 examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
@@ -2307,7 +2376,7 @@ directly too, constructing an `OsRelease` from fixture text instead of going
 through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
 [openmpi.rs](../crates/rocm-core/src/openmpi.rs)'s tests, and the equivalent
 `os_release_found` test helper in
-[driver_install.rs](../apps/rocm/src/driver_install.rs)'s (the former is
+[driver_plan.rs](../apps/rocm/src/driver_plan.rs)'s (the former is
 `#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
 `apps/rocm`'s own tests).
 
@@ -2330,7 +2399,7 @@ rather than the real host. The `a_fallback_read_plans*`/
 `an_unreadable_file*`/`distro_name_names_an_unreadable_file` tests in
 `rocm-core` and `rocm` construct an `OsRelease` directly — bypassing the real
 read entirely, since the production functions that do it
-(`openmpi::real_os_release`, `runtime_install_finalize::real_os_release`)
+(`openmpi::real_os_release`, `system_packages::real_os_release`)
 read the real machine
 unconditionally and cannot honour a simulated root — to pin that a
 fallback-sourced read plans and hints identically to a primary-sourced one

@@ -409,7 +409,27 @@ impl FileLock {
     /// The lock file itself carries no data; it is a rendezvous point, so an
     /// existing file is reused (never truncated) and its contents are ignored.
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -421,9 +441,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.

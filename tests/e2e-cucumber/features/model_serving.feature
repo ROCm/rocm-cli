@@ -355,17 +355,27 @@ Feature: Model serving
   # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
   # serves via the raw AIM Docker image reference rather than the catalog
   # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
-  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # exact image/profile, not a catalog-discovery test. Because it names the raw
+  # image, the catalog's GPU-family refusal (no profile for Strix Halo) does not
+  # apply to it. `@requires-engine:aim`
   # skips here when Docker is unreachable OR the gfx family isn't one aim is
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
+  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
+  # image and a 9B checkpoint on a cold runner and may wait out the full
+  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. They run only when
+  # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
+  # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
+  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
+  # skip every night (the nightly job logs whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -380,7 +390,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -571,3 +581,72 @@ Feature: Model serving
     Then the install is refused
     And no vLLM install was started
     And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
+  # Hugging Face token was passed. The check runs ahead of GPU detection and
+  # Docker, so it needs neither and gates every PR (ungated). The refusal names
+  # the remedy and leaves no service record behind; serve-37 proves the named
+  # remedy clears the condition. A Docker that logs its calls shows that nothing
+  # was pulled. serve-38 and serve-39 cover the GPU-dependent refusals.
+  @id:serve-gated-aim-refused-without-hf-token
+  Scenario: serve-36 - A gated AIM image is refused without a Hugging Face token
+    Given Docker is watched for any call
+    When the user serves a gated AIM model without passing a Hugging Face token
+    Then serving is refused before any engine starts
+    And the CLI explains that the model needs a Hugging Face token
+    And no service was started
+    And Docker was never called
+
+  # The remedy printed by serve-36 (`export HF_TOKEN`, then `--engine-env
+  # HF_TOKEN`) must actually clear that refusal. The host's one GPU is one the
+  # image supports and every GPU is masked, so the serve passes the token and
+  # GPU-family gates and stops at the GPU pre-flight, still before anything is
+  # pulled. The GPU is planted, so the outcome does not depend on the runner.
+  # Linux only: the empty `HIP_VISIBLE_DEVICES` mask and the planted kernel
+  # topology are Linux mechanisms.
+  @id:serve-gated-aim-token-remedy-clears-refusal @requires-os:linux
+  Scenario: serve-37 - Passing the exported Hugging Face token clears the gated AIM refusal
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Radeon PRO W7900
+    When the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked
+    Then serving is refused before any engine starts
+    And the refusal is that no usable GPU is visible
+    And Docker was never called
+
+  # An AIM image only carries profiles for some GPUs. On a GPU it has none for,
+  # `rocm serve --engine aim` is refused up front and names what the image does
+  # support, rather than pulling a container that fails inside. The detected GPU
+  # is planted (an Instinct card against a Radeon-only image), so this needs no
+  # AMD hardware and runs on every Linux lane.
+  @id:serve-aim-refused-on-unsupported-gpu @requires-os:linux
+  Scenario: serve-38 - An AIM image is refused on a GPU it has no profile for
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves a Radeon-only AIM image
+    Then serving is refused before any engine starts
+    And the CLI says the image has no profile for this GPU and names the GPUs it supports
+    And Docker was never called
+
+  # `rocm serve` gives an engine one GPU, so an AIM image whose smallest profile
+  # needs several is refused before launch instead of starting with too few.
+  @id:serve-aim-refused-when-it-needs-several-gpus @requires-os:linux
+  Scenario: serve-39 - An AIM image that needs several GPUs is refused
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves an AIM image that needs eight GPUs
+    Then serving is refused before any engine starts
+    And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
+    And Docker was never called
+
+
+  # ROCMAI-827: `rocm serve` started the background automation helper
+  # (`rocm daemon`) on every launch, even with every automation watcher off —
+  # when it has nothing to do — and that helper outlived the service. With no
+  # watcher enabled, serve now starts no helper; the scenario's fresh config
+  # has none enabled. The helper's own lifecycle once a watcher is on is
+  # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
+  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
+    Given a managed runtime is active
+    When the user serves a GGUF model on lemonade with no automation enabled
+    Then serving started no background helper

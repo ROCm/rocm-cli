@@ -1228,7 +1228,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "report heading",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/config_cmd.rs",
         "rocm config",
         "heading of the `rocm config` report (`writeln!(output, \"rocm config\")`)",
     ),
@@ -1466,7 +1466,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --dry-run",
             Surface::CommandLine
         ),
@@ -1475,7 +1475,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --yes",
             Surface::CommandLine
         ),

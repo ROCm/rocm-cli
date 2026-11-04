@@ -282,8 +282,10 @@ Feature: GPU detection and system inspection
   # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
   # machine other than the runner. The driver plan cannot be exercised this way:
   # `rocm install driver` builds a plan that runs against the real machine, so it
-  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
-  # parsing is covered by the unit tests in `driver_install.rs`.
+  # deliberately reads the real `/etc/os-release` (`real_os_release` in
+  # `system_packages.rs`, whose test there pins that it ignores a simulated
+  # host root); the plan built from it is covered by the unit tests in
+  # `driver_plan.rs`.
   #
   # The planted distributions are ones no CI runner or developer host here runs,
   # so a probe that read the real file instead would report a different one.

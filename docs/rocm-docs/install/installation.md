@@ -15,7 +15,9 @@ ROCm CLI ships as a single prebuilt binary. Platform support:
 
 For WSL2 setup and diagnosis, see [ROCm CLI on WSL2](wsl.md).
 
-Live dashboard telemetry requires Linux or WSL2 (see
+Live dashboard GPU/CPU/memory telemetry works on Windows too; the
+serving-instance registry view is Linux/WSL2 only, since there's no
+`rocmdashd` unix socket on Windows (see
 [Interactive interfaces](../getting-started.md#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see
 [vLLM adapter](../engines/vllm.md)).

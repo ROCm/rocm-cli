@@ -30,8 +30,6 @@ use crate::ui::widgets::{
     gpu_stats_line, instances_on_gpu, node_efficiency, power_style, temperature_style, trunc,
 };
 
-/// Rows consumed above the GPU section in [`draw`] (CPU 10 + mem/swap 3 + I/O 3).
-const ROWS_ABOVE_GPUS: u16 = 16;
 /// Height of the GPU-section summary header (partition + efficiency).
 const GPU_HEADER_H: u16 = 1;
 /// Minimum slot height for a "full" GPU panel: border (2) + stats (1) +
@@ -330,20 +328,6 @@ fn plan_gpu_rows(section_h: u16, n: usize) -> (bool, usize) {
     } else {
         (false, cap.saturating_sub(1).max(1)) // reserve one row for the indicator
     }
-}
-
-/// Visible compact-row count for the Hardware Observe sub-panel given the full body height.
-///
-/// Used by `AppState` to keep `gpu_scroll` in sync on navigation. Accounts for
-/// both the rows above the GPU section and the section's own header row.
-pub fn gpu_visible_count(body_h: u16, n: usize) -> usize {
-    let section = body_h.saturating_sub(ROWS_ABOVE_GPUS);
-    let panels = if section >= 2 {
-        section - GPU_HEADER_H
-    } else {
-        section
-    };
-    plan_gpu_rows(panels, n).1
 }
 
 /// Advance/clamp a scroll offset so index `sel` lies within
@@ -727,12 +711,6 @@ mod tests {
         // degenerate visible
         assert_eq!(scroll_to_show(9, 4, 0), 0);
     }
-
-    // ponytail: P3 folds Hardware into Observe; the main selection model now
-    // drives the instances list rather than per-GPU scroll, so the former
-    // `appstate_navigation_advances_gpu_scroll` test is removed.
-    // `scroll_to_show` / `gpu_visible_count` stay unit-tested above and are
-    // reused by Observe's GPU panel.
 
     #[test]
     fn gpu_compact_line_colors_and_truncates() {

@@ -10,13 +10,19 @@
 //! This is a crate-level module that depends on neither `therock` (which writes
 //! manifests when it installs a runtime) nor `runtimes_cmd` (which lists and
 //! activates them); both build on it. `runtimes_cmd` re-exports the selection
-//! and path-helper names that other modules import from it, but it still
-//! reaches the manifest model (the manifest and probe types and the loaders)
-//! through `therock`'s re-exports, along with a few `therock` helpers. So
-//! `runtimes_cmd` depends on `therock`, while `therock` no longer depends on
-//! `runtimes_cmd` in production code. The serde shape of
-//! [`InstalledRuntimeManifest`] and its probe structs is the on-disk contract of
-//! the registry files and of each install's `.rocm-cli-runtime.json`.
+//! and path-helper names that other modules import from it, but it,
+//! `runtime_adopt` and `runtime_uninstall` still reach the manifest model (the
+//! manifest and probe types and the loaders) through `therock`'s re-exports,
+//! along with a few `therock` helpers. So `runtimes_cmd` depends on `therock`,
+//! while `therock` no longer depends on `runtimes_cmd` in production code. It
+//! also holds `paths_equivalent` and `normalize_path_for_compare`, which adopt
+//! and uninstall both need, and the on-disk active-runtime marker
+//! (`ActiveRuntimeMarker`, `active_runtime_marker_path`,
+//! `active_runtime_marker_matches`) that activation writes and uninstall reads
+//! and clears. The serde shape of [`InstalledRuntimeManifest`] and its probe
+//! structs is the on-disk contract of the registry files and of each install's
+//! `.rocm-cli-runtime.json`; the marker is user state too, and its serde shape
+//! is as fixed.
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
@@ -640,6 +646,49 @@ fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = normalize_path_for_compare(left);
+    let right = normalize_path_for_compare(right);
+    rocm_core::runtime_paths_equivalent(&left, &right)
+}
+
+pub(crate) fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ActiveRuntimeMarker {
+    pub(crate) runtime_id: String,
+    pub(crate) runtime_key: String,
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) install_root: PathBuf,
+    pub(crate) previous_runtime_id: Option<String>,
+    pub(crate) previous_runtime_key: Option<String>,
+    pub(crate) activated_at_unix_ms: u128,
+}
+
+pub(crate) fn active_runtime_marker_matches(paths: &AppPaths, runtime_key: &str) -> Result<bool> {
+    let marker_path = active_runtime_marker_path(paths);
+    if !marker_path.is_file() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&marker_path)
+        .with_context(|| format!("failed to read {}", marker_path.display()))?;
+    let marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
+    Ok(marker.runtime_key.eq_ignore_ascii_case(runtime_key))
+}
+
+pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
+    paths.data_dir.join("runtimes").join("active.json")
 }
 
 #[cfg(test)]

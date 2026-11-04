@@ -6,8 +6,8 @@
 //!
 //! Originally a mechanical relocation from `main.rs` with no behavior change —
 //! the `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
-//! re-imported via `use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};`
-//! — `select_serve_engine` rides along for `assess_model_for_host`, not dispatch).
+//! re-imported via `use crate::serve_cmd::{ServeArgs, serve};`; `model_fit.rs`'s
+//! `assess_model_for_host` calls `select_serve_engine` directly).
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
@@ -17,8 +17,10 @@
 //! bail. Read the comment at the pre-gate, not this paragraph, for what the
 //! serve path does today.
 //!
-//! `collect_serve_notes` stays in `main.rs` (no entanglement; a later pass
-//! can relocate it). `detect_gpu_count`, `gpu_vram_usage`,
+//! `collect_serve_notes`, the GPU/device warnings folded into the interactive
+//! summary, was relocated here from `main.rs` verbatim, with its two tests and
+//! their `vram`/`host_gpu` fixtures; `serve` is its only production caller.
+//! `detect_gpu_count`, `gpu_vram_usage`,
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
@@ -38,8 +40,9 @@ use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
 use rocm_core::{
-    AppPaths, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
-    detect_host_gpu_summary, generate_service_id, preferred_serve_engine_for_host_gpu_summary,
+    AppPaths, GfxSupport, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
+    detect_host_gfx_target, detect_host_gpu_summary, engine_recipe_gfx_support,
+    generate_service_id, normalize_therock_family, preferred_serve_engine_for_host_gpu_summary,
     resolve_model_recipe,
 };
 use rocm_engine_protocol::{
@@ -56,7 +59,7 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::gpu_policy::{
-    detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
+    GpuVramUsage, detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
     select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
@@ -68,7 +71,7 @@ use crate::service_launch::{
     validate_bind_host,
 };
 use crate::{
-    GatedEngineAction, cli_progress, collect_serve_notes, device_policy_name,
+    GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
     ensure_engine_allowed_on_platform,
 };
 
@@ -114,7 +117,7 @@ pub(crate) fn select_serve_engine(
     }
 
     if let Some(engine) = recipe
-        .and_then(|recipe| recipe.preferred_engines.first())
+        .and_then(|recipe| recipe_preferred_engine(recipe, host_gpu_summary, cfg!(windows)))
         .filter(|value| !value.trim().is_empty())
     {
         return ServeEngineSelection {
@@ -127,6 +130,51 @@ pub(crate) fn select_serve_engine(
         engine: default_engine_for_platform().to_owned(),
         source: "platform default",
     }
+}
+
+/// The recipe's first preferred engine that can run on this host. AIM is only
+/// chosen on its own when the detected GPU family is one the image has a profile
+/// for and the host is Linux or WSL, so an undetected GPU or native Windows is not,
+/// and on native Windows vLLM is not an option once AIM has been passed over. When no listed engine fits, the
+/// platform default applies, as it did before the recipe was catalogued. An
+/// explicit `--engine aim` never comes through here, and still gets the refusal
+/// that names the supported GPUs.
+fn recipe_preferred_engine<'a>(
+    recipe: &'a ModelRecipeRecord,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    windows: bool,
+) -> Option<&'a str> {
+    let is_aim = |engine: &str| engine.eq_ignore_ascii_case("aim");
+    let aim_usable = !windows
+        && recipe
+            .engine_recipes
+            .iter()
+            .find(|record| is_aim(&record.engine))
+            .is_none_or(|record| {
+                matches!(
+                    engine_recipe_gfx_support(
+                        record,
+                        host_gpu_summary.and_then(|summary| summary.therock_family.as_deref()),
+                    ),
+                    GfxSupport::Supported(_)
+                ) || record.supported_gfx_families.is_empty()
+            });
+    // Native Windows has no vLLM, but a recipe whose first engine is vLLM keeps
+    // it there, as it does without the AIM catalog: the skip applies only when
+    // falling past an AIM first choice that was not usable.
+    let mut passed_unusable_aim = false;
+    recipe
+        .preferred_engines
+        .iter()
+        .map(String::as_str)
+        .find(|engine| {
+            if is_aim(engine) {
+                passed_unusable_aim |= !aim_usable;
+                aim_usable
+            } else {
+                !(windows && passed_unusable_aim && engine.eq_ignore_ascii_case("vllm"))
+            }
+        })
 }
 
 fn model_recipe_supports_engine(recipe: &ModelRecipeRecord, engine: &str) -> bool {
@@ -191,6 +239,184 @@ fn render_serve_engine_recipe_lines(engine_recipe: &EngineRecipeHint) -> String 
         );
     }
     output
+}
+
+/// For AIM, refuses a GPU the catalog has no profile for and pins the catalog's
+/// `AIM_PROFILE_ID` for the detected GPU family. `host_family` is a normalized
+/// TheRock family, `None` when it could not be detected (nothing is enforced
+/// then). Runs before `--engine-env`, so an explicit override still wins.
+fn engine_recipe_with_aim_gfx_profile(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<EngineRecipeHint>,
+    host_family: impl FnOnce() -> Option<String>,
+) -> Result<Option<EngineRecipeHint>> {
+    let Some(aim) = recipe
+        .filter(|_| engine.eq_ignore_ascii_case("aim"))
+        .and_then(|recipe| {
+            recipe
+                .engine_recipes
+                .iter()
+                .find(|record| record.engine.eq_ignore_ascii_case("aim"))
+                .map(|record| (recipe, record))
+        })
+        .filter(|(_, record)| !record.supported_gfx_families.is_empty())
+    else {
+        return Ok(hint);
+    };
+    let (recipe, record) = aim;
+    let family = host_family();
+    match engine_recipe_gfx_support(record, family.as_deref()) {
+        GfxSupport::Unrestricted => Ok(hint),
+        GfxSupport::Unsupported => bail!(
+            "the AIM image for `{}` has no profile for this GPU ({}); it supports: {}. Choose a model \
+             or engine that supports this GPU (`rocm model --verbose`)",
+            recipe.canonical_model_id,
+            family.as_deref().unwrap_or("unknown"),
+            record.supported_gfx_families.join(", ")
+        ),
+        GfxSupport::Supported(profile) => Ok(match (hint, profile) {
+            (Some(mut hint), Some(profile)) => {
+                hint.extra_env
+                    .insert("AIM_PROFILE_ID".to_owned(), profile.to_owned());
+                Some(hint)
+            }
+            (hint, _) => hint,
+        }),
+    }
+}
+
+/// The AIM checks that depend on the host GPU, in the order `serve` applies
+/// them: refuse a family the image has no profile for, pin the profile the
+/// catalog names for the detected family, then refuse an image that needs more
+/// than one GPU. The host is only probed for an AIM record that restricts GPU
+/// families, and not at all for `--device cpu_only`, since these checks are about
+/// the GPU the container would use. An undetected family enforces nothing.
+fn aim_gpu_preflight(
+    engine: &str,
+    model: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<EngineRecipeHint>,
+    cpu_only: bool,
+    detect_family: impl FnOnce() -> Option<String>,
+) -> Result<Option<EngineRecipeHint>> {
+    let family = aim_engine_record(engine, recipe)
+        .filter(|record| !record.supported_gfx_families.is_empty() && !cpu_only)
+        .and_then(|_| detect_family());
+    let hint = engine_recipe_with_aim_gfx_profile(engine, recipe, hint, || family.clone())?;
+    if let Some(needed) = aim_min_gpu_count(engine, recipe, family.as_deref()) {
+        ensure_aim_multi_gpu_supported(model, needed)?;
+    }
+    Ok(hint)
+}
+
+fn aim_engine_record<'a>(
+    engine: &str,
+    recipe: Option<&'a ModelRecipeRecord>,
+) -> Option<&'a rocm_core::ModelRecipeEngineRecord> {
+    recipe
+        .filter(|_| engine.eq_ignore_ascii_case("aim"))?
+        .engine_recipes
+        .iter()
+        .find(|record| record.engine.eq_ignore_ascii_case("aim"))
+}
+
+/// Refuses to launch a gated AIM image before the container is pulled when no
+/// Hugging Face token will reach it: `--engine-env HF_TOKEN=<value>`, or the bare
+/// `--engine-env HF_TOKEN` with `HF_TOKEN` exported (the form that is never
+/// stored). `hint` carries the `--engine-env` entries.
+fn ensure_aim_hf_token(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<&EngineRecipeHint>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    if !aim_engine_record(engine, recipe).is_some_and(|record| record.requires_hf_token) {
+        return Ok(());
+    }
+    let supplied = hint
+        .and_then(|hint| hint.extra_env.get("HF_TOKEN"))
+        .is_some_and(|value| {
+            !value.trim().is_empty() || env("HF_TOKEN").is_some_and(|v| !v.trim().is_empty())
+        });
+    if supplied {
+        return Ok(());
+    }
+    let model = recipe.map_or("<model>", |r| r.canonical_model_id.as_str());
+    bail!(
+        "`{model}` is a gated model and needs a Hugging Face token. Export it and pass the \
+         bare name so it is forwarded and never stored: `export HF_TOKEN=<token>`, then \
+         `rocm serve {model} --engine aim --engine-env HF_TOKEN`"
+    )
+}
+
+/// GPUs an AIM image needs on `family`, when more than one (see
+/// `min_gpu_counts`). `None` when it needs one, or the family is unknown.
+fn aim_min_gpu_count(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    family: Option<&str>,
+) -> Option<u32> {
+    let family = family?;
+    aim_engine_record(engine, recipe)?
+        .min_gpu_counts
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(family))
+        .map(|(_, count)| *count)
+}
+
+/// Refuses an AIM image that needs `needed` GPUs before anything is pulled:
+/// `rocm serve` selects a single GPU, so the container would start with too few
+/// devices and fail inside the image.
+fn ensure_aim_multi_gpu_supported(model: &str, needed: u32) -> Result<()> {
+    bail!(
+        "`{model}` needs {needed} GPUs for this GPU family, but `rocm serve` runs an engine on \
+         one GPU and does not support multi-GPU serving yet, so this model cannot be started \
+         here however many GPUs the host has. Choose a model with a single-GPU profile \
+         (`rocm model --verbose`)"
+    )
+}
+
+/// Note shown when the AIM profile that was pinned for this serve targets boards
+/// other than the detected GPU (a gfx family can cover cards the profile was not
+/// built for). `hint` is the final engine hint: the note needs the catalog's
+/// profile to be what will actually run, so it stays quiet when no profile was
+/// pinned (GPU family undetected, `--device cpu_only`) or `--engine-env
+/// AIM_PROFILE_ID` replaced it.
+fn aim_board_note(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    gpu_name: Option<&str>,
+    hint: Option<&EngineRecipeHint>,
+) -> Option<String> {
+    let record = aim_engine_record(engine, recipe)?;
+    let name = gpu_name?;
+    if record.supported_boards.is_empty() {
+        return None;
+    }
+    let pinned = hint?.extra_env.get("AIM_PROFILE_ID")?;
+    if !record.profile_ids.values().any(|id| id == pinned) {
+        return None;
+    }
+    let squash = |value: &str| {
+        value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let name_key = squash(name);
+    if record
+        .supported_boards
+        .iter()
+        .any(|board| name_key.contains(&squash(board)))
+    {
+        return None;
+    }
+    Some(format!(
+        "the pinned AIM profile `{pinned}` targets {}; `{name}` is not one of them, so it may not run well. Override with `--engine-env AIM_PROFILE_ID=<id>`",
+        record.supported_boards.join(" / ")
+    ))
 }
 
 fn protocol_engine_recipe_hint(
@@ -534,6 +760,14 @@ fn engine_recipe_with_extra_env(
     });
     for entry in engine_env {
         let (key, value) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+        // A bare `KEY` forwards it from the environment; the hint cannot carry an
+        // explicitly empty value, so `KEY=` would silently mean the same thing.
+        if entry.contains('=') && value.is_empty() {
+            bail!(
+                "--engine-env `{entry}` sets an empty value; pass `{key}` alone to forward it \
+                 from your environment, or `{key}=VALUE`"
+            );
+        }
         if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             bail!(
                 "--engine-env expects `KEY=VALUE` (or a bare `KEY` to forward it from the \
@@ -724,7 +958,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // Before runtime resolution and any launch: an engine the platform gate rules
     // out (vLLM on native Windows) must not reach a "no active runtime" error or
     // a background server that dies with no output.
-    ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
+    ensure_engine_allowed_on_os(&selected_engine, GatedEngineAction::Serve)?;
     // Fail closed: a public bind must be authenticated, but Windows managed
     // Lemonade cannot receive the key (see `ensure_public_bind_engine_supported`),
     // so refuse rather than launch an open public server.
@@ -735,6 +969,43 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
+    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
+    // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
+    // surface the explicit `--gpu` as ignored rather than printing a device the
+    // server will not use.
+    //
+    // Always `false` today, and kept anyway: `parse_device_policy` rejects
+    // `cpu`/`cpu_only` outright (pinned by
+    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`), so
+    // the only policy that reaches here is `GpuRequired`. The term is what makes
+    // every `!cpu_only` guard below read as a guard on the *policy* rather than
+    // on a constant, so admitting the policy later cannot silently turn CPU-only
+    // serving into GPU pre-flight failures. It is not evidence that the CPU path
+    // is exercised; nothing in the suite can reach it.
+    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // The token needs nothing from the GPU, so it is checked first: a gated model
+    // is refused for its missing token on any host, not only on one whose GPU the
+    // image supports. Only `--engine-env` can supply it, so a hint built from
+    // that alone is enough; the real hint below still gets the same env applied
+    // after the catalog's profile pin, which is what lets the flag override it.
+    ensure_aim_hf_token(
+        &selected_engine,
+        shared_recipe.as_ref(),
+        engine_recipe_with_extra_env(&selected_engine, None, &engine_env)?.as_ref(),
+        |key| std::env::var(key).ok(),
+    )?;
+    let recipe_hint = aim_gpu_preflight(
+        &selected_engine,
+        &model,
+        shared_recipe.as_ref(),
+        recipe_hint,
+        cpu_only,
+        || {
+            detect_host_gfx_target()
+                .as_deref()
+                .and_then(normalize_therock_family)
+        },
+    )?;
     // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
     // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
     // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
@@ -775,7 +1046,26 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         generation_defaults,
     )?;
     let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
-    let engine_env_note = engine_env_ignored_note(&selected_engine, &engine_env);
+    let aim_gpu_name = aim_engine_record(&selected_engine, shared_recipe.as_ref())
+        .filter(|record| !record.profile_ids.is_empty())
+        .and_then(|_| {
+            host_gpu_summary
+                .clone()
+                .unwrap_or_else(|| detect_host_gpu_summary(Some(&paths)))
+                .name
+        });
+    let engine_env_notes: Vec<String> = [
+        engine_env_ignored_note(&selected_engine, &engine_env),
+        aim_board_note(
+            &selected_engine,
+            shared_recipe.as_ref(),
+            aim_gpu_name.as_deref(),
+            engine_recipe.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -787,21 +1077,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
-    // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
-    // surface the explicit `--gpu` as ignored rather than printing a device the
-    // server will not use.
-    //
-    // Always `false` today, and kept anyway: `parse_device_policy` rejects
-    // `cpu`/`cpu_only` outright (pinned by
-    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`), so
-    // the only policy that reaches here is `GpuRequired`. The term is what makes
-    // every `!cpu_only` guard below read as a guard on the *policy* rather than
-    // on a constant, so admitting the policy later cannot silently turn CPU-only
-    // serving into GPU pre-flight failures. It is not evidence that the CPU path
-    // is exercised; nothing in the suite can reach it.
-    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
     // AMD GPU ordinals still usable after the active visibility mask
     // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
     // ordinal space — the space `--gpu` is validated and exported through. A
@@ -984,6 +1260,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !cpu_only && !scripted_backend_failure && !reuse_existing && host_has_no_usable_gpu {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
+    // The Docker probe comes after every refusal that needs no daemon (the AIM
+    // token and GPU pre-flight, the no-usable-GPU bail): a request they refuse
+    // never reaches `docker info`.
+    ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
     // Whether the refusal above was waived *only* because a live service was
     // expected to be reused. `reuse_existing` already implies `!cpu_only` and
     // `host_has_no_usable_gpu` (the pre-gate requires both), so the scripted
@@ -1185,7 +1465,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         if let Some(note) = &gpu_memory_utilization_note {
             println!("  note: {note}");
         }
-        if let Some(note) = &engine_env_note {
+        for note in &engine_env_notes {
             println!("  note: {note}");
         }
     }
@@ -1284,9 +1564,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
             );
-            if let Some(note) = &engine_env_note {
-                notes.push(note.clone());
-            }
+            notes.extend(engine_env_notes.iter().cloned());
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -1326,6 +1604,55 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         require_api_key,
         gpu_refusal_waived_for_reuse,
     )
+}
+
+/// GPU/device warnings folded into the interactive deployment summary. Mirrors the
+/// inline warnings printed in the plain serve plan, in the same order.
+#[allow(clippy::too_many_arguments)]
+fn collect_serve_notes(
+    cpu_only: bool,
+    gpu_selection: &GpuSelection,
+    rocr_visible_devices_set: bool,
+    gpu_indices: &[u32],
+    gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    engine_is_vllm: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
+    if cpu_only {
+        if matches!(gpu_selection, GpuSelection::Index(_)) {
+            notes.push(
+                "--gpu was ignored because --device cpu_only runs the model on CPU".to_owned(),
+            );
+        }
+    } else {
+        if rocr_visible_devices_set {
+            notes.push(
+                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
+                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
+                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
+                 ROCR_VISIBLE_DEVICES."
+                    .to_owned(),
+            );
+        }
+        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
+        {
+            notes.push(warning);
+            // vLLM's total-VRAM reservation is what turns a busy card into an OOM;
+            // pair the generic warning with the concrete knob that avoids it.
+            if engine_is_vllm {
+                notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
+            }
+        }
+    }
+    notes
 }
 
 #[cfg(test)]
@@ -1473,6 +1800,87 @@ mod tests {
     }
 
     #[test]
+    fn aim_catalogued_hf_ids_pick_aim_only_on_a_gpu_it_supports() {
+        // These ids had no recipe before the AIM catalog; cataloguing them must not
+        // move an Instinct host off vLLM, nor send a host the image has no profile
+        // for (or an undetected GPU, or native Windows) to an engine that refuses it.
+        let host = |family: Option<&str>| rocm_core::HostGpuSummary {
+            therock_family: family.map(str::to_owned),
+            ..rocm_core::HostGpuSummary::default()
+        };
+        let instinct = host(Some("gfx94X-dcgpu"));
+        let radeon = host(Some("gfx110X-all"));
+        let strix = host(Some("gfx1151"));
+        let undetected = host(None);
+
+        // An Instinct-only image (`Qwen/Qwen3-32B`) and a Radeon one
+        // (`Qwen/Qwen3.5-9B`) each get AIM on their own family and their next
+        // listed engine (vLLM) elsewhere, or the platform default on Windows.
+        let instinct_image = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
+        let radeon_image = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").unwrap();
+        for (recipe, family, windows, expected) in [
+            (&instinct_image, &instinct, false, Some("aim")),
+            (&instinct_image, &instinct, true, None),
+            (&instinct_image, &radeon, false, Some("vllm")),
+            (&instinct_image, &strix, false, Some("vllm")),
+            (&instinct_image, &undetected, false, Some("vllm")),
+            (&radeon_image, &radeon, false, Some("aim")),
+            (&radeon_image, &radeon, true, None),
+            (&radeon_image, &instinct, false, Some("vllm")),
+            (&radeon_image, &strix, false, Some("vllm")),
+        ] {
+            assert_eq!(
+                recipe_preferred_engine(recipe, Some(family), windows),
+                expected,
+                "{} on {:?} (windows: {windows})",
+                recipe.canonical_model_id,
+                family.therock_family
+            );
+        }
+        // No GPU summary at all is treated like an undetected GPU.
+        assert_eq!(
+            recipe_preferred_engine(&radeon_image, None, false),
+            Some("vllm")
+        );
+        // Recipes that do not prefer AIM are untouched.
+        let vllm_only = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct").unwrap();
+        assert_eq!(
+            recipe_preferred_engine(&vllm_only, Some(&strix), false),
+            Some("vllm")
+        );
+        // A recipe that lists vLLM first keeps it on native Windows (the skip
+        // applies only past an unusable AIM first choice), as it does on main.
+        assert_eq!(
+            recipe_preferred_engine(&vllm_only, Some(&strix), true),
+            Some("vllm")
+        );
+
+        // End to end through the selector. A vLLM-preferred host keeps vLLM; the
+        // rest follow the table above (the platform default is OS-specific, so
+        // compare against it rather than a literal).
+        let on_instinct = select_serve_engine(None, None, Some(&instinct_image), Some(&instinct));
+        if !cfg!(windows) {
+            assert_eq!(on_instinct.engine, "vllm");
+            let on_radeon = select_serve_engine(None, None, Some(&radeon_image), Some(&radeon));
+            assert_eq!(on_radeon.engine, "aim");
+        }
+        let on_strix = select_serve_engine(None, None, Some(&radeon_image), Some(&strix));
+        // AIM has no profile for Strix Halo, so the recipe's next engine is used;
+        // native Windows has no vLLM either, so it takes the platform default.
+        assert_eq!(
+            on_strix.engine,
+            if cfg!(windows) {
+                default_engine_for_platform()
+            } else {
+                "vllm"
+            }
+        );
+        // An explicit engine is never overridden.
+        let explicit = select_serve_engine(Some("aim"), None, Some(&radeon_image), Some(&strix));
+        assert_eq!(explicit.engine, "aim");
+    }
+
+    #[test]
     fn serve_qwen_uses_vllm_with_hf_repo_on_vllm_preferred_gpu() {
         // The qwen alias serves the GGUF via Lemonade by default, but on a vLLM-preferred
         // GPU it must serve the non-GGUF Hugging Face repo through vLLM.
@@ -1532,17 +1940,32 @@ mod tests {
     }
 
     #[test]
-    fn catalog_extra_env_reaches_the_aim_hint_and_engine_env_overrides_it() {
+    fn catalog_profile_pin_reaches_the_aim_hint_and_engine_env_overrides_it() {
         let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim catalog entry");
-        let hint = protocol_engine_recipe_hint(&recipe, "aim").expect("aim hint");
+        let hint = protocol_engine_recipe_hint(&recipe, "aim");
+        let pinned = |family: &'static str| {
+            engine_recipe_with_aim_gfx_profile("aim", Some(&recipe), hint.clone(), || {
+                Some(family.to_owned())
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let w7900 = pinned("gfx110X-all");
         assert_eq!(
-            hint.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            w7900.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
             Some("vllm-w7900-bf16-tp1-latency")
+        );
+        assert_eq!(
+            pinned("gfx120X-all")
+                .extra_env
+                .get("AIM_PROFILE_ID")
+                .map(String::as_str),
+            Some("vllm-r9700-bf16-tp1-latency")
         );
 
         let overridden = engine_recipe_with_extra_env(
             "aim",
-            Some(hint),
+            Some(w7900),
             &[
                 "AIM_PROFILE_ID=vllm-other".to_owned(),
                 "HF_TOKEN".to_owned(),
@@ -1559,6 +1982,266 @@ mod tests {
             "`--engine-env` must beat the catalog's value"
         );
         assert_eq!(overridden.extra_env.get("HF_TOKEN"), Some(&String::new()));
+    }
+
+    #[test]
+    fn aim_serve_refuses_a_gpu_the_image_has_no_profile_for() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        let err = engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint, || {
+            Some("gfx94X-dcgpu".to_owned())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no profile for this GPU (gfx94X-dcgpu)"),
+            "{err}"
+        );
+        assert!(err.contains("gfx110X-all, gfx120X-all"), "{err}");
+
+        // Strix Halo has no AIM profile either.
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        assert!(
+            engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint, || Some(
+                "gfx1151".to_owned()
+            ))
+            .is_err()
+        );
+
+        // Instinct images serve on Instinct without pinning a profile (AIM
+        // auto-selects), and are refused on a Radeon.
+        let instinct = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("instinct aim entry");
+        let hint = protocol_engine_recipe_hint(&instinct, "aim");
+        let served =
+            engine_recipe_with_aim_gfx_profile("aim", Some(&instinct), hint.clone(), || {
+                Some("gfx94X-dcgpu".to_owned())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!served.extra_env.contains_key("AIM_PROFILE_ID"));
+        assert!(
+            engine_recipe_with_aim_gfx_profile("aim", Some(&instinct), hint, || Some(
+                "gfx110X-all".to_owned()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gated_aim_model_needs_an_hf_token_before_launch() {
+        let gated = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+            .expect("gated aim entry");
+        let hint = |engine_env: &[&str]| {
+            engine_recipe_with_extra_env(
+                "aim",
+                protocol_engine_recipe_hint(&gated, "aim"),
+                &engine_env
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let no_env = |_: &str| None;
+        let exported = |_: &str| Some("hf_x".to_owned());
+
+        // Without the flag, or with the bare flag but nothing exported, refuse and
+        // name the command that clears it.
+        for env in [&no_env as &dyn Fn(&str) -> Option<String>, &exported] {
+            let err = ensure_aim_hf_token("aim", Some(&gated), hint(&[]).as_ref(), env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--engine-env HF_TOKEN"), "{err}");
+        }
+        assert!(
+            ensure_aim_hf_token("aim", Some(&gated), hint(&["HF_TOKEN"]).as_ref(), no_env).is_err()
+        );
+        // The advised form (bare flag with the variable exported) or an explicit
+        // value clears it, and other engines are never checked.
+        assert!(
+            ensure_aim_hf_token("aim", Some(&gated), hint(&["HF_TOKEN"]).as_ref(), exported)
+                .is_ok()
+        );
+        assert!(
+            ensure_aim_hf_token(
+                "aim",
+                Some(&gated),
+                hint(&["HF_TOKEN=hf_y"]).as_ref(),
+                no_env
+            )
+            .is_ok()
+        );
+        assert!(ensure_aim_hf_token("vllm", Some(&gated), None, no_env).is_ok());
+        let open = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("ungated aim entry");
+        assert!(ensure_aim_hf_token("aim", Some(&open), None, no_env).is_ok());
+    }
+
+    #[test]
+    fn multi_gpu_aim_image_is_refused_before_launch() {
+        let id = "deepseek-ai/DeepSeek-R1";
+        let r1 = resolve_builtin_model_recipe(id).expect("multi-gpu aim entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&r1), Some("gfx94X-dcgpu")),
+            Some(8)
+        );
+        assert_eq!(aim_min_gpu_count("aim", Some(&r1), Some("gfx1151")), None);
+        assert_eq!(aim_min_gpu_count("aim", Some(&r1), None), None);
+        assert_eq!(
+            aim_min_gpu_count("vllm", Some(&r1), Some("gfx94X-dcgpu")),
+            None
+        );
+        // A single-GPU image has no requirement.
+        let small = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("single-gpu entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&small), Some("gfx94X-dcgpu")),
+            None
+        );
+        // Radeon needs differ per family.
+        let flash = resolve_builtin_model_recipe("zai-org/GLM-4.7-Flash").expect("flash entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&flash), Some("gfx110X-all")),
+            Some(2)
+        );
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&flash), Some("gfx120X-all")),
+            Some(4)
+        );
+
+        let err = ensure_aim_multi_gpu_supported(id, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs 8 GPUs") && err.contains("does not support multi-GPU"));
+    }
+
+    #[test]
+    fn aim_board_note_only_fires_when_the_catalog_profile_is_what_runs() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        // The hint the serve path ends up with once a GPU family was detected.
+        let pinned = engine_recipe_with_aim_gfx_profile(
+            "aim",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            || Some("gfx110X-all".to_owned()),
+        )
+        .unwrap();
+        let note = |gpu: Option<&str>, hint: Option<&EngineRecipeHint>| {
+            aim_board_note("aim", Some(&radeon), gpu, hint)
+        };
+        assert!(note(Some("AMD Radeon PRO W7900"), pinned.as_ref()).is_none());
+        assert!(note(Some("AMD Radeon AI PRO R9700"), pinned.as_ref()).is_none());
+        let other = note(Some("AMD Radeon RX 7900 XTX"), pinned.as_ref()).expect("warns");
+        assert!(
+            other.contains("vllm-w7900-bf16-tp1-latency")
+                && other.contains("W7900 / R9700")
+                && other.contains("--engine-env AIM_PROFILE_ID"),
+            "{other}"
+        );
+        assert!(note(None, pinned.as_ref()).is_none());
+
+        // No pin applied (family undetected, or `--device cpu_only`): no claim about it.
+        let unpinned = engine_recipe_with_aim_gfx_profile(
+            "aim",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            || None,
+        )
+        .unwrap();
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), unpinned.as_ref()).is_none());
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), None).is_none());
+        // An explicit AIM_PROFILE_ID replaced the catalog's: its board is the user's call.
+        let overridden =
+            engine_recipe_with_extra_env("aim", pinned, &["AIM_PROFILE_ID=vllm-other".to_owned()])
+                .unwrap();
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), overridden.as_ref()).is_none());
+        // Instinct images pin no profile, so there is nothing to mismatch.
+        let instinct = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("instinct entry");
+        assert!(aim_board_note("aim", Some(&instinct), Some("anything"), None).is_none());
+    }
+
+    #[test]
+    fn aim_gpu_preflight_probes_only_for_a_restricted_aim_record_off_cpu_only() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        let preflight = |engine: &str, cpu_only: bool, family: fn() -> Option<String>| {
+            aim_gpu_preflight(engine, "m", Some(&radeon), hint.clone(), cpu_only, family)
+        };
+        let no_probe = || -> Option<String> { panic!("host GPU must not be probed") };
+
+        // An undetected family enforces nothing.
+        assert_eq!(preflight("aim", false, || None).unwrap(), hint);
+        // The probe runs for AIM off `cpu_only`, and the result is enforced.
+        assert!(preflight("aim", false, || Some("gfx94X-dcgpu".to_owned())).is_err());
+        // Neither a different engine nor `--device cpu_only` reaches the probe,
+        // so an unsupported family cannot refuse them.
+        assert_eq!(preflight("vllm", false, no_probe).unwrap(), hint);
+        assert_eq!(preflight("aim", true, no_probe).unwrap(), hint);
+    }
+
+    #[test]
+    fn aim_gpu_preflight_pins_the_profile_and_then_refuses_multi_gpu_images() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let pinned = aim_gpu_preflight(
+            "aim",
+            "m",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            false,
+            || Some("gfx110X-all".to_owned()),
+        )
+        .unwrap()
+        .expect("hint");
+        assert_eq!(
+            pinned.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            Some("vllm-w7900-bf16-tp1-latency")
+        );
+
+        // The multi-GPU refusal comes from the same pre-flight, and only for a
+        // family whose count exceeds one.
+        let multi = resolve_builtin_model_recipe("zai-org/GLM-4.7-Flash").expect("multi-GPU entry");
+        let hint = || protocol_engine_recipe_hint(&multi, "aim");
+        let err = aim_gpu_preflight("aim", "m", Some(&multi), hint(), false, || {
+            Some("gfx120X-all".to_owned())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("multi-GPU serving yet"), "{err:#}");
+        assert!(
+            aim_gpu_preflight("aim", "m", Some(&multi), hint(), true, || None).is_ok(),
+            "cpu_only skips the multi-GPU check"
+        );
+    }
+
+    #[test]
+    fn recipe_preferred_engine_treats_unrestricted_and_missing_aim_records_as_usable() {
+        let host = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx1151".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+        let mut recipe = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("vllm")
+        );
+        // Only a signed external index reaches these two arms, so they are built
+        // here: an AIM record that restricts no family is usable on any GPU, and
+        // a recipe that lists AIM first but carries no AIM record has nothing to
+        // gate it.
+        for record in &mut recipe.engine_recipes {
+            if record.engine == "aim" {
+                record.supported_gfx_families.clear();
+            }
+        }
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("aim")
+        );
+        recipe
+            .engine_recipes
+            .retain(|record| record.engine != "aim");
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("aim")
+        );
+        assert_eq!(recipe_preferred_engine(&recipe, Some(&host), true), None);
     }
 
     #[test]
@@ -1641,6 +2324,12 @@ mod tests {
                 notes: vec!["adapter hint".to_owned()],
                 model_id_override: None,
                 image_digest: None,
+                generated_at_unix_ms: None,
+                supported_gfx_families: Vec::new(),
+                profile_ids: BTreeMap::new(),
+                requires_hf_token: false,
+                supported_boards: Vec::new(),
+                min_gpu_counts: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
@@ -1652,6 +2341,12 @@ mod tests {
                 notes: Vec::new(),
                 model_id_override: None,
                 image_digest: None,
+                generated_at_unix_ms: None,
+                supported_gfx_families: Vec::new(),
+                profile_ids: BTreeMap::new(),
+                requires_hf_token: false,
+                supported_boards: Vec::new(),
+                min_gpu_counts: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
         ];
@@ -2171,6 +2866,20 @@ mod tests {
     }
 
     #[test]
+    fn engine_env_distinguishes_a_bare_key_from_an_empty_value() {
+        let env = |entry: &str| engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]);
+        let bare = env("HF_TOKEN").unwrap().expect("hint");
+        assert_eq!(bare.extra_env.get("HF_TOKEN").map(String::as_str), Some(""));
+        let err = env("HF_TOKEN=").unwrap_err().to_string();
+        assert!(
+            err.contains("empty value") && err.contains("`HF_TOKEN` alone"),
+            "{err}"
+        );
+        let set = env("A=b").unwrap().expect("hint");
+        assert_eq!(set.extra_env.get("A").map(String::as_str), Some("b"));
+    }
+
+    #[test]
     fn engine_env_ignored_note_is_none_for_aim() {
         assert_eq!(
             engine_env_ignored_note("aim", &["AIM_PROFILE_ID=foo".to_owned()]),
@@ -2204,5 +2913,133 @@ mod tests {
         assert!(!engine_recipe_enables_tool_choice(Some(&without)));
         let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
         assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+    }
+
+    #[test]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            Some(note),
+            None,
+            false,
+        );
+        assert!(
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
+        );
+
+        let quiet = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214): both this test module
+    /// and `gpu_policy.rs`'s own build `GpuVramUsage` fixtures, and this helper
+    /// has no other home now that `gpu_policy.rs` owns the type.
+    fn vram(index: u32, used_mb: u64, total_mb: u64) -> GpuVramUsage {
+        GpuVramUsage {
+            index,
+            used_mb,
+            total_mb,
+        }
+    }
+
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214) for the same reason as
+    /// `vram` above.
+    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
+        rocm_core::HostGpuSummary {
+            gfx_target: Some(gfx_target.to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        }
+    }
+
+    #[test]
+    fn serve_notes_pair_low_vram_with_the_vllm_utilization_hint() {
+        // A busy discrete card that trips the low-VRAM warning: on vLLM the note
+        // must also carry the concrete `--gpu-memory-utilization` workaround, so
+        // the interactive summary tells the user how to avoid the OOM.
+        let busy = [vram(0, 182_000, 192_000)];
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            true,
+        );
+        assert!(
+            notes.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning must be present: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
+        );
+
+        // The literal fragments the GPU-lane scenario
+        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
+        // only where a real card exists, so pin the wording here too: a rename
+        // then fails on every lane rather than silently on the one lane that can
+        // observe it. `GPU 0 has only` is what makes the warning provably about
+        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
+        // pre-launch hint from any other line that merely names the flag.
+        assert!(
+            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
+            "the warning must name the selected GPU: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("vLLM reserves ~90%")),
+            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
+        );
+
+        // The same busy card on a non-vLLM engine keeps the warning but omits the
+        // vLLM-only knob, which that engine cannot honor.
+        let lemonade = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            false,
+        );
+        assert!(
+            lemonade.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning still fires for other engines: {lemonade:?}"
+        );
+        assert!(
+            !lemonade
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
+        );
     }
 }

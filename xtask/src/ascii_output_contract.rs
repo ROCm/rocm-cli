@@ -183,11 +183,6 @@ mod tests {
             SPINNER_LABEL,
         ),
         (
-            "apps/rocm/src/main.rs",
-            "Waiting for a launch already under way…",
-            SPINNER_LABEL,
-        ),
-        (
             "apps/rocm/src/serve_cmd.rs",
             "Starting {model} on {selected_engine}…",
             SPINNER_LABEL,
@@ -195,6 +190,11 @@ mod tests {
         (
             "apps/rocm/src/serve_cmd.rs",
             "Running smoke test…",
+            SPINNER_LABEL,
+        ),
+        (
+            "apps/rocm/src/service_records.rs",
+            "Waiting for a launch already under way…",
             SPINNER_LABEL,
         ),
         ("apps/rocm/src/therock.rs", "Downloading {}…", SPINNER_LABEL),

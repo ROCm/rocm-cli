@@ -319,10 +319,6 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,
 /// role-colored line. Kept free of `Frame` so it can be unit-tested.
-pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>> {
-    transcript_lines_from_turns(&state.chat, theme)
-}
-
 fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<Line<'a>> {
     let mut lines = Vec::with_capacity(turns.len());
     for turn in turns {
@@ -444,7 +440,7 @@ mod tests {
         s.chat.push(ChatTurn::agent("echo: hello"));
         s.chat.push(ChatTurn::error("boom"));
         let theme = s.theme;
-        let lines = transcript_lines(&s, &theme);
+        let lines = transcript_lines_from_turns(&s.chat, &theme);
         assert_eq!(lines.len(), 3);
     }
 
@@ -456,7 +452,7 @@ mod tests {
             "GPU-2 is at 87% util, 71°C.\n⚙ via: gpu_status",
         ));
         let theme = s.theme;
-        let lines = transcript_lines(&s, &theme);
+        let lines = transcript_lines_from_turns(&s.chat, &theme);
         // The annotation splits into its own line and is visible in the render.
         assert_eq!(lines.len(), 2, "answer + annotation render as two lines");
         assert!(
@@ -547,7 +543,7 @@ mod tests {
 
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.chat.push(ChatTurn::agent("borrow me"));
-        let lines = transcript_lines(&s, &s.theme);
+        let lines = transcript_lines_from_turns(&s.chat, &s.theme);
         assert!(matches!(
             lines[0].spans[1].content,
             Cow::Borrowed("borrow me")

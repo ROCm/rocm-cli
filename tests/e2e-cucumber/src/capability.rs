@@ -175,7 +175,10 @@ impl HostCapability {
                     // Strix Halo (gfx1151) — exactly the families
                     // `family_prefers_vllm` excludes. Without this, a
                     // Docker-equipped Instinct lane would run the Radeon aim
-                    // image with a W7900 profile.
+                    // image with a W7900 profile. Strix Halo is verified for the
+                    // raw image reference serve-26 uses; the catalog entry
+                    // itself is refused on gfx1151 (no profile for it), so
+                    // this is not a statement about the catalog.
                     && !family_prefers_vllm(self.gfx_target.as_deref())
             }
             _ => self.available_engines.iter().any(|e| e == engine),

@@ -425,3 +425,39 @@ Feature: Runtime configuration
     Then the install is refused as having no ROCm build for that GPU
     And the refusal offers no package family to install instead
     And the refusal points at examining what this host supports
+
+  # When the machine already has its own (unmanaged) ROCm and that ROCm is newer
+  # than the SDK the install picks, the preview says why the older SDK is
+  # selected. Such a host often reports its version with a packaging build
+  # number on the end, which must not stop the CLI from reading it.
+  #
+  # Linux-only: `--format tarball` is rejected outright on Windows. Hermetic:
+  # the catalog is a loopback fixture and `--family` is named, so no GPU and no
+  # network are needed and this runs on the ordinary E2E lane.
+  #
+  # Technical details: the host install is planted under the scenario's root
+  # and exported as ROCM_PATH; its `.info/version` reads `7.20.1-33`. The
+  # catalog serves one release tarball, ROCm 7.10.0, for `gfx120X-all`.
+  @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
+  Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a newer version with a packaging build number
+    When the user previews a tarball SDK install
+    Then the preview explains that the host's newer ROCm is passed over for the selected SDK
+
+  # A host version the CLI cannot read is "can't tell", and "can't tell" is
+  # never "newer". The regression this pins: a suffix that merely starts with a
+  # digit was dropped whole, so the host was read as a plain, newer release and
+  # the preview claimed so. runtime-20 is what makes the absence below
+  # evidence: it shows the same preview printing the note when the host
+  # version is readable and newer.
+  #
+  # Technical details: `.info/version` reads `7.20.1-33rc1`, which with its
+  # suffix dropped would be `7.20.1`, newer than the catalog's 7.10.0.
+  @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
+  Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a version with an unreadable build suffix
+    When the user previews a tarball SDK install
+    Then the preview selects the newest SDK in the catalog
+    And the preview does not claim the host's ROCm is newer

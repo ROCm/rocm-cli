@@ -134,6 +134,19 @@ pub(crate) fn build_uninstall_plan(
         ));
     }
 
+    // Only a helper that is running can be left behind. "Uninstall does not stop
+    // it" is said only where that is the whole story: with a watcher enabled the
+    // helper stays up; an idle one is already on its way out.
+    if let Some(note) = crate::service_launch::background_helper_note(paths)
+        && note.running
+    {
+        plan.warnings.push(if note.outlives {
+            format!("{}; uninstall does not stop it", note.text)
+        } else {
+            note.text
+        });
+    }
+
     // Remote sessions are worse than local ones to drop silently. The model runs
     // on someone else's machine and its endpoint is published there, so removing
     // the record here does not stop either — it only destroys the last thing that
@@ -649,5 +662,73 @@ mod tests {
             "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
         );
         Ok(())
+    }
+
+    fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = watcher_enabled;
+        config.save(paths).expect("save config");
+        rocm_core::AutomationRuntimeState {
+            running: helper_running,
+            automations_enabled: true,
+            daemon_pid: std::process::id(),
+            started_at_unix_ms: 1,
+            last_tick_unix_ms: 1,
+            local_webhook_endpoint: None,
+            active_watchers: Vec::new(),
+        }
+        .write(paths)
+        .expect("write runtime state");
+    }
+
+    /// ROCMAI-827: uninstall does not stop the automation helper, and the plan
+    /// says so only where it is true. The exact warning for each state: a helper
+    /// that stays up (a watcher is enabled) is named with the command that ends it
+    /// and "uninstall does not stop it"; one that is idle and about to exit says
+    /// only that, since uninstall leaving it is not the whole story; none running
+    /// is not mentioned.
+    #[test]
+    fn plan_warns_about_a_helper_uninstall_leaves_running_only_when_there_is_one() {
+        let (root, paths) = test_paths("uninstall-helper-warning");
+        paths.ensure().expect("create app dirs");
+        let options = UninstallOptions {
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let helper_warnings = |plan: &UninstallPlan| -> Vec<String> {
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("background automation helper"))
+                .cloned()
+                .collect()
+        };
+
+        set_helper_facts(&paths, false, false);
+        let none = helper_warnings(&build_uninstall_plan(&paths, &options).expect("plan"));
+        set_helper_facts(&paths, true, false);
+        let enabled_dead = helper_warnings(&build_uninstall_plan(&paths, &options).expect("plan"));
+        set_helper_facts(&paths, false, true);
+        let idle = helper_warnings(&build_uninstall_plan(&paths, &options).expect("plan"));
+        set_helper_facts(&paths, true, true);
+        let outlives = helper_warnings(&build_uninstall_plan(&paths, &options).expect("plan"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(none.is_empty(), "{none:?}");
+        assert!(
+            enabled_dead.is_empty(),
+            "nothing is running to leave: {enabled_dead:?}"
+        );
+        assert_eq!(
+            idle,
+            [
+                "the background automation helper (`rocm daemon`) is still running; no automation is enabled, so it exits on its own within a few seconds"
+            ]
+        );
+        assert_eq!(
+            outlives,
+            [
+                "the background automation helper (`rocm daemon`) keeps running while an automation is enabled (server-recover); to stop it, run `rocm automations disable server-recover`, after which it exits on its own within a few seconds; uninstall does not stop it"
+            ]
+        );
     }
 }

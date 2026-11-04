@@ -623,14 +623,14 @@ Expected result:
 - A prompt appears naming the serving model and warning that it may
   still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first. From the dashboard (not the launcher) on a
-  host where its own daemon client never connects (Windows, for the whole
-  session), the prompt still shows that same stop command and the service
-  id, but not the model's name — the dashboard's own live view is where the
-  name comes from, and it never fills there. The launcher's own copy of the
-  prompt always names the model, Windows included — it reads the
-  managed-service registry directly rather than through the dashboard's
-  daemon connection.
+  placeholder) to stop it first. From the dashboard (not the launcher) on
+  Windows, where the dashboard streams live GPU/CPU/memory but never gets a
+  serving-instance snapshot (no `rocmdashd` unix socket there), the prompt
+  still shows that same stop command and the service id, but not the
+  model's name — the dashboard's own live view is where the name comes
+  from, and it never fills there. The launcher's own copy of the prompt
+  always names the model, Windows included — it reads the managed-service
+  registry directly rather than through the dashboard's daemon connection.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
@@ -711,6 +711,34 @@ Expected result:
 
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
+
+### 4b. Dashboard Live GPU/CPU/Memory On Windows
+
+On a native Windows machine with an AMD GPU (no `rocmdashd` socket exists
+there, so the dashboard collects in-process):
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- Within a few seconds the Home tab shows live CPU and memory figures and a
+  GPU card with utilization and VRAM, updating about once a second. Until the
+  first reading arrives the GPU area shows a "Detecting GPU…" placeholder
+  rather than 0.0%.
+- On a host with exactly one real display adapter, VRAM total, temperature,
+  power and clock are filled in when the AMD driver's `amdadlx64.dll` is
+  present. With more than one adapter (for example a hybrid laptop) VRAM
+  total stays unmeasured and shows `—` in the Home hero and in the GPU wall
+  sidebar, never `0.0%`.
+- Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
+  back when it ends.
+- Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
+  utilization and VRAM usage working and temperature/power/clock at their
+  unmeasured values, with no crash.
+- No other output of this section needs a daemon: `rocm dash` must not report
+  a failed daemon connection.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
@@ -953,7 +981,13 @@ Expected result:
 ## 10. AIM (Docker) Engine Verification
 
 Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
-succeed).
+succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
+Radeon AI PRO R9700 (`gfx110X-all`, `gfx120X-all`) only; on a GPU of another
+family, such as Strix Halo or an Instinct card, `rocm serve` refuses it, so use
+the raw image form further down. Other boards of a supported family (for
+example an RX 7900 XTX) are not refused: the CLI prints a note that the pinned
+profile targets the W7900 / R9700 and names `--engine-env AIM_PROFILE_ID` to
+override it.
 
 ```bash
 rocm serve aim-qwen3.5-9b --engine aim --managed
@@ -969,9 +1003,15 @@ the engine's default 5-minute readiness wait. Raise it with
 environment of `rocm serve`. Stopping or failing a start removes the container
 and its downloaded weights, so a retry downloads them again.
 
-`aim-qwen3.5-9b` is the catalog entry (`rocm model --verbose`). It supplies the
-pinned image and `AIM_PROFILE_ID`; to serve a raw image reference instead, pass
-the profile yourself:
+`aim-qwen3.5-9b` (canonical id `Qwen/Qwen3.5-9B`) is the catalog entry
+(`rocm model --verbose`). It supplies the pinned image and, for the detected GPU
+family, `AIM_PROFILE_ID`; on a GPU the image has no profile for (for example
+Strix Halo or an Instinct card) `rocm serve` refuses with the supported
+families. An image whose smallest profile needs several GPUs on the detected
+family is refused, because `rocm serve` gives an engine one GPU. None of these
+GPU checks run when the host's GPU family cannot be detected or with
+`--device cpu_only`. To serve a raw image
+reference instead, which skips these catalog checks, pass the profile yourself:
 
 ```bash
 rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
@@ -981,7 +1021,9 @@ rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine ai
 `--engine-env KEY=VALUE` is stored with the service record, so use it for
 non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
 it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
-it is forwarded from your environment and never stored. `--engine-env` is
+it is forwarded from your environment and never stored. A gated model
+(`rocm model --verbose` shows the `HF_TOKEN` note) is refused before
+anything is pulled if no token was passed. `--engine-env` is
 ignored by the other engines (the command prints a note saying so).
 
 Expected result:
@@ -1000,3 +1042,34 @@ Expected result:
   service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
+
+## 11. Background Automation Helper
+
+The helper (`rocm daemon`) runs only while an automation watcher is enabled.
+Start from a fresh config (all watchers off) and use a scratch
+`ROCM_CLI_CONFIG_DIR`/`ROCM_CLI_DATA_DIR` if you do not want to touch yours.
+
+```bash
+rocm automations enable gpu-metrics --mode observe
+rocm daemon --status
+rocm automations disable gpu-metrics
+```
+
+Expected result:
+
+- Enabling prints `helper: started background automation daemon`, and a
+  `rocm daemon` process (Windows: `rocm.exe daemon`; Linux: `ps`) is running.
+  `rocm automations` reports the background service as `running`.
+- After disabling the only watcher, the process exits by itself within a few
+  seconds (the loop ticks every 5 seconds) and `rocm automations` reports it
+  `stopped`. Nothing needs to be killed.
+- With no watcher enabled (the default), `rocm serve` of a model starts no
+  `rocm daemon` process at all, and `rocm services stop <service-id> --yes`
+  prints no note about a helper.
+- With a watcher enabled, `rocm services stop <service-id> --yes` leaves the
+  helper running and says so: its `note:` line names the enabled watcher and
+  the `rocm automations disable <watcher>` command that ends it. `rocm uninstall
+  --dry-run` carries the same warning, ending `uninstall does not stop it`.
+- Re-enabling a watcher right after disabling the last one (within the few
+  seconds before the helper exits) still ends with a helper running: enable
+  waits for an exiting helper to finish, then starts a new one.

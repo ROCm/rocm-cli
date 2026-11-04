@@ -845,31 +845,47 @@ fn active_pressure_target(record: ManagedServiceRecord) -> Option<ManagedService
 }
 
 fn pending_stop_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
-    Ok(rocm_core::load_recent_automation_proposals(paths, 100)?
-        .into_iter()
-        .any(|proposal| {
-            proposal.status == "pending"
-                && proposal.watcher_id == "gpu-thermal-protect"
-                && proposal.service_id.as_deref() == Some(service_id)
-                && (proposal.action == "queue_stop_server_proposal"
-                    || proposal.tool.as_deref() == Some("stop_server"))
-        }))
+    pending_proposal_exists(
+        paths,
+        "gpu-thermal-protect",
+        service_id,
+        "queue_stop_server_proposal",
+        "stop_server",
+    )
 }
 
+fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
+    pending_proposal_exists(
+        paths,
+        "server-recover",
+        service_id,
+        "queue_restart_proposal",
+        "restart_server",
+    )
+}
+
+/// Whether `watcher_id` already has a pending proposal for `service_id`, either
+/// queued under `action` or carrying `tool`.
+///
 /// Reads the whole proposals store rather than a recent window: a pending
 /// proposal is never dropped, so it can be arbitrarily old, and a window that
 /// missed it would let the watcher queue a duplicate once the original aged
 /// out of that window. Compaction bounds the reviewed proposals to a fixed
 /// count; pending ones are kept.
-fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
+fn pending_proposal_exists(
+    paths: &AppPaths,
+    watcher_id: &str,
+    service_id: &str,
+    action: &str,
+    tool: &str,
+) -> Result<bool> {
     Ok(rocm_core::load_automation_proposals(paths)?
         .into_iter()
         .any(|proposal| {
             proposal.status == "pending"
-                && proposal.watcher_id == "server-recover"
+                && proposal.watcher_id == watcher_id
                 && proposal.service_id.as_deref() == Some(service_id)
-                && (proposal.action == "queue_restart_proposal"
-                    || proposal.tool.as_deref() == Some("restart_server"))
+                && (proposal.action == action || proposal.tool.as_deref() == Some(tool))
         }))
 }
 
@@ -2119,6 +2135,88 @@ mod tests {
         Ok(())
     }
 
+    /// How many pending proposals to queue behind the one under test so it sits
+    /// beyond a recent-window read: more than the reviewed-retention cap, and
+    /// more than the 100 the code once read, so the tests keep guarding that
+    /// window even if the cap is ever lowered below it.
+    fn proposals_beyond_a_recent_window() -> usize {
+        const WINDOW_THE_CODE_ONCE_READ: usize = 100;
+        rocm_core::REVIEWED_PROPOSALS_RETAINED.max(WINDOW_THE_CODE_ONCE_READ) + 1
+    }
+
+    #[test]
+    fn gpu_thermal_protect_dedupe_sees_a_pending_stop_older_than_the_recent_window() -> Result<()> {
+        let (root, paths) = temp_app_paths("gpu-thermal-protect-dedupe-old");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-hot",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "gpu-thermal-protect",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "gpu.thermal_pressure".to_owned(),
+            source: "gpu_telemetry".to_owned(),
+            watcher_hint: Some("gpu-thermal-protect".to_owned()),
+            service_id: Some("svc-hot".to_owned()),
+            reason: Some("hotspot_temperature_threshold".to_owned()),
+            payload: json!({
+                "summary": "GPU 0 hotspot temperature is 96 C (limit 95 C)",
+            }),
+        };
+
+        handle_gpu_thermal_protect_event(&paths, WatcherMode::Propose, &mut state, &event)?;
+        // More newer proposals than the store keeps reviewed ones (all pending
+        // here, so none is compacted away), which puts the stop proposal beyond
+        // a recent-window read the size of that cap. A pending proposal is
+        // never dropped from the store, so it is still waiting for review.
+        for index in 0..proposals_beyond_a_recent_window() {
+            queue_proposal_with_arguments(
+                &paths,
+                "gpu-thermal-protect",
+                "queue_stop_server_proposal",
+                "Stop another server",
+                "unrelated proposal",
+                Some(format!("svc-other-{index}")),
+                json!({}),
+            )?;
+        }
+        handle_gpu_thermal_protect_event(&paths, WatcherMode::Propose, &mut state, &event)?;
+        let stops_for_hot_server = rocm_core::load_automation_proposals(&paths)?
+            .into_iter()
+            .filter(|proposal| {
+                proposal.tool.as_deref() == Some("stop_server")
+                    && proposal.service_id.as_deref() == Some("svc-hot")
+                    && proposal.status == "pending"
+            })
+            .count();
+        let events = rocm_core::load_recent_automation_events(&paths, 2)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(stops_for_hot_server, 1);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "stop_proposal_already_pending")
+        );
+        Ok(())
+    }
+
     #[test]
     fn server_recover_does_not_duplicate_pending_restart_proposals() -> Result<()> {
         let (root, paths) = temp_app_paths("server-recover-dedupe");
@@ -2224,9 +2322,10 @@ mod tests {
             &event,
             &mut record,
         )?;
-        // Enough newer proposals from other watchers that the restart proposal
-        // is no longer among the 100 most recent.
-        for index in 0..101 {
+        // More newer proposals than the store keeps reviewed ones (all pending
+        // here, so none is compacted away), which puts the restart proposal
+        // beyond a recent-window read the size of that cap.
+        for index in 0..proposals_beyond_a_recent_window() {
             queue_proposal_with_arguments(
                 &paths,
                 "gpu-thermal-protect",

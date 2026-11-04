@@ -19,12 +19,14 @@ pub mod format;
 pub mod gradient;
 mod header;
 pub mod heatmap;
+mod help_modal;
 pub mod install_manager;
 mod instance_detail;
 pub mod instance_list;
 pub mod job_console;
 pub mod launcher;
 pub mod logs_view;
+mod menu;
 pub mod modal;
 pub mod model_picker;
 pub mod onboarding;
@@ -37,7 +39,9 @@ pub mod sparkline;
 pub mod spinner;
 pub mod tabs;
 pub mod theme;
+mod theme_picker;
 pub mod update_manager;
+mod warnings_modal;
 pub mod widgets;
 
 use ratatui::Frame;
@@ -131,7 +135,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
+        Modal::Help => help_modal::draw_help(f, body, state.active_tab, &theme),
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
@@ -141,15 +145,21 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             }
         }
         Modal::ThemePicker => {
-            modal::draw_theme_picker(f, body, state.theme_picker_sel, &state.theme_name, &theme);
+            theme_picker::draw_theme_picker(
+                f,
+                body,
+                state.theme_picker_sel,
+                &state.theme_name,
+                &theme,
+            );
         }
-        Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
-        Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
-        Modal::Options => modal::draw_options(f, body, state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::Menu => menu::draw_menu(f, body, state.menu_sel, &theme),
+        Modal::Palette => menu::draw_palette(f, body, state.palette_sel, &theme),
+        Modal::Options => menu::draw_options(f, body, state, &theme),
+        Modal::GlobalHelp => help_modal::draw_global_help(f, body, &theme),
         Modal::Warnings => {
             let warnings = state.latest.as_ref().map_or(&[][..], |s| &s.warnings[..]);
-            modal::draw_warnings(f, body, warnings, &theme);
+            warnings_modal::draw_warnings(f, body, warnings, &theme);
         }
     }
 
@@ -376,6 +386,43 @@ mod tests {
     // Shared with `app`'s own test module rather than each carrying its own
     // byte-identical copy — see its doc comment.
     use crate::app::test_support::{st, with_registry_probe};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    pub(in crate::ui) fn flat(term: &Terminal<TestBackend>) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Render `draw` onto a fresh `w`x`h` backend and return it row by row,
+    /// trailing blanks trimmed. Row structure is what the sizing tests below
+    /// assert on — `flat` throws it away.
+    pub(in crate::ui) fn rows(w: u16, h: u16, draw: impl Fn(&mut ratatui::Frame)) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Index of the popup's bottom border row (the rounded bottom-left corner).
+    pub(in crate::ui) fn bottom_border_row(rows: &[String]) -> usize {
+        rows.iter()
+            .position(|r| r.contains('╰'))
+            .unwrap_or_else(|| panic!("no popup bottom border was painted:\n{}", rows.join("\n")))
+    }
 
     #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {
@@ -482,7 +529,7 @@ mod tests {
     }
 
     /// The wash `grey_overlay` paints behind an open overlay (see the
-    /// `grey_overlay_dims_every_cell` test in `modal.rs` for the exact color:
+    /// `grey_overlay_dims_every_cell` test in `menu.rs` for the exact color:
     /// the function itself is `panel::grey_overlay`, and the test stays beside
     /// `draw_logo`, which it composes); these tests only check that
     /// `draw`/`draw_focused` actually invoke it at their three call sites, not

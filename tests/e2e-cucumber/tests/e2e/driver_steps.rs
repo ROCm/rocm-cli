@@ -97,7 +97,7 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     // by the plan itself. The dry run only shows the planned command text; the
     // conditional (warns only when amdgpu-dkms is installed) is proven by
     // `previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
-    // apps/rocm/src/driver_install.rs.
+    // apps/rocm/src/driver_plan.rs.
     assert!(
         output.contains("from a previous installation is installed and was not removed"),
         "{output}"

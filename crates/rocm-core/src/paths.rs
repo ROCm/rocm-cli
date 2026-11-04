@@ -19,6 +19,14 @@ use crate::runtime::{
     managed_runtime_data_root, normalize_runtime_path_for_host,
 };
 
+/// The `ROCM_CLI_*_DIR` overrides, one field per root, each `None` when unset.
+#[derive(Debug, Clone, Default)]
+struct PathOverrides {
+    config: Option<PathBuf>,
+    data: Option<PathBuf>,
+    cache: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -30,25 +38,51 @@ impl AppPaths {
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
-        let paths = Self {
-            config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
-                .or_else(default_config_dir)
-                .context("unable to determine config directory for rocm-cli")?,
-            data_dir: data_dir_override
-                .clone()
-                .or_else(default_data_dir)
-                .context("unable to determine data directory for rocm-cli")?,
-            cache_dir: cache_dir_override
-                .clone()
-                .or_else(default_cache_dir)
-                .context("unable to determine cache directory for rocm-cli")?,
-        }
-        .normalize_for_host();
+        let paths = Self::from_overrides(PathOverrides {
+            config: env_path_override("ROCM_CLI_CONFIG_DIR"),
+            data: data_dir_override.clone(),
+            cache: cache_dir_override.clone(),
+        })?;
         Ok(Self::discover_from_paths(
             paths,
             data_dir_override.is_some(),
             cache_dir_override.is_some(),
         ))
+    }
+
+    /// The three roots from their `ROCM_CLI_*_DIR` overrides, before any
+    /// `setup.therock_venv` managed root is applied.
+    ///
+    /// The cache folder follows a data folder moved by `ROCM_CLI_DATA_DIR` to
+    /// `<data>/cache` — the same place it sits by default, `~/.rocm/cache`
+    /// under `~/.rocm`, and where [`Self::with_managed_root`] puts it when the
+    /// data folder moves to a managed root — unless `ROCM_CLI_CACHE_DIR` names
+    /// one of its own. Falling back to the default instead would leave an
+    /// install isolated by its config and data folders sharing the default
+    /// install's cache, and `rocm uninstall` would delete it.
+    ///
+    /// Takes the overrides as a named struct so tests can drive it without
+    /// mutating the process environment, and so the three optional folders
+    /// cannot be transposed.
+    fn from_overrides(overrides: PathOverrides) -> Result<Self> {
+        let PathOverrides {
+            config: config_dir,
+            data: data_dir,
+            cache,
+        } = overrides;
+        let cache_dir = cache.or_else(|| data_dir.as_deref().map(managed_runtime_cache_dir));
+        Ok(Self {
+            config_dir: config_dir
+                .or_else(default_config_dir)
+                .context("unable to determine config directory for rocm-cli")?,
+            data_dir: data_dir
+                .or_else(default_data_dir)
+                .context("unable to determine data directory for rocm-cli")?,
+            cache_dir: cache_dir
+                .or_else(default_cache_dir)
+                .context("unable to determine cache directory for rocm-cli")?,
+        }
+        .normalize_for_host())
     }
 
     fn discover_from_paths(
@@ -382,6 +416,90 @@ mod tests {
         assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
 
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+    #[test]
+    fn cache_dir_follows_an_overridden_data_dir() -> Result<()> {
+        let (root, _) = temp_app_paths("cache-follows-data");
+        let config = root.join("config");
+        let data = root.join("data");
+
+        let paths = AppPaths::from_overrides(PathOverrides {
+            config: Some(config.clone()),
+            data: Some(data.clone()),
+            cache: None,
+        })?;
+        assert_eq!(paths.config_dir, normalize_runtime_path_for_host(&config));
+        assert_eq!(paths.data_dir, normalize_runtime_path_for_host(&data));
+        assert_eq!(
+            paths.cache_dir,
+            normalize_runtime_path_for_host(&data.join("cache")),
+            "an install isolated by ROCM_CLI_DATA_DIR must not share the default cache"
+        );
+
+        // An explicit cache folder still wins over the data folder's.
+        let cache = root.join("elsewhere").join("cache");
+        let pinned = AppPaths::from_overrides(PathOverrides {
+            config: Some(config),
+            data: Some(data),
+            cache: Some(cache.clone()),
+        })?;
+        assert_eq!(pinned.cache_dir, normalize_runtime_path_for_host(&cache));
+        Ok(())
+    }
+    #[test]
+    fn a_managed_root_does_not_move_a_cache_that_followed_the_data_dir() -> Result<()> {
+        // The path `discover()` takes with ROCM_CLI_DATA_DIR set and no cache
+        // override, with a `setup.therock_venv` managed root in the config.
+        let (root, _) = temp_app_paths("cache-follows-data-managed-root");
+        let config = root.join("config");
+        let data = root.join("data");
+        let managed_runtime = root
+            .join("managed")
+            .join("runtimes")
+            .join("wheel")
+            .join("release-wheel-gfx942-7-0");
+        fs::create_dir_all(&config)?;
+        fs::write(
+            config.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "setup": { "therock_venv": managed_runtime }
+            }))?,
+        )?;
+
+        let paths = AppPaths::from_overrides(PathOverrides {
+            config: Some(config),
+            data: Some(data.clone()),
+            cache: None,
+        })?;
+        assert_eq!(
+            configured_managed_root_from_config(&paths),
+            Some(managed_runtime),
+            "the fixture must be a config the managed-root lookup reads"
+        );
+        let discovered = AppPaths::discover_from_paths(paths, true, false);
+        assert_eq!(discovered.data_dir, normalize_runtime_path_for_host(&data));
+        assert_eq!(
+            discovered.cache_dir,
+            normalize_runtime_path_for_host(&data.join("cache"))
+        );
+        Ok(())
+    }
+    #[test]
+    fn cache_dir_keeps_its_default_without_a_data_override() -> Result<()> {
+        // Only the config folder moved: data and cache both stay at their
+        // defaults, so the cache is not pulled under the config folder.
+        let (root, _) = temp_app_paths("cache-default");
+        let default_cache =
+            default_cache_dir().expect("the test host has a home folder for the default cache");
+        let paths = AppPaths::from_overrides(PathOverrides {
+            config: Some(root.join("config")),
+            ..PathOverrides::default()
+        })?;
+        assert_eq!(
+            paths.cache_dir,
+            normalize_runtime_path_for_host(&default_cache)
+        );
         Ok(())
     }
     #[test]

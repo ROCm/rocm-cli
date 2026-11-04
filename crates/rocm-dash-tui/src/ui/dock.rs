@@ -40,21 +40,6 @@ pub const fn is_wide(cols: u16, rows: u16) -> bool {
     cols >= WIDE_COLS && rows >= WIDE_ROWS
 }
 
-/// Split a body rect into (left rail, center, right dock) for the wide layout.
-/// Returns `None` when the body is too narrow to host both rails + a center.
-#[must_use]
-pub const fn triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
-    let min_center = 40u16;
-    if body.width < RAIL_W + DOCK_W + min_center {
-        return None;
-    }
-    let left = Rect::new(body.x, body.y, RAIL_W, body.height);
-    let center_w = body.width - RAIL_W - DOCK_W;
-    let center = Rect::new(body.x + RAIL_W, body.y, center_w, body.height);
-    let right = Rect::new(body.x + RAIL_W + center_w, body.y, DOCK_W, body.height);
-    Some((left, center, right))
-}
-
 /// Draw the right dock appropriate for `tab`: a live LOGS stream for the
 /// operational tabs (Observe/ROCm/Serving), a CONTEXT rail for Home/Chat.
 pub fn draw_right_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -114,14 +99,16 @@ pub fn gpu_wall(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .label_fg(theme.fg),
             Rect::new(inner.x, y + 1, inner.width, 1),
         );
+        // A zero total means VRAM size is unmeasured (e.g. a multi-adapter
+        // Windows host), not 0% used: show the same "—" the Home hero does.
         let vram = if g.vram_total_mb > 0 {
-            g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0
+            format::pct((g.vram_used_mb as f64 / g.vram_total_mb as f64 * 100.0) as f32)
         } else {
-            0.0
+            "—".to_string()
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("VRAM {}", format::pct(vram as f32)),
+                format!("VRAM {vram}"),
                 Style::default().fg(theme.muted),
             ))),
             Rect::new(inner.x, y + 2, inner.width, 1),
@@ -349,16 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn is_wide_and_triptych_extents() {
+    fn is_wide_extents() {
         assert!(!is_wide(160, 44));
         assert!(!is_wide(200, 40));
         assert!(is_wide(180, 45));
-        let (l, c, r) = triptych(Rect::new(0, 0, 200, 50)).unwrap();
-        assert_eq!(l.width, RAIL_W);
-        assert_eq!(r.width, DOCK_W);
-        assert_eq!(l.width + c.width + r.width, 200);
-        // A narrow body yields no triptych.
-        assert!(triptych(Rect::new(0, 0, 100, 50)).is_none());
     }
 
     #[test]
@@ -555,5 +536,43 @@ mod tests {
         term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
         let out = flat(&term);
         assert!(out.contains("GPUs"), "gpu wall title missing: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_placeholder_for_unmeasured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        let out = flat(&term);
+        assert!(out.contains("VRAM —"), "placeholder missing: {out:?}");
+        assert!(!out.contains("VRAM 0.0%"), "fake zero shown: {out:?}");
+    }
+
+    #[test]
+    fn gpu_wall_shows_percentage_for_measured_vram() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 4_000,
+                vram_total_mb: 16_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(RAIL_W, 20)).unwrap();
+        let theme = s.theme;
+        term.draw(|f| gpu_wall(f, f.area(), &s, &theme)).unwrap();
+        assert!(flat(&term).contains("VRAM 25.0%"));
     }
 }
