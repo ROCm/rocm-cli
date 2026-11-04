@@ -60,7 +60,9 @@ pub use engine_default::{
     preferred_serve_engine_for_host_gpu_summary,
 };
 
-pub use gpu_visibility::{has_usable_amd_gpu, usable_amd_gpu_indices};
+pub use gpu_visibility::{
+    WindowsGpuListing, has_usable_amd_gpu, usable_amd_gpu_indices, windows_amd_gpu_listing,
+};
 use linux::detect_linux_amdgpu_driver_version;
 #[cfg(target_os = "linux")]
 use linux::detect_linux_primary_gpu_name;

@@ -20,6 +20,10 @@ Feature: Stopping a managed service
   #
   # Plants the record rather than failing a real serve: no GPU, no network, so
   # this runs on the mock lane every PR.
+  #
+  # The `Local server stopped` header follows the stop's own verdict, so this
+  # is the confirmed half; service-stop-03 and -04 below are the unconfirmed
+  # one.
 
   @id:service-stop-yes-stops-a-running-service
   Scenario: service-stop-01 - `rocm services stop <id> --yes` stops a running managed service
@@ -42,10 +46,12 @@ Feature: Stopping a managed service
   # Linux-only: the token is read from `/proc`, which is where `rocmd` reads it
   # too; without one the identity check is not exercised at all.
   #
-  # The unconfirmed half of the contract — a recorded process that survives the
-  # stop, or whose identity cannot be read — needs a process that outlives
-  # SIGKILL or an unreadable `/proc` entry. Neither can be staged from outside
-  # the binary, so that half is covered by `rocmd`'s unit tests instead.
+  # The daemon's unconfirmed half — a recorded process that survives the stop,
+  # or whose identity cannot be read — needs a process that outlives SIGKILL or
+  # an unreadable `/proc` entry. Neither can be staged from outside `rocmd`,
+  # which has no test seam for it, so that half of `stop_server` is covered by
+  # `rocmd`'s unit tests. `rocm services stop`'s unconfirmed half is staged
+  # below, in service-stop-03 and -04.
 
   @id:service-stop-confirms-a-stop-and-cleans-up
   @requires-os:linux
@@ -56,3 +62,60 @@ Feature: Stopping a managed service
     And the recorded process is no longer running
     And the server's record reads stopped and names no process
     And the server's endpoint key file is gone
+
+  # `rocm services stop`'s unconfirmed half. Neither way a stop goes
+  # unconfirmed can be produced from outside the binary — a recorded process
+  # that outlives SIGKILL, or one whose start-time cannot be read back — so the
+  # `e2e-test-hooks` build's `ROCM_E2E_STOP_OUTCOME` seam makes the verified
+  # stop report that outcome for the recorded process without signalling it.
+  # Everything else runs for real: the stop's record writes, the key handling,
+  # the report and the exit status. The seam applies to the one stop the Given
+  # sets it up for.
+  #
+  # Neither report names a command to run the stop again. A second stop cannot
+  # be relied on to finish: when the recorded process is gone and only a
+  # process under it survived, a second stop finds the recorded one gone and
+  # confirms without reaching the survivor.
+  #
+  # What the seam cannot show is what `terminate_verified` itself does: it
+  # replaces that call, so these scenarios prove the CLI's report, exit status
+  # and kept record and key for each outcome, not whether a process was
+  # signalled. That an `unverified` PID is never signalled rests on
+  # `terminate_verified` returning before any signal when the identity is
+  # indeterminate (`rocm-core`'s `proc_lifecycle.rs`); no unit test covers that
+  # path yet, because an unreadable `/proc` entry cannot be staged there either.
+  #
+  # Linux-only for the same reason as service-stop-02: the recorded process
+  # carries the start-time token `/proc` gives it.
+
+  @id:service-stop-unconfirmed-fails-and-keeps-the-record
+  @requires-os:linux
+  Scenario: service-stop-03 - A stop that cannot confirm the exit fails, keeps the server's record, and names no retry
+    Given a managed server whose recorded process is running
+    And the next stop cannot confirm that process exited
+    When the user stops it with --yes
+    Then the CLI reports the stop as not confirmed for a process that did not exit
+    And the server's record still names its process and the stop request
+    And the report says the record and the endpoint key were kept, and the key file is still there
+
+  @id:service-stop-unverified-fails-without-a-retry
+  @requires-os:linux
+  Scenario: service-stop-04 - A stop that cannot verify its process fails, keeps the server's record, and names a check, not a retry
+    Given a managed server whose recorded process is running
+    And the next stop cannot verify that process as the server's
+    When the user stops it with --yes
+    Then the CLI reports the stop as not confirmed for a process it could not verify
+    And the server's record still names its process and the stop request
+    And the report says the record and the endpoint key were kept, and the key file is still there
+
+  # A server started without an API key has no key file, and an unconfirmed
+  # stop of it keeps only the record; the report must not claim otherwise.
+  @id:service-stop-unconfirmed-keyless-keeps-only-the-record
+  @requires-os:linux
+  Scenario: service-stop-05 - An unconfirmed stop of a server without an endpoint key reports keeping only its record
+    Given a managed server without an endpoint key whose recorded process is running
+    And the next stop cannot confirm that process exited
+    When the user stops it with --yes
+    Then the CLI reports the stop as not confirmed and names no stop command
+    And the server's record still names its process and the stop request
+    And the report says only the record was kept, and there is no key file
