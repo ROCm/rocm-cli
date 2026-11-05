@@ -1841,7 +1841,11 @@ async fn services_manager_closed(world: &mut E2eWorld) {
     // through the rows where the main menu would be. The same chip is what
     // guards against Esc falling through to open the main menu instead: with
     // `Modal::Menu` open it reads "close", so this wait fails rather than
-    // passing on a frame with the menu over the closed manager.
+    // passing on a frame with the menu over the closed manager. The literal
+    // depends on the chip's spacing and on the "menu" arm, which the dash-tui
+    // unit test `footer_esc_chip_renders_the_text_the_e2e_dashboard_steps_wait_for`
+    // (`footer.rs`) pins for both the idle and the menu-open footer, so a change
+    // to either fails there rather than as a timeout here.
     wait_for_all_markers(
         tui,
         "the Observe tab, with no main menu opened by Escape",
@@ -1915,28 +1919,18 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
     // The tab bar behind the palette already draws "Home", "Serving", "Observe"
-    // and "Chat", so those words are not evidence the popup is on screen. Each
-    // destination is therefore looked for as a palette row (the cursor column
-    // `PALETTE_DESTS` rows start with, then the label) below the "Go to…" title,
-    // which the tab bar above it cannot satisfy. Chat is the palette's last
+    // and "Chat", and the dimmed backdrop can carry any of those words beside
+    // the popup, so the words alone are not evidence the popup is on screen.
+    // Each destination is therefore looked for as a palette row (the cursor
+    // column `PALETTE_DESTS` rows start with, then the label) at the popup's own
+    // text column, on a later line than the row before it
+    // (`e2e_cucumber::palette_rows`, unit-tested). Chat is the palette's last
     // destination row, so the wait ends only once every row is drawn.
     wait_for_frame(session(world), "the command palette", |screen| {
-        let Some(title_row) = screen.lines().position(|line| line.contains("Go to")) else {
-            return vec!["the \"Go to\" title".to_string()];
-        };
-        let below_title = screen
-            .lines()
-            .skip(title_row + 1)
-            .collect::<Vec<_>>()
-            .join("\n");
-        ["Home", "ROCm", "Serving", "Observe", "Chat"]
-            .into_iter()
-            .filter(|label| {
-                !below_title.contains(&format!("▸ {label}"))
-                    && !below_title.contains(&format!("  {label}"))
-            })
-            .map(|label| format!("the palette row {label:?}"))
-            .collect()
+        e2e_cucumber::palette_rows::palette_rows_missing(
+            screen,
+            &["Home", "ROCm", "Serving", "Observe", "Chat"],
+        )
     })
     .await;
 }
@@ -2606,21 +2600,22 @@ async fn prepare_doctor_report(world: &mut E2eWorld) {
 
 #[then("the report is displayed for review")]
 async fn report_displayed_for_review(world: &mut E2eWorld) {
-    let tui = session(world);
     // Whichever way this machine goes, the command prints one JSON object that
-    // carries a `schema`: the report, or the refusal envelope.
-    tui.wait_for_screen("\"schema\"", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the report preview did not appear: {e}"));
-    // The console's dismiss hint appears only once the job has finished, so
-    // the key that follows cannot land on a job still running.
-    tui.wait_for_screen("Enter/Esc dismiss", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the report preview never finished: {e}"));
+    // carries a `schema`: the report, or the refusal envelope. The console's
+    // dismiss hint appears only once the job has finished, so the key that
+    // follows cannot land on a job still running. Both are waited for together
+    // so the answer below is read from the frame that ended the wait, not from a
+    // later read of a screen that can still be changing.
+    let frame = wait_for_all_markers(
+        session(world),
+        "the report preview, finished",
+        &["\"schema\"", "Enter/Esc dismiss"],
+    )
+    .await;
     // What the CLI said, read from its own output on the console: the refusal
     // envelope is the one with a `refused` key. The card is checked against it
     // after the console is left.
-    world.dash_report_refused = Some(tui.screen_text().contains("\"refused\""));
+    world.dash_report_refused = Some(frame.contains("\"refused\""));
 }
 
 #[when("the user leaves the report review")]

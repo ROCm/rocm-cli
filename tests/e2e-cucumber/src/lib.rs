@@ -14,6 +14,7 @@ pub mod mock_server;
 pub mod model_id;
 pub mod monotonic_clock;
 pub mod paced_download;
+pub mod palette_rows;
 pub mod panic_capture;
 pub mod polled_deadline;
 pub mod powershell_text_rule;
