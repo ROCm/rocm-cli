@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{AppState, OPTIONS_TABS, PALETTE_DESTS};
+use crate::app::{AppState, MENU_ITEMS, OPTIONS_TABS, PALETTE_DESTS};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::theme::Theme;
 
@@ -25,8 +25,9 @@ use crate::ui::theme::Theme;
 /// Row (relative to `inner.y`) where the Esc menu's selectable items begin,
 /// just below the 5-row logo (rows 1..=5).
 const MENU_ITEMS_Y: u16 = 8;
-/// Number of selectable rows in the Esc menu (Options / Help / Quit).
-const MENU_ITEM_COUNT: u16 = 3;
+/// Number of selectable rows in the Esc menu, counted from the one list
+/// ([`MENU_ITEMS`]) the key handling and the drawn rows also use.
+const MENU_ITEM_COUNT: u16 = MENU_ITEMS.len() as u16;
 /// Minimum inner width the logo needs before the menu will render.
 const MENU_MIN_WIDTH: u16 = 31;
 
@@ -54,9 +55,8 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
     draw_logo(f, cx, inner.y + 1, theme);
 
-    let items = ["Options", "Help", "Quit"];
     let mx = inner.x + 4;
-    for (i, label) in items.iter().enumerate() {
+    for (i, item) in MENU_ITEMS.iter().enumerate() {
         let y = inner.y + MENU_ITEMS_Y + i as u16;
         if y >= inner.y + inner.height {
             break;
@@ -75,7 +75,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(cur, Style::default().fg(theme.accent)),
-                Span::styled(*label, st),
+                Span::styled(item.label(), st),
             ])),
             Rect::new(mx, y, inner.width.saturating_sub(4), 1),
         );
@@ -267,7 +267,7 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_logo, grey_overlay, opt_row};
+    use super::{MENU_ITEMS, draw_logo, grey_overlay, opt_row};
     use crate::ui::tests::flat;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
@@ -297,6 +297,148 @@ mod tests {
             !menu_fits(20, MENU_MIN_WIDTH - 1),
             "a box narrower than the logo must not render"
         );
+    }
+
+    /// The text between the menu box's side borders, outer blanks trimmed.
+    fn inside(row: &str) -> &str {
+        row.trim().trim_matches('│').trim()
+    }
+
+    /// Render `draw_menu` on a `w`x`h` screen with `sel` focused and return the
+    /// rows below the logo that carry menu text inside the box, as
+    /// `(screen row, text inside the borders)`. The bottom border does not
+    /// start with a side border, so it is excluded.
+    fn drawn_item_rows(w: u16, h: u16, sel: usize) -> Vec<(usize, String)> {
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, w, h);
+        let rows = crate::ui::tests::rows(w, h, |f| super::draw_menu(f, area, sel, &theme));
+        let logo_end = rows
+            .iter()
+            .rposition(|r| r.contains('█'))
+            .expect("the logo is drawn when the menu fits");
+        rows.iter()
+            .enumerate()
+            .skip(logo_end + 1)
+            .filter(|(_, r)| r.trim_start().starts_with('│') && !inside(r).is_empty())
+            .map(|(y, r)| (y, inside(r).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn esc_menu_draws_options_help_quit_in_order_with_only_the_selected_row_marked() {
+        // Characterisation of the drawn rows: the same three labels in the same
+        // order, one "▸ " cursor on the selected row and a blank cursor column
+        // on the others.
+        for (sel, expected) in [
+            (0usize, ["▸ Options", "Help", "Quit"]),
+            (1, ["Options", "▸ Help", "Quit"]),
+            (2, ["Options", "Help", "▸ Quit"]),
+        ] {
+            let drawn = drawn_item_rows(120, 30, sel);
+            let texts: Vec<&str> = drawn.iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(texts, expected, "rows drawn with sel={sel}");
+            // The three items are on consecutive screen rows.
+            assert_eq!(drawn[1].0, drawn[0].0 + 1, "sel={sel}");
+            assert_eq!(drawn[2].0, drawn[1].0 + 1, "sel={sel}");
+        }
+    }
+
+    #[test]
+    fn esc_menu_item_rows_sit_at_a_fixed_column_with_focus_styling() {
+        use ratatui::style::Modifier;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 120, 30);
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw_menu(f, area, 1, &theme)).unwrap();
+        // One render: the row text and the cell styles both come from this buffer.
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let y_of = |label: &str| -> u16 {
+            rows.iter()
+                .position(|r| inside(r) == label || inside(r) == format!("▸ {label}"))
+                .unwrap_or_else(|| panic!("no row for {label}")) as u16
+        };
+        // Locate the box's left border on the Help row instead of hardcoding
+        // where the popup sits, so a change to the popup's size does not
+        // break this test. The cursor column is 7 cells right of that border
+        // and the label 2 more.
+        let help_y = y_of("Help");
+        let border_x = (0..buf.area.width)
+            .find(|&x| buf[(x, help_y)].symbol() == "│")
+            .expect("the Help row starts inside a bordered box");
+        let (cursor_x, label_x) = (border_x + 7, border_x + 9);
+        assert_eq!(buf[(cursor_x, help_y)].symbol(), "▸");
+        assert_eq!(buf[(cursor_x, help_y)].style().fg, Some(theme.accent));
+        assert_eq!(buf[(label_x, help_y)].symbol(), "H");
+        assert_eq!(buf[(label_x, help_y)].style().fg, Some(theme.accent));
+        assert!(
+            buf[(label_x, help_y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "the selected label is bold"
+        );
+        for (label, first) in [("Options", "O"), ("Quit", "Q")] {
+            let y = y_of(label);
+            assert_eq!(buf[(label_x, y)].symbol(), first, "{label}");
+            assert_eq!(buf[(label_x, y)].style().fg, Some(theme.fg), "{label}");
+            assert!(
+                !buf[(label_x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::BOLD),
+                "{label} is not bold when unselected"
+            );
+            assert_eq!(buf[(cursor_x, y)].symbol(), " ", "{label} has no cursor");
+        }
+    }
+
+    #[test]
+    fn esc_menu_is_drawn_only_when_the_box_is_tall_enough_for_every_item() {
+        // End-to-end counterpart of `esc_menu_requires_room_for_all_items`: on
+        // a 120-column screen the box has 13 rows at height 19 (the logo would
+        // show but not every item) and 14 at height 20, the smallest screen on
+        // which Options, Help and Quit all fit.
+        let theme = Theme::from_name("default-dark");
+        let render = |h: u16| {
+            let area = Rect::new(0, 0, 120, h);
+            crate::ui::tests::rows(120, h, |f| super::draw_menu(f, area, 0, &theme)).join("\n")
+        };
+        let short = render(19);
+        assert!(
+            !short.contains('█')
+                && !short.contains("Options")
+                && !short.contains("Help")
+                && !short.contains("Quit"),
+            "height 19 must draw an empty frame:\n{short}"
+        );
+        let just_fits = render(20);
+        assert!(just_fits.contains('█'), "logo at height 20");
+        for label in ["Options", "Help", "Quit"] {
+            assert!(just_fits.contains(label), "{label} at height 20");
+        }
+    }
+
+    #[test]
+    fn esc_menu_draws_the_rows_of_the_list_the_selection_walks() {
+        // The drawn rows and the wrap bound of `KeyAction::MenuMove` both come
+        // from `MENU_ITEMS` (`app/types.rs`), so what is drawn is exactly what
+        // the selection can reach, label for label.
+        let drawn = drawn_item_rows(120, 30, 0);
+        let drawn: Vec<&str> = drawn
+            .iter()
+            .map(|(_, t)| t.trim_start_matches("▸ "))
+            .collect();
+        let listed: Vec<&str> = MENU_ITEMS.iter().map(|i| i.label()).collect();
+        assert_eq!(drawn, listed);
+        // `label()` is on both sides above, so pin the wording itself too.
+        assert_eq!(listed, ["Options", "Help", "Quit"]);
     }
 
     #[test]
