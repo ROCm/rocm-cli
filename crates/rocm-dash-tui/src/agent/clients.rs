@@ -849,7 +849,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::agent::{
-        ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, SKILL_NAMES, fixture_snapshot,
+        ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, TELEMETRY_TOOL_NAMES, fixture_snapshot,
     };
 
     /// A throwaway, never-pre-existing directory for
@@ -1704,11 +1704,15 @@ mod tests {
         // asserts those tools are actually sent on the wire from that one site.
         //
         // Telemetry set: register_telemetry_tools registers exactly the
-        // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
+        // TELEMETRY_TOOL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
         // TokensPerWatt). Pinning the size here means the telemetry
         // registration can't silently diverge from the canonical set.
-        assert_eq!(SKILL_NAMES.len(), 4, "canonical telemetry set size");
-        for n in SKILL_NAMES {
+        assert_eq!(
+            TELEMETRY_TOOL_NAMES.len(),
+            4,
+            "canonical telemetry set size"
+        );
+        for n in TELEMETRY_TOOL_NAMES {
             assert!(!n.is_empty(), "empty telemetry/skill tool name");
             // Telemetry tools are disjoint from both ROCm sets.
             assert!(
@@ -1807,7 +1811,7 @@ mod tests {
         // outside the three name tables (the retired `list_skills` and
         // `skill_plan` included), and nothing in them left unregistered. A new
         // tool is added to its table in the same change, which keeps this true.
-        let expected_tool_names: std::collections::BTreeSet<&str> = SKILL_NAMES
+        let expected_tool_names: std::collections::BTreeSet<&str> = TELEMETRY_TOOL_NAMES
             .iter()
             .chain(ROCM_READ_TOOL_NAMES.iter())
             .chain(ROCM_MUTATING_TOOL_NAMES.iter())

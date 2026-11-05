@@ -178,8 +178,8 @@ impl Tool for TokensPerWattTool {
     }
 }
 
-/// All Skill names, for definition/uniqueness checks and docs.
-pub const SKILL_NAMES: [&str; 4] = [
+/// All telemetry tool names, for definition/uniqueness checks and docs.
+pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
     GpuStatusTool::NAME,
     ListInstancesTool::NAME,
     BenchSummaryTool::NAME,
@@ -427,7 +427,7 @@ rocm_read_tool!(
     }
 );
 
-/// All read-only ROCm tool names (mirrors [`SKILL_NAMES`]).
+/// All read-only ROCm tool names (mirrors [`TELEMETRY_TOOL_NAMES`]).
 ///
 /// Used for uniqueness/registration checks and the parity map. Mutating tools
 /// are intentionally absent. `natural_language_plan` is read-only: it plans but
@@ -787,15 +787,15 @@ mod tests {
 
     #[test]
     fn skill_names_are_unique_and_non_empty() {
-        for n in SKILL_NAMES {
+        for n in TELEMETRY_TOOL_NAMES {
             assert!(!n.is_empty(), "skill name must be non-empty");
         }
-        let mut sorted = SKILL_NAMES.to_vec();
+        let mut sorted = TELEMETRY_TOOL_NAMES.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            SKILL_NAMES.len(),
+            TELEMETRY_TOOL_NAMES.len(),
             "skill names must be unique"
         );
     }
@@ -860,7 +860,7 @@ mod tests {
         // installs an engine, and no executor ever applied their plans. They
         // must not come back in any tool set the model is offered.
         for gone in ["list_skills", "skill_plan"] {
-            assert!(!SKILL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(!TELEMETRY_TOOL_NAMES.contains(&gone), "{gone} is retired");
             assert!(!ROCM_READ_TOOL_NAMES.contains(&gone), "{gone} is retired");
             assert!(
                 !ROCM_MUTATING_TOOL_NAMES.contains(&gone),
@@ -1015,7 +1015,10 @@ mod tests {
         }
         // Disjoint from read-only + skill names (iterates the registry itself).
         for n in ROCM_MUTATING_TOOL_NAMES {
-            assert!(!SKILL_NAMES.contains(&n), "collision with skill: {n}");
+            assert!(
+                !TELEMETRY_TOOL_NAMES.contains(&n),
+                "collision with skill: {n}"
+            );
             // install_sdk_dry_run (read-only) must not clash with install_sdk.
             assert!(
                 !ROCM_READ_TOOL_NAMES.contains(&n),
@@ -1232,9 +1235,9 @@ mod tests {
         // natural_language_plan is read-only (plans, never executes) — Phase 7.
         assert!(ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
         // The telemetry/skill tools are still present and disjoint from the new set.
-        assert!(SKILL_NAMES.contains(&"gpu_status"));
+        assert!(TELEMETRY_TOOL_NAMES.contains(&"gpu_status"));
         for n in ROCM_READ_TOOL_NAMES {
-            assert!(!SKILL_NAMES.contains(&n), "name collision: {n}");
+            assert!(!TELEMETRY_TOOL_NAMES.contains(&n), "name collision: {n}");
         }
     }
 }
