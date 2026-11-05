@@ -912,9 +912,10 @@ can:
   directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
-`--wait` keeps `rocm serve` waiting until the server answers requests, however
-long a first-time model download takes, instead of returning `starting` after 45
-seconds; if the server exits first (crashes, is killed, or is stopped with
+`--wait` keeps `rocm serve` waiting until the server answers requests or its
+engine gives up (vLLM and AIM after 5 minutes by default; raise it with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
+of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background. It cannot be combined with `--foreground` or `--verbose`, and

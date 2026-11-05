@@ -607,8 +607,10 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
-        /// Keep waiting until the server answers requests, however long a first-time
-        /// model download takes, instead of returning `starting` after 45 seconds.
+        /// Keep waiting until the server answers requests or its engine gives up
+        /// (vLLM and AIM after 5 minutes by default, raised with
+        /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
+        /// instead of returning `starting` after 45 seconds.
         /// Also waits on a matching server that is already starting. Fails with a
         /// pointer to the logs if the server exits first. Cannot be
         /// combined with --foreground or --verbose, which already stay attached.

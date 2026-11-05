@@ -774,7 +774,7 @@ fn died_during_wait(
     }
     settle_exited_service(paths, service_id);
     Some(anyhow!(
-        "the server exited before it became ready; see `rocm logs --service {service_id}` for its output"
+        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
     ))
 }
 

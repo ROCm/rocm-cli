@@ -403,7 +403,7 @@ rocm services
 rocm services list --all
 rocm services logs <service-id>
 rocm services logs <service-id> --follow
-rocm serve <model> --wait   # waits past 45s and returns once the server answers (also for a matching server still starting; an already-serving one returns at once)
+rocm serve <model> --wait   # waits past 45s and returns once the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -430,7 +430,8 @@ Expected result:
   row directly under the newest output (and under the download bar) as the log
   grows; with output piped to a file it is printed once instead.
 - `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
-  server answers. If the server is killed or stopped meanwhile, it exits non-zero
+  server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
+  with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
   with `the server exited before it became ready` and a `rocm logs --service`
   pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
