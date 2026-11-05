@@ -13,7 +13,11 @@
 //! decode must produce is pinned by the round-trip, version-skew and golden
 //! document tests.
 
+#[path = "../../rocm-core/tests/common/proptest_cases.rs"]
+mod proptest_cases;
+
 use proptest::prelude::*;
+use proptest_cases::proptest_cases;
 use rocm_engine_protocol::{
     DetectResponse, DevicePolicy, EngineCapabilities, EngineDeviceAvailability, EngineMethod,
     EngineRecipeEndpointHint, EngineRecipeHint, EngineRecipeUnsupportedCombinationHint,
@@ -30,7 +34,8 @@ macro_rules! decode_without_panic {
     };
 }
 
-/// Every envelope/payload type a plugin's output is decoded into.
+/// Every envelope and payload type the protocol decodes, in either direction:
+/// what a plugin writes (responses) and what it reads (requests).
 fn decode_all_without_panic(bytes: &[u8]) {
     decode_without_panic!(EngineRequestEnvelope, bytes);
     decode_without_panic!(EngineResponseEnvelope, bytes);
@@ -251,7 +256,10 @@ fn mutate(json: &str, position: usize, kind: u8) -> Vec<u8> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(512),
+        ..ProptestConfig::default()
+    })]
 
     /// Encode then decode must be the identity for every value the type holds.
     #[test]
@@ -365,7 +373,10 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(1024),
+        ..ProptestConfig::default()
+    })]
 
     /// A plugin binary name is attacker-influenced (anyone who can drop a file
     /// into a plugin directory). The derived engine id is later used to build
@@ -392,9 +403,11 @@ proptest! {
         ],
     ) {
         if let Some(id) = engine_id_from_plugin_binary_name(&name) {
+            // The character set below has no separator, so it also rules out
+            // `/` and `\`. That well-formed names do yield their id, which a
+            // helper that never returned one would fail, is pinned by
+            // `plugin_binary_names_yield_their_engine_id`.
             prop_assert!(!id.is_empty());
-            prop_assert!(!id.contains('/'), "engine id must not contain `/`: {id:?}");
-            prop_assert!(!id.contains('\\'), "engine id must not contain `\\`: {id:?}");
             prop_assert!(id != "." && id != "..", "engine id must not traverse: {id:?}");
             prop_assert!(
                 id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
@@ -403,8 +416,11 @@ proptest! {
         }
     }
 
-    /// `--gpu` is direct user input. Parsing must never panic, and a successful
-    /// parse must round-trip through the CLI spelling it reports.
+    /// `--gpu` is direct user input. Parsing must never panic on arbitrary
+    /// text, and a successful parse must round-trip through the CLI spelling
+    /// it reports. Random text almost never parses, so this is mostly a panic
+    /// check; which values must parse, and to what, is pinned by
+    /// `gpu_cli_values_parse_as_documented`.
     #[test]
     fn gpu_selection_parse_never_panics_and_roundtrips(value in "[ -~]{0,16}") {
         match GpuSelection::parse_cli_value(&value) {
@@ -475,7 +491,10 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(256),
+        ..ProptestConfig::default()
+    })]
 
     /// A `LogsRequest` carries a `tail_lines` count straight from the caller into
     /// the engines' tail logic; it must round-trip exactly, including the
@@ -545,11 +564,6 @@ proptest! {
         prop_assert_eq!(decoded.port, port);
         prop_assert_eq!(decoded.gpu_selection, selection);
         prop_assert_eq!(decoded.device_policy, device_policy);
-        prop_assert_eq!(
-            is_public_bind_host(&decoded.host),
-            is_public_bind_host(&host),
-            "the bind classification must not change across the wire"
-        );
     }
 
     /// A request envelope decodes exactly when its method is one of the
@@ -709,7 +723,10 @@ const HEALTHCHECK_REQUIRED_FIELDS: [&str; 5] = [
 ];
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(256),
+        ..ProptestConfig::default()
+    })]
 
     /// Version skew: a newer engine sends extra fields and may omit ones this
     /// build requires. The document decodes exactly when every required field
@@ -992,7 +1009,10 @@ fn engine_methods_use_their_documented_wire_names() {
 // `BTreeMap` keys in a recipe hint come off the wire; duplicates in the JSON
 // must resolve deterministically rather than depending on iteration order.
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(256),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn duplicate_parser_setting_keys_resolve_last_wins(

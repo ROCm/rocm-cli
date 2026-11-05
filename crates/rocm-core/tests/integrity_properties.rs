@@ -11,9 +11,13 @@
 //! random generator essentially never produces an input that reaches the
 //! interesting branches of an RSA verifier.
 
+#[path = "common/proptest_cases.rs"]
+mod proptest_cases;
+
 use std::sync::OnceLock;
 
 use proptest::prelude::*;
+use proptest_cases::proptest_cases;
 use rocm_core::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -52,7 +56,10 @@ fn payload_strategy() -> impl Strategy<Value = Vec<u8>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(64),
+        ..ProptestConfig::default()
+    })]
 
     /// Baseline: a genuine signature over the exact payload verifies.
     #[test]
@@ -169,7 +176,10 @@ fn mangle_pem(pem: &str, style: u8) -> String {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(48),
+        ..ProptestConfig::default()
+    })]
 
     /// Tolerated mangling must not change *which* key is trusted.
     #[test]

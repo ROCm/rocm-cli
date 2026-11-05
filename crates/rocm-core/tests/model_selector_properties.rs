@@ -13,13 +13,16 @@
 //! never panic and must not report a *different* model as the one the user
 //! asked for.
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::thread;
+#[path = "common/loopback.rs"]
+mod loopback;
+#[path = "common/proptest_cases.rs"]
+mod proptest_cases;
+
 use std::time::Duration;
 
+use loopback::LoopbackServer;
 use proptest::prelude::*;
+use proptest_cases::proptest_cases;
 use rocm_core::{ModelRecipeRecord, builtin_model_recipes, openai_models_endpoint_has_model};
 
 fn catalog() -> &'static [ModelRecipeRecord] {
@@ -43,34 +46,37 @@ fn advertised_selectors() -> Vec<(String, String)> {
     selectors
 }
 
-/// Serve one HTTP response carrying `body` on an ephemeral loopback port.
-fn serve_once(body: String) -> (u16, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let port = listener.local_addr().expect("local addr").port();
-    let handle = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut scratch = [0_u8; 4096];
-            let _ = stream.read(&mut scratch);
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(body.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    (port, handle)
+/// A `/v1/models` document listing exactly `ids`.
+fn models_document(ids: &[&str]) -> String {
+    serde_json::json!({
+        "object": "list",
+        "data": ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "object": "model" }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// Ask the readiness check what it makes of the document `server` serves when
+/// expecting `expected`. Panics if the request never reached the server, so a
+/// transport failure cannot pass as a "not ready" verdict.
+fn readiness_from(server: &LoopbackServer, expected: Option<&str>) -> Result<bool, String> {
+    let before = server.requests_served();
+    let outcome =
+        openai_models_endpoint_has_model(&server.url(), expected, None, Duration::from_secs(10))
+            .map_err(|error| error.to_string());
+    assert!(
+        server.requests_served() > before,
+        "the readiness check never reached the test server: {outcome:?}"
+    );
+    outcome
 }
 
 /// Ask the readiness check what it makes of `body` when expecting `expected`.
 fn endpoint_reports(body: String, expected: Option<&str>) -> Result<bool, String> {
-    let (port, server) = serve_once(body);
-    let url = format!("http://127.0.0.1:{port}");
-    let outcome = openai_models_endpoint_has_model(&url, expected, None, Duration::from_secs(10))
-        .map_err(|error| error.to_string());
-    let _ = server.join();
-    outcome
+    let server = LoopbackServer::start(Some("application/json"), body.into_bytes());
+    readiness_from(&server, expected)
 }
 
 #[test]
@@ -81,30 +87,11 @@ fn the_shipped_catalog_is_not_empty() {
     );
 }
 
-/// No selector the catalog advertises may resolve to two different recipes.
-/// `resolve_model_recipe` returns the first match, so an overlap means the
-/// winner depends on JSON ordering rather than on the user's intent.
-#[test]
-fn no_advertised_selector_matches_two_recipes() {
-    let mut ambiguous: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for (selector, _) in advertised_selectors() {
-        let matches: Vec<&str> = catalog()
-            .iter()
-            .filter(|recipe| recipe.matches_ref(&selector))
-            .map(|recipe| recipe.canonical_model_id.as_str())
-            .collect();
-        if matches.len() > 1 {
-            ambiguous.insert(selector, matches);
-        }
-    }
-    assert!(
-        ambiguous.is_empty(),
-        "these selectors resolve to more than one recipe, so the winner is catalog order: \
-         {ambiguous:#?}"
-    );
-}
-
 /// Every advertised selector must resolve to the recipe that advertises it.
+///
+/// That no selector is advertised twice is the catalog schema's own check
+/// (`ModelRecipeIndexDocument::validate`, which normalizes refs the same way
+/// `matches_ref` does), run on the shipped catalog by its unit tests.
 #[test]
 fn every_advertised_selector_resolves_to_its_own_recipe() {
     for (selector, owner) in advertised_selectors() {
@@ -122,7 +109,10 @@ fn every_advertised_selector_resolves_to_its_own_recipe() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(512),
+        ..ProptestConfig::default()
+    })]
 
     /// Selector matching ignores surrounding whitespace and ASCII case: any
     /// re-casing of an advertised selector, padded with spaces, tabs or
@@ -212,19 +202,18 @@ proptest! {
     }
 }
 
-/// `/v1/models` bodies shaped the way a real engine shapes them, plus the
-/// degenerate shapes a broken or hostile one could send.
+/// `/v1/models` bodies that name no model matching any of the expectations
+/// below, shaped the way a real engine shapes them, plus the degenerate shapes
+/// a broken or hostile one could send.
+///
+/// The listed ids carry no letter. Every expected name below does, and every
+/// rule readiness matches by — equality, basename, catalog alias, family word —
+/// needs a letter in common, so none of these documents may read as ready.
 fn models_body_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
-        3 => prop::collection::vec("[ -~]{0,24}", 0..4).prop_map(|ids| {
-            serde_json::json!({
-                "object": "list",
-                "data": ids
-                    .into_iter()
-                    .map(|id| serde_json::json!({ "id": id, "object": "model" }))
-                    .collect::<Vec<_>>(),
-            })
-            .to_string()
+        3 => prop::collection::vec("[0-9 ._:#/@-]{0,24}", 0..4).prop_map(|ids| {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            models_document(&ids)
         }),
         1 => Just("{}".to_owned()),
         1 => Just(r#"{"data": []}"#.to_owned()),
@@ -240,12 +229,17 @@ fn models_body_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(48),
+        ..ProptestConfig::default()
+    })]
 
-    /// A malformed or hostile `/v1/models` document must produce a clean
-    /// `false` or a clean error — never a panic, and never a spurious "ready".
+    /// A `/v1/models` document that names no matching model — malformed,
+    /// hostile, or listing only unrelated ids — must produce a clean `false` or
+    /// a clean error: never a panic, and never "ready". A check that reported
+    /// ready for any non-empty listing, ignoring the expected model, fails here.
     #[test]
-    fn a_models_document_never_reports_ready_without_naming_a_model(
+    fn a_models_document_naming_no_matching_model_never_reports_ready(
         body in models_body_strategy(),
         expected in prop::sample::select(vec![
             "Qwen/Qwen3-4B-Instruct-2507",
@@ -253,27 +247,14 @@ proptest! {
             "nonexistent/model",
         ]),
     ) {
-        // The call must return, not unwind. Any `Ok(true)` has to be justified
-        // by the document actually naming a model that matches.
-        if endpoint_reports(body.clone(), Some(expected)) == Ok(true) {
-            let value: serde_json::Value = serde_json::from_str(body.trim())
-                .expect("a ready verdict requires a parseable document");
-            let names_a_model = value
-                .get("data")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .any(|item| {
-                    ["id", "model", "name"]
-                        .into_iter()
-                        .filter_map(|field| item.get(field).and_then(serde_json::Value::as_str))
-                        .any(|value| !value.trim().is_empty())
-                });
-            prop_assert!(
-                names_a_model,
-                "reported ready for {expected:?} from a document naming no model at all: {body}"
-            );
-        }
+        let verdict = endpoint_reports(body.clone(), Some(expected));
+        prop_assert_ne!(
+            verdict,
+            Ok(true),
+            "reported ready for {:?} from a document naming no matching model: {}",
+            expected,
+            body
+        );
     }
 
     /// Positive control for the property above: a document that does list the
@@ -303,14 +284,8 @@ proptest! {
         let mut ids = others;
         let position = at.index(ids.len() + 1);
         ids.insert(position, listed.clone());
-        let body = serde_json::json!({
-            "object": "list",
-            "data": ids
-                .iter()
-                .map(|id| serde_json::json!({ "id": id, "object": "model" }))
-                .collect::<Vec<_>>(),
-        })
-        .to_string();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let body = models_document(&ids);
         prop_assert_eq!(
             endpoint_reports(body, Some(expected)),
             Ok(true),
@@ -365,33 +340,42 @@ fn is_bare_family_word(name: &str) -> bool {
 /// and a family match from one that has lost its guards or matches inside a
 /// word rather than at its start.
 ///
-/// Bare family words are excluded here and pinned by
-/// [`a_bare_family_word_satisfies_readiness_for_the_whole_family`], which
-/// documents the one shape that *does* cross-match today.
+/// Two shapes that *do* cross-match today are excluded here and pinned
+/// separately, so they stay visible: bare family words, by
+/// [`a_bare_family_word_satisfies_readiness_for_the_whole_family`], and one
+/// recipe's alias spelling another recipe's basename, by
+/// [`an_alias_spelling_another_models_basename_reads_as_ready_for_it`].
+///
+/// The request count grows with the square of the catalog (every served name
+/// against every wanted model), so each served name gets one loopback server
+/// that answers all of its requests, rather than a server per request.
 #[test]
 fn listing_a_different_catalog_model_is_never_readiness() {
     let recipes = catalog();
     assert!(recipes.len() > 1, "need at least two recipes to confuse");
     let mut false_positives = Vec::new();
 
-    for wanted in recipes {
-        for served in recipes {
-            if served.canonical_model_id == wanted.canonical_model_id {
+    for served in recipes {
+        let served_names = std::iter::once(&served.canonical_model_id).chain(&served.aliases);
+        for served_name in served_names {
+            if is_bare_family_word(served_name) {
                 continue;
             }
-            let served_names = std::iter::once(&served.canonical_model_id).chain(&served.aliases);
-            for served_name in served_names {
-                // Skip a name the *wanted* recipe also answers to: that is a
-                // genuine shared alias, not a confusion.
-                if wanted.matches_ref(served_name) || is_bare_family_word(served_name) {
+            let server = LoopbackServer::start(
+                Some("application/json"),
+                models_document(&[served_name.as_str()]).into_bytes(),
+            );
+            for wanted in recipes {
+                // Skip the served recipe itself, a name the *wanted* recipe
+                // also answers to (a genuine shared alias, not a confusion),
+                // and the pinned alias/basename collision.
+                if wanted.canonical_model_id == served.canonical_model_id
+                    || wanted.matches_ref(served_name)
+                    || spells_the_basename_of(served_name, wanted)
+                {
                     continue;
                 }
-                let body = serde_json::json!({
-                    "object": "list",
-                    "data": [{ "id": served_name, "object": "model" }],
-                })
-                .to_string();
-                if endpoint_reports(body, Some(&wanted.canonical_model_id)) == Ok(true) {
+                if readiness_from(&server, Some(&wanted.canonical_model_id)) == Ok(true) {
                     false_positives.push(format!(
                         "wanted {:?} but an endpoint serving only {:?} reported ready",
                         wanted.canonical_model_id, served_name
@@ -399,16 +383,14 @@ fn listing_a_different_catalog_model_is_never_readiness() {
                 }
             }
         }
+    }
 
+    for wanted in recipes {
         for served_name in near_miss_names(&wanted.canonical_model_id) {
             if wanted.matches_ref(&served_name) {
                 continue;
             }
-            let body = serde_json::json!({
-                "object": "list",
-                "data": [{ "id": served_name, "object": "model" }],
-            })
-            .to_string();
+            let body = models_document(&[served_name.as_str()]);
             if endpoint_reports(body, Some(&wanted.canonical_model_id)) == Ok(true) {
                 false_positives.push(format!(
                     "wanted {:?} but an endpoint serving only the near miss {:?} reported ready",
@@ -425,6 +407,80 @@ fn listing_a_different_catalog_model_is_never_readiness() {
     );
 }
 
+/// Whether `name`, as an engine would report it, is exactly the basename of
+/// `recipe`'s canonical id (up to ASCII case) — the part after the last `/`,
+/// which readiness accepts on its own because engines commonly report a model
+/// by its basename.
+fn spells_the_basename_of(name: &str, recipe: &ModelRecipeRecord) -> bool {
+    let basename = recipe
+        .canonical_model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(&recipe.canonical_model_id);
+    name.trim().eq_ignore_ascii_case(basename)
+}
+
+/// Characterization test for a known false-positive surface, pinned so it is
+/// visible rather than merely absent from the suite.
+///
+/// Readiness accepts a model's basename for the model (an engine launched on
+/// `Qwen/Qwen3-32B` commonly reports `Qwen3-32B`). Some catalog aliases spell
+/// the basename of a *different* catalog model: `qwen3-32b` is an alias of
+/// `Qwen/Qwen3-32B-FP8` and also the basename of `Qwen/Qwen3-32B`. An engine
+/// launched on the FP8 recipe under that alias reports `qwen3-32b`, and that
+/// reads as ready for `Qwen/Qwen3-32B` — readiness cannot tell the two apart
+/// from the name alone.
+///
+/// The collisions are derived from the catalog and compared with the list
+/// below, so a catalog change that adds one fails here and has to be looked
+/// at rather than being silently excluded from
+/// [`listing_a_different_catalog_model_is_never_readiness`]. If readiness or
+/// the catalog aliases are changed to remove a collision, update the list
+/// along with them.
+#[test]
+fn an_alias_spelling_another_models_basename_reads_as_ready_for_it() {
+    let mut collisions = Vec::new();
+    for owner in catalog() {
+        for alias in &owner.aliases {
+            for other in catalog() {
+                if other.canonical_model_id != owner.canonical_model_id
+                    && !other.matches_ref(alias)
+                    && spells_the_basename_of(alias, other)
+                {
+                    collisions.push((
+                        alias.as_str(),
+                        owner.canonical_model_id.as_str(),
+                        other.canonical_model_id.as_str(),
+                    ));
+                }
+            }
+        }
+    }
+    collisions.sort_unstable();
+    assert_eq!(
+        collisions,
+        vec![
+            ("qwen3-32b", "Qwen/Qwen3-32B-FP8", "Qwen/Qwen3-32B"),
+            (
+                "qwen3.6-35b-a3b",
+                "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+                "Qwen/Qwen3.6-35B-A3B"
+            ),
+        ],
+        "(alias, recipe it belongs to, recipe whose basename it spells) — the catalog's \
+         alias/basename collisions changed"
+    );
+
+    for (alias, owner, other) in collisions {
+        assert_eq!(
+            endpoint_reports(models_document(&[alias]), Some(other)),
+            Ok(true),
+            "pinning the current behavior: {owner:?} served as {alias:?} reads as ready for \
+             {other:?}"
+        );
+    }
+}
+
 /// Readiness accepts a catalog model under any of its names: an engine that
 /// reports an alias satisfies a request for the canonical id, and the reverse.
 /// Checked for every alias in the shipped catalog.
@@ -437,11 +493,7 @@ fn readiness_accepts_a_catalog_model_under_any_of_its_names() {
                 (alias.as_str(), recipe.canonical_model_id.as_str()),
                 (recipe.canonical_model_id.as_str(), alias.as_str()),
             ] {
-                let body = serde_json::json!({
-                    "object": "list",
-                    "data": [{ "id": served, "object": "model" }],
-                })
-                .to_string();
+                let body = models_document(&[served]);
                 if endpoint_reports(body, Some(wanted)) != Ok(true) {
                     misses.push(format!("serving {served:?} did not satisfy {wanted:?}"));
                 }
@@ -489,7 +541,7 @@ fn near_miss_names(id: &str) -> Vec<String> {
 ///
 /// Readiness matches a bare *family* word against any model with a name token
 /// that starts with it, and does so in both directions. One direction is
-/// exercised by an existing unit test in `net.rs`: asking for `qwen` is
+/// exercised by an existing unit test in `endpoint_readiness.rs`: asking for `qwen` is
 /// satisfied by an engine serving `Qwen3-0.6B-GGUF`. This test pins the other: an endpoint
 /// whose `/v1/models` reports only the bare id `qwen` — itself a catalog alias
 /// — is reported ready for other `Qwen*` entries in the catalog, not just the
@@ -507,11 +559,7 @@ fn near_miss_names(id: &str) -> Vec<String> {
 /// updated along with the behavior.
 #[test]
 fn a_bare_family_word_satisfies_readiness_for_the_whole_family() {
-    let body = serde_json::json!({
-        "object": "list",
-        "data": [{ "id": "qwen", "object": "model" }],
-    })
-    .to_string();
+    let body = models_document(&["qwen"]);
 
     let cross_matched: Vec<&str> = catalog()
         .iter()
@@ -538,7 +586,7 @@ fn a_bare_family_word_satisfies_readiness_for_the_whole_family() {
         "the cross-match must at least stay inside the family: {cross_matched:?}"
     );
 
-    // The other direction, which the `net.rs` unit test also exercises: asking
+    // The other direction, which the `endpoint_readiness.rs` unit test also exercises: asking
     // for the bare family word is satisfied by an engine serving any catalog
     // model of that family.
     for recipe in catalog().iter().filter(|recipe| {
@@ -547,11 +595,7 @@ fn a_bare_family_word_satisfies_readiness_for_the_whole_family() {
             .to_ascii_lowercase()
             .contains("qwen")
     }) {
-        let body = serde_json::json!({
-            "object": "list",
-            "data": [{ "id": recipe.canonical_model_id, "object": "model" }],
-        })
-        .to_string();
+        let body = models_document(&[recipe.canonical_model_id.as_str()]);
         assert_eq!(
             endpoint_reports(body, Some("qwen")),
             Ok(true),
@@ -572,11 +616,7 @@ fn a_bare_family_word_satisfies_readiness_for_an_uncatalogued_model() {
         ("llama", "meta-llama/Llama-3.1-70B-Instruct"),
         ("gemma", "google/gemma-2-27b-it"),
     ] {
-        let body = serde_json::json!({
-            "object": "list",
-            "data": [{ "id": served, "object": "model" }],
-        })
-        .to_string();
+        let body = models_document(&[served]);
         assert_eq!(
             endpoint_reports(body, Some(wanted)),
             Ok(true),

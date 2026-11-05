@@ -283,7 +283,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scratch_dir;
+    use crate::test_support::{proptest_cases, scratch_dir};
     use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
 
@@ -298,6 +298,25 @@ mod tests {
         let error = verify_sha256(&archive, &"0".repeat(64)).unwrap_err();
         assert!(error.to_string().contains("SHA-256 mismatch"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Whether `error` is the digest check's own rejection, so a failure to
+    /// read the archive cannot pass as one.
+    fn is_digest_mismatch(error: &anyhow::Error) -> bool {
+        error.to_string().contains("SHA-256 mismatch")
+    }
+
+    /// A runner with a fixed seed, so a failure reproduces as-is, running at
+    /// least `cases` cases. `TestRunner::deterministic` alone takes its case
+    /// count from `PROPTEST_CASES` unchecked, so `PROPTEST_CASES=0` would pass
+    /// these properties without running one.
+    fn deterministic_runner(cases: u32) -> proptest::test_runner::TestRunner {
+        let config = proptest::test_runner::Config {
+            cases: proptest_cases(cases),
+            ..proptest::test_runner::Config::default()
+        };
+        let rng = proptest::test_runner::TestRng::deterministic_rng(config.rng_algorithm);
+        proptest::test_runner::TestRunner::new_with_rng(config, rng)
     }
 
     /// Property: the archive digest check accepts the pinned digest and nothing
@@ -326,7 +345,7 @@ mod tests {
 
         assert!(verify_sha256(&archive, &truth).is_ok());
 
-        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let mut runner = deterministic_runner(256);
         let near_miss = {
             let truth = truth.clone();
             (0usize..64, 1usize..64, 0u8..7).prop_map(move |(position, keep, kind)| match kind {
@@ -352,7 +371,8 @@ mod tests {
                     "the generator must only produce near misses"
                 );
                 prop_assert!(
-                    verify_sha256(&archive, &candidate).is_err(),
+                    verify_sha256(&archive, &candidate)
+                        .is_err_and(|error| is_digest_mismatch(&error)),
                     "the archive digest check accepted {:?} for an archive whose digest is {:?}",
                     candidate,
                     truth
@@ -364,7 +384,7 @@ mod tests {
         // An empty pin is the one near miss the generator above cannot produce
         // (it keeps at least one character); it must not read as "no check".
         assert!(
-            verify_sha256(&archive, "").is_err(),
+            verify_sha256(&archive, "").is_err_and(|error| is_digest_mismatch(&error)),
             "an empty pinned digest accepted the archive"
         );
 
@@ -397,18 +417,18 @@ mod tests {
         *tail_flipped.last_mut().unwrap() ^= 1;
         fs::write(&archive, &tail_flipped).unwrap();
         assert!(
-            verify_sha256(&archive, &truth).is_err(),
+            verify_sha256(&archive, &truth).is_err_and(|error| is_digest_mismatch(&error)),
             "a flip in the last byte was accepted"
         );
 
-        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let mut runner = deterministic_runner(256);
         runner
             .run(&(0usize..content.len(), 0u8..8), |(position, bit)| {
                 let mut tampered = content.clone();
                 tampered[position] ^= 1 << bit;
                 fs::write(&archive, &tampered).unwrap();
                 prop_assert!(
-                    verify_sha256(&archive, &truth).is_err(),
+                    verify_sha256(&archive, &truth).is_err_and(|error| is_digest_mismatch(&error)),
                     "an archive differing by one bit was accepted"
                 );
                 Ok(())
