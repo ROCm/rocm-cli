@@ -378,7 +378,7 @@ struct ServerState {
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
 /// route, so successive scrapes exercise the daemon's rate/average windowing
-/// (`gen_tps_from_delta`, `avg_ms_from_histogram` in
+/// (`gen_tps_from_delta`, `observe_latency` in
 /// `rocm-dash-daemon::runner`) the same way a real vLLM would:
 ///   * `vllm:generation_tokens_total` strictly increases every scrape, so the
 ///     counter-delta windowing yields a positive, visible generation rate
