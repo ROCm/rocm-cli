@@ -511,7 +511,7 @@ never prompts and never refuses, whatever the active default is.
 The preview also prepares no Python. On a host with no usable Python, a real
 install downloads a managed `uv`, has it install Python, and saves that Python's
 path in the config; `--dry-run` instead prints a `python_note:` line saying so
-and does none of it. Scenario `runtime-22` checks the note against the state it
+and does none of it. Scenario `runtime-23` checks the note against the state it
 left: a recording `uv` standing in for the download was never run (that log is
 the evidence; no network is involved), and there is no managed-tools folder and
 no saved config. It also looks for a tool archive in its own cache folder, but
@@ -520,7 +520,7 @@ The preview does not announce a Python the install would refuse either: with `RO
 as a wheel tag other than the layout's (`3.13`, `3.13t`, `cpython-3.13` or
 `cpython@3.13` for the canonical cp312 layout) the preview fails with the
 install's own message, before it prints any plan or a line saying it would
-prepare that Python, which scenario `runtime-23` checks for `3.13`. A version
+prepare that Python, which scenario `runtime-24` checks for `3.13`. A version
 whose tag cannot be read off its name (`pypy@3.10`, a range) is announced as
 unchecked: the note and the progress line say its tag cannot be checked until it
 is installed. Both scenarios run on Linux; the decisions themselves are

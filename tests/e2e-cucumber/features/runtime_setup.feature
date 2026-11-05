@@ -452,6 +452,28 @@ Feature: Runtime configuration
     Then the preview selects the newest SDK in the catalog
     And the preview does not claim the host's ROCm is newer
 
+  # The `tool_call:` lines `rocm <request>` prints are the command the operator
+  # reviews before re-running with `--yes`, and the one that then runs. Their
+  # quoter used to wrap a value only when it held whitespace, so a folder whose
+  # name carries a lone `'` rendered bare and left a line no shell can parse —
+  # the operator was shown something that denotes no argv at all. The
+  # assertion reads each line back through a POSIX word-splitter and demands
+  # `--prefix` followed by exactly the requested folder: what the line has to
+  # mean, rather than one spelling of it. (A space alone does not distinguish
+  # the two quoters on this surface — the old one wrapped whitespace — which is
+  # why the folder name carries a quote.)
+  #
+  # The argv the dispatched install receives is not observable here: the Given
+  # stops it on its first step, as in runtime-15, and for the same reasons —
+  # offline, instant, writes nothing, identical on every lane. The executed
+  # `tool_call:` line is the closest observable account of it.
+  @id:runtime-freeform-prefix-with-quote-is-one-argument
+  Scenario: runtime-22 - A natural-language install into a folder named with a quote keeps the folder one argument
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install into a folder whose name has a quote
+    Then the request plan names that folder as a single argument
+    And the executed command names that folder as a single argument
+
   # A preview is a promise that nothing on the machine changes. On a host with
   # no usable Python the install needs one, and the preview used to go and get
   # it: it downloaded a managed `uv`, had `uv` install Python, and saved that
@@ -481,7 +503,7 @@ Feature: Runtime configuration
   # scenario's own, so a tool archive left in the cache the suite shares across
   # scenarios and runs cannot trip the backstop check.
   @id:runtime-install-preview-prepares-no-python @requires-os:linux
-  Scenario: runtime-22 - Previewing an SDK install on a host with no usable Python prepares no Python
+  Scenario: runtime-23 - Previewing an SDK install on a host with no usable Python prepares no Python
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
     When the user previews a wheel SDK install for arch gfx1200 with no version pin
@@ -493,14 +515,14 @@ Feature: Runtime configuration
   # wheels need (3.12 for this layout); a real install prepares it, finds its
   # wheel tag is wrong and refuses. The preview refuses by the same rule instead
   # of saying it would prepare 3.13, and still prepares nothing on the way to
-  # refusing, which the last Then checks against the folders, as runtime-22 does.
+  # refusing, which the last Then checks against the folders, as runtime-23 does.
   #
-  # Linux only, for the same empty-`PATH` host as runtime-22. The tag rule is
+  # Linux only, for the same empty-`PATH` host as runtime-23. The tag rule is
   # unit-tested on every platform
   # (`a_managed_python_version_is_read_as_the_wheel_tag_it_reports` in
   # `apps/rocm/src/therock/python.rs`).
   @id:runtime-install-preview-refuses-unusable-managed-python @requires-os:linux
-  Scenario: runtime-23 - Previewing an SDK install is refused when the install would refuse the managed Python version
+  Scenario: runtime-24 - Previewing an SDK install is refused when the install would refuse the managed Python version
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
     And the managed Python version is overridden to 3.13

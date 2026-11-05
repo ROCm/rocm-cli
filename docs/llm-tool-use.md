@@ -20,6 +20,14 @@ rocm-cli local assistants use structured tools, not shell commands.
   result shows it is useful.
 - The model must use argv-style `rocm` arguments. It must not invent PowerShell,
   Bash, `cmd`, `git`, or arbitrary package-manager commands.
+- A tool call is refused if its name or any string in its arguments carries a
+  terminal control or format character (an escape sequence, a carriage return,
+  a bidi override, a zero-width character). Those values are printed — in the
+  approval card, the request plan, tool output and error messages — and a
+  terminal acts on such a character instead of showing it. This applies to
+  every tool; `rocm_command` checks each `args` entry itself, after trimming it.
+  The provider-assisted planner's argv is held to the same rule, and a planner
+  note carrying such a character is left out and counted.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready.
 - The built-in local assistant is fixed to `qwen`

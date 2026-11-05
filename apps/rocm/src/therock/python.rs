@@ -1449,7 +1449,7 @@ exit 1
     /// claims nothing was prepared, so the folders have to agree), and that the
     /// same host DOES reach `uv` when the install is real, so an empty marker
     /// means the preview stayed out of it rather than that the stand-in is not
-    /// wired up. The Gherkin scenario `runtime-22` drives the same case through
+    /// wired up. The Gherkin scenario `runtime-23` drives the same case through
     /// the built binary.
     #[cfg(unix)]
     #[test]
