@@ -161,12 +161,13 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, ManagedChildLiveness, detach_command_session, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
+    spawn_detached_no_inherit, spawn_detached_with_log, spawn_hidden_console_no_inherit,
+    spawn_hidden_console_with_log, wait_for_process_exit,
 };
 pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{

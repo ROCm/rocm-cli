@@ -108,7 +108,6 @@ use crate::engine_runtime_select::apply_app_path_env;
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
     http_post_local_service_json, managed_service_launcher_path, parse_engine_recipe_json_arg,
-    wait_for_service_http_ready,
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::gpu_policy::parse_device_policy;
@@ -731,7 +730,7 @@ fn process_check_command(pid: u64) -> String {
 
 /// A managed service's record exactly as it is on disk, without the engine-state
 /// and liveness refresh [`load_managed_service`] applies (and may persist).
-fn read_managed_service_manifest(
+pub(crate) fn read_managed_service_manifest(
     paths: &AppPaths,
     service_id: &str,
 ) -> Result<(ManagedServiceRecord, PathBuf)> {
@@ -1315,17 +1314,31 @@ fn restart_internal_managed_service_with(
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, &record.service_id);
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
     #[cfg(windows)]
-    let child_pid = {
+    let (child_pid, mut liveness) = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
         let mut env_refs = app_path_env_var_refs(&env_values);
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to restart managed engine process")?
+        // Attach the child's stdout/stderr to the service log, mirroring the
+        // Unix branch's `attach_background_stdio` below (ROCMAI-541): without
+        // this, a restarted engine's own output — including the final error
+        // chain a failing `__engine-serve-http` prints to stderr — reaches
+        // nothing and is lost.
+        let child_pid = rocm_core::spawn_detached_with_log(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            &record.log_path,
+        )
+        .context("failed to restart managed engine process")?;
+        (
+            child_pid,
+            rocm_core::ManagedChildLiveness::from_pid(child_pid),
+        )
     };
     #[cfg(not(windows))]
-    let child_pid = {
+    let (child_pid, mut liveness) = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
@@ -1345,30 +1358,83 @@ fn restart_internal_managed_service_with(
             .try_wait()
             .context("failed to check restarted engine startup state")?
         {
-            update_restarting_record(paths, &stopped_record, |current| {
+            // A `rocm services stop` landing in this window kills the child the
+            // restart just spawned; stamping `failed` over the stop's own
+            // bookkeeping would report a deliberate stop as a crash. Checked
+            // first, as every sibling branch does and as
+            // `mark_service_failed`'s contract requires.
+            if crate::service_launch::managed_service_stop_was_requested(paths, &record.service_id)
+            {
+                bail!(
+                    "managed engine for service `{}` was stopped while it was restarting",
+                    record.service_id
+                );
+            }
+            // The manifest alone is not enough (ROCMAI-541 N2): the engine
+            // process that owns `engine_state_path` is gone and cannot mark
+            // it `failed` itself, so this does it on the engine's behalf —
+            // the same reasoning as `finalize_managed_launch_readiness` on the
+            // launch path. Gated on the manifest write having actually landed:
+            // `update_restarting_record`'s CAS returns `None` when the record
+            // no longer reads as this restart left it, which means someone
+            // else (a stop, another restart) owns it now — and the engine
+            // state file is read straight back into the manifest by
+            // `refresh_from_engine_state`, so stamping it unconditionally
+            // would reintroduce through that door the very clobber the CAS
+            // just prevented.
+            let recorded_failed = update_restarting_record(paths, &stopped_record, |current| {
                 current.status = "failed".to_owned();
             })?;
+            if recorded_failed.is_some() {
+                let _ = rocm_core::merge_json_state_file(
+                    &record.engine_state_path,
+                    &serde_json::json!({ "status": "failed" }),
+                );
+            }
             bail!(
                 "{}",
                 managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
-        child.id()
+        let child_pid = child.id();
+        (
+            child_pid,
+            rocm_core::ManagedChildLiveness::from_child(child),
+        )
     };
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
-    let readiness = wait_for_service_http_ready(
+    // The progress-bearing variant purely for its per-tick hook: a stop landing
+    // inside this 45s window clears its own marker as soon as it confirms, so
+    // reading the marker only afterwards can miss it and stamp a deliberate stop
+    // `failed`. See `service_launch::StopWatch`. Nothing is rendered — a restart
+    // has no spinner — so the tick only samples.
+    let mut stop_watch = crate::service_launch::StopWatch::default();
+    let readiness = crate::engine_runtime_select::wait_for_service_http_ready_with_progress(
         &started.engine,
         &started.host,
         started.port,
-        started.served_model_name(),
+        &|| started.served_model_name().to_owned(),
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
+        &mut |_elapsed| stop_watch.sample(paths, &started.service_id),
     );
-    record_restart_readiness(paths, &started, readiness)
+    // A readiness wait that never reaches `Serving` is ambiguous (still
+    // loading vs. already dead) without checking whether the restarted child
+    // is still alive — same ROCMAI-541 gap `finalize_managed_launch_readiness`
+    // closes on the launch path (N2). Backed by `liveness`, not a bare
+    // `process_is_running` pid probe: see `ManagedChildLiveness`'s doc comment
+    // for why a probe alone is inert against a zombie on Unix.
+    record_restart_readiness(
+        paths,
+        &started,
+        readiness,
+        || liveness.is_running(),
+        stop_watch.stop_was_requested(),
+    )
 }
 
 /// Apply one of a restart's own changes to the record as it is on disk now,
@@ -1440,11 +1506,54 @@ fn record_restarted_child(
 /// the record still reads as [`record_restarted_child`] left it; otherwise a
 /// stop or another restart has written since, and the record as it is now is
 /// returned untouched.
+///
+/// A readiness wait that never reaches [`EndpointReadiness::Serving`] is
+/// ambiguous on its own, same as on the fresh-launch path
+/// (`finalize_managed_launch_readiness`, ROCMAI-541): the restarted engine
+/// could still be loading, or could already be dead — a restarted engine that
+/// dies during its own readiness wait used to record `starting` forever, with
+/// no liveness check at all to tell the two apart (N2). `child_is_alive`
+/// resolves it the same way: on the failure branch this marks both the
+/// manifest and the engine's own state file `failed` and fails loudly,
+/// mirroring the launch path's contract.
+///
+/// That failure branch is itself ambiguous one level further, exactly as on
+/// the launch path: the dead, not-yet-`Serving` child could be a crash, or it
+/// could be a `rocm services stop`/`rocm dash` stop landing during this
+/// restart's own readiness wait — see
+/// [`crate::service_launch::managed_service_stop_was_requested`]'s doc
+/// comment (ROCMAI-541 B1). That check is consulted first and, when it
+/// fires, this returns the record as it is on disk now — whatever the stop
+/// already recorded — rather than falling through to stamp `failed` over it.
 fn record_restart_readiness(
     paths: &AppPaths,
     started: &ManagedServiceRecord,
     readiness: EndpointReadiness,
+    mut child_is_alive: impl FnMut() -> bool,
+    stop_seen_while_waiting: bool,
 ) -> Result<ManagedServiceRecord> {
+    if readiness != EndpointReadiness::Serving && !child_is_alive() {
+        if stop_seen_while_waiting
+            || crate::service_launch::managed_service_stop_was_requested(paths, &started.service_id)
+        {
+            return Ok(read_managed_service_manifest(paths, &started.service_id)
+                .map_or_else(|_| started.clone(), |(record, _)| record));
+        }
+        let _ = update_restarting_record(paths, started, |current| {
+            current.status = "failed".to_owned();
+        })?;
+        let _ = rocm_core::merge_json_state_file(
+            &started.engine_state_path,
+            &serde_json::json!({ "status": "failed" }),
+        );
+        bail!(
+            "{}",
+            crate::service_launch::managed_engine_exit_failure_detail(
+                &started.service_id,
+                &started.log_path
+            )
+        );
+    }
     let updated = update_restarting_record(paths, started, |current| {
         current.status = status_for_readiness(readiness).to_owned();
         if readiness == EndpointReadiness::Serving {
@@ -3042,8 +3151,16 @@ pub(crate) mod tests {
         stopping.stop_requested_unix_ms = Some(1_234);
         stopping.write().unwrap();
 
-        let returned =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable).unwrap();
+        // The restarted child is alive throughout: this test is about the stop
+        // marker surviving the readiness write, not the dead-child branch.
+        let returned = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || true,
+            false,
+        )
+        .unwrap();
         let on_disk = raw_manifest(&paths, service_id);
         let _ = fs::remove_dir_all(root);
         assert_eq!(
@@ -3071,8 +3188,17 @@ pub(crate) mod tests {
         finished.status = "stopped".to_owned();
         finished.write().unwrap();
 
-        let returned =
-            record_restart_readiness(&paths, &started, EndpointReadiness::Serving).unwrap();
+        // `Serving` always short-circuits the liveness check (see
+        // `record_restart_readiness`'s doc comment), so this never calls back
+        // in here.
+        let returned = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Serving,
+            || unreachable!("Serving must not consult liveness"),
+            false,
+        )
+        .unwrap();
         let on_disk = raw_manifest(&paths, service_id);
         let _ = fs::remove_dir_all(root);
         assert_eq!(on_disk.status, "stopped");
@@ -3081,6 +3207,87 @@ pub(crate) mod tests {
             returned.status, "stopped",
             "the caller sees the record as it is"
         );
+    }
+
+    /// ROCMAI-541 N2: a restarted engine that dies during its own readiness
+    /// wait must fail the restart and land `failed` on both the manifest and
+    /// the engine's own state file — mirroring
+    /// `finalize_managed_launch_readiness_fails_closed_when_the_child_died`
+    /// on the fresh-launch path. Before this, `record_restart_readiness` had
+    /// no liveness check at all, so this case recorded `starting` forever.
+    #[test]
+    fn restart_readiness_fails_closed_when_the_restarted_child_died() {
+        let (root, paths) = test_paths("restart-readiness-dead-child");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-dead-child";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+        fs::create_dir_all(started.log_path.parent().unwrap()).unwrap();
+        fs::write(&started.log_path, "Model pulled successfully\n").unwrap();
+
+        let result = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let engine_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&started.engine_state_path).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(root);
+
+        let error = result.expect_err("a dead restarted child must fail, not report `starting`");
+        let message = error.to_string();
+        assert!(message.contains(service_id), "{message}");
+        assert!(message.contains("Model pulled successfully"), "{message}");
+        assert_eq!(on_disk.status, "failed");
+        assert_eq!(engine_state["status"], "failed");
+    }
+
+    /// ROCMAI-541 B1: a `rocm services stop`/`rocm dash` stop that lands
+    /// during a restart's own readiness wait must not be reported as a
+    /// crash — mirroring
+    /// `finalize_managed_launch_readiness_treats_a_requested_stop_as_clean`
+    /// on the fresh-launch path. Before this, only the attach path checked
+    /// `managed_service_stop_was_requested`; this decision point stamped
+    /// `failed` over a cleanly, intentionally stopped restart instead.
+    #[test]
+    fn restart_readiness_treats_a_requested_stop_as_clean_not_a_crash() {
+        let (root, paths) = test_paths("restart-readiness-requested-stop");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-requested-stop";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+
+        // Simulate a concurrent stop confirming the restarted child gone
+        // during the wait: it writes the marker and `status: "stopped"` to
+        // the manifest on disk directly, never through `started`.
+        let mut stopped_meanwhile = raw_manifest(&paths, service_id);
+        stopped_meanwhile.status = "stopped".to_owned();
+        stopped_meanwhile.stop_requested_unix_ms = Some(4_321);
+        stopped_meanwhile.write().unwrap();
+
+        let result = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let returned = result.expect("a requested stop must not fail the restart");
+        assert_eq!(returned.status, "stopped");
+        assert_eq!(returned.stop_requested_unix_ms, Some(4_321));
+        assert_eq!(
+            on_disk.status, "stopped",
+            "the manifest must not be overwritten with `failed`"
+        );
+        assert_eq!(on_disk.stop_requested_unix_ms, Some(4_321));
     }
 
     #[test]

@@ -188,6 +188,12 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The scripted-engine `service_id` a serve step captured from the CLI's
+    /// own printed output (ROCMAI-541 N5) — not by scanning the services dir
+    /// for "the newest record" after the fact, which a concurrent recovery
+    /// mechanism could make ambiguous. Set as soon as the id is known; read
+    /// by the later `Then` steps instead of re-deriving it.
+    pub scripted_service_id: Option<String>,
     /// Whether the Doctor report preview in the dashboard console was the CLI's
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
@@ -352,6 +358,7 @@ impl Default for E2eWorld {
             skill_symptom: None,
             helper_identity: None,
             recorded_process: None,
+            scripted_service_id: None,
             dash_report_refused: None,
             automation_daemon: None,
         }

@@ -634,6 +634,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -670,3 +671,43 @@ Feature: Model serving
     # suppression was untested: deleting the guard left the scenario green and a
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
+
+
+  # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
+  # log in this terminal (`run_attached_service`), and a managed engine that dies
+  # well after its early-startup window must fail that attach loudly — never the
+  # pre-fix "server process exited" / exit 0, which left a crash indistinguishable
+  # from a clean stop. Needs a real spawned `__engine-serve-http` child that
+  # survives both platforms' early-startup liveness checks before dying, which the
+  # scripted-engine E2E hook (`ROCM_E2E_SCRIPTED_ENGINE`, gated by the
+  # `e2e-test-hooks` feature — see `run_scripted_e2e_engine_serve_http` in
+  # `apps/rocm/src/engine_ipc.rs`) provides without any GPU: it stands in for the
+  # real Lemonade/vLLM dispatch entirely, and `serve_cmd.rs`'s
+  # `scripted_engine_death` bypasses the no-GPU pre-flight and the
+  # self-managed-engine install that would otherwise refuse this on the no-GPU
+  # lane. Piped (non-TTY) stdio, so this exercises `stream_attached_logs_no_tty`
+  # specifically — the only possible outcome of a scripted/CI `--verbose`
+  # session, per that function's own doc comment.
+  @id:serve-scripted-death-after-startup @requires-no-gpu
+  Scenario: serve-42 - A managed engine that dies after startup fails loudly
+    Given the scripted engine is armed to die shortly after startup
+    When the user serves a model expecting the engine to crash after startup
+    Then serving fails with a non-zero exit and names the crash
+    And the service record and its engine state both read failed
+
+  # The companion regression, proving the other half of the same fix: an
+  # externally triggered stop in the same post-startup window must NOT be
+  # treated as the crash above. `rocm services stop` run from a second
+  # invocation kills the pid the attached `--verbose` session is watching,
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-42
+  # exercises — never `AttachOutcome::Stop`, which only ever fires from this
+  # attached session's own keystroke reader (and piped stdio has none at all).
+  # Before ROCMAI-541 B2 this made a clean, intentional, externally-triggered
+  # stop fail exactly like serve-42's crash.
+  @id:serve-scripted-external-stop-while-attached @requires-no-gpu
+  Scenario: serve-43 - An externally stopped attached serve exits cleanly, not as a crash
+    Given the scripted engine is armed to run until stopped
+    When the user attaches to the scripted serve in the background
+    And another shell stops that service while it is attached
+    Then the attached serve exits zero and reports a stop, not a crash
+    And the service record does not read failed

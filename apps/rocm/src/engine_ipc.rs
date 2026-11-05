@@ -57,11 +57,14 @@
 //! file's `use` list below points there now instead of at the crate root.
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
+#[cfg(feature = "e2e-test-hooks")]
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, engine_binary_path, engine_plugin_dirs};
@@ -351,6 +354,23 @@ pub(crate) fn builtin_engine_available(engine: &str) -> bool {
     matches!(engine, "lemonade" | "vllm" | "aim")
 }
 
+/// Entry point for the hidden `__engine-serve-http` subcommand: the process
+/// `spawn_managed_engine_child`/`restart_internal_managed_service_with` launch
+/// detached to actually run the engine.
+///
+/// ROCMAI-541: on Windows this process's stdout/stderr reach the service log
+/// only because the parent attached them at spawn time
+/// (`rocm_core::spawn_detached_with_log`); a gap there (or in a future
+/// caller that spawns this subcommand some other way) would otherwise lose an
+/// engine's failure reason completely, since nothing else reads a detached
+/// child's output. So this wrapper does not rely on that attachment alone: on
+/// any error from the engine dispatch below, it appends the full error chain
+/// directly to the service log file named by `--log-path` (the same file
+/// `rocm logs <service_id>` tails) and to this process's own structured log,
+/// and marks the engine state file `failed` — regardless of whether the
+/// engine already did either on this particular error path. A later success
+/// (this function only runs once per process, so there is no later state to
+/// race against) is unaffected; only the error path writes anything here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_engine_serve_http(
     engine: &str,
@@ -366,10 +386,30 @@ pub(crate) fn run_builtin_engine_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    let parsed_policy = parse_device_policy(Some(device_policy))?;
-    match engine {
+    // ROCMAI-541 (B3): short-circuit every real engine entirely when the
+    // scripted-engine E2E hook is armed, so a scenario can exercise a managed
+    // child that survives its early-startup liveness checks and then dies (or
+    // runs until stopped) without any real engine logic — GPU, Python venv, or
+    // network download — in the way. See `run_scripted_e2e_engine_serve_http`.
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some() {
+        let result =
+            run_scripted_e2e_engine_serve_http(&service_id, &state_path, log_path.as_deref());
+        if let Err(error) = &result {
+            record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), error);
+        }
+        return result;
+    }
+    let parsed_policy = match parse_device_policy(Some(device_policy)) {
+        Ok(policy) => policy,
+        Err(error) => {
+            record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), &error);
+            return Err(error);
+        }
+    };
+    let result = match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -377,12 +417,12 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -390,12 +430,12 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
         "aim" => rocm_engine_aim::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -403,12 +443,110 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
-        other => bail!("engine `{other}` is not built into this rocm binary"),
+        other => Err(anyhow::anyhow!(
+            "engine `{other}` is not built into this rocm binary"
+        )),
+    };
+    if let Err(error) = &result {
+        record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), error);
     }
+    result
+}
+
+/// Best-effort, platform-generic failure capture for
+/// [`run_builtin_engine_serve_http`] — see its doc comment for why this exists
+/// alongside the Windows stdio-attach fix rather than instead of it.
+///
+/// Never fails itself: a service already failing must not fail a second time,
+/// less legibly, because its own failure-reporting hit an error.
+fn record_engine_serve_http_failure(
+    service_id: &str,
+    state_path: &Path,
+    log_path: Option<&Path>,
+    error: &anyhow::Error,
+) {
+    let detail = format!("{error:?}");
+    tracing::error!(service_id, %detail, "managed engine serve-http failed");
+    if let Some(log_path) = log_path
+        && let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+    {
+        let _ = writeln!(
+            file,
+            "__engine-serve-http service_id={service_id} failed: {detail}"
+        );
+    }
+    let _ =
+        rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "failed" }));
+}
+
+/// ROCMAI-541 (B3) E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
+/// every real engine so a scenario can exercise a managed child dying (or being
+/// stopped) *after* its early-startup window, on a host with no GPU — the gap
+/// the original ROCMAI-541 fix left uncovered (see
+/// `serve-scripted-death-after-startup` and
+/// `serve-scripted-external-stop-while-attached` in `model_serving.feature`).
+///
+/// Marks the engine state file `running` (mirroring a real engine reaching
+/// that point) and appends a progress line to the service log — the same two
+/// signals `finalize_managed_launch_readiness`/`managed_engine_exit_failure_detail`
+/// read — then either:
+///
+/// - `ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS` set to a parseable delay: sleeps that
+///   long (long enough to clear both platforms' early-startup liveness checks,
+///   short enough to land well inside the 45s readiness window) and returns an
+///   error, simulating a crash after startup;
+/// - unset: loops until something kills this process (e.g. `rocm services
+///   stop`), capped at a generous safety ceiling so a scenario that forgets to
+///   stop it cannot hang a CI job forever.
+///
+/// Compiled only into the `e2e-test-hooks` binary; production builds never see
+/// this function or the env vars it reads.
+#[cfg(feature = "e2e-test-hooks")]
+fn run_scripted_e2e_engine_serve_http(
+    service_id: &str,
+    state_path: &Path,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let append_log = |line: &str| {
+        if let Some(log_path) = log_path
+            && let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    };
+    append_log(&format!(
+        "scripted e2e engine: started service_id={service_id} pid={}",
+        std::process::id()
+    ));
+    let _ =
+        rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "running" }));
+    let death_after_ms = std::env::var("ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if let Some(delay_ms) = death_after_ms {
+        thread::sleep(Duration::from_millis(delay_ms));
+        append_log("scripted e2e engine: dying on schedule");
+        bail!("scripted e2e engine death after startup (service `{service_id}`)");
+    }
+    // No scheduled death: run until something stops this process. The ceiling
+    // only guards against a scenario that forgot to stop it — a real scenario
+    // kills this well before 2 minutes.
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    append_log("scripted e2e engine: safety ceiling reached, exiting cleanly");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

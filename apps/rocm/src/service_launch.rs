@@ -40,8 +40,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rocm_core::format_http_base_url;
 use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServiceRecord};
-use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
 use crate::endpoint_keys;
@@ -56,7 +56,6 @@ use crate::engine_runtime_select::{
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
 use crate::service_hints;
-#[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
 use crate::services_text::{
     render_service_action_result, render_service_action_result_with_helper_note,
@@ -270,6 +269,234 @@ pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path
         recent_lines.join("\n")
     )
 }
+/// Render an unexpected managed-engine exit for the user, when the engine was
+/// already running and then disappeared on its own — unlike
+/// [`managed_engine_startup_failure_detail`], there is no [`ExitStatus`] to
+/// quote here. Callers reach this only after [`managed_service_stop_was_requested`]
+/// has already ruled out an intentional/external stop, so by the time this
+/// renders, the exit really is unexplained — i.e. a crash. The service log is
+/// the only record of why, since the child is detached and writes nowhere else
+/// — platform-generic since ROCMAI-541 attaches it on Windows too (see
+/// `spawn_detached_with_log` above).
+/// Retire a crashed service: mark the manifest and the engine's own state file
+/// `failed`. The engine process is gone and cannot stamp its own file, so this
+/// does it on the engine's behalf.
+///
+/// Both writes are merges, never a whole-record `ManagedServiceRecord::write()`,
+/// because every caller holds a copy of the record captured before the crash:
+/// writing that back wholesale would erase a `stop_requested_unix_ms` a
+/// concurrent stop may have written in the same window. Stamping the manifest
+/// alone is not enough either — `refresh_from_engine_state` reads the engine
+/// state file back into a newer manifest, so an unstamped state file would undo
+/// the manifest write on the next refresh.
+///
+/// Best-effort by design: a crash report must not be lost because the
+/// bookkeeping behind it could not be written.
+pub(crate) fn mark_service_failed(manifest_path: &Path, engine_state_path: &Path) {
+    let _ =
+        rocm_core::merge_json_state_file(manifest_path, &serde_json::json!({ "status": "failed" }));
+    let _ = rocm_core::merge_json_state_file(
+        engine_state_path,
+        &serde_json::json!({ "status": "failed" }),
+    );
+}
+
+pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
+    let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+    if recent_lines.is_empty() {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {}",
+            log_path.display()
+        )
+    } else {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {} \
+             (or `rocm logs {service_id}`)\n\nrecent service log output:\n{}",
+            log_path.display(),
+            recent_lines.join("\n")
+        )
+    }
+}
+
+/// Whether the on-disk manifest shows this exit was something other than a
+/// crash: an operator-requested stop in flight or already confirmed
+/// (`stop_requested_unix_ms`), or a status that already reads `stopped`.
+///
+/// `AttachOutcome::Stop` only ever fires from *this* attached session's own
+/// keystroke reader (Ctrl-C) — it says nothing about a stop triggered any
+/// other way. `rocm services stop <id>` run from another shell and `rocm
+/// dash`'s stop action both kill the pid a watching session (this attach
+/// loop, or a background launch/restart's readiness wait) cares about by
+/// signalling it directly, after writing `stop_requested_unix_ms` first —
+/// which is what lands here, in `ServerExited`, rather than `Stop`, and is
+/// otherwise indistinguishable from a crash (ROCMAI-541 B1/B2). `rocmd`'s own
+/// restart-recovery watcher (`restart_managed_service` in
+/// `apps/rocmd/src/watchers.rs`) is a different case: it only ever fires once
+/// the manifest or the endpoint already shows the service dead or
+/// unreachable on its own, and reacts by clearing `stop_requested_unix_ms`
+/// and re-exec'ing a fresh supervisor — it does not itself signal the old
+/// engine, so that path is already a genuine crash by the time this check
+/// runs, and correctly still reads as one (no marker was ever set for it).
+///
+/// Read fresh from disk — never a `record` some caller captured at spawn
+/// time, which cannot reflect a stop another process requested afterward. A
+/// manifest that cannot be read at all falls through to "not a requested
+/// stop": that is itself anomalous, and silently treating it as a clean stop
+/// would risk masking a real crash.
+///
+/// # Known residual race (ROCMAI-541 review, tracked separately)
+///
+/// The `status == "stopped"` term is **not** sound proof of an intentional
+/// stop. `managed_service_status::refresh_managed_service_runtime_liveness`
+/// reconciles *any* record whose tracked pids are all dead to `"stopped"` —
+/// `dash.rs` describes it as "demoting a crashed server's stale `running`
+/// record to `stopped`" — without writing a marker. So an ordinary concurrent
+/// `rocm services` / `rocm dash` / daemon read that lands between a crash and
+/// the check below can relabel that crash as a clean stop, and it would be
+/// reported as one.
+///
+/// It cannot simply be dropped: a *confirmed* stop clears its own marker
+/// (`stop_internal_managed_service_confirmed_with`), so the status is the only
+/// trace such a stop leaves. Verified empirically — removing this term turns
+/// the external-stop scenario (`serve-scripted-external-stop-while-attached`)
+/// red, because the stop completes well inside one poll interval.
+///
+/// Closing it properly means making the two distinguishable on disk — either a
+/// distinct status for a bare dead-pid reconciliation, or a confirmed stop
+/// leaving a durable marker — which changes bookkeeping shared with `rocmd`
+/// and the dashboard, and is deliberately out of this change's scope.
+/// [`StopWatch`] narrows the window (it catches any stop visible while the
+/// child was still being watched) but cannot close it.
+///
+/// Read fresh from disk — never a `record` some caller captured at spawn
+/// time, which cannot reflect a stop another process requested afterward.
+pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
+        |(record, _)| record.stop_requested_unix_ms.is_some() || record.status == "stopped",
+    )
+}
+
+/// Latches an operator-requested stop seen at any point while a managed child
+/// is being watched.
+///
+/// `stop_requested_unix_ms` is the only sound evidence that an exit was
+/// intentional (see [`managed_service_stop_was_requested`] for why the record's
+/// status is not), but it is deliberately short-lived:
+/// `stop_internal_managed_service_confirmed_with` writes it before it signals
+/// anything and clears it again once the stop is confirmed. A watcher that only
+/// reads it *after* noticing the child is gone can therefore arrive after the
+/// marker has been cleared, and report a deliberate stop as a crash.
+///
+/// Sampling on every liveness poll catches any stop that was still in flight
+/// while the child was being watched — in particular an *unconfirmed* stop,
+/// which re-stamps the marker and leaves the status alone, so
+/// [`managed_service_stop_was_requested`]'s status term would not fire for it
+/// either.
+///
+/// It is a narrowing, not a closure: a stop that is requested, signals, and
+/// confirms entirely inside one poll interval clears its marker before the next
+/// sample, so the latch misses it. That case is caught by the status term in
+/// [`managed_service_stop_was_requested`] — see the residual race documented
+/// there. A crash never writes the marker, so the latch cannot produce a false
+/// "stopped" of its own.
+#[derive(Default)]
+pub(crate) struct StopWatch {
+    seen: bool,
+}
+
+impl StopWatch {
+    /// Check the marker once, keeping any previous sighting. Cheap enough to
+    /// call on every poll: one small JSON read, and it stops reading entirely
+    /// once latched.
+    pub(crate) fn sample(&mut self, paths: &AppPaths, service_id: &str) {
+        if !self.seen {
+            self.seen = managed_service_stop_was_requested(paths, service_id);
+        }
+    }
+
+    /// Whether a stop was requested at any point during the watch.
+    pub(crate) const fn stop_was_requested(&self) -> bool {
+        self.seen
+    }
+}
+
+/// Decide a managed launch's final status from the HTTP readiness wait and the
+/// child's liveness, and retire a child that died before reaching `Serving` as
+/// a failure rather than quietly reporting whatever lower status the readiness
+/// wait happened to see last.
+///
+/// A readiness wait that only times out (never reaches [`EndpointReadiness::Serving`])
+/// is ambiguous on its own: the process could still be loading a large model, or
+/// it could already be dead (ROCMAI-541 — this was previously indistinguishable,
+/// so `rocm serve` reported `starting` and exited 0 either way). `child_is_alive`
+/// resolves it and is injected so the dead-child branch is unit-testable without
+/// spawning a real process — mirroring `autostart_spawn_in_flight`'s `pid_alive`
+/// parameter elsewhere in this file. The real caller backs it with
+/// [`rocm_core::ManagedChildLiveness`] rather than a bare `process_is_running`
+/// pid probe: on Unix a signal probe alone succeeds for a zombie child this
+/// process has not reaped yet (see that type's doc comment), which previously
+/// left this exact check inert on Linux despite the readiness/liveness split
+/// existing. `Serving` always succeeds regardless of the live check: inference
+/// having already answered is a stronger readiness signal than a liveness check
+/// taken afterward, which could itself lose a race against the same process
+/// exiting right after serving the probe.
+///
+/// On the failure branch this also marks the engine's own state file `failed`
+/// (best-effort): the engine process is gone and cannot do it for itself, and
+/// without this the state file can be left reading `starting` indefinitely (see
+/// `run_builtin_engine_serve_http`'s own, primary fix for the common case where
+/// the engine process is alive long enough to run that logic itself).
+///
+/// A dead-and-not-`Serving` child is still ambiguous one level further: it
+/// could be a crash, or it could be a `rocm services stop`/`rocm dash` stop
+/// that landed during this readiness wait — see
+/// [`managed_service_stop_was_requested`]'s doc comment (ROCMAI-541 B1). That
+/// check is read fresh from disk, never from `record`, which was captured at
+/// spawn time and cannot reflect a stop requested since. When it fires,
+/// `record` is refreshed from disk too — rather than left as that stale
+/// spawn-time snapshot — so that a caller's own follow-up write of `record`
+/// carries the stop marker forward instead of clobbering it. Returns `false`
+/// in that case so the caller knows to skip any further bookkeeping that
+/// would otherwise write back over it; `true` otherwise (the normal path,
+/// unchanged).
+///
+/// Marks the manifest itself via a merge (`merge_json_state_file`), not a
+/// whole-file `record.write()`: `record` is this function's own stale,
+/// spawn-time snapshot, and writing it back wholesale would erase a
+/// `stop_requested_unix_ms` a concurrent stop just wrote to disk — the same
+/// hazard the merge above (and the attach path's equivalent write) already
+/// guards against.
+fn finalize_managed_launch_readiness(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    readiness: EndpointReadiness,
+    mut child_is_alive: impl FnMut() -> bool,
+    stop_seen_while_waiting: bool,
+) -> Result<bool> {
+    if readiness != EndpointReadiness::Serving && !child_is_alive() {
+        // The latch first, then a fresh read: a stop that began and finished
+        // inside the readiness wait has already cleared its own marker, so the
+        // point check below cannot see it (see `StopWatch`).
+        if stop_seen_while_waiting || managed_service_stop_was_requested(paths, &record.service_id)
+        {
+            if let Ok((on_disk, _)) =
+                crate::services_text::read_managed_service_manifest(paths, &record.service_id)
+            {
+                *record = on_disk;
+            }
+            return Ok(false);
+        }
+        record.status = "failed".to_owned();
+        mark_service_failed(&record.manifest_path, &record.engine_state_path);
+        bail!(
+            "{}",
+            managed_engine_exit_failure_detail(&record.service_id, &record.log_path)
+        );
+    }
+    record.status = status_for_readiness(readiness).to_owned();
+    Ok(true)
+}
+
 #[cfg(not(windows))]
 pub(crate) fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
     let mut command = ProcessCommand::new(program);
@@ -309,6 +536,12 @@ enum ManagedSpawn {
     Spawned {
         record: Box<ManagedServiceRecord>,
         child_pid: u32,
+        /// Carries the spawned `Child` (Unix) or bare pid (Windows) onward so
+        /// callers can confirm the child's *real* exit later — via
+        /// `try_wait()` on Unix, not just a `kill(pid, 0)` probe that also
+        /// succeeds for a zombie this process has not reaped yet (ROCMAI-541;
+        /// see `rocm_core::ManagedChildLiveness`'s doc comment).
+        liveness: rocm_core::ManagedChildLiveness,
     },
 }
 
@@ -621,17 +854,33 @@ fn spawn_managed_engine_child(
         record.requires_api_key,
     )?;
     #[cfg(windows)]
-    let child_pid = {
+    let (child_pid, liveness) = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
         let mut env_refs = app_path_env_var_refs(&env_values);
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
+        // Attach the child's stdout/stderr to the service log (ROCMAI-541),
+        // mirroring the Unix branch's `attach_background_stdio` below. Without
+        // this, `spawn_detached_no_inherit` leaves the child's output — including
+        // the error chain a failing `__engine-serve-http` prints to stderr —
+        // reaching nothing: the log would stop at the engine's last explicit
+        // progress write, and both `rocm serve --verbose` and `rocm logs` would
+        // never see why it died.
+        let child_pid = rocm_core::spawn_detached_with_log(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            &record.log_path,
+        )
+        .context("failed to launch managed engine process")?;
+        (
+            child_pid,
+            rocm_core::ManagedChildLiveness::from_pid(child_pid),
+        )
     };
     #[cfg(not(windows))]
-    let child_pid = {
+    let (child_pid, liveness) = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
@@ -652,12 +901,43 @@ fn spawn_managed_engine_child(
             .try_wait()
             .context("failed to check managed engine startup state")?
         {
+            // ROCMAI-541 B2/AC3: this is the literal original symptom — the
+            // engine died before the readiness wait even started, so nothing
+            // else is ever going to mark this manifest or the engine's own
+            // state file anything other than the `starting`/0 defaults
+            // `ManagedServiceRecord::new` wrote above. Mark both `failed` here,
+            // the same way `finalize_managed_launch_readiness` does for a death
+            // during the readiness wait and `record_restart_readiness`/
+            // `update_restarting_record` do for the restart path's equivalent
+            // branch. A merge (`merge_json_state_file`), not a whole-file
+            // `record.write()`: `record` is only the in-memory copy from
+            // before this spawn, and writing it back wholesale would erase a
+            // `stop_requested_unix_ms` a concurrent stop could have written to
+            // disk in this same narrow window.
+            //
+            // Which is exactly why the stop is checked first: a `rocm services
+            // stop` landing inside this window kills the child we just spawned,
+            // and stamping `failed` over the stop's own bookkeeping would
+            // report a deliberate stop as a crash. Every sibling branch
+            // (`finalize_managed_launch_readiness`, `record_restart_readiness`,
+            // the attached `ServerExited` arm) consults it before marking
+            // failed, and `mark_service_failed`'s own contract requires it;
+            // this branch did not, which was the gap.
+            if managed_service_stop_was_requested(paths, service_id) {
+                bail!(
+                    "managed engine for service `{service_id}` was stopped while it was starting"
+                );
+            }
+            mark_service_failed(&record.manifest_path, &record.engine_state_path);
             bail!(
                 "{}",
                 managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
-        child_pid
+        (
+            child_pid,
+            rocm_core::ManagedChildLiveness::from_child(child),
+        )
     };
     // The child is both roles until the engine state file names a separate
     // server process. Each role gets its own token, captured while the child is
@@ -667,11 +947,29 @@ fn spawn_managed_engine_child(
     record.record_supervisor_identity(child_pid);
     record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
-    record.write()?;
+    // Merge the fields this spawn actually owns, not a whole-file
+    // `record.write()`: `record` is still the in-memory snapshot from
+    // `ManagedServiceRecord::new` (already persisted once above, before this
+    // child was spawned), and writing it back wholesale would erase a
+    // `stop_requested_unix_ms` a concurrent stop could have written to disk
+    // in the narrow window between that first write and this one — the same
+    // hazard the early-death branch above already guards against with its
+    // own merge.
+    rocm_core::merge_json_state_file(
+        &record.manifest_path,
+        &serde_json::json!({
+            "status": record.status,
+            "supervisor_pid": record.supervisor_pid,
+            "supervisor_start_ticks": record.supervisor_start_ticks,
+            "engine_pid": record.engine_pid,
+            "engine_start_ticks": record.engine_start_ticks,
+        }),
+    )?;
 
     Ok(ManagedSpawn::Spawned {
         record: Box::new(record),
         child_pid,
+        liveness,
     })
 }
 
@@ -813,7 +1111,7 @@ pub(crate) fn start_managed_service(
             env_id,
         );
     }
-    let (mut record, child_pid) = match spawn_managed_engine_child(
+    let (mut record, child_pid, mut liveness) = match spawn_managed_engine_child(
         &paths,
         engine,
         service_id,
@@ -830,7 +1128,11 @@ pub(crate) fn start_managed_service(
         gpu_refusal_waived_for_reuse,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
-        ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
+        ManagedSpawn::Spawned {
+            record,
+            child_pid,
+            liveness,
+        } => (*record, child_pid, liveness),
     };
     // The claiming service record is now persisted, so the selected GPU is
     // visible to any concurrent auto-selection. Release the launch lock before
@@ -841,6 +1143,12 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
+    // Sample the stop marker on every readiness tick, not just once at the end:
+    // a `rocm services stop` that lands inside this 45s window clears its own
+    // marker as soon as it confirms, so a single read afterwards can miss it and
+    // report the stop as a crash. See `StopWatch`.
+    let mut stop_watch = StopWatch::default();
+    let service_id_for_watch = record.service_id.clone();
     let readiness = wait_for_service_http_ready_with_progress(
         engine,
         host,
@@ -852,32 +1160,69 @@ pub(crate) fn start_managed_service(
         },
         endpoint_api_key,
         Duration::from_secs(45),
-        on_wait_tick,
+        &mut |elapsed| {
+            stop_watch.sample(&paths, &service_id_for_watch);
+            on_wait_tick(elapsed);
+        },
     );
-    let launch_status = status_for_readiness(readiness);
-    record.status = launch_status.to_owned();
-    if readiness == EndpointReadiness::Serving {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
-    }
-    record.write()?;
-    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
-    record_cli_audit_event(
+    // A readiness wait that never reaches `Serving` is ambiguous (still loading
+    // vs. already dead) without checking whether the child is still alive — see
+    // `finalize_managed_launch_readiness`'s doc comment (ROCMAI-541). This bails
+    // with a non-zero exit and the service log's tail when it is not — unless a
+    // stop was requested concurrently (B1), in which case it returns `false` and
+    // has already refreshed `record` from disk, so the bookkeeping below is
+    // skipped entirely rather than writing this stale snapshot back over
+    // whatever the stop just recorded. Backed by `liveness` (the retained
+    // `Child`/pid from the spawn above), not a bare `process_is_running(child_pid)`
+    // probe — see `ManagedChildLiveness`'s doc comment for why a probe alone is
+    // inert against a zombie on Unix.
+    let proceed_with_launch_bookkeeping = finalize_managed_launch_readiness(
         &paths,
-        "service",
-        "managed_service_launch",
-        "info",
-        format!(
-            "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine, resolve.canonical_model_id, endpoint_url, launch_status
-        ),
-        Some(service_id),
-    );
+        &mut record,
+        readiness,
+        || liveness.is_running(),
+        stop_watch.stop_was_requested(),
+    )?;
+    let launch_status = record.status.clone();
+    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
+    if proceed_with_launch_bookkeeping {
+        if readiness == EndpointReadiness::Serving {
+            // Latch the verification the wait just performed, so the readiness
+            // checks behind `services list` and chat read it instead of
+            // re-probing.
+            record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+        }
+        // Merge the two fields this readiness result actually owns, not a
+        // whole-file `record.write()`: `record` is still spawn-time state, and
+        // an unconfirmed stop landing during the 45s wait above (marker set,
+        // child still alive at the instant `finalize_managed_launch_readiness`
+        // checked it) or a confirmed stop racing this exact `Serving` probe can
+        // still write `stop_requested_unix_ms` to disk in the gap between that
+        // check and this write — the same hazard its own merge already guards
+        // against for the dead-child case.
+        rocm_core::merge_json_state_file(
+            &record.manifest_path,
+            &serde_json::json!({
+                "status": record.status,
+                "inference_verified_at_unix_ms": record.inference_verified_at_unix_ms,
+            }),
+        )?;
+        record_cli_audit_event(
+            &paths,
+            "service",
+            "managed_service_launch",
+            "info",
+            format!(
+                "launched managed service engine={} model={} endpoint={} readiness={}",
+                engine, resolve.canonical_model_id, endpoint_url, launch_status
+            ),
+            Some(service_id),
+        );
+    }
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
-        status: launch_status.to_owned(),
+        status: launch_status,
         already_running: false,
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
@@ -1274,27 +1619,37 @@ pub(crate) fn run_attached_service(
     // lock before streaming logs, which blocks for the whole attached session.
     drop(launch_lock);
 
-    let (service_id, log_path, child_pid) = match spawn {
-        // A server for this engine+model is already live. Don't fight it for the
-        // port — point the user at the existing one instead of tailing a log we
-        // did not start.
-        ManagedSpawn::AlreadyRunning(report) => {
-            println!("model already being served");
-            println!("  service_id: {}", report.service_id);
-            println!("  endpoint: {}", report.endpoint_url);
-            println!("  status: {}", report.status);
-            println!("  logs: rocm logs {}", report.service_id);
-            println!(
-                "  stop: {}",
-                service_hints::service_stop_hint(&report.service_id)
-            );
-            drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
-            return Ok(());
-        }
-        ManagedSpawn::Spawned { record, child_pid } => {
-            (service_id.to_owned(), record.log_path.clone(), child_pid)
-        }
-    };
+    let (service_id, log_path, engine_state_path, child_pid, supervisor_start_ticks, mut liveness) =
+        match spawn {
+            // A server for this engine+model is already live. Don't fight it for the
+            // port — point the user at the existing one instead of tailing a log we
+            // did not start.
+            ManagedSpawn::AlreadyRunning(report) => {
+                println!("model already being served");
+                println!("  service_id: {}", report.service_id);
+                println!("  endpoint: {}", report.endpoint_url);
+                println!("  status: {}", report.status);
+                println!("  logs: rocm logs {}", report.service_id);
+                println!(
+                    "  stop: {}",
+                    service_hints::service_stop_hint(&report.service_id)
+                );
+                drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
+                return Ok(());
+            }
+            ManagedSpawn::Spawned {
+                record,
+                child_pid,
+                liveness,
+            } => (
+                service_id.to_owned(),
+                record.log_path.clone(),
+                record.engine_state_path.clone(),
+                child_pid,
+                record.supervisor_start_ticks,
+                liveness,
+            ),
+        };
 
     // The child is a managed service that outlives this session once detached.
     // The background helper adds one thing for it: with the `server-recover`
@@ -1324,7 +1679,16 @@ pub(crate) fn run_attached_service(
     println!("  streaming engine logs - Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
-    let outcome = stream_attached_logs(&log_path, child_pid)?;
+    // Sampled on every liveness poll for the whole attached session: an external
+    // `rocm services stop` clears its own marker once it confirms, so reading it
+    // only after the child is gone can miss it and report a deliberate stop as a
+    // crash. See `StopWatch`.
+    let mut stop_watch = StopWatch::default();
+    let outcome = stream_attached_logs(&log_path, || {
+        stop_watch.sample(&paths, &service_id);
+        liveness.is_running()
+    })?;
+    let stop_seen_while_attached = stop_watch.stop_was_requested();
     println!();
 
     match outcome {
@@ -1366,10 +1730,76 @@ pub(crate) fn run_attached_service(
             )
         }
         AttachOutcome::ServerExited => {
-            println!("server process exited");
-            println!("  service_id: {service_id}");
-            println!("  recent logs: rocm logs {service_id}");
-            Ok(())
+            // `Stop` above is only this attached session's *own* keystroke
+            // reader (Ctrl-C) or its own fallback — it says nothing about a
+            // stop triggered any other way. `rocm services stop <id>` from
+            // another shell and `rocm dash`'s stop action both kill the pid
+            // this loop is watching by signalling it directly, which lands
+            // here, in `ServerExited`, not `Stop`. So an exited child alone
+            // does not mean a crash (ROCMAI-541): check the manifest's stop
+            // marker (`stop_requested_unix_ms`, set before any such external
+            // stop signals anything — see
+            // `stop_internal_managed_service_confirmed_with`) and its
+            // `stopped` status before concluding one — see
+            // `managed_service_stop_was_requested`'s doc comment for why
+            // `rocmd`'s own restart-recovery watcher needs no such carve-out
+            // here. Only when neither is present is this an unexplained exit
+            // — i.e. a crash.
+            if stop_seen_while_attached || managed_service_stop_was_requested(&paths, &service_id) {
+                println!("server process exited");
+                println!("  service_id: {service_id}");
+                println!("  recent logs: rocm logs {service_id}");
+                return Ok(());
+            }
+            // Mark both the manifest and the engine state file `failed` (the
+            // engine process is gone and cannot do it for itself) and fail
+            // loudly instead of the previous "server process exited" / exit 0.
+            // The manifest write is a best-effort merge, not a full
+            // `ManagedServiceRecord::write()`: this attached session's own copy
+            // of the record was captured at spawn time and may be stale by now
+            // (a concurrent restart could have replaced it), so only the one
+            // field this crash verdict owns is touched — never a write-back
+            // that could clobber a newer record with an older snapshot.
+            //
+            // Guarded on the manifest still naming the exact *supervisor*
+            // process this session spawned and has been watching — `child_pid`
+            // is `supervisor_pid`/`supervisor_start_ticks`'s subject, the
+            // `__engine-serve-http` process this loop's `liveness` tracks and
+            // whose exit is what landed us here. `engine_pid` is the wrong
+            // identity to gate on: `refresh_from_engine_state` overwrites it
+            // with whatever the engine itself reports as `server_pid`, which
+            // for an engine like Lemonade that spawns its own child server is
+            // *that* child's pid, not this loop's `child_pid` — so comparing
+            // on `engine_pid` is false for the exact case this whole fix is
+            // for (a Lemonade-backed server that was running and then died),
+            // and the manifest would never get stamped. `supervisor_pid`/
+            // `supervisor_start_ticks` are never touched by
+            // `refresh_from_engine_state` and ARE rewritten by a legitimate
+            // restart (`record_supervisor_identity` at the top of this same
+            // spawn path), so comparing on them actually distinguishes "this
+            // manifest still names the child we're watching" from "a restart
+            // already replaced it". The engine state file is guarded the same
+            // way: its own `status` is exactly what `refresh_from_engine_state`
+            // reads back into a newer manifest, so leaving this write
+            // unguarded would let the clobber this guard prevents on the
+            // manifest simply round-trip back in through that file instead.
+            let still_watching_this_supervisor =
+                crate::services_text::read_managed_service_manifest(&paths, &service_id).is_ok_and(
+                    |(current, _)| {
+                        current.supervisor_pid == child_pid
+                            && current.supervisor_start_ticks == supervisor_start_ticks
+                    },
+                );
+            if still_watching_this_supervisor {
+                mark_service_failed(
+                    &paths.service_manifest_path(&service_id),
+                    &engine_state_path,
+                );
+            }
+            bail!(
+                "{}",
+                managed_engine_exit_failure_detail(&service_id, &log_path)
+            );
         }
     }
 }
@@ -1403,14 +1833,23 @@ const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
 /// capture the keys directly (in raw mode Ctrl-C does not raise SIGINT, so we see
 /// it as a key event). When stdin is not a TTY (piped/CI), keystroke capture is
 /// impossible, so we follow the log until the process exits instead.
-fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+///
+/// `is_alive` is injected rather than this calling `process_is_running` on a
+/// bare pid directly, so the real caller can back it with
+/// [`rocm_core::ManagedChildLiveness`] — a `kill(pid, 0)` probe alone succeeds
+/// for a zombie this process has not reaped yet on Unix (ROCMAI-541; see that
+/// type's doc comment).
+fn stream_attached_logs(
+    log_path: &Path,
+    mut is_alive: impl FnMut() -> bool,
+) -> Result<AttachOutcome> {
     use std::io::IsTerminal as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     if !std::io::stdin().is_terminal() {
-        return stream_attached_logs_no_tty(log_path, child_pid);
+        return stream_attached_logs_no_tty(log_path, is_alive);
     }
 
     // Enter raw mode *before* spawning the key reader. In raw mode Ctrl-C arrives
@@ -1479,7 +1918,7 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
         if let Ok(signal) = rx.try_recv() {
             break signal;
         }
-        if !process_is_running(child_pid) {
+        if !is_alive() {
             break AttachOutcome::ServerExited;
         }
         thread::sleep(Duration::from_millis(150));
@@ -1493,7 +1932,17 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
 /// Non-interactive fallback for [`stream_attached_logs`]: no keystroke capture,
 /// so just follow the log until the (detached) engine process exits. A Ctrl-C
 /// here delivers SIGINT to this process and leaves the managed server running.
-fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+///
+/// This is the *only* possible outcome of a piped/non-TTY attached session
+/// (there is no keystroke reader to ever produce `Detach`/`Stop` here), so
+/// every externally-triggered stop during such a session reaches here as
+/// `ServerExited` — making the caller's stop-marker check
+/// (`managed_service_stop_was_requested`) load-bearing for every scripted or
+/// CI `rocm serve --verbose` invocation, not just an edge case.
+fn stream_attached_logs_no_tty(
+    log_path: &Path,
+    mut is_alive: impl FnMut() -> bool,
+) -> Result<AttachOutcome> {
     let mut stdout = io::stdout();
     let mut log_reader: Option<io::BufReader<fs::File>> = None;
     let mut line = String::new();
@@ -1514,7 +1963,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
                 }
             }
         }
-        if !process_is_running(child_pid) {
+        if !is_alive() {
             return Ok(AttachOutcome::ServerExited);
         }
         thread::sleep(Duration::from_millis(200));
@@ -2789,5 +3238,340 @@ mod tests {
         fs::write(&path, "not-a-pid").expect("write garbage");
         assert_eq!(read_autostart_claim(&path), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541: the service log tail must reach the user, and a missing log
+    /// must still name the service and where to look rather than being silent.
+    #[test]
+    fn exit_failure_detail_quotes_the_service_log_tail_when_present() {
+        let (root, paths) = test_paths("exit-failure-detail-log-present");
+        paths.ensure().expect("ensure paths");
+        let log_path = paths.service_log_path("svc-dead-1");
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("mkdir log dir");
+        fs::write(
+            &log_path,
+            "Model pulled successfully\nFATAL: HOME is unset\n",
+        )
+        .expect("write log");
+
+        let detail = managed_engine_exit_failure_detail("svc-dead-1", &log_path);
+
+        assert!(detail.contains("svc-dead-1"), "{detail}");
+        assert!(detail.contains("exited unexpectedly"), "{detail}");
+        assert!(detail.contains("FATAL: HOME is unset"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exit_failure_detail_names_the_service_even_without_a_log() {
+        let (root, paths) = test_paths("exit-failure-detail-log-absent");
+        let log_path = paths.service_log_path("svc-dead-2");
+        // Deliberately never created.
+        let detail = managed_engine_exit_failure_detail("svc-dead-2", &log_path);
+        assert!(detail.contains("svc-dead-2"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541 B2: `AttachOutcome::Stop` only ever fires from this
+    /// session's own keystroke reader, never from `rocm services stop`
+    /// another shell issued, `rocm dash`, or `rocmd`'s restart-recovery — all
+    /// of which kill the watched pid directly and so land in `ServerExited`.
+    /// The manifest's stop marker is what tells the two apart; this covers
+    /// every state that marker can be in before `managed_service_stop_was_requested`
+    /// is consulted.
+    #[test]
+    fn stop_was_requested_true_for_in_flight_or_confirmed_stop() {
+        let (root, paths) = test_paths("stop-was-requested-true");
+        paths.ensure().expect("ensure paths");
+        let make_record = |service_id: &str| {
+            ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "lemonade",
+                "qwen",
+                "qwen-canonical",
+                "127.0.0.1",
+                11540,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            )
+        };
+
+        // An unconfirmed stop: the marker is set but the status is left
+        // `ready`/`running` until termination is confirmed (see
+        // `stop_internal_managed_service_confirmed_with`).
+        let mut in_flight = make_record("svc-stop-in-flight");
+        in_flight.status = "running".to_owned();
+        in_flight.stop_requested_unix_ms = Some(1);
+        in_flight.write().expect("write in-flight record");
+        assert!(managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-in-flight"
+        ));
+
+        // A confirmed stop clears the marker but leaves `status: "stopped"`.
+        let mut confirmed = make_record("svc-stop-confirmed");
+        confirmed.status = "stopped".to_owned();
+        confirmed.write().expect("write confirmed-stop record");
+        assert!(managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-confirmed"
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The complement: a plain running service with no stop marker and no
+    /// `stopped` status must not be mistaken for an intentional stop — an
+    /// unexplained exit from this state is exactly ROCMAI-541's crash case.
+    #[test]
+    fn stop_was_requested_false_for_a_live_service_or_a_missing_manifest() {
+        let (root, paths) = test_paths("stop-was-requested-false");
+        paths.ensure().expect("ensure paths");
+        let mut running = ManagedServiceRecord::new(
+            &paths,
+            "svc-stop-not-requested",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11541,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        running.status = "running".to_owned();
+        running.write().expect("write running record");
+        assert!(!managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-not-requested"
+        ));
+
+        // A manifest that cannot be read at all (never written here) must
+        // fail closed too — see this function's doc comment.
+        assert!(!managed_service_stop_was_requested(
+            &paths,
+            "svc-never-existed"
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541 acceptance criterion 2: a managed engine that died before
+    /// ever answering HTTP must fail `rocm serve` with both a non-zero exit
+    /// code and a message naming it, not just the unreadable "starting"
+    /// status the readiness timeout alone used to leave behind. `pid_is_running`
+    /// is injected (`|_| false`) rather than spawning and killing a real
+    /// process, the same seam `autostart_spawn_in_flight` above uses for an
+    /// identical reason: this repo cannot spawn and reap a real child inside a
+    /// `cargo test` run portably across Linux and Windows.
+    #[test]
+    fn finalize_managed_launch_readiness_fails_closed_when_the_child_died() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-dead-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dead-3",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11530,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, "Model pulled successfully\n")?;
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let result = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(&root);
+            panic!("a dead child must fail the launch, not report `starting`");
+        };
+        // ROCMAI-541 AC2: the failure must name the service and carry the log
+        // tail, not just the unreadable "starting" status the old readiness
+        // timeout alone left behind.
+        //
+        // This deliberately does not also assert
+        // `crate::exit_code_for(Err(error)) == ExitCode::FAILURE`: every
+        // `anyhow::Error` that is not a `FixExitCode`/`ClapExitCode` downcast
+        // maps to `ExitCode::FAILURE` there (see `exit_code_for`), and
+        // `bail!(...)` here can never produce either downcast — so that
+        // assertion could not fail regardless of whether this function is
+        // correct, and would misleadingly suggest the real `run()` call chain
+        // (clap parsing, `start_managed_service`, `exit_code_for`) is exercised
+        // here. It is not; this test calls `finalize_managed_launch_readiness`
+        // directly.
+        let message = error.to_string();
+        assert!(message.contains("svc-dead-3"), "{message}");
+        assert!(message.contains("Model pulled successfully"), "{message}");
+
+        // Both the manifest and the engine's own state file must read `failed`
+        // (AC3) — the manifest because this function already held it, and the
+        // engine state file because the engine process that owns it is gone and
+        // cannot write "failed" there itself.
+        assert_eq!(record.status, "failed");
+        let (reread, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-dead-3")?;
+        assert_eq!(reread.status, "failed");
+        let engine_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record.engine_state_path)?)?;
+        assert_eq!(engine_state["status"], "failed");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The same readiness timeout must NOT be treated as a failure while the
+    /// child is still alive — a large model can legitimately take longer than
+    /// the readiness budget to load, and that must keep reporting `starting`
+    /// with exit code 0, not regress into the failure path above.
+    #[test]
+    fn finalize_managed_launch_readiness_keeps_reporting_starting_while_alive() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-alive-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-alive-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11531,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || true,
+            false,
+        )?;
+
+        assert_eq!(record.status, "starting");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A readiness wait that already confirmed `Serving` must not be
+    /// second-guessed by a liveness check that could itself lose a race against
+    /// the same process exiting right after answering the probe.
+    #[test]
+    fn finalize_managed_launch_readiness_trusts_a_confirmed_serving_result() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-serving-raced");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-served-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11532,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Serving,
+            || false,
+            false,
+        )?;
+
+        assert_eq!(record.status, "ready");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// ROCMAI-541 B1: a `rocm services stop`/`rocm dash` stop that lands
+    /// during the 45s launch readiness wait must not be reported as a crash —
+    /// no `failed` status, no non-zero exit — and the in-memory `record` must
+    /// come back refreshed from disk so a caller's own follow-up write cannot
+    /// clobber the stop marker the stop itself just wrote.
+    #[test]
+    fn finalize_managed_launch_readiness_treats_a_requested_stop_as_clean() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-requested-stop");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-stopped-during-launch",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11533,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // Simulate a concurrent `rocm services stop` landing mid-wait: it
+        // writes the marker (and, once confirmed, `status: "stopped"`) to the
+        // manifest on disk — never through this stale in-memory `record`.
+        let mut stopped_on_disk = record.clone();
+        stopped_on_disk.status = "stopped".to_owned();
+        stopped_on_disk.stop_requested_unix_ms = Some(999);
+        stopped_on_disk.write()?;
+
+        let proceed = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        )?;
+
+        assert!(
+            !proceed,
+            "a requested stop must tell the caller to skip its own follow-up write"
+        );
+        assert_eq!(record.status, "stopped", "record is refreshed from disk");
+        assert_eq!(record.stop_requested_unix_ms, Some(999));
+
+        let (on_disk, _) = crate::services_text::read_managed_service_manifest(
+            &paths,
+            "svc-stopped-during-launch",
+        )?;
+        assert_eq!(
+            on_disk.status, "stopped",
+            "the manifest must not be overwritten with `failed`"
+        );
+        assert_eq!(on_disk.stop_requested_unix_ms, Some(999));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

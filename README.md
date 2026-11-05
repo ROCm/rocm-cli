@@ -911,6 +911,11 @@ can:
   itself fails, the command says why on stderr, signals the server process
   directly and exits 0; if that signal fails too, it says so on stderr.
 
+If the server dies on its own while you are attached, `rocm serve` exits
+**non-zero** and prints why, quoting the end of the service log, and the service
+is left marked `failed`. Stopping it deliberately — Ctrl-C here, or `rocm
+services stop` from another shell — still exits 0.
+
 `--managed` is the explicit form of the default background behavior.
 `--no-smoke-test` skips the post-startup inference probe.
 

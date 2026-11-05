@@ -1261,8 +1261,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+    // ROCMAI-541 (B3): the scripted-engine E2E scenario needs a real managed
+    // child to actually spawn and survive its early-startup window on a no-GPU
+    // host, so it also bypasses this host precondition — mirroring
+    // `scripted_backend_failure` above. See `run_scripted_e2e_engine_serve_http`
+    // for what runs once the spawned child reaches it.
+    let scripted_engine_death =
+        cfg!(feature = "e2e-test-hooks") && std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some();
     if !cpu_only
         && !scripted_backend_failure
+        && !scripted_engine_death
         && !e2e_simulate_oom_launch()
         && !reuse_existing
         && host_has_no_usable_gpu
@@ -1383,7 +1391,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_engine_death
     {
+        // See `scripted_engine_death`'s own doc comment above: the scripted-engine
+        // scenario needs the spawn below to reach `run_builtin_engine_serve_http`
+        // without a real (and, for Lemonade, GPU-dependent) runtime install.
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
     // Reuse the `ResolveModel` answer the reuse pre-gate already paid for, so a
