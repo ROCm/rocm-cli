@@ -831,11 +831,12 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
+    let engine = "vllm";
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
     // stderr and the exit code ride along so a run that stopped on a refusal reads
     // as one in the Then step, instead of as "the name was not expanded".
     world.serve_runs = Some(vec![ServeRun {
-        engine: "vllm".to_owned(),
+        engine: engine.to_owned(),
         stdout,
         stderr,
         rc,
@@ -2184,10 +2185,7 @@ async fn assert_consistent_expansion(world: &mut E2eWorld) {
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
         let Some(model) = run.resolved_model().map(str::to_string) else {
-            panic!(
-                "engine #{i} produced no 'resolved model' line: {}",
-                run.missing_plan_message()
-            );
+            panic!("engine #{i}: {}", run.missing_plan_message());
         };
         resolved.push(model);
     }

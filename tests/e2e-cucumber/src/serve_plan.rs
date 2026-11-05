@@ -5,8 +5,10 @@
 //! Say why a `rocm serve` run printed no `resolved model:` line.
 //!
 //! `rocm serve` prints its plan (`serve plan` / `resolved model: ...`) only after a
-//! chain of refusals has passed: the platform and engine gate, the no-usable-GPU
-//! bail, the "no active ROCm runtime" bail and the engine's model-resolution call.
+//! chain of refusals has passed, among them, in the order `serve_cmd.rs` runs
+//! them: the OS gate that rules an engine out (vLLM on native Windows), the
+//! no-usable-GPU bail, the Docker-aware engine gate, the "no active ROCm runtime"
+//! bail and the engine's model-resolution call.
 //! A run that stops at any of them leaves stdout without the line, and the refusal
 //! goes to stderr. The short-name scenarios used to keep stdout only, so every
 //! such run read as "the name was not expanded" whatever actually stopped it. The
@@ -55,8 +57,9 @@ impl ServeRun {
             ),
         };
         format!(
-            "no 'resolved model' in output: {verdict}\n\nstdout:\n{}\n\nstderr:\n{}",
-            self.stdout, self.stderr
+            "no 'resolved model' in output: {verdict}\n\n{}\n\n{}",
+            crate::section("stdout", &self.stdout),
+            crate::section("stderr", &self.stderr)
         )
     }
 }
@@ -132,6 +135,21 @@ mod tests {
         assert!(
             message.contains("(exit 1) and wrote nothing to stderr"),
             "{message}"
+        );
+        assert!(
+            message.contains("--- stdout: (empty) ---"),
+            "an empty stream is marked, not left as a bare heading: {message}"
+        );
+    }
+
+    #[test]
+    fn blank_stderr_lines_are_skipped_and_the_reported_line_is_trimmed() {
+        let indented = attempt("vllm", "", "   \n\t\n  Error: refused\n", 1).missing_plan_message();
+        assert!(indented.contains("(exit 1): Error: refused"), "{indented}");
+        let blank_only = attempt("vllm", "", "  \n", 1).missing_plan_message();
+        assert!(
+            blank_only.contains("(exit 1) and wrote nothing to stderr"),
+            "whitespace is not a stderr line: {blank_only}"
         );
     }
 }

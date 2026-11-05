@@ -32,24 +32,28 @@
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
-# --- EAI-7219: short-name expansion (vLLM does not resolve the alias) ---
+# --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
 # What the lane logs show, so the scope below is not read as more than it is:
 # lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
 # on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
 # stopped before it printed a serve plan, so the plan's name line was never
-# reached. Whether that stop is the bug above or an earlier refusal (a missing
-# active runtime, a no-GPU bail, native Windows refusing vLLM since ROCMAI-823) is
-# not known: the steps used to discard stderr. They now report it, so the next lane
-# run says which. Until then the rows keep their all-hosts scope.
+# reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
+# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
+# shown it. Whether the empty stdout is that bug or an earlier refusal (a missing
+# active runtime, a no-GPU bail) is not known: the steps used to discard stderr.
+# They now report it, so the next lane run says which. On native Windows the stop
+# is the up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug.
+# Until the lane stderr is in, the rows keep their all-hosts scope, and their
+# reasons name both shapes so neither becomes a false claim.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
-reason = "A vLLM serve of a short name prints no serve plan, so no expanded full model name is shown."
+reason = "A vLLM serve of a short name shows no expanded full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "A vLLM serve of a short name prints no serve plan, so its resolved model name cannot match lemonade's."
+reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run
