@@ -100,7 +100,9 @@ impl PacedDownloadServer {
 /// compressed size) deterministic across runs — though `rand` doesn't
 /// guarantee `StdRng`'s algorithm is stable across crate versions, so a
 /// future `rand` bump could change these bytes (and the compressed size)
-/// even with the seed unchanged. Shared by both the TheRock tarball and
+/// even with the seed unchanged. The 0.10 bump did not: its changelog says
+/// `StdRng` moved to the `chacha20` crate but "the output remains the same",
+/// so the bytes match those from 0.9. Shared by both the TheRock tarball and
 /// ComfyUI source-archive fixtures, which each need enough incompressible
 /// bytes to stream in more than one paced chunk.
 pub fn deterministic_payload(len: usize) -> Vec<u8> {
