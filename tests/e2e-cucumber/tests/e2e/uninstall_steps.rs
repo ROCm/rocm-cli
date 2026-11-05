@@ -283,6 +283,64 @@ async fn default_cache_intact(world: &mut E2eWorld) {
     );
 }
 
+/// Every place the CLI keeps state when only the config and data folders are
+/// set: those two, the cache folder inside the data folder, and the default
+/// `~/.rocm` that a stray write would land in. The harness's own cache folder
+/// is left out because a runner may share it between scenarios.
+fn state_folders(world: &E2eWorld) -> Vec<PathBuf> {
+    let paths = world.app_paths();
+    vec![
+        paths.config_dir,
+        paths.data_dir.clone(),
+        paths.data_dir.join("cache"),
+        home_dir(world).join(".rocm"),
+    ]
+}
+
+#[given("ROCm CLI has never created its folders in the user's home")]
+async fn no_folders_yet(world: &mut E2eWorld) {
+    // The harness creates the config, data and cache folders empty before each
+    // scenario; a machine ROCm CLI never touched has none of them.
+    for sub in ["config", "data", "cache"] {
+        let folder = root(world).join(sub);
+        std::fs::remove_dir(&folder)
+            .unwrap_or_else(|e| panic!("failed to remove the empty {}: {e}", folder.display()));
+    }
+    for folder in state_folders(world) {
+        assert!(
+            std::fs::symlink_metadata(&folder).is_err(),
+            "the scenario must start without {}",
+            folder.display()
+        );
+    }
+}
+
+#[when("the user dry-runs an uninstall")]
+async fn dry_run_uninstall(world: &mut E2eWorld) {
+    run_without_cache_setting(world, &["uninstall", "--keep-binaries", "--dry-run"]);
+}
+
+#[then("the uninstall reports that nothing would be removed")]
+async fn reports_nothing_to_remove(world: &mut E2eWorld) {
+    let stdout = output(world);
+    assert!(
+        stdout.contains("Nothing managed by rocm-cli would be removed."),
+        "a machine with no folders has nothing to remove:\n{stdout}"
+    );
+}
+
+#[then("ROCm CLI has still not created its folders")]
+async fn still_no_folders(world: &mut E2eWorld) {
+    for folder in state_folders(world) {
+        assert!(
+            std::fs::symlink_metadata(&folder).is_err(),
+            "the dry run created {}:\n{}",
+            folder.display(),
+            output(world)
+        );
+    }
+}
+
 fn output(world: &E2eWorld) -> &str {
     world
         .cli_output

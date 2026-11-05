@@ -954,7 +954,10 @@ symlinks.
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
-anything is removed:
+anything is removed, and a dry run on a machine ROCm CLI never touched
+(`uninstall-06`) reporting nothing to remove and creating no folder. The
+`uninstall` command does not start the file logger, which would otherwise create
+the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"

@@ -1071,6 +1071,11 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+- On a home folder ROCm CLI never touched, the dry run says
+  `Nothing managed by rocm-cli would be removed.` and leaves the home folder
+  empty (scenario `uninstall-06`): run
+  `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
+  on that folder.
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no

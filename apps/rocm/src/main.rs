@@ -1661,14 +1661,15 @@ fn run() -> Result<()> {
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let _log_guard = AppPaths::discover()
-        .ok()
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let _log_guard = logging::is_enabled_for(&raw_args)
+        .then(AppPaths::discover)
+        .and_then(Result::ok)
         .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
     maybe_notice_legacy_uv_cache();
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
     }

@@ -66,3 +66,17 @@ Feature: Uninstall
     And the uninstall does not name the default install's cache folder
     And the data folder's own cache folder is gone
     And the default install's cache folder still holds the user's files
+
+  # `rocm uninstall --dry-run` shows what would be removed without changing
+  # anything. It once started the file logger first, which created the data
+  # folder's `logs` folder, and then listed that folder as the one thing to
+  # remove, so a machine ROCm CLI had never touched looked installed. The
+  # promise is two-sided: the plan says there is nothing to remove, and the
+  # folders it would have removed are still absent afterwards.
+  @id:uninstall-dry-run-on-an-untouched-machine-creates-nothing
+  Scenario: uninstall-06 - A dry run on a machine ROCm CLI never touched reports nothing to remove and creates nothing
+    Given ROCm CLI has never created its folders in the user's home
+    When the user dry-runs an uninstall
+    Then the uninstall succeeds
+    And the uninstall reports that nothing would be removed
+    And ROCm CLI has still not created its folders
