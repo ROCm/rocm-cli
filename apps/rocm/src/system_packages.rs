@@ -13,8 +13,9 @@
 //! `rocm install sdk` (`SdkInstallConsents`) stays in `runtime_install_finalize.rs`,
 //! which passes the plain `system_packages` bool in. That module re-exports
 //! `ensure_openmpi_for_vllm`, `ensure_libatomic_for_torch` and
-//! `ensure_libnuma_for_torch` for `install_cmd.rs` and `engines_cmd.rs`, and
-//! `driver_install.rs` reads `real_os_release` from here directly.
+//! `ensure_libnuma_for_torch` for `install_cmd.rs` and `engines_cmd.rs`. Every plan
+//! here reads the real host's os-release through
+//! `rocm_core::hardware_root::real_os_release`.
 
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -62,18 +63,6 @@ const fn system_package_install_action(
     }
 }
 
-/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
-/// when the former is absent (per `os-release(5)`).
-///
-/// Deliberately not routed through `rocm_core::host_path`: every caller builds
-/// a package-manager plan (`apt`, `dnf`, `zypper`) that then runs against the
-/// real machine, so a simulated host root must not choose its distro. The descriptive distro name `examine` reports comes from
-/// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
-/// root.
-pub(crate) fn real_os_release() -> rocm_core::hardware_root::OsRelease {
-    rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
-}
-
 /// Run a command given as an argv vector directly, without going through a shell.
 ///
 /// Used for [`run_system_package_install_plan`], whose commands are modeled as
@@ -117,7 +106,7 @@ pub(crate) fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 
     let plan = rocm_core::openmpi::plan_for_os_release_read(
-        &real_os_release(),
+        &rocm_core::hardware_root::real_os_release(),
         rocm_core::openmpi::build_openmpi_install_plan,
     );
 
@@ -291,7 +280,10 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
         return;
     }
 
-    let plan = rocm_core::openmpi::plan_for_os_release_read(&real_os_release(), dep.build_plan);
+    let plan = rocm_core::openmpi::plan_for_os_release_read(
+        &rocm_core::hardware_root::real_os_release(),
+        dep.build_plan,
+    );
 
     println!("{} setup", dep.name);
     println!("  reason: {}", dep.reason);
@@ -440,7 +432,6 @@ fn run_system_package_install_plan(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     use std::fs;
 
     use super::*;
@@ -533,8 +524,10 @@ mod tests {
 
     /// The package-manager plans run against the real machine, so a simulated
     /// host root must not change the distro they are built for: under a root
-    /// whose `/etc/os-release` names a different distro, `real_os_release`
-    /// still returns the real file.
+    /// whose `/etc/os-release` names a different distro,
+    /// `rocm_core::hardware_root::real_os_release` still returns the real file.
+    /// Every caller (the driver, OpenMPI, libatomic and libnuma plans and hints)
+    /// reads through that one function.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn real_os_release_ignores_a_simulated_host_root() {
@@ -558,7 +551,7 @@ mod tests {
                 rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
                 &root.to_string_lossy(),
             );
-            real_os_release()
+            rocm_core::hardware_root::real_os_release()
         };
         fs::remove_dir_all(&root).ok();
 
@@ -569,8 +562,8 @@ mod tests {
         );
         // Independent of `hardware_root::read_os_release`: rather than call
         // the exact same helper with the same identity resolver `real_os_release`
-        // wraps one line away (which would pass even if its `.context(...)`
-        // call or resolver closure broke), read both candidate paths directly
+        // wraps (which would pass even if the resolver it passes broke), read
+        // both candidate paths directly
         // and apply the same existence-only fallback rule inline. This mirrors
         // which variant is correct for each case, rather than accepting
         // `Absent` or `Unreadable` interchangeably — see `ExpectedOsRelease`'s
@@ -604,6 +597,53 @@ mod tests {
                 "expected Unreadable at {path}, got {read:?}"
             ),
         }
+    }
+
+    /// Every package-manager plan this module and `driver_install.rs` build is
+    /// written for the real machine, so they all read its os-release through
+    /// `rocm_core::hardware_root::real_os_release`, whose own test
+    /// (`real_os_release_ignores_a_simulated_host_root`) proves it ignores a
+    /// simulated host root. A caller that read the file with `read_os_release`
+    /// and its own resolver would be a second reader that test does not cover, so
+    /// no source file of this binary may name `read_os_release` or the identity
+    /// resolver: the one place that does is `hardware_root.rs` in `rocm-core`.
+    #[test]
+    fn no_caller_in_this_binary_reads_the_real_os_release_by_hand() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).expect("a readable source directory") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // Spelled in two halves so this file does not match its own scan.
+        let needles = [
+            ["read_os_", "release("].concat(),
+            ["identity_path_", "for_str"].concat(),
+        ];
+        let mut files = Vec::new();
+        rust_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(!files.is_empty(), "the scan found no source files");
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|path| {
+                let text = fs::read_to_string(path).expect("a readable source file");
+                needles.iter().any(|needle| text.contains(needle.as_str()))
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these files read os-release by hand instead of through \
+             rocm_core::hardware_root::real_os_release: {offenders:?}"
+        );
     }
 
     /// The OpenMPI, libatomic and libnuma install hints (`rocm_core::openmpi`)
