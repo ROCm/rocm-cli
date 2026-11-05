@@ -840,7 +840,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
-                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCm/rocm-cli#897"
+                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "#897"
                 ),
                 "{id}"
             );

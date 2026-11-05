@@ -822,24 +822,28 @@ On a failed serve, the shared serve steps preserve the full service log under
 failures also include the installed runtime manifest's version/backend, configured
 `backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
 and `version.txt`,
-and each candidate's `--version` and `--help` output. Probes are read-only,
-time-bounded (5 seconds each, 20 seconds total), and output-capped at 64 KiB each.
+and each candidate's `--version` and `--help` output. At most eight candidates
+are hashed and probed, with two read-only probes per candidate. Each probe retains
+up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
+marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
+output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
+Each probe has a five-second timeout. Hashing and probes share a 20-second budget
+after inventory discovery; hashing runs off the async executor, rejects files
+over 32 MiB, and checks its deadline between 64 KiB reads. Filesystem operations
+and process cleanup are not preemptible, so this is not a hard wall-clock limit
+on the entire report.
 A candidate or configured build pin is **not proof** of which binary the router
 launched; a failed probe is retained as evidence, not treated as an identity.
 Probes inherit the harness environment rather than reconstructing the engine's
 managed library paths, so a probe loader error alone does not establish why the
 serve failed.
 
-[Issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the distinct
-Ubuntu signatures: `--no-mmap` rejection, backend-ready/router-unavailable, and
-backend download failure. Do not equate the backend's ready line on port 8001
-with a working model on port 11435, or infer a shutdown without lifecycle evidence.
-The existing hardware scenarios `@id:bench-load-real-serve`,
-`@id:chat-tool-definitions-accepted`, `@id:chat-end-to-end-local-model`,
-`@id:serve-lemonade-inference`, and `@id:serve-stop-leaves-no-background-helper`
-exercise these paths on the Strix Halo Ubuntu release/nightly lanes. This change
-only adds harness diagnostics and corrects xfail attribution; it does not change
-the CLI's asynchronous managed-launch contract or claim to fix a backend.
+Use the evidence to distinguish backend startup, download, and router readiness
+failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the
+Strix Halo Ubuntu investigation. A backend's ready line does not establish that
+the router serves the requested model, and a readiness timeout alone does not
+establish a shutdown. Diagnostics do not change the CLI's asynchronous
+managed-launch contract or imply a backend fix.
 
 Exercise the diagnostics and expectation scoping without a GPU:
 

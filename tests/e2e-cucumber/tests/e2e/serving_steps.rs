@@ -13,7 +13,7 @@ use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
+    ServeAttempt, archive_service_log, reported_engine, serve_attempt_report, service_log_tail,
 };
 
 /// Model id of the live managed service the reuse scenarios plant.
@@ -156,18 +156,20 @@ async fn serve_failure_evidence(
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
     let backend_evidence = if engine == "lemonade" {
-        e2e_cucumber::lemonade_diagnostics::backend_evidence(
-            &world
-                .app_paths()
-                .engine_manifests_dir("lemonade")
-                .join("runtime.json"),
+        Some(
+            e2e_cucumber::lemonade_diagnostics::backend_evidence(
+                &world
+                    .app_paths()
+                    .engine_manifests_dir("lemonade")
+                    .join("runtime.json"),
+            )
+            .await,
         )
-        .await
     } else {
-        "not a Lemonade serve".to_owned()
+        None
     };
     let stop_status = stop_scenario_services(world);
-    let report = serve_attempt_report(&ServeAttempt {
+    serve_attempt_report(&ServeAttempt {
         headline,
         device_state,
         stdout,
@@ -175,8 +177,8 @@ async fn serve_failure_evidence(
         log_tail: &log_tail,
         archived_log: &archived_log,
         stop_status: &stop_status,
-    });
-    format!("{report}\n--- Lemonade backend evidence ---\n{backend_evidence}")
+        backend_evidence: backend_evidence.as_deref(),
+    })
 }
 
 /// Launch a managed serve and wait until the endpoint really serves it, failing
@@ -1010,7 +1012,7 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             "{}",
             serve_failure_evidence(
                 world,
-                selected_engine(&stdout),
+                reported_engine(&stdout).unwrap_or(""),
                 &headline,
                 &device_state,
                 &stdout,
@@ -2469,11 +2471,7 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
 
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
-    let Some(engine) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("engine:"))
-        .map(str::trim)
-    else {
+    let Some(engine) = reported_engine(output) else {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine

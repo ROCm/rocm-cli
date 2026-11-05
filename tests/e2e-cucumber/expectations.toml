@@ -55,7 +55,7 @@ reason = "Engines do not report a consistent resolved model name for a short nam
 # os=linux: native Windows passed (29338475133 Strix-Windows).
 [["serve-default-engine-working-endpoint"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -63,7 +63,7 @@ flaky = true
 # The same serve precondition blocks inference; native Windows passed.
 [["serve-default-engine-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -71,7 +71,7 @@ flaky = true
 # The readiness contract depends on the same real Lemonade serve.
 [["serve-readiness-contract"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -79,7 +79,7 @@ flaky = true
 # Explicit Lemonade serving shares the same failure on the Ubuntu lane.
 [["serve-lemonade-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -94,7 +94,7 @@ serve_timeout_secs = 90
 # Chat's mock lane must remain expect-pass: only a real GPU serve is affected.
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -108,7 +108,7 @@ flaky = true
 # the no-GPU MockServer path and native Windows remain expect-pass.
 [["chat-end-to-end-local-model"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -128,7 +128,7 @@ reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-prov
 # failure reporting, the CSV columns, and the rollup-split warning.
 [["bench-load-real-serve"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -136,7 +136,7 @@ flaky = true
 # serve-40 has the same serve precondition; this is not an automation-helper bug.
 [["serve-stop-leaves-no-background-helper"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "ROCm/rocm-cli#897"
+bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
