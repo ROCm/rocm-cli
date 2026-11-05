@@ -150,3 +150,14 @@ Feature: Chat and endpoint detection
     Then the planning assistant was asked exactly once
     And the plan text returned is the one the planning assistant gave
     And the action returned is the one the planning assistant gave
+
+  # Expected to FAIL. Scenario 8 names the model and works; this one leaves the
+  # choice to the CLI and is told nothing is running — on the very machine whose
+  # services list shows a ready local server. Asking to chat locally should use
+  # the local server that is there, whichever model the user chose to serve.
+  @id:chat-local-uses-the-running-server
+  Scenario: chat-13 - Chatting locally uses the local server that is already running
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt without naming a model
+    Then the CLI prints the assistant's reply

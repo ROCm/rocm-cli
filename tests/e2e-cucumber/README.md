@@ -104,10 +104,18 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 
 ## Tags and per-scenario expectations
 
-There is no tag-filter tiering. Each CI job runs the **whole** suite
-(`cargo xtask e2e`, no `-t` filter); the harness resolves every scenario to
-**pass / xfail / skip** at runtime from its capability tags plus the known-bug
-matrix, then reconciles the actual result against that expectation.
+Each CI job runs the suite as a whole (`cargo xtask e2e`, no `-t` filter); the
+harness resolves every scenario to **pass / xfail / skip** at runtime from its
+capability tags plus the known-bug matrix, then reconciles the actual result
+against that expectation.
+
+Four tags tier the suite at runtime rather than by a `-t` filter, so a scenario
+carrying one runs only where its env var is set: `@nightly`
+(`E2E_INCLUDE_NIGHTLY`), `@lifecycle` (`E2E_INCLUDE_LIFECYCLE`),
+`@requires-docker` (`E2E_INCLUDE_DOCKER`) and `@merge-queue` (`E2E_MERGE_QUEUE`,
+set on the self-hosted merge-queue lanes). A `@merge-queue` scenario does not run
+on ordinary per-PR CI, only on the self-hosted lanes in
+[`.github/workflows/e2e-selfhosted.yml`](../../.github/workflows/e2e-selfhosted.yml).
 
 ### Naming
 
@@ -147,6 +155,8 @@ Scenarios carry stable-id and capability tags:
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
+| `@requires-no-gpu` | Premise is a host with no usable AMD GPU (e.g. a refusal that only happens without one). The inverse of `@requires-gpu`; resolves to **skip** on a GPU host. |
+| `@merge-queue` | Too expensive for per-PR CI (a real serve). Skipped unless `E2E_MERGE_QUEUE` is set, which every self-hosted lane in [`e2e-selfhosted.yml`](../../.github/workflows/e2e-selfhosted.yml) except the MI300X one does on a `merge_group` event. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM refusal scenarios serve-33/34/35. |
 
@@ -158,6 +168,20 @@ matches a condition is expected to fail (xfail); if it then passes, that is an
 `flaky = true` tolerate either outcome while still reporting the intermittent
 bug. See `src/expectation.rs` for the resolver and `expectations.toml`'s header
 for the condition grammar.
+
+When a comment here points at product code, **cite a symbol, never a line
+number** — `select_runtime_update_source` in [`apps/rocm/src/main.rs`](../../apps/rocm/src/main.rs), not
+`main.rs:16427`. `main.rs` alone is many thousands of lines and
+moves every week; nothing checks these numbers, so a stale one sends the reader
+somewhere confidently wrong, which is worse than no pointer at all.
+
+When a scenario's comment block says **"Expected to FAIL"**, write it directly
+above that scenario's `@id:` tag line with **no blank line between them**. A test
+binds each such claim to the tags immediately beneath it and fails if the row has
+since been deleted — so the prose cannot quietly come to say the opposite of what
+the suite enforces. A blank line breaks that binding, and the same test then
+fails naming the comment's own file and line rather than letting the scenario
+drop out of the check unnoticed.
 
 On a GPU host, a `serve` precondition that never publishes its model is
 relaunched once — but only for a scenario expected to pass; a known bug keeps its
