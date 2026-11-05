@@ -1867,6 +1867,7 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           elif [ "${{ needs.changes.outputs.heavy }}" = "true" ] \
             && [ "${{ needs.clippy.result }}" != "success" ]; then
+            # Deliberately stricter than pr-linux-binaries' `success || skipped`: clippy is skipped only on a dispatch, which the first branch already handled.
             echo "::notice title=E2E scenarios not run::clippy did not pass (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. The required clippy check blocks the merge."
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif { [ "${{ needs.build-and-test.result }}" = "success" ] \
