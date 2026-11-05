@@ -29,7 +29,9 @@ mod summaries;
 // `deterministic_comfyui_tool_summary` lives in `summaries.rs` and stays
 // reachable here as `chat::deterministic_comfyui_tool_summary` for
 // `comfyui.rs`'s tests, which are its only readers outside `summaries.rs`.
-#[cfg(test)]
+// Those tests are all `#[cfg(unix)]`, so the re-export is gated the same way:
+// on Windows it would be an unused import.
+#[cfg(all(test, unix))]
 pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 use self::summaries::{
     deterministic_chat_tool_summary, deterministic_summary_can_stand_alone,
