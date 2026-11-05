@@ -350,17 +350,29 @@ mod tests {
         let area = Rect::new(0, 0, 120, 30);
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| super::draw_menu(f, area, 1, &theme)).unwrap();
-        let rows = crate::ui::tests::rows(120, 30, |f| super::draw_menu(f, area, 1, &theme));
+        // One render: the row text and the cell styles both come from this buffer.
         let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
         let y_of = |label: &str| -> u16 {
             rows.iter()
                 .position(|r| inside(r) == label || inside(r) == format!("▸ {label}"))
                 .unwrap_or_else(|| panic!("no row for {label}")) as u16
         };
-        // The box is 60 wide on a 120-column screen, so its left border is at
-        // x=30; the cursor column is 7 cells right of it and the label 2 more.
-        let (cursor_x, label_x) = (37u16, 39u16);
+        // Locate the box's left border on the Help row instead of hardcoding
+        // where the popup sits, so a change to the popup's size does not
+        // break this test. The cursor column is 7 cells right of that border
+        // and the label 2 more.
         let help_y = y_of("Help");
+        let border_x = (0..buf.area.width)
+            .find(|&x| buf[(x, help_y)].symbol() == "│")
+            .expect("the Help row starts inside a bordered box");
+        let (cursor_x, label_x) = (border_x + 7, border_x + 9);
         assert_eq!(buf[(cursor_x, help_y)].symbol(), "▸");
         assert_eq!(buf[(cursor_x, help_y)].style().fg, Some(theme.accent));
         assert_eq!(buf[(label_x, help_y)].symbol(), "H");
