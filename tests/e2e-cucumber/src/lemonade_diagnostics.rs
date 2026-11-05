@@ -393,6 +393,32 @@ mod tests {
         assert!(!report.contains(&skipped.display().to_string()), "{report}");
     }
 
+    /// An executable past the hash cap is not fingerprinted, but the report says
+    /// so instead of omitting the line, and still lists the candidate and probes it.
+    #[tokio::test]
+    async fn oversized_executable_reports_why_it_has_no_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        let server = root.path().join("bin/llamacpp/rocm-stable").join(binary);
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::File::create(&server)
+            .unwrap()
+            .set_len(MAX_HASH_BYTES + 1)
+            .unwrap();
+        let report = backend_evidence(&write_manifest(root.path())).await;
+        assert!(
+            report.contains("sha256 unavailable: executable exceeds 32 MiB hash limit"),
+            "{report}"
+        );
+        assert!(!report.contains("sha256: "), "{report}");
+        assert!(report.contains(&server.display().to_string()), "{report}");
+        assert!(report.contains("--version:"), "{report}");
+    }
+
     #[tokio::test]
     async fn exhausted_budget_skips_hashing_and_probes() {
         let root = tempfile::tempdir().unwrap();
