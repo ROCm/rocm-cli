@@ -459,16 +459,12 @@ fn vllm_venv_root(runtime: &VllmRuntime) -> Result<PathBuf> {
             runtime.runtime_id
         )
     })?;
-    python
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            anyhow!(
-                "python executable `{}` is not inside a venv (bin/Scripts) layout",
-                python.display()
-            )
-        })
+    rocm_core::runtime_python_env_root_for_executable(python).ok_or_else(|| {
+        anyhow!(
+            "python executable `{}` is not inside a venv (bin/Scripts) layout",
+            python.display()
+        )
+    })
 }
 /// Finds `<venv>/lib/python3.*/site-packages`, the one location a venv keeps
 /// its packages under. Bails on anything other than exactly one `python3.*`
@@ -1124,29 +1120,28 @@ mod tests {
             PathBuf::from("/opt/venv")
         );
     }
-    /// Today's rule for a runtime's venv: the interpreter's grandparent
-    /// whatever its own folder is called, refused only when there is no
-    /// grandparent at all.
+    /// The runtime's venv is found by the rule every caller shares (see
+    /// `rocm_core::runtime_python_env_root_for_executable`): an interpreter in
+    /// an unrelated folder is refused, not mapped to that folder's parent,
+    /// which would send the site-packages lookup into a folder that is not a
+    /// venv.
     #[test]
-    fn vllm_venv_root_takes_the_grandparent_whatever_the_folder_is_called() {
+    fn vllm_venv_root_needs_a_bin_or_scripts_folder() {
         for (python, expected) in [
             ("/opt/venv/bin/python", Some("/opt/venv")),
             ("/opt/venv/Scripts/python.exe", Some("/opt/venv")),
             ("/opt/venv/SCRIPTS/python.exe", Some("/opt/venv")),
-            ("/opt/venv/tools/python", Some("/opt/venv")),
+            ("/opt/venv/tools/python", None),
             ("python", None),
             ("/python", None),
         ] {
             let runtime = test_vllm_runtime(Some(PathBuf::from(python)), None);
             let root = vllm_venv_root(&runtime);
-            match expected {
-                Some(expected) => {
-                    assert_eq!(root.unwrap(), PathBuf::from(expected), "{python}");
-                }
-                None => {
-                    let error = root.expect_err(python).to_string();
-                    assert!(error.contains("is not inside a venv"), "{python}: {error}");
-                }
+            if let Some(expected) = expected {
+                assert_eq!(root.unwrap(), PathBuf::from(expected), "{python}");
+            } else {
+                let error = root.expect_err(python).to_string();
+                assert!(error.contains("is not inside a venv"), "{python}: {error}");
             }
         }
     }

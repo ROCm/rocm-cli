@@ -205,7 +205,8 @@ pub use runtime::{
     runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
-    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_python_env_bin_dir, runtime_python_env_root_for_executable,
+    runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_identity::{ServiceId, generate_service_id};

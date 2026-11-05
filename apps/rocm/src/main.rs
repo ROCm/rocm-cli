@@ -1047,7 +1047,7 @@ left, so it cannot undo more than one activation."
         /// Python executable inside the existing ROCm environment.
         #[arg(long)]
         python: PathBuf,
-        /// Optional SDK root path.
+        /// Python environment folder. Taken from --python when that sits in a bin or Scripts folder; required otherwise.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Runtime id to assign.

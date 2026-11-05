@@ -22,7 +22,7 @@ use crate::therock;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, RocmCliConfig, runtime_is_linux, runtime_is_windows, runtime_path_list_join,
-    runtime_path_list_split, runtime_paths_equivalent,
+    runtime_path_list_split, runtime_paths_equivalent, runtime_python_env_root_for_executable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -237,7 +237,7 @@ pub(super) fn runtime_environment_for_manifest(
     }
 
     let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(&manifest.python_executable),
+        venv_root: runtime_python_env_root_for_executable(&manifest.python_executable),
         rocm_root: Some(manifest.runtime_root.clone()),
         path_entries: Vec::new(),
         library_entries: Vec::new(),
@@ -254,7 +254,7 @@ pub(super) fn runtime_environment_from_runtime(
     python: &Path,
 ) -> ComfyUiRuntimeEnvironment {
     let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(python),
+        venv_root: runtime_python_env_root_for_executable(python),
         rocm_root: manifest
             .rocm_sdk
             .as_ref()
@@ -305,15 +305,6 @@ fn collect_rocm_runtime_paths(root: &Path, env: &mut ComfyUiRuntimeEnvironment) 
         }
         push_existing_path(&mut env.library_entries, path);
     }
-}
-
-fn infer_python_env_root(python: &Path) -> Option<PathBuf> {
-    let bin_dir = python.parent()?;
-    let name = bin_dir.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if matches!(name.as_str(), "scripts" | "bin") {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    None
 }
 
 pub(super) fn apply_runtime_environment(

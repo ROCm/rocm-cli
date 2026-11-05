@@ -1515,3 +1515,66 @@ async fn assert_freeform_execution_prefix_is_one_word(world: &mut E2eWorld) {
         &freeform_prefix_with_quote(world),
     );
 }
+
+/// Where scenario runtime-23 plants its interpreter: inside a folder called `tools`,
+/// which is neither `bin` nor `Scripts`, so nothing about its location names an
+/// environment.
+fn interpreter_outside_a_venv(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("not-a-venv")
+        .join("tools")
+        .join("python")
+}
+
+/// A stand-in interpreter that answers the SDK probe with the smallest document the
+/// CLI parses. The refusal under test happens after the probe and before anything is
+/// read from the environment, so nothing else about the interpreter matters.
+///
+/// A POSIX shell script, so the scenario is Linux-only (`@requires-os:linux`).
+#[given("a Python interpreter that sits outside any environment's bin folder")]
+async fn setup_interpreter_outside_a_venv(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world);
+    std::fs::create_dir_all(python.parent().expect("interpreter has a folder"))
+        .expect("failed to create the interpreter's folder");
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\necho '{\"import_ok\": true}'\n",
+    )
+    .expect("failed to write the stand-in interpreter");
+}
+
+#[when("the user adopts that interpreter without naming an environment folder")]
+async fn user_adopts_interpreter_without_root(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world)
+        .to_string_lossy()
+        .into_owned();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "adopt", "--python", &python]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal asks for the environment folder with --root")]
+async fn assert_adopt_refusal_asks_for_root(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("could not infer the Python environment folder")
+            && combined.contains("pass --root"),
+        "the refusal does not ask for --root:\n{combined}"
+    );
+}
+
+#[then("no runtime is registered")]
+async fn assert_no_runtime_registered(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert!(
+        stdout.contains("installed: none") || stdout.contains("managed_runtimes: 0"),
+        "the refused adoption left a runtime registered:\n{stdout}"
+    );
+}

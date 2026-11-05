@@ -473,3 +473,22 @@ Feature: Runtime configuration
     When the user approves a natural-language SDK install into a folder whose name has a quote
     Then the request plan names that folder as a single argument
     And the executed command names that folder as a single argument
+
+  # `rocm runtimes adopt --python` takes the environment folder from where the
+  # interpreter sits: the folder that holds its `bin` (or `Scripts`) folder. An
+  # interpreter anywhere else has no environment folder to infer, and a guess (the
+  # interpreter's grandparent, which is what the command used to adopt) would
+  # register a folder that is not an environment as a runtime. The command refuses
+  # instead and names the flag that supplies the folder; nothing is saved.
+  #
+  # Linux-only: the stand-in interpreter is a POSIX shell script. The "adopts with
+  # --root" half is covered by the unit test
+  # `adopt_request_without_an_inferred_root_asks_for_root`, which shows an explicit
+  # root clears the refusal; adopting for real needs a genuine ROCm SDK environment.
+  @id:runtime-adopt-outside-a-venv-asks-for-root @requires-os:linux
+  Scenario: runtime-23 - Adopting a Python that sits outside any environment's bin folder asks for --root
+    Given a Python interpreter that sits outside any environment's bin folder
+    When the user adopts that interpreter without naming an environment folder
+    Then the adoption is refused
+    And the refusal asks for the environment folder with --root
+    And no runtime is registered
