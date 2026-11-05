@@ -16,10 +16,10 @@ files as the `nightly-queue-results` artifact, and a pass or fail.
 This is **manual-only** and gates nothing yet. The scheduled GPU lanes in
 [`nightly.yml`](../.github/workflows/nightly.yml) remain the nightly coverage
 gate described in [ci-hardware-testing.md](ci-hardware-testing.md). Two
-things must change before this could replace them: the queue's runs must use
-a lane image carrying the suite (until then a run executes a placeholder, so
-its lanes fail by design), and the published verdict must become trustworthy
-enough to gate on — see "What this does not protect yet" below.
+things must happen before this could replace them: a lane must be seen to
+build and run the suite from a cold start in the lane image, and the published
+verdict must become trustworthy enough to gate on — see "What this does not
+protect yet" below.
 
 This page is the **contract** between this repository and the queue side: what
 a lane must do to be reported, and how to read the report. The queue side —
@@ -50,13 +50,23 @@ repository's own artifact retention.
 
 ## What a run executes
 
-Runs start on the queue side: on its schedule, which stays off until the lane
-image carries the suite, or on request. A run has five inputs; the queue side
-sets their defaults, and any of them can be overridden for a single run:
+Runs start on the queue side: on its schedule, which stays off until a lane
+has been seen to run the suite, or on request. A run has six inputs; the queue
+side sets their defaults, and any of them can be overridden for a single run:
 
+- the branch — the branch of this repository to test, `main` by default. The
+  run resolves it to a commit once, as it starts, and every lane checks out
+  that commit, so all lanes test the same code however long each waits for a
+  GPU. The report's first line names the commit. Only a branch of this
+  repository can be named, never a commit id. A lane that cannot check the
+  commit out fails, with the reason in its `lane.log`.
 - the lane image — the container every lane runs
 - the lane command — a single line run by `bash` under `set -euo pipefail` in
-  that image
+  that image, from the root of the checkout, with the commit in
+  `ROCM_CLI_COMMIT`. The default is
+  [`scripts/run-e2e-lane.sh`](../scripts/run-e2e-lane.sh), which builds
+  and runs the full suite from a cold start, so what a lane runs is changed
+  here, by a pull request, like any other test
 - the blocking lanes — which lanes can fail the run; left empty, every lane can
 - the excluded lanes — GPU models to leave out of this run
 - the wait — how long the run waits for its slowest lane before cancelling
