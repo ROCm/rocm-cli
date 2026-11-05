@@ -143,9 +143,7 @@ pub use managed_runtime::{
     active_managed_therock_channel, active_managed_therock_environment,
     active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
 };
-use managed_runtime::{
-    collect_sdk_library_paths, managed_sdk_tool_path, managed_therock_sdk_probe_candidates,
-};
+use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
     GfxSupport, MODEL_RECIPE_STALE_AFTER_MS, ModelArtifactCacheStatus, ModelCatalogPlatform,
     ModelRecipeArtifactRecord, ModelRecipeArtifactSourcePolicyRecord, ModelRecipeEndpointRecord,
