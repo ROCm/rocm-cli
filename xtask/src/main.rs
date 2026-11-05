@@ -26,6 +26,7 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod proptest_regressions_contract;
 mod release_readiness;
 mod report_mailbox;
 mod report_rollup;

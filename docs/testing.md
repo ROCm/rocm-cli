@@ -248,6 +248,34 @@ share of cases and would pass with it present on a short run. The uninstall prop
 knob instead, `ROCM_DELETION_PROP_CASES`, described under Uninstall And
 Download Removal below; it follows the same rule.
 
+When a property fails, proptest saves the shrunk case as a `cc <hash> # shrinks
+to ...` line in a file named after the source file the `proptest!` block is
+written in, and replays it before any new case on every later run: a block in
+`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`. Moving
+the test to another file therefore leaves its saved cases behind, and proptest
+does not warn: they just stop being replayed. **Move the regression file with
+the test**, with `git mv` to the name the test's new file needs. This is
+enforced by a test, not by an `xtask` subcommand:
+`every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
+`xtask` walks the tree and **fails the build** on a file under any
+`proptest-regressions/` directory whose `<crate>/src/<path>.rs` is missing or
+holds no `proptest!` block, naming the file and the source file it expected.
+Run it on its own with:
+
+```bash
+cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
+```
+
+The pull-request affected-crates selection reaches `xtask` only through the
+crates it depends on (`rocm-core`, `e2e-report`), so a move confined to
+`apps/rocm` meets this check in the merge queue, which runs the whole
+workspace; run the command above after moving a property test. To prove a moved seed is read,
+append a deliberately unparsable line to it, run the test with `--nocapture`
+(`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
+`unparsable line, ignoring` warning naming that path, and remove the line.
+The check does not tell a seed that still reproduces from one that no longer
+does; it only confirms that something reads the file.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
