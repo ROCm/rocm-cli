@@ -2,13 +2,6 @@
 //
 // SPDX-License-Identifier: MIT
 
-/// The ROCm SDK 10.0 release line, as it appears in both
-/// [`crate::runtime::ROCM_DISCOVER_BUILD_VERSIONS`] and the discover-build table below.
-pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
-/// The ROCm SDK 10.1 release line, as it appears in both
-/// [`crate::runtime::ROCM_DISCOVER_BUILD_VERSIONS`] and the discover-build table below.
-pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
-
 /// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
 /// ignoring patch and any dev/pre-release suffix. See
 /// [`vllm_rocm_discover_build`] for why the line, not the exact release, is
@@ -96,9 +89,20 @@ pub(crate) struct VllmRocmDiscoverBuild {
     pub(crate) torchaudio_version: DiscoverVersion,
 }
 
+/// Every ROCm SDK `major.minor` line the engine installs by live wheel
+/// discovery, one row each, and the only list of those versions.
+///
+/// Three readers follow it with nothing else to keep in step: install routing
+/// ([`vllm_rocm_discover_build`], through `wheel_builds::vllm_install_route`),
+/// the static-pin fallback that fails closed for a 10.x line with no row
+/// (`wheel_builds::vllm_install_target`), and launch-time environment setup
+/// (`runtime::runtime_has_discover_build`). Adding, removing or reordering a
+/// row therefore changes all three together;
+/// `discover_build_table_pins_the_versions_it_serves_in_order` makes that a
+/// reviewed edit.
 pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
     VllmRocmDiscoverBuild {
-        rocm_sdk_version: ROCM_SDK_10_0,
+        rocm_sdk_version: "10.0.0",
         python_tag: "cp314",
         vllm_index_url: "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/",
         torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
@@ -118,7 +122,7 @@ pub(crate) const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         torchaudio_version: DiscoverVersion::Series("2.11"),
     },
     VllmRocmDiscoverBuild {
-        rocm_sdk_version: ROCM_SDK_10_1,
+        rocm_sdk_version: "10.1.0",
         python_tag: "cp314",
         vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
         // Torch stack from `whl-next`, not staging: it is the index

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::discover_builds::{ROCM_SDK_10_0, ROCM_SDK_10_1, rocm_sdk_series_matches};
+use crate::discover_builds::vllm_rocm_discover_build;
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
@@ -96,29 +96,20 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
-/// ROCm SDK versions keyed by a row in `discover_builds.rs`'s discover-build table
-/// (see [`crate::discover_builds::vllm_rocm_discover_build`] for the recipe each
-/// one resolves to: wheel indexes, version prefixes, interpreter tag). The
-/// table literally uses [`ROCM_SDK_10_0`] and [`ROCM_SDK_10_1`] for its
-/// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
-/// matches against the same two strings. This list and that table are still
-/// two separate pieces of data, kept in agreement only by
-/// `wheel_builds.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
-/// test, not by construction — a new table row needs a matching entry here,
-/// and that test is what catches it if one is missed.
-pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
-
 /// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
-/// recipe. Exposed as runtime metadata, matched directly against
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `wheel_builds` — the
-/// vLLM launch path in `process.rs`, specifically — don't need to reach into
-/// `wheel_builds`'s build-selection code for a plain yes/no check.
+/// recipe: the same row lookup install routing uses
+/// ([`vllm_rocm_discover_build`], over the one discover-build table in
+/// `discover_builds.rs`), so a version is a discover build for launch-time
+/// environment setup exactly when it is one for install routing. There is no
+/// separate list of versions to keep in step with that table. Exposed as
+/// runtime metadata so callers outside `wheel_builds` — the vLLM launch path
+/// in `process.rs`, specifically — don't need to reach into its
+/// build-selection code for a plain yes/no check.
 pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
-    runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
-        ROCM_DISCOVER_BUILD_VERSIONS
-            .iter()
-            .any(|key| rocm_sdk_series_matches(version, key))
-    })
+    runtime
+        .rocm_sdk_version
+        .as_deref()
+        .is_some_and(|version| vllm_rocm_discover_build(version).is_some())
 }
 
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
