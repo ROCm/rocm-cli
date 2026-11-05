@@ -101,6 +101,29 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
+# serve-40 serves the same small GGUF model through the same lemonade managed serve
+# as the rows above, so on a lemonade LINUX host its When step never sees the model
+# on /v1/models and panics before the Then assertion runs. Scoped like those rows
+# (os=linux). Known from run 41986772728: serve-40 passes on the Strix Halo Windows
+# lane, is skipped on the Strix Halo WSL2 lane (no AMD GPU detected), and fails on
+# both Strix Halo Ubuntu lanes. The row also matches any other Linux host that runs
+# the scenario with lemonade (the MI300X and W7900 lanes had not reported in that
+# run); whether lemonade serves there is not verified, and `flaky = true` tolerates
+# a pass on such a host. The cause on the Strix Halo Ubuntu lanes is not settled
+# and varies between runs (#897), so this row names that issue rather than EAI-7423
+# and carries `flaky = true` like its siblings. While it is in place the
+# scenario's own check (serve starts no background helper when no watcher is
+# enabled) is not exercised on the hosts it matches, and a genuine failure of that
+# check there would also read as a failure that was expected. `flaky` also means a
+# fixed #897 is not flagged as a stale row, so delete the row by hand when #897 is
+# closed.
+[["serve-stop-leaves-no-background-helper"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "#897"
+reason = "Lemonade serving fails on the Strix Halo Ubuntu lanes, so the model never appears on /v1/models and the helper check is never reached."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "vllm" }
@@ -130,13 +153,6 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
-# --- EAI-7384: re-provisioning nests the managed runtime path recursively
-# (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
-[["runtime-path-not-nested"]]
-when = {}
-bug = "EAI-7384"
-reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
-
 # Bench's real-serve precondition is blocked by #897 on the same Linux hosts.
 #
 # This does NOT weaken the coverage the bench fix relies on: the five
@@ -145,18 +161,6 @@ reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-prov
 # failure reporting, the CSV columns, and the rollup-split warning.
 [["bench-load-real-serve"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "#897"
-reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
-serve_timeout_secs = 90
-flaky = true
-
-# serve-40 has the same serve precondition; this is not an automation-helper bug.
-# xfail + flaky tolerates either outcome, so on this lane the "no background
-# helper" assertion carries no signal until #897 is closed: a pass here does not
-# show the scenario's own behaviour is healthy, and a failure is not attributed
-# to it. Remove the row once #897 is fixed.
-[["serve-stop-leaves-no-background-helper"]]
-when = { effective_engine = "lemonade", os = "linux" }
 bug = "#897"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
