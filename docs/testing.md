@@ -820,7 +820,9 @@ relying on this coverage.
 On a failed serve, the shared serve steps preserve the full service log under
 `service-logs/` in the E2E results artifact before stopping the service. The engine
 is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
-neither names one, the report says `engine unknown: backend evidence skipped`.
+neither names one, the report says `engine unknown: backend evidence skipped`. A
+value that starts with `--` (as in `serve m --engine --managed`) is another flag, not
+an engine, and counts as no engine named.
 Lemonade failures also include the installed runtime manifest's version/backend, configured
 `backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
 and `version.txt`,
@@ -831,14 +833,22 @@ marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
 output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
 Each probe has a five-second timeout. Hashing and probes share a 20-second budget
 after inventory discovery; hashing runs off the async executor, rejects files
-over 32 MiB, and checks its deadline between 64 KiB reads. Filesystem operations
-and process cleanup are not preemptible, so this is not a hard wall-clock limit
-on the entire report.
+over 32 MiB, and checks its deadline between 64 KiB reads. A candidate over the
+size cap gets no fingerprint, and its entry says so with `sha256 unavailable:
+executable exceeds 32 MiB hash limit`; it is still listed and probed. Filesystem
+operations and process cleanup are not preemptible, so this is not a hard
+wall-clock limit on the entire report.
 A candidate or configured build pin is **not proof** of which binary the router
 launched; a failed probe is retained as evidence, not treated as an identity.
 Probes inherit the harness environment rather than reconstructing the engine's
 managed library paths, so a probe loader error alone does not establish why the
-serve failed.
+serve failed. The probes run once the serve has exited non-zero or its readiness
+wait has timed out, and after the log has been read and archived, but before the
+service is stopped, so the router may still be running while they execute. Whether
+a `llama-server --version` or `--help` run initialises a GPU backend, and so could
+contend with that router on a shared-memory device, has not been checked; the
+probes are bounded and sequential, and the attempt's failing outcome is already
+decided when they start.
 
 Use the evidence to distinguish backend startup, download, and router readiness
 failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the
