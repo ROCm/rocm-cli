@@ -191,6 +191,7 @@ async fn serve_and_wait(
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
+        world.serve_summary = Some(stdout.clone());
         return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
@@ -591,6 +592,7 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
+            world.serve_summary = Some(stdout);
             return;
         }
         // `serve_failure_evidence` reads and copies out the log BEFORE it stops
@@ -2386,6 +2388,171 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
         stdout.contains("127.0.0.1"),
         "endpoint not in services list:\n{stdout}"
     );
+}
+
+/// The `device:` value as `rocm serve` / `rocm services list` print it, split
+/// into the backend it names and the GPU ordinal it pinned, if any.
+///
+/// Every engine renders it through
+/// `rocm_engine_protocol::format_reported_device`, so the grammar is
+/// `<backend>`, then an optional ` gpu <n>`, then an optional ` (<gpu name>)`.
+/// `None` for anything else, which is what makes a hardcoded or malformed value
+/// fail rather than pass.
+fn parse_device_row(value: &str) -> Option<(&str, Option<u32>)> {
+    // The name is the only part that may contain spaces, and it is always last
+    // and parenthesised. Split on the FIRST " (" so a name with its own
+    // parentheses ("AMD Radeon (TM) Graphics") still leaves the head intact.
+    let head = match value.split_once(" (") {
+        Some((head, name)) if name.ends_with(')') => head,
+        Some(_) => return None,
+        None => value,
+    };
+    let mut parts = head.split_whitespace();
+    let backend = parts.next()?;
+    let ordinal = match parts.next() {
+        Some("gpu") => Some(parts.next()?.parse().ok()?),
+        // A bare `gpu` with no ordinal is the shape ROCMAI-550 removed; so is
+        // any other trailing word.
+        Some(_) => return None,
+        None => None,
+    };
+    parts.next().is_none().then_some((backend, ordinal))
+}
+
+/// How long the `device:` row may take to show up after the serve returned.
+///
+/// It is not available the instant a service is recorded `ready`:
+/// `engines/lemonade` reports `"unknown"` until its own `inference_verified`
+/// probe has come back, and `fetch_service_device` drops `"unknown"` rather
+/// than printing it. So there is a real window in which a correct
+/// implementation has no row yet, and failing on the first look would make
+/// this step flake on timing rather than on behavior.
+const DEVICE_ROW_DEADLINE: Duration = Duration::from_secs(90);
+
+/// The value of the first `device:` row in `text`, trimmed.
+fn device_row_value(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix("device:"))
+        .map(str::trim)
+}
+
+/// ROCMAI-550: `rocm services list` must show the backend/device the engine
+/// actually selected (read live from its `Healthcheck` RPC), not just that a
+/// service exists. Reuses `assert_service_in_list`'s model-name match so this
+/// only checks the row for the service this scenario just started.
+///
+/// It asserts the VALUE, not merely the presence of the row. A row whose value
+/// were empty, malformed, or nailed to a constant would satisfy "starts with
+/// `device:`" while reporting nothing real, so this parses it and holds it to
+/// three independent facts:
+///
+/// 1. it has the `<backend> [gpu <n>] [(<name>)]` shape every engine reports;
+/// 2. the backend is one this engine can actually have selected - only
+///    Lemonade has a Vulkan path, so `vulkan` from `vllm` or `aim` is wrong,
+///    and `unknown` is wrong from any of them;
+/// 3. it equals what the `rocm serve` deployment summary printed for the same
+///    service — *when* that summary printed a device row at all, which is a
+///    documented maybe rather than a promise (see the comment at that
+///    comparison, and `serve_summary::DeploymentSummary::device`).
+/// The row is polled rather than read once: see [`DEVICE_ROW_DEADLINE`] for
+/// the window in which a correct implementation legitimately has no row yet.
+/// Running out of that window is an assertion naming what was last seen, not a
+/// panic on the first look.
+#[then("the services list reports the engine's actual backend device")]
+async fn assert_services_list_reports_device(world: &mut E2eWorld) {
+    let model = world.model_name.clone().unwrap_or_default();
+    let deadline = Instant::now() + DEVICE_ROW_DEADLINE;
+    // The last thing looked at, so a timeout can show it rather than just
+    // saying it timed out: the service's own block when there was one, else the
+    // whole listing (which is the evidence for the service having gone missing).
+    let mut last_seen;
+    let device = loop {
+        let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+        match stdout
+            .split("\n- ")
+            .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
+        {
+            Some(block) => {
+                last_seen = block.to_owned();
+                if let Some(device) = device_row_value(&last_seen) {
+                    break device.to_owned();
+                }
+            }
+            None => last_seen = stdout,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after {}s `rocm services list` still reports no `device:` line for \
+             {model} - the engine's Healthcheck RPC should report the backend it \
+             actually selected once the service is serving:\n{last_seen}",
+            DEVICE_ROW_DEADLINE.as_secs()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+    let block = last_seen.as_str();
+    let (backend, _ordinal) = parse_device_row(&device).unwrap_or_else(|| {
+        panic!(
+            "`device: {device}` is not the `<backend> [gpu <n>] [(<name>)]` shape \
+             every engine reports, so it cannot be the engine's own answer:\n{block}"
+        )
+    });
+
+    let engine = block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("engine:"))
+        .map_or_else(
+            || panic!("services-list entry for {model} has no engine:\n{block}"),
+            str::trim,
+        );
+    // Only Lemonade has a Vulkan llama.cpp backend; vLLM and AIM are ROCm-only,
+    // so `vulkan` from either would mean the row is not coming from the engine
+    // that served. `unknown` is the engines' own "I have no state for this",
+    // which `fetch_service_device` is supposed to drop rather than print.
+    let allowed: &[&str] = match engine {
+        "lemonade" => &["rocm", "vulkan"],
+        _ => &["rocm"],
+    };
+    assert!(
+        allowed.contains(&backend),
+        "`device: {device}` names backend `{backend}`, which the `{engine}` \
+         engine cannot have selected (expected one of {allowed:?}):\n{block}"
+    );
+
+    // The same fact, read from the other surface. `rocm serve` printed this row
+    // at launch; nothing else in these scenarios inspects that summary, so
+    // without this the summary half of ROCMAI-550 has no live assertion at all.
+    //
+    // Only when the summary HAS the row. Its absence is not a defect and must
+    // not be asserted against, in either direction:
+    //
+    // * `serve` asks the engine once the launch reports `ready` and retries
+    //   only within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` (~6s), because the
+    //   row is informational and the alternative is holding a terminal;
+    // * `engines/lemonade` answers `"unknown"` until its own
+    //   `inference_verified` probe returns, which for a model still loading can
+    //   be far longer than that - which is exactly why the Given step then
+    //   polls `/v1/models` for up to minutes;
+    // * so a correct `rocm serve` can print `status ready` with no `device:`
+    //   row, while `rocm services list` - asked later, after this step has
+    //   waited - has one.
+    //
+    // An earlier revision asserted that a `ready` summary must carry the row.
+    // That is the exact false failure this note describes, and it was invisible
+    // only because serve-07 is xfail'd on lemonade+linux (see the comment on
+    // that scenario in model_serving.feature). What remains asserted is the
+    // half that is a real invariant: the two surfaces read one engine over one
+    // RPC, so where both speak they must say the same thing.
+    let summary = world
+        .serve_summary
+        .as_deref()
+        .expect("the Given step must have recorded the serve summary");
+    if let Some(summary_device) = device_row_value(summary) {
+        assert_eq!(
+            summary_device, device,
+            "`rocm serve` and `rocm services list` must report the same device \
+             for one service; they read it from the same Healthcheck RPC"
+        );
+    }
 }
 
 #[then("the list reports the attempt and how to look at it")]

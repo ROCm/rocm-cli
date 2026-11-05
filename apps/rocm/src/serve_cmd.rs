@@ -54,7 +54,7 @@ use rocm_engine_protocol::{
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engine_install_env::engine_manages_own_runtime;
-use crate::engine_ipc::engine_request;
+use crate::engine_ipc::{engine_request, fetch_service_device_briefly};
 use crate::engine_runtime_select::{
     EngineSelection, resolve_engine_selection, validate_engine_selection_runtime,
 };
@@ -1590,6 +1590,22 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             };
             spinner.clear();
 
+            // Read what the engine actually selected rather than guessing from
+            // the pre-launch GPU plan: `gpu_indices` above can be empty for a
+            // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
+            // the server is running fine on it. Only meaningful once the
+            // server is ready to answer, same gate as the smoke test.
+            //
+            // Asked more than once, briefly: `engines/lemonade` answers
+            // `"unknown"` until its own inference probe has come back, which is
+            // a real window right after a launch reports ready. The wait is
+            // bounded (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is a
+            // supported outcome — the summary then has no `device:` row, and
+            // `rocm services list` shows it once the engine can say.
+            let device = (report.status == "ready")
+                .then(|| fetch_service_device_briefly(&paths, &selected_engine, &report.service_id))
+                .flatten();
+
             let mut notes = collect_serve_notes(
                 cpu_only,
                 &gpu_selection,
@@ -1635,6 +1651,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
+                device,
                 already_running: report.already_running,
                 metrics,
                 api_key: launched_key,

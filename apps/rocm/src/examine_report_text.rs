@@ -136,7 +136,7 @@ use crate::runtimes_cmd::{
 };
 use crate::therock;
 use crate::{
-    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform,
+    PlatformRuleOut, engine_inventory, engine_inventory_note, engine_ruled_out_by_platform,
     engine_ruled_out_by_platform_with, missing_packaged_engine_reason,
 };
 
@@ -196,7 +196,17 @@ pub(crate) fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
+    let gpu_support_level = rocm_core::gpu_support_level(
+        summary.detected_gfx_target.as_deref(),
+        summary.compatible_therock_family.as_deref(),
+    );
+    append_examine_engine_inventory(
+        &mut output,
+        paths,
+        config,
+        &summary.default_engine,
+        gpu_support_level,
+    );
     Ok((output, summary))
 }
 
@@ -254,7 +264,27 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    render_engine_inventory_text_for_host(
+        paths,
+        rocm_core::default_engine_for_host(&host_gpu),
+        rocm_core::gpu_support_level_for_host_gpu(&host_gpu),
+    )
+}
+
+/// `rocm engines` for a host whose preferred engine and GPU support level the
+/// caller has already probed.
+///
+/// Split from [`render_engine_inventory_text_with_paths`] for the same reason
+/// [`append_examine_engine_inventory`] takes both as parameters: the host probe
+/// reads real sysfs, so a test cannot otherwise reach the Vulkan-only branch -
+/// no CI runner has a GPU that is detected *and* confirmed to have no ROCm
+/// build. Both values come from one `detect_host_gpu_summary` call above, so
+/// the marker and the note still cannot disagree about the same host.
+fn render_engine_inventory_text_for_host(
+    paths: Option<&AppPaths>,
+    host_default_engine: &str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> String {
     // A configured `default_engine` still wins over the host preference, mirroring
     // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
     // the legend could mark an engine `serve` will not actually default to.
@@ -297,6 +327,7 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
     }
     for (name, note) in engine_inventory() {
         let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
+        let note = engine_inventory_note(name, note, gpu_support_level);
         write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -421,6 +452,7 @@ fn append_examine_engine_inventory(
     paths: &AppPaths,
     config: &RocmCliConfig,
     host_default_engine: &str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
 ) {
     // Mirrors `select_serve_engine`'s guard: a blank configured value must not
     // out-rank the host preference, or `effective_default` below would become
@@ -503,6 +535,7 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
+        let note = engine_inventory_note(engine, note, gpu_support_level);
         write_marked_row(
             output,
             "  ",
@@ -1842,7 +1875,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("configured_default_engine: <platform default>"),
@@ -2507,7 +2546,13 @@ mod tests {
 
         // Host default deliberately disagrees with the configured value: an
         // engine the user chose must outrank whatever the GPU would prefer.
-        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -2524,7 +2569,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
@@ -2544,7 +2595,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
         let _ = fs::remove_dir_all(root);
 
         for (engine, _) in engine_inventory() {
@@ -2572,7 +2629,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -2592,7 +2655,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         // The configured line still reads as unset — the host default must not be
         // mistaken for something the user chose.
@@ -2624,7 +2693,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("effective_default_engine: lemonade"),
@@ -2658,11 +2733,148 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        // A gfx90c host (or any confirmed-no-ROCm-build GPU) actually runs
+        // Lemonade's Vulkan backend, not the ROCm one the static catalog text
+        // always claimed.
+        let (root, paths) = test_paths("examine-engine-inventory-vulkan-only");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanOnly,
+        );
+
+        assert!(
+            output.contains("no ROCm/HIP support") && output.contains("Vulkan llama.cpp backend"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("note=default embedded Lemonade server with ROCm"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let (root, paths) = test_paths("examine-engine-inventory-rocm-capable");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
+
+        assert!(
+            output.contains("note=default embedded Lemonade server with ROCm llama.cpp backend"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm engines` makes the same claim `rocm examine` does, through a
+    /// different renderer, so it needs the same pair of tests:
+    /// `examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support`
+    /// is this test's counterpart on the examine surface.
+    #[test]
+    fn engines_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        let (root, paths) = test_paths("engines-inventory-vulkan-only");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanOnly,
+        );
+
+        assert!(
+            output.contains("no ROCm/HIP support") && output.contains("Vulkan llama.cpp backend"),
+            "`rocm engines` must name the backend this GPU really runs on:\n{output}"
+        );
+        assert!(
+            !output.contains("Lemonade server with ROCm llama.cpp backend"),
+            "`rocm engines` must not keep asserting ROCm support on a host without it:\n{output}"
+        );
+        // The substitution is lemonade's alone; vLLM's row is not host-aware.
+        assert!(
+            output.contains("Linux/WSL ROCm GPU serving engine through external vLLM"),
+            "only lemonade's note is support-level aware:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn engines_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let (root, paths) = test_paths("engines-inventory-rocm-capable");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "vllm",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
+
+        assert!(
+            output.contains("default embedded Lemonade server with ROCm llama.cpp backend"),
+            "a ROCm-capable host must keep the ROCm wording:\n{output}"
+        );
+        assert!(
+            !output.contains("Vulkan llama.cpp backend"),
+            "a ROCm-capable host must not be told it is on Vulkan:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An unrecognized or undetected GPU is a gap in what the catalog knows,
+    /// not a confirmed absence of ROCm - printing the Vulkan wording for it
+    /// would turn that gap into a false claim about the hardware, which is the
+    /// distinction `GpuSupportLevel::Unknown` exists to preserve. It must not
+    /// get the *ROCm* wording either: that was the original bug, reappearing
+    /// on precisely the hosts where support is least known.
+    #[test]
+    fn engines_inventory_does_not_claim_vulkan_for_an_unrecognized_gpu() {
+        let (root, paths) = test_paths("engines-inventory-unknown");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
+
+        assert!(
+            !output.contains("no ROCm/HIP support"),
+            "an unrecognized GPU must not be reported as confirmed ROCm-less:\n{output}"
+        );
+        assert!(
+            !output.contains("Lemonade server with ROCm llama.cpp backend"),
+            "an unrecognized GPU must not be told it has ROCm support either:\n{output}"
+        );
+        assert!(
+            output.contains("rocm examine"),
+            "claiming no backend still has to leave a way to find out:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }

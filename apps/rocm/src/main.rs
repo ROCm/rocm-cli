@@ -528,12 +528,15 @@ rocm model --verbose"
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
     /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
-    /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
-    /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
-    /// the server exited, it says so on stderr and exits with an error; if the stop itself
-    /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. Inspect or stop servers later with
+    /// (status, endpoint, model, smoke-test metrics, and the backend device the engine
+    /// reports it is running on). The device line is read back from the running server, so
+    /// it is omitted when the engine cannot say yet: a server that answers is not always
+    /// done loading its weights. `rocm services list` shows it once it is known. Use
+    /// --verbose to stream engine logs in this terminal instead. When streaming, press Ctrl-D
+    /// to detach and leave the server running, or Ctrl-C to stop it. If that stop answers
+    /// that it could not confirm the server exited, it says so on stderr and exits with an
+    /// error; if the stop itself fails, it says why on stderr, signals the server process
+    /// directly and exits
     /// `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
@@ -1178,6 +1181,12 @@ enum ComfyuiCommand {
 enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
+    ///
+    /// Each running server is asked which backend and GPU it is actually on, so
+    /// this takes a few seconds rather than returning instantly. The asking is
+    /// capped in total (about 18 seconds worst case, however many servers are
+    /// listed), and a server that does not answer in time simply has no device
+    /// line.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
@@ -2350,6 +2359,84 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     bare
 }
 
+/// This host's GPU support level from the cheap host probe, for the call sites
+/// that need it without gathering a whole [`ExamineSummary`].
+///
+/// The same two inputs `rocm examine` derives it from, read through
+/// `detect_host_gpu_summary` rather than the full examine gather — exactly what
+/// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+/// The inventory note to print for `engine`, given the row `catalog_note` the
+/// static catalogue carries for it and what this host actually supports.
+///
+/// The one place the lemonade substitution lives. All three host-aware
+/// inventory renderers — [`render_engine_inventory_text_for_host`]
+/// (`rocm engines`), [`append_examine_engine_inventory`] (`rocm examine`) and
+/// [`builtin_codex_bridge_engine_inventory`] (the codex bridge and its
+/// `engines` MCP tool) — route their note through this, so the three cannot
+/// drift into disagreeing about the same host. Tests exercise the renderers
+/// rather than this function: asserting on it directly would only restate the
+/// condition below instead of proving a surface prints it.
+pub(crate) fn engine_inventory_note(
+    engine: &str,
+    catalog_note: &'static str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> &'static str {
+    if engine == "lemonade" {
+        lemonade_engine_note(gpu_support_level)
+    } else {
+        catalog_note
+    }
+}
+
+/// The lemonade engine note shown in `rocm examine`, `rocm engines` and the
+/// codex-bridge engine inventory, adjusted for whether this host's detected GPU
+/// can actually use the ROCm llama.cpp backend.
+///
+/// All three of those have a live `GpuSupportLevel` in scope. The two places
+/// that still print the note statically — the dashboard TUI's engine-manager
+/// pane and `rocmd`'s own catalog in `apps/rocmd/src/common.rs` — keep the
+/// unconditional ROCm wording, and that is deliberate rather than an oversight:
+/// the TUI pane renders a hard-coded descriptive list with no probe behind it,
+/// and `rocmd` is the daemon answering for whichever host a client asks about,
+/// not necessarily the one it runs on. Both are their own change if they ever
+/// need to be host-aware.
+///
+/// The match is exhaustive rather than a catch-all on purpose. `Unknown` is
+/// "no GPU detected yet, or a gfx target this catalog does not recognize", and
+/// folding it into the ROCm arm reproduced the exact bug ROCMAI-550 exists to
+/// fix - asserting ROCm support on a host where nothing establishes it, just
+/// on the hosts where the CLI knows least. It does not get the Vulkan wording
+/// either: that is a confirmed absence, and a detection gap is not one. So it
+/// claims no backend and names the command that can answer. A new
+/// `GpuSupportLevel` variant now has to be classified here rather than
+/// silently inheriting the ROCm claim.
+///
+/// What the `Unknown` arm promises is bounded by what the named command
+/// delivers. It used to say `rocm examine` would show "which llama.cpp backend
+/// this GPU uses", and examine showed no such thing — it printed a
+/// `rocm_support` line only for `VulkanOnly`, so on exactly the hosts that got
+/// this note it printed nothing at all. `ExamineSummary::rocm_support_line`
+/// now answers for every level, and this says what that answer is: the support
+/// level, not the backend. The backend is settled by launching one, which that
+/// line in turn points at.
+const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
+    match level {
+        rocm_core::GpuSupportLevel::VulkanOnly => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, so it runs on the Vulkan llama.cpp backend"
+        }
+        rocm_core::GpuSupportLevel::RocmHip => {
+            "default embedded Lemonade server with ROCm llama.cpp backend"
+        }
+        rocm_core::GpuSupportLevel::Unknown => {
+            "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
+        }
+    }
+}
+
+fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
+    rocm_core::gpu_support_level_for_host_gpu(&rocm_core::detect_host_gpu_summary(paths))
+}
+
 fn refresh_startup_update_check_quietly() {
     let Ok(paths) = AppPaths::discover() else {
         return;
@@ -3408,6 +3495,81 @@ pub(crate) mod tests {
         assert_eq!(
             listed, expected,
             "serve --engine possible-values must stay in sync with builtin_engine_inventory()"
+        );
+    }
+
+    /// The codex bridge renders `summary` to the operator just as the two CLI
+    /// surfaces render their note, so the same correction has to reach it.
+    #[test]
+    fn codex_bridge_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::VulkanOnly);
+
+        let lemonade = engines
+            .iter()
+            .find(|engine| engine.id == "lemonade")
+            .expect("the bridge inventory must still carry lemonade");
+        assert!(
+            lemonade.summary.contains("no ROCm/HIP support")
+                && lemonade.summary.contains("Vulkan llama.cpp backend"),
+            "bridge clients must be told the real backend: {}",
+            lemonade.summary
+        );
+        assert!(
+            !lemonade.summary.contains("with ROCm llama.cpp backend"),
+            "the stale ROCm claim must not survive in the bridge: {}",
+            lemonade.summary
+        );
+        // Only `summary` is support-level aware; the bridge's JSON shape and
+        // every other engine's row are untouched by the substitution.
+        assert!(lemonade.installed_binary);
+        let vllm = engines
+            .iter()
+            .find(|engine| engine.id == "vllm")
+            .expect("the bridge inventory must still carry vllm");
+        assert_eq!(
+            vllm.summary,
+            "Linux/WSL ROCm GPU serving engine through external vLLM"
+        );
+    }
+
+    #[test]
+    fn codex_bridge_engine_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::RocmHip);
+
+        let lemonade = engines
+            .iter()
+            .find(|engine| engine.id == "lemonade")
+            .expect("the bridge inventory must still carry lemonade");
+        assert_eq!(
+            lemonade.summary,
+            "default embedded Lemonade server with ROCm llama.cpp backend"
+        );
+    }
+
+    #[test]
+    fn codex_bridge_engine_inventory_does_not_claim_vulkan_for_an_unrecognized_gpu() {
+        let engines = builtin_codex_bridge_engine_inventory(rocm_core::GpuSupportLevel::Unknown);
+
+        let lemonade = engines
+            .iter()
+            .find(|engine| engine.id == "lemonade")
+            .expect("the bridge inventory must still carry lemonade");
+        assert!(
+            !lemonade.summary.contains("no ROCm/HIP support"),
+            "an unrecognized GPU must not be reported as confirmed ROCm-less: {}",
+            lemonade.summary
+        );
+        assert!(
+            !lemonade.summary.contains("with ROCm llama.cpp backend"),
+            "nor told it has ROCm support - that is the claim this PR removes, \
+             surviving on the hosts the CLI knows least about: {}",
+            lemonade.summary
+        );
+        assert!(
+            lemonade.summary.contains("rocm examine"),
+            "claiming no backend still has to leave the operator a way to find \
+             out: {}",
+            lemonade.summary
         );
     }
 

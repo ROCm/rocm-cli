@@ -1286,6 +1286,24 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
     ),
+    // The `device:` row's value (ROCMAI-550). Every engine reports the backend
+    // it selected as `<backend> [gpu <n>] [(<name>)]` -- `vulkan (AMD Radeon
+    // Graphics)`, `rocm gpu 1 (AMD Instinct MI300X)` -- so the ROCm half of
+    // that value reads as a `rocm` invocation to this scan while naming no
+    // command at all. The engines no longer need an entry each: they build the
+    // string through `rocm_engine_protocol::format_reported_device` rather
+    // than holding a `"rocm gpu ..."` literal. These are the two docs that
+    // quote the format back.
+    (
+        "README.md",
+        "rocm gpu 0 (AMD Instinct MI300X)",
+        "an example `device:` value in the deployment-summary description, not a command",
+    ),
+    (
+        "docs/manual-testing.md",
+        "rocm gpu 0 (AMD Instinct MI300X)",
+        "the `device:` value the tester is told to expect, not a command to run",
+    ),
 ];
 
 /// Natural-language examples must reach the planner with a multi-word request:

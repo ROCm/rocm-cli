@@ -1457,3 +1457,29 @@ async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
         );
     }
 }
+
+/// Having removed every `--family` the user could try, the refusal has to leave
+/// somewhere to go — and that somewhere must be true on whatever host runs it.
+///
+/// This scenario asks for `--family gfx90c`, which is refused by
+/// `unsupported_requested_target_message` before any host probe runs, so the
+/// runner's own GPU has no bearing on the refusal. That makes this lane the
+/// proof that the refusal does not predict a backend: these runners are
+/// ROCm-capable, so an earlier draft's "`rocm serve <model>` runs on Lemonade's
+/// Vulkan backend" was being asserted green here on exactly the kind of host
+/// where it is false. `rocm examine` holds either way, and is the command that
+/// reports the real support level this PR added.
+#[then("the refusal points at examining what this host supports")]
+async fn assert_unsupported_family_points_at_examine(world: &mut E2eWorld) {
+    let output = unsupported_family_attempt(world);
+    assert!(
+        output.contains("rocm examine"),
+        "the refusal took every package family away, so it must leave the user a \
+         next step:\n{output}"
+    );
+    assert!(
+        !output.contains("rocm serve"),
+        "this refusal never looked at the host's GPU, so it must not predict \
+         which backend serving would use here:\n{output}"
+    );
+}

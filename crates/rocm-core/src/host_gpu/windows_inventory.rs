@@ -140,8 +140,7 @@ impl WindowsExamineInventory {
     /// vendor, so the rows also hold devices like "AMD Bluetooth Capture Audio
     /// Device" and "Intel(R) UHD Graphics". A row counts only with an AMD PCI
     /// device id (`PCI\VEN_1002`) or a marketing name `rocm examine` recognizes.
-    #[cfg(any(windows, test))]
-    fn amd_display_count(&self) -> usize {
+    pub(crate) fn amd_display_count(&self) -> usize {
         self.displays
             .iter()
             .filter(|display| {
@@ -974,6 +973,33 @@ Class Name:                Display
         assert_eq!(
             info.date.map(|d| d.to_string()).as_deref(),
             Some("2026-05-02")
+        );
+    }
+
+    #[test]
+    fn the_windows_display_count_counts_amd_adapters_only() {
+        let inventory = WindowsExamineInventory {
+            cpu_model: None,
+            system_ram_gib: None,
+            displays: vec![
+                WindowsDisplayAdapter {
+                    name: "Intel(R) UHD Graphics".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: Some("PCI\\VEN_8086&DEV_9A49".to_owned()),
+                },
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon(TM) Graphics".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: Some("PCI\\VEN_1002&DEV_15BF".to_owned()),
+                },
+            ],
+        };
+        assert_eq!(inventory.amd_display_count(), 1);
+        assert_eq!(
+            inventory.amd_display_name(),
+            Some("AMD Radeon(TM) Graphics".to_owned())
         );
     }
 }

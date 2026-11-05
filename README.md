@@ -893,10 +893,22 @@ services stop <service-id> --yes`) or match the original flags.
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+with the status, the engine and the backend device it actually selected (for
+example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
+where the engine pinned no GPU ordinal — read back from the running engine), the
+full inference endpoint, the API-qualified model name, and a quick smoke test
+(time to first token and approximate tokens per second). `rocm services` reports
+the same `device` for each running service.
+
+The device line is omitted when the engine cannot say yet. A server is reported
+ready as soon as it answers, which can be before it has finished loading the
+model, and until then the engine does not know which device it ended up on;
+`rocm serve` waits a few seconds for it rather than holding your terminal, and
+`rocm services` shows it once it is known. The GPU name is omitted on a machine
+with more than one AMD GPU, where naming one of them could name the wrong one.
+
+Control returns to your shell with the server still running; manage it later
+with `rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1098,6 +1110,13 @@ signaled; for a process it could not verify as the server's, it signals nothing
 and names an operating-system command to check on it. It does not suggest
 running the stop again: when only a process under the recorded one survived, a
 second stop can report the server stopped while that process still runs.
+
+`list` asks each running server which backend and GPU it is actually on, so it
+can take a few seconds rather than returning instantly. The query is capped in
+total — about 18 seconds worst case, however many servers are listed — and a
+server that does not answer in time simply has no `device` line rather than
+holding up the rest of the list. The same applies to asking about servers in
+`rocm chat`, which prints the same list.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts

@@ -102,6 +102,7 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
+pub use gfx_target::{GpuSupportLevel, gpu_support_level, gpu_support_level_for_host_gpu};
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
     normalize_therock_family,
@@ -111,7 +112,7 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
     WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
+    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, pinned_gpu_name,
     preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]

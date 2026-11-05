@@ -101,7 +101,7 @@ use rocm_core::{AppPaths, EndpointReadiness, ManagedServiceRecord};
 use rocm_engine_protocol::{DEFAULT_LOG_TAIL_LINES, EngineMethod, StopRequest, StopResponse};
 
 use crate::endpoint_keys;
-use crate::engine_ipc::{builtin_engine_serve_http_args, engine_request};
+use crate::engine_ipc::{builtin_engine_serve_http_args, engine_request, fetch_service_devices};
 #[cfg(not(windows))]
 use crate::engine_runtime_select::apply_app_path_env;
 #[cfg(windows)]
@@ -382,6 +382,23 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
     let _ = writeln!(output, "  Reclaim the space: rocm services prune");
 }
 
+/// `rocm services list`, and the chat `services` tool, which renders the same
+/// text.
+///
+/// **This is no longer a pure local read.** Since ROCMAI-550 it makes one live
+/// `Healthcheck` RPC per *ready* service to fill the `device:` row, capped in
+/// aggregate by `engine_ipc::SERVICE_DEVICE_PROBE_BUDGET`. Worst case is that
+/// budget plus one in-flight probe — about 18s with the built-in engines, not
+/// 10s, because the budget gates the *start* of each probe and never
+/// interrupts one. That doc comment carries the arithmetic and why a
+/// per-probe deadline was not taken.
+///
+/// The chat tool pays the same bound deliberately rather than rendering a
+/// device-less view: the two surfaces would then disagree about one service
+/// while claiming to show the same list, and "which GPU is this running on" is
+/// a question asked in chat at least as often as at the prompt. The cost is
+/// bounded and flat in the number of services, which is what makes it
+/// acceptable there.
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
     // Counts describe the WHOLE registry, not the rows this view keeps. The
     // default view hides records that are not live, and counting the filtered
@@ -431,11 +448,29 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         return Ok(output);
     }
 
+    // Queried live from each engine's `Healthcheck` RPC, not persisted on the
+    // record: a persisted value would go stale across a restart or backend
+    // realignment, and the whole point is that this matches what the server
+    // actually reports right now. Only asked of engines ready to answer, the
+    // same gate `rocm serve`'s summary uses, and capped in aggregate by
+    // `fetch_service_devices` so a long list (or one unresponsive server)
+    // cannot turn what used to be a local-only render into a long wait.
+    let devices = fetch_service_devices(
+        paths,
+        records
+            .iter()
+            .filter(|record| record.status == "ready")
+            .map(|record| (record.service_id.as_str(), record.engine.as_str())),
+    );
+
     let _ = writeln!(output, "Servers");
-    for record in records {
+    for record in &records {
         let _ = writeln!(output, "- {}", record.service_id);
         let _ = writeln!(output, "  status: {}", record.status);
         let _ = writeln!(output, "  engine: {}", record.engine);
+        if let Some(device) = devices.get(&record.service_id) {
+            let _ = writeln!(output, "  device: {device}");
+        }
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
@@ -2047,6 +2082,10 @@ pub(crate) mod tests {
         );
         assert!(rendered.contains("- svc-ready"));
         assert!(rendered.contains("  stop: rocm services stop svc-ready --yes"));
+        // No real engine state file backs this record, so the engine's own
+        // Healthcheck reports `device: "unknown"` - not more informative than
+        // omitting the line, so it must not appear.
+        assert!(!rendered.contains("device:"), "{rendered}");
         assert!(!rendered.contains("- svc-failed"));
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));

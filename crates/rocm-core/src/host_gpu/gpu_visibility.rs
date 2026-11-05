@@ -172,7 +172,7 @@ fn windows_gpu_listing_from(adapters: usize, hip_mask: Option<String>) -> Window
 ///
 /// `None` only when NEITHER surface could be read (availability truly unknown).
 #[cfg(any(target_os = "linux", test))]
-fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
+pub(super) fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
     match kfd {
         // KFD is compute-authoritative: prefer it whenever it sees a GPU.
         Some(k) if k > 0 => Some(k),
@@ -291,6 +291,22 @@ fn usable_amd_gpu_indices_from(
         return Some((0..hip_space as u32).collect());
     };
     mask_tokens_within(hip_space, hip)
+}
+
+/// Whether any GPU visibility mask is set in the environment.
+///
+/// Linux-only, mirroring [`visibility_mask_from_env`]: no other platform has a
+/// mask reader here, so there is nothing for this to answer about.
+///
+/// A `bool` wrapper so callers outside this module can ask the question
+/// without `GpuVisibilityMask` — the mask's shape is this module's business,
+/// and exposing it only to answer "is one set?" would widen the type's
+/// visibility for nothing. Read by `pinned_gpu_name`, which refuses to name a
+/// GPU when a mask is in effect: the host probes answer for the primary
+/// adapter, and a mask can make the pinned ordinal refer to a different one.
+#[cfg(target_os = "linux")]
+pub(super) fn visibility_mask_in_effect() -> bool {
+    visibility_mask_from_env().is_some()
 }
 
 #[cfg(test)]

@@ -71,6 +71,16 @@ pub(crate) fn write_running_state(
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": device_policy_name(&request.device_policy),
             "gpu_indices": request.gpu_indices,
+            // The name of the GPU this service was pinned to, so
+            // `healthcheck_service` can name a device and not just a backend
+            // (ROCMAI-550). Captured here, once, rather than probed per
+            // healthcheck: `rocm services list` healthchecks every ready
+            // service on its render path. `rocm_core::pinned_gpu_name` answers
+            // `null` whenever the host probe cannot be attributed to the pinned
+            // ordinal (a second AMD GPU on the host, a visibility mask); the
+            // key is recorded either way, so its absence means an older state
+            // file rather than a probe that declined.
+            "gpu_name": rocm_core::pinned_gpu_name(&request.gpu_indices),
             "runtime_id": request.runtime_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "env_id": request.env_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "runtime_kind": "lemonade_embeddable",

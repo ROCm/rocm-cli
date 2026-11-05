@@ -2429,6 +2429,53 @@ the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
 
+
+## The Reported Backend Device And Support Level
+
+ROCMAI-550 made two surfaces report what this host can actually do instead of a
+static ROCm claim. Both are worth knowing about before reading a failure in
+them.
+
+**`rocm serve` and `rocm services list` print a `device:` row** — the backend
+and GPU the engine says it selected, read back over the engine's own
+`Healthcheck` RPC rather than inferred from the launch plan. Every engine
+renders it through `rocm_engine_protocol::format_reported_device`, so the shape
+is one and the same everywhere: a backend word, then an optional ` gpu <n>`,
+then an optional ` (<gpu name>)`.
+
+**The row is optional, and a missing one is not a defect.** An engine answers
+`unknown` until it can really say — `engines/lemonade` until its own inference
+probe returns, which for a model still loading its weights is minutes rather
+than seconds — and the CLI drops `unknown` rather than printing it. `rocm serve`
+retries within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` (~6s, plus one in-flight
+probe) and then prints the summary without the row; `rocm services list` shows
+it once the engine can answer. So:
+
+- a test may assert that a row, where present, is well-formed and that the two
+  surfaces agree — which is what `the services list reports the engine's actual
+  backend device` (serve-05, serve-07) does;
+- a test may **not** assert that a `ready` serve printed one.
+
+The GPU name is optional in the same way, and deliberately so:
+`rocm_core::pinned_gpu_name` reports a name only on a host with exactly one AMD
+GPU and no visibility mask, because every name probe here answers for the
+host's primary adapter rather than for a HIP ordinal. On a multi-GPU host the
+row is the backend and ordinal with no name — correct and unspecific, rather
+than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
+by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
+
+**`rocm examine` prints a `rocm_support` line on every host**, at one of three
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
+Unknown covers both "nothing detected" and "a target this build's catalog does
+not recognise" — conflating the latter with "confirmed to have no ROCm build"
+would turn a detection gap into a claim about the hardware. `examine-31` holds
+the line against the `detected_gfx_target` and `compatible_therock_family` the
+same report prints, so every lane checks the level its own hardware implies:
+
+```bash
+cargo xtask e2e -- -n '(examine-31)'
+```
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global
