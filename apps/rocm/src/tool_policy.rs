@@ -2499,4 +2499,141 @@ mod tests {
             "accepted as a user install folder: {accepted:?}"
         );
     }
+
+    /// The serve safety rules as the chat assistant meets them: every refusal in
+    /// the shared table, through the safety check itself and through the two
+    /// entry points a model's `rocm_command` call goes by. A refused call yields
+    /// no `ChatRocmCommandAction`, so no approval card is built and nothing runs.
+    ///
+    /// The planner suite (`freeform_planner`) runs the same table.
+    #[test]
+    fn chat_refuses_each_unsafe_serve_and_proposes_nothing() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let context = format!("{}: {:?}", case.rule, case.args);
+            let error = validate_chat_rocm_command_safety(&owned_argv(case.args))
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+
+            let call = rocm_command_call(case.args);
+            let error = chat_rocm_command_action(&call)
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+            let error = validate_chat_tool_call(&call)
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+        }
+
+        // `--foreground` refuses even next to `--managed`. The chat check is the
+        // only one that sees this pair; the planner's clap parse refuses it first.
+        let error = validate_chat_rocm_command_safety(&owned_argv(
+            crate::test_support::SERVE_FOREGROUND_AND_MANAGED,
+        ))
+        .expect_err("foreground serving is refused even with --managed")
+        .to_string();
+        assert_eq!(
+            error,
+            "local assistant must request managed serving with --managed"
+        );
+    }
+
+    #[test]
+    fn chat_proposes_a_safe_serve_for_approval_with_its_argv_unchanged() {
+        use crate::test_support::{SERVE_SAFETY_ACCEPTED, owned_argv};
+
+        for args in SERVE_SAFETY_ACCEPTED {
+            let argv = owned_argv(args);
+            validate_chat_rocm_command_safety(&argv)
+                .unwrap_or_else(|error| panic!("{args:?} must pass the safety check: {error}"));
+            let action = chat_rocm_command_action(&rocm_command_call(args))
+                .unwrap_or_else(|error| panic!("{args:?} must be proposed: {error}"));
+            // A serve starts a server, so it is never read-only.
+            assert_eq!(
+                action,
+                ChatRocmCommandAction::Approval {
+                    args: argv,
+                    pending_title: "Start local model server".to_owned(),
+                    command_title: "Serve".to_owned(),
+                },
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The rules fire in a fixed order, so an argv that breaks several reports
+    /// the first one: public bind, then CPU, then host, then managed.
+    #[test]
+    fn chat_reports_the_first_broken_serve_rule() {
+        use crate::test_support::owned_argv;
+
+        for (args, expected) in [
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--allow-public-bind",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "local assistant cannot request public network binding",
+            ),
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "local assistant cannot request CPU execution; ROCm GPU execution is required",
+            ),
+            (
+                &["serve", "qwen", "--host", "0.0.0.0", "--foreground"][..],
+                "local assistant cannot request non-local host `0.0.0.0`",
+            ),
+            (
+                &["serve", "qwen", "--foreground"][..],
+                "local assistant must request managed serving with --managed",
+            ),
+        ] {
+            let error = validate_chat_rocm_command_safety(&owned_argv(args))
+                .expect_err("unsafe")
+                .to_string();
+            assert_eq!(error, expected, "{args:?}");
+        }
+    }
+
+    /// The chat check matches the `serve` word without regard to case, so a
+    /// model that writes `SERVE` does not step around the rules.
+    #[test]
+    fn chat_enforces_the_serve_rules_whatever_the_case_of_the_serve_word() {
+        use crate::test_support::owned_argv;
+
+        for word in ["Serve", "SERVE"] {
+            let error = validate_chat_rocm_command_safety(&owned_argv(&[
+                word,
+                "qwen",
+                "--device",
+                "cpu",
+                "--managed",
+            ]))
+            .expect_err("a CPU serve is refused in any case")
+            .to_string();
+            assert_eq!(
+                error,
+                "local assistant cannot request CPU execution; ROCm GPU execution is required"
+            );
+            validate_chat_rocm_command_safety(&owned_argv(&[word, "qwen", "--managed"]))
+                .expect("a managed serve passes in any case");
+        }
+    }
 }

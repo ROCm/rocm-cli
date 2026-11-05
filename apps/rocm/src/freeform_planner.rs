@@ -2020,4 +2020,201 @@ mod tests {
         );
         Ok(())
     }
+
+    /// The planner's response for a `serve` call, as the provider would send it.
+    fn serve_planner_response(args: &[&str]) -> String {
+        serde_json::json!({
+            "intent": "serve",
+            "tool_call": {"tool": "rocm", "args": args},
+        })
+        .to_string()
+    }
+
+    /// The serve safety rules as the provider-assisted planner meets them: every
+    /// refusal in the shared table, at the validator and at the response parser
+    /// that builds the plan. A refused response yields no `StructuredRequestPlan`,
+    /// so there is no planned action for anything to run, and the operator sees
+    /// the refusal as the planner's failure note.
+    ///
+    /// The chat suite (`tool_policy`) runs the same table.
+    #[test]
+    fn planner_refuses_each_unsafe_serve_and_plans_nothing() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let context = format!("{}: {:?}", case.rule, case.args);
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: owned_argv(case.args),
+            };
+            let error = validate_provider_planner_tool_call(&call).expect_err(&context);
+            assert_eq!(error.to_string(), case.planner_error, "{context}");
+
+            let error = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(case.args),
+            )
+            .expect_err(&context);
+            assert_eq!(error.to_string(), case.planner_error, "{context}");
+            assert_eq!(
+                planner_failure_note("local", &error),
+                format!(
+                    "Provider-assisted planner `local` could not resolve this request: {}",
+                    case.planner_error
+                ),
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_plans_a_safe_serve_for_approval_with_its_argv_unchanged() -> Result<()> {
+        use crate::test_support::{SERVE_SAFETY_ACCEPTED, owned_argv};
+
+        for args in SERVE_SAFETY_ACCEPTED {
+            let plan = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(args),
+            )?;
+            assert_eq!(plan.intent, PlannerIntent::Serve, "{args:?}");
+            // A serve starts a server, so the plan always asks for approval.
+            assert_eq!(plan.approval, "required before execution", "{args:?}");
+            assert_eq!(plan.actions.len(), 1, "{args:?}");
+            assert_eq!(plan.actions[0].args, owned_argv(args), "{args:?}");
+        }
+        Ok(())
+    }
+
+    /// The rules fire in a fixed order, so an argv that breaks several reports
+    /// the first one: public bind, then CPU, then host, then managed.
+    #[test]
+    fn planner_reports_the_first_broken_serve_rule() {
+        use crate::test_support::owned_argv;
+
+        for (args, expected) in [
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--allow-public-bind",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "provider planner cannot request public network binding",
+            ),
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+            ),
+            (
+                &["serve", "qwen", "--host", "0.0.0.0", "--foreground"][..],
+                "provider planner cannot request non-local host `0.0.0.0`",
+            ),
+            (
+                &["serve", "qwen", "--foreground"][..],
+                "provider planner must request managed serving with --managed",
+            ),
+        ] {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: owned_argv(args),
+            };
+            let error = validate_provider_planner_tool_call(&call)
+                .expect_err("unsafe")
+                .to_string();
+            assert_eq!(error, expected, "{args:?}");
+        }
+    }
+
+    /// Where the planner's serve rules and the chat tool policy's differ today,
+    /// pinned in one place. The rules are the same four, in the same order, over
+    /// the same argv helpers; what differs is the words.
+    #[test]
+    fn planner_and_chat_serve_refusals_differ_in_actor_and_cpu_wording_only() {
+        use crate::test_support::SERVE_SAFETY_REFUSALS;
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let chat = case
+                .chat_error
+                .strip_prefix("local assistant ")
+                .unwrap_or_else(|| panic!("chat refusal names the assistant: {}", case.chat_error));
+            let planner = case
+                .planner_error
+                .strip_prefix("provider planner ")
+                .unwrap_or_else(|| {
+                    panic!("planner refusal names the planner: {}", case.planner_error)
+                });
+            if case.rule == "cpu device" {
+                assert_eq!(
+                    (chat, planner),
+                    (
+                        "cannot request CPU execution; ROCm GPU execution is required",
+                        "cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+                    )
+                );
+            } else {
+                assert_eq!(chat, planner, "{}: {:?}", case.rule, case.args);
+            }
+        }
+    }
+
+    /// `--foreground` next to `--managed` is refused by clap before the planner's
+    /// safety check runs, where the chat check refuses it for the managed rule.
+    #[test]
+    fn planner_refuses_foreground_with_managed_as_an_invalid_command() {
+        use crate::test_support::{SERVE_FOREGROUND_AND_MANAGED, owned_argv};
+
+        let call = ProviderPlannerToolCall {
+            tool: "rocm".to_owned(),
+            args: owned_argv(SERVE_FOREGROUND_AND_MANAGED),
+        };
+        let error = validate_provider_planner_tool_call(&call)
+            .expect_err("clap refuses the conflicting flags")
+            .to_string();
+        assert_eq!(
+            error,
+            "provider planner returned a rocm command that is not valid"
+        );
+    }
+
+    /// The planner matches the `serve` word exactly, where the chat check
+    /// ignores case, so `Serve` and `SERVE` never reach the planner's safety
+    /// check: the clap parse that precedes it refuses them. Either way an
+    /// uppercase `serve` is refused; only the reason differs.
+    #[test]
+    fn planner_refuses_an_uppercase_serve_word_before_the_safety_check() {
+        use crate::test_support::owned_argv;
+
+        for word in ["Serve", "SERVE"] {
+            for args in [
+                &[word, "qwen", "--device", "cpu", "--managed"][..],
+                &[word, "qwen", "--managed"][..],
+            ] {
+                let call = ProviderPlannerToolCall {
+                    tool: "rocm".to_owned(),
+                    args: owned_argv(args),
+                };
+                let error = validate_provider_planner_tool_call(&call)
+                    .expect_err("an uppercase serve word is not a rocm command")
+                    .to_string();
+                assert_eq!(
+                    error, "provider planner returned a rocm command that is not valid",
+                    "{args:?}"
+                );
+            }
+        }
+    }
 }

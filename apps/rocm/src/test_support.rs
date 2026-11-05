@@ -229,6 +229,138 @@ pub(crate) fn write_test_pip_runtime(
     Ok(manifest)
 }
 
+/// A `rocm serve` argv the serve safety policy refuses, with the refusal each
+/// surface reports for it.
+///
+/// Two surfaces enforce the policy on a model-proposed `serve`: the chat tool
+/// policy (`tool_policy::validate_chat_rocm_command_safety`) and the
+/// provider-assisted planner (`freeform_planner::validate_provider_planner_tool_call`).
+/// Both suites run this one table, so a rule missing from either surface fails
+/// that surface's tests, and the same argv cannot be refused by one for a
+/// different reason than the other without the table saying so.
+pub(crate) struct ServeSafetyCase {
+    /// The rule the argv breaks.
+    pub(crate) rule: &'static str,
+    pub(crate) args: &'static [&'static str],
+    /// The full message the chat tool policy refuses it with.
+    pub(crate) chat_error: &'static str,
+    /// The full message the planner refuses it with.
+    pub(crate) planner_error: &'static str,
+}
+
+/// Every refusal the serve safety policy has, each rule reached by more than one
+/// spelling of its trigger. A case breaks exactly one rule, so the message names
+/// the rule that fired and nothing else could have.
+pub(crate) const SERVE_SAFETY_REFUSALS: &[ServeSafetyCase] = &[
+    ServeSafetyCase {
+        rule: "public bind",
+        args: &[
+            "serve",
+            "qwen",
+            "--engine",
+            "vllm",
+            "--allow-public-bind",
+            "--managed",
+        ],
+        chat_error: "local assistant cannot request public network binding",
+        planner_error: "provider planner cannot request public network binding",
+    },
+    ServeSafetyCase {
+        rule: "public bind",
+        args: &["serve", "qwen", "--managed", "--allow-public-bind"],
+        chat_error: "local assistant cannot request public network binding",
+        planner_error: "provider planner cannot request public network binding",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &[
+            "serve",
+            "qwen",
+            "--engine",
+            "vllm",
+            "--device",
+            "cpu",
+            "--managed",
+        ],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &["serve", "qwen", "--device=cpu", "--managed"],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &["serve", "qwen", "--device", "cpu_only", "--managed"],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+    },
+    ServeSafetyCase {
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host", "0.0.0.0", "--managed"],
+        chat_error: "local assistant cannot request non-local host `0.0.0.0`",
+        planner_error: "provider planner cannot request non-local host `0.0.0.0`",
+    },
+    ServeSafetyCase {
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host=example.test", "--managed"],
+        chat_error: "local assistant cannot request non-local host `example.test`",
+        planner_error: "provider planner cannot request non-local host `example.test`",
+    },
+    ServeSafetyCase {
+        // Classified public on purpose: only the three exact loopback spellings
+        // pass (see `is_public_bind_host`).
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host", "LOCALHOST", "--managed"],
+        chat_error: "local assistant cannot request non-local host `LOCALHOST`",
+        planner_error: "provider planner cannot request non-local host `LOCALHOST`",
+    },
+    ServeSafetyCase {
+        rule: "managed required",
+        args: &["serve", "qwen", "--engine", "vllm"],
+        chat_error: "local assistant must request managed serving with --managed",
+        planner_error: "provider planner must request managed serving with --managed",
+    },
+    ServeSafetyCase {
+        rule: "managed required",
+        args: &["serve", "qwen", "--engine", "vllm", "--foreground"],
+        chat_error: "local assistant must request managed serving with --managed",
+        planner_error: "provider planner must request managed serving with --managed",
+    },
+];
+
+/// `--foreground` next to `--managed`: the safety check refuses the pair, but
+/// clap does too (the flags conflict), so the planner never reaches its safety
+/// check with it and only the chat check is what refuses it first.
+pub(crate) const SERVE_FOREGROUND_AND_MANAGED: &[&str] =
+    &["serve", "qwen", "--managed", "--foreground"];
+
+/// `rocm serve` argvs the serve safety policy lets through, and that also parse
+/// as a `rocm` command, so the planner reaches its safety check with them.
+pub(crate) const SERVE_SAFETY_ACCEPTED: &[&[&str]] = &[
+    &["serve", "qwen", "--managed"],
+    &[
+        "serve",
+        "qwen",
+        "--engine",
+        "vllm",
+        "--device",
+        "gpu_required",
+        "--managed",
+    ],
+    &["serve", "qwen", "--device=gpu_required", "--managed"],
+    &["serve", "qwen", "--host", "127.0.0.1", "--managed"],
+    &["serve", "qwen", "--host=localhost", "--managed"],
+    &["serve", "qwen", "--host", "::1", "--managed"],
+];
+
+/// `args` as the owned argv both surfaces take.
+pub(crate) fn owned_argv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_owned()).collect()
+}
+
 mod tests {
     use super::*;
 
