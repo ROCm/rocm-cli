@@ -1130,6 +1130,37 @@ mod tests {
         Ok(())
     }
 
+    /// Recovering the setup runtime can fail, and the ComfyUI path now reports
+    /// that failure as the engine paths do, rather than carrying on as if setup
+    /// had named nothing: a setup folder whose runtime is no longer usable is
+    /// named, with the reason, and nothing is written to the registry.
+    #[test]
+    fn comfyui_selection_reports_a_setup_runtime_that_is_no_longer_usable() -> Result<()> {
+        let paths = test_paths("comfyui-selection-setup-unusable");
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        fs::remove_file(
+            manifest
+                .python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+
+        let message = select_runtime(&paths, &config, None)
+            .expect_err("an unusable setup runtime is an error")
+            .to_string();
+
+        assert!(
+            message.contains("is not usable") && message.contains(&manifest.runtime_key),
+            "got: {message}"
+        );
+        assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
+        Ok(())
+    }
+
     /// The two paths that pick "the one ready runtime" must not drift apart:
     /// for each registry state below, ComfyUI selects a runtime exactly when
     /// the engine paths do, and the same one. Both reach the rule through
