@@ -9,7 +9,7 @@
 //! (`install_driver(...)`/`reconcile_driver_install(...)`, re-imported via
 //! `use crate::driver_install::{install_driver, reconcile_driver_install};`);
 //! `install()` has since moved to `install_cmd.rs`, which imports them itself.
-//! `InstallTarget`/`Cli` remain in the crate root; neither is referenced
+//! `InstallTarget`/`Cli` live in `cli.rs`; neither is referenced
 //! from this file. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
 //! private types (`DriverInstallState` and friends), so those moved here too
 //! rather than staying in `main.rs`. `DriverInstallResult`/`DriverInstallError`
