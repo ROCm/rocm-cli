@@ -139,7 +139,7 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
 async fn serve_failure_evidence(
-    world: &E2eWorld,
+    world: &mut E2eWorld,
     engine: &str,
     headline: &str,
     device_state: &str,
@@ -1004,15 +1004,17 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             &ready_substr,
             timeout_secs,
         );
+        let stdout = world.cli_output.clone().unwrap_or_default();
+        let stderr = world.cli_stderr.clone().unwrap_or_default();
         panic!(
             "{}",
             serve_failure_evidence(
                 world,
-                selected_engine(world.cli_output.as_deref().unwrap_or_default()),
+                selected_engine(&stdout),
                 &headline,
                 &device_state,
-                world.cli_output.as_deref().unwrap_or_default(),
-                world.cli_stderr.as_deref().unwrap_or_default(),
+                &stdout,
+                &stderr,
             )
             .await
         );
