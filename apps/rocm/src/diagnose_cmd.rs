@@ -27,8 +27,10 @@
 use anyhow::{Result, bail};
 use rocm_core::browser::Opener;
 use rocm_core::{AppPaths, RocmCliConfig};
+use serde::Serialize;
 
 use crate::FixExitCode;
+use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::model_fit::assess_model_on_this_host;
 
 pub(crate) fn diagnose(
@@ -99,31 +101,56 @@ pub(crate) fn diagnose(
     if report_requested {
         return show_prepared_report(&examination, &report, json, send);
     }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print!("{}", rocm_core::render_diagnose_text(&report, top));
-        if let Some(readiness) = &report.model {
-            println!();
-            print!(
-                "{}",
-                rocm_core::model_readiness::render_model_readiness_text(readiness)
-            );
+    print_json_or_text(
+        json,
+        &DiagnoseOutput {
+            report: &report,
+            top,
+            inspected_remotely,
+        },
+    )
+}
+
+/// What `rocm diagnose` prints: the report as JSON, or the report as text with
+/// the parts that depend on how it was gathered (`--top`, a remote inspection).
+struct DiagnoseOutput<'a> {
+    report: &'a rocm_core::DiagnoseReport,
+    top: usize,
+    inspected_remotely: bool,
+}
+
+impl Serialize for DiagnoseOutput<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.report.serialize(serializer)
+    }
+}
+
+impl JsonOrText for DiagnoseOutput<'_> {
+    fn render_text(&self) -> String {
+        let mut text = rocm_core::render_diagnose_text(self.report, self.top);
+        if let Some(readiness) = &self.report.model {
+            text.push('\n');
+            text.push_str(&rocm_core::model_readiness::render_model_readiness_text(
+                readiness,
+            ));
         }
         // Inspecting a distribution from outside it collects no environment, so
         // the checks that read one never run. Without saying so, "no known
         // misconfiguration matched" reads as a clean bill of health for the
         // whole installation, when it only covers the WSL GPU stack.
-        if inspected_remotely {
-            println!(
+        if self.inspected_remotely {
+            text.push_str(
                 "\nNote: inspected from outside the distribution, which sees only its \
                  WSL GPU stack.\nChecks that read the environment (HSA_OVERRIDE_GFX_VERSION, \
                  PATH, the framework/ROCm pairing)\ndid not run. For those, run `rocm diagnose` \
-                 inside the distribution."
+                 inside the distribution.\n",
             );
         }
+        text
     }
-    Ok(())
 }
 
 /// The catalog entry a report should name, and whether a fix was offered for it.
@@ -490,6 +517,85 @@ mod tests {
             established_entry(&established),
             (Some("fix-6-path"), true),
             "an established cause with a fix is exactly what a report is for"
+        );
+    }
+
+    fn host_report() -> rocm_core::DiagnoseReport {
+        rocm_core::run_diagnose(&rocm_core::Examination::default(), "")
+    }
+
+    fn output(report: &rocm_core::DiagnoseReport, inspected_remotely: bool) -> DiagnoseOutput<'_> {
+        DiagnoseOutput {
+            report,
+            top: 5,
+            inspected_remotely,
+        }
+    }
+
+    /// `--json` prints the report itself; the extra fields on the view are for
+    /// the text form and must not leak into the document.
+    #[test]
+    fn diagnose_json_is_the_report_itself() {
+        let report = host_report();
+        assert_eq!(
+            serde_json::to_string(&output(&report, true)).expect("the view serializes"),
+            serde_json::to_string(&report).expect("the report serializes")
+        );
+    }
+
+    #[test]
+    fn diagnose_text_is_the_report_text_when_nothing_is_appended() {
+        let report = host_report();
+        assert_eq!(
+            output(&report, false).render_text(),
+            rocm_core::render_diagnose_text(&report, 5)
+        );
+    }
+
+    /// The model verdict follows the report after one blank line.
+    #[test]
+    fn diagnose_text_puts_a_blank_line_before_the_model_readiness() {
+        let mut report = host_report();
+        let readiness = rocm_core::model_readiness::ModelReadiness {
+            model_ref: "example/model".to_owned(),
+            canonical_model_id: None,
+            verdict: rocm_core::model_readiness::ModelVerdict::Undetermined,
+            evidence: vec!["no recipe was read".to_owned()],
+            engine: None,
+            engine_source: None,
+            required_gpu_memory_gib: None,
+            available_gpu_memory_gib: None,
+            alternatives: Vec::new(),
+            fix: None,
+            route: None,
+            undetermined_reason: None,
+            warnings: Vec::new(),
+        };
+        let readiness_text = rocm_core::model_readiness::render_model_readiness_text(&readiness);
+        report.model = Some(readiness);
+        let report_text = rocm_core::render_diagnose_text(&report, 5);
+        assert_eq!(
+            output(&report, false).render_text(),
+            format!("{report_text}\n{readiness_text}")
+        );
+    }
+
+    /// An inspection from outside the distribution says so after the report,
+    /// and the note ends its last line.
+    #[test]
+    fn diagnose_text_ends_the_remote_inspection_note_with_a_newline() {
+        let report = host_report();
+        let text = output(&report, true).render_text();
+        let note = text
+            .strip_prefix(&rocm_core::render_diagnose_text(&report, 5))
+            .expect("the report text comes first");
+        assert!(
+            note.starts_with("\nNote: inspected from outside the distribution"),
+            "unexpected note: {note:?}"
+        );
+        assert!(
+            note.ends_with("run `rocm diagnose` inside the distribution.\n"),
+            "unexpected note: {note:?}"
         );
     }
 }
