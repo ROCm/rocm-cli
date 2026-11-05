@@ -291,10 +291,10 @@ pub(crate) fn build_watcher_enable_args(
     Ok(argv)
 }
 
-/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
-/// policy so `rocm` and `rocmd` never classify the same host differently.
+/// Inverse of [`rocm_core::is_public_bind_host`], which owns the policy so
+/// `rocm` and `rocmd` never classify the same host differently.
 fn is_loopback_host(host: &str) -> bool {
-    !rocm_engine_protocol::is_public_bind_host(host)
+    !rocm_core::is_public_bind_host(host)
 }
 
 fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {

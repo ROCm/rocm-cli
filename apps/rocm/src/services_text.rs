@@ -119,7 +119,6 @@ use crate::managed_service_status::{
     managed_service_sidebar_counts, refresh_managed_service_runtime_liveness,
 };
 use crate::service_hints::{self, service_action_past_tense};
-use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
@@ -1268,10 +1267,11 @@ fn restart_internal_managed_service_with(
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     // Checked before the stop, so a refused restart leaves a running service
     // running instead of stopping it and then failing to bring it back.
-    ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         &record.host,
         preserved_endpoint_key.is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Restart,
     )?;
     let (stop_report, stopped) =
         stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
@@ -2436,6 +2436,24 @@ pub(crate) mod tests {
         assert!(
             !rendered.contains("--require-api-key"),
             "a service that never passed the flag must not be told it did: {rendered}"
+        );
+        // The restart's refusal is the shared guard's, worded for a restart —
+        // the same text a fresh launch and the daemon print, bar the action. A
+        // private copy here, or the wrong action passed, would differ.
+        assert_eq!(
+            rendered,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "0.0.0.0",
+                false,
+                false,
+                rocm_core::ServiceStart::Restart,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            rendered.contains("restarting it would reopen it without authentication"),
+            "{rendered}"
         );
 
         // The refusal happens before the stop, so the service is left alone.

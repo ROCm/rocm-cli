@@ -100,12 +100,13 @@ pub(crate) fn supervise_service(
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.
-    crate::engine_ipc::ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         &record.host,
         rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
             .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
             .is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Respawn,
     )?;
     record.write()?;
 
@@ -145,10 +146,11 @@ pub(crate) fn supervise_service(
     // an anonymous public one is not.
     let endpoint_key_applied =
         crate::engine_ipc::apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    crate::engine_ipc::ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         &record.host,
         endpoint_key_applied,
         record.requires_api_key,
+        rocm_core::ServiceStart::Respawn,
     )?;
     let mut child = command
         .spawn()
@@ -558,7 +560,7 @@ mod tests {
     /// call site testable at all. The arguments below are the shape a recovery
     /// re-exec passes: a loopback bind, no GPU, no recipe.
     ///
-    /// This exists because testing `ensure_public_service_has_endpoint_key`
+    /// This exists because testing `rocm_core::ensure_public_service_has_endpoint_key`
     /// directly with literal arguments cannot catch the defect that actually
     /// happened twice in this crate's history — the guard being *wired up* with
     /// the wrong value at its call site.
@@ -569,8 +571,14 @@ mod tests {
     /// suite instead of failing it. Both callers below are regression tests for
     /// a fail-*open*, which is exactly the shape that turns into a hang.
     fn supervise_at_the_guard(paths: &AppPaths, service_id: &str) -> Result<()> {
+        supervise_at_the_guard_on(paths, service_id, "127.0.0.1")
+    }
+
+    /// [`supervise_at_the_guard`] for a service recorded on `host`.
+    fn supervise_at_the_guard_on(paths: &AppPaths, service_id: &str, host: &str) -> Result<()> {
         let paths = paths.clone();
         let service_id = service_id.to_owned();
+        let host = host.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = supervise_service(
@@ -581,7 +589,7 @@ mod tests {
                 "a-model".to_owned(),
                 None,
                 None,
-                "127.0.0.1".to_owned(),
+                host,
                 11434,
                 "gpu_required".to_owned(),
                 None,
@@ -703,8 +711,22 @@ mod tests {
 
         let error = supervise_at_the_guard(&paths, "svc-needs-key")
             .expect_err("a service that required a key must not be recovered without one");
+        // The daemon's refusal is the shared guard's, worded for a respawn: the
+        // same text `rocm` prints for a restart, bar the action. A private copy
+        // here, or the wrong action passed, would read differently.
+        assert_eq!(
+            format!("{error:#}"),
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Respawn,
+            )
+            .unwrap_err()
+            .to_string()
+        );
         assert!(
-            format!("{error:#}").contains("without authentication"),
+            format!("{error:#}").contains("respawning it would reopen it without authentication"),
             "{error:#}"
         );
 
@@ -720,6 +742,37 @@ mod tests {
             stored.requires_api_key,
             "a refused recovery must not disarm the requirement"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn supervising_a_public_service_refuses_when_its_key_is_gone_whether_or_not_it_asked_for_one() {
+        // The second rule at the real call site: the bind address alone makes a
+        // keyless respawn unsafe, so a service that never passed
+        // `--require-api-key` is refused too, and is not told it did.
+        let (root, paths) = temp_app_paths("supervise-public-no-key");
+        seed_registry(&paths, "svc-public", false);
+
+        let error = supervise_at_the_guard_on(&paths, "svc-public", "0.0.0.0")
+            .expect_err("a public service must not be respawned without its key");
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "0.0.0.0",
+                false,
+                false,
+                rocm_core::ServiceStart::Respawn,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            rendered.contains("bound to the public host `0.0.0.0`"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("`--require-api-key`"), "{rendered}");
 
         let _ = fs::remove_dir_all(&root);
     }
