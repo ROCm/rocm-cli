@@ -498,8 +498,9 @@ pub async fn run_loop(
             last_sysinfo_refresh = tick_count;
         }
 
-        // Service discovery — every DISCOVERY_TICKS ticks, diff each source vs
-        // its known set, emit Discovered/Gone events, and update reducer state.
+        // Service discovery — every `discovery_ticks` ticks, reconcile each
+        // source against what it had live before, emit Discovered/Gone events,
+        // and update reducer state.
         let discovery_due = tick_count == 1 || tick_count.is_multiple_of(discovery_ticks);
         let mut reconcile = Reconcile {
             state: &mut runner.state,
@@ -976,8 +977,11 @@ struct DiscoveryState {
     lemonade_id: Option<String>,
 }
 
-/// Which discovery source a service came from. It only selects the log wording;
-/// the reconcile itself treats every source the same way.
+/// Which discovery source a service came from. It only selects the log wording
+/// in [`Reconcile::announce`] and [`Reconcile::retire`]; those two steps behave
+/// the same for every source. How a pass decides what is new, known or gone
+/// differs: Docker and the registry go through `reconcile_set`, Lemonade through
+/// `reconcile_lemonade`.
 #[derive(Clone, Copy)]
 enum DiscoverySource {
     Docker,
@@ -1062,9 +1066,9 @@ impl Reconcile<'_> {
     /// managed-service registry). `known` is what the previous pass saw and
     /// `seen` what this one saw; the caller stores `seen` as the next `known`.
     ///
-    /// A service whose port changed under the same id is a new logical service
-    /// at a new scrape address: its rate baseline and latency windows are reset
-    /// and no live fields carry over.
+    /// A service whose port changed under the same id has a new scrape address:
+    /// its rate baseline and latency windows are reset and no live fields carry
+    /// over. It is still the same service, so it is not announced again.
     fn reconcile_set(
         &mut self,
         source: DiscoverySource,
@@ -1806,7 +1810,7 @@ mod tests {
         assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
 
         // A new id (the host or port changed) purges the old id's telemetry and
-        // announces the new one without carrying anything across.
+        // announces the new one.
         pass.reconcile()
             .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
         assert_eq!(pass.announced(), ["discovered l2"]);

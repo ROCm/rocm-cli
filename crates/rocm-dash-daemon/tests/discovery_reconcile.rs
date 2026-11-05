@@ -8,13 +8,16 @@
 //! Docker, the probe-based Lemonade endpoint, and the managed-service registry.
 //! These tests drive the real loop through the sources that can run without a
 //! container daemon (the registry and Lemonade) and pin what a user of the
-//! broadcast stream can observe: a service is announced once, keeps its live
-//! scrape fields across rediscovery, starts clean when its endpoint changes, and
-//! is announced gone exactly when it disappears.
+//! broadcast stream can observe. On the registry source: a service is announced
+//! once, keeps its live scrape fields across rediscovery, and starts clean when
+//! its endpoint changes. On Lemonade: the endpoint is announced once, scraped,
+//! and announced gone when it stops answering.
 //!
-//! The Docker source has no seam that works without a container daemon, so its
-//! reconcile is covered only by the unit tests next to the shared helper in
-//! `runner.rs`.
+//! The registry's retirement of a vanished service and Lemonade's change of id
+//! are not driven through the loop here; they are covered only by the unit tests
+//! in `runner.rs`. The Docker source has no seam that works without a container
+//! daemon, so its reconcile is covered only by the unit tests next to the shared
+//! helper in `runner.rs`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -215,9 +218,11 @@ const KV_PCT: f32 = 25.0;
 /// that trails it by a tick or two is still seen.
 const SETTLE_SNAPSHOTS: usize = 3;
 
-/// Read snapshots until `pick` returns a value. Bounded as a whole, so a
-/// condition that never holds fails at [`DEADLINE`] instead of looping on fresh
-/// snapshots forever.
+/// Read snapshots until `pick` returns a value. The deadline is checked before
+/// each snapshot, so a condition that never holds fails instead of looping on
+/// fresh snapshots forever. Each wait for the next snapshot still has its own
+/// [`DEADLINE`], so if the runner stops broadcasting, the failure can come up to
+/// one further [`DEADLINE`] after the first.
 async fn snapshot_where<T>(
     rx: &mut broadcast::Receiver<Event>,
     pick: impl Fn(&Snapshot) -> Option<T>,
@@ -363,7 +368,7 @@ async fn managed_endpoint_change_starts_the_instance_clean() {
     let services_dir = tmp.path().join("services");
     let healthy = spawn_server(|_| vllm_metrics()).await;
     // The new endpoint never answers a scrape, so any live field on the instance
-    // after the change was carried over from the old one.
+    // when it first appears on the new port was carried over from the old one.
     let silent = spawn_server(|_| http(503, "text/plain", "")).await;
     write_record(&services_dir, healthy.port);
     let (mut rx, _runner) = spawn_runner(managed_opts(services_dir.clone()));
@@ -378,8 +383,8 @@ async fn managed_endpoint_change_starts_the_instance_clean() {
     write_record(&services_dir, silent.port);
 
     // Watch the stream from the moment the record changes until the instance has
-    // been seen on its new port and has stayed there for a few snapshots, under
-    // one deadline. Any announcement or retirement of the service in that window
+    // been seen on its new port and a few more snapshots have followed, under one
+    // deadline. Any announcement or retirement of the service in that window
     // means the change was treated as a different service rather than the same
     // one moving.
     let mut change = Change::default();
