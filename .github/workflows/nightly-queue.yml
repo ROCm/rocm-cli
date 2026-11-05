@@ -1,24 +1,21 @@
-# Nightly E2E on the shared GPU queue — the publishing side.
+# GPU E2E on the shared queue — publish a run that has already finished.
 #
-# The nightly itself runs next to the queue, on its own schedule, and leaves its
-# results where the queue-report runner can read them. This job only publishes
-# a finished run: it prints the run's report and lane matrix, uploads the lanes'
+# queue-run.yml starts, waits for and publishes runs. This publishes one again
+# by its id, for instance one whose queue-run.yml job was cancelled while the
+# run went on: it prints the run's report and lane matrix, uploads the lanes'
 # files, and passes or fails with the run's verdict. It needs no credential, so
 # the shared self-hosted runner never holds the queue's. What that does and does
 # not protect is in docs/nightly-on-the-queue.md.
 name: Nightly E2E (queue)
 
 on:
-  # Manual only, and gating nothing, until a lane has been seen to run the suite
-  # and the published verdict can be trusted (see the doc). The run itself is not
-  # scheduled before then either. A schedule will replace this, set after the
-  # run's deadline, or it would find that night's run still going and fail.
+  # Manual only, and gating nothing.
   workflow_dispatch:
     inputs:
       request_id:
-        description: "The run to publish; empty publishes the newest scheduled run, which must have finished"
+        description: "The id of the finished run to publish"
         type: string
-        default: ""
+        required: true
 
 # Nothing here reads the repository. Uploading files uses the per-job runtime
 # token GitHub issues to every job regardless of these permissions.
