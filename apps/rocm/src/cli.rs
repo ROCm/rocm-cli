@@ -128,6 +128,10 @@ pub(crate) enum Command {
         /// blocked - `rocm serve` still accepts it, this just cannot say in
         /// advance whether it fits.
         ///
+        /// For example: `rocm diagnose --model Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+        /// --context-size 32768 --kv-cache-type q8_0`. `HF_ENDPOINT` points the
+        /// header read at a Hugging Face mirror.
+        ///
         /// A flag rather than a positional: `diagnose` takes no positional
         /// today, and one added now would be ambiguous against `--symptom`.
         #[arg(long, value_name = "MODEL")]
@@ -1933,6 +1937,28 @@ mod tests {
                     ),
             }) => (restart_services, yes),
             other => panic!("expected runtimes activate or rollback, got {other:?}"),
+        }
+    }
+
+    /// `rocm diagnose --model` tells the user that `rocm serve` takes no context
+    /// size, KV cache type or GPU layer count and passes none to the engine
+    /// (`SERVE_OPTIONS_NOTE` and `SERVE_CONTEXT_NOTE` in `gguf_fit.rs`). This
+    /// fails when `rocm serve` gains one of them, so the notes are updated with it.
+    #[test]
+    fn serve_takes_no_estimate_options_yet() {
+        let serve = |extra: &[&str]| {
+            let mut argv = vec!["rocm", "serve", "o/r:Q4_K_M"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert!(serve(&[]).is_ok(), "the model alone parses");
+        for option in [
+            &["--context-size", "4096"][..],
+            &["--ctx-size", "4096"][..],
+            &["--kv-cache-type", "q8_0"][..],
+            &["--n-gpu-layers", "20"][..],
+        ] {
+            assert!(serve(option).is_err(), "rocm serve now takes {option:?}");
         }
     }
 

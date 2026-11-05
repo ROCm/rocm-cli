@@ -44,7 +44,7 @@ use crate::diagnose::{Fix, Route, upstream_route};
 use crate::gguf::parse_gguf_header;
 use crate::gguf_fit::{
     CannotEstimateReason, ContextEstimate, ESTIMATE_CAVEAT, EstimateOutcome, FitRequest,
-    KvCacheType, SERVE_OPTIONS_NOTE, estimate_fit, evidence_lines, tokens,
+    KvCacheType, SERVE_CONTEXT_NOTE, SERVE_OPTIONS_NOTE, estimate_fit, evidence_lines, tokens,
 };
 use crate::gguf_source::{GgufRef, GgufSource, ProjectorNamed, parse_gguf_ref};
 use serde::{Deserialize, Serialize};
@@ -881,6 +881,16 @@ fn apply_context_estimate(
                 Some(fix)
             }
             Some(CannotEstimateReason::NoGpu) => Some(no_gpu_fix(ask_again(&readiness.model_ref))),
+            // A layout whose figure can be too low (state-space, hybrid,
+            // mixture-of-experts, or a header missing a width) was sized and
+            // compared, and its detail tells the reader to compare the total
+            // with the GPU's memory and leave headroom. No command would turn it
+            // into a verdict, so there is no plan to offer.
+            Some(
+                CannotEstimateReason::UnmeasuredLayout | CannotEstimateReason::MissingMetadata,
+            ) => None,
+            // An APU's pool cannot be read and no command changes that; a fit or
+            // a misfit is the answer itself, with its suggestions.
             _ => None,
         };
         if estimate.outcome == EstimateOutcome::Fits {
@@ -914,13 +924,15 @@ fn apply_context_estimate(
     } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::HeaderUnreadable)
         && matches!(reference, GgufRef::Hub { .. })
     {
-        // The header could not be fetched: a name that does not exist, a gated
-        // or private repository, or no network. Serving it would start a
+        // The header could not be fetched or read: a name that does not exist, a
+        // gated or private repository, no network, a busy hub, or a file that is
+        // not a GGUF. The estimate's detail says which. Serving it would start a
         // download of the whole file to learn the same thing, so the plan is to
-        // check and ask again.
+        // act on that detail and ask again.
         readiness.fix = Some(Fix {
-            summary: "check the repository name and quantization, and that this machine can \
-                      reach Hugging Face, then ask again"
+            summary: "act on the reason above (a misspelt name or quantization, no route to \
+                      Hugging Face, a busy hub to wait for, or a file that is not a GGUF), \
+                      then ask again"
                 .to_owned(),
             verify: ask_again(&readiness.model_ref),
             notes: vec![
@@ -935,8 +947,19 @@ fn apply_context_estimate(
     } else if let Some(fix) = &mut readiness.fix {
         point_fix_at_unsized_gguf(fix, reference, &ask_again(&readiness.model_ref));
     }
-    if estimate.outcome == EstimateOutcome::DoesNotFit && !estimate.suggestions.is_empty() {
-        readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
+    // A compared estimate is sized for a context `rocm serve` would not pass,
+    // so the answer says so, once: with the options a suggestion names, or on
+    // its own.
+    if matches!(
+        estimate.outcome,
+        EstimateOutcome::Fits | EstimateOutcome::DoesNotFit
+    ) {
+        let note = if estimate.suggestions.is_empty() {
+            SERVE_CONTEXT_NOTE
+        } else {
+            SERVE_OPTIONS_NOTE
+        };
+        readiness.warnings.push(note.to_owned());
     }
     readiness.estimate = Some(estimate);
 }
@@ -959,22 +982,7 @@ fn rediagnose(model_ref: &str, request: &ContextRequest) -> String {
 /// as another flag.
 fn rediagnose_for(model_ref: &str, request: &ContextRequest, windows: bool) -> String {
     use std::fmt::Write as _;
-    // `~` is plain after the first character, where neither shell expands it;
-    // Windows short names (`ADMINI~1`) carry one in the middle of a path.
-    let plain = !model_ref.is_empty()
-        && !model_ref.starts_with('~')
-        && model_ref.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '/' | ':' | '.' | '_' | '-' | '=' | '~')
-                || (windows && c == '\\')
-        });
-    let quoted = if plain {
-        model_ref.to_owned()
-    } else if windows {
-        crate::quoting::powershell_quote(model_ref)
-    } else {
-        crate::quoting::posix_shell_quote(model_ref)
-    };
+    let quoted = shell_word(model_ref, windows);
     let mut command = if model_ref.starts_with('-') {
         format!("rocm diagnose --model={quoted}")
     } else {
@@ -987,6 +995,28 @@ fn rediagnose_for(model_ref: &str, request: &ContextRequest, windows: bool) -> S
         let _ = write!(command, " --kv-cache-type {kind}");
     }
     command
+}
+
+/// `model_ref` as one word of a command for this platform's shell: as it is
+/// when no shell would split or expand it, quoted for PowerShell on Windows and
+/// for a POSIX shell elsewhere otherwise.
+fn shell_word(model_ref: &str, windows: bool) -> String {
+    // `~` is plain after the first character, where neither shell expands it;
+    // Windows short names (`ADMINI~1`) carry one in the middle of a path.
+    let plain = !model_ref.is_empty()
+        && !model_ref.starts_with('~')
+        && model_ref.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | ':' | '.' | '_' | '-' | '=' | '~')
+                || (windows && c == '\\')
+        });
+    if plain {
+        model_ref.to_owned()
+    } else if windows {
+        crate::quoting::powershell_quote(model_ref)
+    } else {
+        crate::quoting::posix_shell_quote(model_ref)
+    }
 }
 
 /// The plan when no GPU is visible to ROCm: find out why, then ask again with
@@ -1082,15 +1112,16 @@ fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, verify: &str) {
                 .to_owned(),
         );
     }
-    // Nor does it take a local file: `rocm serve <path>` would fail, so the
-    // line offered is the question asked again.
-    if matches!(reference, GgufRef::Local(_)) {
-        verify.clone_into(&mut fix.verify);
-        fix.notes.push(
-            "`rocm serve` does not take a local file path; it takes a catalog model or \
-             `owner/repo:QUANT` on Hugging Face"
-                .to_owned(),
-        );
+    // `rocm serve` does take a local file, and serves it as it is; the path is
+    // quoted for the shell. One that starts with `-` would be read as a flag,
+    // so that one is asked about again instead.
+    if let GgufRef::Local(path) = reference {
+        let path = path.to_string_lossy();
+        if path.starts_with('-') {
+            verify.clone_into(&mut fix.verify);
+        } else {
+            fix.verify = format!("rocm serve {}", shell_word(&path, cfg!(windows)));
+        }
     }
 }
 
@@ -1137,11 +1168,11 @@ const fn verdict_label(verdict: ModelVerdict) -> &'static str {
 fn header_label(readiness: &ModelReadiness) -> String {
     match &readiness.estimate {
         Some(estimate) if estimate.outcome == EstimateOutcome::Fits => format!(
-            "ESTIMATED: fits at {} (not a tested minimum)",
+            "ESTIMATED: fits at {} (calibrated on one MI300X, not a tested minimum)",
             tokens(estimate.context_size)
         ),
         Some(estimate) if estimate.outcome == EstimateOutcome::DoesNotFit => format!(
-            "ESTIMATED: does not fit at {} (not a tested minimum)",
+            "ESTIMATED: does not fit at {} (calibrated on one MI300X, not a tested minimum)",
             tokens(estimate.context_size)
         ),
         _ => verdict_label(readiness.verdict).to_owned(),
@@ -2205,10 +2236,10 @@ mod tests {
     }
 
     /// A local file that was read but cannot be sized (here one shard of a
-    /// split model) is not offered back as `rocm serve <path>`, which takes no
-    /// path: the line is the question asked again, with its flags.
+    /// split model) is offered to `rocm serve`, which takes a local path, with
+    /// the path quoted for the shell where it needs to be.
     #[test]
-    fn an_unsized_local_gguf_is_not_offered_to_rocm_serve() {
+    fn an_unsized_local_gguf_is_offered_to_rocm_serve_quoted() {
         let mut readiness = not_curated("models/split.gguf");
         attach_context_estimate(
             &mut readiness,
@@ -2221,17 +2252,18 @@ mod tests {
             Some(CannotEstimateReason::SplitFile)
         );
         let fix = readiness.fix.as_ref().expect("a plan");
+        assert_eq!(fix.verify, "rocm serve models/split.gguf");
+        let mut spaced = not_curated("my models/split.gguf");
+        attach_context_estimate(
+            &mut spaced,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &FakeSource::with(llama_like(10).u32("split.count", 3).file(0)),
+        );
         assert_eq!(
-            fix.verify,
-            "rocm diagnose --model models/split.gguf --context-size 8192"
+            spaced.fix.as_ref().expect("a plan").verify,
+            "rocm serve 'my models/split.gguf'"
         );
-        assert!(
-            fix.notes
-                .iter()
-                .any(|note| note.contains("does not take a local file path")),
-            "{fix:?}"
-        );
-        assert!(!render_model_readiness_text(&readiness).contains("rocm serve models/"));
     }
 
     /// A context flag with a reference that is neither curated nor a GGUF says
@@ -2271,7 +2303,7 @@ mod tests {
             &FakeSource::failing(),
         );
         let fix = readiness.fix.as_ref().expect("a plan");
-        assert!(fix.summary.contains("reach Hugging Face"), "{fix:?}");
+        assert!(fix.summary.contains("no route to Hugging Face"), "{fix:?}");
         assert_eq!(
             fix.verify,
             "rocm diagnose --model some-lab/never-curated-7b:Q4_K_M --context-size 8192"
@@ -2301,6 +2333,46 @@ mod tests {
                 .any(|note| note.contains("`owner/repo:QUANT`")),
             "{fix:?}"
         );
+    }
+
+    /// A layout that gets figures and no verdict is sized and compared, so the
+    /// "serve it and see" plan and the tracker route no longer apply, and no
+    /// command would turn it into a verdict: there is no plan, and the detail
+    /// says to compare the total with the GPU's memory.
+    #[test]
+    fn a_layout_without_a_verdict_gets_its_figures_and_no_plan() {
+        for (layout, source) in [
+            (
+                "mixture-of-experts",
+                FakeSource::with(llama_like(10).u32("llama.expert_count", 8).file(64)),
+            ),
+            (
+                "state-space",
+                FakeSource::with(llama_like(10).u32("llama.ssm.state_size", 16).file(64)),
+            ),
+        ] {
+            let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+            attach_context_estimate(
+                &mut readiness,
+                &asked(4096),
+                &host_with(24.0, 64.0),
+                &source,
+            );
+            let estimate = readiness.estimate.as_ref().expect("an estimate");
+            assert_eq!(
+                estimate.cannot_estimate_reason,
+                Some(CannotEstimateReason::UnmeasuredLayout),
+                "{layout}"
+            );
+            assert!(estimate.total_gib.is_some(), "{layout}");
+            assert!(readiness.fix.is_none(), "{layout}: {:?}", readiness.fix);
+            assert!(readiness.route.is_none(), "{layout}");
+            let text = render_model_readiness_text(&readiness);
+            assert!(
+                text.contains("compare it with this GPU's"),
+                "{layout}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -2527,8 +2599,11 @@ mod tests {
                 .contains("could not be reached")
         );
         assert_eq!(estimate.total_gib, None);
-        // The original "serve it directly" plan survives: nothing replaced it.
-        assert!(readiness.fix.is_some());
+        // The plan is to act on that reason and ask again, not to serve a file
+        // whose header could not even be read.
+        let fix = readiness.fix.as_ref().expect("a plan");
+        assert!(fix.summary.contains("act on the reason above"), "{fix:?}");
+        assert!(fix.verify.starts_with("rocm diagnose --model "), "{fix:?}");
 
         let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
         attach_context_estimate(
@@ -2648,6 +2723,48 @@ mod tests {
         assert_eq!(readiness, before);
     }
 
+    /// A compared estimate says once that `rocm serve` would not use the size it
+    /// was sized for: with the suggestions' options when it does not fit, on its
+    /// own when it fits; an estimate that compared nothing says neither.
+    #[test]
+    fn a_compared_estimate_says_rocm_serve_passes_no_context() {
+        let warnings = |memory_gib: f64| {
+            let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+            attach_context_estimate(
+                &mut readiness,
+                &asked(8192),
+                &host_with(memory_gib, 64.0),
+                &FakeSource::weights(2048),
+            );
+            readiness.warnings
+        };
+        let fits = warnings(24.0);
+        assert!(fits.iter().any(|w| w == SERVE_CONTEXT_NOTE), "{fits:?}");
+        assert!(!fits.iter().any(|w| w == SERVE_OPTIONS_NOTE), "{fits:?}");
+        let misfit = warnings(2.0);
+        assert!(misfit.iter().any(|w| w == SERVE_OPTIONS_NOTE), "{misfit:?}");
+        assert!(
+            !misfit.iter().any(|w| w == SERVE_CONTEXT_NOTE),
+            "{misfit:?}"
+        );
+        let mut uncompared = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut uncompared,
+            &asked(8192),
+            &HostFacts {
+                accelerator_memory: AcceleratorMemory::Unknown,
+                system_ram_gib: None,
+            },
+            &FakeSource::weights(2048),
+        );
+        assert!(
+            !uncompared
+                .warnings
+                .iter()
+                .any(|w| w == SERVE_CONTEXT_NOTE || w == SERVE_OPTIONS_NOTE)
+        );
+    }
+
     #[test]
     fn a_one_token_context_reads_as_one_token() {
         let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
@@ -2658,7 +2775,10 @@ mod tests {
             &FakeSource::weights(64),
         );
         let text = render_model_readiness_text(&readiness);
-        assert!(text.contains(": ESTIMATED: fits at 1 token (not"), "{text}");
+        assert!(
+            text.contains(": ESTIMATED: fits at 1 token (calibrated"),
+            "{text}"
+        );
         assert!(!text.contains("1 tokens"), "{text}");
     }
 

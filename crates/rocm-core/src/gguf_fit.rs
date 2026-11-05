@@ -528,6 +528,14 @@ fn shown_text(text: &str) -> String {
         .collect()
 }
 
+/// Whether the header lacks the feed-forward or the embedding width, which size
+/// the compute buffer's fixed part. A width of zero is no width: no real model
+/// has one, and taking it at its word would understate the buffer the same way.
+fn widths_missing(header: &GgufHeader) -> bool {
+    let known = |width: Option<u64>| width.is_some_and(|width| width > 0);
+    !known(header.feed_forward_length) || !known(header.embedding_length)
+}
+
 /// Work out the sizing, or why it cannot be worked out.
 fn sizing(header: &GgufHeader, file_size: u64) -> Result<Sizing, (CannotEstimateReason, String)> {
     if header.split_count.is_some_and(|count| count > 1) {
@@ -788,7 +796,7 @@ pub fn estimate_fit(
                 .to_owned(),
         );
     }
-    if header.feed_forward_length.is_none() || header.embedding_length.is_none() {
+    if widths_missing(header) {
         estimate.notes.push(
             "the header does not carry both the feed-forward and the embedding width, so the \
              compute buffer's fixed part is understated and the real figure can be higher"
@@ -830,7 +838,7 @@ pub fn estimate_fit(
     // confident "fits" that is wrong costs a user a failed load, and a margin
     // with no measurement behind it would be a guess. The host's memory is
     // still reported, so the reader can compare it themselves.
-    let widths_missing = header.feed_forward_length.is_none() || header.embedding_length.is_none();
+    let widths_missing = widths_missing(header);
     if header.ssm || header.moe || widths_missing {
         let why = match (header.ssm, header.moe) {
             (true, true) => {
@@ -1151,10 +1159,21 @@ pub const ESTIMATE_CAVEAT: &str = "these are estimates from the file's metadata,
      attention-score matrix that is not counted, and the figure is too low); another build or GPU can differ, so leave some headroom \
      and check with a real run";
 
-/// The standing note about `rocm serve`: the options an estimate talks about are
-/// the engine's, and `rocm serve` does not pass them through today.
+/// The standing note about `rocm serve` when there are suggestions.
+///
+/// The options they name are the engine's, and `rocm serve` does not pass them
+/// through today. `serve_takes_no_estimate_options_yet` in `apps/rocm/src/main.rs` fails when
+/// `rocm serve` gains one of them, so this text cannot go stale unnoticed.
 pub const SERVE_OPTIONS_NOTE: &str = "`rocm serve` does not take a context size, KV cache type or \
-     GPU layer count yet; the options named above are llama.cpp's own llama-server flags";
+     GPU layer count yet, and passes none to the engine, so a model it serves gets the engine's \
+     own default context; the options named above are llama.cpp's own llama-server flags";
+
+/// The same fact for an estimate with no suggestions: the context size it was
+/// sized for is not one `rocm serve` would use. Pinned by the same test as
+/// [`SERVE_OPTIONS_NOTE`].
+pub const SERVE_CONTEXT_NOTE: &str = "`rocm serve` does not take a context size yet and passes \
+     none to the engine, so a model it serves gets the engine's own default context, which can \
+     differ from the size estimated here";
 
 #[cfg(test)]
 mod tests {
@@ -3467,6 +3486,18 @@ mod tests {
             (
                 "no embedding width",
                 base().u32("x.feed_forward_length", 512),
+            ),
+            (
+                "a feed-forward width of zero",
+                base()
+                    .u32("x.embedding_length", 256)
+                    .u32("x.feed_forward_length", 0),
+            ),
+            (
+                "an embedding width of zero",
+                base()
+                    .u32("x.embedding_length", 0)
+                    .u32("x.feed_forward_length", 512),
             ),
         ] {
             let (header, size) = header_of(&builder.tensor("w", &[1024]), 4096);

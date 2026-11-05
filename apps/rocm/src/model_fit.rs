@@ -15,8 +15,11 @@
 //! out for the platform (native Windows for vLLM and AIM, an unreachable Docker
 //! daemon for AIM) and word the reason.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change; see
-//! `docs/architecture.md`. It is a module of its own, rather than part of the
+//! Relocated from `main.rs` with no behavior change; see
+//! `docs/architecture.md`. Since then the memory classification answers "no GPU
+//! is visible" when a device mask hides every card (it reported a card of 0 GiB,
+//! or an APU's unreadable pool), and the assessment attaches the GGUF estimate.
+//! It is a module of its own, rather than part of the
 //! `rocm diagnose` handler, so `examine_report_text.rs` (which reads
 //! `PlatformRuleOut` and `engine_ruled_out_by_platform`) and
 //! `model_catalog_text.rs` (which reads `PlatformRuleOut` and

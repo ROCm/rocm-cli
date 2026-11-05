@@ -3507,14 +3507,34 @@ async fn assert_gguf_estimate_compares_only_a_measured_gpu(world: &mut E2eWorld)
     let estimate = estimate_section(&model);
     let outcome = estimate["outcome"].as_str().unwrap_or_default();
     if estimate["available_gib"].is_number() {
-        // The model needs about 1.26 GiB of runtime and compute allowances and
-        // nothing else (the fixture has no input embedding to leave in host
-        // memory, so its weights are the whole data region), so any GPU worth
-        // the name has room: the point is that a measured GPU
-        // gets a comparison, not that this one passes it.
-        assert!(
-            matches!(outcome, "fits" | "does_not_fit"),
-            "a measured GPU was not compared against: {estimate:#}"
+        // The outcome the reported figures imply: the verdict is decided on the
+        // parts as shown (each rounded up to a whole MiB) against the card's
+        // memory, so the same arithmetic over the JSON says which answer is
+        // owed on this lane, and a predicate turned the wrong way fails here.
+        const MIB: f64 = 1024.0 * 1024.0;
+        let shown_mib: f64 = [
+            "weights_bytes",
+            "kv_cache_bytes",
+            "compute_buffer_bytes",
+            "runtime_reserve_bytes",
+        ]
+        .iter()
+        .map(|field| {
+            let bytes = estimate[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no {field}: {estimate:#}"));
+            (bytes as f64 / MIB).ceil()
+        })
+        .sum();
+        let available_mib = estimate["available_gib"].as_f64().unwrap_or_default() * 1024.0;
+        let expected = if shown_mib <= available_mib {
+            "fits"
+        } else {
+            "does_not_fit"
+        };
+        assert_eq!(
+            outcome, expected,
+            "{shown_mib} MiB needed against {available_mib} MiB: {estimate:#}"
         );
         if outcome == "fits" {
             assert!(
@@ -3560,18 +3580,36 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
     }
     // Which label is owed depends on whether this host's memory was compared,
     // and the report says which: a compared estimate names the card it was
-    // compared with. Either comparison outcome is accepted (a host with very
-    // little dedicated VRAM is told the estimate does not fit), but a compared
-    // estimate must be labelled ESTIMATED and one that was not, UNDETERMINED --
-    // so the label is checked on whichever lane runs this, not only accepted.
+    // compared with. A compared estimate must be labelled ESTIMATED with the
+    // outcome its own figures imply, and one that was not, UNDETERMINED -- so
+    // the label is checked on whichever lane runs this, not only accepted.
     // A GPU-less hosted runner takes the second branch; a lane that measures
     // dedicated VRAM (the MI300X self-hosted lane) takes the first.
     let compared = output.contains("the GPU with the most dedicated VRAM that ROCm can see has");
     if compared {
+        // The label owed follows from the two figures the report prints: the
+        // total it needs ("= about N MiB") and the card's ("has M MiB").
+        let number_after = |marker: &str| -> u64 {
+            let at = output
+                .find(marker)
+                .unwrap_or_else(|| panic!("no `{marker}` in:\n{output}"))
+                + marker.len();
+            output[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| panic!("no figure after `{marker}` in:\n{output}"))
+        };
+        let needed = number_after("= about ");
+        let offered = number_after("can see has ");
+        let label = if needed <= offered {
+            ": ESTIMATED: fits at 2048 tokens"
+        } else {
+            ": ESTIMATED: does not fit at 2048 tokens"
+        };
         assert!(
-            header.contains(": ESTIMATED: fits at 2048 tokens")
-                || header.contains(": ESTIMATED: does not fit at 2048 tokens"),
-            "the estimate compared memory but is not labelled ESTIMATED: {header}"
+            header.contains(label),
+            "{needed} MiB needed against {offered} MiB, so `{label}` is owed: {header}"
         );
     } else {
         assert!(
@@ -3916,11 +3954,9 @@ async fn assert_missing_gguf_plan_is_to_check_the_path(world: &mut E2eWorld) {
     let verify = fix["verify"].as_str().unwrap_or("");
     let bare = format!("rocm diagnose --model {path}");
     let quoted = format!("rocm diagnose --model '{path}'");
+    // Either form asks again with `rocm diagnose`; serving a file that is not
+    // there would only repeat the error.
     assert!(verify == bare || verify == quoted, "{model:#}");
-    assert!(
-        !fix["verify"].as_str().unwrap_or("").contains("rocm serve"),
-        "serving a file that is not there only repeats the error: {model:#}"
-    );
 }
 
 #[when(

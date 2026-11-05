@@ -80,8 +80,9 @@ the result from `--json`:
   cache's cost of one token); the comparison (`available_gib` is the total
   dedicated VRAM of the GPU with the most of it that ROCm can see, not what is
   free; `max_context` is the largest context that fits, capped at
-  `training_context`, and is null when GPU memory was not measured and also when
-  not even one 256-token step fits); and what the figures leave out
+  `training_context`, and is null when GPU memory was not measured, when no
+  verdict is given (`unmeasured_layout`, or `missing_metadata` with figures),
+  and when not even one 256-token step fits); and what the figures leave out
   (`conservative_ceiling` says the ceiling is known to be conservative,
   `suggestions[]` what would make it fit, `notes[]` the caveats).
   It is an estimate, not a tested minimum: report it as one. With `--report`

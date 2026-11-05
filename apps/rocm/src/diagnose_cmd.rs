@@ -8,8 +8,9 @@
 //! which acts on a delivery decision with an injected `Opener`, and
 //! `established_entry` picks the catalog entry a report names.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change; see
-//! `docs/architecture.md`. `diagnose` and `fix` are `pub(crate)`: `dispatch()`
+//! Relocated from `main.rs` with no behavior change; see
+//! `docs/architecture.md`. Since then `--model` has gained the GGUF estimate's
+//! flags, and `--report` ignores a model question and says so on stderr. `diagnose` and `fix` are `pub(crate)`: `dispatch()`
 //! calls them through the re-import `use crate::diagnose_cmd::{diagnose,
 //! fix};`. The other three functions have no caller outside this module and
 //! stay private. `diagnose` gets its `--model` verdict from
