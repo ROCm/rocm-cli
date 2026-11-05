@@ -1599,8 +1599,10 @@ mod tests {
     // The Docker source cannot be driven end to end without a container
     // daemon, and `reconcile_set` is the code both it and the managed-service
     // registry run, so these tests exercise it directly. The registry and
-    // Lemonade sources are also covered end to end in
-    // `tests/discovery_reconcile.rs`.
+    // Lemonade sources are also driven end to end in
+    // `tests/discovery_reconcile.rs`, except the registry's retirement of a
+    // vanished service and Lemonade's change of id, which only these tests
+    // cover.
 
     fn discovered(id: &str, port: u16) -> DiscoveredService {
         DiscoveredService {
