@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Rig `Tool` ("Skill") wrappers over the cached telemetry snapshot, plus the
+//! Rig `Tool` wrappers over the cached telemetry snapshot, plus the
 //! read-only and mutating ROCm machine-inspection tools and their registration
 //! onto a Rig `AgentBuilder`.
 //!
@@ -30,12 +30,12 @@ use super::snapshot::{
 };
 
 // ---------------------------------------------------------------------------
-// Rig Tool ("Skill") wrappers. Each holds an `Arc<StateSnapshot>` (read-only)
-// and a shared `fired` log so the reply can cite which Skills ran. `call` only
-// reads the snapshot — no mutation, no network, no file I/O.
+// Rig Tool wrappers for the telemetry tools. Each holds an `Arc<StateSnapshot>`
+// (read-only) and a shared `fired` log so the reply can cite which tools ran.
+// `call` only reads the snapshot — no mutation, no network, no file I/O.
 // ---------------------------------------------------------------------------
 
-/// Shared "which Skills fired" log, threaded into every tool struct below and
+/// Shared "which tools fired" log, threaded into every tool struct below and
 /// into the three real `AgentClient` backends via `agent::clients`.
 pub(super) type FiredLog = Arc<Mutex<Vec<String>>>;
 
@@ -786,9 +786,9 @@ mod tests {
     use crate::agent::fixture_snapshot;
 
     #[test]
-    fn skill_names_are_unique_and_non_empty() {
+    fn telemetry_tool_names_are_unique_and_non_empty() {
         for n in TELEMETRY_TOOL_NAMES {
-            assert!(!n.is_empty(), "skill name must be non-empty");
+            assert!(!n.is_empty(), "telemetry tool name must be non-empty");
         }
         let mut sorted = TELEMETRY_TOOL_NAMES.to_vec();
         sorted.sort_unstable();
@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(
             sorted.len(),
             TELEMETRY_TOOL_NAMES.len(),
-            "skill names must be unique"
+            "telemetry tool names must be unique"
         );
     }
 
@@ -1013,11 +1013,11 @@ mod tests {
                 "missing mutating tool: {expected}"
             );
         }
-        // Disjoint from read-only + skill names (iterates the registry itself).
+        // Disjoint from read-only + telemetry tool names (iterates the registry itself).
         for n in ROCM_MUTATING_TOOL_NAMES {
             assert!(
                 !TELEMETRY_TOOL_NAMES.contains(&n),
-                "collision with skill: {n}"
+                "collision with telemetry tool: {n}"
             );
             // install_sdk_dry_run (read-only) must not clash with install_sdk.
             assert!(
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn rocm_read_tool_names_are_complete_and_disjoint_from_skills() {
+    fn rocm_read_tool_names_are_complete_and_disjoint_from_telemetry_tools() {
         // Every expected read-only tool is registered…
         for expected in [
             "doctor",
@@ -1234,7 +1234,7 @@ mod tests {
         }
         // natural_language_plan is read-only (plans, never executes) — Phase 7.
         assert!(ROCM_READ_TOOL_NAMES.contains(&"natural_language_plan"));
-        // The telemetry/skill tools are still present and disjoint from the new set.
+        // The telemetry tools are still present and disjoint from the new set.
         assert!(TELEMETRY_TOOL_NAMES.contains(&"gpu_status"));
         for n in ROCM_READ_TOOL_NAMES {
             assert!(!TELEMETRY_TOOL_NAMES.contains(&n), "name collision: {n}");
