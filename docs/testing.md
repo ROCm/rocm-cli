@@ -508,6 +508,17 @@ The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
 never prompts and never refuses, whatever the active default is.
 
+The preview also prepares no Python. On a host with no usable Python, a real
+install downloads a managed `uv`, has it install Python, and saves that Python's
+path in the config; `--dry-run` instead prints a `python_note:` line saying so
+and does none of it. Scenario `runtime-22` checks the note and the empty
+managed-tools, cache-tools and config folders together, with a recording `uv`
+standing in for the download. It runs on Linux; the decision itself is
+unit-tested on Unix hosts (the Python stand-ins are shell scripts, as in the
+other resolver tests) by `a_dry_run_with_no_usable_python_prepares_nothing` in
+[python.rs](../apps/rocm/src/therock/python.rs). The preview does still write
+its package-index cache under the cache folder.
+
 Then it verifies:
 
 - runtime manifest metadata

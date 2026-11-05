@@ -202,11 +202,13 @@ pub const SKILL_NAMES: [&str; 4] = [
 // whose state changed (and drops the endpoint key of a service whose requested
 // stop has finished). `doctor`/`examine` can re-register the configured setup
 // runtime in the runtime registry when its entry is missing. `update_check` and
-// `install_sdk_dry_run` cache package-index metadata under the cache folder
-// and, on a host with no usable Python on PATH, can download a managed `uv` and
-// Python into the data folder and record that Python in the saved config. The
-// boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
-// pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
+// `install_sdk_dry_run` cache package-index metadata under the cache folder.
+// `update_check` can also, on a host with no usable Python on PATH, download a
+// managed `uv` and Python into the data folder and record that Python in the
+// saved config; `install_sdk_dry_run` does not: on such a host it reports the
+// Python a real install would prepare and prepares none. The boundary type
+// (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
+// `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected

@@ -233,6 +233,68 @@ fn allow_base_overrides(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
 }
 
+/// Only the canonical release index, for a scenario that never pins ROCm 10 and
+/// so never reaches the next layout.
+#[given("a canonical release pip index fixture")]
+async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("current"),
+        [
+            ("rocm", CURRENT_ROCM_VERSION),
+            ("torch", CURRENT_TORCH_VERSION),
+            ("torchvision", CURRENT_TORCHVISION_VERSION),
+            ("torchaudio", CURRENT_TORCHAUDIO_VERSION),
+        ],
+    );
+    serve_pip_fixtures(world);
+}
+
+/// File the recording `uv` appends to, one line per invocation.
+const UV_INVOCATION_LOG: &str = "uv-invocations.log";
+
+/// A host where the CLI can find no Python: `PATH` is one empty folder, so the
+/// search comes up empty and no managed Python has been saved. `uv` is a
+/// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
+/// to prepare a managed Python reaches it, instead of downloading the real one,
+/// and leaves a line behind.
+///
+/// Relies on the ambient environment not naming a Python: a set
+/// `ROCM_CLI_PYTHON` would answer the search before it looks at `PATH`, and a
+/// set `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP` would turn the case this
+/// scenario is about into an error. Either would make the scenario pass or fail
+/// for a reason it does not name, so they are refused up front.
+#[given("a host with no usable Python and a recording uv")]
+async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
+    for var in [
+        "ROCM_CLI_PYTHON",
+        "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
+    ] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set in the environment running the suite, which would change what this \
+             scenario exercises; unset it"
+        );
+    }
+    let scenario_root = root(world).to_path_buf();
+    let empty_path = scenario_root.join("no-python-on-path");
+    std::fs::create_dir_all(&empty_path).expect("failed to create the empty PATH folder");
+    let uv = scenario_root
+        .join("recording-uv-bin")
+        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
+    crate::install_fixture_binary("fake-uv", &uv);
+    world
+        .command_env
+        .push(("PATH", empty_path.into_os_string()));
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world.command_env.push((
+        "FAKE_UV_LOG",
+        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
+    ));
+}
+
 #[given("a canonical release pip index fixture and a ROCm 10 pip index fixture")]
 async fn pip_index_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
@@ -987,6 +1049,71 @@ fn assert_contains(world: &E2eWorld, needle: &str, what: &str) {
         stdout(world).contains(needle),
         "{what}: expected {needle:?} in the preview:\n{}",
         stdout(world)
+    );
+}
+
+/// The managed interpreter the canonical layout needs. Keep in step with
+/// `DEFAULT_MANAGED_PYTHON_VERSION` in `apps/rocm/src/therock/python.rs`.
+const CANONICAL_MANAGED_PYTHON: &str = "3.12";
+
+#[then("the preview says a real install would prepare a managed Python")]
+async fn preview_says_managed_python_would_be_prepared(world: &mut E2eWorld) {
+    assert_contains(world, "python_source: managed", "python source");
+    assert_contains(
+        world,
+        "python_launcher: not prepared by this preview",
+        "python launcher",
+    );
+    assert_contains(
+        world,
+        &format!("would use uv to install managed Python {CANONICAL_MANAGED_PYTHON}"),
+        "python note",
+    );
+}
+
+/// The preview says it prepared no Python, and the state it left agrees. The
+/// claim and the filesystem are checked together: the note alone would pass
+/// with the bug present, and so would the empty folders alone if the preview
+/// had simply stopped before it got to the Python.
+#[then("the preview prepared no Python, as it says")]
+async fn preview_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "a real install would prepare Python {CANONICAL_MANAGED_PYTHON}. This preview does not."
+        ),
+        "the progress line about what the preview skipped",
+    );
+    let paths = world.app_paths();
+    let scenario_root = root(world).to_path_buf();
+    let uv_log = scenario_root.join(UV_INVOCATION_LOG);
+    assert!(
+        !uv_log.exists(),
+        "the preview ran uv, which it says it did not:\n{}",
+        std::fs::read_to_string(&uv_log).unwrap_or_default()
+    );
+    let tools = rocm_core::managed_tools_dir(&paths.data_dir);
+    assert!(
+        !tools.exists(),
+        "the preview created the managed tools folder {}, which would hold a managed uv and Python",
+        tools.display()
+    );
+    assert!(
+        !paths.cache_dir.join("tools").exists(),
+        "the preview downloaded a tool archive into {}",
+        paths.cache_dir.join("tools").display()
+    );
+    let config = paths.config_path();
+    assert!(
+        !config.exists(),
+        "the preview saved a configuration at {}, which would record a managed Python: {}",
+        config.display(),
+        std::fs::read_to_string(&config).unwrap_or_default()
     );
 }
 

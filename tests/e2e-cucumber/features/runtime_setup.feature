@@ -451,3 +451,34 @@ Feature: Runtime configuration
     When the user previews a tarball SDK install
     Then the preview selects the newest SDK in the catalog
     And the preview does not claim the host's ROCm is newer
+
+  # A preview is a promise that nothing on the machine changes. On a host with
+  # no usable Python the install needs one, and the preview used to go and get
+  # it: it downloaded a managed `uv`, had `uv` install Python, and saved that
+  # Python's path in the configuration, all before printing a plan. The assistant's
+  # `install_sdk_dry_run` tool reaches the same code. Now the preview reports that
+  # a managed Python would be prepared and prepares nothing.
+  #
+  # The preview's own note says it prepared nothing, so the Then checks that note
+  # and the state together: no `uv` invocation, no managed tools folder, no
+  # downloaded tool archive and no saved configuration. The recording `uv` is what
+  # makes "no download" observable without the network: the CLI reaches it only by
+  # going on to prepare a Python. The first Then shows the preview still got as far
+  # as a plan, so the empty folders are not just a command that stopped early.
+  #
+  # Linux only: the empty-`PATH` host is built for the Linux search order. The
+  # decision itself is unit-tested on Unix hosts against an injected search path
+  # (`a_dry_run_with_no_usable_python_prepares_nothing` in
+  # `apps/rocm/src/therock/python.rs`); the Windows search order and a Windows
+  # run of this preview are not covered by a test.
+  #
+  # Technical details: the fixture serves one canonical release index, `PATH` is a
+  # single empty folder, and `ROCM_CLI_UV_BINARY` names a stand-in that appends
+  # its arguments to a log file.
+  @id:runtime-install-preview-prepares-no-python @requires-os:linux
+  Scenario: runtime-22 - Previewing an SDK install on a host with no usable Python prepares no Python
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    Then the preview says a real install would prepare a managed Python
+    And the preview prepared no Python, as it says

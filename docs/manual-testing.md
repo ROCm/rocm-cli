@@ -158,6 +158,14 @@ Expected result:
   asking and prints a line crediting that flag by name — not `--yes`.
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
+- On a host with no usable Python (a minimal container; run with `PATH` pointing
+  at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
+  `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
+  line says `not prepared by this preview`, `python_source:` says `managed`,
+  and a `python_note:` line says a real install would use `uv` to install the
+  managed Python. Afterwards the data folder has no `tools` folder and the
+  config folder has no `config.json`: the preview downloaded no `uv` or Python
+  and saved no Python path. A real install on the same host does both.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
