@@ -31,28 +31,39 @@ export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 # The lane's status stays the suite's: a failed copy only warns.
 save_results() {
   local rc=$?
-  if [ -d tests/e2e-cucumber/results ]; then
-    mkdir -p "$out/results" &&
-      cp -R tests/e2e-cucumber/results/. "$out/results/" ||
-      echo "warning: could not copy the E2E results to $out" >&2
+  if [[ -d tests/e2e-cucumber/results ]]; then
+    mkdir -p "${out}/results" &&
+      cp -R tests/e2e-cucumber/results/. "${out}/results/" ||
+      echo "warning: could not copy the E2E results to ${out}" >&2
   fi
-  exit "$rc"
+  exit "${rc}"
 }
 trap save_results EXIT
 
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
-mkdir -p "$work"
-export CARGO_TARGET_DIR="$work/target"
-export E2E_SHARED_CACHE_DIR="$work/shared"
-export E2E_SHARED_UV_CACHE_DIR="$work/uv-cache"
-prewarm="$work/prewarm"
-export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+mkdir -p "${work}"
+export CARGO_TARGET_DIR="${work}/target"
+export E2E_SHARED_CACHE_DIR="${work}/shared"
+export E2E_SHARED_UV_CACHE_DIR="${work}/uv-cache"
+prewarm="${work}/prewarm"
+export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
 
 # What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
-# installs it; the ROCm dev images carry a compiler but not these.
-if ! command -v pkg-config >/dev/null || [ ! -e /usr/include/sys/capability.h ]; then
-  apt-get update -qq
+# installs it; the ROCm dev images carry a compiler but not these. The update is
+# retried as there: a mirror mid-sync fails it for a few minutes.
+if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]]; then
+  for attempt in 1 2 3 4; do
+    if apt-get update -qq; then
+      break
+    fi
+    if [[ "${attempt}" -eq 4 ]]; then
+      echo "apt-get update failed after ${attempt} attempts" >&2
+      exit 1
+    fi
+    echo "apt-get update failed (attempt ${attempt}); retrying in 60s" >&2
+    sleep 60
+  done
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     pkg-config build-essential libcap-dev >/dev/null
 fi
@@ -63,7 +74,7 @@ if ! command -v cargo >/dev/null; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
     sh -s -- -y --profile minimal --default-toolchain none
   # shellcheck source=/dev/null
-  . "$HOME/.cargo/env"
+  . "${HOME}/.cargo/env"
 fi
 
 bash .github/scripts/gpu-preflight.sh
@@ -71,13 +82,13 @@ bash .github/scripts/gpu-preflight.sh
 # The e2e-test-hooks feature must match what `cargo xtask e2e` builds for
 # itself; see the e2e-gpu job in e2e-selfhosted.yml.
 cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+export ROCM_CLI_BINARY="${CARGO_TARGET_DIR}/release/rocm"
+export ROCM_CLI_ROCMD_BINARY="${CARGO_TARGET_DIR}/release/rocmd"
 
 # Installed in place, never moved: install sdk bakes absolute paths into the
 # runtime manifest. See `xtask e2e-prewarm`.
-HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-  UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-  cargo xtask e2e-prewarm --channel "$channel" --prewarm-dir "$prewarm"
+HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
+  UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
+  cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}"
 
 cargo xtask e2e
