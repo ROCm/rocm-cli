@@ -10,7 +10,7 @@
 //! is that sequence, split into the two fallible steps callers compose.
 //!
 //! [`print_prompt`] and [`read_answer`] stay two calls rather than one bundled
-//! "ask and read" function because `fix.rs`'s `confirm()` attempts the read
+//! "ask and read" function because `fix/consent.rs`'s `confirm()` attempts the read
 //! even when the prompt couldn't be written — its behavior before this module
 //! existed — while `uninstall_plan.rs` and `therock/consent.rs` treat a failed
 //! write as fatal, each with their own phase-specific message. A single
