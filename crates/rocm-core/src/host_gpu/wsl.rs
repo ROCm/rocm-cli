@@ -17,7 +17,7 @@ use super::{DriverSummary, WslSummary};
 use crate::gfx_target::parse_windows_display_gfx_target;
 use crate::{discover_rocm_installs, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) fn detect_wsl_windows_display_gfx_target_fast() -> Option<String> {
     detect_wsl_windows_display_probe_text()
@@ -208,22 +208,29 @@ pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
     ldconfig_cache().map(|text| text.contains("librocdxg.so"))
 }
 
-/// Whether `relative` exists under any ROCm install on this host.
+/// The ROCm install roots on this host: the conventional `/opt/rocm` first, then
+/// every install discovery reports.
 ///
 /// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
 /// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
 /// package that was in fact installed. Ask the same resolver the rest of the CLI
 /// uses, and keep the conventional root as a fallback for the case where
 /// discovery finds nothing.
-fn rocm_relative_file_exists(relative: &str) -> bool {
-    if host_path("/opt/rocm").join(relative).exists() {
-        return true;
-    }
+fn rocm_roots() -> Vec<PathBuf> {
     // Discovery reports real install paths; reading them through `host_path`
     // keeps a simulated host's answer from being decided by the real machine.
-    discover_rocm_installs()
-        .iter()
-        .any(|install| host_path(&install.path).join(relative).exists())
+    std::iter::once(host_path("/opt/rocm"))
+        .chain(
+            discover_rocm_installs()
+                .iter()
+                .map(|install| host_path(&install.path)),
+        )
+        .collect()
+}
+
+/// Whether `relative` exists under any of `roots`.
+fn rocm_relative_file_exists(roots: &[PathBuf], relative: &str) -> bool {
+    roots.iter().any(|root| root.join(relative).exists())
 }
 
 /// Whether `librocdxg.so` sits in a directory on `ld_library_path`.
@@ -248,13 +255,40 @@ fn librocdxg_on_loader_path(ld_library_path: Option<&str>, exists: impl Fn(&Path
     })
 }
 
-/// Whether the loader can resolve `librocdxg.so`: registered in the linker cache,
-/// or on `LD_LIBRARY_PATH`.
+/// Whether some ROCm install holds `librocdxg.so` in the same `lib` directory as
+/// a `libhsa-runtime64`.
 ///
-/// The one place the two sources are combined, so `rocdxg_ready`, the `missing`
+/// The runtime opens `librocdxg.so` by name, and TheRock builds it with
+/// `RUNPATH $ORIGIN`, so the loader looks in the runtime's own directory before it
+/// asks the linker cache or `LD_LIBRARY_PATH`. A tarball under
+/// `/opt/rocm-<version>` keeps the two side by side and registers neither, which
+/// is why a working install read as missing while those were the only sources
+/// asked (ROCM-30386). The library alone in a `lib` directory does not count: with
+/// no runtime beside it, only the cache or `LD_LIBRARY_PATH` can reach it.
+///
+/// Takes the install roots and an existence check rather than reading the
+/// machine, so the layouts can be tested without one.
+fn librocdxg_beside_runtime(roots: &[PathBuf], exists: impl Fn(&Path) -> bool) -> bool {
+    roots.iter().any(|root| {
+        let lib = root.join("lib");
+        exists(&lib.join("librocdxg.so"))
+            && ["libhsa-runtime64.so.1", "libhsa-runtime64.so"]
+                .iter()
+                .any(|runtime| exists(&lib.join(runtime)))
+    })
+}
+
+/// Whether the loader can resolve `librocdxg.so`: registered in the linker cache,
+/// on `LD_LIBRARY_PATH`, or beside the runtime that opens it.
+///
+/// The one place the sources are combined, so `rocdxg_ready`, the `missing`
 /// detail and the diagnose guards cannot disagree about it.
-const fn librocdxg_loadable(in_linker_cache: bool, on_ld_library_path: bool) -> bool {
-    in_linker_cache || on_ld_library_path
+const fn librocdxg_loadable(
+    in_linker_cache: bool,
+    on_ld_library_path: bool,
+    beside_runtime: bool,
+) -> bool {
+    in_linker_cache || on_ld_library_path || beside_runtime
 }
 
 /// The predicate itself, separated from reading the machine so the union can be
@@ -288,8 +322,9 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     let is_wsl = true;
 
     let dxcore = host_path("/usr/lib/wsl/lib/libdxcore.so").exists();
-    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
-    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let roots = rocm_roots();
+    let librocdxg = rocm_relative_file_exists(&roots, "lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists(&roots, "share/rocdxg/dids.conf");
     let ldconfig_text = ldconfig_cache();
     let ldconfig_librocdxg = ldconfig_text
         .as_deref()
@@ -300,6 +335,9 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
         librocdxg_on_loader_path(std::env::var("LD_LIBRARY_PATH").ok().as_deref(), |file| {
             host_path(file).exists()
         });
+    // The roots are already re-rooted through `host_path`, so this existence check
+    // takes the path as given.
+    let librocdxg_beside_runtime = librocdxg_beside_runtime(&roots, Path::exists);
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
     let mut missing = Vec::new();
@@ -314,10 +352,14 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
         // install, so quoting one root would misreport where it was not found.
         missing.push("librocdxg.so");
     }
-    // Only when neither source resolves it: a library on `LD_LIBRARY_PATH` loads
-    // without a cache entry, so naming the cache would send the user after a
-    // registration the workload does not need.
-    if !librocdxg_loadable(ldconfig_librocdxg, librocdxg_on_ld_library_path) {
+    // Only when no source resolves it: a library on `LD_LIBRARY_PATH`, or beside
+    // the runtime that opens it, loads without a cache entry, so naming the cache
+    // would send the user after a registration the workload does not need.
+    if !librocdxg_loadable(
+        ldconfig_librocdxg,
+        librocdxg_on_ld_library_path,
+        librocdxg_beside_runtime,
+    ) {
         missing.push("ldconfig:librocdxg.so");
     }
     let detail = if missing.is_empty() {
@@ -334,6 +376,7 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
         rocdxg_dids,
         ldconfig_librocdxg,
         librocdxg_on_ld_library_path,
+        librocdxg_beside_runtime,
         rocminfo,
         cargo,
         detail,
@@ -352,7 +395,11 @@ impl WslSummary {
         self.dxg_device
             && self.dxcore
             && self.librocdxg
-            && librocdxg_loadable(self.ldconfig_librocdxg, self.librocdxg_on_ld_library_path)
+            && librocdxg_loadable(
+                self.ldconfig_librocdxg,
+                self.librocdxg_on_ld_library_path,
+                self.librocdxg_beside_runtime,
+            )
     }
 }
 
@@ -439,6 +486,7 @@ mod tests {
             rocdxg_dids: false,
             ldconfig_librocdxg: false,
             librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: false,
             rocminfo: false,
             cargo: true,
             detail: Some("missing /opt/rocm/lib/librocdxg.so".to_owned()),
@@ -570,12 +618,107 @@ mod tests {
         }
     }
 
+    /// An existence check over a fixed set of files, compared component-wise so a
+    /// path built with the platform separator matches one written with `/`.
+    fn exists_among(files: &[&str]) -> impl Fn(&Path) -> bool {
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        move |path| {
+            files
+                .iter()
+                .any(|file| file.components().eq(path.components()))
+        }
+    }
+
     #[test]
-    fn the_library_is_loadable_from_either_source() {
-        assert!(librocdxg_loadable(true, false));
-        assert!(librocdxg_loadable(false, true));
-        assert!(librocdxg_loadable(true, true));
-        assert!(!librocdxg_loadable(false, false));
+    fn the_library_beside_the_runtime_that_opens_it_counts() {
+        // The ROCM-30386 layout: a TheRock tarball under a versioned root, the two
+        // libraries side by side, neither registered anywhere.
+        let roots = [PathBuf::from("/opt/rocm-10.1.0")];
+        for runtime in ["libhsa-runtime64.so.1", "libhsa-runtime64.so"] {
+            let runtime = format!("/opt/rocm-10.1.0/lib/{runtime}");
+            assert!(
+                librocdxg_beside_runtime(
+                    &roots,
+                    exists_among(&["/opt/rocm-10.1.0/lib/librocdxg.so", &runtime])
+                ),
+                "{runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_library_alone_or_the_runtime_alone_does_not_count() {
+        let roots = [PathBuf::from("/opt/rocm")];
+        // The package layout: librocdxg in a `lib` directory with no runtime
+        // beside it, reached only through the cache or LD_LIBRARY_PATH.
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&["/opt/rocm/lib/librocdxg.so"])
+        ));
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&["/opt/rocm/lib/libhsa-runtime64.so.1"])
+        ));
+        assert!(!librocdxg_beside_runtime(&[], exists_among(&[])));
+    }
+
+    #[test]
+    fn beside_means_the_same_directory_not_the_same_machine() {
+        // The runtime in one install and the library in another: the runtime's
+        // `$ORIGIN` is its own install, so the other one's library is not found.
+        let roots = [
+            PathBuf::from("/opt/rocm"),
+            PathBuf::from("/opt/rocm-10.1.0"),
+        ];
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&[
+                "/opt/rocm/lib/librocdxg.so",
+                "/opt/rocm-10.1.0/lib/libhsa-runtime64.so.1",
+            ])
+        ));
+        // A runtime elsewhere under the same root is not beside it either.
+        assert!(!librocdxg_beside_runtime(
+            &roots[..1],
+            exists_among(&[
+                "/opt/rocm/lib/librocdxg.so",
+                "/opt/rocm/lib/llvm/lib/libhsa-runtime64.so.1",
+            ])
+        ));
+    }
+
+    #[test]
+    fn the_library_is_loadable_from_any_one_source() {
+        assert!(librocdxg_loadable(true, false, false));
+        assert!(librocdxg_loadable(false, true, false));
+        assert!(librocdxg_loadable(false, false, true));
+        assert!(librocdxg_loadable(true, true, true));
+        assert!(!librocdxg_loadable(false, false, false));
+    }
+
+    #[test]
+    fn rocdxg_is_ready_for_an_unregistered_library_beside_the_runtime() {
+        // The ROCM-30386 layout with no environment help at all: the tarball's
+        // runtime opens librocdxg from its own directory.
+        let mut summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: true,
+            rocminfo: true,
+            cargo: false,
+            detail: None,
+        };
+        assert!(summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_ready");
+        // Without the sibling runtime nothing reaches the library.
+        summary.librocdxg_beside_runtime = false;
+        assert!(!summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_missing");
     }
 
     #[test]
@@ -590,6 +733,7 @@ mod tests {
             rocdxg_dids: true,
             ldconfig_librocdxg: false,
             librocdxg_on_ld_library_path: true,
+            librocdxg_beside_runtime: false,
             rocminfo: true,
             cargo: false,
             detail: None,
@@ -651,6 +795,7 @@ mod tests {
             rocdxg_dids: false,
             ldconfig_librocdxg: true,
             librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: false,
             rocminfo: false,
             cargo: false,
             detail: None,

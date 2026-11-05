@@ -535,3 +535,16 @@ Feature: GPU detection and system inspection
     Then the inspection reports the ROCDXG driver status "wsl_rocdxg_missing"
     And the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH
     And the inspection's driver detail says the library is missing from the linker cache
+
+  # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
+  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
+  # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
+  # control is `examine-32`, the same machine with the library alone.
+  @id:examine-rocdxg-ready-beside-runtime @requires-os:linux
+  Scenario: examine-33 - The inspection reports ROCDXG ready when the library sits beside the runtime that opens it
+    Given a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail does not send the user to register the library with ldconfig

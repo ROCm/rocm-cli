@@ -2259,6 +2259,24 @@ async fn wsl_machine_with_rocdxg_nowhere_the_loader_looks(world: &mut E2eWorld) 
     plant_wsl_machine_with_unregistered_rocdxg(world, "");
 }
 
+#[given(
+    "a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn wsl_machine_with_rocdxg_beside_the_runtime(world: &mut E2eWorld) {
+    // The same machine as the control above, plus the runtime that opens the
+    // library: the only difference between the two scenarios, so the verdict can
+    // only turn on it.
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let lib = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/opt/rocm/lib");
+    std::fs::write(lib.join("libhsa-runtime64.so.1"), "")
+        .expect("failed to plant libhsa-runtime64.so.1");
+}
+
 #[then(expr = "the inspection reports the ROCDXG driver status {string}")]
 async fn assert_rocdxg_driver_status(world: &mut E2eWorld, status: String) {
     assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
@@ -2270,15 +2288,20 @@ async fn assert_rocdxg_driver_status(world: &mut E2eWorld, status: String) {
     );
 }
 
-fn assert_rocdxg_sources(world: &E2eWorld, in_cache: bool, on_loader_path: bool) {
+fn assert_rocdxg_sources(
+    world: &E2eWorld,
+    in_cache: bool,
+    on_loader_path: bool,
+    beside_runtime: bool,
+) {
     let json = parsed_json(world);
     let flag = |pointer: &str| {
         json.pointer(pointer)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
     };
-    // The library itself is on disk in both scenarios, so the verdict turns on
-    // the two loader sources alone.
+    // The library itself is on disk in every scenario, so the verdict turns on
+    // the loader sources alone.
     assert!(flag("/summary/wsl/librocdxg"), "{json:#}");
     assert_eq!(
         flag("/summary/wsl/ldconfig_librocdxg"),
@@ -2290,20 +2313,32 @@ fn assert_rocdxg_sources(world: &E2eWorld, in_cache: bool, on_loader_path: bool)
         on_loader_path,
         "{json:#}"
     );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_beside_runtime"),
+        beside_runtime,
+        "{json:#}"
+    );
 }
 
 #[then(
     "the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache"
 )]
 async fn assert_rocdxg_only_on_the_loader_path(world: &mut E2eWorld) {
-    assert_rocdxg_sources(world, false, true);
+    assert_rocdxg_sources(world, false, true, false);
 }
 
 #[then(
     "the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH"
 )]
 async fn assert_rocdxg_in_neither_source(world: &mut E2eWorld) {
-    assert_rocdxg_sources(world, false, false);
+    assert_rocdxg_sources(world, false, false, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_only_beside_the_runtime(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, true);
 }
 
 /// The `driver_detail` line is the CLI's own advice about what is wrong. It is

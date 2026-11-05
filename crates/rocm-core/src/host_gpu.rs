@@ -166,6 +166,12 @@ pub struct WslSummary {
     /// field existed, hence the default.
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
+    /// `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`,
+    /// which finds it through its own `$ORIGIN` runpath with no cache entry and
+    /// no `LD_LIBRARY_PATH`. Absent from output written before the field
+    /// existed, hence the default.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     pub rocminfo: bool,
     pub cargo: bool,
     pub detail: Option<String>,

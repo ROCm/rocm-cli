@@ -181,7 +181,7 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
 | `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
 | `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
-| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache and from the `LD_LIBRARY_PATH` of the shell running the check |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but the loader has no way to find it: it is absent from the linker cache and from the `LD_LIBRARY_PATH` of the shell running the check, and is not in the same directory as a `libhsa-runtime64` |
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
@@ -267,7 +267,9 @@ collects a fixed set of data. This leaves four limits:
   framework and ROCm version pairing. That includes `LD_LIBRARY_PATH`: a
   library the loader reaches only through that variable is not in the linker
   cache, so `--distro` can still report `fix-wsl-4` for an install that
-  `rocm diagnose` inside the distro finds healthy. The finding's evidence says
+  `rocm diagnose` inside the distro finds healthy. A library beside its runtime,
+  the layout of a TheRock tarball, is a file check, so `--distro` does see that
+  one. The finding's evidence says
   the variable could not be checked from outside the distribution, rather than
   claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
@@ -305,10 +307,15 @@ below.
 - `librocdxg` linker-cache visibility from `ldconfig -p`
 - whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`
   (`wsl_librocdxg_on_ld_library_path`). The loader searches that variable
-  before the cache, so a TheRock tarball under `/opt/rocm-<version>`, which
-  nothing registers with `ldconfig`, is reachable this way. `driver_status`
-  is `wsl_rocdxg_ready` when the library is found by either source, and
-  `wsl_rocdxg_missing` only when neither finds it
+  before the cache, so an install exported there is reachable without a cache
+  entry
+- whether `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`
+  (`wsl_librocdxg_beside_runtime`). The runtime opens `librocdxg.so` by name and
+  carries `RUNPATH $ORIGIN`, so a TheRock tarball under `/opt/rocm-<version>`,
+  which keeps the two side by side and registers nothing with `ldconfig`, loads
+  with neither the cache nor the variable. `driver_status` is
+  `wsl_rocdxg_ready` when any of the three sources finds the library, and
+  `wsl_rocdxg_missing` only when none does
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
@@ -328,7 +335,7 @@ a listing that says whether the part is an APU or a discrete card, so
 
 On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there. Under the default `gpu_required` policy it asks the same question `rocm examine` answers, whether the WSL GPU path is ready (`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on top. `--gpu auto` therefore selects GPU 0 on a ready host.
 
-When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH` counts as ready, so export the install's `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
+When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH`, or beside the runtime that opens it, counts as ready. A TheRock tarball is laid out the second way and needs nothing exported; for a library that sits alone, export its `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
 
 ## Install UX Recommendations
 

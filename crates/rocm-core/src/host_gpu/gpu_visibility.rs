@@ -318,6 +318,7 @@ mod tests {
             rocdxg_dids: true,
             ldconfig_librocdxg: librocdxg_in_cache,
             librocdxg_on_ld_library_path: on_ld_library_path,
+            librocdxg_beside_runtime: false,
             rocminfo: false,
             cargo: false,
             detail: None,
@@ -336,6 +337,15 @@ mod tests {
                 "cache {in_cache}, LD_LIBRARY_PATH {on_path}"
             );
         }
+    }
+
+    #[test]
+    fn a_wsl_host_with_rocdxg_beside_the_runtime_has_one_usable_gpu() {
+        // The tarball layout: no cache entry and no LD_LIBRARY_PATH, but the
+        // runtime opens the library from its own directory.
+        let mut summary = wsl_summary(false, false);
+        summary.librocdxg_beside_runtime = true;
+        assert_eq!(wsl_usable_indices(Some(&summary), None), Some(vec![0]));
     }
 
     #[test]

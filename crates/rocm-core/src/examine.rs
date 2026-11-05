@@ -121,6 +121,13 @@ pub struct WslFacts {
     /// user's environment.
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
+    /// Whether `librocdxg.so` is in the same `lib` directory as a
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// TheRock tarball is laid out this way and is never in the linker cache.
+    /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
+    /// can ask it from outside the distribution.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     /// Whether `rocminfo` is on PATH.
     pub rocminfo: bool,
     /// Whether ROCm can actually enumerate a GPU here.
@@ -152,12 +159,14 @@ pub struct WslFacts {
 }
 
 impl WslFacts {
-    /// The linker cache positively lacks ROCDXG and nothing on `LD_LIBRARY_PATH`
-    /// supplies it either. `None` from the cache (ldconfig could not run) is not
-    /// evidence, so it is not "unloadable".
+    /// The linker cache positively lacks ROCDXG and neither `LD_LIBRARY_PATH` nor
+    /// the runtime's own directory supplies it. `None` from the cache (ldconfig
+    /// could not run) is not evidence, so it is not "unloadable".
     #[must_use]
     pub const fn librocdxg_unloadable(&self) -> bool {
-        matches!(self.ldconfig_librocdxg, Some(false)) && !self.librocdxg_on_ld_library_path
+        matches!(self.ldconfig_librocdxg, Some(false))
+            && !self.librocdxg_on_ld_library_path
+            && !self.librocdxg_beside_runtime
     }
 }
 

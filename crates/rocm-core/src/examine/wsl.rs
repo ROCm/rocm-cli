@@ -38,6 +38,7 @@ pub(super) fn probe_wsl(e: &mut Examination) {
         librocdxg_on_ld_library_path: summary
             .as_ref()
             .is_some_and(|s| s.librocdxg_on_ld_library_path),
+        librocdxg_beside_runtime: summary.as_ref().is_some_and(|s| s.librocdxg_beside_runtime),
         rocminfo,
         rocm_sees_gpu: rocminfo.then(probe_rocminfo_sees_gpu),
         distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
@@ -86,6 +87,12 @@ if ls /opt/rocm*/lib/librocdxg.so >/dev/null 2>&1 \
   || ls /usr/local/rocm*/lib/librocdxg.so >/dev/null 2>&1; then echo librocdxg=1; else echo librocdxg=0; fi
 if ls /opt/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1 \
   || ls /usr/local/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1; then echo dids=1; else echo dids=0; fi
+beside=0
+for d in /opt/rocm*/lib /usr/local/rocm*/lib; do
+  if [ -e "$d/librocdxg.so" ] \
+    && { [ -e "$d/libhsa-runtime64.so.1" ] || [ -e "$d/libhsa-runtime64.so" ]; }; then beside=1; break; fi
+done
+echo librocdxg_beside_runtime=$beside
 for ldc in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
   if cache=$(command -v "$ldc" >/dev/null 2>&1 && "$ldc" -p 2>/dev/null); then
     case "$cache" in *librocdxg.so*) echo ldconfig=1 ;; *) echo ldconfig=0 ;; esac
@@ -227,6 +234,8 @@ pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, S
         // The remote script runs in a non-login shell with none of the user's
         // environment, so there is no `LD_LIBRARY_PATH` to ask about.
         librocdxg_on_ld_library_path: false,
+        // Files, not environment, so the remote script can answer this one.
+        librocdxg_beside_runtime: parse_remote_flag(&fields, "librocdxg_beside_runtime"),
         rocminfo,
         rocm_sees_gpu: rocminfo.then(|| parse_remote_flag(&fields, "rocmgfx")),
         distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
