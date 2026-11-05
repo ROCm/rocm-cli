@@ -39,8 +39,8 @@
 use std::fmt::Write as _;
 use std::fs;
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal};
+use anyhow::{Context, Result};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
 
 use crate::runtime_adopt::{
     AdoptRuntimeOptions, adopt_runtime_from_python_options, import_runtime_manifest,
@@ -213,12 +213,9 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
-            let plan = if yes {
+            let plan = if require_yes_or_interactive(yes, "runtimes uninstall")? {
                 plan
             } else {
-                if !interactive_terminal() {
-                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
-                }
                 match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
                     RuntimeUninstallConfirmation::Cancelled => {
                         println!("runtime uninstall cancelled");
