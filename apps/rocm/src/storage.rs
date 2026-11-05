@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
 use serde::Serialize;
 
+use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::runtimes_cmd::{
     ActiveRuntimeMarker, InstallRootDecision, active_runtime_marker_path,
     should_remove_runtime_install_root,
@@ -616,6 +617,12 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
         "To free space: rocm storage remove-old-installs --dry-run"
     );
     output
+}
+
+impl JsonOrText for StorageReport {
+    fn render_text(&self) -> String {
+        render_report(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
