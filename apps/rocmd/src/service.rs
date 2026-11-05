@@ -1080,4 +1080,184 @@ mod tests {
         );
         Ok(())
     }
+
+    // ---- Characterisation of this module's own managed-stop routine. ----
+    //
+    // `rocm` carries a second copy of `MANAGED_STOP_GRACE` and of
+    // `terminate_recorded_service_pids`, and the two have diverged. These pin
+    // what THIS copy does today so that the change that merges them is visible
+    // in the tests it has to edit. The termination is a stand-in throughout, so
+    // no process is signalled and the tests behave the same on every host.
+
+    const SUPERVISOR_PID: u32 = 999_999_998;
+    const ENGINE_PID: u32 = 999_999_997;
+
+    fn record_naming(
+        paths: &AppPaths,
+        supervisor: u32,
+        supervisor_ticks: Option<u64>,
+        engine: Option<u32>,
+        engine_ticks: Option<u64>,
+    ) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "svc-characterise-stop",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor,
+            None,
+            None,
+            None,
+        );
+        record.supervisor_start_ticks = supervisor_ticks;
+        record.engine_pid = engine;
+        record.engine_start_ticks = engine_ticks;
+        record
+    }
+
+    /// The identities `terminate_recorded_service_pids` handed its termination
+    /// function, in call order, together with what each returned as a stop.
+    fn terminate_with(
+        record: &ManagedServiceRecord,
+        outcome: rocm_core::TerminationOutcome,
+    ) -> (Vec<rocm_core::ProcessIdentity>, Vec<RecordedPidStop>) {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let stops = terminate_recorded_service_pids(record, |identity| {
+            seen.borrow_mut().push(*identity);
+            outcome
+        });
+        (seen.into_inner(), stops)
+    }
+
+    #[test]
+    fn managed_stop_grace_is_ten_seconds() {
+        // `rocm` keeps its own copy of this value, in step only by a comment.
+        assert_eq!(MANAGED_STOP_GRACE, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn managed_stop_terminates_supervisor_then_engine_each_with_its_own_start_time() {
+        let (root, paths) = temp_app_paths("managed-stop-order");
+        let record = record_naming(&paths, SUPERVISOR_PID, Some(11), Some(ENGINE_PID), Some(22));
+
+        let (seen, stops) = terminate_with(&record, rocm_core::TerminationOutcome::Graceful);
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            seen,
+            vec![
+                rocm_core::ProcessIdentity::new(SUPERVISOR_PID, Some(11)),
+                rocm_core::ProcessIdentity::new(ENGINE_PID, Some(22)),
+            ],
+            "the supervisor first, and no start-time read across from the other PID"
+        );
+        assert_eq!(
+            stops
+                .iter()
+                .map(|stop| (stop.pid, stop.role))
+                .collect::<Vec<_>>(),
+            vec![(SUPERVISOR_PID, "supervisor"), (ENGINE_PID, "engine")]
+        );
+    }
+
+    #[test]
+    fn managed_stop_terminates_a_pid_recorded_twice_once_and_keeps_a_known_start_time() {
+        let (root, paths) = temp_app_paths("managed-stop-aliased-ticks");
+        // The supervisor entry carries no start-time, the engine entry does:
+        // the one PID is stopped once, with the known token.
+        let record = record_naming(&paths, SUPERVISOR_PID, None, Some(SUPERVISOR_PID), Some(33));
+
+        let (seen, stops) = terminate_with(&record, rocm_core::TerminationOutcome::Graceful);
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            seen,
+            vec![rocm_core::ProcessIdentity::new(SUPERVISOR_PID, Some(33))]
+        );
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].role, "supervisor_and_engine");
+    }
+
+    #[test]
+    fn managed_stop_skips_a_zero_pid_and_an_absent_engine() {
+        let (root, paths) = temp_app_paths("managed-stop-zero-pid");
+        let record = record_naming(&paths, 0, None, Some(0), None);
+
+        let (seen, stops) = terminate_with(&record, rocm_core::TerminationOutcome::Graceful);
+        fs::remove_dir_all(root).ok();
+
+        assert!(seen.is_empty());
+        assert!(stops.is_empty());
+    }
+
+    /// DIVERGENCE from `rocm`: this copy reports the stopping process's own PID,
+    /// as `self`, where `rocm` drops it. It is never handed to the termination
+    /// function, and it counts as stopped.
+    #[test]
+    fn managed_stop_reports_its_own_pid_as_self_and_never_terminates_it() {
+        let (root, paths) = temp_app_paths("managed-stop-own-pid");
+        let record = record_naming(&paths, std::process::id(), None, Some(ENGINE_PID), None);
+
+        let (seen, stops) = terminate_with(&record, rocm_core::TerminationOutcome::Graceful);
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            seen,
+            vec![rocm_core::ProcessIdentity::new(ENGINE_PID, None)],
+            "the stopping process is never signalled"
+        );
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0].pid, std::process::id());
+        assert_eq!(stops[0].role, "supervisor");
+        assert_eq!(stops[0].outcome, "self");
+        assert!(!stops[0].signaled && !stops[0].forced);
+        assert!(stops[0].stopped, "the launcher is not the service");
+    }
+
+    #[test]
+    fn managed_stop_classifies_each_outcome_as_signaled_forced_and_stopped() {
+        use rocm_core::TerminationOutcome::{
+            AlreadyGone, Forced, Graceful, IdentityMismatch, TimedOut, Unverified,
+        };
+        let (root, paths) = temp_app_paths("managed-stop-classes");
+        let record = record_naming(&paths, SUPERVISOR_PID, None, None, None);
+
+        // (outcome, signaled, forced, stopped)
+        let expected = [
+            (AlreadyGone, false, false, true),
+            (IdentityMismatch, false, false, true),
+            (Unverified, false, false, false),
+            (Graceful, true, false, true),
+            (Forced, true, true, true),
+            (TimedOut, true, true, false),
+        ];
+        for (outcome, signaled, forced, stopped) in expected {
+            let (_, stops) = terminate_with(&record, outcome);
+            assert_eq!(stops.len(), 1);
+            let stop = &stops[0];
+            assert_eq!(stop.outcome, outcome.as_str());
+            assert_eq!(
+                (stop.signaled, stop.forced, stop.stopped),
+                (signaled, forced, stopped),
+                "{outcome:?}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The tree-kill step is Windows-only and is a private `cfg(windows)` block
+    /// of `terminate_recorded_pid` with no injection point, so nothing here can
+    /// observe it. What this does pin is the portable half: a recorded PID that
+    /// is not running reaches `terminate_verified` and comes back unchanged.
+    #[test]
+    fn terminate_recorded_pid_reports_an_absent_pid_as_already_gone() {
+        let outcome =
+            terminate_recorded_pid(&rocm_core::ProcessIdentity::new(SUPERVISOR_PID, None));
+
+        assert_eq!(outcome, rocm_core::TerminationOutcome::AlreadyGone);
+    }
 }

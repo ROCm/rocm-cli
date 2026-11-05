@@ -3578,4 +3578,175 @@ pub(crate) mod tests {
         );
         let _ = fs::remove_dir_all(root);
     }
+
+    // ---- Characterisation of this module's own managed-stop routine. ----
+    //
+    // `rocmd` carries a second copy of `MANAGED_STOP_GRACE` and of
+    // `terminate_recorded_service_pids`, and the two have diverged. These pin
+    // what THIS copy does today so that the change that merges them is visible
+    // in the tests it has to edit. Every PID below is one that cannot be
+    // running, so nothing is signalled and the tests behave the same on every
+    // host.
+
+    /// A PID no host has in use, so the stop reports it as already gone.
+    const ABSENT_SUPERVISOR_PID: u32 = 999_999_998;
+    const ABSENT_ENGINE_PID: u32 = 999_999_997;
+
+    /// A record naming `supervisor` and `engine` with no recorded start-times.
+    fn record_naming(
+        paths: &AppPaths,
+        supervisor: u32,
+        engine: Option<u32>,
+    ) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "svc-characterise-stop",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = engine;
+        record
+    }
+
+    /// The `(pid, role, outcome)` rows of a stop's per-PID report, in order.
+    fn outcome_rows(
+        termination: &RecordedStopTermination,
+    ) -> Vec<(u32, &'static str, rocm_core::TerminationOutcome)> {
+        termination
+            .pid_outcomes
+            .iter()
+            .map(|entry| (entry.pid, entry.role, entry.outcome))
+            .collect()
+    }
+
+    #[test]
+    fn managed_stop_grace_is_ten_seconds() {
+        // `rocmd` keeps its own copy of this value, in step only by a comment.
+        assert_eq!(MANAGED_STOP_GRACE, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn managed_stop_reports_supervisor_then_engine_in_that_order() {
+        let (root, paths) = test_paths("managed-stop-order");
+        let record = record_naming(&paths, ABSENT_SUPERVISOR_PID, Some(ABSENT_ENGINE_PID));
+
+        let termination = terminate_recorded_service_pids(&record);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            outcome_rows(&termination),
+            vec![
+                (
+                    ABSENT_SUPERVISOR_PID,
+                    "supervisor",
+                    rocm_core::TerminationOutcome::AlreadyGone
+                ),
+                (
+                    ABSENT_ENGINE_PID,
+                    "engine",
+                    rocm_core::TerminationOutcome::AlreadyGone
+                ),
+            ]
+        );
+        assert!(
+            termination.signaled_pids.is_empty(),
+            "nothing that is not running is signalled"
+        );
+        assert!(termination.all_stopped);
+    }
+
+    #[test]
+    fn managed_stop_reports_a_pid_recorded_twice_once_under_both_roles() {
+        let (root, paths) = test_paths("managed-stop-aliased");
+        let record = record_naming(&paths, ABSENT_SUPERVISOR_PID, Some(ABSENT_SUPERVISOR_PID));
+
+        let termination = terminate_recorded_service_pids(&record);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            outcome_rows(&termination),
+            vec![(
+                ABSENT_SUPERVISOR_PID,
+                "supervisor_and_engine",
+                rocm_core::TerminationOutcome::AlreadyGone
+            )]
+        );
+    }
+
+    /// DIVERGENCE from `rocmd`: this copy drops the stopping process's own PID
+    /// before anything is reported, where `rocmd` reports it as `self`.
+    #[test]
+    fn managed_stop_leaves_its_own_pid_out_of_the_report() {
+        let (root, paths) = test_paths("managed-stop-own-pid");
+        let record = record_naming(&paths, std::process::id(), Some(ABSENT_ENGINE_PID));
+
+        let termination = terminate_recorded_service_pids(&record);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            outcome_rows(&termination),
+            vec![(
+                ABSENT_ENGINE_PID,
+                "engine",
+                rocm_core::TerminationOutcome::AlreadyGone
+            )],
+            "the stopping process is absent from the per-PID report"
+        );
+        assert!(
+            termination.all_stopped,
+            "and it does not stand in the way of a confirmed stop"
+        );
+        assert!(termination.signaled_pids.is_empty());
+    }
+
+    #[test]
+    fn managed_stop_of_a_record_naming_only_its_own_pid_confirms_with_an_empty_report() {
+        let (root, paths) = test_paths("managed-stop-only-own-pid");
+        let record = record_naming(&paths, std::process::id(), None);
+
+        let termination = terminate_recorded_service_pids(&record);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(termination.pid_outcomes.is_empty());
+        assert!(termination.signaled_pids.is_empty());
+        assert!(termination.all_stopped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stop_signals_the_supervisor_before_the_engine() {
+        let sup = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor");
+        let eng = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn engine");
+        let (sup_pid, eng_pid) = (sup.id(), eng.id());
+        let (root, paths) = test_paths("managed-stop-signal-order");
+        let mut record =
+            managed_record_for_pid(&paths, sup_pid, rocm_core::process_start_ticks(sup_pid));
+        record.engine_pid = Some(eng_pid);
+        record.engine_start_ticks = rocm_core::process_start_ticks(eng_pid);
+
+        let termination = terminate_recorded_service_pids(&record);
+        let (mut sup, mut eng) = (sup, eng);
+        let _ = sup.wait();
+        let _ = eng.wait();
+        let _ = fs::remove_dir_all(root);
+
+        // Not sorted: the order is the routine's, and a copy that visited the
+        // engine first would fail here.
+        assert_eq!(termination.signaled_pids, vec![sup_pid, eng_pid]);
+        assert!(termination.all_stopped);
+    }
 }
