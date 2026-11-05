@@ -64,12 +64,16 @@ pub const fn is_carveout(vram_total_mib: u64) -> bool {
 /// but stalled, failed, or printed something unparseable is a device that
 /// could not be read right now, which must never be mistaken for either "no
 /// tooling" or "drained".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe<T> {
     /// The tool is not installed.
     Absent,
     /// The tool is there but gave no usable reading.
     Unreadable,
+    /// The tool ran and exited successfully, but its output was not understood.
+    /// Like `Unreadable` for every decision, it also carries what the tool
+    /// printed (see [`output_hint`]) so a log can show what the parser met.
+    Unparsed(String),
     Read(T),
 }
 
@@ -80,6 +84,7 @@ impl<T> Probe<T> {
         match self {
             Self::Absent => Probe::Absent,
             Self::Unreadable => Probe::Unreadable,
+            Self::Unparsed(hint) => Probe::Unparsed(hint),
             Self::Read(value) => f(value).map_or(Probe::Unreadable, Probe::Read),
         }
     }
@@ -87,8 +92,10 @@ impl<T> Probe<T> {
     /// Fall back to `next` when this probe produced no reading.
     ///
     /// A reading from either wins. Without one, the result is `Absent` only if
-    /// every tool tried was absent; if any tool was present and gave nothing,
-    /// it is `Unreadable`.
+    /// every tool tried was absent; if either tool ran and printed something not
+    /// understood the result keeps what it printed (`Unparsed`, the first tool's
+    /// if both); otherwise any tool that was present and gave nothing makes it
+    /// `Unreadable`.
     #[must_use]
     pub fn or_else(self, next: impl FnOnce() -> Self) -> Self {
         if matches!(self, Self::Read(_)) {
@@ -97,9 +104,62 @@ impl<T> Probe<T> {
         match (self, next()) {
             (_, read @ Self::Read(_)) => read,
             (Self::Absent, Self::Absent) => Self::Absent,
+            (Self::Unparsed(hint), _) | (_, Self::Unparsed(hint)) => Self::Unparsed(hint),
             _ => Self::Unreadable,
         }
     }
+}
+
+impl Probe<String> {
+    /// Parse a tool's stdout with `f`. Output `f` rejects is not `Unreadable`
+    /// but `Unparsed`, carrying the first line of it (see [`output_hint`]) so the
+    /// log says what the tool printed; `source` names the command.
+    #[must_use]
+    pub fn parse_text<U>(self, source: &str, f: impl FnOnce(&str) -> Option<U>) -> Probe<U> {
+        match self {
+            Self::Absent => Probe::Absent,
+            Self::Unreadable => Probe::Unreadable,
+            Self::Unparsed(hint) => Probe::Unparsed(hint),
+            Self::Read(text) => {
+                f(&text).map_or_else(|| Probe::Unparsed(output_hint(source, &text)), Probe::Read)
+            }
+        }
+    }
+}
+
+/// The longest first line of tool output [`output_hint`] repeats.
+pub const HINT_MAX_CHARS: usize = 120;
+
+/// What a tool printed, as one bounded, printable line for a log.
+///
+/// It is `source`, then the first non-blank line of `text` with anything outside
+/// printable ASCII replaced by `?` and cut to [`HINT_MAX_CHARS`] characters.
+/// Meant for the header row of a CSV a parser could not match, so the next run
+/// shows the real column names.
+#[must_use]
+pub fn output_hint(source: &str, text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return format!("{source} printed no output");
+    };
+    let clean: String = line
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    let shown = if clean.chars().count() > HINT_MAX_CHARS {
+        format!(
+            "{}...",
+            clean.chars().take(HINT_MAX_CHARS).collect::<String>()
+        )
+    } else {
+        clean
+    };
+    format!("{source} printed {shown:?}")
 }
 
 /// One memory pool's size and free space, in MiB.
@@ -107,6 +167,16 @@ impl<T> Probe<T> {
 pub struct Pool {
     pub total_mib: u64,
     pub free_mib: u64,
+}
+
+impl Pool {
+    #[must_use]
+    pub const fn new(total_mib: u64, free_mib: u64) -> Self {
+        Self {
+            total_mib,
+            free_mib,
+        }
+    }
 }
 
 /// What the device tooling reported for GPU 0.
@@ -169,13 +239,16 @@ pub fn required_free_mib(total_mib: u64) -> u64 {
 }
 
 /// What one sample means for the drain wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Judgement {
     /// No device tool is installed: nothing to wait on (mock/local run).
     NoTooling,
     /// A tool is present but gave no usable reading. This is not "no tooling"
     /// and not "drained": the wait keeps trying.
     Unreadable,
+    /// As `Unreadable`, and the tool's output was not understood: what it
+    /// printed, for the report (see [`output_hint`]).
+    Unparsed(String),
     /// A reading, and the pool and floor it is held to.
     Target(DrainTarget),
 }
@@ -186,6 +259,7 @@ pub fn judge(sample: Probe<DeviceMemory>) -> Judgement {
     match sample {
         Probe::Absent => Judgement::NoTooling,
         Probe::Unreadable => Judgement::Unreadable,
+        Probe::Unparsed(hint) => Judgement::Unparsed(hint),
         Probe::Read(memory) => Judgement::Target(select_drain_target(memory)),
     }
 }
@@ -213,7 +287,7 @@ pub fn probe_budget(now: Instant, deadline: Instant) -> Duration {
 }
 
 /// How the drain wait ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// No device tool is installed (mock/local run): nothing was waited on.
     NoTooling,
@@ -222,11 +296,14 @@ pub enum Verdict {
     /// The deadline passed with the pool still below its floor.
     NotDrained(DrainTarget),
     /// No usable reading at the end: `samples` samples in a row gave none, and
-    /// `last_reading` is the most recent one the wait did get, if any. This is
-    /// not "not drained": the harness did not observe that.
+    /// `last_reading` is the most recent one the wait did get, if any. `hint` is
+    /// what a tool printed that was not understood, when one did (the latest
+    /// such sample, kept until a reading arrives). This is not "not drained":
+    /// the harness did not observe that.
     Unreadable {
         last_reading: Option<DrainTarget>,
         samples: u32,
+        hint: Option<String>,
     },
 }
 
@@ -236,6 +313,7 @@ pub struct DrainWait {
     samples: u32,
     unread_in_a_row: u32,
     last_reading: Option<DrainTarget>,
+    hint: Option<String>,
 }
 
 impl DrainWait {
@@ -248,32 +326,40 @@ impl DrainWait {
             Judgement::Target(target) => {
                 self.unread_in_a_row = 0;
                 self.last_reading = Some(target);
+                // A reading shows the tool's output is understood after all.
+                self.hint = None;
                 target.drained().then_some(Verdict::Drained(target))
             }
-            // A tool that vanishes mid-wait is a sample nobody could read.
-            Judgement::NoTooling | Judgement::Unreadable => {
-                self.unread_in_a_row += 1;
-                (self.last_reading.is_none()
-                    && self.unread_in_a_row >= UNREAD_SAMPLES_BEFORE_GIVING_UP)
-                    .then(|| self.unreadable())
+            Judgement::Unparsed(hint) => {
+                self.hint = Some(hint);
+                self.unread()
             }
+            // A tool that vanishes mid-wait is a sample nobody could read.
+            Judgement::NoTooling | Judgement::Unreadable => self.unread(),
         }
+    }
+
+    fn unread(&mut self) -> Option<Verdict> {
+        self.unread_in_a_row += 1;
+        (self.last_reading.is_none() && self.unread_in_a_row >= UNREAD_SAMPLES_BEFORE_GIVING_UP)
+            .then(|| self.unreadable())
     }
 
     /// The verdict when the deadline passes: not drained if the last sample was
     /// a reading, unreadable if it was not.
     #[must_use]
-    pub const fn timed_out(&self) -> Verdict {
+    pub fn timed_out(&self) -> Verdict {
         match self.last_reading {
             Some(target) if self.unread_in_a_row == 0 => Verdict::NotDrained(target),
             _ => self.unreadable(),
         }
     }
 
-    const fn unreadable(&self) -> Verdict {
+    fn unreadable(&self) -> Verdict {
         Verdict::Unreadable {
             last_reading: self.last_reading,
             samples: self.unread_in_a_row,
+            hint: self.hint.clone(),
         }
     }
 }
@@ -305,19 +391,28 @@ pub fn describe_verdict(verdict: Verdict, elapsed_secs: u64) -> String {
         Verdict::Unreadable {
             last_reading: None,
             samples,
+            hint,
         } => format!(
             "device state: could not read device memory ({samples} samples in {elapsed_secs}s; \
-             the GPU tool is installed but gave no usable reading)"
+             the GPU tool is installed but gave no usable reading{})",
+            hint_suffix(hint.as_deref())
         ),
         Verdict::Unreadable {
             last_reading: Some(target),
+            hint,
             ..
         } => format!(
             "device state: could not read device memory at the end of {elapsed_secs}s (last \
-             reading: {})",
-            target.describe()
+             reading: {}{})",
+            target.describe(),
+            hint_suffix(hint.as_deref())
         ),
     }
+}
+
+/// `"; <hint>"` for a report line, or nothing without one.
+fn hint_suffix(hint: Option<&str>) -> String {
+    hint.map_or_else(String::new, |hint| format!("; {hint}"))
 }
 
 /// Choose the pool the engine allocates from and the floor to hold it to.
@@ -346,11 +441,7 @@ pub fn select_drain_target(memory: DeviceMemory) -> DrainTarget {
 /// names (`Total Memory` and `Total Used Memory` for VRAM; the `GTT ` forms for
 /// GTT); the first data row is the first GPU. Values are bytes in the output.
 #[must_use]
-pub fn parse_rocm_smi_csv_pool(
-    text: &str,
-    total_column: &str,
-    used_column: &str,
-) -> Option<(u64, u64)> {
+pub fn parse_rocm_smi_csv_pool(text: &str, total_column: &str, used_column: &str) -> Option<Pool> {
     let mut lines = text.lines();
     let header = lines.next()?;
     let cols: Vec<&str> = header.split(',').collect();
@@ -361,7 +452,24 @@ pub fn parse_rocm_smi_csv_pool(
     let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
     let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
     let mib = 1024 * 1024;
-    Some((total / mib, total.saturating_sub(used) / mib))
+    Some(Pool::new(total / mib, total.saturating_sub(used) / mib))
+}
+
+/// Read VRAM from `amd-smi metric -m` output.
+///
+/// The `TOTAL_VRAM:` and `FREE_VRAM:` lines look like `TOTAL_VRAM: 196592 MB`;
+/// the number in front of the unit is taken as MiB. The first GPU's lines win. A
+/// zero total parses here; it is [`sample_device_memory`] that treats it as a
+/// failed read.
+#[must_use]
+pub fn parse_amd_smi_vram(text: &str) -> Option<Pool> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|number| number.parse::<u64>().ok())
+    };
+    Some(Pool::new(field("TOTAL_VRAM:")?, field("FREE_VRAM:")?))
 }
 
 /// Assemble one device-memory sample from a VRAM probe and a GTT probe.
@@ -373,39 +481,35 @@ pub fn parse_rocm_smi_csv_pool(
 /// - a GTT reading makes the sample;
 /// - a GTT probe that ran but gave nothing usable (a stall, a failure, output
 ///   not understood, or a zero total, which is a failed read rather than an
-///   empty pool) makes the whole sample `Unreadable`. Judging the tiny
+///   empty pool) makes the whole sample `Unreadable` (`Unparsed`, with what the
+///   tool printed, when it ran but its output was not understood). Judging the tiny
 ///   carveout instead could report "drained" while the engine still holds its
 ///   GTT-backed memory. `gpu-preflight.sh` treats a zero GTT total the same way,
 ///   as an unreadable sample to retry;
 /// - no tool that reports GTT at all (`Absent`) leaves `gtt` empty, and the
 ///   wait judges VRAM as it did before GTT was considered.
 pub fn sample_device_memory(
-    vram: impl FnOnce() -> Probe<(u64, u64)>,
-    gtt: impl FnOnce() -> Probe<(u64, u64)>,
+    vram: impl FnOnce() -> Probe<Pool>,
+    gtt: impl FnOnce() -> Probe<Pool>,
 ) -> Probe<DeviceMemory> {
-    let (vram_total, vram_free) = match vram() {
+    let vram = match vram() {
         // A zero total is a failed read, not a pool: its floor would be zero and
         // every sample would count as drained.
-        Probe::Read((total, free)) if total > 0 => (total, free),
+        Probe::Read(pool) if pool.total_mib > 0 => pool,
         Probe::Read(_) | Probe::Unreadable => return Probe::Unreadable,
+        Probe::Unparsed(hint) => return Probe::Unparsed(hint),
         Probe::Absent => return Probe::Absent,
     };
-    let vram = Pool {
-        total_mib: vram_total,
-        free_mib: vram_free,
-    };
-    if !is_carveout(vram_total) {
+    if !is_carveout(vram.total_mib) {
         return Probe::Read(DeviceMemory { vram, gtt: None });
     }
     match gtt() {
-        Probe::Read((total_mib, free_mib)) if total_mib > 0 => Probe::Read(DeviceMemory {
+        Probe::Read(pool) if pool.total_mib > 0 => Probe::Read(DeviceMemory {
             vram,
-            gtt: Some(Pool {
-                total_mib,
-                free_mib,
-            }),
+            gtt: Some(pool),
         }),
         Probe::Read(_) | Probe::Unreadable => Probe::Unreadable,
+        Probe::Unparsed(hint) => Probe::Unparsed(hint),
         Probe::Absent => Probe::Read(DeviceMemory { vram, gtt: None }),
     }
 }
@@ -582,7 +686,7 @@ mod tests {
 
     /// Run `sample_device_memory` with canned probes, reporting whether the GTT
     /// probe was consulted.
-    fn sample(vram: Probe<(u64, u64)>, gtt: Probe<(u64, u64)>) -> (Probe<DeviceMemory>, bool) {
+    fn sample(vram: Probe<Pool>, gtt: Probe<Pool>) -> (Probe<DeviceMemory>, bool) {
         let mut gtt_asked = false;
         let result = sample_device_memory(
             || vram,
@@ -596,7 +700,10 @@ mod tests {
 
     #[test]
     fn a_carveout_host_reads_gtt_and_the_sample_carries_it() {
-        let (result, gtt_asked) = sample(Probe::Read((512, 318)), Probe::Read((102_400, 102_360)));
+        let (result, gtt_asked) = sample(
+            Probe::Read(Pool::new(512, 318)),
+            Probe::Read(Pool::new(102_400, 102_360)),
+        );
         assert!(gtt_asked, "a carveout host must have its GTT read");
         assert_eq!(result, Probe::Read(strix_halo()));
     }
@@ -604,8 +711,8 @@ mod tests {
     #[test]
     fn a_discrete_host_never_makes_the_gtt_call() {
         let (result, gtt_asked) = sample(
-            Probe::Read((196_592, 196_309)),
-            Probe::Read((1_000_000, 1_000_000)),
+            Probe::Read(Pool::new(196_592, 196_309)),
+            Probe::Read(Pool::new(1_000_000, 1_000_000)),
         );
         assert!(
             !gtt_asked,
@@ -622,14 +729,17 @@ mod tests {
     fn a_carveout_host_whose_gtt_probe_failed_is_unreadable_not_judged_by_vram() {
         // VRAM alone would read as "drained" here (free is above its floor), so
         // falling back to it would hide a GTT-backed allocation still held.
-        let (result, gtt_asked) = sample(Probe::Read((512, 500)), Probe::Unreadable);
+        let (result, gtt_asked) = sample(Probe::Read(Pool::new(512, 500)), Probe::Unreadable);
         assert!(gtt_asked);
         assert_eq!(result, Probe::Unreadable);
     }
 
     #[test]
     fn a_zero_gtt_total_is_a_failed_reading_not_a_pool() {
-        let (result, _) = sample(Probe::Read((512, 500)), Probe::Read((0, 0)));
+        let (result, _) = sample(
+            Probe::Read(Pool::new(512, 500)),
+            Probe::Read(Pool::new(0, 0)),
+        );
         assert_eq!(result, Probe::Unreadable);
     }
 
@@ -637,14 +747,14 @@ mod tests {
     fn a_zero_vram_total_is_a_failed_reading_not_a_drained_host() {
         // With no GTT tool the sample would otherwise be judged by a VRAM pool
         // whose floor is zero, which is drained by definition.
-        let (result, gtt_asked) = sample(Probe::Read((0, 0)), Probe::Absent);
+        let (result, gtt_asked) = sample(Probe::Read(Pool::new(0, 0)), Probe::Absent);
         assert_eq!(result, Probe::Unreadable);
         assert!(!gtt_asked);
     }
 
     #[test]
     fn a_carveout_host_with_no_gtt_tool_keeps_the_vram_behaviour() {
-        let (result, gtt_asked) = sample(Probe::Read((512, 318)), Probe::Absent);
+        let (result, gtt_asked) = sample(Probe::Read(Pool::new(512, 318)), Probe::Absent);
         assert!(gtt_asked);
         let Probe::Read(memory) = result else {
             panic!("a host without a GTT tool still has a VRAM sample: {result:?}");
@@ -656,11 +766,11 @@ mod tests {
     #[test]
     fn a_vram_probe_that_is_absent_or_unreadable_is_passed_through_without_asking_for_gtt() {
         assert_eq!(
-            sample(Probe::Absent, Probe::Read((102_400, 102_360))),
+            sample(Probe::Absent, Probe::Read(Pool::new(102_400, 102_360))),
             (Probe::Absent, false)
         );
         assert_eq!(
-            sample(Probe::Unreadable, Probe::Read((102_400, 102_360))),
+            sample(Probe::Unreadable, Probe::Read(Pool::new(102_400, 102_360))),
             (Probe::Unreadable, false)
         );
     }
@@ -716,7 +826,7 @@ mod tests {
                     card0,107374182400,41787392\n";
         assert_eq!(
             parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory"),
-            Some((102_400, 102_360))
+            Some(Pool::new(102_400, 102_360))
         );
     }
 
@@ -726,7 +836,7 @@ mod tests {
                     card0,536870912,203321344\n";
         assert_eq!(
             parse_rocm_smi_csv_pool(text, "Total Memory", "Total Used Memory"),
-            Some((512, 318))
+            Some(Pool::new(512, 318))
         );
     }
 
@@ -822,6 +932,7 @@ mod tests {
             Verdict::Unreadable {
                 last_reading: None,
                 samples: UNREAD_SAMPLES_BEFORE_GIVING_UP,
+                hint: None,
             }
         );
         let line = describe_verdict(verdict, 24);
@@ -848,6 +959,7 @@ mod tests {
             Verdict::Unreadable {
                 last_reading: Some(select_drain_target(strix_holding(1_000))),
                 samples: UNREAD_SAMPLES_BEFORE_GIVING_UP * 3,
+                hint: None,
             }
         );
         assert_eq!(
@@ -876,6 +988,7 @@ mod tests {
             Verdict::Unreadable {
                 last_reading: Some(target),
                 samples: 1,
+                hint: None,
             }
         );
     }
@@ -883,7 +996,7 @@ mod tests {
     #[test]
     fn an_undrained_carveout_judged_without_gtt_says_it_could_not_follow_the_engines_memory() {
         // The real assembly path: amd-smi read the carveout, no tool reports GTT.
-        let (memory, _) = sample(Probe::Read((512, 318)), Probe::Absent);
+        let (memory, _) = sample(Probe::Read(Pool::new(512, 318)), Probe::Absent);
         let mut wait = DrainWait::default();
         assert_eq!(wait.observe(judge(memory)), None);
         let line = describe_verdict(wait.timed_out(), 120);
@@ -914,6 +1027,222 @@ mod tests {
             let line = describe_verdict(held, 120);
             assert!(!line.contains("carveout"), "{line}");
         }
+    }
+
+    /// What `amd-smi metric -m` prints, per GPU, with the lines the parser reads
+    /// among others it must not confuse with them.
+    const AMD_SMI_GPU0: &str = "GPU: 0\n    MEM_USAGE:\n        TOTAL_VRAM: 196592 MB\n        \
+                                USED_VRAM: 283 MB\n        FREE_VRAM: 196309 MB\n        \
+                                TOTAL_VISIBLE_VRAM: 196592 MB\n        FREE_VISIBLE_VRAM: 196309 MB\n";
+
+    #[test]
+    fn amd_smi_vram_reads_the_total_and_free_lines_in_mib() {
+        assert_eq!(
+            parse_amd_smi_vram(AMD_SMI_GPU0),
+            Some(Pool::new(196_592, 196_309))
+        );
+    }
+
+    #[test]
+    fn amd_smi_vram_takes_the_first_gpu_and_ignores_indentation_and_units() {
+        let two = format!("{AMD_SMI_GPU0}GPU: 1\n  TOTAL_VRAM: 1 MB\n  FREE_VRAM: 2 MB\n");
+        assert_eq!(parse_amd_smi_vram(&two), Some(Pool::new(196_592, 196_309)));
+        // Tabs, wide gaps, any unit word and a missing space after the colon all
+        // read the same way: the number after the name is the value.
+        assert_eq!(
+            parse_amd_smi_vram("\tTOTAL_VRAM:   512   MiB\n   FREE_VRAM:318\n"),
+            Some(Pool::new(512, 318))
+        );
+        assert_eq!(
+            parse_amd_smi_vram("TOTAL_VRAM: 512\r\nFREE_VRAM: 318 MB\r\n"),
+            Some(Pool::new(512, 318))
+        );
+    }
+
+    #[test]
+    fn amd_smi_vram_needs_both_fields_as_numbers() {
+        assert_eq!(parse_amd_smi_vram("TOTAL_VRAM: 512 MB\n"), None);
+        assert_eq!(parse_amd_smi_vram("FREE_VRAM: 318 MB\n"), None);
+        assert_eq!(
+            parse_amd_smi_vram("TOTAL_VRAM: N/A\nFREE_VRAM: 318 MB\n"),
+            None
+        );
+        assert_eq!(parse_amd_smi_vram("no such fields here"), None);
+        assert_eq!(parse_amd_smi_vram(""), None);
+        // The visible-VRAM lines are different fields, not the ones asked for.
+        assert_eq!(
+            parse_amd_smi_vram("TOTAL_VISIBLE_VRAM: 512 MB\nFREE_VISIBLE_VRAM: 318 MB\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_zero_amd_smi_total_parses_and_is_then_rejected_as_a_failed_read() {
+        let zero = "TOTAL_VRAM: 0 MB\nFREE_VRAM: 0 MB\n";
+        let parsed = parse_amd_smi_vram(zero).expect("parses");
+        assert_eq!(parsed, Pool::new(0, 0));
+        let (result, gtt_asked) = sample(Probe::Read(parsed), Probe::Absent);
+        assert_eq!(result, Probe::Unreadable);
+        assert!(!gtt_asked);
+    }
+
+    #[test]
+    fn output_hint_is_the_first_nonblank_line_bounded_and_printable() {
+        assert_eq!(
+            output_hint(
+                "rocm-smi gtt",
+                "\n  \ndevice,VRAM Total Memory (B)\ncard0,1\n"
+            ),
+            "rocm-smi gtt printed \"device,VRAM Total Memory (B)\""
+        );
+        assert_eq!(output_hint("tool", ""), "tool printed no output");
+        assert_eq!(output_hint("tool", " \n\t\n"), "tool printed no output");
+        // Non-ASCII and control characters are replaced, not repeated.
+        assert_eq!(
+            output_hint("tool", "GTT \u{1b}[31mT\u{f6}tal\u{0}"),
+            "tool printed \"GTT ?[31mT?tal?\""
+        );
+        // Quotes and backslashes are escaped by the quoting.
+        assert_eq!(
+            output_hint("tool", "a\"b\\c"),
+            "tool printed \"a\\\"b\\\\c\""
+        );
+        let long = "x".repeat(HINT_MAX_CHARS + 50);
+        let hint = output_hint("tool", &long);
+        assert_eq!(
+            hint,
+            format!("tool printed \"{}...\"", "x".repeat(HINT_MAX_CHARS))
+        );
+        let exact = "y".repeat(HINT_MAX_CHARS);
+        assert_eq!(
+            output_hint("tool", &exact),
+            format!("tool printed \"{exact}\"")
+        );
+    }
+
+    #[test]
+    fn output_a_parser_rejects_is_unparsed_with_what_it_printed_not_plain_unreadable() {
+        let header = "device,GTT Total (B),GTT Used (B)\ncard0,107374182400,41787392\n";
+        let probe = Probe::Read(header.to_owned()).parse_text("rocm-smi gtt", |text| {
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory")
+        });
+        assert_eq!(
+            probe,
+            Probe::Unparsed(
+                "rocm-smi gtt printed \"device,GTT Total (B),GTT Used (B)\"".to_owned()
+            )
+        );
+        // Right headers still read, and a tool that is absent or failed is not
+        // given a hint it has not earned.
+        let good = "device,GTT Total Memory (B),GTT Total Used Memory (B)\ncard0,1048576,0\n";
+        assert_eq!(
+            Probe::Read(good.to_owned()).parse_text("x", |t| {
+                parse_rocm_smi_csv_pool(t, "GTT Total Memory", "GTT Total Used Memory")
+            }),
+            Probe::Read(Pool::new(1, 1))
+        );
+        assert_eq!(
+            Probe::<String>::Absent.parse_text("x", |_| Some(0_u8)),
+            Probe::Absent
+        );
+        assert_eq!(
+            Probe::<String>::Unreadable.parse_text("x", |_| Some(0_u8)),
+            Probe::Unreadable
+        );
+    }
+
+    #[test]
+    fn a_fallback_tool_that_printed_something_unknown_keeps_what_it_printed() {
+        let unparsed = || Probe::<u8>::Unparsed("amd-smi printed \"GPU: 0\"".to_owned());
+        assert_eq!(
+            unparsed().or_else(|| Probe::Absent),
+            unparsed(),
+            "an absent fallback leaves the first tool's output visible"
+        );
+        assert_eq!(Probe::Absent.or_else(unparsed), unparsed());
+        assert_eq!(Probe::Unreadable.or_else(unparsed), unparsed());
+        assert_eq!(unparsed().or_else(|| Probe::Unreadable), unparsed());
+        assert_eq!(unparsed().or_else(|| Probe::Read(7)), Probe::Read(7));
+        // The first tool's output wins when both printed something.
+        assert_eq!(
+            unparsed().or_else(|| Probe::Unparsed("rocm-smi printed \"x\"".to_owned())),
+            unparsed()
+        );
+    }
+
+    #[test]
+    fn a_carveout_host_whose_gtt_output_was_not_understood_carries_what_it_printed() {
+        let hint = "rocm-smi gtt printed \"device,GTT Total (B)\"";
+        let (result, gtt_asked) = sample(
+            Probe::Read(Pool::new(512, 318)),
+            Probe::Unparsed(hint.to_owned()),
+        );
+        assert!(gtt_asked);
+        assert_eq!(result, Probe::Unparsed(hint.to_owned()));
+        // And a VRAM probe's unparsed output passes through without asking for GTT.
+        let (result, gtt_asked) = sample(Probe::Unparsed(hint.to_owned()), Probe::Absent);
+        assert_eq!(result, Probe::Unparsed(hint.to_owned()));
+        assert!(!gtt_asked);
+        assert_eq!(judge(result), Judgement::Unparsed(hint.to_owned()));
+    }
+
+    #[test]
+    fn what_a_tool_printed_reaches_the_final_line_when_it_never_reads() {
+        let hint = "rocm-smi --showmeminfo gtt --csv printed \"device,GTT Total (B)\"";
+        let mut wait = DrainWait::default();
+        for _ in 1..UNREAD_SAMPLES_BEFORE_GIVING_UP {
+            assert_eq!(wait.observe(Judgement::Unparsed(hint.to_owned())), None);
+        }
+        let verdict = wait
+            .observe(Judgement::Unparsed(hint.to_owned()))
+            .expect("the third unread sample ends the wait");
+        assert_eq!(
+            describe_verdict(verdict, 9),
+            "device state: could not read device memory (3 samples in 9s; the GPU tool is \
+             installed but gave no usable reading; rocm-smi --showmeminfo gtt --csv printed \
+             \"device,GTT Total (B)\")"
+        );
+    }
+
+    #[test]
+    fn what_a_tool_printed_is_kept_through_later_plain_failures_and_dropped_by_a_reading() {
+        let hint = "rocm-smi printed \"hdr\"";
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(Judgement::Unparsed(hint.to_owned())), None);
+        // A later timeout does not erase the evidence of the earlier sample.
+        assert_eq!(wait.observe(Judgement::Unreadable), None);
+        let Verdict::Unreadable { hint: kept, .. } = wait.timed_out() else {
+            panic!("two unread samples are unreadable at the deadline");
+        };
+        assert_eq!(kept.as_deref(), Some(hint));
+        // A reading shows the output is understood after all.
+        assert_eq!(wait.observe(undrained()), None);
+        assert_eq!(wait.observe(Judgement::Unreadable), None);
+        let Verdict::Unreadable {
+            hint: after,
+            last_reading,
+            ..
+        } = wait.timed_out()
+        else {
+            panic!("the last sample was unreadable");
+        };
+        assert_eq!(after, None);
+        assert!(last_reading.is_some());
+    }
+
+    #[test]
+    fn a_hint_follows_the_last_reading_on_the_line_when_the_deadline_finds_it_unreadable() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(undrained()), None);
+        assert_eq!(
+            wait.observe(Judgement::Unparsed("t printed \"h\"".to_owned())),
+            None
+        );
+        assert_eq!(
+            describe_verdict(wait.timed_out(), 120),
+            "device state: could not read device memory at the end of 120s (last reading: \
+             1000 MiB free of 102400 MiB GTT, floor 92160 MiB; t printed \"h\")"
+        );
     }
 
     #[test]

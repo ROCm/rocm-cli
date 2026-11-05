@@ -12,8 +12,8 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::device_memory::{
-    DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Probe, bounded_stdout, describe_verdict, judge,
-    parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
+    DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Pool, Probe, bounded_stdout, describe_verdict,
+    judge, parse_amd_smi_vram, parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
@@ -305,50 +305,44 @@ async fn wait_for_free_vram() -> String {
     }
 }
 
-/// [`device_memory_mib`] off the async worker: it runs subprocesses, each bounded
-/// by `probe_budget` (at most the probe timeout, never past `deadline`), so the
-/// blocking thread it occupies is released.
+/// Device memory for GPU 0 off the async worker: VRAM via `amd-smi` (then
+/// `rocm-smi`), plus the GTT pool from `rocm-smi` where the host needs it (see
+/// [`sample_device_memory`] for when GTT is read and what a failed read means).
+/// `amd-smi` is not asked for GTT: its output has no field this harness has been
+/// checked against, whereas the preflight step already reads `rocm-smi`'s GTT
+/// rows on these hosts. It runs subprocesses, each bounded by `probe_budget` (at
+/// most the probe timeout, never past `deadline`), so the blocking thread it
+/// occupies is released.
 async fn probe_device_memory(deadline: Instant) -> Probe<DeviceMemory> {
-    tokio::task::spawn_blocking(move || device_memory_mib(deadline))
-        .await
-        .unwrap_or(Probe::Unreadable)
+    tokio::task::spawn_blocking(move || {
+        sample_device_memory(|| vram_pool(deadline), || gtt_pool(deadline))
+    })
+    .await
+    .unwrap_or(Probe::Unreadable)
 }
 
-/// Device memory for GPU 0: VRAM via `amd-smi` (then `rocm-smi`), plus the GTT
-/// pool from `rocm-smi` where the host needs it (see [`sample_device_memory`]
-/// for when GTT is read and what a failed read means). `amd-smi` is not asked
-/// for GTT: its output has no field this harness has been checked against,
-/// whereas the preflight step already reads `rocm-smi`'s GTT rows on these
-/// hosts.
-fn device_memory_mib(deadline: Instant) -> Probe<DeviceMemory> {
-    sample_device_memory(|| vram_mib(deadline), || gtt_mib(deadline))
-}
-
-/// `(total, free)` GTT in MiB for GPU 0, via `rocm-smi`.
-fn gtt_mib(deadline: Instant) -> Probe<(u64, u64)> {
+/// GTT for GPU 0, via `rocm-smi`. The command is named in the report when its
+/// output is not understood, so the first run on a host shows the CSV header the
+/// column names were meant to match.
+fn gtt_pool(deadline: Instant) -> Probe<Pool> {
     use std::process::Command;
     let mut command = Command::new("rocm-smi");
     command.args(["--showmeminfo", "gtt", "--csv"]);
     bounded_stdout(command, probe_budget(Instant::now(), deadline))
-        .parse(|text| parse_rocm_smi_csv_pool(&text, "GTT Total Memory", "GTT Total Used Memory"))
+        .parse_text("rocm-smi --showmeminfo gtt --csv", |text| {
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory")
+        })
 }
 
-/// `(total, free)` device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`).
-fn vram_mib(deadline: Instant) -> Probe<(u64, u64)> {
+/// Device VRAM for GPU 0, via `amd-smi` (then `rocm-smi`).
+fn vram_pool(deadline: Instant) -> Probe<Pool> {
     use std::process::Command;
     // amd-smi: lines like "        TOTAL_VRAM: 196592 MB" / "FREE_VRAM: 196309 MB".
     let amd_smi = || {
         let mut command = Command::new("amd-smi");
         command.args(["metric", "-m"]);
-        bounded_stdout(command, probe_budget(Instant::now(), deadline)).parse(|text| {
-            let field = |name: &str| {
-                text.lines()
-                    .find_map(|l| l.trim().strip_prefix(name))
-                    .and_then(|v| v.split_whitespace().next())
-                    .and_then(|n| n.parse::<u64>().ok())
-            };
-            Some((field("TOTAL_VRAM:")?, field("FREE_VRAM:")?))
-        })
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
+            .parse_text("amd-smi metric -m", parse_amd_smi_vram)
     };
     // rocm-smi fallback: `--showmeminfo vram --csv` → vram total/used per card.
     let rocm_smi = || {
@@ -356,7 +350,9 @@ fn vram_mib(deadline: Instant) -> Probe<(u64, u64)> {
         command.args(["--showmeminfo", "vram", "--csv"]);
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
         bounded_stdout(command, probe_budget(Instant::now(), deadline))
-            .parse(|text| parse_rocm_smi_csv_pool(&text, "Total Memory", "Total Used Memory"))
+            .parse_text("rocm-smi --showmeminfo vram --csv", |text| {
+                parse_rocm_smi_csv_pool(text, "Total Memory", "Total Used Memory")
+            })
     };
     amd_smi().or_else(rocm_smi)
 }
