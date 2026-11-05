@@ -100,6 +100,24 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so i
 serve_timeout_secs = 90
 flaky = true
 
+# serve-40 serves the same small GGUF model through the same lemonade managed serve
+# as the rows above, so on a lemonade LINUX host its When step never sees the model
+# on /v1/models and panics before the Then assertion runs. Scoped like those rows
+# (os=linux: the Strix Halo Windows lane reports no unexpected failure). The cause
+# on the Strix Halo Ubuntu lanes is not settled and varies between runs (#897), so
+# this row names that issue rather than EAI-7423 and carries `flaky = true` like
+# its siblings. While it is in place the scenario's own check (serve starts no
+# background helper when no watcher is enabled) is not exercised on those lanes,
+# and a genuine failure of that check on a Linux lemonade host would also read as
+# a failure that was expected. `flaky` also means a fixed #897 is not flagged as a
+# stale row, so delete the row by hand when #897 is closed.
+[["serve-stop-leaves-no-background-helper"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "#897"
+reason = "Lemonade serving fails on the Strix Halo Ubuntu lanes, so the model never appears on /v1/models and the helper check is never reached."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "vllm" }

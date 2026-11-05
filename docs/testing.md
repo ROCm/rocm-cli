@@ -1735,7 +1735,11 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper).
+(GPU lane: serving with no watcher enabled starts no helper; on a lemonade
+Linux host such as the Strix Halo Ubuntu lanes it is an expected failure in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
+serving there is broken (#897), so the helper check itself runs only on the
+lanes where lemonade serves).
 
 Natural-language plan handoff tests:
 

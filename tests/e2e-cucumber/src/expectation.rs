@@ -2245,6 +2245,31 @@ flaky = true
         ));
     }
 
+    /// serve-40 serves through the same lemonade managed serve as serve-07, so
+    /// its row is scoped the same way: xfail on a lemonade Linux host, with the
+    /// same shortened serve wait, and not an expected failure on native Windows.
+    /// The row must stay `flaky` (a fixed #897 would otherwise turn the Ubuntu
+    /// lanes red as a stale XPASS) and must name #897.
+    #[test]
+    fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let id = "serve-stop-leaves-no-background-helper";
+        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
+        assert_eq!(
+            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+            m.serve_timeout_for("serve-lemonade-inference", &cap("strix-ubuntu"), "lemonade"),
+        );
+        assert_eq!(
+            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+            Some(90)
+        );
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
+        let entries = m.entries_for(id);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].flaky);
+        assert_eq!(entries[0].bug, "#897");
+    }
+
     #[test]
     fn glob_matches_family() {
         assert!(glob_match("gfx94*", "gfx942"));
