@@ -45,11 +45,10 @@
 //! `builtin_engine_request`, and `ScopedEnvVar` have no callers outside this
 //! module and stay private. Shared helpers this module calls back into at the
 //! crate root — `with_sigpipe_ignored` and `device_policy_name` — stay in
-//! `main.rs` and are reached
-//! unqualified via `use crate::{...}`, same as for other mechanically
-//! relocated modules. `parse_device_policy` moved out of `main.rs` into
-//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via `use
-//! crate::gpu_policy::parse_device_policy;` instead. `apply_app_path_env`,
+//! `main.rs` and are reached unqualified via `use crate::{...}`, same as for
+//! other mechanically relocated modules. `parse_device_policy` moved out of
+//! `main.rs` into `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via
+//! `use crate::gpu_policy::parse_device_policy;` instead. `apply_app_path_env`,
 //! `app_path_env_vars`, `optional_arg`, and `engine_recipe_json_arg` moved out
 //! of `main.rs` into `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this
 //! file's `use` list below points there now instead of at the crate root.
