@@ -376,6 +376,20 @@ documents. Do not generate those production keys inside CI. Once published, the
 installers, metadata cache, and model recipe index can make release-channel
 signature verification mandatory by default with those keys as trust roots.
 
+Those trust roots are pinned copies of the published keys: the
+`PINNED_RELEASE_PUBLIC_KEY_CURRENT`/`_NEXT` slots in
+[install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
+[install.ps1](../install.ps1), and
+`PINNED_METADATA_PUBLIC_KEY_PEM` in
+[fetch.rs](../apps/rocm/src/therock/fetch.rs). CI and the release and nightly
+workflows run `cargo xtask verify-pinned-keys`, which fails when a pinned copy
+differs from its canonical file under `docs/keys/`. It reads the one assignment
+the installer actually uses, so each slot must be assigned exactly once as a
+plain declaration, a slot whose key is not published yet must stay `""`, and
+`install.sh` must mark both of its slots `readonly`. The full rules, and what a
+textual check cannot catch, are in
+[verify_pinned_keys.rs](../xtask/src/verify_pinned_keys.rs).
+
 When those owner-controlled inputs exist, release operators can add
 `--require-production-trust` or set `ROCM_CLI_REQUIRE_PRODUCTION_TRUST=1` so the
 dist verifier fails unless the release signing public key, runtime metadata

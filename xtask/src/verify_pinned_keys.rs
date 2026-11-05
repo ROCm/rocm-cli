@@ -20,8 +20,10 @@
 //!   a second assignment, a key pasted into the wrong slot. It is a textual check
 //!   of plain installer code, not an interpreter, and does not defend against
 //!   deliberately obfuscated code (a name assembled at runtime through `eval` or
-//!   `Invoke-Expression`, an assignment hidden inside a multi-line string or a
-//!   block that never runs). Anyone who can commit that can also change
+//!   `Invoke-Expression`, an assignment hidden inside a multi-line string, a
+//!   PowerShell `<# … #>` block comment or a block that never runs, a PowerShell
+//!   multiple assignment with the name first (`$Name, $x = …`), `foreach` or
+//!   `[ref]`). Anyone who can commit that can also change
 //!   `docs/keys/` in the same commit, so review is the control there.
 //! - **Dormant slots stay empty.** Until a canonical `docs/keys/` file exists and
 //!   is non-empty, its slot is not compared, but it must be exactly `""`: the
@@ -62,7 +64,8 @@
 //!   rather than guessed at.
 //! - **Read-only at runtime.** `install.sh` must mark each slot `readonly` after
 //!   assigning it, so a later write fails instead of silently replacing the trust
-//!   root. `install.ps1` does not: `irm … | iex` runs it in the caller's session,
+//!   root. The `readonly` command must name the slot itself, with no flags
+//!   (`-f` names a function, `-p` only prints) and not in a trailing comment. `install.ps1` does not: `irm … | iex` runs it in the caller's session,
 //!   where a read-only variable would outlive the run and make the next install in
 //!   that session fail (`-Force` would avoid that, but also defeats the point).
 //! - **CI cross-check.** When a CI signing public key is configured — the file
@@ -239,11 +242,15 @@ const fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// The part of a shell line before a trailing ` #` comment.
+fn shell_code(line: &str) -> &str {
+    line.split(" #").next().unwrap_or(line)
+}
+
 /// Whether `line` is `readonly`/`export` followed only by names and flags, which
 /// sets attributes without changing any value. `export NAME; unset NAME` is not.
 fn is_attribute_command(line: &str) -> bool {
-    let code = line.split(" #").next().unwrap_or(line);
-    let mut words = code.split_whitespace();
+    let mut words = shell_code(line).split_whitespace();
     matches!(words.next(), Some("readonly" | "export"))
         && words.all(|word| {
             word.starts_with('-')
@@ -331,8 +338,12 @@ fn classify(line: &str, start: usize, name: &str, embedding: Embedding) -> Optio
             if !(plain || compound) {
                 return None;
             }
-            // Only a variable scope names this variable; `$env:Name` and other
-            // drive-qualified names are something else and leave it unset.
+            // Only a variable scope names this variable, so only it can be the
+            // declaration. `$env:Name` and other drive-qualified names leave the
+            // variable unset, but are still counted as a write: a lone one is
+            // reported as an unsupported form (most likely a mistyped
+            // declaration), and next to the declaration it fails closed rather
+            // than being guessed harmless.
             let variable_scope = ["", "script", "global", "local", "private"]
                 .iter()
                 .any(|s| scope.eq_ignore_ascii_case(s));
@@ -359,6 +370,18 @@ fn classify(line: &str, start: usize, name: &str, embedding: Embedding) -> Optio
     }
 }
 
+/// Whether the occurrence of a name at `start` in `line` is named by a `readonly`
+/// command that makes it read-only: no flags (`-f` names a function, `-p` only
+/// prints), and the name in the command itself rather than its trailing comment.
+fn marks_readonly(line: &str, start: usize) -> bool {
+    let code = shell_code(line);
+    let mut words = code.split_whitespace();
+    is_attribute_command(line)
+        && words.next() == Some("readonly")
+        && words.all(|word| !word.starts_with('-'))
+        && start < code.len()
+}
+
 /// Every occurrence of `name` in `source` that can set its value, skipping
 /// whole-line comments, plus the lines of `readonly` commands naming it.
 /// PowerShell names are case-insensitive.
@@ -381,8 +404,7 @@ fn find_assignments(
                         declaration,
                     }),
                     None if matches!(embedding, Embedding::Shell)
-                        && is_attribute_command(line)
-                        && line.split_whitespace().next() == Some("readonly") =>
+                        && marks_readonly(line, start) =>
                     {
                         readonly_lines.push(index + 1);
                     }
@@ -433,9 +455,28 @@ fn extract_constant<'a>(
                 .map(|a| a.line.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let declarations: Vec<usize> = many
+                .iter()
+                .filter(|a| a.declaration)
+                .map(|a| a.line)
+                .collect();
+            let fix = match declarations.as_slice() {
+                [line] => format!(
+                    "keep the declaration on line {line} and remove or reword the \
+                     other lines{}",
+                    match embedding {
+                        Embedding::Rust => "",
+                        Embedding::Shell | Embedding::PowerShell => {
+                            " (any mention of the name outside a variable reference \
+                             counts as a write)"
+                        }
+                    }
+                ),
+                _ => format!("leave exactly one, as {}", embedding.supported_form(name)),
+            };
             return Err(format!(
                 "assigns {token} {} times (lines {lines}); {}, so exactly one \
-                 assignment is allowed",
+                 assignment is allowed: {fix}",
                 many.len(),
                 embedding.why_one()
             ));
@@ -640,12 +681,18 @@ fn check_pinned_keys(root: &Path, ci_public_key: Option<&str>) -> Result<Vec<Str
             match (&canonical_body, pinned) {
                 (Some(canonical), Some(pinned)) if pinned == *canonical => {}
                 (Some(_), _) => bail!(
-                    "{}: {} does not embed the canonical key {} in {} — the pinned \
-                     constant and the published key have diverged",
+                    "{}: {} does not embed the canonical key {} in {} (line {}) — the \
+                     pinned constant and the published key have diverged; copy the key \
+                     from {} into {}, or, if the published key is the one that is \
+                     wrong, fix {} and every source that pins it",
                     entry.name,
                     source.path,
                     entry.canonical,
-                    source.token
+                    source.token,
+                    constant.line,
+                    entry.canonical,
+                    source.token,
+                    entry.canonical
                 ),
                 (None, None) => {}
                 (None, Some(_)) => bail!(
@@ -906,13 +953,38 @@ mod tests {
     const PS_CURRENT: &str = "$PinnedReleasePublicKeyCurrent";
     const RS_META: &str = "PINNED_METADATA_PUBLIC_KEY_PEM";
 
+    /// The file the check reads `token` from, taken from [`PINNED_KEYS`] so the
+    /// tests follow the constant when it moves to another file.
+    fn source_path(token: &str) -> &'static str {
+        PINNED_KEYS
+            .iter()
+            .flat_map(|key| key.sources)
+            .find(|source| source.token == token)
+            .map_or_else(
+                || panic!("{token} is not a pinned source"),
+                |source| source.path,
+            )
+    }
+
+    /// The Rust file holding the metadata key.
+    fn rs_path() -> &'static str {
+        source_path(RS_META)
+    }
+
+    /// The Rust file's name, as the shorter error fragments name it.
+    fn rs_file() -> &'static str {
+        rs_path().rsplit('/').next().expect("a file name")
+    }
+
     /// A scratch repository with all three canonical keys published, so every
     /// slot is live rather than dormant.
     fn scratch_repo(install_sh: &str, install_ps1: &str, therock_rs: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("docs/keys")).expect("mkdir docs/keys");
-        std::fs::create_dir_all(root.join("apps/rocm/src")).expect("mkdir apps/rocm/src");
+        let rust = root.join(rs_path());
+        std::fs::create_dir_all(rust.parent().expect("a parent"))
+            .expect("mkdir the Rust source dir");
         for (file, key) in [
             ("rocm-cli-release-current-public.pem", SAMPLE),
             ("rocm-cli-release-next-public.pem", NEXT_KEY),
@@ -922,8 +994,7 @@ mod tests {
         }
         std::fs::write(root.join("install.sh"), install_sh).expect("write install.sh");
         std::fs::write(root.join("install.ps1"), install_ps1).expect("write install.ps1");
-        std::fs::write(root.join("apps/rocm/src/therock.rs"), therock_rs)
-            .expect("write therock.rs");
+        std::fs::write(rust, therock_rs).expect("write the Rust source");
         dir
     }
 
@@ -999,7 +1070,7 @@ mod tests {
         for expected in [
             "release-current: pinned in install.sh, install.ps1",
             "release-next: pinned in install.sh, install.ps1",
-            "metadata: pinned in apps/rocm/src/therock.rs",
+            &format!("metadata: pinned in {}", rs_path()),
         ] {
             assert!(messages.iter().any(|m| m == expected), "{messages:?}");
         }
@@ -1066,7 +1137,7 @@ mod tests {
         let error = empty_next("", "", &good_rs())
             .expect_err("a key pasted into a dormant Rust slot must fail");
         assert!(
-            error.contains("apps/rocm/src/therock.rs pins a key in PINNED_METADATA_PUBLIC_KEY_PEM"),
+            error.contains(&format!("{} pins a key in {RS_META}", rs_path())),
             "{error}"
         );
     }
@@ -1113,8 +1184,8 @@ mod tests {
             &good_ps1(),
             &rs,
             &[
-                "apps/rocm/src/therock.rs does not embed the canonical key",
-                RS_META,
+                &format!("{} does not embed the canonical key", rs_path()),
+                &format!("{RS_META} (line 6)"),
             ],
         );
     }
@@ -1128,7 +1199,10 @@ mod tests {
             &sh(&current),
             &good_ps1(),
             &good_rs(),
-            &["install.sh assigns PINNED_RELEASE_PUBLIC_KEY_CURRENT 2 times (lines 1, 6)"],
+            &[
+                "install.sh assigns PINNED_RELEASE_PUBLIC_KEY_CURRENT 2 times (lines 1, 6)",
+                "leave exactly one, as `PINNED_RELEASE_PUBLIC_KEY_CURRENT=\"…\"`",
+            ],
         );
     }
 
@@ -1320,7 +1394,7 @@ mod tests {
                     &good_sh(),
                     &good_ps1(),
                     &rs,
-                    &["apps/rocm/src/therock.rs", RS_META, "2 times"],
+                    &[rs_path(), RS_META, "2 times"],
                 );
             }
         }
@@ -1415,7 +1489,7 @@ mod tests {
                 &good_sh(),
                 &good_ps1(),
                 &rs,
-                &["therock.rs assigns", "unsupported form"],
+                &[&format!("{} assigns", rs_file()), "unsupported form"],
             );
         }
 
@@ -1532,9 +1606,10 @@ mod tests {
                     "const {RS_META}: &str = \"{}\";\n",
                     META.replace('\n', &format!("\n{indent}")).trim_end()
                 ),
-                &[
-                    "therock.rs PINNED_METADATA_PUBLIC_KEY_PEM on line 1 has a key line that starts with whitespace",
-                ],
+                &[&format!(
+                    "{} {RS_META} on line 1 has a key line that starts with whitespace",
+                    rs_file()
+                )],
             );
             accepted(
                 &good_sh(),
@@ -1559,7 +1634,7 @@ mod tests {
                 "const {RS_META}: &str = \"{}\";\n",
                 META.replace('\n', "\\t")
             ),
-            &["therock.rs PINNED_METADATA_PUBLIC_KEY_PEM on line 1 holds `\\`"],
+            &[&format!("{} {RS_META} on line 1 holds `\\`", rs_file())],
         );
     }
 
@@ -1583,7 +1658,10 @@ mod tests {
             &good_sh(),
             &good_ps1(),
             &format!("const {RS_META}: &str = \"\";\n"),
-            &["therock.rs does not embed the canonical key", RS_META],
+            &[
+                &format!("{} does not embed the canonical key", rs_file()),
+                RS_META,
+            ],
         );
     }
 
@@ -1624,20 +1702,21 @@ mod tests {
     /// shell command turns the assignment into a prefix that leaves it unset.
     #[test]
     fn nothing_may_follow_the_closing_quote() {
+        // `"@` closes only a here-string that opened with `@"`.
+        rejected(
+            &good_sh(),
+            &ps1(&format!("{PS_CURRENT} = \"{SAMPLE}\"@\n")),
+            &good_rs(),
+            &[
+                "install.ps1 assigns $PinnedReleasePublicKeyCurrent on line 1 to a string followed by `@",
+            ],
+        );
         for tail in [
             " -replace \"MIIB\", \"MIIC\"",
             ".Replace(\"MIIB\", \"MIIC\")",
             ".Substring(5)",
             " + \"x\"",
         ] {
-            rejected(
-                &good_sh(),
-                &ps1(&format!("{PS_CURRENT} = \"{SAMPLE}\"@\n")),
-                &good_rs(),
-                &[
-                    "install.ps1 assigns $PinnedReleasePublicKeyCurrent on line 1 to a string followed by `@",
-                ],
-            );
             rejected(
                 &good_sh(),
                 &ps1(&format!("{PS_CURRENT} = @\"\n{SAMPLE}\"@{tail}\n")),
@@ -1661,9 +1740,10 @@ mod tests {
             &good_sh(),
             &good_ps1(),
             &format!("const {RS_META}: &str = \"{META}\"; const X: u8 = 1;\n"),
-            &[
-                "therock.rs assigns PINNED_METADATA_PUBLIC_KEY_PEM on line 1 to a string followed by",
-            ],
+            &[&format!(
+                "{} assigns {RS_META} on line 1 to a string followed by",
+                rs_file()
+            )],
         );
 
         // An empty-looking slot that the runtime fills: the dormant NEXT slot has
@@ -1798,23 +1878,40 @@ mod tests {
             &["does not mark PINNED_RELEASE_PUBLIC_KEY_CURRENT"],
         );
 
-        // A `readonly` command must name the slot itself, not merely mention it.
-        for line in [
-            "readonly COPY=\"${PINNED_RELEASE_PUBLIC_KEY_CURRENT}\"",
-            "readonly OTHER=1 # PINNED_RELEASE_PUBLIC_KEY_CURRENT",
-        ] {
-            let mentioned = format!(
+        // A `readonly` command must name the slot itself, without flags: a read
+        // of it, a mention in the trailing comment, `-f` (which names a
+        // function) and `-p` (which only prints) leave the variable writable.
+        let with_line = |line: &str| {
+            format!(
                 "{}PINNED_RELEASE_PUBLIC_KEY_NEXT=\"{NEXT_KEY}\"\n{line}\n\
                  readonly PINNED_RELEASE_PUBLIC_KEY_NEXT\n",
                 sh_current()
-            );
+            )
+        };
+        for line in [
+            "readonly COPY=\"${PINNED_RELEASE_PUBLIC_KEY_CURRENT}\"",
+            "readonly OTHER # PINNED_RELEASE_PUBLIC_KEY_CURRENT",
+            "readonly -f PINNED_RELEASE_PUBLIC_KEY_CURRENT",
+            "readonly -p PINNED_RELEASE_PUBLIC_KEY_CURRENT",
+        ] {
             rejected(
-                &mentioned,
+                &with_line(line),
                 &good_ps1(),
                 &good_rs(),
-                &["install.sh", SH_CURRENT],
+                &["install.sh does not mark PINNED_RELEASE_PUBLIC_KEY_CURRENT readonly"],
             );
         }
+        // A trailing comment after an assignment is not an attribute command at
+        // all, so the mention in it counts as a second write of the slot.
+        rejected(
+            &with_line("readonly OTHER=1 # PINNED_RELEASE_PUBLIC_KEY_CURRENT"),
+            &good_ps1(),
+            &good_rs(),
+            &[
+                "install.sh assigns PINNED_RELEASE_PUBLIC_KEY_CURRENT 2 times (lines 1, 11)",
+                "keep the declaration on line 1",
+            ],
+        );
 
         // Accepted: `readonly NAME=` marks itself, and a trailing comment is fine.
         accepted(
@@ -1827,7 +1924,7 @@ mod tests {
         );
     }
 
-    /// The real installers and therock.rs pass as committed, and the check still
+    /// The real installers and Rust source pass as committed, and the check still
     /// bites on them. The copy takes every canonical key the repository
     /// publishes, so this keeps holding once the NEXT or metadata key is added.
     #[test]
@@ -1839,7 +1936,14 @@ mod tests {
                 .iter()
                 .map(|key| key.canonical)
                 .filter(|path| real.join(path).exists());
-            for path in published.chain(["install.ps1", "apps/rocm/src/therock.rs"]) {
+            // Every source the check reads except install.sh, which the caller
+            // supplies, so a source that moves is copied from where it now lives.
+            let sources = PINNED_KEYS
+                .iter()
+                .flat_map(|key| key.sources)
+                .map(|source| source.path)
+                .filter(|&path| path != "install.sh");
+            for path in published.chain(sources) {
                 let to = dir.path().join(path);
                 std::fs::create_dir_all(to.parent().unwrap()).expect("mkdir");
                 std::fs::copy(real.join(path), to).expect("copy");
