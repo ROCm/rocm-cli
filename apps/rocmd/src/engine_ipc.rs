@@ -110,8 +110,9 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
 /// Ask an engine a question about a managed service, through the stdio client
 /// `rocmd` shares with `rocm`.
 ///
-/// The engine is reached by re-executing this process's own executable as
-/// `__engine-stdio <engine>`, the verb `rocm` serves for its built-in engines.
+/// The engine is reached by running the `rocm` executable as
+/// `__engine-stdio <engine>`, the verb `rocm` serves for its built-in engines
+/// ([`rocm_executable`] says which executable that is).
 pub(crate) fn engine_request<T, R>(
     paths: &AppPaths,
     engine: &str,
@@ -124,9 +125,37 @@ where
     R: DeserializeOwned,
 {
     let envelope = engine_request_envelope(method, request)?;
-    let engine_binary =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+    let engine_binary = rocm_executable()?;
     engine_request_via(&engine_binary, paths, engine, service_id, &envelope)
+}
+
+/// The `rocm` executable that serves `__engine-stdio`.
+///
+/// `rocmd` runs in two shapes. Embedded, as `rocm daemon`, this process
+/// is `rocm` and its own executable is the answer. Run as the standalone
+/// `rocmd` binary shipped beside `rocm`, its own executable has no such verb
+/// (its parser answers "unrecognized subcommand"), so every engine request
+/// failed; there the answer is the `rocm` next to it.
+fn rocm_executable() -> Result<PathBuf> {
+    let current =
+        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+    rocm_executable_from(current, || rocm_core::sibling_binary_path("rocm"))
+}
+
+/// [`rocm_executable`] given this process's executable and the way to find a
+/// sibling `rocm`, so the choice can be tested without either.
+fn rocm_executable_from(
+    current: PathBuf,
+    sibling_rocm: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    // Exactly `rocmd` (or `rocmd.exe`). A renamed or test binary is not known to
+    // lack the verb, and has no `rocm` beside it to prefer.
+    if current.file_stem().is_some_and(|stem| stem == "rocmd") {
+        return sibling_rocm().context(
+            "the standalone rocmd needs the rocm executable beside it to reach an engine",
+        );
+    }
+    Ok(current)
 }
 
 /// [`engine_request`] with the executable that serves `__engine-stdio` named by
@@ -346,6 +375,48 @@ mod tests {
     // run `rocmd`'s entry point against a stand-in engine child and pin what
     // `rocmd` chooses: the verb, the environment and the stderr handling. The
     // other caller's choices are pinned in `apps/rocm/src/engine_ipc.rs`.
+
+    #[test]
+    fn the_standalone_rocmd_reaches_engines_through_the_rocm_beside_it() {
+        let beside = || Ok(PathBuf::from("/opt/rocm-cli/bin/rocm"));
+
+        // The standalone binary has no `__engine-stdio` verb, so it must not
+        // re-execute itself.
+        for standalone in ["/opt/rocm-cli/bin/rocmd", "C:/rocm-cli/bin/rocmd.exe"] {
+            assert_eq!(
+                rocm_executable_from(PathBuf::from(standalone), beside).unwrap(),
+                Path::new("/opt/rocm-cli/bin/rocm"),
+                "{standalone}"
+            );
+        }
+
+        // Embedded as `rocm daemon`, this process is `rocm`; a test binary
+        // or a renamed copy has no `rocm` beside it to prefer.
+        for own in [
+            "/opt/rocm-cli/bin/rocm",
+            "C:/rocm-cli/bin/rocm.exe",
+            "/work/target/debug/deps/rocmd-0f3a9c1d",
+            "/opt/rocm-cli/bin/rocm-0.3",
+        ] {
+            let chosen = rocm_executable_from(PathBuf::from(own), || {
+                panic!("{own} has no use for a sibling")
+            })
+            .unwrap();
+            assert_eq!(chosen, Path::new(own));
+        }
+
+        // A standalone `rocmd` with no `rocm` beside it fails with a message that
+        // says why, rather than running something that cannot serve the verb.
+        let error = rocm_executable_from(PathBuf::from("/opt/rocm-cli/bin/rocmd"), || {
+            anyhow::bail!("unable to locate sibling binary rocm")
+        })
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "the standalone rocmd needs the rocm executable beside it to reach an engine: \
+             unable to locate sibling binary rocm"
+        );
+    }
 
     #[test]
     fn rocmd_runs_the_child_on_its_own_paths_keeps_stderr_and_asks_for_no_progress() {
