@@ -251,6 +251,28 @@ pub(crate) fn attach_background_stdio(
 /// immediately" (e.g. `" with status exit status: 1"` on Unix, where a real
 /// `ExitStatus` is available; empty on Windows, where the liveness check
 /// below only has a yes/no answer, not an exit code).
+/// Windows spawn-liveness check: wait out the startup window, then fail with the
+/// startup log when the child is already gone. The wait and the liveness probe
+/// are injected so a unit test runs the exit-detected path on every platform,
+/// including the Windows lane that actually calls it.
+///
+/// # Errors
+/// Fails with the startup-failure detail when `is_running` reports the child dead.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ensure_spawned_child_survives_startup(
+    child_pid: u32,
+    log_path: &Path,
+    settle: impl FnOnce(),
+    is_running: impl FnOnce(u32) -> bool,
+) -> Result<()> {
+    settle();
+    if is_running(child_pid) {
+        Ok(())
+    } else {
+        bail!("{}", managed_engine_startup_failure_detail("", log_path))
+    }
+}
+
 pub(crate) fn managed_engine_startup_failure_detail(
     status_clause: &str,
     log_path: &Path,
@@ -356,14 +378,17 @@ fn live_managed_services(paths: &AppPaths) -> Vec<ManagedServiceRecord> {
 
 /// Ports that live managed services still own.
 ///
-/// Conservative by design: a record reserves its port regardless of the host it
-/// recorded, because a `0.0.0.0` (or `localhost`) listener also blocks the
-/// loopback address a new local server would bind. Over-reserving costs one
-/// candidate in a 101-port scan; under-reserving costs a collision.
+/// Conservative by design: on the default loopback host a record reserves its
+/// port regardless of the host it recorded, because a `0.0.0.0` (or `localhost`)
+/// listener also blocks the loopback address a new local server would bind.
+/// Over-reserving costs one candidate in a 101-port scan; under-reserving costs
+/// a collision. On a custom host the recorded host is compared (see
+/// `serve_port::hosts_overlap`).
 fn reserved_service_ports(live: &[ManagedServiceRecord]) -> Vec<serve_port::ReservedPort> {
     live.iter()
         .map(|record| serve_port::ReservedPort {
             port: record.port,
+            host: record.host.clone(),
             service_id: record.service_id.clone(),
             status: record.status.clone(),
         })
@@ -890,13 +915,12 @@ fn launch_managed_engine_child_locked(
         // Set before the immediate-exit check below, so a bail! here still leaves
         // `record.engine_pid` telling cleanup that a child was spawned.
         record.engine_pid = Some(child_pid);
-        thread::sleep(Duration::from_millis(200));
-        if !process_is_running(child_pid) {
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail("", &record.log_path)
-            );
-        }
+        ensure_spawned_child_survives_startup(
+            child_pid,
+            &record.log_path,
+            || thread::sleep(Duration::from_millis(200)),
+            process_is_running,
+        )?;
         child_pid
     };
     #[cfg(not(windows))]
@@ -1927,6 +1951,28 @@ fn finish_attached_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_that_exited_during_the_startup_window_is_reported_with_its_log() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("engine.log");
+        fs::write(&log, "boom: engine could not start\n")?;
+        let settled = std::cell::Cell::new(false);
+        let error = ensure_spawned_child_survives_startup(
+            4242,
+            &log,
+            || settled.set(true),
+            |pid| {
+                assert_eq!(pid, 4242);
+                false
+            },
+        )
+        .expect_err("a dead child must fail the launch");
+        assert!(settled.get(), "the startup window must elapse first");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        ensure_spawned_child_survives_startup(4242, &log, || {}, |_| true)?;
+        Ok(())
+    }
     use crate::tests::test_paths;
     use rocm_core::DEFAULT_LOCAL_HOST;
 

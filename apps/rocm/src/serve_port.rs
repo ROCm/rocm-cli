@@ -80,6 +80,8 @@ impl PortRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReservedPort {
     pub(crate) port: u16,
+    /// The host the holding service recorded.
+    pub(crate) host: String,
     pub(crate) service_id: String,
     pub(crate) status: String,
 }
@@ -126,6 +128,23 @@ pub(crate) fn loopback_bind_probe(port: u16) -> io::Result<LoopbackPortLease> {
     rocm_core::lease_loopback_port(port)
 }
 
+/// Whether two bind hosts can contend for the same port: identical spellings, or
+/// either side a wildcard listener, which also covers every specific address.
+fn hosts_overlap(a: &str, b: &str) -> bool {
+    const WILDCARDS: [&str; 3] = ["0.0.0.0", "::", "[::]"];
+    a.eq_ignore_ascii_case(b) || WILDCARDS.contains(&a) || WILDCARDS.contains(&b)
+}
+
+fn reserved_message(host: &str, port: u16, owner: &ReservedPort) -> String {
+    format!(
+        "{host}:{port} is already reserved by managed service {} ({}). Stop it with `{}`, or \
+         pass a different `--port`.",
+        owner.service_id,
+        owner.status,
+        service_hints::service_stop_hint(&owner.service_id)
+    )
+}
+
 /// Turn a [`PortRequest`] into one concrete, leased port.
 ///
 /// Callers must hold the shared managed-service allocation lock across this call
@@ -151,13 +170,19 @@ pub(crate) fn resolve_serve_port(
         // or failure stays engine-owned. Automatic is refused here as well as in
         // `serve()`, because this is the shared choke point every caller reaches
         // — and it is refused by returning an error, never by panicking.
-        // The managed-service reservation check below is deliberately skipped:
-        // a record stores a port but not the interface it bound, so applying it
-        // to another host could refuse a launch on a different interface.
         validate_port_request(host, request)?;
         let Some(port) = request.explicit() else {
             bail!("automatic port selection is not available on host {host}");
         };
+        // Bind success stays engine-owned, but a live managed service already on
+        // this port on an overlapping host is refused here, not after the model
+        // load. The OS probe stays canonical-only.
+        if let Some(owner) = reserved
+            .iter()
+            .find(|entry| entry.port == port && hosts_overlap(&entry.host, host))
+        {
+            bail!("{}", reserved_message(host, port, owner));
+        }
         return Ok(LoopbackPortLease::engine_owned(port));
     }
 
@@ -171,13 +196,7 @@ pub(crate) fn resolve_serve_port(
                 // explicit port then resolves. A full CLI-level E2E for this needs
                 // a real GPU, since reaching this branch requires a completed
                 // model/engine resolution first.
-                bail!(
-                    "{DEFAULT_LOCAL_HOST}:{port} is already reserved by managed service {} \
-                     ({}). Stop it with `{}`, or pass a different `--port`.",
-                    owner.service_id,
-                    owner.status,
-                    service_hints::service_stop_hint(&owner.service_id)
-                );
+                bail!("{}", reserved_message(DEFAULT_LOCAL_HOST, port, owner));
             }
             probe(port).map_err(|error| explicit_bind_error(port, &error))
         }
@@ -231,6 +250,7 @@ mod tests {
     fn reserved(port: u16, service_id: &str, status: &str) -> ReservedPort {
         ReservedPort {
             port,
+            host: DEFAULT_LOCAL_HOST.to_owned(),
             service_id: service_id.to_owned(),
             status: status.to_owned(),
         }
@@ -301,17 +321,41 @@ mod tests {
         let mut probe = |_port: u16| -> io::Result<LoopbackPortLease> {
             panic!("custom hosts must not be preflighted against IPv4 loopback")
         };
-        // Even a port a live loopback service reserves is passed straight
+        // A port reserved only on a different, specific host is passed straight
         // through: the engine owns bind on that address.
+        let mut other = reserved(11_435, "svc-a", "running");
+        other.host = "192.168.1.5".to_owned();
         let lease = resolve_serve_port(
-            "0.0.0.0",
+            "10.0.0.7",
             PortRequest::Explicit(11_435),
-            &[reserved(11_435, "svc-a", "running")],
+            &[other],
             &mut probe,
         )
         .expect("custom host explicit port is engine-owned");
         assert_eq!(lease.port(), 11_435);
         assert!(!lease.is_held());
+    }
+
+    #[test]
+    fn custom_host_explicit_port_held_on_an_overlapping_host_is_refused() {
+        let mut probe = |_port: u16| -> io::Result<LoopbackPortLease> {
+            panic!("custom hosts must not be preflighted against IPv4 loopback")
+        };
+        // Same spelling, and a wildcard holder against a specific host.
+        for (holder, requested) in [("localhost", "localhost"), ("0.0.0.0", "localhost")] {
+            let mut owner = reserved(11_435, "svc-a", "running");
+            owner.host = holder.to_owned();
+            let error = resolve_serve_port(
+                requested,
+                PortRequest::Explicit(11_435),
+                &[owner],
+                &mut probe,
+            )
+            .expect_err("an overlapping live holder must refuse the port");
+            let text = error.to_string();
+            assert!(text.contains("svc-a"), "{holder}/{requested}: {text}");
+            assert!(text.contains(&format!("{requested}:11435")), "{text}");
+        }
     }
 
     #[test]
