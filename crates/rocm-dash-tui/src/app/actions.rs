@@ -1468,6 +1468,42 @@ mod tests {
     }
 
     #[test]
+    fn esc_menu_selection_wraps_over_its_three_rows_and_each_row_runs_its_own_action() {
+        let mut s = st();
+        apply_action(&mut s, KeyAction::OpenMenu);
+        assert_eq!(s.menu_sel, 0, "the menu opens on its first row");
+        // Up from the first row wraps to the last; down from the last wraps
+        // back to the first.
+        apply_action(&mut s, KeyAction::MenuMove(-1));
+        assert_eq!(s.menu_sel, 2);
+        apply_action(&mut s, KeyAction::MenuMove(1));
+        assert_eq!(s.menu_sel, 0);
+        // A full lap of down-presses visits every row once and comes back.
+        let mut lap = Vec::new();
+        for _ in 0..3 {
+            apply_action(&mut s, KeyAction::MenuMove(1));
+            lap.push(s.menu_sel);
+        }
+        assert_eq!(lap, [1, 2, 0]);
+        assert_eq!(s.modal, Modal::Menu, "moving never closes the menu");
+
+        // Row 0 opens Options on its first tab; row 1 opens the global help;
+        // row 2 is Quit, which exits at once when nothing is being served.
+        s.options_tab = 3;
+        s.menu_sel = 0;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::Options);
+        assert_eq!(s.options_tab, 0);
+        s.modal = Modal::Menu;
+        s.menu_sel = 1;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::GlobalHelp);
+        s.modal = Modal::Menu;
+        s.menu_sel = 2;
+        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+    }
+
+    #[test]
     fn palette_activation_switches_tab() {
         let mut s = st();
         apply_action(&mut s, KeyAction::OpenPalette);
