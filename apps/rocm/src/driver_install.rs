@@ -19,7 +19,7 @@
 //! The plan this module runs (its model, rendering, per-distro builders and the
 //! WSL rocDXG plan) lives in `driver_plan.rs`, which does not depend on this
 //! module; the host's os-release comes from `system_packages.rs`. This module
-//! re-exports `host_install_driver_only_reports` for `chat.rs` and
+//! re-exports `host_install_driver_only_reports` for `tool_policy.rs` and
 //! `freeform_planner.rs`.
 
 use std::fmt::Write as _;

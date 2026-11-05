@@ -76,6 +76,9 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// One entry per `rocm serve` run a scenario made, with the stderr and exit
+    /// code `cli_outputs` has no room for (see `e2e_cucumber::serve_plan`).
+    pub serve_runs: Option<Vec<e2e_cucumber::serve_plan::ServeRun>>,
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
@@ -328,6 +331,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            serve_runs: None,
             cli_elapsed: None,
             remote_env: Vec::new(),
             launch_release: None,
@@ -1361,9 +1365,7 @@ async fn main() {
                 // genuinely slow serve, e.g. a large model) takes precedence;
                 // otherwise fall back to any xfail matrix override (fail-fast for
                 // a known-bug serve). Absent both → the step default.
-                world.serve_timeout_override = decl
-                    .serve_timeout_secs
-                    .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})

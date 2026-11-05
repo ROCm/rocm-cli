@@ -32,16 +32,31 @@
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
-# --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
+# --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
+# What the lane logs show, so the scope below is not read as more than it is:
+# lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
+# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
+# stopped before it printed a serve plan, so the plan's name line was never
+# reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
+# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
+# shown it. The steps used to discard stderr, so the cause of the empty stdout was
+# not known. The first lane run that reported it (run 41811714290: Strix Halo
+# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
+# runtime is configured", before any alias handling, so on those lanes the rows are
+# red for a missing runtime and not for this bug. On native Windows the stop is the
+# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# The rows keep their all-hosts scope until the scenarios get a managed runtime or
+# are gated on the engine and the rows are narrowed to the real bug; their reasons
+# name both shapes so neither becomes a false claim.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
-reason = "Serve output does not surface the expanded full model name for a short name."
+reason = "A vLLM serve of a short name shows no expanded full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "Engines do not report a consistent resolved model name for a short name."
+reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run
@@ -100,6 +115,29 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so i
 serve_timeout_secs = 90
 flaky = true
 
+# serve-40 serves the same small GGUF model through the same lemonade managed serve
+# as the rows above, so on a lemonade LINUX host its When step never sees the model
+# on /v1/models and panics before the Then assertion runs. Scoped like those rows
+# (os=linux). Known from run 41986772728: serve-40 passes on the Strix Halo Windows
+# lane, is skipped on the Strix Halo WSL2 lane (no AMD GPU detected), and fails on
+# both Strix Halo Ubuntu lanes. The row also matches any other Linux host that runs
+# the scenario with lemonade (the MI300X and W7900 lanes had not reported in that
+# run); whether lemonade serves there is not verified, and `flaky = true` tolerates
+# a pass on such a host. The cause on the Strix Halo Ubuntu lanes is not settled
+# and varies between runs (#897), so this row names that issue rather than EAI-7423
+# and carries `flaky = true` like its siblings. While it is in place the
+# scenario's own check (serve starts no background helper when no watcher is
+# enabled) is not exercised on the hosts it matches, and a genuine failure of that
+# check there would also read as a failure that was expected. `flaky` also means a
+# fixed #897 is not flagged as a stale row, so delete the row by hand when #897 is
+# closed.
+[["serve-stop-leaves-no-background-helper"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "#897"
+reason = "Lemonade serving fails on the Strix Halo Ubuntu lanes, so the model never appears on /v1/models and the helper check is never reached."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "vllm" }
@@ -136,13 +174,6 @@ bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the chat request never reaches a live model."
 serve_timeout_secs = 90
 flaky = true
-
-# --- EAI-7384: re-provisioning nests the managed runtime path recursively
-# (runtimes/wheel/.../runtimes/wheel/). Surfaces wherever a real install runs. ---
-[["runtime-path-not-nested"]]
-when = {}
-bug = "EAI-7384"
-reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-provisioning."
 
 # The GPU-backed bench scenario benchmarks a really served model, so on a
 # lemonade LINUX host it inherits the same managed-serve bug as the sibling

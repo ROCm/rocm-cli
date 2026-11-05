@@ -25,8 +25,9 @@ use rocm_dash_core::traits::{
 };
 use serde::Deserialize;
 
-/// Lemonade's default OpenAI-compatible port. Mirrors `rocm_dash_tui::skills`
-/// (defined locally to avoid a cross-crate dep from collectors → tui).
+/// Lemonade's default OpenAI-compatible port. Mirrors the endpoint the
+/// dash-tui chat probe uses (`rocm_dash_tui::llm`), defined locally to avoid a
+/// cross-crate dep from collectors → tui.
 pub const LEMONADE_PORT: u16 = 13305;
 /// The runtime-stats path on the canonical `/api/v1` base.
 pub const LEMONADE_STATS_PATH: &str = "/api/v1/stats";
@@ -317,8 +318,8 @@ mod tests {
         assert!(collector.fetch_stats().await.is_err());
     }
 
-    /// Integration-gated: scrape a REAL local Lemonade server (start it first via
-    /// `rocm skill run install-lemonade --apply`). Not run in CI.
+    /// Integration-gated: scrape a REAL local Lemonade server (install the engine
+    /// with `rocm engines install lemonade` and start it first). Not run in CI.
     #[tokio::test]
     #[ignore = "requires a running Lemonade server on :13305"]
     async fn live_lemonade_scrape_produces_instance() {

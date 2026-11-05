@@ -15,6 +15,7 @@ use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
+use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
 /// Model id of the live managed service the reuse scenarios plant.
 ///
@@ -897,18 +898,32 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
-    world.cli_output = Some(stdout);
+    let engine = "vllm";
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+    // stderr and the exit code ride along so a run that stopped on a refusal reads
+    // as one in the Then step, instead of as "the name was not expanded".
+    world.serve_runs = Some(vec![ServeRun {
+        engine: engine.to_owned(),
+        stdout,
+        stderr,
+        rc,
+    }]);
 }
 
 #[when("the user serves the same short name with different engines")]
 async fn user_serves_multiple_engines(world: &mut E2eWorld) {
-    let mut outputs = Vec::new();
+    let mut runs = Vec::new();
     for engine in ["lemonade", "vllm"] {
-        let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
-        outputs.push(stdout);
+        let (stdout, stderr, rc) =
+            crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+        runs.push(ServeRun {
+            engine: engine.to_owned(),
+            stdout,
+            stderr,
+            rc,
+        });
     }
-    world.cli_outputs = Some(outputs);
+    world.serve_runs = Some(runs);
 }
 
 #[when("the user lists running services")]
@@ -2324,12 +2339,15 @@ async fn assert_masked_index_message(world: &mut E2eWorld) {
 
 #[then("the output shows the full model name")]
 async fn assert_full_model_name(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no CLI output");
-    let resolved = resolved_model(output)
-        .unwrap_or_else(|| panic!("no 'resolved model' in output:\n{output}"));
+    let runs = world.serve_runs.as_ref().expect("no serve run");
+    let run = runs.first().expect("no serve run");
+    let resolved = run
+        .resolved_model()
+        .unwrap_or_else(|| panic!("{}", run.missing_plan_message()));
     assert!(
         resolved.contains('/'),
-        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{}",
+        run.stdout
     );
 }
 
@@ -2349,19 +2367,16 @@ async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
 
 #[then("all engines expand to the same full model name")]
 async fn assert_consistent_expansion(world: &mut E2eWorld) {
-    let outputs = world.cli_outputs.as_ref().expect("no CLI outputs");
-    assert!(
-        outputs.len() >= 2,
-        "need at least 2 serve outputs to compare"
-    );
+    let runs = world.serve_runs.as_ref().expect("no serve runs");
+    assert!(runs.len() >= 2, "need at least 2 serve outputs to compare");
     let mut resolved: Vec<String> = Vec::new();
-    for (i, output) in outputs.iter().enumerate() {
+    for (i, run) in runs.iter().enumerate() {
         // A missing `resolved model:` line means the engine never got far enough
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = resolved_model(output).map(str::to_string) else {
-            panic!("engine #{i} produced no 'resolved model' line:\n{output}");
+        let Some(model) = run.resolved_model().map(str::to_string) else {
+            panic!("engine #{i}: {}", run.missing_plan_message());
         };
         resolved.push(model);
     }
@@ -2446,17 +2461,6 @@ fn selected_engine(output: &str) -> &str {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
-}
-
-/// The model a serve plan actually resolved to (`resolved model: <id>`), which
-/// can differ from the requested id — `rocm serve <model>` with no `--engine`
-/// picks the recipe's preferred model+engine. `None` if the plan has no such line
-/// (e.g. the serve errored before resolving).
-fn resolved_model(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("resolved model:"))
-        .map(str::trim)
 }
 
 /// A distinctive substring of a model id that appears in the served endpoint's

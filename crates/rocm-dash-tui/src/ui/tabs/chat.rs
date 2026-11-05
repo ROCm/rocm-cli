@@ -328,7 +328,7 @@ fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<
             ChatRole::Error => ("err  ", theme.err),
             ChatRole::System => ("··   ", theme.muted),
         };
-        // Multi-line content (e.g. an answer plus a "⚙ via: …" Skill annotation)
+        // Multi-line content (e.g. an answer plus a "⚙ via: …" fired-tools annotation)
         // renders one terminal line per segment; continuation lines are indented
         // to align under the first line's content.
         for (i, seg) in turn.content.split('\n').enumerate() {
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_renders_skill_annotation_on_its_own_line() {
+    fn transcript_renders_tool_annotation_on_its_own_line() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // An agent reply carrying a tool-call surfacing annotation.
         s.chat.push(ChatTurn::agent(
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "answer + annotation render as two lines");
         assert!(
             format!("{lines:?}").contains("gpu_status"),
-            "the fired Skill is surfaced in the transcript"
+            "the fired tool is surfaced in the transcript"
         );
     }
 
