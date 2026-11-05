@@ -34,7 +34,24 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
 }
 
+/// The variable that moves where engine virtualenvs live (see
+/// [`AppPaths::engine_envs_root`]), and the one `rocm` sets on an engine child
+/// that must install into a particular root.
+pub const ENGINE_ENVS_ROOT_ENV: &str = "ROCM_CLI_ENGINE_ENVS_ROOT";
+
 impl AppPaths {
+    /// The three `ROCM_CLI_*_DIR` variables that make a child process run on
+    /// these roots, in the order config, data, cache. [`Self::discover`] reads
+    /// the same three back, so a child started with these finds the roots its
+    /// parent was given.
+    pub fn env_vars(&self) -> [(&'static str, &Path); 3] {
+        [
+            ("ROCM_CLI_CONFIG_DIR", self.config_dir.as_path()),
+            ("ROCM_CLI_DATA_DIR", self.data_dir.as_path()),
+            ("ROCM_CLI_CACHE_DIR", self.cache_dir.as_path()),
+        ]
+    }
+
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
@@ -159,7 +176,7 @@ impl AppPaths {
     /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
     /// keeps the lookup honest meanwhile.
     pub fn engine_envs_root(&self) -> PathBuf {
-        self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
+        self.engine_envs_root_from(env_path_override(ENGINE_ENVS_ROOT_ENV).as_deref())
     }
 
     /// [`Self::engine_envs_root`] against a caller-supplied override.
@@ -342,6 +359,28 @@ mod tests {
     use super::*;
 
     use crate::test_support::temp_app_paths;
+
+    #[test]
+    fn env_vars_name_the_three_roots_discover_reads_back() {
+        let (_root, paths) = temp_app_paths("env-vars");
+        assert_eq!(
+            paths.env_vars(),
+            [
+                ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
+                ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
+                ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
+            ]
+        );
+        // `discover` reads these same names; a rename in one place must not
+        // leave the other behind.
+        let source = include_str!("paths.rs");
+        for (name, _) in paths.env_vars() {
+            assert!(
+                source.contains(&format!("env_path_override(\"{name}\")")),
+                "{name} is not read by AppPaths::discover"
+            );
+        }
+    }
 
     #[test]
     fn audit_events_path_lives_under_data_audit() {

@@ -205,6 +205,27 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### The engine stdio client
+
+`rocm` and `rocmd` run an engine child through one client,
+[`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs) in
+`rocm-engine-protocol`. Its conversation (the request line, the environment each
+option sets, what a failing exit or an unusable answer is reported as, the
+SIGPIPE guard) is tested there against `FakeEngine`, a shell-script engine child
+from [`fake_engine.rs`](../crates/rocm-engine-protocol/src/fake_engine.rs) that
+records its argv, environment and stdin; the pure parts (the command a call
+builds, `decode_engine_response`, stderr collection) run on every platform, and
+the ones that start the fake are `#[cfg(unix)]`. The `rocm` and `rocmd` callers
+each run their own entry point against the same fake and pin only what they
+choose: the program and verb, the app paths, and whether stderr is forwarded (see
+`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). A caller that
+grew its own private copy of the conversation would fail those tests.
+
+The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
+its default action, which is how `rocm` runs, because the test harness leaves it
+ignored and changing it process-wide would race sibling tests. A write that is
+not guarded kills that process, and the parent test reports the signal.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the

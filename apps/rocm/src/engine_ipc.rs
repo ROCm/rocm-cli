@@ -4,35 +4,34 @@
 
 //! Engine plugin binary resolution and the engine IPC request/response
 //! envelope: locating an engine's executable (packaged plugin vs. the
-//! platform-packaged fallback), encoding/decoding the JSON-over-stdio
-//! envelope used to talk to it, and the built-in (in-process) fast path for
-//! `lemonade`/`vllm` that skips spawning a child process entirely.
+//! platform-packaged fallback), talking to it over JSON-over-stdio, and the
+//! built-in (in-process) fast path for `lemonade`/`vllm`/`aim` that skips
+//! spawning a child process entirely.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-213) of the `main.rs` modularization (see `docs/architecture.md`).
+//! The stdio conversation itself is not implemented here. The request framing,
+//! the child's environment, stderr handling, the SIGPIPE guard around the write
+//! and the reading of the answer are the client in
+//! [`rocm_engine_protocol`]'s `stdio_client` module, which `rocmd` uses too.
+//! This module chooses what to run (the built-in handler, or the resolved
+//! engine binary with `stdio`) and what `rocm` asks of the client for it
+//! ([`engine_stdio_child_request`]).
+//!
 //! `dispatch()` calls directly into this module at two points —
 //! `Command::EngineStdio { engine } => run_builtin_engine_stdio(&engine)` and
 //! the `__engine-serve-http` arm's `run_builtin_engine_serve_http(...)` call —
 //! both re-imported via `use crate::engine_ipc::{run_builtin_engine_serve_http,
-//! run_builtin_engine_stdio};`; `dispatch()`'s own body is otherwise
-//! unaffected.
+//! run_builtin_engine_stdio};`.
 //!
 //! This module owns: resolving an engine's binary path
 //! (`resolve_engine_binary_path`, `resolve_engine_binary_path_with_paths`,
-//! `find_engine_plugin_binary`), the stdio request/response envelope used to
-//! talk to an external engine binary or the in-process built-in handler
+//! `find_engine_plugin_binary`), the request entry points
 //! (`engine_request`, `engine_request_with_env_root`,
-//! `decode_engine_response`, the `ScopedEnvVar`/
+//! `engine_stdio_child_request`), the `ScopedEnvVar`/
 //! `with_scoped_builtin_engine_env` env-scoping helpers and the
 //! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_request`,
-//! `run_builtin_engine_stdio`), and the built-in HTTP-serving path
+//! `run_builtin_engine_stdio`, and the built-in HTTP-serving path
 //! (`builtin_engine_available`, `run_builtin_engine_serve_http`,
-//! `builtin_engine_serve_http_args`). One item sits physically inside this
-//! span in `main.rs` but stays there rather than moving: `impl
-//! From<WatcherModeArg> for WatcherMode` is unrelated clap-arg-to-domain-type
-//! conversion that only happens to sit between `find_engine_plugin_binary` and
-//! `engine_request` in the original file (it has since moved to `cli.rs`,
-//! next to the enum it converts).
+//! `builtin_engine_serve_http_args`).
 //!
 //! `main.rs` calls into it for `resolve_engine_binary_path`,
 //! `resolve_engine_binary_path_with_paths`, `engine_request`,
@@ -42,39 +41,32 @@
 //! `runtime_install_finalize.rs` call into it for
 //! `engine_request_with_env_root`; `service_launch.rs` calls into it for
 //! `builtin_engine_serve_http_args`. `find_engine_plugin_binary`,
-//! `decode_engine_response`, `with_scoped_builtin_engine_env`,
-//! `builtin_engine_request`, and `ScopedEnvVar` have no callers outside this
-//! module and stay private. Shared helpers this module calls back into at the
-//! crate root — `with_sigpipe_ignored` and `device_policy_name` — stay in
-//! `main.rs` and are reached unqualified via `use crate::{...}`, same as for
-//! other mechanically relocated modules. `parse_device_policy` moved out of
-//! `main.rs` into `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via
-//! `use crate::gpu_policy::parse_device_policy;` instead. `apply_app_path_env`,
-//! `app_path_env_vars`, `optional_arg`, and `engine_recipe_json_arg` moved out
-//! of `main.rs` into `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this
-//! file's `use` list below points there now instead of at the crate root.
+//! `with_scoped_builtin_engine_env`, `builtin_engine_request`, and
+//! `ScopedEnvVar` have no callers outside this module and stay private. The
+//! one helper this module calls back into at the crate root, `device_policy_name`,
+//! stays in `main.rs` and is reached via `use crate::device_policy_name;`.
+//! `parse_device_policy` is in `gpu_policy.rs`; `app_path_env_vars` and
+//! `engine_recipe_json_arg` are in `engine_runtime_select.rs`, and
+//! `optional_arg` is in `rocm_engine_protocol`.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, engine_binary_path, engine_plugin_dirs};
+use rocm_core::{AppPaths, ENGINE_ENVS_ROOT_ENV, engine_binary_path, engine_plugin_dirs};
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EnginePluginDescriptor, EngineRecipeHint, EngineRequestEnvelope,
-    EngineResponseEnvelope,
+    EngineResponseEnvelope, EngineStdioOptions, decode_engine_response, engine_request_envelope,
+    optional_arg, run_engine_stdio,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::engine_runtime_select::{
-    app_path_env_vars, apply_app_path_env, engine_recipe_json_arg, optional_arg,
-};
+use crate::device_policy_name;
+use crate::engine_runtime_select::{app_path_env_vars, engine_recipe_json_arg};
 use crate::gpu_policy::parse_device_policy;
-use crate::{device_policy_name, with_sigpipe_ignored};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -130,11 +122,7 @@ where
     R: DeserializeOwned,
 {
     let stream_progress = matches!(&method, EngineMethod::Install);
-    let envelope = EngineRequestEnvelope {
-        method,
-        payload: serde_json::to_value(request)
-            .context("failed to encode engine request payload")?,
-    };
+    let envelope = engine_request_envelope(method, request)?;
     if let Some(envelope) = with_scoped_builtin_engine_env(paths, env_root, || {
         builtin_engine_request(engine, &envelope)
     }) {
@@ -150,8 +138,16 @@ where
 }
 
 /// The out-of-process half of [`engine_request_with_env_root`]: run
-/// `engine_binary stdio`, send `envelope` on its stdin and decode its answer.
-/// Split out so a test can point it at a stand-in binary.
+/// `engine_binary stdio` through the client `rocm` shares with `rocmd`, send
+/// `envelope` on its stdin and decode its answer.
+///
+/// What `rocm` asks of that client: the child runs on this process's app paths
+/// when it has them and on the engine environments root when the request names
+/// one, an install asks for progress on stderr, and the child's stderr is
+/// written to this process's as it arrives, which is how a terminal user
+/// watches an install. No endpoint key is handed over, because none of the
+/// requests `rocm` makes is about a running service's endpoint. Split out so a
+/// test can point it at a stand-in binary.
 fn engine_stdio_child_request<R>(
     engine_binary: &Path,
     paths: Option<&AppPaths>,
@@ -162,118 +158,29 @@ fn engine_stdio_child_request<R>(
 where
     R: DeserializeOwned,
 {
-    let mut command = ProcessCommand::new(engine_binary);
-    command.arg("stdio");
-    if let Some(paths) = paths {
-        apply_app_path_env(&mut command, paths);
-    }
-    if let Some(env_root) = env_root {
-        command.env("ROCM_CLI_ENGINE_ENVS_ROOT", env_root);
-    }
-    if stream_progress {
-        command.env("ROCM_ENGINE_PROGRESS_STDERR", "1");
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn engine stdio process")?;
-
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("engine stdio child did not expose stdin")?;
-        // Ignore SIGPIPE for the duration of the write: with SIG_DFL in effect
-        // process-wide, an engine that exits before reading its stdin would
-        // otherwise kill `rocm` with SIGPIPE before the exit-status diagnostics
-        // below can run. Under SIG_IGN the write returns EPIPE instead, which we
-        // surface as the normal "failed to write engine request" error and then
-        // let `wait()` report why the engine exited.
-        with_sigpipe_ignored(|| {
-            serde_json::to_writer(&mut stdin, envelope)
-                .context("failed to write engine request")?;
-            stdin.write_all(b"\n")?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-    }
-
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let mut reader = io::BufReader::new(stderr);
-            let mut collected = Vec::new();
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if let Ok(text) = std::str::from_utf8(&line) {
-                            eprint!("{text}");
-                        } else {
-                            let _ = io::stderr().write_all(&line);
-                        }
-                        collected.extend_from_slice(&line);
-                    }
-                    Err(error) => {
-                        let message = format!("failed to read engine progress: {error}\n");
-                        eprint!("{message}");
-                        collected.extend_from_slice(message.as_bytes());
-                        break;
-                    }
-                }
-            }
-            collected
-        })
-    });
-    let mut stdout = Vec::new();
-    child
-        .stdout
-        .take()
-        .context("engine stdio child did not expose stdout")?
-        .read_to_end(&mut stdout)
-        .context("failed to read engine stdio response")?;
-    let status = child
-        .wait()
-        .context("failed waiting for engine stdio response")?;
-    let stderr = stderr_handle
-        .map(|handle| handle.join().unwrap_or_else(|_| Vec::new()))
-        .unwrap_or_default();
-
-    if !status.success() && stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-        if stderr.is_empty() {
-            bail!("engine stdio process exited with status {status}");
-        }
-        bail!("engine stdio process exited with status {status}: {stderr}");
-    }
-    let envelope: EngineResponseEnvelope = serde_json::from_slice(&stdout).with_context(|| {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-        if stderr.is_empty() {
-            "failed to parse engine response envelope".to_owned()
-        } else {
-            format!("failed to parse engine response envelope; stderr: {stderr}")
-        }
-    })?;
-    decode_engine_response(envelope)
+    let options = stdio_options(paths, env_root, stream_progress);
+    decode_engine_response(run_engine_stdio(
+        engine_binary,
+        ["stdio"],
+        &options,
+        envelope,
+    )?)
 }
 
-fn decode_engine_response<R>(envelope: EngineResponseEnvelope) -> Result<R>
-where
-    R: DeserializeOwned,
-{
-    if !envelope.ok {
-        let error = envelope.error.map_or_else(
-            || "unknown engine error".to_owned(),
-            |value| format!("{}: {}", value.code, value.message),
-        );
-        bail!("{error}");
+/// What `rocm` asks of the shared stdio client; see
+/// [`engine_stdio_child_request`].
+const fn stdio_options<'a>(
+    paths: Option<&'a AppPaths>,
+    env_root: Option<&'a Path>,
+    stream_progress: bool,
+) -> EngineStdioOptions<'a> {
+    EngineStdioOptions {
+        app_paths: paths,
+        env_root,
+        endpoint_key_file: None,
+        request_progress: stream_progress,
+        forward_stderr: true,
     }
-    let data = envelope
-        .data
-        .context("engine response envelope did not contain data")?;
-    serde_json::from_value(data).context("failed to decode engine response payload")
 }
 
 struct ScopedEnvVar {
@@ -321,10 +228,7 @@ fn with_scoped_builtin_engine_env<R>(
         }
     }
     if let Some(env_root) = env_root {
-        vars.push(ScopedEnvVar::set_path(
-            "ROCM_CLI_ENGINE_ENVS_ROOT",
-            env_root,
-        ));
+        vars.push(ScopedEnvVar::set_path(ENGINE_ENVS_ROOT_ENV, env_root));
     }
     let result = f();
     drop(vars);
@@ -507,55 +411,36 @@ mod tests {
         Ok(())
     }
 
-    // ---- The stdio client, driven against a stand-in engine child. ----
+    // ---- What `rocm` asks of the shared stdio client. ----
     //
-    // These pin what `rocm` puts on an engine child's command line, environment
-    // and stdin and how it reads the answer back. `rocmd` keeps its own client
-    // with a different contract; its tests are in `apps/rocmd/src/engine_ipc.rs`.
-
-    fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
-        EngineRequestEnvelope { method, payload }
-    }
+    // The conversation itself (framing, SIGPIPE guard, exit status and answer
+    // handling) is the client's, tested in `rocm-engine-protocol`. These tests
+    // run `rocm`'s entry point against a stand-in engine child and pin what
+    // `rocm` chooses: the verb, the environment and the stderr handling. The
+    // other caller's choices are pinned in `apps/rocmd/src/engine_ipc.rs`.
 
     #[test]
-    fn decode_engine_response_reports_each_way_an_answer_can_be_unusable() {
-        let failed = EngineResponseEnvelope {
-            ok: false,
-            data: None,
-            error: Some(rocm_engine_protocol::EngineErrorDetail {
-                code: "stop_failed".to_owned(),
-                message: "it broke".to_owned(),
-            }),
-        };
-        let error = decode_engine_response::<serde_json::Value>(failed).unwrap_err();
-        assert_eq!(error.to_string(), "stop_failed: it broke");
+    fn rocm_asks_for_forwarded_stderr_and_no_endpoint_key() {
+        let (root, paths) = crate::tests::test_paths("engine-ipc-options");
+        let env_root = root.join("envs");
 
-        let unexplained = EngineResponseEnvelope {
-            ok: false,
-            data: None,
-            error: None,
-        };
-        let error = decode_engine_response::<serde_json::Value>(unexplained).unwrap_err();
-        assert_eq!(error.to_string(), "unknown engine error");
-
-        let empty = EngineResponseEnvelope {
-            ok: true,
-            data: None,
-            error: None,
-        };
-        let error = decode_engine_response::<serde_json::Value>(empty).unwrap_err();
+        let options = stdio_options(Some(&paths), Some(&env_root), true);
         assert_eq!(
-            error.to_string(),
-            "engine response envelope did not contain data"
+            options.app_paths.map(|p| &p.data_dir),
+            Some(&paths.data_dir)
         );
+        assert_eq!(options.env_root, Some(env_root.as_path()));
+        assert!(options.request_progress);
+        // The terminal user watches an install through the child's stderr.
+        assert!(options.forward_stderr);
+        // No request `rocm` makes is about a running service's endpoint.
+        assert_eq!(options.endpoint_key_file, None);
 
-        let wrong_shape = EngineResponseEnvelope::success(serde_json::json!({"stopped": "yes"}));
-        let error =
-            decode_engine_response::<rocm_engine_protocol::StopResponse>(wrong_shape).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "failed to decode engine response payload"
-        );
+        let bare = stdio_options(None, None, false);
+        assert!(bare.app_paths.is_none() && bare.env_root.is_none());
+        assert!(!bare.request_progress);
+        assert!(bare.forward_stderr);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -567,6 +452,10 @@ mod tests {
 
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
+        fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
+            EngineRequestEnvelope { method, payload }
+        }
+
         fn stop_request() -> EngineRequestEnvelope {
             envelope(EngineMethod::Stop, json!({"service_id": "svc"}))
         }
@@ -577,15 +466,13 @@ mod tests {
             env_root: Option<&Path>,
             stream_progress: bool,
         ) -> Result<Value> {
-            engine.run(|| {
-                engine_stdio_child_request::<Value>(
-                    engine.path(),
-                    paths,
-                    &stop_request(),
-                    env_root,
-                    stream_progress,
-                )
-            })
+            engine_stdio_child_request::<Value>(
+                engine.path(),
+                paths,
+                &stop_request(),
+                env_root,
+                stream_progress,
+            )
         }
 
         fn ambient(key: &str) -> Option<String> {
@@ -689,23 +576,6 @@ mod tests {
         }
 
         #[test]
-        fn a_nonzero_exit_with_no_answer_reports_the_status_and_stderr() {
-            let engine = FakeEngine::new("rocm-crash", true, "echo boom >&2\nexit 3");
-            let error = request(&engine, None, None, false).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "engine stdio process exited with status exit status: 3: boom"
-            );
-
-            let silent = FakeEngine::new("rocm-silent-crash", true, "exit 4");
-            let error = request(&silent, None, None, false).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "engine stdio process exited with status exit status: 4"
-            );
-        }
-
-        #[test]
         fn a_nonzero_exit_that_still_answered_is_decoded_not_discarded() {
             // The engine's own error envelope is the useful diagnostic, so an
             // answer on stdout wins over the exit status.
@@ -724,27 +594,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn an_unparseable_answer_carries_the_childs_stderr() {
-            let engine = FakeEngine::new(
-                "rocm-garbage",
-                true,
-                "printf 'not json'\necho oops >&2\nexit 0",
-            );
-            let error = request(&engine, None, None, false).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "failed to parse engine response envelope; stderr: oops"
-            );
-
-            let silent = FakeEngine::new("rocm-garbage-quiet", true, "printf 'not json'");
-            let error = request(&silent, None, None, false).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "failed to parse engine response envelope"
-            );
-        }
-
         /// The write of a request to an engine that has already exited must come
         /// back as an error even where SIGPIPE is at its default action, which is
         /// how `main` runs `rocm`. Re-executes this test in a fresh process that
@@ -757,15 +606,13 @@ mod tests {
                 let engine = FakeEngine::new("rocm-sigpipe", false, "exit 3");
                 // Larger than a pipe buffer, so the write reaches the closed read end.
                 let big = "x".repeat(1 << 20);
-                let result = engine.run(|| {
-                    engine_stdio_child_request::<Value>(
-                        engine.path(),
-                        None,
-                        &envelope(EngineMethod::Stop, json!({ "blob": big })),
-                        None,
-                        false,
-                    )
-                });
+                let result = engine_stdio_child_request::<Value>(
+                    engine.path(),
+                    None,
+                    &envelope(EngineMethod::Stop, json!({ "blob": big })),
+                    None,
+                    false,
+                );
                 let error = result.expect_err("the engine never answered");
                 assert!(
                     format!("{error:#}").contains("failed to write engine request"),
@@ -774,7 +621,7 @@ mod tests {
                 return;
             }
 
-            let status = ProcessCommand::new(std::env::current_exe().unwrap())
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "engine_ipc::tests::stdio_child::a_request_to_an_engine_that_already_exited_is_an_error_under_sig_dfl",
                     "--exact",

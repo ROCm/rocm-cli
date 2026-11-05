@@ -55,6 +55,7 @@ pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
 pub mod service_record;
+mod sigpipe;
 pub mod terminal;
 pub mod user_path;
 
@@ -167,7 +168,7 @@ pub use net::{
     http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
-pub use paths::{AppPaths, engine_plugin_dirs};
+pub use paths::{AppPaths, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
@@ -222,6 +223,7 @@ pub use service_record::{
     INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
     engine_stop_decides_confirmation,
 };
+pub use sigpipe::with_sigpipe_ignored;
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
