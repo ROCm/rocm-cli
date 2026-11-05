@@ -356,10 +356,17 @@ impl WslSummary {
     }
 }
 
+/// The `driver_status` `rocm examine` reports when the WSL GPU path is usable.
+///
+/// One constant for the producer ([`wsl_driver_summary`]) and for the advice that
+/// tells a refused `rocm serve` user which status to look for, so the two cannot
+/// drift apart.
+pub const WSL_ROCDXG_READY: &str = "wsl_rocdxg_ready";
+
 pub(super) fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
     let ready = wsl.rocdxg_ready();
     let status = if ready {
-        "wsl_rocdxg_ready"
+        WSL_ROCDXG_READY
     } else if wsl.dxg_device && wsl.dxcore {
         "wsl_rocdxg_missing"
     } else {

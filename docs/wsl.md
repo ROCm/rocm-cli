@@ -324,6 +324,12 @@ and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
 a listing that says whether the part is an APU or a discrete card, so
 `has_amd_gpu: true` beside both `false` is the expected WSL shape.
 
+## How `rocm serve` Finds The GPU On WSL
+
+On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there. Under the default `gpu_required` policy it asks the same question `rocm examine` answers, whether the WSL GPU path is ready (`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on top. `--gpu auto` therefore selects GPU 0 on a ready host.
+
+When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH` counts as ready, so export the install's `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
+
 ## Install UX Recommendations
 
 `rocm install sdk` inside WSL should:

@@ -82,7 +82,7 @@ use windows_inventory::{
 use wsl::detect_wsl_windows_display_probe_text;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
-pub use wsl::{WslHostDriverProbe, is_wsl_host};
+pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
     ldconfig_cache, ldconfig_lists_librocdxg,

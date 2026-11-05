@@ -374,12 +374,37 @@ pub(crate) enum ManagedReuseRefusal {
 /// pre-flight, and the spawn below when the reuse that waived that pre-flight
 /// turns out not to be available after all.
 pub(crate) fn no_usable_gpu_refusal(device_policy: &DevicePolicy) -> String {
+    // Keyed on the same `is_wsl_host()` the usable-GPU probe branches on, so the
+    // advice follows the platform whose answer produced the refusal.
+    no_usable_gpu_refusal_text(device_policy_name(device_policy), rocm_core::is_wsl_host())
+}
+
+/// The refusal text for `policy`, split on whether the probe that refused was
+/// the WSL one.
+///
+/// WSL reaches the GPU through `/dev/dxg` and ROCDXG, and has no `/dev/kfd`, so
+/// telling a WSL user to confirm that device is present names something that can
+/// never clear the condition. There the advice points at the status `rocm
+/// examine` reports for the path the probe actually asked about
+/// ([`rocm_core::WSL_ROCDXG_READY`]), and at `rocm diagnose`, which names what is
+/// missing.
+fn no_usable_gpu_refusal_text(policy: &str, on_wsl: bool) -> String {
+    let remedy = if on_wsl {
+        format!(
+            "WSL reaches the GPU through /dev/dxg and ROCDXG rather than /dev/kfd: run \
+             `rocm examine` and check that `driver_status` is `{ready}` (`rocm diagnose` \
+             names what is missing), and ensure HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES \
+             are not masking every device.",
+            ready = rocm_core::WSL_ROCDXG_READY
+        )
+    } else {
+        "Check the driver with `rocm examine`, confirm /dev/kfd is present, and ensure \
+         HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES are not masking every device."
+            .to_owned()
+    };
     format!(
-        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
-         policy and does not fall back to CPU. Check the driver with `rocm examine`, \
-         confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
-         ROCR_VISIBLE_DEVICES are not masking every device.",
-        policy = device_policy_name(device_policy)
+        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} policy \
+         and does not fall back to CPU. {remedy}"
     )
 }
 
@@ -1612,6 +1637,40 @@ fn finish_attached_stop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_no_gpu_refusal_sends_a_bare_metal_user_to_dev_kfd() {
+        let text = super::no_usable_gpu_refusal_text("gpu_required", false);
+        assert!(text.contains("confirm /dev/kfd is present"), "{text}");
+        assert!(!text.contains("ROCDXG"), "{text}");
+    }
+
+    #[test]
+    fn the_no_gpu_refusal_does_not_send_a_wsl_user_to_dev_kfd() {
+        // WSL has no /dev/kfd, so advice to confirm it can never clear the
+        // condition. The text names the status `examine` reports for the path
+        // the probe asked about, taken from the constant the producer uses, so
+        // the two cannot drift. That the status really is the one a refused
+        // host shows is asserted end to end by serve-42.
+        let text = super::no_usable_gpu_refusal_text("gpu_required", true);
+        assert!(!text.contains("/dev/kfd is present"), "{text}");
+        assert!(text.contains("rocm examine"), "{text}");
+        assert!(text.contains("rocm diagnose"), "{text}");
+        assert!(
+            text.contains(&format!("`{}`", rocm_core::WSL_ROCDXG_READY)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_no_gpu_refusal_names_the_policy_on_both_platforms() {
+        for on_wsl in [false, true] {
+            let text = super::no_usable_gpu_refusal_text("gpu_required", on_wsl);
+            assert!(
+                text.starts_with("no usable AMD GPU detected; `rocm serve` requires a GPU under the gpu_required policy"),
+                "{text}"
+            );
+        }
+    }
     use super::*;
     use crate::tests::test_paths;
 

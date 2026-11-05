@@ -2222,17 +2222,31 @@ fn plant_wsl_machine_with_unregistered_rocdxg(world: &mut E2eWorld, loader_path:
         "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6'\n",
     )
     .expect("failed to write the fake ldconfig");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
+    push_planted_wsl_machine_env(world, loader_path);
+}
+
+/// Hand the planted WSL machine to the next `rocm` invocation. Separate from the
+/// planting so a scenario that runs a second command on the same machine can give
+/// it the same environment: the scenario env is consumed by each run.
+fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let path = std::env::join_paths(std::iter::once(root.join("fake-bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
     .expect("PATH entries cannot hold a separator");
     world.command_env.push(("PATH", path));
     world
         .command_env
         .push(("LD_LIBRARY_PATH", loader_path.into()));
-    world
-        .command_env
-        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
 }
 
 #[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
@@ -2317,5 +2331,67 @@ async fn assert_rocdxg_detail_names_the_cache(world: &mut E2eWorld) {
     assert!(
         detail.contains("ldconfig:librocdxg.so"),
         "nothing lets the loader find the library, so the detail must say so: {detail}"
+    );
+}
+
+// ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
+
+#[when("the user serves a model under the GPU-required default on that machine")]
+async fn user_serves_on_the_planted_wsl_machine(world: &mut E2eWorld) {
+    // The pre-flight refuses before any engine is prepared, so the model and
+    // engine named here are never fetched.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+            "--engine",
+            "lemonade",
+            "--gpu",
+            "auto",
+            "--no-smoke-test",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal points the user at the WSL driver status instead of /dev/kfd")]
+async fn assert_wsl_refusal_advice(world: &mut E2eWorld) {
+    let output = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        !output.contains("/dev/kfd is present"),
+        "WSL has no /dev/kfd, so advice to confirm it cannot clear the condition:\n{output}"
+    );
+    assert!(
+        output.contains("`driver_status` is `wsl_rocdxg_ready`"),
+        "the refusal must name the status `rocm examine` reports as ready:\n{output}"
+    );
+}
+
+#[then(
+    "inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check"
+)]
+async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
+    // The refusal says to run `rocm examine` and compare `driver_status` with the
+    // ready value. Run it on the same planted machine: it must exist, accept
+    // those arguments, and show the condition the refusal is about.
+    push_planted_wsl_machine_env(world, "");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        "wsl_rocdxg_missing",
+        "{json:#}"
     );
 }
