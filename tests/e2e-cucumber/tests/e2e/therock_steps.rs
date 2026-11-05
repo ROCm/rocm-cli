@@ -291,8 +291,8 @@ async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
         .push(("PATH", empty_path.into_os_string()));
     // A cache folder of this scenario's own. The harness otherwise points the
     // CLI at a cache shared across scenarios and, on CI, across runs, where a
-    // tool archive an earlier scenario downloaded would be mistaken for one the
-    // preview downloaded. Overrides the shared one for this scenario only.
+    // tool archive an earlier run left would trip the backstop check for one in
+    // the cache. Overrides the shared one for this scenario only.
     let scratch_cache = scenario_root.join(SCRATCH_CACHE_DIR);
     std::fs::create_dir_all(&scratch_cache).expect("failed to create the scratch cache folder");
     world
@@ -1104,8 +1104,9 @@ async fn preview_prepared_no_python(world: &mut E2eWorld) {
     assert_no_python_prepared(world);
 }
 
-/// The state half of the claim: no `uv` run, no managed tools folder, no
-/// downloaded tool archive, no saved configuration.
+/// The state half of the claim: the recording `uv` was never run (the evidence
+/// that nothing was prepared), no managed tools folder, no saved configuration,
+/// and, as a backstop only, no tool archive in the scenario's cache.
 fn assert_no_python_prepared(world: &E2eWorld) {
     let paths = world.app_paths();
     let scenario_root = root(world).to_path_buf();
@@ -1121,8 +1122,12 @@ fn assert_no_python_prepared(world: &E2eWorld) {
         "the preview created the managed tools folder {}, which would hold a managed uv and Python",
         tools.display()
     );
-    // The scenario's own cache folder (see the Given), not `paths.cache_dir`,
-    // which is the shared one where a run's leftovers would already be.
+    // A backstop, not the detector. `ROCM_CLI_UV_BINARY` makes `ensure_uv_binary`
+    // return the recording `uv` before any download could begin, so this folder
+    // stays empty even if the preview did go on to prepare a Python; the `uv`
+    // log above is what shows that. It is the scenario's own cache folder (see
+    // the Given), not `paths.cache_dir`, which is the shared one where a run's
+    // leftovers would already be.
     let cache_tools = scenario_root.join(SCRATCH_CACHE_DIR).join("tools");
     assert!(
         !cache_tools.exists(),

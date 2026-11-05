@@ -460,11 +460,14 @@ Feature: Runtime configuration
   # a managed Python would be prepared and prepares nothing.
   #
   # The preview's own note says it prepared nothing, so the Then checks that note
-  # and the state together: no `uv` invocation, no managed tools folder, no
-  # downloaded tool archive and no saved configuration. The recording `uv` is what
-  # makes "no download" observable without the network: the CLI reaches it only by
-  # going on to prepare a Python. The first Then shows the preview still got as far
-  # as a plan, so the empty folders are not just a command that stopped early.
+  # and the state together. The evidence is the recording `uv`: the CLI reaches
+  # it only by going on to prepare a Python, so its log not existing means no
+  # preparation was attempted, with no network needed. Beside it the Then checks
+  # that no managed tools folder and no configuration exist; a tool archive in the
+  # scenario's cache is checked too, but only as a backstop, since the stand-in
+  # `uv` is returned before any download could start. The first Then shows the
+  # preview still got as far as a plan, so the absences are not just a command
+  # that stopped early.
   #
   # Linux only: the empty-`PATH` host is built for the Linux search order. The
   # decision itself is unit-tested on Unix hosts against an injected search path
@@ -476,7 +479,7 @@ Feature: Runtime configuration
   # single empty folder, `ROCM_CLI_UV_BINARY` names a stand-in that appends its
   # arguments to a log file, and `ROCM_CLI_CACHE_DIR` is a folder of this
   # scenario's own, so a tool archive left in the cache the suite shares across
-  # scenarios and runs is not mistaken for one this preview downloaded.
+  # scenarios and runs cannot trip the backstop check.
   @id:runtime-install-preview-prepares-no-python @requires-os:linux
   Scenario: runtime-22 - Previewing an SDK install on a host with no usable Python prepares no Python
     Given a canonical release pip index fixture
