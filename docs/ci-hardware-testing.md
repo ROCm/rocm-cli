@@ -44,9 +44,10 @@ R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
 rung instead of being removed outright.
 
-A separate, manual-only workflow,
-[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml), publishes GPU
-lanes run on a shared GPU queue, one per GPU model, so no runner holds a GPU
+Two separate workflows,
+[`queue-run.yml`](../.github/workflows/queue-run.yml) and
+[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml), run and publish
+GPU lanes on a shared GPU queue, one per GPU model, so no runner holds a GPU
 for the length of a job. It is not a rung yet and gates nothing; see
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
@@ -119,7 +120,8 @@ mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
 the lane simply passes on the wrong GPU and reports under the label it was
 named for.
 
-No workflow other than `nightly-queue.yml` may name the `queue-report` label.
+No workflow other than `queue-run.yml` and `nightly-queue.yml` may name the
+`queue-report` label.
 The shared-queue publishing runner carries that label alone, without GitHub's
 default `self-hosted`, OS and architecture labels, so a job reaches it only by
 naming that label, and `queue_nightly_publisher_holds_no_credential` in
