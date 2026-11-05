@@ -22,6 +22,9 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
 
 impl AppState {
+    /// Install the resolved chat endpoint and set the initial consent state.
+    /// `None` → `Unavailable`; `Some` → `Accepted` when pre-consented (e.g.
+    /// `--chat-yes`), otherwise `Pending` (the one-time in-TUI prompt).
     pub fn set_chat_config(&mut self, llm: Option<crate::llm::LlmConfig>, pre_consent: bool) {
         self.chat_consent = match (&llm, pre_consent) {
             (None, _) => ChatConsent::Unavailable,

@@ -146,6 +146,38 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
     );
 }
 
+/// Case count for a property test that sets its own count: `PROPTEST_CASES`
+/// (proptest's own knob, which an explicit count would otherwise override)
+/// when it is set and above `default`, otherwise `default`.
+///
+/// Never below `default`: the counts are chosen so a property catches the
+/// defects it targets with near certainty, and some of those are hit by a
+/// small share of cases, so a lower count would pass with them present. `0`
+/// would pass vacuously. A value that is ignored, because it is lower or does
+/// not parse, is reported on stderr. `archive_props::run_property` applies the
+/// same rule with its own copy, since other crates include that file by
+/// `#[path]`.
+pub(crate) fn proptest_cases(default: u32) -> u32 {
+    let requested = std::env::var("PROPTEST_CASES").ok();
+    let cases = raised_case_count(requested.as_deref(), default);
+    if let Some(requested) = requested
+        && requested.parse::<u32>().ok() != Some(cases)
+    {
+        eprintln!(
+            "PROPTEST_CASES={requested} ignored: this property runs at least {default} cases"
+        );
+    }
+    cases
+}
+
+/// The pure half of [`proptest_cases`]: `requested` raises `default` and never
+/// lowers it.
+fn raised_case_count(requested: Option<&str>, default: u32) -> u32 {
+    requested
+        .and_then(|value| value.parse().ok())
+        .map_or(default, |requested: u32| requested.max(default))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +185,14 @@ mod tests {
     #[test]
     fn temp_app_paths_gives_each_call_its_own_root_even_for_one_label() {
         assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
+    }
+
+    #[test]
+    fn proptest_cases_are_raised_but_never_lowered() {
+        assert_eq!(raised_case_count(None, 256), 256);
+        assert_eq!(raised_case_count(Some("4096"), 256), 4096);
+        assert_eq!(raised_case_count(Some("16"), 256), 256);
+        assert_eq!(raised_case_count(Some("0"), 256), 256);
+        assert_eq!(raised_case_count(Some("lots"), 256), 256);
     }
 }

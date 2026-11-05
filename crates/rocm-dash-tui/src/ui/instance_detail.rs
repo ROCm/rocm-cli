@@ -7,7 +7,7 @@
 //!
 //! Split out of `ui/tabs/instances.rs`. It reads `sorted_instances`,
 //! `clamp_sel` and `status_meta` from there, which stay single-sourced beside
-//! the table and card code that also use them; nothing in `instances.rs` calls
+//! the table code that also uses them; nothing in `instances.rs` calls
 //! back into this module. `ui/mod.rs` calls `draw_detail` for `Modal::Detail`
 //! on the Observe tab and writes the returned max scroll offset to
 //! `AppState::instance_detail_max_scroll`.
@@ -383,7 +383,6 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tabs::instances::draw;
     use crate::ui::tabs::instances::tests::{
         buffer_text, mk_inst, mk_inst_obs, mk_state, obs, state_with_snap,
     };
@@ -406,16 +405,6 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(inst.container_id.clone(), inst);
         let state = mk_state(m, 0);
-
-        // Card grid: the VRAM line fires only because vram_total_mb > 0.
-        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw(f, f.area(), &state, &state.theme))
-            .unwrap();
-        let grid = buffer_text(&term);
-        assert!(
-            grid.contains(&vram),
-            "card grid must render the used / total MiB VRAM string; got:\n{grid}"
-        );
 
         // Detail modal: shows the quantization value and the VRAM pair.
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();

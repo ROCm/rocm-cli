@@ -3748,6 +3748,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
+ "chrono",
  "directories",
  "flate2",
  "libc",
@@ -3844,7 +3845,6 @@ dependencies = [
  "rig-core",
  "rocm-dash-collectors",
  "rocm-dash-core",
- "rocm-deps",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6119,6 +6119,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "e2e-report",
  "flate2",

@@ -13,9 +13,6 @@
 use super::{AppState, ChatConsent, ChatProvider, ChatTurn, SlashOutcome};
 
 impl AppState {
-    /// Install the resolved chat endpoint and set the initial consent state.
-    /// `None` → `Unavailable`; `Some` → `Accepted` when pre-consented (e.g.
-    /// `--chat-yes`), otherwise `Pending` (the one-time in-TUI prompt).
     /// Accept the detected endpoint and enable chat. No-op when no endpoint is
     /// available. Focuses the input so the user can type immediately.
     pub const fn accept_chat_consent(&mut self) {

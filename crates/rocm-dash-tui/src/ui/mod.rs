@@ -18,7 +18,6 @@ mod footer;
 pub mod format;
 pub mod gradient;
 mod header;
-pub mod heatmap;
 mod help_modal;
 pub mod install_manager;
 mod instance_detail;

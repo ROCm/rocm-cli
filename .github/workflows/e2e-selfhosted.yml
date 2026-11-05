@@ -92,7 +92,7 @@ jobs:
   # GPU lanes on a doc-only PR. Off pull_request (push/merge_group) heavy is
   # forced true, matching ci.yml.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     permissions:
       contents: read
       pull-requests: read
@@ -336,13 +336,25 @@ jobs:
           # pre-warm and suite so xtask does not rebuild. Honors
           # CARGO_TARGET_DIR set above.
           #
-          # `--features rocm/e2e-test-hooks` must match what `cargo xtask e2e`
-          # builds when it builds for itself. The suite's deterministic failure
+          # `--features rocm/e2e-test-hooks` is the *floor* a pre-built binary
+          # must carry, not an exact match for what `cargo xtask e2e` builds
+          # when it builds for itself: xtask now also enables
+          # `rocm/e2e-oom-fault-injection`, so its feature set is a strict
+          # superset of this one. `xtask/src/workflow_contract.rs` asserts the
+          # floor for that reason.
+          #
+          # The floor is what matters here. The suite's deterministic failure
           # seams (e.g. the scripted Lemonade backend-install failure) are
           # compiled out without it, so a pre-built binary that omits the feature
           # leaves those scenarios unable to reach their premise — they then fail
           # as regressions on whichever lane happens to select them. Every lane
           # that pre-builds and exports ROCM_CLI_BINARY must pass it.
+          #
+          # The fault-injection hook is deliberately NOT added here. Scenarios
+          # needing it carry `@requires-oom-fault-injection`, which this lane
+          # cannot satisfy (no `ROCM_E2E_OOM_FAULT_INJECTION=1`, since only xtask
+          # sets it), so they resolve to a reported skip rather than a silent
+          # pass — see docs/testing.md, "The OOM fault-injection capability".
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -517,8 +529,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
-          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
-          # what `cargo xtask e2e` would build.
+          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
+          # floor a pre-built binary must carry (xtask builds a superset).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -852,8 +864,8 @@ jobs:
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
           # This job does not set CARGO_TARGET_DIR, so the binaries land in
           # the default target\release (fall back to it when the env var is unset).
-          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
-          # what `cargo xtask e2e` would build.
+          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
+          # floor a pre-built binary must carry (xtask builds a superset).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
@@ -1422,8 +1434,8 @@ jobs:
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
-          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
-          # what `cargo xtask e2e` would build.
+          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
+          # floor a pre-built binary must carry (xtask builds a superset).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -1604,8 +1616,8 @@ jobs:
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
-          # what `cargo xtask e2e` would build.
+          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
+          # floor a pre-built binary must carry (xtask builds a superset).
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
@@ -1657,7 +1669,7 @@ jobs:
   # so a failing/skipped self-hosted platform still appears in the grid.
   e2e-report:
     name: E2E consolidated report (self-hosted)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     timeout-minutes: 15
     # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
@@ -1682,6 +1694,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # Pull every self-hosted e2e artifact matching the glob; `xtask e2e-report`
       # turns each into one labeled platform and the `*-report` glob picks up any

@@ -268,8 +268,7 @@ impl Theme {
     }
 }
 
-/// Tone for an [`InstanceStatus`], shared by [`Theme::instance_status_color`]
-/// and `BoxRole::from_tone` (the Instances tab's health-driven card border).
+/// Tone for an [`InstanceStatus`], behind [`Theme::instance_status_color`].
 /// `Starting` is the warning tone because it is a background in-progress state
 /// the user is not necessarily watching (see `docs/ux-guidelines.md`), unlike a
 /// foreground running job, which is accent. Exhaustive, so a new variant forces

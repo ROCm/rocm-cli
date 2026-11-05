@@ -1146,6 +1146,14 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
+        "crates/rocm-core/src/vllm_oom.rs",
+        "rocm diagnose --symptom",
+        "shared marker prefix (`VLLM_OOM_DIAGNOSE_COMMAND`): it exists so a log \
+         line rocm-cli authored can be told apart from one the engine printed. \
+         The runnable advice is composed from it with the user's symptom \
+         appended, and those full lines are scanned on their own",
+    ),
+    (
         "apps/rocm/src/examine_report_text.rs",
         "rocm interactive shell",
         "heading of the non-interactive launcher report",

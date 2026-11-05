@@ -130,6 +130,20 @@ impl InstanceStatus {
         matches!(self, Self::Ready | Self::Running)
     }
 
+    /// True while the instance is coming up but not yet ready.
+    #[must_use]
+    pub const fn is_starting(self) -> bool {
+        matches!(self, Self::Starting { .. })
+    }
+
+    /// True for a status that belongs in a "running" listing: serving, or on
+    /// its way there (`Starting`). A starting service is otherwise invisible
+    /// until its readiness probe passes.
+    #[must_use]
+    pub const fn counts_as_running(self) -> bool {
+        self.is_serving() || self.is_starting()
+    }
+
     /// Short UPPERCASE label for status chips. `Starting` surfaces its startup
     /// phase (e.g. `LOADING`) when one is known, else the generic `STARTING`.
     #[must_use]
@@ -280,6 +294,11 @@ mod tests {
             .is_serving()
         );
         assert!(!InstanceStatus::Stopped.is_serving());
+        assert!(InstanceStatus::Starting { phase: None }.counts_as_running());
+        assert!(InstanceStatus::Ready.counts_as_running());
+        assert!(!InstanceStatus::Starting { phase: None }.is_serving());
+        assert!(!InstanceStatus::Stopped.counts_as_running());
+        assert!(!InstanceStatus::Error.counts_as_running());
         assert!(!InstanceStatus::Error.is_serving());
         assert!(!InstanceStatus::Unknown.is_serving());
     }

@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # CI hardware (GPU / WSL) testing
 
-The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
+The hosted CI (`ubuntu-24.04` and `ubuntu-26.04`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
 dedicated hardware layer covers that gap by running the same cucumber-rs E2E
 suite on dedicated self-hosted runners with real AMD GPUs.
@@ -61,7 +61,7 @@ separate tier flag or tag filter to maintain.
 
 | Job | Workflow | Platform | Runner labels |
 |---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
+| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
@@ -466,6 +466,18 @@ consolidated report, are in the required list anymore (`ci.yml`'s own mock
 prefixed but distinct from the self-hosted names above, so no name string
 actually collides). An offline or unclaimed self-hosted runner can no longer
 block a merge.
+
+**Hosted Ubuntu images.** `build-and-test`, `test`, `e2e` and `remote-ssh`
+each run on both `ubuntu-24.04` and `ubuntu-26.04`. The 24.04 legs keep the
+check names these jobs always had, and three of those are required
+(`build-and-test`, `Test (affected crates)`, `E2E tests`);
+`remote control channel (containerised)` is not required on either image. The
+26.04 legs report with an `(ubuntu-26.04)` suffix, and none of those names is a
+required check yet (confirmed 2026-11-02), so a failure that occurs only on
+26.04 shows red but does not block a merge. Making 26.04 blocking takes an
+admin adding `build-and-test (ubuntu-26.04)`,
+`Test (affected crates) (ubuntu-26.04)` and `E2E tests (ubuntu-26.04)` to the
+required list.
 
 ## Fork safety
 

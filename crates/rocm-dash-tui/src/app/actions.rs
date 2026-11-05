@@ -754,17 +754,6 @@ pub(crate) fn handle_key(
     }
 }
 
-/// Translate a `MouseEvent` into the existing `KeyAction` vocabulary.
-///
-/// The caller is responsible for the surrounding state context:
-/// - `last_tab_bar_area` / `last_body_area` are read off `AppState` by the
-///   event loop so this function stays pure on the input event.
-/// - Per-tab body clicks are dispatched to the active tab module's
-///   `hit_test` from the event loop.
-///
-/// We only translate the parts of mouse handling that are tab-agnostic:
-/// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
-/// click is handled in tab modules.
 /// Map a navigation key to a job-console pan delta `(lines, cols)` while a
 /// console is showing. `None` for non-scroll keys so they fall through to the
 /// console's own action handler (Ctrl+C / q / Esc / Enter). A page is 10 lines.
@@ -780,6 +769,17 @@ pub(crate) const fn console_scroll_delta(code: KeyCode) -> Option<(i16, i16)> {
     }
 }
 
+/// Translate a `MouseEvent` into the existing `KeyAction` vocabulary.
+///
+/// The caller is responsible for the surrounding state context:
+/// - `last_tab_bar_area` / `last_body_area` are read off `AppState` by the
+///   event loop so this function stays pure on the input event.
+/// - Per-tab body clicks are dispatched to the active tab module's
+///   `hit_test` from the event loop.
+///
+/// We only translate the parts of mouse handling that are tab-agnostic:
+/// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
+/// click is handled in tab modules.
 pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction {
     // Domain-tab (ROCm/Serving) and overlay/console scroll is resolved in
     // `resolve_mouse` (it needs `&AppState` for hit-testing and overlay state).

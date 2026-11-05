@@ -13,8 +13,8 @@
 //! `posix_shell_quote`'s output is sent over SSH to a remote shell
 //! (`apps/rocm/src/remote/mod.rs`'s `remote_serve_command` and friends), and
 //! `powershell_quote`'s output is written into a `.ps1` script executed via
-//! `powershell.exe -File` (`apps/rocm/src/comfyui.rs`'s Windows runtime
-//! launch) or interpolated into a `-Command` string
+//! `powershell.exe -File` (`apps/rocm/src/comfyui/process.rs`'s Windows
+//! runtime launch) or interpolated into a `-Command` string
 //! (`crate::fix::path_export_windows`, `crate::diagnose`'s matching
 //! printed copy). A mistake in either one is a real command-injection or
 //! script-corruption bug, which is why both carry direct unit coverage here

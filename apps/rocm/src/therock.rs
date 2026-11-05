@@ -1110,7 +1110,7 @@ fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> Pa
 /// keep the venv's own `bin/python`, which is itself a symlink to the base
 /// interpreter — resolving that would record the system Python and break venv
 /// semantics. The adopt path already draws the line in the same place: see
-/// `main::adopt_runtime_from_probe`, which canonicalizes the install root next to
+/// `runtime_adopt::adopt_runtime_from_probe`, which canonicalizes the install root next to
 /// `absolute_existing_file_path_preserving_symlink` for the interpreter.
 fn resolved_install_root(
     paths: &AppPaths,

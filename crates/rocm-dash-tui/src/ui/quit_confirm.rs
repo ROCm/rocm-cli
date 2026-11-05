@@ -89,9 +89,10 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
-/// (mirroring the Serving tab's "Running now" listing in
+/// (mirroring the serving rows of the Serving tab's "Running now" listing in
 /// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans), and how to stop each one that this host's own registry
+/// styled spans; that listing also shows starting services, which this gate
+/// deliberately does not count), and how to stop each one that this host's own registry
 /// manages (a live read, passed in as `snapshot` so the caller controls how
 /// many times the registry is actually read — see `quit_confirm_request`) —
 /// not a blanket command, since a Docker- or Lemonade-discovered instance

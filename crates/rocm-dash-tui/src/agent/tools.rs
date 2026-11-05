@@ -178,114 +178,74 @@ impl Tool for TokensPerWattTool {
     }
 }
 
-/// Read-only tool exposing the rocm-dash **skills** registry (auto-config / auto-install).
-///
-/// The agent can list skills and fetch a skill's dry-run plan;
-/// it never executes a skill (execution is `--apply`-gated in the CLI).
-pub struct ListSkillsTool {
-    pub fired: FiredLog,
-}
-
-impl Tool for ListSkillsTool {
-    const NAME: &'static str = "list_skills";
-    type Error = ToolError;
-    type Args = NoArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "List the available rocm-dash skills (auto-config / \
-                          auto-install helpers like install-lemonade and \
-                          auto-config-endpoint) the user can run."
-                .to_string(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        }
-    }
-
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        let skills: Vec<Value> = crate::skills::builtin_skills()
-            .iter()
-            .map(|s| json!({ "name": s.name, "description": s.description }))
-            .collect();
-        Ok(json!({ "skills": skills, "skill_count": skills.len() }))
-    }
-}
-
-/// Read-only tool returning a skill's ordered dry-run plan (no execution).
-pub struct SkillPlanTool {
-    pub fired: FiredLog,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SkillPlanArgs {
-    pub name: String,
-}
-
-impl Tool for SkillPlanTool {
-    const NAME: &'static str = "skill_plan";
-    type Error = ToolError;
-    type Args = SkillPlanArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Show the ordered dry-run step plan for a named skill \
-                          WITHOUT executing it. Use after list_skills."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Skill name, e.g. install-lemonade." }
-                },
-                "required": ["name"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        match crate::skills::builtin_skill(&args.name) {
-            Some(m) => Ok(json!({ "name": m.name, "plan": crate::skills::build_plan(&m) })),
-            None => Ok(json!({ "error": format!("unknown skill: {}", args.name) })),
-        }
-    }
-}
-
 /// All Skill names, for definition/uniqueness checks and docs.
-pub const SKILL_NAMES: [&str; 6] = [
+pub const SKILL_NAMES: [&str; 4] = [
     GpuStatusTool::NAME,
     ListInstancesTool::NAME,
     BenchSummaryTool::NAME,
     TokensPerWattTool::NAME,
-    ListSkillsTool::NAME,
-    SkillPlanTool::NAME,
 ];
 
 // ---------------------------------------------------------------------------
 // Read-only ROCm machine-inspection tools (group B). These forward the model's
 // tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
-// bin-supplied executor (live dash only). They are READ-ONLY: no mutating tool
-// is registered here (mutating tools + the approval UI land in Phase 4). The
+// bin-supplied executor (live dash only). They are READ-ONLY in the approval
+// sense: none of them performs a mutating action (an install, start, stop,
+// uninstall, configuration change, or anything else that needs operator
+// approval). An intent the bin classifies as mutating comes back as
+// `ApprovalRequired` and [`run_rocm_read_tool`] turns it into an error, and the
+// mutating tools are group D below, which only surface an approval request
+// rather than executing. That is a narrower claim than "no side effects":
+// reading can still refresh local bookkeeping and caches. `services`,
+// `service_logs`, `port_status`, `bridge_snapshot` and the `rocm_command`
+// service views reload the managed-service records, which rewrites a record
+// whose state changed (and drops the endpoint key of a service whose requested
+// stop has finished). `doctor`/`examine` can re-register the configured setup
+// runtime in the runtime registry when its entry is missing. `update_check` and
+// `install_sdk_dry_run` cache package-index metadata under the cache folder
+// and, on a host with no usable Python on PATH, can download a managed `uv` and
+// Python into the data folder and record that Python in the saved config. The
 // boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
 // pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
 /// executor (None ⇒ a clear "not available in this mode" message; ApprovalRequired
-/// ⇒ a "needs approval" note — read-only tools shouldn't hit it, handled defensively).
-fn run_rocm_read_tool(exec: Option<&SharedRocmToolExecutor>, name: &str, args: &Value) -> Value {
-    match exec {
-        None => json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." }),
-        Some(e) => match e.execute(name, args) {
-            RocmToolOutcome::Result(v) => v,
-            RocmToolOutcome::Error(s) => json!({ "error": s }),
-            RocmToolOutcome::ApprovalRequired(_) => {
-                json!({ "error": "this action requires approval (interactive chat only)" })
-            }
-        },
+/// ⇒ a "needs approval" error and nothing runs — `rocm_command` lands here for
+/// any argv the bin classifies as mutating, since a read tool has no approval
+/// channel).
+///
+/// `execute()` is synchronous and can block for seconds or longer: the bin's
+/// read tools run host-probe subprocesses, make HTTP readiness probes of
+/// running managed services, and can fetch a package index (the SDK install
+/// preview) or call a configured model endpoint (a provider-assisted plan). So
+/// it runs on tokio's blocking pool, as the slash-tool path does, rather than on
+/// the async worker driving the agent — where it would stall every other task
+/// queued on that worker for as long as the executor takes. If the agent's
+/// request timeout fires first, the blocking call still runs to completion,
+/// including its incidental writes (refreshed service records, the package
+/// index cache), and its result is dropped.
+async fn run_rocm_read_tool(
+    exec: Option<&SharedRocmToolExecutor>,
+    name: &'static str,
+    args: Value,
+) -> Value {
+    let Some(exec) = exec.cloned() else {
+        return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
+    };
+    match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
+        Ok(RocmToolOutcome::Result(v)) => v,
+        Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
+        Ok(RocmToolOutcome::ApprovalRequired(_)) => {
+            json!({ "error": "this action requires approval (interactive chat only)" })
+        }
+        // A panic (or cancellation at runtime shutdown): log the details rather
+        // than hand a panic payload to the model, and so to a possibly remote
+        // provider; the model only needs to know the tool failed.
+        Err(e) => {
+            tracing::warn!(tool = name, error = %e, "ROCm read tool task failed");
+            json!({ "error": format!("ROCm tool `{name}` failed to run") })
+        }
     }
 }
 
@@ -314,7 +274,7 @@ macro_rules! rocm_read_tool {
             }
             async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                 record(&self.fired, $name);
-                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, &args))
+                Ok(run_rocm_read_tool(self.executor.as_ref(), $name, args).await)
             }
         }
     };
@@ -708,17 +668,15 @@ where
         })
 }
 
-/// Register the telemetry + skill registry tools (GpuStatus, ListInstances,
-/// BenchSummary, TokensPerWatt — snapshot-backed; ListSkills, SkillPlan —
-/// read-only registry) on a fresh Rig `AgentBuilder`, cloning the snapshot +
-/// shared `fired` log into each. Kept generic over the builder's completion
-/// model + preamble so all three backends (RigAgentClient, ChatGptAgentClient,
-/// AnthropicAgentClient) reuse one registration site (DRY — the tool list lives
-/// in exactly one place, mirroring [`register_rocm_read_tools`]). Takes the base
-/// builder (`NoToolConfig`) and returns it in `WithBuilderTools` because the
-/// first `.tool()` transitions the type-state; the ROCm read/mutating
-/// registrations chain after it. Note: ListSkillsTool/SkillPlanTool take only
-/// `fired`; the other four take `snap` + `fired`.
+/// Register the telemetry tools (GpuStatus, ListInstances, BenchSummary,
+/// TokensPerWatt — all snapshot-backed) on a fresh Rig `AgentBuilder`, cloning
+/// the snapshot + shared `fired` log into each. Kept generic over the builder's
+/// completion model + preamble so all three backends (RigAgentClient,
+/// ChatGptAgentClient, AnthropicAgentClient) reuse one registration site (DRY —
+/// the tool list lives in exactly one place, mirroring
+/// [`register_rocm_read_tools`]). Takes the base builder (`NoToolConfig`) and
+/// returns it in `WithBuilderTools` because the first `.tool()` transitions the
+/// type-state; the ROCm read/mutating registrations chain after it.
 pub(super) fn register_telemetry_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P>,
     snap: &Arc<StateSnapshot>,
@@ -745,13 +703,6 @@ where
             snap: snap.clone(),
             fired: fired.clone(),
         })
-        // Skills registry tools (read-only: list + dry-run plan; never execute).
-        .tool(ListSkillsTool {
-            fired: fired.clone(),
-        })
-        .tool(SkillPlanTool {
-            fired: fired.clone(),
-        })
 }
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
@@ -759,8 +710,8 @@ where
 /// builder's completion model + preamble so all three backends (the
 /// OpenAI-compatible, ChatGPT, and Anthropic paths) reuse one registration
 /// site (DRY — the tool list lives in exactly one place). The builder is
-/// already in the `WithBuilderTools` state because the telemetry/skill tools
-/// were registered first.
+/// already in the `WithBuilderTools` state because the telemetry tools were
+/// registered first.
 pub(super) fn register_rocm_read_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
@@ -902,53 +853,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn skill_tools_expose_both_demo_skills() {
-        // list_skills returns both demo skills (the agent can see them).
-        let list = ListSkillsTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let def = list.definition(String::new()).await;
-        assert_eq!(def.name, "list_skills");
-        let out = list.call(NoArgs::default()).await.expect("list ok");
-        let names: Vec<String> = out["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"install-lemonade".to_string()));
-        assert!(names.contains(&"auto-config-endpoint".to_string()));
-
-        // skill_plan returns the ordered dry-run plan for a named skill.
-        let plan_tool = SkillPlanTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let out = plan_tool
-            .call(SkillPlanArgs {
-                name: "install-lemonade".to_string(),
-            })
-            .await
-            .expect("plan ok");
-        let plan = out["plan"].as_array().unwrap();
-        assert!(
-            plan.iter()
-                .any(|l| l.as_str().unwrap().contains("lemonade-sdk"))
-        );
-        // Unknown skill → graceful error object, not a panic.
-        let miss = plan_tool
-            .call(SkillPlanArgs {
-                name: "nope".to_string(),
-            })
-            .await
-            .unwrap();
-        assert!(miss["error"].is_string());
-    }
-
     #[test]
-    fn skill_tool_names_registered_in_skill_names() {
-        assert!(SKILL_NAMES.contains(&"list_skills"));
-        assert!(SKILL_NAMES.contains(&"skill_plan"));
+    fn retired_skill_registry_tools_are_not_advertised() {
+        // `list_skills` / `skill_plan` described install steps (a GitHub
+        // releases download plus a `tar` extraction) that are not how the product
+        // installs an engine, and no executor ever applied their plans. They
+        // must not come back in any tool set the model is offered.
+        for gone in ["list_skills", "skill_plan"] {
+            assert!(!SKILL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(!ROCM_READ_TOOL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(
+                !ROCM_MUTATING_TOOL_NAMES.contains(&gone),
+                "{gone} is retired"
+            );
+        }
     }
 
     /// Minimal executor that echoes a fixed JSON value for any tool call.
@@ -1039,6 +957,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_rocm_command_reports_approval_without_executing() {
+        // `rocm_command` is registered as a read-only tool, so it has no
+        // approval channel: when the executor classifies the argv as mutating,
+        // the tool must hand the model an error and run nothing.
+        let approved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingMutatingExec {
+            approved: approved.clone(),
+        });
+        let tool = RocmCommandRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "args": ["serve", "qwen", "--managed"] }))
+            .await
+            .expect("tool call ok");
+        assert!(
+            out.get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("requires approval")),
+            "an approval request must reach the model as an error, got {out}"
+        );
+        assert!(
+            approved.lock().unwrap().is_empty(),
+            "a read-only tool must never execute a mutating command"
+        );
+    }
+
+    #[tokio::test]
     async fn mutating_tool_none_executor_is_graceful() {
         let tool = LaunchServerRocmTool {
             executor: None,
@@ -1075,6 +1022,126 @@ mod tests {
                 "collision with read tool: {n}"
             );
         }
+    }
+
+    /// Executor whose `execute()` can only finish if the async runtime keeps
+    /// making progress while it runs: it spawns a task onto the current runtime
+    /// and blocks until that task has run. On an async worker thread the task
+    /// is stuck behind the blocked worker, so `execute()` gives up after
+    /// [`STALL_TIMEOUT`] and reports the stall instead of hanging the test.
+    #[derive(Debug)]
+    struct NeedsRuntimeProgressExec;
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    impl crate::tool_exec::RocmToolExecutor for NeedsRuntimeProgressExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::runtime::Handle::current().spawn(async move {
+                let _ = tx.send(());
+            });
+            match rx.recv_timeout(STALL_TIMEOUT) {
+                Ok(()) => RocmToolOutcome::Result(json!({ "ok": true })),
+                Err(_) => RocmToolOutcome::Error("async runtime stalled".to_string()),
+            }
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    #[test]
+    fn read_only_tool_call_does_not_block_the_async_runtime() {
+        // The bin's executor blocks (see `run_rocm_read_tool`). The dash runs
+        // the agent on a multi-thread runtime, which on a single-CPU host has
+        // one worker; a `call()` that ran `execute()` inline would hold that
+        // worker, and no other async task could run until the executor returned.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(NeedsRuntimeProgressExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // Spawned like the event loop spawns `agent.complete`, so the call runs
+        // on the runtime's worker rather than on the `block_on` thread.
+        let out = rt
+            .block_on(async move { tokio::spawn(async move { tool.call(json!({})).await }).await })
+            .expect("tool task joins")
+            .expect("tool call ok");
+        assert_eq!(
+            out,
+            json!({ "ok": true }),
+            "the executor ran on an async worker and starved the runtime"
+        );
+    }
+
+    /// Executor whose `execute()` panics, standing in for a bug in the bin.
+    #[derive(Debug)]
+    struct PanickingExec;
+    impl crate::tool_exec::RocmToolExecutor for PanickingExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            panic!("executor bug");
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    /// In-memory `tracing` writer, so a test can read back what was logged.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_reports_a_panicking_executor_as_a_tool_error() {
+        // A panic inside `execute()` must come back to the model as a tool
+        // error. Unwinding instead would end the spawned agent task without a
+        // reply, leaving the chat waiting on a turn that never finishes.
+        let tool = ExamineRocmTool {
+            executor: Some(Arc::new(PanickingExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        // `#[tokio::test]` runs on one thread, so the thread-local subscriber
+        // sees the warning logged after the blocking task is joined.
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = tool.call(json!({})).await.expect("tool call ok");
+        drop(guard);
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("WARN")
+                && logged.contains("examine")
+                && logged.contains("executor bug"),
+            "the panic must be logged with the tool name and payload, got: {logged}"
+        );
+        let error = out.get("error").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            error.contains("`examine` failed to run"),
+            "expected a tool error naming the tool, got {out}"
+        );
+        assert!(
+            !error.contains("executor bug"),
+            "the panic payload must not be sent to the model, got {out}"
+        );
     }
 
     #[tokio::test]

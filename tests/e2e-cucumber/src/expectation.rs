@@ -31,6 +31,7 @@ const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_OOM_FAULT_INJECTION_TAG: &str = "requires-oom-fault-injection";
 const REQUIRES_CASE_SENSITIVE_FS_TAG: &str = "requires-case-sensitive-fs";
 const REQUIRES_DIR_PERMISSIONS_TAG: &str = "requires-dir-permissions";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
@@ -113,6 +114,16 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
+    /// `@requires-oom-fault-injection`: the scenario drives the test-only
+    /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+    /// to fabricate a GPU-less OOM launch, so it can only run against a binary
+    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
+    /// test a prebuilt shipping release binary that has the hook compiled out —
+    /// there the real GPU-required serve pre-flight would run instead. Skipped
+    /// when [`HostCapability::oom_fault_injection`] is false so those lanes do
+    /// not report the missing hook as a regression.
+    pub requires_oom_fault_injection: bool,
     /// `@requires-case-sensitive-fs`: the scenario's premise is two files whose
     /// names differ only in letter case (e.g. two runtime registry entries), so
     /// it is skipped where the scenarios' temp root folds case and the second
@@ -179,6 +190,7 @@ impl ScenarioDecl {
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
+        let mut requires_oom_fault_injection = false;
         let mut requires_case_sensitive_fs = false;
         let mut requires_dir_permissions = false;
         let mut requires_engine = None;
@@ -214,6 +226,8 @@ impl ScenarioDecl {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_OOM_FAULT_INJECTION_TAG {
+                requires_oom_fault_injection = true;
             } else if tag == REQUIRES_CASE_SENSITIVE_FS_TAG {
                 requires_case_sensitive_fs = true;
             } else if tag == REQUIRES_DIR_PERMISSIONS_TAG {
@@ -234,6 +248,7 @@ impl ScenarioDecl {
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
+            requires_oom_fault_injection,
             requires_case_sensitive_fs,
             requires_dir_permissions,
             requires_engine,
@@ -575,6 +590,13 @@ pub fn resolve(
             reason: "requires WSL; this host is not running under WSL".to_owned(),
         };
     }
+    if decl.requires_oom_fault_injection && !cap.oom_fault_injection {
+        return Expectation::Skip {
+            reason: "requires the e2e-oom-fault-injection build; this binary has \
+                     the hook compiled out"
+                .to_owned(),
+        };
+    }
     // Checked before the filesystem premise: on native Windows both fail, and
     // the OS is the coarser, more useful reason to report.
     if let Some(os) = &decl.requires_os
@@ -705,6 +727,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -717,6 +740,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -729,6 +753,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: false,
                 dir_permissions_bind: true,
             },
@@ -750,6 +775,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -765,6 +791,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -779,6 +806,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -791,6 +819,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
             },
@@ -1604,6 +1633,56 @@ serve_timeout_secs = 90
         }
     }
 
+    /// The fault-injection gate keys on the *binary's* build, not the host, so
+    /// the same mock lane runs it or skips it depending only on whether the hook
+    /// was compiled in. Proving both directions keeps a feature-less prebuilt
+    /// binary (the self-hosted lanes) from reporting the missing hook as a bug.
+    #[test]
+    fn requires_oom_fault_injection_runs_only_when_the_hook_is_built_in() {
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:serve-oom-launch-memory-guidance",
+            "requires-oom-fault-injection",
+        ]);
+        assert!(d.requires_oom_fault_injection);
+
+        // Binary built without the feature (default fixtures) — skip.
+        let without_hook = cap("mock");
+        assert!(!without_hook.oom_fault_injection);
+        assert!(matches!(
+            resolve(
+                &d,
+                &without_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
+            Expectation::Skip { .. }
+        ));
+
+        // Same host, but the binary carries the hook — run.
+        let mut with_hook = cap("mock");
+        with_hook.oom_fault_injection = true;
+        assert_eq!(
+            resolve(
+                &d,
+                &with_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
+            Expectation::ExpectPass
+        );
+    }
+
     #[test]
     fn case_sensitive_fs_tag_parses_in_both_shapes() {
         assert!(decl(&["id:x", "requires-case-sensitive-fs"]).requires_case_sensitive_fs);
@@ -2132,15 +2211,21 @@ flaky = true
         ));
     }
 
+    /// EAI-7998's row (`examine --json` reporting `has_amd_gpu: false` on a WSL2
+    /// host whose own summary names a gfx target) is resolved by taking the
+    /// field from that same target on WSL, not by this test, which only guards
+    /// against a silent regression. A WSL host with a reported target and one
+    /// without both go through the scenario now, so re-adding the row has to be
+    /// a deliberate decision.
     #[test]
-    fn gpu_report_disagreement_xfail_requires_a_reported_gfx_target() {
+    fn gpu_report_agreement_has_no_xfail_on_wsl() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        assert!(m.is_xfail(
-            "examine-both-forms-agree-on-gpu",
-            &cap("wsl-no-passthrough"),
-            "lemonade"
-        ));
-        assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
+        for host in ["wsl-no-passthrough", "wsl"] {
+            assert!(
+                !m.is_xfail("examine-both-forms-agree-on-gpu", &cap(host), "lemonade"),
+                "examine-08 must run, not xfail, on the {host} host"
+            );
+        }
     }
 
     /// EAI-8031's row (Windows lane cold-downloading its HF checkpoint every

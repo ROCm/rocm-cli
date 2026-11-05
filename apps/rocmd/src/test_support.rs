@@ -165,8 +165,8 @@ pub(crate) fn seed_keyed_service(paths: &AppPaths, service_id: &str, port: u16) 
 }
 
 /// The state an unconfirmed stop must leave behind: not marked stopped, the
-/// PID kept so a later stop can still reach it, the deferred-cleanup marker
-/// set, and the endpoint key still on disk.
+/// PID kept because the record still names that process, the deferred-cleanup
+/// marker set, and the endpoint key still on disk.
 pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     reloaded: &ManagedServiceRecord,
     key_kept: bool,
@@ -177,7 +177,7 @@ pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     );
     assert_eq!(
         reloaded.supervisor_pid, UNCONFIRMED_STOP_PID,
-        "an unconfirmed stop must keep the PID a later stop needs"
+        "an unconfirmed stop must keep the PID of the process it may have left running"
     );
     assert!(
         reloaded.stop_requested_unix_ms.is_some(),

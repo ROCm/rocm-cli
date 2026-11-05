@@ -1407,7 +1407,7 @@ mod archive_properties {
     /// recreates the symlink as archived, so nothing upstream of the lookup
     /// stops it.
     #[test]
-    #[ignore = "known defect: uv binary lookup follows symlinks out of the staging dir (#522)"]
+    #[ignore = "known gap: uv binary lookup follows symlinks out of the staging dir (#522)"]
     fn uv_binary_lookup_never_chmods_a_file_outside_staging() {
         use std::os::unix::fs::PermissionsExt as _;
         let layout = Layout::new();
@@ -1433,7 +1433,7 @@ mod archive_properties {
     /// whole host filesystem.) This runs the lookup on a worker thread and
     /// fails if it has not returned in 20 s; the thread is leaked on failure.
     #[test]
-    #[ignore = "known defect: uv binary lookup does not terminate on a symlink loop (#522)"]
+    #[ignore = "known gap: uv binary lookup does not terminate on a symlink loop (#522)"]
     fn uv_binary_lookup_terminates_on_a_symlink_loop() {
         let layout = Layout::new();
         let entries = [

@@ -13,13 +13,22 @@
 //! name, the `Received` chain, the client in `X-Mailer`, the time zone in
 //! `Date`, and often a signature under the body. The report itself carries
 //! none of that, and this module keeps it that way downstream. The header
-//! parser keeps the four headers it needs and drops every other one while
-//! reading, a `Message-ID` is held only as a digest, and only the JSON value in
-//! the body is read. So none of those headers can leave this module, whatever
-//! a later change prints. The subject does leave it, because it is what tells a
-//! report from other mail; for a report the CLI wrote it, but the subject of a
-//! reply or of unrelated mail is free text, which the caller prints only on
-//! request.
+//! parser keeps the five headers it needs (`Subject`, `Message-ID`, the two
+//! content headers, and `Date`) and drops every other one while reading. A
+//! `Message-ID` is held only as a digest, `Date` only as a week (below), and
+//! only the JSON value in the body is read. So no other header can leave this
+//! module, whatever a later change prints. The subject does leave it, because it
+//! is what tells a report from other mail; for a report the CLI wrote it, but
+//! the subject of a reply or of unrelated mail is free text, which the caller
+//! prints only on request.
+//!
+//! `Date` is the one kept header that is itself sender-identifying: its zone is.
+//! An earlier version dropped it for that reason. It is kept now because it is
+//! the only place a report's time is recorded, and the weekly trend needs a time
+//! axis. It is reduced to the week it falls in inside [`week_of`], which
+//! converts it to UTC, takes the day and then the week, and returns nothing
+//! else. The time of day, the zone and the day itself never leave that function,
+//! so none of them can reach a count or an output.
 //!
 //! Only `.eml` is read: one message per file, which is what Outlook on the web
 //! and the Graph `$value` endpoint produce, and a damaged file is exactly one
@@ -28,13 +37,27 @@
 //! failure this whole path exists to avoid.
 
 use base64::Engine as _;
-use rocm_core::ReadOutcome;
+use chrono::DateTime;
 use rocm_core::report_delivery::SUBJECT_TAG;
+use rocm_core::{ReadOutcome, ReportWeek};
 use sha2::{Digest, Sha256};
+
+/// The earliest day a report can have been sent, as days since 1970-01-01:
+/// 2026-10-05, the day the code that writes reports first landed in this
+/// repository. No report exists from before it.
+///
+/// The report address takes mail from anyone, so a `Date` is what the sender's
+/// client claims and not evidence of when a report was written. One before this
+/// or one in the future reads as undated instead of inventing a week that never
+/// happened. A date inside the range is still taken as given, so one sender can
+/// still choose a week inside it; that is a limit of reading time from the mail,
+/// and it matters once a rise is acted on without a person reading it.
+pub(crate) const EARLIEST_PLAUSIBLE_DAY: i64 = 20_731;
 
 /// One exported message, reduced to what the rollup may see.
 ///
-/// There is deliberately no field here that could hold a sender.
+/// There is deliberately no field here that could hold a sender, and none finer
+/// than a week for when it was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Message {
     /// The decoded subject, used only to tell report mail from other mail.
@@ -42,6 +65,9 @@ pub(crate) struct Message {
     /// SHA-256 of the `Message-ID`, used only to drop a message exported
     /// twice. The raw value often names the sender's host, so it is not kept.
     pub id_digest: Option<String>,
+    /// The week the message was sent in, or `None` when its `Date` is missing,
+    /// cannot be read, or is not plausible. See [`week_of`].
+    pub week: Option<ReportWeek>,
     /// The decoded text of the message, or `None` when no text part exists.
     pub body: Option<String>,
 }
@@ -110,8 +136,9 @@ pub(crate) fn read_body(body: &str) -> ReadOutcome {
         .unwrap_or(whole)
 }
 
-/// Parse one `.eml` file.
-pub(crate) fn parse_eml(bytes: &[u8]) -> Message {
+/// Parse one `.eml` file. `today` is the current day in days since 1970-01-01,
+/// passed in so the plausibility check below is the same on every run.
+pub(crate) fn parse_eml(bytes: &[u8], today: i64) -> Message {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
     let (headers, body) = split_entity(&text);
     Message {
@@ -124,8 +151,34 @@ pub(crate) fn parse_eml(bytes: &[u8]) -> Message {
             .message_id
             .as_deref()
             .map(|id| format!("{:x}", Sha256::digest(id.trim().as_bytes()))),
+        week: headers
+            .date
+            .as_deref()
+            .and_then(|date| week_of(date, today)),
         body: entity_text(&headers, body),
     }
+}
+
+/// The week a `Date` header falls in, and nothing else about it.
+///
+/// The header is converted to UTC, so a message sent late on a Sunday in one
+/// zone and early on a Monday in another lands in the same week. The zone is
+/// used for that and then goes out of scope with the rest of the parsed date.
+/// `None` for a header that is missing, malformed, before
+/// [`EARLIEST_PLAUSIBLE_DAY`], or after `today` plus a day of slack for clocks
+/// that disagree.
+///
+/// A trailing comment such as `(CEST)`, nested ones included, is part of the
+/// format and `chrono` reads it. An unclosed one is malformed, so the header is
+/// undated.
+fn week_of(date: &str, today: i64) -> Option<ReportWeek> {
+    let day = DateTime::parse_from_rfc2822(date.trim())
+        .ok()?
+        .timestamp()
+        .div_euclid(86_400);
+    (EARLIEST_PLAUSIBLE_DAY..=today.saturating_add(1))
+        .contains(&day)
+        .then(|| ReportWeek::from_unix_day(day))
 }
 
 /// The headers this module reads. Everything else is dropped while parsing.
@@ -133,6 +186,8 @@ pub(crate) fn parse_eml(bytes: &[u8]) -> Message {
 struct Headers {
     subject: Option<String>,
     message_id: Option<String>,
+    /// Held only until [`parse_eml`] reduces it to a week.
+    date: Option<String>,
     content_type: Option<String>,
     transfer_encoding: Option<String>,
 }
@@ -165,6 +220,7 @@ fn split_entity(text: &str) -> (Headers, &str) {
         match name.trim().to_ascii_lowercase().as_str() {
             "subject" => headers.subject = Some(value),
             "message-id" => headers.message_id = Some(value),
+            "date" => headers.date = Some(value),
             "content-type" => headers.content_type = Some(value),
             "content-transfer-encoding" => headers.transfer_encoding = Some(value),
             _ => {}
@@ -420,6 +476,21 @@ fn decode_words(header: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 2027-01-15, as days since 1970-01-01: the day these tests run "on".
+    const TODAY: i64 = 20_833;
+
+    fn parse(bytes: &[u8]) -> Message {
+        parse_eml(bytes, TODAY)
+    }
+
+    /// The Monday of the week a message with this `Date` header lands in.
+    fn week_for(date: &str) -> Option<String> {
+        let headers = format!("Subject: [rocm-doctor] x\nDate: {date}");
+        parse(&eml(&headers, REPORT))
+            .week
+            .map(|week| week.to_string())
+    }
+
     const REPORT: &str = r#"{
   "schema": 1,
   "architecture": "gfx942",
@@ -451,7 +522,7 @@ mod tests {
 
     #[test]
     fn a_plain_message_reads_as_a_report() {
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] fix-6-path on gfx942 / ubuntu-22\nContent-Type: text/plain; charset=utf-8",
             REPORT,
         ));
@@ -467,7 +538,7 @@ mod tests {
             "\"architecture_matrix\": \"ROCm",
             "\"architecture_matrix\": \"RO=\nCm",
         );
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: text/plain\nContent-Transfer-Encoding: quoted-printable",
             &encoded,
         ));
@@ -486,7 +557,7 @@ mod tests {
             "--b1\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: base64\n\n{}\n--b1\nContent-Type: text/html\n\n<p>ignored</p>\n--b1--\n",
             wrapped.join("\n")
         );
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: multipart/alternative;\n boundary=\"b1\"",
             &body,
         ));
@@ -507,7 +578,7 @@ mod tests {
                 ]
             })
             .collect();
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: multipart/alternative; boundary=zz",
             &format!(
                 "--zz\nContent-Type: text/html; charset=utf-8\n\n<html><body>{html}</body></html>\n--zz--\n"
@@ -522,7 +593,7 @@ mod tests {
             "\"ROCm compatibility matrix, ",
             "\"ROCm compatibility matrix, \n",
         );
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: text/plain; format=flowed",
             &flowed,
         ));
@@ -531,7 +602,7 @@ mod tests {
 
     #[test]
     fn an_encoded_subject_still_carries_the_tag() {
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: =?utf-8?Q?=5Brocm-doctor=5D_fix-6-path?= =?utf-8?B?IG9uIGdmeDk0Mg==?=",
             REPORT,
         ));
@@ -569,11 +640,11 @@ mod tests {
             "Undeliverable: [rocm-doctor] fix-6-path on gfx942 / ubuntu-22",
             "Lunch on Friday?",
         ] {
-            let message = parse_eml(&eml(&format!("Subject: {subject}"), REPORT));
+            let message = parse(&eml(&format!("Subject: {subject}"), REPORT));
             assert!(!message.is_report(), "{subject}");
         }
         for subject in ["Fw: [rocm-doctor] x", "FWD: Fw: [rocm-doctor] x"] {
-            let message = parse_eml(&eml(&format!("Subject: {subject}"), REPORT));
+            let message = parse(&eml(&format!("Subject: {subject}"), REPORT));
             assert!(message.is_report(), "{subject}");
         }
     }
@@ -581,7 +652,7 @@ mod tests {
     /// Nothing that identifies the sender survives parsing.
     #[test]
     fn the_sender_never_leaves_the_parser() {
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "From: Sender-Marker-Name <sender-marker@example.com>\n\
              Received: from host-marker.example.com (10.0.0.1)\n\
              X-Mailer: Mailer-Marker 1.0\n\
@@ -591,16 +662,25 @@ mod tests {
             &format!("{REPORT}\n\n--\nSignature-Marker\n"),
         ));
         let kept = format!("{message:?}");
+        // The `Date` is kept as a week and as nothing else: not its time of
+        // day, its zone or its day.
         for marker in [
             "Sender-Marker",
             "sender-marker",
             "host-marker",
             "Mailer-Marker",
             "+0200",
+            "10:00",
+            "26 Oct",
             "id-marker",
         ] {
             assert!(!kept.contains(marker), "{marker} survived parsing: {kept}");
         }
+        assert_eq!(
+            message.week.map(|week| week.to_string()).as_deref(),
+            Some("2026-10-26"),
+            "the week is what survives of the Date"
+        );
         // The signature is in the body, which is kept; it is never parsed.
         let ReadOutcome::Understood(report) = read_body(message.body.as_deref().unwrap()) else {
             panic!("the report under the headers must still read");
@@ -612,7 +692,7 @@ mod tests {
     /// A part may omit its headers entirely, which makes it `text/plain`.
     #[test]
     fn a_part_with_no_headers_is_read_as_text() {
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: multipart/mixed; boundary=q",
             &format!("--q\n\n{REPORT}\n--q--\n"),
         ));
@@ -623,7 +703,7 @@ mod tests {
     #[test]
     fn an_empty_plain_part_falls_back_to_the_html_part() {
         let html = REPORT.replace('"', "&quot;").replace('\n', "<br>");
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: multipart/alternative; boundary=zz",
             &format!(
                 "--zz\nContent-Type: text/plain\n\n\n--zz\nContent-Type: text/html\n\n{html}\n--zz--\n"
@@ -634,15 +714,116 @@ mod tests {
 
     #[test]
     fn forwards_are_recognised_and_other_reports_are_not() {
-        let subject = |s: &str| parse_eml(&eml(&format!("Subject: {s}"), REPORT));
+        let subject = |s: &str| parse(&eml(&format!("Subject: {s}"), REPORT));
         assert!(subject("Fw: [rocm-doctor] x").is_forward());
         assert!(subject("FWD: Fw: [rocm-doctor] x").is_forward());
         assert!(!subject("[rocm-doctor] x").is_forward());
     }
 
+    /// Thursday 2026-10-29 is in the week that starts on Monday 2026-10-26,
+    /// whatever zone it was written in and however the header is spelled.
+    #[test]
+    fn a_date_lands_in_the_week_of_its_utc_day_whatever_its_zone() {
+        for date in [
+            "Thu, 29 Oct 2026 10:00:00 +0200",
+            "Thu, 29 Oct 2026 10:00:00 -0800",
+            "Thu, 29 Oct 2026 10:00:00 GMT",
+            "Thu, 29 Oct 2026 10:00:00 +0000 (UTC)",
+            "Thu, 29 Oct 2026 10:00:00 +0200 (Central European Summer Time)",
+            // A folded header is one header.
+            "Thu, 29 Oct\n 2026 10:00:00 +0000",
+        ] {
+            assert_eq!(week_for(date).as_deref(), Some("2026-10-26"), "{date:?}");
+        }
+    }
+
+    /// The week turns over at midnight in UTC, not at midnight where the mail
+    /// was sent, so the same instant is the same week for every sender.
+    #[test]
+    fn the_week_turns_over_at_midnight_utc_not_where_it_was_sent() {
+        for (date, monday) in [
+            ("Sun, 25 Oct 2026 23:59:59 +0000", "2026-10-19"),
+            ("Mon, 26 Oct 2026 00:00:00 +0000", "2026-10-26"),
+            // Monday 00:30 in UTC, though it was still Sunday where it was sent.
+            ("Sun, 25 Oct 2026 23:30:00 -0100", "2026-10-26"),
+            // Sunday 23:30 in UTC, though it was already Monday where it was sent.
+            ("Mon, 26 Oct 2026 00:30:00 +0100", "2026-10-19"),
+        ] {
+            assert_eq!(week_for(date).as_deref(), Some(monday), "{date}");
+        }
+    }
+
+    /// A week named by its Monday reads the same either side of New Year.
+    #[test]
+    fn a_week_that_spans_new_year_is_one_week() {
+        for (date, monday) in [
+            ("Mon, 28 Dec 2026 00:00:00 +0000", "2026-12-28"),
+            ("Thu, 31 Dec 2026 12:00:00 +0000", "2026-12-28"),
+            ("Sun, 03 Jan 2027 23:59:59 +0000", "2026-12-28"),
+            ("Mon, 04 Jan 2027 00:00:00 +0000", "2027-01-04"),
+        ] {
+            assert_eq!(week_for(date).as_deref(), Some(monday), "{date}");
+        }
+    }
+
+    /// Mail from anyone can say anything in `Date`. A date that cannot be
+    /// trusted to mean a week puts the report in no week, which the rollup then
+    /// says, rather than in a week that never happened.
+    #[test]
+    fn a_date_that_is_missing_unreadable_or_implausible_is_undated() {
+        assert_eq!(
+            parse(&eml("Subject: [rocm-doctor] x", REPORT)).week,
+            None,
+            "no Date header"
+        );
+        for date in [
+            "yesterday",
+            "",
+            "Thu, 29 Oct 2026 25:00:00 +0000", // not a time
+            "Fri, 29 Oct 2026 10:00:00 +0000", // the weekday does not match the date
+            "Mon, 01 Jan 2024 10:00:00 +0000", // before any report existed
+            "Sun, 04 Oct 2026 12:00:00 +0000", // the day before the code first landed
+            "Thu, 29 Oct 2099 10:00:00 +0000", // in the future
+            // A comment that never closes is malformed, not a comment.
+            "Thu, 29 Oct 2026 10:00:00 +0200 (unclosed",
+        ] {
+            assert_eq!(week_for(date), None, "{date:?}");
+        }
+        // The day the code first landed is the first plausible day.
+        assert_eq!(
+            week_for("Mon, 05 Oct 2026 00:00:00 +0000").as_deref(),
+            Some("2026-10-05")
+        );
+        // One day ahead of today is allowed, for clocks that disagree. Two is not.
+        assert!(week_for("Sat, 16 Jan 2027 10:00:00 +0000").is_some());
+        assert_eq!(week_for("Sun, 17 Jan 2027 10:00:00 +0000"), None);
+    }
+
+    /// Only the top-level `Date` counts. A part of the message may carry its own
+    /// headers, and those are not when the message was sent.
+    #[test]
+    fn a_date_inside_a_mime_part_is_not_the_date_of_the_message() {
+        // The part is dated Thursday 5 November, in the week of 2026-11-02.
+        let body = format!("--q\nDate: Thu, 05 Nov 2026 10:00:00 +0000\n\n{REPORT}\n--q--\n");
+        let headers = "Subject: [rocm-doctor] x\nContent-Type: multipart/mixed; boundary=q";
+
+        // With a top-level `Date` as well, the message is in the top-level week.
+        let both = parse(&eml(
+            &format!("{headers}\nDate: Thu, 29 Oct 2026 10:00:00 +0000"),
+            &body,
+        ));
+        assert_eq!(
+            both.week.map(|week| week.to_string()).as_deref(),
+            Some("2026-10-26"),
+            "the part's date must not stand in for the message's"
+        );
+        // With none at the top level, the part's does not fill the gap.
+        assert_eq!(parse(&eml(headers, &body)).week, None);
+    }
+
     #[test]
     fn a_message_with_no_text_part_has_no_body() {
-        let message = parse_eml(&eml(
+        let message = parse(&eml(
             "Subject: [rocm-doctor] x\nContent-Type: multipart/mixed; boundary=q",
             "--q\nContent-Type: application/octet-stream\n\nAAAA\n--q--\n",
         ));
