@@ -246,7 +246,7 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
 
 CLI:
 
@@ -331,7 +331,7 @@ on two counts, and both change how you edit it:
   what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
-  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  The failure catalog itself is authoritative in [fix/catalog.rs](crates/rocm-core/src/fix/catalog.rs)
   (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
   checker and OS scoping) — adding, renaming, or re-scoping a failure mode
   means changing the CLI **first**, then the two docs. That feature is what
