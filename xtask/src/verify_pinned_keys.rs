@@ -1026,10 +1026,20 @@ mod tests {
                 }
             }
         }
-        let body_chars: usize = body.iter().map(|line| line.chars().count()).sum();
-        assert!(
-            body_chars > 300,
-            "the walk covered only {body_chars} body characters"
+        // The walk covered the whole key, counted straight from the committed
+        // file rather than through `raw_body_lines`, whatever its size: a
+        // rotation to a different key type or length changes this count, not
+        // the test.
+        let walked: usize = body.iter().map(|line| line.chars().count()).sum();
+        let committed: usize = canonical
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .map(|line| line.chars().count())
+            .sum();
+        assert!(committed > 0, "the committed key has a body");
+        assert_eq!(
+            walked, committed,
+            "the walk must cover every body character of the committed key"
         );
         assert_eq!(checked, expected_checks, "every position gets every edit");
     }
@@ -1142,10 +1152,10 @@ mod tests {
     fn a_correct_key_elsewhere_in_the_file_never_rescues_a_wrong_constant() {
         let canonical = canonical_release_key_text();
         let mut body = raw_body_lines(&canonical);
-        // Flip the case of the first letter on the second body line, a
+        // Flip the case of the first letter on the first body line, a
         // one-character drift that stays inside the base64 alphabet.
         let flipped: String = {
-            let mut chars: Vec<char> = body[1].chars().collect();
+            let mut chars: Vec<char> = body[0].chars().collect();
             let at = chars
                 .iter()
                 .position(char::is_ascii_alphabetic)
@@ -1157,7 +1167,7 @@ mod tests {
             };
             chars.into_iter().collect()
         };
-        body[1] = flipped;
+        body[0] = flipped;
         let wrong = pem_from_lines(&body);
         assert_fixture_differs(&wrong, &canonical);
 
@@ -1219,7 +1229,13 @@ mod tests {
     fn non_base64_noise_in_an_embedded_key_is_normalized_away() {
         let canonical = canonical_release_key_text();
         for noise in [" ", "!", "."] {
-            let noisy = canonical.replacen("\nMII", &format!("\n{noise}MII"), 1);
+            // At the start of the body, which every key has, rather than
+            // before a particular key type's leading bytes.
+            let noisy = canonical.replacen(
+                &format!("{PEM_BEGIN}\n"),
+                &format!("{PEM_BEGIN}\n{noise}"),
+                1,
+            );
             assert_fixture_differs(&noisy, &canonical);
             let root = release_layout(
                 &canonical,
