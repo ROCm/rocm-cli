@@ -50,9 +50,11 @@
 //! `read_managed_service_manifest`, `internal_stop_server_value` and
 //! `process_check_command` are `pub(crate)` for `service_control.rs` (the last
 //! one only for its tests); `read_tail_lines`, `render_logs_text`,
-//! `render_logs_browser_text`, `render_services_text`, `render_service_logs_text`,
-//! and `validate_service_id` are also `pub(crate)` and read from `chat.rs`'s
-//! deterministic tool-output summaries; `read_optional_tail_lines` and
+//! `render_logs_browser_text`, `render_services_text` and
+//! `render_service_logs_text` are also `pub(crate)` and read from `chat.rs`'s
+//! deterministic tool-output summaries; `validate_service_id` is also
+//! `pub(crate)` and read from `tool_policy.rs`'s service-tool validation,
+//! `services_cmd.rs` and `service_records.rs`; `read_optional_tail_lines` and
 //! `render_service_action_result` are also `pub(crate)` and read from
 //! `service_launch.rs`'s managed-spawn/attach path. Every other item in this
 //! list has no caller outside this module and stays private.
