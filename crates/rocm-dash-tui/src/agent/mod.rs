@@ -56,11 +56,10 @@ pub use tools::{
     AutomationsRocmTool, BenchSummaryTool, BridgeSnapshotRocmTool, DoctorRocmTool, EnginesRocmTool,
     ExamineRocmTool, GpuSnapshotRocmTool, GpuStatusArgs, GpuStatusTool, InstallEngineRocmTool,
     InstallSdkDryRunRocmTool, InstallSdkRocmTool, LaunchServerRocmTool, ListInstancesTool,
-    ListSkillsTool, NaturalLanguagePlanRocmTool, NoArgs, PathExistsRocmTool, PortStatusRocmTool,
+    NaturalLanguagePlanRocmTool, NoArgs, PathExistsRocmTool, PortStatusRocmTool,
     ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, RocmCommandRocmTool, SKILL_NAMES,
-    ServiceLogsRocmTool, ServicesRocmTool, SkillPlanArgs, SkillPlanTool, StopServerRocmTool,
-    TokensPerWattTool, ToolError, UpdateCheckRocmTool, WatcherDisableRocmTool,
-    WatcherEnableRocmTool,
+    ServiceLogsRocmTool, ServicesRocmTool, StopServerRocmTool, TokensPerWattTool, ToolError,
+    UpdateCheckRocmTool, WatcherDisableRocmTool, WatcherEnableRocmTool,
 };
 
 /// One-shot request budget. A hung backend becomes a timeout error turn, never
