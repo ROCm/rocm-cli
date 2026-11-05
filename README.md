@@ -918,7 +918,8 @@ engine gives up (vLLM and AIM after 5 minutes by default; raise it with
 of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
-in the background. It cannot be combined with `--foreground` or `--verbose`, and
+in the background; a generated API key (public bind) is printed when the wait
+begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
 when the model is already being served and still starting, it waits on that
 server instead (an already-serving one is reported at once). Watch the download with
 `rocm logs --service <id> --follow` from another terminal.
@@ -1405,8 +1406,10 @@ rocm uninstall [--yes] [--dry-run]
 download's progress, until the server stops (a server that ends `failed` makes the command exit
 non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
 ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
-line stays on the row under the newest output; piped or redirected output prints
-it once.
+line stays on the row under the newest output. Piped or redirected output keeps
+stdout to the log text alone: the hint (once), `is ready.` and `stopped following.`
+lines go to stderr. A server that is already `failed` when the follow starts exits
+non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will

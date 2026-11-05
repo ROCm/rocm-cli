@@ -428,7 +428,9 @@ Expected result:
   line when it finishes starting; Ctrl-C ends the follow and the server keeps running.
   On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>` line stays on the
   row directly under the newest output (and under the download bar) as the log
-  grows; with output piped to a file it is printed once instead.
+  grows; piped, stdout carries only the log text and the hint (once), ready and
+  stopped-following lines go to stderr. A server already `failed` when the follow
+  starts also exits non-zero.
 - `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
   server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
   with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero

@@ -130,6 +130,15 @@ const FOLLOW_SERVICE_ID: &str = "vllm-e2e-follow";
 
 #[given("a stopped local server whose log shows a download at 43 percent")]
 async fn plant_stopped_server_with_log(world: &mut E2eWorld) {
+    plant_server_with_log(world, "stopped");
+}
+
+#[given("a failed local server whose log shows a download at 43 percent")]
+async fn plant_failed_server_with_log(world: &mut E2eWorld) {
+    plant_server_with_log(world, "failed");
+}
+
+fn plant_server_with_log(world: &mut E2eWorld, status: &str) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let data = root.path().join("data");
     let services = data.join("services");
@@ -147,7 +156,7 @@ async fn plant_stopped_server_with_log(world: &mut E2eWorld) {
         "port": 9,
         "endpoint_url": "http://127.0.0.1:9/v1",
         "mode": "managed",
-        "status": "stopped",
+        "status": status,
         "supervisor_pid": 0,
         "engine_pid": null,
         "manifest_path": services.join(format!("{FOLLOW_SERVICE_ID}.json")),
@@ -185,15 +194,42 @@ async fn follow_without_service(world: &mut E2eWorld) {
 #[then("the CLI prints the download line, says it is not following, and exits")]
 async fn prints_and_exits(world: &mut E2eWorld) {
     let out = ok_output(world);
+    let err = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        out.contains("Downloading model.safetensors: 43%"),
+        "expected the planted log line, got:\n{out}"
+    );
+    // Piped, stdout is log text only; the notice about the follow goes to stderr.
+    let note = format!("Service {FOLLOW_SERVICE_ID} is stopped; not following.");
+    assert!(!out.contains(&note), "notice leaked onto stdout:\n{out}");
+    assert!(
+        err.contains(&note),
+        "expected the not-following line, got:\n{err}"
+    );
+}
+
+#[then("the CLI prints the download line, says it is not following, and exits with an error")]
+async fn prints_and_fails(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let out = world.cli_output.clone().unwrap_or_default();
+    let err = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(
+        rc, 0,
+        "a failed server must not follow as success:\n{out}\n{err}"
+    );
     assert!(
         out.contains("Downloading model.safetensors: 43%"),
         "expected the planted log line, got:\n{out}"
     );
     assert!(
-        out.contains(&format!(
-            "Service {FOLLOW_SERVICE_ID} is stopped; not following."
+        err.contains(&format!(
+            "Service {FOLLOW_SERVICE_ID} is failed; not following."
         )),
-        "expected the not-following line, got:\n{out}"
+        "expected the not-following line, got:\n{err}"
+    );
+    assert!(
+        err.contains(&format!("service {FOLLOW_SERVICE_ID} failed")),
+        "expected the failure error, got:\n{err}"
     );
 }
 

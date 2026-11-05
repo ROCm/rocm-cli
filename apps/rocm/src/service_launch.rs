@@ -773,9 +773,48 @@ fn died_during_wait(
         return None;
     }
     settle_exited_service(paths, service_id);
-    Some(anyhow!(
+    let mut message = format!(
         "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
-    ))
+    );
+    // A plain `serve` adds the memory guidance for a vLLM launch that ran out of
+    // VRAM; the wait's failure is the same launch, so it gets the same note.
+    // "starting" is the status the note keys on for "never became ready", which is
+    // what a `--wait` death is, whatever the settled record now says.
+    if let Ok(record) = ManagedServiceRecord::read_manifest(paths, service_id) {
+        for note in crate::serve_summary::append_oom_serve_note(
+            Vec::new(),
+            &record.engine,
+            false,
+            "starting",
+            Some(&record.log_path),
+        ) {
+            let _ = write!(message, "\n  note: {note}");
+        }
+    }
+    Some(anyhow!(message))
+}
+
+/// Record the outcome of a finished wait on the manifest as it is now, changing
+/// only what the wait learned. The copy read at spawn time can be long stale:
+/// `rocmd` may have recorded a restart or a new supervisor pid, and `rocm logs`
+/// refreshes the record, so writing it back whole would revert those.
+fn record_wait_outcome(
+    paths: &AppPaths,
+    held: &mut ManagedServiceRecord,
+    status: &str,
+    verified: bool,
+) -> Result<()> {
+    let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
+        .unwrap_or_else(|_| held.clone());
+    status.clone_into(&mut latest.status);
+    if verified {
+        // Latch the verification the wait just performed, so the readiness checks
+        // behind `services list` and chat read it instead of re-probing.
+        latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
+    latest.write()?;
+    *held = latest;
+    Ok(())
 }
 
 /// Test-only fault-injection switch, off (`const false`) in shipped binaries:
@@ -947,11 +986,12 @@ fn wait_on_existing_service(
         return Err(error);
     }
     report.status = status_for_readiness(readiness).to_owned();
-    record.status.clone_from(&report.status);
-    if readiness == EndpointReadiness::Serving {
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
-    }
-    record.write()?;
+    record_wait_outcome(
+        paths,
+        &mut record,
+        &report.status,
+        readiness == EndpointReadiness::Serving,
+    )?;
     Ok(report)
 }
 
@@ -1052,13 +1092,12 @@ pub(crate) fn start_managed_service(
         return Err(error);
     }
     let launch_status = status_for_readiness(readiness);
-    record.status = launch_status.to_owned();
-    if readiness == EndpointReadiness::Serving {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
-    }
-    record.write()?;
+    record_wait_outcome(
+        &paths,
+        &mut record,
+        launch_status,
+        readiness == EndpointReadiness::Serving,
+    )?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
         &paths,
@@ -1124,6 +1163,23 @@ pub(crate) fn print_managed_launch_plain(
         println!("  manifest_path: {}", manifest_path.display());
     }
     println!("  readiness: {}", report.status);
+}
+
+/// The client configuration to show when a `--wait` begins, so a key generated for
+/// a public bind reaches the user even if the wait is interrupted or fails.
+/// `None` unless the wait is on the launch that key belongs to: an attach to an
+/// already-starting server (`waiting_on` differs from `service_id`) answers to
+/// its own key, which is not shown here.
+pub(crate) fn wait_begin_client_config(
+    waiting_on: &str,
+    service_id: &str,
+    host: &str,
+    port: u16,
+    api_key: Option<&str>,
+) -> Option<String> {
+    let key = api_key.filter(|_| waiting_on == service_id)?;
+    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
+    Some(render_endpoint_client_config(&endpoint_url, key))
 }
 
 /// Render the one-time secure client configuration for a public, authenticated
@@ -2028,6 +2084,77 @@ mod tests {
         );
         assert_eq!(status(), "stopped");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn died_during_wait_adds_the_oom_guidance_for_a_vllm_launch_only() {
+        let (root, paths) = test_paths("wait-died-oom");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.engine = "vllm".to_owned();
+        record.write().expect("write");
+        fs::write(
+            &record.log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("log");
+        let id = record.service_id;
+        let pending = EndpointReadiness::Unreachable;
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(message.contains("--gpu-memory-utilization"), "{message}");
+
+        // Same log, another engine: that engine has no such flag to suggest.
+        let mut record = ManagedServiceRecord::read_manifest(&paths, &id).unwrap();
+        record.engine = "lemonade".to_owned();
+        "starting".clone_into(&mut record.status);
+        record.write().expect("write");
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(!message.contains("--gpu-memory-utilization"), "{message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_wait_outcome_keeps_what_changed_on_disk_during_the_wait() {
+        let (root, paths) = test_paths("wait-outcome");
+        paths.ensure().expect("paths");
+        let mut held = record_tracking_pid(&paths, 111, "starting");
+        held.write().expect("write");
+        // While the wait ran, `rocmd` recorded a restart and a new supervisor.
+        let mut elsewhere = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        elsewhere.restart_count = 3;
+        elsewhere.supervisor_pid = 222;
+        elsewhere.write().expect("write");
+
+        record_wait_outcome(&paths, &mut held, "ready", true).expect("outcome");
+        let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        assert_eq!(after.status, "ready");
+        assert!(after.inference_verified_at_unix_ms.is_some());
+        assert_eq!(after.restart_count, 3, "the restart count was reverted");
+        assert_eq!(after.supervisor_pid, 222, "the supervisor pid was reverted");
+
+        record_wait_outcome(&paths, &mut held, "starting", false).expect("outcome");
+        let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        assert_eq!(after.status, "starting");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_begin_shows_the_key_only_for_the_launch_it_belongs_to() {
+        let own = wait_begin_client_config("svc-new", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
+            .expect("own launch shows its key");
+        assert!(own.contains("api key: k-secret"), "{own}");
+        assert!(own.contains("http://0.0.0.0:8000/v1/models"), "{own}");
+        // Attached to an already-starting server: its key is not this one.
+        assert!(
+            wait_begin_client_config("svc-old", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
+                .is_none()
+        );
+        // Loopback binds have no key to show.
+        assert!(wait_begin_client_config("svc-new", "svc-new", "127.0.0.1", 8000, None).is_none());
     }
 
     #[test]

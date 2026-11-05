@@ -50,3 +50,13 @@ Feature: Log inspection
     Given a stopped local server whose log shows a download at 43 percent
     When the user follows that server's logs with rocm services logs -f
     Then the CLI prints the download line, says it is not following, and exits
+
+  # A server that ended `failed` is not a success, whether `--follow` finds it
+  # already failed (this scenario) or sees it fail while following (covered by
+  # `follow_service_logs_fails_when_the_service_failed` in
+  # `apps/rocm/src/services_text.rs`).
+  @id:logs-follow-failed-service-exits-nonzero
+  Scenario: logs-07 - Following a failed server's logs prints them and exits with an error
+    Given a failed local server whose log shows a download at 43 percent
+    When the user follows that server's logs
+    Then the CLI prints the download line, says it is not following, and exits with an error

@@ -718,6 +718,32 @@ impl FollowFooter {
         Ok(())
     }
 
+    /// Clear the footer and end an unfinished redraw row, leaving the cursor on
+    /// a fresh row.
+    fn finish(&mut self, out: &mut impl io::Write) -> Result<()> {
+        self.erase(out)?;
+        if self.open_row {
+            writeln!(out)?;
+            self.open_row = false;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// One line of the follow's own, written below the log output with the
+    /// footer redrawn under it. An unfinished download bar row is ended first,
+    /// not overwritten.
+    fn write_notice(
+        &mut self,
+        out: &mut impl io::Write,
+        text: &str,
+        cols: Option<usize>,
+    ) -> Result<()> {
+        self.finish(out)?;
+        writeln!(out, "{text}")?;
+        self.draw(out, false, cols)
+    }
+
     /// `cols` truncates the text so it never wraps onto a second row, which the
     /// one-row erase could not clear.
     fn draw(
@@ -776,6 +802,7 @@ pub(crate) fn follow_service_logs(paths: &AppPaths, service_id: &str) -> Result<
         paths,
         service_id,
         &mut out,
+        &mut io::stderr(),
         tty,
         LOG_FOLLOW_POLL,
         LOG_FOLLOW_LIVENESS_EVERY,
@@ -790,27 +817,82 @@ fn newly_ready(announced: &mut bool, status: &str) -> bool {
     ready
 }
 
+/// A line about the follow itself (the hint, "is ready.", "stopped following.").
+/// On a terminal it shares the log's stream and row layout; piped, it goes to
+/// `err` so `rocm logs -f | grep error` sees log text only.
+fn write_note(
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    line: &str,
+) -> Result<()> {
+    if tty {
+        writeln!(out, "{line}")?;
+    } else {
+        writeln!(err, "{line}")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn follow_service_logs_with(
     paths: &AppPaths,
     service_id: &str,
     out: &mut impl io::Write,
+    err: &mut impl io::Write,
     tty: bool,
     poll: Duration,
     liveness_every: Duration,
     cols: &dyn Fn() -> Option<usize>,
 ) -> Result<()> {
-    let record = load_managed_service(paths, service_id)?;
+    follow_service_logs_via(
+        paths,
+        service_id,
+        &|| load_managed_service(paths, service_id),
+        out,
+        err,
+        tty,
+        poll,
+        liveness_every,
+        cols,
+    )
+}
+
+/// [`follow_service_logs_with`] with the record read injected: a `ready` status
+/// only sticks while the endpoint answers, so a test cannot plant one on disk.
+#[allow(clippy::too_many_arguments)]
+fn follow_service_logs_via(
+    paths: &AppPaths,
+    service_id: &str,
+    load: &dyn Fn() -> Result<ManagedServiceRecord>,
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
+) -> Result<()> {
+    let record = load()?;
     // Open the tail before the snapshot: output written in between is then shown
     // twice (in the snapshot and by the first poll) rather than lost, and the
     // tail can start mid-line.
     let mut tail = LogTail::at_end(&record.log_path);
     write!(out, "{}", render_service_logs_text(paths, service_id)?)?;
+    out.flush()?;
     if !managed_service_is_live(&record) {
-        writeln!(
+        write_note(
             out,
-            "\nService {service_id} is {}; not following.",
-            record.status
+            err,
+            tty,
+            &format!(
+                "\nService {service_id} is {}; not following.",
+                record.status
+            ),
         )?;
+        // Same outcome as a follow that sees the server fail: not a success.
+        if record.status == "failed" {
+            bail!("service {service_id} failed; see the log output above");
+        }
         return Ok(());
     }
     // On a terminal the hint is a footer that stays under the newest output; a
@@ -818,10 +900,46 @@ fn follow_service_logs_with(
     let mut footer = tty.then(|| FollowFooter::new(service_id));
     match footer.as_mut() {
         Some(footer) => footer.draw(out, false, cols())?,
-        None => writeln!(out, "\n{}", follow_hint(service_id))?,
+        None => write_note(out, err, tty, &format!("\n{}", follow_hint(service_id)))?,
     }
     out.flush()?;
 
+    let result = follow_loop(
+        load,
+        &record,
+        &mut tail,
+        &mut footer,
+        out,
+        err,
+        tty,
+        poll,
+        liveness_every,
+        cols,
+    );
+    if result.is_err()
+        && let Some(footer) = footer.as_mut()
+    {
+        // Leave the terminal on a clean row so the caller's `Error:` is not glued
+        // to the footer or to an unfinished download bar.
+        let _ = footer.finish(out);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn follow_loop(
+    load: &dyn Fn() -> Result<ManagedServiceRecord>,
+    record: &ManagedServiceRecord,
+    tail: &mut LogTail,
+    footer: &mut Option<FollowFooter>,
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+    cols: &dyn Fn() -> Option<usize>,
+) -> Result<()> {
+    let service_id = record.service_id.as_str();
     let mut announced_ready = record.status == "ready";
     let mut since_check = Duration::ZERO;
     loop {
@@ -837,17 +955,12 @@ fn follow_service_logs_with(
             continue;
         }
         since_check = Duration::ZERO;
-        let record = load_managed_service(paths, service_id)?;
+        let record = load()?;
         if newly_ready(&mut announced_ready, &record.status) {
-            let line = [LogSegment {
-                text: format!("Service {service_id} is ready."),
-                redraw: false,
-            }];
+            let line = format!("Service {service_id} is ready.");
             match footer.as_mut() {
-                Some(footer) => footer.write_batch(out, &line, cols())?,
-                None => {
-                    write_log_segments(out, &line, tty)?;
-                }
+                Some(footer) => footer.write_notice(out, &line, cols())?,
+                None => write_note(out, err, tty, &line)?,
             }
         }
         if !managed_service_is_live(&record) {
@@ -863,10 +976,14 @@ fn follow_service_logs_with(
             if open_row {
                 writeln!(out)?;
             }
-            writeln!(
+            write_note(
                 out,
-                "Service {service_id} is {}; stopped following.",
-                record.status
+                err,
+                tty,
+                &format!(
+                    "Service {service_id} is {}; stopped following.",
+                    record.status
+                ),
             )?;
             // Same outcome as `serve --wait`: a server that failed is not a success.
             if record.status == "failed" {
@@ -2511,10 +2628,12 @@ pub(crate) mod tests {
             appended
         });
         let mut out = Vec::new();
+        let mut err = Vec::new();
         follow_service_logs_with(
             &paths,
             "svc_follow_tty",
             &mut out,
+            &mut err,
             true,
             Duration::from_millis(20),
             Duration::from_millis(40),
@@ -2577,10 +2696,12 @@ pub(crate) mod tests {
             appended
         });
         let mut out = Vec::new();
+        let mut err = Vec::new();
         follow_service_logs_with(
             &paths,
             "svc_follow_bar",
             &mut out,
+            &mut err,
             true,
             Duration::from_millis(20),
             Duration::from_millis(40),
@@ -2621,10 +2742,12 @@ pub(crate) mod tests {
         record.status = "stopped".to_owned();
         record.write()?;
         let mut out = Vec::new();
+        let mut err = Vec::new();
         follow_service_logs_with(
             &paths,
             "svc_follow_tty_stopped",
             &mut out,
+            &mut err,
             true,
             Duration::from_millis(1),
             Duration::from_millis(1),
@@ -2660,20 +2783,25 @@ pub(crate) mod tests {
         fs::write(&record.log_path, "Downloading 86%\n")?;
 
         let mut out = Vec::new();
+        let mut err = Vec::new();
         follow_service_logs_with(
             &paths,
             "svc_follow_stopped",
             &mut out,
+            &mut err,
             false,
             Duration::from_millis(1),
             Duration::from_millis(1),
             &|| None,
         )?;
         let out = String::from_utf8(out)?;
+        let err = String::from_utf8(err)?;
         assert!(out.contains("Downloading 86%"), "{out}");
+        // The notice is not log text, so a pipe keeps it off stdout.
+        assert!(!out.contains("not following"), "{out}");
         assert!(
-            out.contains("Service svc_follow_stopped is stopped; not following."),
-            "{out}"
+            err.contains("Service svc_follow_stopped is stopped; not following."),
+            "{err}"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -2720,18 +2848,20 @@ pub(crate) mod tests {
             record.write()
         });
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let result = follow_service_logs_with(
             &paths,
             "svc_follow_fail",
             &mut out,
+            &mut err,
             false,
             Duration::from_millis(20),
             Duration::from_millis(40),
             &|| None,
         );
         writer.join().expect("writer thread")?;
-        let out = String::from_utf8(out)?;
-        assert!(out.contains("is failed; stopped following"), "{out}");
+        let err = String::from_utf8(err)?;
+        assert!(err.contains("is failed; stopped following"), "{err}");
         let error = result.expect_err("a failed service must not exit 0");
         assert!(
             error.to_string().contains("svc_follow_fail failed"),
@@ -2781,10 +2911,12 @@ pub(crate) mod tests {
             appended
         });
         let mut out = Vec::new();
+        let mut err = Vec::new();
         follow_service_logs_with(
             &paths,
             "svc_follow_live",
             &mut out,
+            &mut err,
             false,
             Duration::from_millis(20),
             Duration::from_millis(40),
@@ -2792,9 +2924,208 @@ pub(crate) mod tests {
         )?;
         writer.join().expect("writer thread")?;
         let out = String::from_utf8(out)?;
-        assert!(out.contains("Following svc_follow_live"), "{out}");
+        let err = String::from_utf8(err)?;
+        // Piped: stdout is the log text alone, with no terminal escapes, and the
+        // follow's own lines go to stderr, the hint exactly once.
         assert!(out.contains("Downloading 43%"), "{out}");
-        assert!(out.contains("stopped following"), "{out}");
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains("Following"), "{out}");
+        assert!(!out.contains("stopped following"), "{out}");
+        assert_eq!(err.matches("Following svc_follow_live").count(), 1, "{err}");
+        assert!(err.contains("stopped following"), "{err}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn starting_record(paths: &AppPaths, id: &str, port: u16) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            id,
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        Ok(record)
+    }
+
+    /// A record read that walks through `statuses` (the last one repeats).
+    fn scripted_statuses(
+        base: ManagedServiceRecord,
+        statuses: &'static [&'static str],
+    ) -> impl Fn() -> Result<ManagedServiceRecord> {
+        let calls = std::cell::Cell::new(0_usize);
+        move || {
+            let call = calls.get();
+            calls.set(call + 1);
+            let mut record = base.clone();
+            record.status = statuses[call.min(statuses.len() - 1)].to_owned();
+            Ok(record)
+        }
+    }
+
+    #[test]
+    fn follow_service_logs_announces_ready_once_when_the_server_comes_up() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-line");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_ready", 11441)?;
+        fs::write(&record.log_path, "before\n")?;
+        // Initial read, then one read per liveness check.
+        let load = scripted_statuses(
+            record,
+            &["starting", "starting", "ready", "ready", "stopped"],
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_via(
+            &paths,
+            "svc_follow_ready",
+            &load,
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            &|| None,
+        )?;
+        let err = String::from_utf8(err)?;
+        assert_eq!(
+            err.matches("Service svc_follow_ready is ready.").count(),
+            1,
+            "{err}"
+        );
+        assert!(!String::from_utf8(out)?.contains("is ready."));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_ends_a_download_bar_row_before_the_ready_line_on_a_tty() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-bar");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_rbar", 11442)?;
+        fs::write(&record.log_path, "")?;
+        let log_path = record.log_path.clone();
+        let appender = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(50));
+            let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+            std::io::Write::write_all(&mut file, b"28%\r43%\r")?;
+            Ok(())
+        });
+        // The bar is on screen when the status turns ready (liveness check 3 on).
+        let calls = std::cell::Cell::new(0_usize);
+        let base = record;
+        let load = move || -> Result<ManagedServiceRecord> {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call >= 3 {
+                thread::sleep(Duration::from_millis(30));
+            }
+            let mut record = base.clone();
+            record.status = match call {
+                0..=7 => "starting",
+                8..=9 => "ready",
+                _ => "stopped",
+            }
+            .to_owned();
+            Ok(record)
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        follow_service_logs_via(
+            &paths,
+            "svc_follow_rbar",
+            &load,
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            &|| None,
+        )?;
+        appender.join().expect("appender thread")?;
+        let out = String::from_utf8(out)?;
+        // The bar's row is ended with a newline, then the ready line gets its own
+        // row; it never replaces the bar.
+        assert!(
+            out.contains(&format!(
+                "{ERASE}\x1b[1A\nService svc_follow_rbar is ready.\n"
+            )),
+            "{out:?}"
+        );
+        assert!(err.is_empty(), "a terminal follow writes nothing to stderr");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_clears_the_footer_when_the_follow_errors() -> Result<()> {
+        let (root, paths) = test_paths("follow-error");
+        paths.ensure()?;
+        let record = starting_record(&paths, "svc_follow_gone", 11443)?;
+        fs::write(&record.log_path, "")?;
+        let manifest = record.manifest_path;
+        // The service record disappears mid-follow, so the next liveness read fails.
+        let remover = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(100));
+            fs::remove_file(manifest)?;
+            Ok(())
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_gone",
+            &mut out,
+            &mut err,
+            true,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        );
+        remover.join().expect("remover thread")?;
+        assert!(result.is_err(), "a vanished record must end the follow");
+        let out = String::from_utf8(out)?;
+        // The footer row is erased, so `Error:` starts on a clean row.
+        assert!(out.ends_with(ERASE), "{out:?}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_fails_for_a_service_that_is_already_failed() -> Result<()> {
+        let (root, paths) = test_paths("follow-already-failed");
+        paths.ensure()?;
+        let mut record = starting_record(&paths, "svc_follow_dead", 11444)?;
+        record.status = "failed".to_owned();
+        record.supervisor_pid = 0;
+        record.write()?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_dead",
+            &mut out,
+            &mut err,
+            false,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &|| None,
+        );
+        let error = result.expect_err("a failed service must not exit 0");
+        assert!(
+            error.to_string().contains("svc_follow_dead failed"),
+            "{error}"
+        );
+        assert!(String::from_utf8(err)?.contains("is failed; not following."));
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
