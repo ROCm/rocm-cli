@@ -869,7 +869,7 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::append_examine_runtime_state;
@@ -2311,9 +2311,14 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt");
+    /// A Python environment outside ROCm CLI's folders that `rocm runtimes adopt`
+    /// accepts: an interpreter, the SDK libraries the probe names, and the probe
+    /// that reports them. Returns the environment folder, the request that adopts
+    /// it, and the probe.
+    fn adoptable_environment(
+        root: &Path,
+        replace: bool,
+    ) -> Result<(PathBuf, AdoptRuntimeRequest, therock::RocmSdkPythonProbe)> {
         let external_root = root.join("external-therock-venv");
         let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -2342,37 +2347,43 @@ pub(crate) mod tests {
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root.clone(),
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
+        let request = AdoptRuntimeRequest {
+            python_executable,
+            install_root: external_root.clone(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+            replace,
+        };
+        let probe = therock::RocmSdkPythonProbe {
+            import_ok: true,
+            rocm_sdk_version: Some("7.13.0".to_owned()),
+            root_path: Some(sdk_root.clone()),
+            bin_path: Some(sdk_bin.clone()),
+            runtime_roots: vec![sdk_root],
+            bin_paths: vec![sdk_bin.clone()],
+            library_paths: vec![sdk_bin],
+            resolved_libraries: vec![
+                therock::RocmSdkLibraryProbe {
+                    shortname: "amdhip64".to_owned(),
+                    paths: vec![amdhip],
+                },
+                therock::RocmSdkLibraryProbe {
+                    shortname: "hipblas".to_owned(),
+                    paths: vec![hipblas],
+                },
+            ],
+            resolved_target_family: Some("gfx120X-all".to_owned()),
+            ..therock::RocmSdkPythonProbe::default()
+        };
+        Ok((external_root, request, probe))
+    }
+
+    #[test]
+    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+
+        let adopted = adopt_runtime_from_probe(&paths, request, probe)?;
 
         assert!(adopted.read_only);
         assert_eq!(adopted.channel, "release");
@@ -2402,6 +2413,200 @@ pub(crate) mod tests {
         let rendered = render_runtimes_text(&paths, &config)?;
         assert!(rendered.contains("* adopted-release-pip-gfx120x-all-7-13-0"));
         assert!(rendered.contains("mode=read-only"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Which of the two files a registered runtime can have exist: its registry
+    /// entry, and the `.rocm-cli-runtime.json` ROCm CLI keeps in the install
+    /// root as proof that it owns the folder.
+    fn registered_files(paths: &AppPaths, install_root: &Path, runtime_key: &str) -> (bool, bool) {
+        (
+            runtime_manifest_path(paths, runtime_key).is_file(),
+            install_root.join(".rocm-cli-runtime.json").is_file(),
+        )
+    }
+
+    /// A runtime ROCm CLI installed itself, with both of its manifest files
+    /// deleted so a test sees only what the write under test creates.
+    fn installed_runtime_without_manifest_files(
+        paths: &AppPaths,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let manifest = write_test_pip_runtime(
+            paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        fs::remove_file(runtime_manifest_path(paths, &manifest.runtime_key))?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        assert_eq!(
+            registered_files(paths, &manifest.install_root, &manifest.runtime_key),
+            (false, false)
+        );
+        Ok(manifest)
+    }
+
+    /// Registering a runtime whose registry entry exists is refused until the
+    /// caller asks to replace it. `register(replace)` makes the attempt; the
+    /// message and the entry on disk are asserted together, and the same call
+    /// with `replace` set is what clears the refusal.
+    fn assert_duplicate_registration_needs_replace(
+        paths: &AppPaths,
+        runtime_key: &str,
+        register: impl Fn(bool) -> Result<()>,
+    ) -> Result<()> {
+        let entry = runtime_manifest_path(paths, runtime_key);
+        fs::write(&entry, "stale entry")?;
+
+        let error = register(false).unwrap_err().to_string();
+
+        assert!(
+            error.contains("already exists") && error.contains("--replace"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "stale entry",
+            "a refused registration must leave the existing entry alone"
+        );
+        register(true)?;
+        let replaced: therock::InstalledRuntimeManifest =
+            serde_json::from_slice(&fs::read(&entry)?)?;
+        assert_eq!(replaced.runtime_key, runtime_key);
+        Ok(())
+    }
+
+    /// Installing writes both files, and a second install of the same key
+    /// overwrites both without being asked: it is the same runtime again.
+    #[test]
+    fn runtime_install_writes_the_registry_entry_and_the_install_root_manifest() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-install");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+
+        crate::runtime_registry::save_runtime_manifest(&paths, &manifest)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        let reinstalled = therock::InstalledRuntimeManifest {
+            version: "7.14.0".to_owned(),
+            ..manifest.clone()
+        };
+        crate::runtime_registry::save_runtime_manifest(&paths, &reinstalled)?;
+        for path in [
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+        ] {
+            let written: therock::InstalledRuntimeManifest =
+                serde_json::from_slice(&fs::read(&path)?)?;
+            assert_eq!(written.version, "7.14.0", "{}", path.display());
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Importing registers a folder somebody else owns, so it writes the
+    /// registry entry and nothing into that folder, and refuses to replace an
+    /// existing entry unless asked.
+    #[test]
+    fn runtime_import_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-import");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+        let exported_manifest = root.join("external-runtime.json");
+        fs::write(&exported_manifest, serde_json::to_vec_pretty(&manifest)?)?;
+
+        import_runtime_manifest(&paths, &exported_manifest, false)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false)
+        );
+        assert_duplicate_registration_needs_replace(&paths, &manifest.runtime_key, |replace| {
+            import_runtime_manifest(&paths, &exported_manifest, replace).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false),
+            "replacing an import must not start writing into the folder either"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Adopting has the same contract as importing: registry entry only, and a
+    /// duplicate needs `--replace`.
+    #[test]
+    fn runtime_adopt_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+        let runtime_key = request.runtime_key.clone();
+
+        adopt_runtime_from_probe(&paths, request.clone(), probe.clone())?;
+
+        assert_eq!(
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false)
+        );
+        assert_duplicate_registration_needs_replace(&paths, &runtime_key, |replace| {
+            let request = AdoptRuntimeRequest {
+                replace,
+                ..request.clone()
+            };
+            adopt_runtime_from_probe(&paths, request, probe.clone()).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false),
+            "replacing an adoption must not start writing into the environment either"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Recovering the runtime `rocm setup` created restores its registry entry
+    /// from the manifest in its folder, leaves that manifest in place, and does
+    /// not replace an entry that is already there.
+    #[test]
+    fn setup_recovery_restores_the_registry_entry_and_keeps_the_install_root_manifest() -> Result<()>
+    {
+        let (root, paths) = test_paths("runtime-files-recovery");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        fs::remove_file(&entry)?;
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (false, true)
+        );
+
+        let recovered = recover_setup_runtime_registration(&paths, &config)?;
+
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        fs::write(&entry, "entry written since")?;
+        recover_setup_runtime_registration(&paths, &config)?;
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "entry written since",
+            "recovery only fills a missing entry"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
