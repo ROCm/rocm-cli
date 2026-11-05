@@ -20,8 +20,10 @@
 //!
 //! The translation is the text subset of the Messages API: system prompts and
 //! text turns, sampling parameters, stop sequences, usage and stop reasons.
-//! Streaming, tool use and non-text content blocks are refused with an Anthropic
-//! `invalid_request_error` that says so, rather than being dropped silently.
+//! Streaming, tool use (`tools`, `tool_choice`), extended thinking and non-text
+//! content blocks are refused with an Anthropic `invalid_request_error` that says
+//! so, rather than being dropped silently. Fields that only annotate a request
+//! (`metadata`) are ignored.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,7 +37,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rocm_core::{
     ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    anthropic_messages_native_probe, format_http_base_url, http_get_text_with_auth,
+    anthropic_messages_native_probe, format_http_base_url, http_get_with_auth,
     http_post_json_with_auth, merge_json_state_file, openai_models_endpoint_has_model,
 };
 use serde_json::{Value, json};
@@ -104,7 +106,13 @@ fn run(config: &AnthropicProxyConfig) -> anyhow::Result<()> {
     )
     .unwrap_or(false);
     if native {
-        return publish(config, &upstream, AnthropicEndpointMode::Native);
+        // `upstream` is the loopback form used for probing; what clients are
+        // told is the address the engine listens on, as for the OpenAI row.
+        return publish(
+            config,
+            &format_http_base_url(&config.host, config.engine_port),
+            AnthropicEndpointMode::Native,
+        );
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -222,7 +230,9 @@ impl ProxyError {
         let message = serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|value| {
-                let error = value.get("error")?;
+                // OpenAI-style `{"error": {"message": ...}}` or `{"error": "..."}`,
+                // and FastAPI-style `{"detail": "..."}`.
+                let error = value.get("error").or_else(|| value.get("detail"))?;
                 error
                     .get("message")
                     .or(Some(error))
@@ -247,6 +257,21 @@ impl ProxyError {
     }
 
     fn unreachable(error: &anyhow::Error) -> Self {
+        let timed_out = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            })
+        });
+        if timed_out {
+            return Self {
+                status: 504,
+                kind: "api_error",
+                message: format!("the engine did not answer in time: {error:#}"),
+            };
+        }
         Self {
             status: 502,
             kind: "api_error",
@@ -272,14 +297,23 @@ impl IntoResponse for ProxyError {
 /// The key a client presented, in either of the two places Anthropic clients put
 /// it, as the bearer token the engine expects.
 fn client_api_key(headers: &HeaderMap) -> Option<String> {
-    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
     header("x-api-key")
-        .map(str::trim)
         .or_else(|| {
-            header("authorization")
-                .map(str::trim)
-                .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim())
+            header("authorization").and_then(|value| match value.split_once(' ') {
+                Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => Some(token),
+                // Another scheme (`Basic ...`) carries no key the engine accepts.
+                Some(_) => None,
+                None => Some(value),
+            })
         })
+        .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_owned)
 }
@@ -332,7 +366,7 @@ fn forward_messages(
 async fn models(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
     let key = client_api_key(&headers);
     let result = tokio::task::spawn_blocking(move || {
-        http_get_text_with_auth(
+        http_get_with_auth(
             &state.upstream,
             "/v1/models",
             key.as_deref(),
@@ -341,8 +375,14 @@ async fn models(State(state): State<ProxyState>, headers: HeaderMap) -> Response
     })
     .await;
     match result {
-        Ok(Ok(body)) => {
-            (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+        Ok(Ok(response)) if response.status == 200 => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.body,
+        )
+            .into_response(),
+        Ok(Ok(response)) => {
+            ProxyError::from_upstream(response.status, &response.body).into_response()
         }
         Ok(Err(error)) => ProxyError::unreachable(&error).into_response(),
         Err(error) => ProxyError {
@@ -368,7 +408,11 @@ fn text_of(content: &Value, field: &str) -> Result<String, ProxyError> {
                         block
                             .get("text")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
+                            .ok_or_else(|| {
+                                ProxyError::invalid(format!(
+                                    "a `text` content block in `{field}` needs a string `text`"
+                                ))
+                            })?
                             .to_owned(),
                     ),
                     Some(other) => {
@@ -405,6 +449,20 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
         .is_some_and(|tools| !tools.is_empty())
     {
         return Err(ProxyError::unsupported("tool use (`tools`)"));
+    }
+    if object
+        .get("tool_choice")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(ProxyError::unsupported("`tool_choice`"));
+    }
+    if object
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "disabled")
+    {
+        return Err(ProxyError::unsupported("extended thinking (`thinking`)"));
     }
     let max_tokens = object
         .get("max_tokens")
@@ -517,6 +575,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const MODEL: &str = "Org/Served-Model";
+
+    /// A directory no other test in this process shares. Process id plus a
+    /// millisecond clock is not enough: tests run in parallel threads and two can
+    /// start in the same millisecond, then overwrite each other's state file.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "rocmd-anthropic-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
 
     fn translate(request: &Value) -> Result<Value, ProxyError> {
         anthropic_to_openai(request, MODEL)
@@ -679,6 +749,59 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_x_api_key_falls_back_to_the_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "  ".parse().unwrap());
+        headers.insert("authorization", "bearer from-bearer".parse().unwrap());
+        assert_eq!(client_api_key(&headers).as_deref(), Some("from-bearer"));
+        headers.insert("authorization", "Basic dXNlcjpwdw==".parse().unwrap());
+        assert_eq!(client_api_key(&headers), None);
+    }
+
+    #[test]
+    fn engine_errors_shaped_as_detail_keep_their_message() {
+        let error = ProxyError::from_upstream(404, r#"{"detail": "no such route"}"#);
+        assert_eq!(error.message, "no such route");
+    }
+
+    #[test]
+    fn a_timed_out_engine_is_a_gateway_timeout_not_unreachable() {
+        let timeout = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            .context("failed to read HTTP POST /v1/chat/completions");
+        assert_eq!(ProxyError::unreachable(&timeout).status, 504);
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(ProxyError::unreachable(&refused).status, 502);
+    }
+
+    #[test]
+    fn requests_that_would_silently_lose_meaning_are_refused() {
+        let base = json!({"max_tokens": 4, "messages": [{"role": "user", "content": "x"}]});
+        for (field, value) in [
+            ("tool_choice", json!({"type": "auto"})),
+            (
+                "thinking",
+                json!({"type": "enabled", "budget_tokens": 1024}),
+            ),
+        ] {
+            let mut request = base.clone();
+            request[field] = value;
+            let error = translate(&request).unwrap_err();
+            assert_eq!(error.status, 400, "{field}");
+        }
+        let mut disabled = base;
+        disabled["thinking"] = json!({"type": "disabled"});
+        assert!(translate(&disabled).is_ok());
+        let missing_text = json!({
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": [{"type": "text"}]}],
+        });
+        let error = translate(&missing_text).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("string `text`"), "{}", error.message);
+    }
+
+    #[test]
     fn wildcard_listen_hosts_are_reached_over_loopback() {
         let config = |host: &str| AnthropicProxyConfig {
             host: host.to_owned(),
@@ -755,10 +878,10 @@ mod tests {
                     } else {
                         ("404 Not Found", json!({"detail": "Not Found"}))
                     }
-                } else if request_line.contains("/v1/models") {
-                    ("200 OK", json!({"data": [{"id": MODEL}]}))
                 } else if auth == "Bearer wrong" {
                     ("401 Unauthorized", json!({"error": {"message": "bad key"}}))
+                } else if request_line.contains("/v1/models") {
+                    ("200 OK", json!({"data": [{"id": MODEL}]}))
                 } else {
                     log.lock().unwrap().push((auth, body.to_owned()));
                     (
@@ -889,6 +1012,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_models_auth_failure_is_relayed_not_reported_as_unreachable() {
+        let engine = fake_engine();
+        let base = proxy_over(&engine).await;
+        let (status, error) = tokio::task::spawn_blocking(move || {
+            match ureq::get(&format!("{base}/v1/models"))
+                .set("x-api-key", "wrong")
+                .call()
+            {
+                Err(ureq::Error::Status(status, response)) => (
+                    status,
+                    serde_json::from_str::<Value>(&response.into_string().unwrap()).unwrap(),
+                ),
+                other => panic!("expected an HTTP error, got {other:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 401);
+        assert_eq!(error["error"]["type"], "authentication_error");
+        assert_eq!(error["error"]["message"], "bad key");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn models_are_forwarded_so_readiness_covers_the_proxy() {
         let engine = fake_engine();
         let base = proxy_over(&engine).await;
@@ -902,11 +1048,7 @@ mod tests {
 
     #[test]
     fn proxy_state_prefers_the_served_name_the_engine_reported() {
-        let dir = std::env::temp_dir().join(format!(
-            "rocmd-anthropic-served-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
-        ));
+        let dir = unique_temp_dir("served");
         std::fs::create_dir_all(&dir).unwrap();
         let mut config = AnthropicProxyConfig {
             host: "127.0.0.1".to_owned(),
@@ -924,11 +1066,7 @@ mod tests {
     }
 
     fn published_endpoint_for(engine: &FakeEngine) -> (String, String) {
-        let dir = std::env::temp_dir().join(format!(
-            "rocmd-anthropic-run-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
-        ));
+        let dir = unique_temp_dir("run");
         std::fs::create_dir_all(&dir).unwrap();
         let state_path = dir.join("state.json");
         spawn_alongside_engine(AnthropicProxyConfig {
@@ -979,12 +1117,30 @@ mod tests {
     }
 
     #[test]
+    fn a_native_endpoint_is_published_on_the_bind_host_not_the_probe_loopback() {
+        let engine = fake_engine_with(true);
+        let dir = unique_temp_dir("native-host");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        // The wildcard host is probed over loopback (the fake engine only listens
+        // there) but must be advertised as the address the engine listens on.
+        spawn_alongside_engine(AnthropicProxyConfig {
+            host: "0.0.0.0".to_owned(),
+            engine_port: engine.port,
+            served_model: MODEL.to_owned(),
+            state_path: state_path.clone(),
+            probe_api_key: None,
+        });
+        let url =
+            rocm_core::wait_for_published_anthropic_endpoint(&state_path, Duration::from_secs(30))
+                .expect("no Anthropic endpoint was published");
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(url, format!("http://0.0.0.0:{}", engine.port));
+    }
+
+    #[test]
     fn publish_records_the_endpoint_without_a_v1_suffix() {
-        let dir = std::env::temp_dir().join(format!(
-            "rocmd-anthropic-publish-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
-        ));
+        let dir = unique_temp_dir("publish");
         let config = AnthropicProxyConfig {
             host: "127.0.0.1".to_owned(),
             engine_port: 1,

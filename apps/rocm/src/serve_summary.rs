@@ -498,9 +498,15 @@ mod tests {
             line.trim_start().starts_with("anthropic endpoint")
                 && line.ends_with("http://127.0.0.1:41000")
         });
-        assert!(anthropic, "{rendered}");
+        assert!(
+            anthropic,
+            "no `anthropic endpoint` row ending in the published URL"
+        );
         let anthropic = rendered.find("anthropic endpoint").unwrap();
-        assert!(endpoint < anthropic, "{rendered}");
+        assert!(
+            endpoint < anthropic,
+            "the anthropic row must follow the endpoint row"
+        );
         // Nothing published (the service is not ready, or the wait ran out):
         // no row rather than a made-up one.
         assert!(!render_summary(&base_summary()).contains("anthropic"));

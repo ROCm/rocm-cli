@@ -371,7 +371,7 @@ fn anthropic_endpoint_line(paths: &AppPaths, record: &ManagedServiceRecord, url:
         || rocm_core::anthropic_endpoint_ready(
             url,
             Some(record.served_model_name()),
-            endpoint_keys::endpoint_api_key(paths, &record.service_id).as_deref(),
+            crate::endpoint_keys::endpoint_api_key(paths, &record.service_id).as_deref(),
             Duration::from_millis(750),
         );
     format_anthropic_endpoint_line(url, responding)

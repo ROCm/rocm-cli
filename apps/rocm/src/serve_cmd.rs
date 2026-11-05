@@ -1261,6 +1261,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     std::time::Duration::from_secs(5)
                 },
             );
+            if anthropic_endpoint.is_none() && !report.already_running && report.status == "ready" {
+                notes.push(
+                    "the Anthropic-compatible endpoint was not published yet; it appears as \
+                     `anthropic endpoint:` in `rocm services list` once the engine lists its model"
+                        .to_owned(),
+                );
+            }
             // A managed serve that failed on VRAM lands here not-ready with the OOM
             // traceback only in its own log. Read that log tail so the summary can
             // name the memory knobs, since the pre-launch low-VRAM warning cannot
