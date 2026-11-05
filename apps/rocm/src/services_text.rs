@@ -650,8 +650,11 @@ impl LogTail {
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
+        // Same stripping as `poll`: a cut-off write can end mid-escape.
         (!bytes.is_empty()).then(|| LogSegment {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
+            text: rocm_core::terminal::strip_terminal_control_sequences(&String::from_utf8_lossy(
+                &bytes,
+            )),
             redraw: false,
         })
     }
@@ -2451,6 +2454,21 @@ pub(crate) mod tests {
         let segments = tail.poll();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].text, "beforeafter");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_finish_strips_cursor_escapes_from_a_cut_off_write() -> Result<()> {
+        let (root, _paths) = test_paths("tail-finish-escapes");
+        fs::create_dir_all(&root)?;
+        let log = root.join("engine.log");
+        fs::write(&log, "")?;
+        let mut tail = LogTail::at_end(&log);
+        fs::write(&log, "last\x1b[1Aword")?;
+        assert!(tail.poll().is_empty());
+        let segment = tail.finish().expect("unterminated output is returned");
+        assert_eq!(segment.text, "lastword");
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

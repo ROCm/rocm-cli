@@ -920,6 +920,7 @@ fn wait_on_existing_service(
     paths: &AppPaths,
     mut report: ManagedLaunchReport,
     wait_until_ready: bool,
+    on_wait_begin: &mut dyn FnMut(&str),
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     if !wait_until_ready || report.status == "ready" {
@@ -928,6 +929,9 @@ fn wait_on_existing_service(
     let Ok(mut record) = ManagedServiceRecord::read_manifest(paths, &report.service_id) else {
         return Ok(report);
     };
+    // The id of the server being waited on, which is not the caller's freshly
+    // generated one when it attached to an existing server.
+    on_wait_begin(&report.service_id);
     // The key the caller generated belongs to a launch that did not happen; the
     // existing service answers to its own.
     let stored_key = endpoint_keys::endpoint_api_key(paths, &report.service_id);
@@ -969,6 +973,7 @@ pub(crate) fn start_managed_service(
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
     wait_until_ready: bool,
+    on_wait_begin: &mut dyn FnMut(&str),
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -1008,7 +1013,13 @@ pub(crate) fn start_managed_service(
             // `--wait` applies to a service that is still starting too: the
             // natural retry after `rocm serve m` printed `starting`.
             drop(launch_lock);
-            return wait_on_existing_service(&paths, report, wait_until_ready, on_wait_tick);
+            return wait_on_existing_service(
+                &paths,
+                report,
+                wait_until_ready,
+                on_wait_begin,
+                on_wait_tick,
+            );
         }
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
@@ -1021,6 +1032,9 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
+    if wait_until_ready {
+        on_wait_begin(service_id);
+    }
     let readiness = wait_for_record_ready(
         &paths,
         &record,
@@ -1951,11 +1965,23 @@ mod tests {
         };
         let mut no_tick = |_: Duration| panic!("must not probe");
 
-        let untouched = wait_on_existing_service(&paths, report("starting"), false, &mut no_tick)
-            .expect("no --wait");
+        let untouched = wait_on_existing_service(
+            &paths,
+            report("starting"),
+            false,
+            &mut |_| panic!("no --wait, no banner"),
+            &mut no_tick,
+        )
+        .expect("no --wait");
         assert_eq!(untouched.status, "starting");
-        let ready = wait_on_existing_service(&paths, report("ready"), true, &mut no_tick)
-            .expect("already ready");
+        let ready = wait_on_existing_service(
+            &paths,
+            report("ready"),
+            true,
+            &mut |_| panic!("already ready, no banner"),
+            &mut no_tick,
+        )
+        .expect("already ready");
         assert_eq!(ready.status, "ready");
         record.status = "starting".to_owned();
         assert_eq!(

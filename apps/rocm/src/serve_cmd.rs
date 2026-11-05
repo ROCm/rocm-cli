@@ -1515,16 +1515,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        if wait {
-            // The spinner has no id on it, and a non-TTY stderr gets no spinner at all.
-            eprintln!(
-                "Waiting for {service_id}; Ctrl-C stops waiting, the server keeps running. \
-                 Follow: rocm logs --service {service_id} --follow"
-            );
-        }
-        let mut spinner =
-            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
-        spinner.tick();
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
+            "Starting {model} on {selected_engine}…"
+        )));
+        spinner.borrow_mut().tick();
         let launched = start_managed_service(
             &selected_engine,
             &service_id,
@@ -1542,16 +1536,27 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             require_api_key,
             gpu_refusal_waived_for_reuse,
             wait,
-            &mut |_elapsed| spinner.tick(),
+            // Named with the id the launch resolved to: an already-starting
+            // server keeps its own, not the one generated above. The spinner
+            // has no id on it, and a non-TTY stderr gets no spinner at all.
+            &mut |waiting_on| {
+                spinner.borrow_mut().clear();
+                eprintln!(
+                    "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
+                     Follow: rocm logs --service {waiting_on} --follow"
+                );
+            },
+            &mut |_elapsed| spinner.borrow_mut().tick(),
         );
         // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
         let report = match launched {
             Ok(report) => report,
             Err(error) => {
-                spinner.clear();
+                spinner.borrow_mut().clear();
                 return Err(error);
             }
         };
+        let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
         // writes a `starting` record for a process that never existed, so the
         // helper would be left watching a pid that will never appear, with
