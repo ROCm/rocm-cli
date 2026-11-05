@@ -4,11 +4,11 @@
 
 //! Engine-recipe overrides for `rocm serve`.
 //!
-//! Relocated from `serve_cmd.rs` with no behavior change. These are the pure
-//! transforms `serve()` applies, in order, to the selected engine's launch
-//! recipe hint: mapping the catalog's engine record onto the protocol hint,
-//! then layering the explicit `--tool-call-parser`, `--gpu-memory-utilization`,
-//! `--temperature`/`--top-p`/`--max-tokens` and `--engine-env` controls on top.
+//! These are the pure transforms `serve()` applies, in order, to the selected
+//! engine's launch recipe hint: mapping the catalog's engine record onto the
+//! protocol hint, then layering the explicit `--tool-call-parser`,
+//! `--gpu-memory-utilization`, `--temperature`/`--top-p`/`--max-tokens` and
+//! `--engine-env` controls on top.
 //! `serve()` is the only production caller; nothing here calls back into it.
 
 use std::fmt::Write as _;
