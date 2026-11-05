@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-# Turns the workspace-root `runtime-deps.toml` pins into constants. Declared
+# Turns the versions locked in `runtimes/mise.lock` into constants. Declared
 # explicitly so the file is not mistaken for a stray script.
 build = "build.rs"
 
@@ -14,4 +14,8 @@ build = "build.rs"
 workspace = true
 
 [build-dependencies]
+toml = "1.1"
+
+[dev-dependencies]
+# `src/pins_gen.rs` is also compiled into the tests.
 toml = "1.1"

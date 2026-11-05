@@ -128,12 +128,19 @@ customization point.
 
 ## Pinned runtime versions
 
-The versions of the third-party runtimes rocm-cli downloads are pinned in
-`runtime-deps.toml` at the repository root — one `[runtime.<name>]` table per
-runtime. That file is the only place a runtime version is written down:
-archive names, download URLs, and the dashboard's offline fallback are all
-derived from it, so a bump is a one-line edit and the tree cannot end up
-holding two different versions of the same runtime.
+Lemonade, the one third-party binary rocm-cli downloads that is pinned this
+way so far, is pinned in [`runtimes/mise.toml`](../runtimes/mise.toml) and
+locked, with a download URL and SHA-256 per platform, in
+[`runtimes/mise.lock`](../runtimes/mise.lock). Its build-time constants
+(`rocm_deps::LEMONADE_VERSION` and the per-platform URL and digest) are
+generated from `mise.lock`. The Lemonade adapter checks an install against
+the locked digest and derives archive names and download URLs from the
+version, and `rocm engines` takes the version too, so no non-test source holds
+a second Lemonade version. Other runtimes (vLLM, the ROCm SDK) are still
+pinned in their own adapters until they migrate. Bump the Lemonade pin with
+`runtimes/bin/mise run --cd runtimes update`, or edit the version and run
+`runtimes/bin/mise run --cd runtimes lock`; the weekly runtime-deps-update
+workflow does the former on its own. See [runtime-dependencies.md](runtime-dependencies.md).
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

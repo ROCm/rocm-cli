@@ -5,14 +5,21 @@
 //! Pinned versions of the third-party runtimes rocm-cli manages, plus the
 //! helpers that derive artifact names and URLs from them.
 //!
-//! The pins live in the workspace-root `runtime-deps.toml` and are turned into
-//! the constants below by `build.rs`. Every consumer — the engine adapters and
-//! the dashboard TUI alike — derives what it needs from those constants, so a
-//! runtime version is spelled exactly once in the repository and two crates
-//! cannot disagree about it.
+//! Today that is Lemonade: its pin lives in `runtimes/mise.toml`, is locked
+//! into `runtimes/mise.lock` by mise, and is turned into the constants below by
+//! `build.rs`. The Lemonade adapter checks downloads against the locked
+//! digests and derives its download URLs from the version with
+//! [`lemonade_download_url`] (a test below ties those to the locked URLs); it
+//! and `rocm engines` take the version from here, so no non-test source holds
+//! a second Lemonade version.
+//! Tooling pins in `mise.toml` (uv) get no constants; see `TOOLING_ONLY`.
 
-// `pub const LEMONADE_VERSION: &str = "..."`, one per `runtime-deps.toml` field.
+// `pub const LEMONADE_VERSION: &str = "..."`, plus per-platform URL and digest, one set per runtime tool in `runtimes/mise.lock`.
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
+// The generator `build.rs` runs, compiled here only so its tests run.
+#[cfg(test)]
+mod pins_gen;
 
 /// GitHub repository publishing the Lemonade embeddable release archives.
 pub const LEMONADE_GITHUB_REPO: &str = "lemonade-sdk/lemonade";
@@ -73,6 +80,27 @@ mod tests {
                 "https://github.com/lemonade-sdk/lemonade/releases/download/v{version}/{linux}"
             )
         );
+    }
+
+    /// The Lemonade adapter derives its download URL from the version and
+    /// checks the download against the digest mise locked. The two only belong
+    /// together if mise locked the very archive the adapter downloads — the
+    /// embeddable build, not one of the installers the release also carries.
+    #[test]
+    fn the_locked_assets_are_the_archives_the_adapter_downloads() {
+        for (os_arch, extension, locked_url) in [
+            ("ubuntu-x64", "tar.gz", LEMONADE_LINUX_X64_URL),
+            ("windows-x64", "zip", LEMONADE_WINDOWS_X64_URL),
+        ] {
+            let derived = lemonade_download_url(
+                LEMONADE_VERSION,
+                &lemonade_archive_name(LEMONADE_VERSION, os_arch, extension),
+            );
+            assert_eq!(
+                locked_url, derived,
+                "runtimes/mise.lock locked another asset for {os_arch}"
+            );
+        }
     }
 
     #[test]

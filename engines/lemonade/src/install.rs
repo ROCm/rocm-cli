@@ -32,15 +32,6 @@ const RUNTIME_VERSION_MARKER: &str = "runtime-version.txt";
 /// only bounds the work spent looking; exceeding it is not an error.
 const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 
-/// Digests of the pinned embeddable archives. Unlike the archive names and
-/// URLs, these cannot be derived from the version in `runtime-deps.toml`: each
-/// release has its own digest, so bumping the pin means recording the new pair
-/// here as well.
-const EMBEDDABLE_WINDOWS_SHA256: &str =
-    "50a133bbc35c4f3f8971eafef2c9fe56c4bbbfb0f1032bf8728324d8d8c8a0e1";
-const EMBEDDABLE_LINUX_SHA256: &str =
-    "bdfd3c3e5d6eda5101c8a32f36e6dd9236ceb9ab2eb66734c32628e6e86e18ac";
-
 /// Embeddable asset token and archive extension for the host this adapter runs
 /// on. Only `windows-x64` and `ubuntu-x64` are wired up here; the release also
 /// publishes `macos-arm64` and `ubuntu-arm64`, which this adapter never selects.
@@ -476,11 +467,13 @@ fn embeddable_url(version: &str) -> String {
     rocm_deps::lemonade_download_url(version, &embeddable_archive_name(version))
 }
 
+/// Digest of the pinned embeddable archive for this host, as locked in
+/// `runtimes/mise.lock` alongside the version, so a bump moves both together.
 const fn embeddable_archive_sha256() -> &'static str {
     if runtime_is_windows() {
-        EMBEDDABLE_WINDOWS_SHA256
+        rocm_deps::LEMONADE_WINDOWS_X64_SHA256
     } else {
-        EMBEDDABLE_LINUX_SHA256
+        rocm_deps::LEMONADE_LINUX_X64_SHA256
     }
 }
 
@@ -572,6 +565,28 @@ mod tests {
     use std::io::Write;
     #[cfg(windows)]
     use std::process::{Command as ProcessCommand, Stdio};
+
+    /// The digest the install checks must be the one `runtimes/mise.lock`
+    /// records for the archive this host downloads — not the other OS's.
+    #[test]
+    fn the_checked_digest_is_the_one_locked_for_the_downloaded_archive() {
+        let url = embeddable_url(rocm_deps::LEMONADE_VERSION);
+        let locked = [
+            (
+                rocm_deps::LEMONADE_LINUX_X64_URL,
+                rocm_deps::LEMONADE_LINUX_X64_SHA256,
+            ),
+            (
+                rocm_deps::LEMONADE_WINDOWS_X64_URL,
+                rocm_deps::LEMONADE_WINDOWS_X64_SHA256,
+            ),
+        ];
+        let (_, digest) = locked
+            .iter()
+            .find(|(locked_url, _)| *locked_url == url)
+            .unwrap_or_else(|| panic!("runtimes/mise.lock locks no asset at {url}"));
+        assert_eq!(embeddable_archive_sha256(), *digest);
+    }
 
     #[test]
     fn embeddable_package_matches_runtime_os() {
