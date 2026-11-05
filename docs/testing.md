@@ -513,9 +513,14 @@ install downloads a managed `uv`, has it install Python, and saves that Python's
 path in the config; `--dry-run` instead prints a `python_note:` line saying so
 and does none of it. Scenario `runtime-22` checks the note and the empty
 managed-tools, cache-tools and config folders together, with a recording `uv`
-standing in for the download. It runs on Linux; the decision itself is
-unit-tested on Unix hosts (the Python stand-ins are shell scripts, as in the
-other resolver tests) by `a_dry_run_with_no_usable_python_prepares_nothing` in
+standing in for the download. It does not announce a Python the install would
+refuse either: with `ROCM_CLI_MANAGED_PYTHON_VERSION` naming a version whose
+wheel tag is not the layout's (3.13 for the canonical cp312 layout) the preview
+fails with the install's own message, which scenario `runtime-23` checks. Both
+run on Linux; the decisions themselves are unit-tested on Unix hosts (the Python
+stand-ins are shell scripts, as in the other resolver tests) by
+`a_dry_run_with_no_usable_python_prepares_nothing` and
+`a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` in
 [python.rs](../apps/rocm/src/therock/python.rs). The preview does still write
 its package-index cache under the cache folder.
 

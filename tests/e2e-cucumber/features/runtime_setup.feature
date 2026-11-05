@@ -482,3 +482,23 @@ Feature: Runtime configuration
     When the user previews a wheel SDK install for arch gfx1200 with no version pin
     Then the preview says a real install would prepare a managed Python
     And the preview prepared no Python, as it says
+
+  # A preview must not announce a plan the install would refuse.
+  # `ROCM_CLI_MANAGED_PYTHON_VERSION` can name a Python other than the one the
+  # wheels need (3.12 for this layout); a real install prepares it, finds its
+  # wheel tag is wrong and refuses. The preview refuses by the same rule instead
+  # of saying it would prepare 3.13, and still prepares nothing on the way to
+  # refusing, which the last Then checks against the folders, as runtime-22 does.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-22. The tag rule is
+  # unit-tested on every platform
+  # (`a_managed_python_version_is_read_as_the_wheel_tag_it_reports` in
+  # `apps/rocm/src/therock/python.rs`).
+  @id:runtime-install-preview-refuses-unusable-managed-python @requires-os:linux
+  Scenario: runtime-23 - Previewing an SDK install is refused when the install would refuse the managed Python version
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the managed Python version is overridden to 3.13
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    Then the install fails
+    And the preview is refused because the install would refuse that Python

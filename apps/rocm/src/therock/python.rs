@@ -498,10 +498,26 @@ fn plan_python_launcher_in(
     let lookup = find_python_launcher_in(paths, env, requirement, LookupPurpose::Preview)?;
     Ok(match lookup {
         PythonLookup::Found(launcher) => PlannedPython::Ready(launcher),
-        PythonLookup::NeedsManagedBootstrap => PlannedPython::WouldPrepareManaged {
-            version: managed_python_version(requirement),
-            requirement,
-        },
+        PythonLookup::NeedsManagedBootstrap => {
+            let version = managed_python_version(requirement);
+            // `ROCM_CLI_MANAGED_PYTHON_VERSION` can name a version other than the
+            // one the wheels need. A real install prepares it, finds it reports
+            // the wrong tag and refuses (see `ensure_managed_python`), so the
+            // preview refuses by the same rule rather than announce a plan the
+            // install would not carry out. A version whose tag cannot be read
+            // off its name is announced as is: only installing it would tell.
+            if let Some(tag) = python_tag_for_version(&version) {
+                ensure_python_tag_matches(&tag, requirement).with_context(|| {
+                    format!(
+                        "a real install would prepare managed Python {version}, whose wheel tag it would then refuse"
+                    )
+                })?;
+            }
+            PlannedPython::WouldPrepareManaged {
+                version,
+                requirement,
+            }
+        }
     })
 }
 
@@ -734,14 +750,32 @@ pub(super) fn python_launcher_install_ready(
     requirement: PythonRequirement,
 ) -> Result<()> {
     let compatibility = wheel_compatibility_for_python(program)?;
-    if compatibility.python_tag != requirement.tag {
+    ensure_python_tag_matches(&compatibility.python_tag, requirement)?;
+    verify_python_can_create_venv(program).context("Python could not create a virtual environment")
+}
+
+/// The one rule an interpreter must meet to serve an install: its wheel tag is
+/// the one the layout requires. [`python_launcher_install_ready`] applies it to
+/// an interpreter that exists, and a preview applies it to the managed Python it
+/// would prepare, so the two cannot disagree about what the install accepts.
+fn ensure_python_tag_matches(python_tag: &str, requirement: PythonRequirement) -> Result<()> {
+    if python_tag != requirement.tag {
         bail!(
-            "Python wheel tag {} is not supported by this ROCm install; {} is required",
-            compatibility.python_tag,
+            "Python wheel tag {python_tag} is not supported by this ROCm install; {} is required",
             requirement.tag
         );
     }
-    verify_python_can_create_venv(program).context("Python could not create a virtual environment")
+    Ok(())
+}
+
+/// The wheel tag a managed Python requested as `version` reports (`3.13` and
+/// `3.13.1` both give `cp313`), or `None` when `version` is not a plain
+/// `major.minor[.patch]` and the tag cannot be told without installing it.
+fn python_tag_for_version(version: &str) -> Option<String> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    Some(format!("cp{major}{minor}"))
 }
 
 fn verify_python_can_create_venv(program: &Path) -> Result<()> {
@@ -1527,6 +1561,68 @@ exit 1
         assert_eq!(preview, install);
         assert!(!host.uv_was_run());
         Ok(())
+    }
+
+    /// `ROCM_CLI_MANAGED_PYTHON_VERSION` naming a version whose wheel tag is not
+    /// the one the layout needs: a real install prepares it and then refuses it,
+    /// so the preview refuses too, by the same rule, and prepares nothing. A
+    /// version the layout does accept (a patch release of its own minor) is still
+    /// announced as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_run_refuses_a_managed_python_version_the_install_would_refuse() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let host = PythonHost::new("python-dry-run-version-override")?;
+        let overridden =
+            RestoredEnv::set(&[("ROCM_CLI_MANAGED_PYTHON_VERSION", Some(Path::new("3.13")))]);
+
+        let error = format!("{:#}", host.python_for_install(true).unwrap_err());
+
+        assert!(
+            error.contains("would prepare managed Python 3.13")
+                && error.contains("Python wheel tag cp313 is not supported")
+                && error.contains("cp312 is required"),
+            "{error}"
+        );
+        assert!(!host.uv_was_run());
+        assert_eq!(snapshot(&host.paths), Vec::<PathBuf>::new());
+        drop(overridden);
+
+        // A patch release of the required minor is what the install accepts.
+        let _patch =
+            RestoredEnv::set(&[("ROCM_CLI_MANAGED_PYTHON_VERSION", Some(Path::new("3.12.4")))]);
+        let planned = host.python_for_install(true)?;
+        assert!(
+            matches!(&planned, PlannedPython::WouldPrepareManaged { version, .. } if version == "3.12.4"),
+            "{planned:?}"
+        );
+        assert!(!host.uv_was_run());
+        Ok(())
+    }
+
+    /// The version-to-tag reading the preview's refusal rests on, and that it is
+    /// the same rule `python_launcher_install_ready` applies (same message).
+    #[test]
+    fn a_managed_python_version_is_read_as_the_wheel_tag_it_reports() {
+        assert_eq!(python_tag_for_version("3.12").as_deref(), Some("cp312"));
+        assert_eq!(python_tag_for_version(" 3.14.1 ").as_deref(), Some("cp314"));
+        assert_eq!(python_tag_for_version("3.9").as_deref(), Some("cp39"));
+        // Not a plain major.minor: only installing it would say what it reports.
+        for unreadable in ["", "3", "3.x", "cpython-3.13", "3.13t", "latest"] {
+            assert_eq!(python_tag_for_version(unreadable), None, "{unreadable:?}");
+        }
+
+        let required = python_requirement(SourceLayout::Canonical);
+        assert!(ensure_python_tag_matches("cp312", required).is_ok());
+        let error = ensure_python_tag_matches("cp313", required)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Python wheel tag cp313 is not supported by this ROCm install; cp312 is required"
+        );
     }
 
     /// An interpreter that has not been prepared yet is described by the one the

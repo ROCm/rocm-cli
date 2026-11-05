@@ -252,7 +252,6 @@ async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
 
 /// File the recording `uv` appends to, one line per invocation.
 const UV_INVOCATION_LOG: &str = "uv-invocations.log";
-
 /// A host where the CLI can find no Python: `PATH` is one empty folder, so the
 /// search comes up empty and no managed Python has been saved. `uv` is a
 /// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
@@ -1089,6 +1088,12 @@ async fn preview_prepared_no_python(world: &mut E2eWorld) {
         ),
         "the progress line about what the preview skipped",
     );
+    assert_no_python_prepared(world);
+}
+
+/// The state half of the claim: no `uv` run, no managed tools folder, no
+/// downloaded tool archive, no saved configuration.
+fn assert_no_python_prepared(world: &E2eWorld) {
     let paths = world.app_paths();
     let scenario_root = root(world).to_path_buf();
     let uv_log = scenario_root.join(UV_INVOCATION_LOG);
@@ -1115,6 +1120,49 @@ async fn preview_prepared_no_python(world: &mut E2eWorld) {
         config.display(),
         std::fs::read_to_string(&config).unwrap_or_default()
     );
+}
+
+#[given("the managed Python version is overridden to 3.13")]
+async fn managed_python_version_overridden(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_MANAGED_PYTHON_VERSION", "3.13".into()));
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 with no version pin")]
+async fn try_preview_unpinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+/// The refusal names the version and the tag rule, as a real install would
+/// meet it, and the state agrees that nothing was prepared on the way to it.
+#[then("the preview is refused because the install would refuse that Python")]
+async fn preview_refused_for_python_version(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    for needle in [
+        "would prepare managed Python 3.13",
+        "Python wheel tag cp313 is not supported",
+        "cp312 is required",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle:?} in the refusal:\n{stderr}"
+        );
+    }
+    assert_no_python_prepared(world);
 }
 
 #[then("the preview resolves the canonical release pip index")]
