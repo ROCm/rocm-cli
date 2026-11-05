@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::uninstall_plan::{
-    UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
+    PlanAudience, UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
     is_rocm_install_entry_name, remove_path, render_uninstall_plan,
 };
 
@@ -66,7 +66,14 @@ impl PathEdit {
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     let paths = AppPaths::discover()?;
     let plan = build_uninstall_plan(&paths, &options)?;
-    print!("{}", render_uninstall_plan(&plan, &options));
+    print!(
+        "{}",
+        render_uninstall_plan(
+            &plan,
+            &options,
+            PlanAudience::for_command(interactive_terminal())
+        )
+    );
 
     if plan_is_empty(&plan) || options.dry_run {
         return Ok(());
@@ -841,7 +848,8 @@ mod tests {
             self_delete: Some(PathBuf::from("/opt/bin/rocm.exe")),
             ..UninstallPlan::default()
         };
-        let output = render_uninstall_plan(&plan, &UninstallOptions::default());
+        let output =
+            render_uninstall_plan(&plan, &UninstallOptions::default(), PlanAudience::Captured);
         for expected in [
             "2 item(s) would be removed:",
             "  - install record: /opt/bin/.rocm-cli-path-edit",

@@ -955,9 +955,18 @@ The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
 anything is removed, and a dry run on a machine ROCm CLI never touched
-(`uninstall-06`) reporting nothing to remove and creating no folder. The
-`uninstall` command does not start the file logger, which would otherwise create
-the data folder's `logs` folder before the plan is built:
+(`uninstall-06`) reporting nothing to remove and creating no folder. At a
+terminal (a pseudo-terminal on the Linux lane), a dry run that lists something
+ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
+and checks the listed folder goes; output that is not read at a terminal, and an
+empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
+mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
+is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
+its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+ends differently, since it has no flag to offer: it says removal needs approval,
+which `lifecycle_read_mutate_split_is_honest` in `apps/rocm/src/chat.rs` backs.
+The `uninstall` command does not start the file logger, which would otherwise
+create the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"

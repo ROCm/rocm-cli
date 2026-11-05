@@ -771,6 +771,10 @@ rocm logs --search error timeout")]
     /// PATH change the installer made (its marked shell-profile block, or the
     /// user PATH entry it recorded adding on Windows), unless other programs
     /// share the install folder.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm uninstall --dry-run\n  \
+rocm uninstall\n  \
+rocm uninstall --keep-data --yes")]
     Uninstall {
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
@@ -798,6 +802,11 @@ rocm logs --search error timeout")]
         /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
+        /// Not an option; accepted only to say so. Without it clap answers a
+        /// mistyped `--force` (a likely guess for skipping the confirmation)
+        /// with `--force-dev-binaries`, which removes development binaries.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "")]
+        force: Option<String>,
     },
 }
 
@@ -2268,15 +2277,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             keep_data,
             keep_cache,
             force_dev_binaries,
-        }) => uninstall(UninstallOptions {
-            yes,
-            dry_run,
-            keep_binaries,
-            keep_config,
-            keep_data,
-            keep_cache,
-            force_dev_binaries,
-        }),
+            force,
+        }) => {
+            reject_uninstall_force(force.is_some())?;
+            uninstall(UninstallOptions {
+                yes,
+                dry_run,
+                keep_binaries,
+                keep_config,
+                keep_data,
+                keep_cache,
+                force_dev_binaries,
+            })
+        }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();
             clap_complete::generate(shell, &mut cmd, "rocm", &mut std::io::stdout());
@@ -2284,6 +2297,20 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         None => launch_default(),
     }
+}
+
+/// `rocm uninstall` has no `--force`; the flag is declared (hidden) only so this
+/// can answer it. Left undeclared, clap's nearest-name guess for `--force` is
+/// `--force-dev-binaries`, which removes development binaries, and a near miss
+/// such as `--forc` gets that same suggestion. Declared, those guesses land here
+/// instead, before anything is planned or removed.
+fn reject_uninstall_force(force: bool) -> Result<()> {
+    if force {
+        bail!(
+            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation"
+        );
+    }
+    Ok(())
 }
 
 /// Build the command tree handed to `clap_complete` for shell completions.
@@ -3214,6 +3241,104 @@ pub(crate) mod tests {
             !help.contains("ROCm install"),
             "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
         );
+    }
+
+    /// `--force` is a likely guess for "skip the confirmation", and without a
+    /// declared `--force` clap answers it, and every near miss of it, with
+    /// `--force-dev-binaries`, which removes the binaries of a development build.
+    /// The scenario `uninstall-mistyped-force-is-not-answered-with-a-destructive-flag`
+    /// proves the real binary's output; this pins the parse behind it.
+    #[test]
+    fn a_mistyped_force_never_reaches_the_dev_binaries_flag() {
+        // `--force` itself parses, so the handler can say what to use instead.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force"]).unwrap();
+        let Some(Command::Uninstall {
+            force,
+            force_dev_binaries,
+            ..
+        }) = cli.command
+        else {
+            panic!("not an uninstall command");
+        };
+        assert!(force.is_some() && !force_dev_binaries);
+        let refusal = reject_uninstall_force(force.is_some())
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("`--force` is not an option"), "{refusal}");
+        assert!(refusal.contains("--yes"), "{refusal}");
+        assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
+        assert!(reject_uninstall_force(false).is_ok());
+        // `--force=x` is the same mistake, and gets the same answer rather than
+        // a usage line that lists every flag.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
+        let Some(Command::Uninstall { force, .. }) = cli.command else {
+            panic!("not an uninstall command");
+        };
+        assert!(reject_uninstall_force(force.is_some()).is_err());
+
+        // Near misses and the forms clap suggests from elsewhere in the command
+        // line never offer the destructive flag.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--forcee"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+            vec!["uninstall", "-f"],
+            vec!["--force", "uninstall"],
+        ] {
+            let error = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err();
+            let rendered = error.render().to_string();
+            assert!(
+                !rendered.contains("force-dev-binaries"),
+                "{args:?} was answered with the destructive flag:\n{rendered}"
+            );
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+
+        // The whole flag misspelled is still met with the flag it was meant to be.
+        let error = cli_command()
+            .try_get_matches_from(["rocm", "uninstall", "--force-dev-binary"])
+            .unwrap_err()
+            .render()
+            .to_string();
+        assert!(error.contains("--force-dev-binaries"), "{error}");
+
+        // It stays out of the help.
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("Not an option"), "{help}");
+    }
+
+    /// The help leads with the safe preview, then the real run, as the tip a
+    /// person reads before running a command that deletes things.
+    #[test]
+    fn uninstall_help_shows_a_dry_run_before_the_real_run() {
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .expect("uninstall subcommand")
+            .render_long_help()
+            .to_string();
+        let examples = help.split_once("EXAMPLES:").map_or_else(
+            || panic!("`rocm uninstall --help` has no examples:\n{help}"),
+            |(_, rest)| rest,
+        );
+        let rows: Vec<&str> = examples
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            rows.first().copied(),
+            Some("rocm uninstall --dry-run"),
+            "{examples}"
+        );
+        assert!(rows.contains(&"rocm uninstall"), "{examples}");
     }
 
     #[test]

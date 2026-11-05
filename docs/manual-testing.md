@@ -1063,7 +1063,12 @@ Expected result:
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
   as the command exits) and, under
   `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  terminal ends with `Nothing was removed. To remove these items, run it again
+  without --dry-run.` Running the same command again without `--dry-run` asks
+  `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
+  its output piped to a file or another command it lists the same items and
+  omits that last line (scenario `uninstall-08`).
 - After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
@@ -1075,7 +1080,14 @@ Expected result:
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
-  on that folder.
+  on that folder. It adds no line about how to remove anything (scenario
+  `uninstall-09`).
+- Passing `--force` to `rocm uninstall` is refused with a message that says it
+  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  unknown-argument error (exit 2). Neither
+  suggests `--force-dev-binaries` (scenario `uninstall-10`).
+  `rocm uninstall --help` ends with examples that start with a dry run
+  (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no
