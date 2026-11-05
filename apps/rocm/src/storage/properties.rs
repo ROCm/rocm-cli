@@ -31,7 +31,7 @@
 use proptest::prelude::*;
 
 use proptest::strategy::ValueTree;
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{TestCaseError, TestRunner};
 
 use super::{HoldReason, RetentionInputs, select_runtimes_to_remove};
 use crate::therock::{InstalledRuntimeManifest, WheelRuntimeComposition};
@@ -420,6 +420,27 @@ proptest! {
         }
     }
 
+    /// The configured default holds the install it names, when it names
+    /// exactly one: a default id that names several holds none of them, so
+    /// that `--keep` is not made inert for a whole family.
+    #[test]
+    fn the_install_the_default_names_is_never_selected_for_removal(
+        manifests in manifests(),
+        inputs in retention_inputs(),
+        keep in 0_usize..4,
+    ) {
+        let (removable, _) = select_runtimes_to_remove(&manifests, &inputs, keep);
+        let default_key = expected_default_key(&manifests, &inputs);
+        for key in installed_matching(&manifests, default_key.as_deref()) {
+            prop_assert!(
+                !removable.contains(&key),
+                "default runtime {key:?} selected for removal (default_runtime_id={:?}, \
+                 keep={keep}, removable={removable:?})",
+                inputs.default_runtime_id,
+            );
+        }
+    }
+
     /// The marker is the second source of truth and may disagree with config.
     #[test]
     fn an_install_named_by_the_marker_is_never_selected_for_removal(
@@ -550,37 +571,19 @@ proptest! {
     /// key must resolve to itself.
     ///
     /// The real resolver is called here rather than a copy of its matching
-    /// rule, so this keeps holding whatever that rule becomes. When the two
-    /// disagreed, the failing cases were two installs whose keys differ only
-    /// in letter case; the checked-in seed replays one with `--keep 0`.
+    /// rule, so this keeps holding whatever that rule becomes. With today's
+    /// resolver, which tries an exact key match first, every freshly generated
+    /// case resolves through that exact match, so what this property guards
+    /// day to day is that precedence. The case it exists for, two installs
+    /// whose keys differ only in letter case, is pinned as an explicit input in
+    /// `a_case_twin_pair_resolves_to_the_install_the_policy_cleared`.
     #[test]
     fn the_deleter_resolves_each_selected_key_to_the_install_the_policy_cleared(
         manifests in manifests(),
         inputs in retention_inputs(),
         keep in 0_usize..4,
     ) {
-        let (removable, _) = select_runtimes_to_remove(&manifests, &inputs, keep);
-        // `load_runtime_manifests` hands every caller this order: newest
-        // install first, ties broken by key.
-        let mut newest_first = manifests;
-        newest_first.sort_by(|left, right| {
-            right
-                .installed_at_unix_ms
-                .cmp(&left.installed_at_unix_ms)
-                .then_with(|| left.runtime_key.cmp(&right.runtime_key))
-        });
-
-        for key in &removable {
-            let resolved = crate::runtimes_cmd::select_runtime_manifest(&newest_first, key)
-                .expect("a selected key always names exactly one installed runtime");
-            prop_assert_eq!(
-                &resolved.runtime_key,
-                key,
-                "the plan says remove {:?}, but the deleter resolves that key to {:?}",
-                key,
-                resolved.runtime_key,
-            );
-        }
+        deleter_resolves_each_selected_key_to_itself(manifests, &inputs, keep)?;
     }
 
     /// Each kept install is reported with the right reason: the first one
@@ -622,15 +625,25 @@ proptest! {
                 Some(HoldReason::Marker)
             } else if manifest.read_only || manifest.imported_from.is_some() {
                 Some(HoldReason::NotOwned)
-            } else if groups[&expected_group(manifest)]
-                .iter()
-                .filter(|other| other.installed_at_unix_ms > manifest.installed_at_unix_ms)
-                .count()
-                < keep
-            {
-                Some(HoldReason::WithinKeepLimit)
             } else {
-                None
+                // Nothing but recency holds it, so `recency_groups` must have
+                // put it in a group. A missing group means the checks above
+                // and `held_regardless_of_recency` have drifted apart; fail
+                // naming the install rather than on a map index.
+                let group = groups.get(&expected_group(manifest));
+                prop_assert!(
+                    group.is_some(),
+                    "{:?} held as {:?}, but nothing other than recency holds it and \
+                     it is in no recency group",
+                    key,
+                    reason,
+                );
+                let newer = group
+                    .into_iter()
+                    .flatten()
+                    .filter(|other| other.installed_at_unix_ms > manifest.installed_at_unix_ms)
+                    .count();
+                (newer < keep).then_some(HoldReason::WithinKeepLimit)
             };
             prop_assert_eq!(
                 Some(reason),
@@ -643,6 +656,85 @@ proptest! {
     }
 }
 
+/// The check behind
+/// `the_deleter_resolves_each_selected_key_to_the_install_the_policy_cleared`,
+/// shared with the pinned case-twin example below it.
+fn deleter_resolves_each_selected_key_to_itself(
+    manifests: Vec<InstalledRuntimeManifest>,
+    inputs: &RetentionInputs,
+    keep: usize,
+) -> Result<(), TestCaseError> {
+    let (removable, _) = select_runtimes_to_remove(&manifests, inputs, keep);
+    // `load_runtime_manifests` hands every caller this order: newest
+    // install first, ties broken by key.
+    let mut newest_first = manifests;
+    newest_first.sort_by(|left, right| {
+        right
+            .installed_at_unix_ms
+            .cmp(&left.installed_at_unix_ms)
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+    });
+
+    for key in &removable {
+        let resolved =
+            crate::runtimes_cmd::select_runtime_manifest(&newest_first, key).map_err(|error| {
+                TestCaseError::fail(format!("selected key {key:?} does not resolve: {error}"))
+            })?;
+        prop_assert_eq!(
+            &resolved.runtime_key,
+            key,
+            "the plan says remove {:?}, but the deleter resolves that key to {:?}",
+            key,
+            resolved.runtime_key,
+        );
+    }
+    Ok(())
+}
+
+/// The input that #497's selector fix is about, pinned here rather than left
+/// to the proptest seed file: that file stores an RNG seed, so a change to the
+/// generators makes it replay a different case. Two installs whose keys differ
+/// only in case, same runtime id, installed at the same moment, nothing
+/// pointing at either, `--keep 0`: the policy clears both, and the deleter has
+/// to resolve each key to its own install rather than to its twin.
+#[test]
+fn a_case_twin_pair_resolves_to_the_install_the_policy_cleared() {
+    let twin = |runtime_key: &str| {
+        GeneratedManifest {
+            runtime_key: runtime_key.to_owned(),
+            channel: "release".to_owned(),
+            format: "wheel".to_owned(),
+            family: "gfx110X-all".to_owned(),
+            installed_at_unix_ms: 0,
+            read_only: false,
+            imported: false,
+            toolchain: Toolchain::Specs {
+                extras: DEVEL_EXTRAS,
+                flag: true,
+            },
+        }
+        .build()
+    };
+    let manifests = vec![twin("A"), twin("a")];
+    let inputs = RetentionInputs {
+        active_runtime_key: None,
+        previous_runtime_key: None,
+        default_runtime_id: None,
+        marker_runtime_keys: Vec::new(),
+    };
+
+    let (mut removable, _) = select_runtimes_to_remove(&manifests, &inputs, 0);
+    removable.sort();
+    assert_eq!(
+        removable,
+        ["A", "a"],
+        "both twins must be selected, or the resolution below checks nothing"
+    );
+    if let Err(error) = deleter_resolves_each_selected_key_to_itself(manifests, &inputs, 0) {
+        panic!("{error}");
+    }
+}
+
 /// Printed with `cargo test -- --nocapture`. This measures the generators, not
 /// the policy: it fails only if they stop reaching the cases the properties
 /// above depend on. Several of those properties assert inside a loop over
@@ -652,7 +744,7 @@ proptest! {
 /// one retention group, not just anywhere in the set.
 ///
 /// The RNG is the fixed deterministic one, so the counts are the same on every
-/// run. The floors in [`FLOOR`] sit at about four fifths of them; any change to
+/// run. The floors in [`REACH`] sit at about four fifths of them; any change to
 /// the generators shifts every count, so re-measure them all after one.
 #[test]
 fn generator_reach_report() {
@@ -660,39 +752,24 @@ fn generator_reach_report() {
     let mut runner = TestRunner::deterministic();
     let draw = (manifests(), retention_inputs());
 
-    let labels: [&str; ROWS] = [
-        "two keys differing only in case",
-        "two installs sharing a runtime id",
-        "an adopted or imported install",
-        "a pointer spelled in another case",
-        "a pointer naming nothing installed",
-        "a default naming exactly one install",
-        "a default naming several installs",
-        "in a group: tied install times",
-        "in a group: case-twin keys",
-        "in a group: channel spelled two ways",
-        "in a group: format spelled two ways",
-        "in a group: family spelled two ways",
-        "in a group: devel flag disagreeing with the specs",
-        "in a group: a spaced devel extra",
-        "in a group: a near-miss devel extra",
-        "in a group: another package's spec first",
-        "two groups differing only in the toolchain",
-        "a group with more candidates than --keep 1",
-        "a group with more candidates than --keep 2",
-        "a group with more candidates than --keep 3",
-    ];
+    for (index, (row, label, _)) in REACH.iter().enumerate() {
+        assert_eq!(
+            *row as usize, index,
+            "REACH row {label:?} is out of `Row` order"
+        );
+    }
     let mut hits = [0_u32; ROWS];
     for _ in 0..SAMPLES {
         let (manifests, inputs) = draw.new_tree(&mut runner).expect("generator").current();
         let mut saw = [false; ROWS];
         for (index, left) in manifests.iter().enumerate() {
             for right in manifests.iter().skip(index + 1) {
-                saw[0] |= left.runtime_key.eq_ignore_ascii_case(&right.runtime_key);
-                saw[1] |= left.runtime_id == right.runtime_id;
+                saw[Row::CaseTwinKeys as usize] |=
+                    left.runtime_key.eq_ignore_ascii_case(&right.runtime_key);
+                saw[Row::SharedRuntimeId as usize] |= left.runtime_id == right.runtime_id;
             }
         }
-        saw[2] = manifests
+        saw[Row::NotOwned as usize] = manifests
             .iter()
             .any(|manifest| manifest.read_only || manifest.imported_from.is_some());
         let pointers = inputs
@@ -702,26 +779,28 @@ fn generator_reach_report() {
             .chain(inputs.marker_runtime_keys.iter());
         for pointer in pointers {
             let matching = installed_matching(&manifests, Some(pointer));
-            saw[3] |= matching.iter().any(|key| key != pointer);
-            saw[4] |= matching.is_empty();
+            saw[Row::PointerInOtherCase as usize] |= matching.iter().any(|key| key != pointer);
+            saw[Row::PointerNamesNothing as usize] |= matching.is_empty();
         }
         if let Some(id) = inputs.default_runtime_id.as_deref() {
             let named = manifests
                 .iter()
                 .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(id))
                 .count();
-            saw[5] = named == 1;
-            saw[6] = named > 1;
+            saw[Row::DefaultNamesOne as usize] = named == 1;
+            saw[Row::DefaultNamesSeveral as usize] = named > 1;
         }
         let groups = recency_groups(&manifests, &inputs);
         for members in groups.values() {
             for (index, left) in members.iter().enumerate() {
                 for right in members.iter().skip(index + 1) {
-                    saw[7] |= left.installed_at_unix_ms == right.installed_at_unix_ms;
-                    saw[8] |= left.runtime_key.eq_ignore_ascii_case(&right.runtime_key);
-                    saw[9] |= left.channel != right.channel;
-                    saw[10] |= left.format != right.format;
-                    saw[11] |= left.family != right.family;
+                    saw[Row::GroupTiedTimes as usize] |=
+                        left.installed_at_unix_ms == right.installed_at_unix_ms;
+                    saw[Row::GroupCaseTwins as usize] |=
+                        left.runtime_key.eq_ignore_ascii_case(&right.runtime_key);
+                    saw[Row::GroupChannelTwoWays as usize] |= left.channel != right.channel;
+                    saw[Row::GroupFormatTwoWays as usize] |= left.format != right.format;
+                    saw[Row::GroupFamilyTwoWays as usize] |= left.family != right.family;
                 }
             }
             if members.len() > 1 {
@@ -732,28 +811,35 @@ fn generator_reach_report() {
                         .and_then(|composition| composition.package_specs.first().cloned())
                         .unwrap_or_default()
                 };
-                saw[12] |= members
+                saw[Row::GroupDevelDisagrees as usize] |= members
                     .iter()
                     .any(|manifest| manifest.devel != installed_the_toolchain(manifest));
-                saw[13] |= members
+                saw[Row::GroupSpacedDevel as usize] |= members
                     .iter()
                     .any(|manifest| first_specs(manifest).contains(SPACED_DEVEL_EXTRAS));
-                saw[14] |= members
+                saw[Row::GroupNearMissDevel as usize] |= members
                     .iter()
                     .any(|manifest| first_specs(manifest).contains(NEAR_MISS_EXTRAS));
-                saw[15] |= members
+                saw[Row::GroupOtherSpecFirst as usize] |= members
                     .iter()
                     .any(|manifest| first_specs(manifest).starts_with("torch["));
             }
-            saw[17] |= members.len() > 1;
-            saw[18] |= members.len() > 2;
-            saw[19] |= members.len() > 3;
+            saw[Row::GroupOverKeep1 as usize] |= members.len() > 1;
+            saw[Row::GroupOverKeep2 as usize] |= members.len() > 2;
+            saw[Row::GroupOverKeep3 as usize] |= members.len() > 3;
         }
         // Two groups that differ only in the toolchain choice: what keeps a
         // plain install from evicting a `--devel` one.
-        saw[16] = groups.keys().any(|(channel, format, family, devel)| {
-            *devel && groups.contains_key(&(channel.clone(), format.clone(), family.clone(), false))
-        });
+        saw[Row::GroupsDifferOnlyInToolchain as usize] =
+            groups.keys().any(|(channel, format, family, devel)| {
+                *devel
+                    && groups.contains_key(&(
+                        channel.clone(),
+                        format.clone(),
+                        family.clone(),
+                        false,
+                    ))
+            });
         for (count, seen) in hits.iter_mut().zip(saw) {
             *count += u32::from(seen);
         }
@@ -761,9 +847,9 @@ fn generator_reach_report() {
 
     println!("\n=== storage retention generator reach ({SAMPLES} samples) ===");
     let mut starved = Vec::new();
-    for ((label, count), floor) in labels.iter().zip(hits).zip(FLOOR) {
+    for ((_, label, floor), count) in REACH.iter().zip(hits) {
         println!("  {label:<52} {count:>6} (floor {floor})");
-        if count < floor {
+        if count < *floor {
             starved.push(*label);
         }
     }
@@ -773,10 +859,121 @@ fn generator_reach_report() {
     );
 }
 
+/// One row of `generator_reach_report`: what it counts, and the floor below
+/// which the count fails the test.
+#[derive(Clone, Copy, Debug)]
+enum Row {
+    CaseTwinKeys,
+    SharedRuntimeId,
+    NotOwned,
+    PointerInOtherCase,
+    PointerNamesNothing,
+    DefaultNamesOne,
+    DefaultNamesSeveral,
+    GroupTiedTimes,
+    GroupCaseTwins,
+    GroupChannelTwoWays,
+    GroupFormatTwoWays,
+    GroupFamilyTwoWays,
+    GroupDevelDisagrees,
+    GroupSpacedDevel,
+    GroupNearMissDevel,
+    GroupOtherSpecFirst,
+    GroupsDifferOnlyInToolchain,
+    GroupOverKeep1,
+    GroupOverKeep2,
+    GroupOverKeep3,
+}
+
 const ROWS: usize = 20;
 
-/// Floors for `generator_reach_report`, in the same order as its rows.
-const FLOOR: [u32; ROWS] = [
-    5_380, 9_450, 8_270, 5_310, 10_760, 1_800, 3_650, 1_740, 430, 2_030, 2_040, 2_310, 3_070, 970,
-    650, 1_570, 4_270, 4_990, 960, 130,
+/// The rows in `Row` order, each with its label and floor kept together so
+/// they cannot drift apart; `generator_reach_report` checks that every row
+/// sits at its own `Row` index. The floors sit at about four fifths of the
+/// measured counts.
+const REACH: [(Row, &str, u32); ROWS] = [
+    (Row::CaseTwinKeys, "two keys differing only in case", 5_380),
+    (
+        Row::SharedRuntimeId,
+        "two installs sharing a runtime id",
+        9_450,
+    ),
+    (Row::NotOwned, "an adopted or imported install", 8_270),
+    (
+        Row::PointerInOtherCase,
+        "a pointer spelled in another case",
+        5_310,
+    ),
+    (
+        Row::PointerNamesNothing,
+        "a pointer naming nothing installed",
+        10_760,
+    ),
+    (
+        Row::DefaultNamesOne,
+        "a default naming exactly one install",
+        1_800,
+    ),
+    (
+        Row::DefaultNamesSeveral,
+        "a default naming several installs",
+        3_650,
+    ),
+    (Row::GroupTiedTimes, "in a group: tied install times", 1_740),
+    (Row::GroupCaseTwins, "in a group: case-twin keys", 430),
+    (
+        Row::GroupChannelTwoWays,
+        "in a group: channel spelled two ways",
+        2_030,
+    ),
+    (
+        Row::GroupFormatTwoWays,
+        "in a group: format spelled two ways",
+        2_040,
+    ),
+    (
+        Row::GroupFamilyTwoWays,
+        "in a group: family spelled two ways",
+        2_310,
+    ),
+    (
+        Row::GroupDevelDisagrees,
+        "in a group: devel flag disagreeing with the specs",
+        3_070,
+    ),
+    (
+        Row::GroupSpacedDevel,
+        "in a group: a spaced devel extra",
+        970,
+    ),
+    (
+        Row::GroupNearMissDevel,
+        "in a group: a near-miss devel extra",
+        650,
+    ),
+    (
+        Row::GroupOtherSpecFirst,
+        "in a group: another package's spec first",
+        1_570,
+    ),
+    (
+        Row::GroupsDifferOnlyInToolchain,
+        "two groups differing only in the toolchain",
+        4_270,
+    ),
+    (
+        Row::GroupOverKeep1,
+        "a group with more candidates than --keep 1",
+        4_990,
+    ),
+    (
+        Row::GroupOverKeep2,
+        "a group with more candidates than --keep 2",
+        960,
+    ),
+    (
+        Row::GroupOverKeep3,
+        "a group with more candidates than --keep 3",
+        130,
+    ),
 ];

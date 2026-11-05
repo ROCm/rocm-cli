@@ -1878,11 +1878,25 @@ mod tests {
         Ok(())
     }
 
-    /// What survived one generated prune: the key of the install that was in
-    /// use, and whether its folder is still there.
+    /// What one generated prune did: the key of the install that was in use
+    /// and whether its folder survived, every install the plan named whose
+    /// folder is still there afterwards, and every install the plan did not
+    /// name whose folder is gone.
     struct AppliedPlan {
         in_use_key: String,
         folder_survives: bool,
+        planned_but_left: Vec<String>,
+        unplanned_but_gone: Vec<String>,
+    }
+
+    /// Removes a test root when it goes out of scope, so a case that fails
+    /// part-way through (an early `?`) does not leave its tree behind.
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn apply_generated_plan(
@@ -1891,6 +1905,7 @@ mod tests {
         keep: usize,
     ) -> Result<AppliedPlan> {
         let (root, paths) = test_paths("apply-plan-property");
+        let _cleanup = RemoveOnDrop(root);
         let mut installed = Vec::new();
         for (index, family) in families.iter().enumerate() {
             let record = manifest(
@@ -1914,12 +1929,27 @@ mod tests {
             crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
         }
 
-        let applied = AppliedPlan {
+        Ok(AppliedPlan {
             in_use_key: active.runtime_key.clone(),
             folder_survives: active.install_root.is_dir(),
-        };
-        let _ = std::fs::remove_dir_all(root);
-        Ok(applied)
+            planned_but_left: plan
+                .remove
+                .iter()
+                .filter(|entry| entry.install_root.exists())
+                .map(|entry| entry.runtime_key.clone())
+                .collect(),
+            unplanned_but_gone: installed
+                .iter()
+                .filter(|install| {
+                    !plan
+                        .remove
+                        .iter()
+                        .any(|entry| entry.runtime_key == install.runtime_key)
+                })
+                .filter(|install| !install.install_root.exists())
+                .map(|install| install.runtime_key.clone())
+                .collect(),
+        })
     }
 
     proptest::proptest! {
@@ -1934,9 +1964,19 @@ mod tests {
         /// The same safety invariant as the pure-policy properties, but
         /// driven through real registry files, real install folders and the
         /// real removal call — so it also fails if that removal deletes the
-        /// install in use when the plan did not name it. Every install here is
-        /// owned and every key is distinct, so neither the on-disk ownership
-        /// guards nor case-twin key lookups are what it tests.
+        /// install in use when the plan did not name it, and checks that no
+        /// other install the plan left out lost its folder either. It also
+        /// checks the other direction: every install the plan named is
+        /// actually gone, so a removal that quietly did nothing cannot pass.
+        /// Every install here is owned and every key is distinct, so neither
+        /// the on-disk ownership guards nor case-twin key lookups are what it
+        /// tests.
+        ///
+        /// It calls `uninstall_runtime` for each planned key directly rather
+        /// than going through `storage()`'s removal loop, so that loop's
+        /// last-second hold re-check is not exercised here;
+        /// `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`
+        /// replays the loop, re-check included.
         ///
         /// Keys are lowercase here, as every key ROCm CLI generates is; two
         /// keys differing only in case are covered by
@@ -1957,6 +1997,16 @@ mod tests {
                 applied.folder_survives,
                 "the runtime in use ({}) was removed with --keep {keep}",
                 applied.in_use_key,
+            );
+            proptest::prop_assert!(
+                applied.planned_but_left.is_empty(),
+                "the plan named {:?} for removal with --keep {keep}, but their folders remain",
+                applied.planned_but_left,
+            );
+            proptest::prop_assert!(
+                applied.unplanned_but_gone.is_empty(),
+                "the plan left {:?} out with --keep {keep}, but their folders are gone",
+                applied.unplanned_but_gone,
             );
         }
     }
