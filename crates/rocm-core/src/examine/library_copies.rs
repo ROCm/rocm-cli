@@ -1264,4 +1264,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&missing);
         assert!(rocm_install_siblings(&missing).is_empty());
     }
+
+    /// Serializes the tests that point `ROCM_CLI_DATA_DIR` at a scratch
+    /// registry. Named `*_TEST_LOCK` so the env-mutation contract guard
+    /// recognises the discipline by suffix.
+    static DATA_DIR_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A wheel-format managed runtime's recorded library directories reach the
+    /// search through the real chain, even though none of them sits under the
+    /// probed root.
+    ///
+    /// The layout is the one the CLI installs (see `ROCM_SDK_PROBE_SCRIPT` in
+    /// `apps/rocm/src/therock/probe.rs`): the probe's `root_path` is the
+    /// `_rocm_sdk_devel` package, and the ROCm libraries live in sibling
+    /// packages beside it under `site-packages`, so the only record of where
+    /// they are is the registry's `library_paths`. This drives
+    /// `known_install_roots` -> `install_library_dirs` -> `managed_runtime_roots`
+    /// -> `collect_sdk_library_paths` against a registry read through the real
+    /// `ROCM_CLI_DATA_DIR` lookup, which is the path
+    /// `examine-finds-the-managed-runtimes-own-compilation-library` exercises
+    /// end to end on a GPU host. Without this the only coverage of the
+    /// recorded-directories half is that GPU-gated scenario.
+    ///
+    /// Directories only, no library files: the seam under test decides which
+    /// directories are walked, and `find_library_copies` has its own tests for
+    /// what is found inside them. A recorded directory that does not exist is
+    /// recorded too, and must be dropped rather than walked.
+    #[test]
+    fn a_wheel_runtimes_recorded_library_dirs_outside_its_root_reach_the_search() {
+        let _guard = DATA_DIR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (scratch, paths) = crate::test_support::temp_app_paths("comgr-wheel-recorded-dirs");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = scratch.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        let core_lib = site_packages.join("_rocm_sdk_core").join("lib");
+        let libraries_lib = site_packages
+            .join("_rocm_sdk_libraries_gfx120X_all")
+            .join("lib");
+        let never_installed = site_packages.join("_rocm_sdk_profiler").join("lib");
+        for dir in [&registry, &sdk_bin, &core_lib, &libraries_lib] {
+            std::fs::create_dir_all(dir).expect("create fixture dir");
+        }
+        std::fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin,
+                    "library_paths": [core_lib, libraries_lib, never_installed]
+                }
+            }))
+            .expect("serialize registry record"),
+        )
+        .expect("write registry record");
+
+        let restore = crate::test_env::RestoredEnvVar::set("ROCM_CLI_DATA_DIR", &paths.data_dir);
+        let roots = known_install_roots(&Examination::default());
+        let dirs = install_library_dirs(&roots);
+        drop(restore);
+
+        let managed: Vec<_> = dirs
+            .iter()
+            .filter(|(_, source, _)| *source == "managed-runtime")
+            .collect();
+        for expected in [&core_lib, &libraries_lib] {
+            assert!(
+                managed
+                    .iter()
+                    .any(|(dir, _, owner)| dir == expected && *owner == sdk_root),
+                "the recorded directory {} is outside the probed root and must still be \
+                 searched, attributed to that root: {managed:?}",
+                expected.display()
+            );
+        }
+        assert!(
+            !managed.iter().any(|(dir, _, _)| *dir == never_installed),
+            "a recorded directory that is not on disk must be dropped, not walked: {managed:?}"
+        );
+        // The root's own `bin` is the guess `collect_sdk_library_paths` makes
+        // from the root alone; it has to keep working beside the recorded paths.
+        assert!(
+            managed.iter().any(|(dir, _, _)| *dir == sdk_bin),
+            "the layout read from the root itself must still be searched: {managed:?}"
+        );
+
+        std::fs::remove_dir_all(scratch).ok();
+    }
 }
