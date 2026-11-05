@@ -523,16 +523,48 @@ fn restore_after_failed_activation(
     error: anyhow::Error,
 ) -> anyhow::Error {
     match snapshot.restore(paths, config) {
-        Ok(()) => error.context(
+        Ok(()) => discard_failed_marker_replacement(error).context(
             "failed to record the active ROCm runtime; the previously active runtime is still \
              the active one",
         ),
-        Err(restore_error) => error.context(format!(
+        Err(restore_error) => discard_failed_marker_replacement(error).context(format!(
             "failed to record the active ROCm runtime, and restoring the previous state failed \
              too ({restore_error:#}); the ROCm CLI config and the active runtime marker may now \
              disagree. Run `rocm runtimes list` to see both, then re-run `rocm runtimes activate \
              <runtime_key>` for the runtime you want to write them again"
         )),
+    }
+}
+
+/// Drop the marker a failed activation left behind, and the advice to use it.
+///
+/// On Windows a marker publish can fail after taking the old marker away, and
+/// the shared writer then keeps the new marker in its temp file and advises
+/// renaming it into place (`rocm_core::atomic_write::KeptReplacement`). The
+/// activation is being rolled back, so that file holds the marker of an
+/// activation that failed, and renaming it would install that marker over
+/// whatever the rollback restored. So the file is removed, and the error is
+/// rebuilt without the advice. If the file cannot be removed, the error names
+/// it and says to delete it instead.
+fn discard_failed_marker_replacement(error: anyhow::Error) -> anyhow::Error {
+    let Some(kept) = error.downcast_ref::<rocm_core::atomic_write::KeptReplacement>() else {
+        return error;
+    };
+    let failure = format!(
+        "failed to write active runtime marker {}: {}",
+        kept.destination().display(),
+        kept.cause()
+    );
+    match fs::remove_file(kept.kept()) {
+        Ok(()) => anyhow::anyhow!(failure),
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!(failure)
+        }
+        Err(remove_error) => anyhow::anyhow!(
+            "{failure}; {} holds the marker of the activation that failed and could not be \
+             removed ({remove_error}): delete it, do not rename it into place",
+            kept.kept().display()
+        ),
     }
 }
 
@@ -844,13 +876,13 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
 /// Two `rocm` processes can activate a runtime against the same data
 /// directory at once (two terminals, a script), so the write goes through the
 /// shared atomic writer: each writer stages into its own exclusively created
-/// temp file, and the marker is replaced rather than removed first, so a
-/// reader always finds a complete marker. On Windows the replace goes through
-/// `ReplaceFileW`, and two replacements in flight at once there are not
-/// tested; a `ReplaceFileW` that fails part-way can leave the marker missing,
-/// which the writer repairs with a plain rename where it can (see
-/// `rocm_core::atomic_write`). It does not order the two activations: the last one to publish
-/// wins, as before.
+/// temp file, and the marker is replaced rather than removed first. On Unix,
+/// and on Windows whenever `ReplaceFileW` succeeds, a reader therefore always
+/// finds a complete marker. A `ReplaceFileW` that fails part-way is the
+/// exception: it can leave the marker missing, which the writer repairs with a
+/// plain rename when that rename succeeds (see `rocm_core::atomic_write`); two
+/// replacements in flight at once on Windows are not tested. It does not order
+/// the two activations: the last one to publish wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
     // The shared helper rather than a local temp-file-and-rename: it is the same
@@ -864,8 +896,10 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // takes its temp file with it, so a retried activation cannot strand one in
     // the folder `rocm runtimes` reads. The one exception is a Windows publish
     // that took the old marker away and could not put the new one in place:
-    // the temp file is then the only copy, so it is kept and the error names it. It also creates the `runtimes` folder
-    // when it is missing.
+    // the temp file is then the only copy, so it is kept and the error names
+    // it; a failed activation removes it again once the restore has put the
+    // previous marker back (`discard_failed_marker_replacement`). It also
+    // creates the `runtimes` folder when it is missing.
     let bytes =
         serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
     rocm_core::atomic_write::write_file_atomically(&path, &bytes)
@@ -2229,6 +2263,198 @@ pub(crate) mod tests {
         );
         assert_eq!(persisted.active_runtime_key, None);
         assert_eq!(persisted.default_runtime_id, None);
+        Ok(())
+    }
+
+    /// The Windows partial-replace failure during activation: the marker publish
+    /// took the old marker away and kept the new one in its temp file. Once the
+    /// restore has put the previous marker back, the kept file holds the failed
+    /// activation's marker, so it is removed, and the error no longer tells the
+    /// user to rename it into place. Driven through the shared writer's publish
+    /// seam, so it runs on every platform.
+    #[test]
+    fn a_restored_activation_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+
+        let marker_path = active_runtime_marker_path(&paths);
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(
+            !marker_temp_file_names(&paths)?.is_empty(),
+            "the shared writer keeps the new marker when the old one is gone"
+        );
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(&marker_path)?;
+        let leftovers = marker_temp_file_names(&paths)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(restored_marker, previous_marker);
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        assert!(
+            leftovers.is_empty(),
+            "the failed activation's marker was left beside the restored one: {leftovers:?}"
+        );
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// Produce the error the shared writer returns when a marker publish took
+    /// the old marker away and kept the new one, through its publish seam.
+    /// `prepare_kept` runs on the kept temp file before the error is returned.
+    fn partial_replace_marker_error(
+        paths: &AppPaths,
+        prepare_kept: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> anyhow::Error {
+        let marker_path = active_runtime_marker_path(paths);
+        rocm_core::atomic_write::write_file_atomically_with_publish(
+            &marker_path,
+            b"{\"runtime_key\":\"new\"}",
+            |attempt| std::ffi::OsString::from(format!("partial-{attempt}")),
+            || {},
+            |tmp, path| {
+                fs::remove_file(path)?;
+                prepare_kept(tmp)?;
+                Err(rocm_core::atomic_write::destination_removed_error(
+                    std::io::Error::from_raw_os_error(1176),
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                ))
+            },
+        )
+        .expect_err("the simulated partial replace fails the write")
+        .context(format!(
+            "failed to write active runtime marker {}",
+            marker_path.display()
+        ))
+    }
+
+    /// When the kept marker cannot be removed, the error names it and says to
+    /// delete it, and nothing in it still says to rename it into place. The
+    /// kept path is made a non-empty directory, which `remove_file` refuses on
+    /// every platform.
+    #[test]
+    fn a_kept_marker_that_cannot_be_removed_is_named_with_delete_advice_only() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-stuck");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        let write_error = partial_replace_marker_error(&paths, |tmp| {
+            fs::remove_file(tmp)?;
+            fs::create_dir(tmp)?;
+            fs::write(tmp.join("occupied.txt"), "stuck")
+        });
+        let kept = marker_temp_file_names(&paths)?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(active_runtime_marker_path(&paths))?;
+        let still_there = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(still_there, kept, "the stuck file is left where it was");
+        assert_eq!(restored_marker, previous_marker);
+        assert!(
+            rendered.contains(&kept[0]),
+            "the stuck file is named:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("delete it, do not rename it"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A kept marker that is already gone by the time the rollback looks for it
+    /// is as good as removed: the error neither names it nor tells the user to
+    /// delete or rename it.
+    #[test]
+    fn a_kept_marker_already_gone_is_treated_as_removed() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-gone");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        let kept = marker_temp_file_names(&paths)?;
+        let runtimes_dir = active_runtime_marker_path(&paths)
+            .parent()
+            .context("active runtime marker path has no parent directory")?
+            .to_path_buf();
+        for name in &kept {
+            fs::remove_file(runtimes_dir.join(name))?;
+        }
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&kept[0]), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(!rendered.contains("delete it"), "{rendered}");
+        Ok(())
+    }
+
+    /// When the rollback itself fails as well, the kept marker is still the
+    /// failed activation's, so it goes too, and the error keeps the rollback's
+    /// own recovery advice without the advice to rename it. The config path is
+    /// made a non-empty directory so the restore's config save fails.
+    #[test]
+    fn a_failed_rollback_still_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-double-fault");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(!marker_temp_file_names(&paths)?.is_empty());
+        let config_path = paths.config_path();
+        let _ = fs::remove_file(&config_path);
+        fs::create_dir_all(&config_path)?;
+        fs::write(config_path.join("occupied.txt"), "not a config")?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let leftovers = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("restoring the previous state failed too"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rocm runtimes list"), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         Ok(())
     }
 
