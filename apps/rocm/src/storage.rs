@@ -14,7 +14,7 @@
 //! removal delegates to [`crate::runtimes_cmd::uninstall_runtime`] per selected key so
 //! config/marker cleanup stays in one place, and the guard that decides whether
 //! a folder may be touched at all is the existing
-//! [`crate::should_remove_runtime_install_root`]. What lives here is only the
+//! [`crate::runtime_uninstall::should_remove_runtime_install_root`]. What lives here is only the
 //! *selection* policy — which is exactly the part that needs to be conservative,
 //! because prune acts on a set the user never enumerated.
 
