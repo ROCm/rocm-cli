@@ -56,7 +56,6 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
-use crate::service_control::run_internal_sandbox_tool;
 use crate::service_hints;
 #[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
@@ -64,7 +63,7 @@ use crate::services_text::{
     render_service_action_result, render_service_action_result_with_helper_note,
     service_stop_unconfirmed,
 };
-use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
+use crate::{device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -1169,6 +1168,11 @@ enum AttachOutcome {
 /// detached managed child (the same child the background path spawns) and stream
 /// its log in this terminal. Unlike the old in-process foreground, the server
 /// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
+///
+/// `stop_service` is how Ctrl-C stops the server: the caller passes the managed
+/// stop, so this module does not import the stop path, which itself imports this
+/// module's spawn helpers. It returns the same `stop_server` answer
+/// [`finish_attached_stop`] reads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_attached_service(
     engine: &str,
@@ -1184,6 +1188,7 @@ pub(crate) fn run_attached_service(
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
+    stop_service: impl FnOnce(&AppPaths, &str) -> Result<serde_json::Value>,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -1283,12 +1288,7 @@ pub(crate) fn run_attached_service(
         }
         AttachOutcome::Stop => {
             println!("stopping server...");
-            let stop = run_internal_sandbox_tool(
-                &paths,
-                SandboxToolArg::StopServer,
-                Some(service_id.clone()),
-                true,
-            );
+            let stop = stop_service(&paths, &service_id);
             finish_attached_stop(
                 &paths,
                 &service_id,
