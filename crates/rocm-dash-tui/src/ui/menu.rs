@@ -437,6 +437,8 @@ mod tests {
             .collect();
         let listed: Vec<&str> = MENU_ITEMS.iter().map(|i| i.label()).collect();
         assert_eq!(drawn, listed);
+        // `label()` is on both sides above, so pin the wording itself too.
+        assert_eq!(listed, ["Options", "Help", "Quit"]);
     }
 
     #[test]
