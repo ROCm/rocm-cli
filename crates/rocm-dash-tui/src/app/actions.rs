@@ -312,10 +312,10 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 // `open_quit_confirm` closes the Esc menu itself when a
                 // prompt opens, so a decline doesn't strand the user back in
                 // it (same as every other row here already does on success).
-                // A selection past the list (never set by `OpenMenu` or
-                // `MenuMove`, which keep it in range) still quits, as it did
-                // when this arm was the index fallback.
-                Some(MenuItem::Quit) | None => return request_quit(state),
+                Some(MenuItem::Quit) => return request_quit(state),
+                // Never set by `OpenMenu` or `MenuMove`, which keep the
+                // selection in range; do nothing rather than quit.
+                None => {}
             },
             Modal::Palette => {
                 if let Some((_, tab)) = PALETTE_DESTS.get(state.palette_sel) {
@@ -1507,14 +1507,15 @@ mod tests {
     }
 
     #[test]
-    fn esc_menu_selection_past_the_last_row_still_quits() {
+    fn esc_menu_selection_past_the_last_row_does_nothing() {
         // Nothing sets `menu_sel` out of range (`OpenMenu` resets it and
-        // `MenuMove` wraps it), but the activation match has always treated
-        // every index after Help as Quit; the list lookup keeps that.
+        // `MenuMove` wraps it). If it ever were, activating must not take the
+        // destructive Quit path: no quit request, and the menu stays open.
         let mut s = st();
         s.modal = Modal::Menu;
         s.menu_sel = MENU_ITEMS.len() + 4;
-        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.modal, Modal::Menu);
     }
 
     #[test]
