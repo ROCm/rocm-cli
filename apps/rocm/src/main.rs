@@ -61,6 +61,7 @@ mod service_records;
 mod services_cmd;
 mod services_text;
 mod setup_cmd;
+mod shell_quote;
 mod storage;
 mod system_packages;
 #[cfg(test)]
