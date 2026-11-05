@@ -361,15 +361,17 @@ fn install_wheel_runtime(
             }
         }
     };
-    progress_line(format!(
-        "Checking Python for the ROCm install; if needed, {} Python {}.",
-        if dry_run {
-            "a real install would prepare"
-        } else {
-            "ROCm CLI will prepare"
-        },
-        managed_python_version(python_requirement)
-    ));
+    // A preview promises nothing here: whether a Python would be prepared, and
+    // which, is only known once the search below has run (a version override can
+    // make the answer a refusal), and is reported then.
+    progress_line(if dry_run {
+        "Checking Python for the ROCm install.".to_owned()
+    } else {
+        format!(
+            "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
+            managed_python_version(python_requirement)
+        )
+    });
     // A preview must not prepare the Python it reports: resolving one can
     // download a managed `uv` and Python and save the result in the
     // configuration. It asks what a real install would do instead and prints
@@ -388,9 +390,9 @@ fn install_wheel_runtime(
             ),
             _ => format!("Using Python from {}.", launcher.executable.display()),
         },
-        PlannedPython::WouldPrepareManaged { version, .. } => format!(
-            "No usable Python found; a real install would prepare Python {version}. This preview does not."
-        ),
+        PlannedPython::WouldPrepareManaged { .. } => {
+            python.skipped_preparation_line().unwrap_or_default()
+        }
     });
     let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(

@@ -1178,6 +1178,23 @@ async fn preview_refused_for_python_version(world: &mut E2eWorld) {
             "expected {needle:?} in the refusal:\n{stderr}"
         );
     }
+    // The progress lines must not promise what the refusal then takes back: the
+    // output holds no "would prepare Python 3.13" and no plan.
+    let out = stdout(world);
+    assert!(
+        out.contains("Checking Python for the ROCm install.\n"),
+        "expected the neutral Python check line:\n{out}"
+    );
+    for promise in [
+        "would prepare Python 3.13",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
     assert_no_python_prepared(world);
 }
 

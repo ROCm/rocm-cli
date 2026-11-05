@@ -505,9 +505,11 @@ fn plan_python_launcher_in(
             // the wrong tag and refuses (see `ensure_managed_python`), so the
             // preview refuses by the same rule rather than announce a plan the
             // install would not carry out. A version whose tag cannot be read
-            // off its name is announced as is: only installing it would tell.
-            if let Some(tag) = python_tag_for_version(&version) {
-                ensure_python_tag_matches(&tag, requirement).with_context(|| {
+            // off its name is announced as unchecked: only installing it would
+            // tell.
+            let tag = python_tag_for_version(&version);
+            if let Some(tag) = tag.as_deref() {
+                ensure_python_tag_matches(tag, requirement).with_context(|| {
                     format!(
                         "a real install would prepare managed Python {version}, whose wheel tag it would then refuse"
                     )
@@ -516,6 +518,7 @@ fn plan_python_launcher_in(
             PlannedPython::WouldPrepareManaged {
                 version,
                 requirement,
+                tag_checked: tag.is_some(),
             }
         }
     })
@@ -527,10 +530,13 @@ pub(super) enum PlannedPython {
     /// An interpreter that is usable as it stands.
     Ready(PythonLauncher),
     /// No interpreter is usable. A real install would prepare managed Python
-    /// `version`; this preview has not.
+    /// `version`; this preview has not. `tag_checked` is whether the wheel tag
+    /// `version` reports could be read off its name and matched against the
+    /// requirement; when it could not, only installing it would say.
     WouldPrepareManaged {
         version: String,
         requirement: PythonRequirement,
+        tag_checked: bool,
     },
 }
 
@@ -569,9 +575,47 @@ impl PlannedPython {
     pub(super) fn note(&self) -> Option<String> {
         match self {
             Self::Ready(_) => None,
-            Self::WouldPrepareManaged { version, .. } => Some(format!(
-                "no usable Python was found; a real install would use uv to install managed Python {version} and save its path in the configuration, which this preview did not do"
-            )),
+            Self::WouldPrepareManaged {
+                version,
+                requirement,
+                tag_checked,
+            } => {
+                let unchecked = if *tag_checked {
+                    String::new()
+                } else {
+                    format!(
+                        " (its wheel tag cannot be checked until it is installed; {} is required)",
+                        requirement.tag
+                    )
+                };
+                Some(format!(
+                    "no usable Python was found; a real install would use uv to install managed Python {version}{unchecked} and save its path in the configuration, which this preview did not do"
+                ))
+            }
+        }
+    }
+
+    /// The progress line a preview prints when it reaches a host with no usable
+    /// Python, in place of the interpreter line. Built from the same fields as
+    /// [`Self::note`], so the two cannot differ about the version or whether its
+    /// tag was checked.
+    pub(super) fn skipped_preparation_line(&self) -> Option<String> {
+        match self {
+            Self::Ready(_) => None,
+            Self::WouldPrepareManaged {
+                version,
+                requirement,
+                tag_checked,
+            } => Some(if *tag_checked {
+                format!(
+                    "No usable Python found; a real install would prepare Python {version}. This preview does not."
+                )
+            } else {
+                format!(
+                    "No usable Python found; a real install would prepare Python {version}, whose wheel tag cannot be checked until it is installed ({} is required). This preview does not.",
+                    requirement.tag
+                )
+            }),
         }
     }
 
@@ -768,13 +812,30 @@ fn ensure_python_tag_matches(python_tag: &str, requirement: PythonRequirement) -
     Ok(())
 }
 
-/// The wheel tag a managed Python requested as `version` reports (`3.13` and
-/// `3.13.1` both give `cp313`), or `None` when `version` is not a plain
-/// `major.minor[.patch]` and the tag cannot be told without installing it.
+/// The wheel tag a managed Python requested as `version` reports, or `None`
+/// when it cannot be told without installing it.
+///
+/// `uv` is what reads `version` (it is passed through to `uv python install`),
+/// and this repo has no parser of its own to share, so this reads the spellings
+/// `uv` accepts for a CPython release that name a major and a minor: `3.13`,
+/// `3.13.1`, `3.13t` (free-threaded, which still reports `cp313`), and any of
+/// those after `cpython-` or `cpython@`. Anything else (another implementation,
+/// a range, a wildcard, a pre-release spelled on the minor) yields `None`.
 fn python_tag_for_version(version: &str) -> Option<String> {
-    let mut parts = version.trim().split('.');
+    let version = version.trim();
+    let version = ["cpython-", "cpython@"]
+        .iter()
+        .find_map(|prefix| version.strip_prefix(prefix))
+        .unwrap_or(version);
+    let mut parts = version.split('.');
     let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?;
+    // Only a free-threaded marker may follow the minor's digits.
+    let minor = minor
+        .strip_suffix('t')
+        .unwrap_or(minor)
+        .parse::<u32>()
+        .ok()?;
     Some(format!("cp{major}{minor}"))
 }
 
@@ -1407,12 +1468,14 @@ exit 1
         let PlannedPython::WouldPrepareManaged {
             ref version,
             requirement,
+            tag_checked,
         } = planned
         else {
             panic!("a host with no Python must be planned as needing one, got {planned:?}");
         };
         assert_eq!(version, DEFAULT_MANAGED_PYTHON_VERSION);
         assert_eq!(requirement, python_requirement(SourceLayout::Canonical));
+        assert!(tag_checked, "the default version's tag is readable");
         let note = planned
             .note()
             .expect("a preview that skipped a step says so");
@@ -1602,6 +1665,80 @@ exit 1
         Ok(())
     }
 
+    /// The same refusal for every spelling `uv` accepts for that release: a
+    /// free-threaded `3.13t` and the `cpython-` and `cpython@` forms report
+    /// `cp313` once installed just as `3.13` does, so a preview that did not read
+    /// them would promise a plan the install refuses. A spelling whose tag
+    /// cannot be read is announced as unchecked, not as a promise.
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let host = PythonHost::new("python-dry-run-version-spellings")?;
+        for spelling in ["3.13t", "cpython-3.13", "cpython@3.13"] {
+            let _version =
+                RestoredEnv::set(&[("ROCM_CLI_MANAGED_PYTHON_VERSION", Some(Path::new(spelling)))]);
+            let error = format!("{:#}", host.python_for_install(true).unwrap_err());
+            assert!(
+                error.contains(&format!("would prepare managed Python {spelling}"))
+                    && error.contains("Python wheel tag cp313 is not supported")
+                    && error.contains("cp312 is required"),
+                "{spelling}: {error}"
+            );
+        }
+        for accepted in ["cpython-3.12", "cpython@3.12.4"] {
+            let _version =
+                RestoredEnv::set(&[("ROCM_CLI_MANAGED_PYTHON_VERSION", Some(Path::new(accepted)))]);
+            let planned = host.python_for_install(true)?;
+            assert!(
+                matches!(
+                    &planned,
+                    PlannedPython::WouldPrepareManaged {
+                        tag_checked: true,
+                        ..
+                    }
+                ),
+                "{accepted}: {planned:?}"
+            );
+        }
+
+        let _unreadable = RestoredEnv::set(&[(
+            "ROCM_CLI_MANAGED_PYTHON_VERSION",
+            Some(Path::new("pypy@3.10")),
+        )]);
+        let planned = host.python_for_install(true)?;
+        assert!(
+            matches!(
+                &planned,
+                PlannedPython::WouldPrepareManaged {
+                    tag_checked: false,
+                    ..
+                }
+            ),
+            "{planned:?}"
+        );
+        let note = planned
+            .note()
+            .expect("a preview that skipped a step says so");
+        assert!(
+            note.contains("managed Python pypy@3.10 (its wheel tag cannot be checked until it is installed; cp312 is required)")
+                && note.ends_with("which this preview did not do"),
+            "{note}"
+        );
+        let line = planned
+            .skipped_preparation_line()
+            .expect("a preview that skipped a step says so");
+        assert_eq!(
+            line,
+            "No usable Python found; a real install would prepare Python pypy@3.10, whose wheel tag cannot be checked until it is installed (cp312 is required). This preview does not."
+        );
+        assert!(!host.uv_was_run());
+        assert_eq!(snapshot(&host.paths), Vec::<PathBuf>::new());
+        Ok(())
+    }
+
     /// The version-to-tag reading the preview's refusal rests on, and that it is
     /// the same rule `python_launcher_install_ready` applies (same message).
     #[test]
@@ -1609,8 +1746,33 @@ exit 1
         assert_eq!(python_tag_for_version("3.12").as_deref(), Some("cp312"));
         assert_eq!(python_tag_for_version(" 3.14.1 ").as_deref(), Some("cp314"));
         assert_eq!(python_tag_for_version("3.9").as_deref(), Some("cp39"));
-        // Not a plain major.minor: only installing it would say what it reports.
-        for unreadable in ["", "3", "3.x", "cpython-3.13", "3.13t", "latest"] {
+        // Spellings `uv` accepts for the same CPython release read the same.
+        assert_eq!(python_tag_for_version("3.13t").as_deref(), Some("cp313"));
+        assert_eq!(python_tag_for_version("3.13.1").as_deref(), Some("cp313"));
+        assert_eq!(python_tag_for_version("3.13.*").as_deref(), Some("cp313"));
+        assert_eq!(
+            python_tag_for_version("cpython-3.13").as_deref(),
+            Some("cp313")
+        );
+        assert_eq!(
+            python_tag_for_version("cpython@3.13").as_deref(),
+            Some("cp313")
+        );
+        assert_eq!(
+            python_tag_for_version("cpython-3.12.4").as_deref(),
+            Some("cp312")
+        );
+        // Anything else: only installing it would say what it reports.
+        for unreadable in [
+            "",
+            "3",
+            "3.x",
+            "latest",
+            "pypy@3.10",
+            "3.13rc1",
+            ">=3.12",
+            "cpython-",
+        ] {
             assert_eq!(python_tag_for_version(unreadable), None, "{unreadable:?}");
         }
 
@@ -1641,6 +1803,7 @@ exit 1
             let planned = PlannedPython::WouldPrepareManaged {
                 version: requirement.version.to_owned(),
                 requirement,
+                tag_checked: true,
             };
 
             let compatibility = planned.wheel_compatibility()?;
