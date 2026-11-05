@@ -41,7 +41,7 @@
 //! `main.rs` calls into it for `GpuVramUsage`, `gpu_vram_usage`,
 //! `parse_gpu_indices_arg` (the `dispatch()` call site above),
 //! `serve_gpu_low_memory_warning`, and `vram_capacity_is_meaningful`;
-//! `services_text.rs` calls into it for `parse_device_policy` (from
+//! `service_control.rs` calls into it for `parse_device_policy` (from
 //! `restart_child_argv`); `serve_cmd.rs` calls into it for
 //! `detect_gpu_count`, `gpu_vram_usage`, `parse_device_policy`,
 //! `parse_gpu_selection`, `select_gpu_indices_under_launch_lock`,

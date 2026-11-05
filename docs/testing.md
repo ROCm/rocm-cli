@@ -1382,7 +1382,7 @@ On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
 through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
 and its neighbours), not by killing a real tree. The callers' own tests check
 that each reaches the routine and reports what it returns
-(`cargo test -p rocm --bin rocm services_text::tests::a_stop_` and
+(`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
 `cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
 that no private copy of the routine or its constant has come back. No scenario
 kills a real process tree on Windows: `service-stop-01` plants PID 0 and
@@ -1633,7 +1633,7 @@ also must exit non-zero when their DLL is missing, fix-15 in
 `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
 that only `rocm diagnose` prints
 (`the_igpu_verify_pins_the_variable_it_names` in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
 (`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
@@ -1660,7 +1660,7 @@ in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
 the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
 Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
 GPU or not, and are skipped on Windows. The arms are also checked against the
-catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 (`the_override_fix_verify_matches_the_catalog_copy`,
 `the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
 `the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
@@ -2708,8 +2708,10 @@ On a machine whose runtime is older than 14.40, `diagnose` reports
 and runs nothing: the update needs the Windows administrator prompt. After the
 update, the plan's verify command prints the new version.
 
-The version comparison and the symptom keywords are covered by unit tests in
-`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+The version comparison is covered by unit tests in
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs), and the
+symptom keywords by `outdated_runtime_symptom_keywords_score_honestly` in
+[scoring.rs](../crates/rocm-core/src/diagnose/scoring.rs). No end-to-end scenario drives this check, because the e2e suite
 cannot give a Linux host a Windows runtime: the check is gated to Windows. The
 catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
 scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
@@ -2758,7 +2760,7 @@ just because no HIP SDK is installed — has no Linux end-to-end coverage.
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs)
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
 `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
 and their neighbours) and by the Windows manual check in

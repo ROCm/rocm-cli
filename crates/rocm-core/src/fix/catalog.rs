@@ -7,16 +7,16 @@
 //! `FixRecipe`, the per-platform class table each recipe carries (`Platform`
 //! and the `PRINT_ON_*`/`AUTO_ON_*` shorthands), `RECIPES` itself, the lookups
 //! by fix-id (`find_recipe`, `is_catalog_id`, `class_on`, `needs_on`), and the
-//! test-only oracles that `diagnose.rs` and the e2e crate use to hold their
-//! own copies of a recipe to this one. `RECIPES` together with `diagnose.rs`'s
-//! checkers is the authoritative failure catalog; rendering lives in
+//! test-only oracles that the `diagnose` module and the e2e crate use to hold their
+//! own copies of a recipe to this one. `RECIPES` together with the `diagnose`
+//! module's checkers is the authoritative failure catalog; rendering lives in
 //! `render.rs`, the published JSON contract in `manifest.rs`.
 
 use super::consent::current_os;
 use super::options::{FixClass, FixOptions};
 use super::runners;
 
-/// Shared verbatim by this recipe's own note and `diagnose.rs`'s
+/// Shared verbatim by this recipe's own note and `diagnose/engine.rs`'s
 /// `check_18_comgr_conflict` evidence, which states the same claim in its own
 /// words at the point the real paths are known. A second statement of one
 /// claim is a second thing to keep correct, and the two had already drifted
@@ -461,7 +461,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        // See the matching comment on this fix's `verify` in diagnose.rs:
+        // See the matching comment on this fix's `verify` in diagnose/linux.rs:
         // must query the targeted amdgpu-dkms package's installed status
         // (not a bare rocm/amdgpu name grep), confirm dkms reports the
         // module built, and check rocminfo's own exit code directly.
@@ -1277,13 +1277,13 @@ fn command_argument(lowered: &str) -> Option<(usize, char, &str)> {
 /// `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`),
 /// `the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
 /// and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-9's Windows
-/// line, which only `diagnose.rs` prints, by
+/// line, which only the `diagnose` module prints, by
 /// `the_igpu_verify_pins_the_variable_it_names`.
-/// Some lines `diagnose.rs` prints are PowerShell-only by design, and are
+/// Some lines the `diagnose` module prints are PowerShell-only by design, and are
 /// checked as such where they are built.
 ///
 /// Shared by the checks on the `RECIPES` catalog here and on the `Fix` values
-/// that `diagnose.rs` builds. A copy of this rule lives in the e2e crate
+/// that the `diagnose` module builds. A copy of this rule lives in the e2e crate
 /// (`powershell_text_rule::refusal`), which cannot depend on rocm-core;
 /// `the_powershell_text_rule_agrees_with_the_shared_case_table` and the test
 /// next to that copy both read `tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt`,
@@ -1702,7 +1702,7 @@ mod tests {
     /// `fails_in_windows_powershell` run the verify lines of fix-2, fix-13,
     /// fix-14, fix-15, fix-21 and fix-22 in a shell; the other catalog lines
     /// are not run. The same
-    /// rule is applied to the `Fix` values that `diagnose.rs` builds, in
+    /// rule is applied to the `Fix` values that the `diagnose` module builds, in
     /// `windows_diagnosis_remediation_passes_the_powershell_text_rule`.
     #[test]
     fn windows_recipes_pass_the_powershell_text_rule() {
@@ -1932,7 +1932,7 @@ mod tests {
     /// name the file: `Get-Item` reports a missing path as a non-terminating
     /// error, so without `-ErrorAction Stop` the line exits 0 with no output
     /// (the case `the_msvc_verify_exits_nonzero_when_a_dll_is_missing` covers
-    /// for fix-15). `diagnose.rs` holds its copy of the line equal to this one.
+    /// for fix-15). `diagnose/windows.rs` holds its copy of the line equal to this one.
     /// Only compiled on Windows.
     #[cfg(windows)]
     #[test]
@@ -2345,10 +2345,10 @@ mod tests {
     fn needs_reboot_true_fix_ids_match_the_known_set() {
         // assert_needs_reboot_matches_the_catalog only ever runs for
         // fix-5-amdgpu-load, so every other fix-id's hardcoded needs_reboot
-        // literals in diagnose.rs have no guard against drifting from the
-        // catalog. This doesn't reach into diagnose.rs, but it does catch an
+        // literals in the `diagnose` modules have no guard against drifting from the
+        // catalog. This doesn't reach into the `diagnose` modules, but it does catch an
         // accidental catalog edit and pins the expected set by name so a
-        // deliberate catalog change forces a look at diagnose.rs's matching
+        // deliberate catalog change forces a look at the `diagnose` modules' matching
         // literals too.
         let expected: std::collections::BTreeSet<&str> = [
             "fix-3-rocm-kernel",
@@ -2367,7 +2367,7 @@ mod tests {
             .collect();
         assert_eq!(
             actual, expected,
-            "the catalog's needs_reboot:true set has changed -- update diagnose.rs's \
+            "the catalog's needs_reboot:true set has changed -- update the diagnose modules' \
              matching literals and this test's expected set together"
         );
     }
@@ -2389,9 +2389,9 @@ mod tests {
     #[test]
     fn fix_7_apt_commands_match_the_diagnose_copy_verbatim() {
         // Same drift guard as fix_12_apt_commands_match_the_diagnose_copy_verbatim:
-        // diagnose.rs builds its own per-family command list for fix-7 rather than
+        // diagnose/linux.rs builds its own per-family command list for fix-7 rather than
         // reusing this recipe, so drive diagnose() itself instead of comparing
-        // against a hardcoded literal that can't detect diagnose.rs drifting.
+        // against a hardcoded literal that can't detect diagnose/linux.rs drifting.
         let e = crate::examine::Examination {
             os_family: "linux".to_owned(),
             distro_id: "ubuntu".to_owned(),
@@ -2428,11 +2428,11 @@ mod tests {
             .expect("recipe must have a commented apt list line");
         assert_eq!(
             recipe_apt_list_cmd, diagnose_apt_list_cmd,
-            "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
+            "this recipe's apt list command must match what diagnose/linux.rs's apt family actually emits for fix-7-stale-repos"
         );
 
-        // `verify` must also track diagnose.rs's per-family text, not just
-        // `commands`: diagnose.rs varies `verify` by family too, so compare
+        // `verify` must also track diagnose/linux.rs's per-family text, not just
+        // `commands`: diagnose/linux.rs varies `verify` by family too, so compare
         // each family's line against what diagnose() actually emits for it.
         // The dnf/zypper `ls` lines get the same treatment as apt above --
         // only asserting the apt one left those two families' list commands
@@ -2475,7 +2475,7 @@ mod tests {
                 );
             assert_eq!(
                 recipe_list_cmd, diagnose_list_cmd,
-                "this recipe's {marker} list command must match what diagnose.rs emits for fix-7-stale-repos"
+                "this recipe's {marker} list command must match what diagnose/linux.rs emits for fix-7-stale-repos"
             );
 
             let recipe_verify_line = recipe
@@ -2488,7 +2488,7 @@ mod tests {
                 );
             assert_eq!(
                 recipe_verify_line, diagnose_verify,
-                "this recipe's {marker} verify line must match what diagnose.rs emits for fix-7-stale-repos"
+                "this recipe's {marker} verify line must match what diagnose/linux.rs emits for fix-7-stale-repos"
             );
         }
     }
@@ -2536,9 +2536,9 @@ mod tests {
     #[test]
     fn fix_3_verify_matches_the_diagnose_copy_verbatim() {
         // No drift guard previously existed between this recipe and
-        // diagnose.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
+        // diagnose/linux.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
         // fix-7/fix-12's `commands`, fix-3's `commands` legitimately differ --
-        // diagnose.rs injects the host's live kernel/distro/rocm values into a
+        // diagnose/linux.rs injects the host's live kernel/distro/rocm values into a
         // comment this host-unaware recipe can't know -- but `verify` has no
         // such excuse to diverge).
         let e = crate::examine::Examination {
@@ -2561,7 +2561,7 @@ mod tests {
             .expect("fix-3-rocm-kernel recipe must exist");
         assert_eq!(
             recipe.verify, diagnose_verify,
-            "this recipe's verify step must match what diagnose.rs emits for fix-3-rocm-kernel"
+            "this recipe's verify step must match what diagnose/linux.rs emits for fix-3-rocm-kernel"
         );
     }
 
@@ -2572,7 +2572,7 @@ mod tests {
         // family, which this catalog entry cannot do -- it prints guidance for
         // every family at once). Drive `diagnose()` itself so a drift between
         // the two copies actually fails this test, rather than comparing
-        // against a hardcoded literal that can't detect diagnose.rs changing
+        // against a hardcoded literal that can't detect diagnose/linux.rs changing
         // out from under it.
         let e = crate::examine::Examination {
             os_family: "linux".to_owned(),
@@ -2614,7 +2614,7 @@ mod tests {
             .collect();
         assert_eq!(
             apt_commands_without_trailing_comment, diagnose_apt_commands,
-            "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
+            "this recipe's apt lines must match what diagnose/linux.rs's apt family actually emits for fix-12-installer"
         );
     }
 }
