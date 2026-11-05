@@ -69,7 +69,10 @@ pub fn reported_engine(serve_stdout: &str) -> Option<&str> {
 ///
 /// Accepts `--engine X` and `--engine=X`. `None` when no engine was requested:
 /// the CLI then picks a default, which only the printed plan reveals (see
-/// [`reported_engine`]).
+/// [`reported_engine`]). A value that starts with `--` is another flag, not an
+/// engine (`serve m --engine --managed`), so it counts as absent too: reporting
+/// `--managed` as the engine would skip the backend inventory without the
+/// [`ENGINE_UNKNOWN_EVIDENCE`] line that makes the skip visible.
 #[must_use]
 pub fn engine_from_serve_args<'a>(args: &[&'a str]) -> Option<&'a str> {
     let mut args = args.iter().copied();
@@ -81,7 +84,7 @@ pub fn engine_from_serve_args<'a>(args: &[&'a str]) -> Option<&'a str> {
         } else {
             continue;
         };
-        return value.filter(|engine| !engine.is_empty());
+        return value.filter(|engine| !engine.is_empty() && !engine.starts_with("--"));
     }
     None
 }
@@ -337,6 +340,8 @@ managed service launched
             &["serve", "m", "--engine"],
             &["serve", "m", "--engine="],
             &["serve", "m", "--engine", ""],
+            &["serve", "m", "--engine", "--managed"],
+            &["serve", "m", "--engine=--managed"],
             &["serve", "--engine-version=1"],
         ] {
             assert_eq!(engine_from_serve_args(args), None, "{args:?}");
