@@ -25,8 +25,8 @@ protect yet" below.
 
 This page is the **contract** between this repository and the queue side: what
 a lane must do to be reported, and how to read the report. The queue side —
-how runs are scheduled and executed, and the `queue-publish` command the
-workflow calls — is maintained privately with the queue, not in this
+how runs are started and executed, and the `queue-publish` command the
+workflows call — is maintained privately with the queue, not in this
 repository.
 
 ## Starting a run
@@ -35,37 +35,33 @@ Dispatch `queue-run.yml` with the branch to test (`main` by default); it also
 runs every night at 02:17 UTC on `main`. The job asks the queue side for a run
 of that branch, named for the job's run id and attempt, so re-running the job
 starts a new run. It waits for every lane to finish, up to about five hours,
-then publishes the run as below. Only one run goes at a time: a second
+then publishes the run as below. The job log starts with the run's inputs
+(below). Only one run goes at a time: a second
 dispatch waits for the first, and the queue side refuses one while another,
 however started, is unfinished. The branch must exist in this repository;
 otherwise the job fails at once.
 
 ## Publishing a finished run
 
-Dispatch `nightly-queue.yml`. With no input it publishes the newest scheduled
-run, which fails the job while that run is still going or if it never
-finished; while the schedule is off a dispatch with no input fails;
-`request_id` names a specific run, which is also the only way to publish a run
-started by hand. The job log starts with what the run was — scheduled or by
-hand, and the inputs below. It fails, rather than reporting green, when:
+Dispatch `nightly-queue.yml` with a run's `request_id` — the id its
+`queue-run.yml` job printed — to publish that run again, for instance when that
+job was cancelled while the run went on. It never starts a run, and there is
+no default: a run that did not happen cannot be published in its place. It
+fails, rather than reporting green, when:
 
-- no run has finished, or the named one has not
-- with no `request_id`, the newest scheduled run finished more than 30 hours
-  ago, so the nightly has stopped running
+- the named run has not finished, or never existed
 - the run failed, could not start, was cancelled before it finished, or
   discovered no lanes at all
 
-Re-running with a `request_id` publishes that run again; with none, it
-publishes whatever scheduled run is newest at that moment. It never starts a
-run. Each new run removes results older than two weeks, so an older
-`request_id` may no longer be publishable; an uploaded artifact follows this
-repository's own artifact retention.
+Each new run removes results older than two weeks, so an older `request_id`
+may no longer be publishable; an uploaded artifact follows this repository's
+own artifact retention.
 
 ## What a run executes
 
-Runs start on the queue side: on its schedule, which stays off until a lane
-has been seen to run the suite, or on request. A run has six inputs; the queue
-side sets their defaults, and any of them can be overridden for a single run:
+Every run is asked for: by `queue-run.yml`, or by an operator on the queue
+side. A run has six inputs; the queue side sets their defaults, and any of them
+can be overridden for a single run (`queue-run.yml` sets the branch):
 
 - the branch — the branch of this repository to test, `main` by default. The
   run resolves it to a commit once, as it starts, and every lane checks out
@@ -210,9 +206,9 @@ request can do is start a run of a branch already in this repository.
 
 **Only `/out` is published, and a missing run is never green.** Publishing by
 origin is the main control on what reaches public results, with the scan
-behind it. An unfinished run fails the job, and so does a stale one when no
-`request_id` is given, so a nightly that stops running cannot keep reporting
-an old pass, and a run started by hand cannot stand in for it.
+behind it. An unfinished run fails the job, and a job only ever publishes the
+run it started or was given, so a nightly that stops running cannot keep
+reporting an old pass: the missing night shows as a missing scheduled job.
 
 **Nothing public names the queue's infrastructure.** Runner names, labels,
 paths, branches and this page use neutral names, per

@@ -48,7 +48,7 @@ Two separate workflows,
 [`queue-run.yml`](../.github/workflows/queue-run.yml) and
 [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml), run and publish
 GPU lanes on a shared GPU queue, one per GPU model, so no runner holds a GPU
-for the length of a job. It is not a rung yet and gates nothing; see
+for the length of a job. They are not a rung yet and gate nothing; see
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so
