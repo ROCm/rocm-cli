@@ -1156,7 +1156,10 @@ async fn preview_prepared_no_python(world: &mut E2eWorld) {
 
 /// The state half of the claim: the recording `uv` was never run (the evidence
 /// that nothing was prepared), no managed tools folder, no saved configuration,
-/// and, as a backstop only, no tool archive in the scenario's cache.
+/// and, as a backstop only, no tool archive in the scenario's cache. Every
+/// scenario that calls this previews the canonical layout (no ROCm 10 pin), the
+/// only layout whose preview needs no `uv`; a ROCm 10 preview can legitimately
+/// create the managed tools folder to resolve package versions.
 fn assert_no_python_prepared(world: &E2eWorld) {
     let paths = world.app_paths();
     let scenario_root = root(world).to_path_buf();
@@ -1191,6 +1194,50 @@ fn assert_no_python_prepared(world: &E2eWorld) {
         config.display(),
         std::fs::read_to_string(&config).unwrap_or_default()
     );
+}
+
+/// Plants an interpreter on the empty `PATH` folder that cannot serve the
+/// install: `fake-python` answers the wheel-tag probe with `{}`, which is not
+/// the tag the layout needs, so the search finds a Python and rejects it.
+#[given("the only Python on the host's path is not usable")]
+async fn only_unusable_python_on_path(world: &mut E2eWorld) {
+    let python = root(world).join("no-python-on-path").join("python3");
+    crate::install_fixture_binary("fake-python", &python);
+}
+
+#[given("managed Python bootstrap is disabled")]
+async fn managed_python_bootstrap_disabled(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1".into()));
+}
+
+/// The refusal is the whole story: the output states the finding about the
+/// `PATH` Python and the policy refusal, and no line says what a real install
+/// would go on to do, since it would do nothing.
+#[then("the preview is refused because managed Python is disabled, without a promise")]
+async fn preview_refused_for_disabled_bootstrap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("managed Python bootstrap is disabled"),
+        "expected the policy refusal:\n{stderr}"
+    );
+    let out = stdout(world);
+    assert!(
+        out.contains("Python from PATH is not usable for this ROCm install (cp312 is required).\n"),
+        "expected the finding about the PATH Python:\n{out}"
+    );
+    for promise in [
+        "a real install would",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
 }
 
 #[given("the managed Python version is overridden to 3.13")]

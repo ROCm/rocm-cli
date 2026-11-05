@@ -491,6 +491,11 @@ Feature: Runtime configuration
   # preview still got as far as a plan, so the absences are not just a command
   # that stopped early.
   #
+  # The guarantee is the canonical layout's. A preview of a ROCm 10 or newer wheel
+  # resolves its package versions with `uv pip compile` and so can fetch the
+  # managed `uv` (creating the `tools` folder) on a clean host, though it still
+  # prepares no Python; this scenario is not that case and does not claim it.
+  #
   # Linux only: the empty-`PATH` host is built for the Linux search order. The
   # decision itself is unit-tested on Unix hosts against an injected search path
   # (`a_dry_run_with_no_usable_python_prepares_nothing` in
@@ -529,3 +534,27 @@ Feature: Runtime configuration
     When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
     Then the install fails
     And the preview is refused because the install would refuse that Python
+
+  # The sibling of runtime-24 for the policy refusal. A preview must not say what
+  # a real install would do on a path where it would do nothing. Here the host's
+  # only Python cannot serve the install and managed Python is switched off with
+  # `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`, so a real install refuses; the
+  # preview used to print that it would use ROCm CLI's managed Python first. It
+  # now prints the finding about the PATH Python, neutrally, and then the same
+  # refusal as the install, with no line predicting anything. The state is checked
+  # as in runtime-23. Every other combination of PATH Python, saved Python,
+  # bootstrap policy and version override is pinned by the unit test
+  # `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
+  # `apps/rocm/src/therock/python.rs`, which asserts each row's complete output.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23, with `fake-python`
+  # planted on it as the unusable interpreter.
+  @id:runtime-install-preview-refuses-disabled-managed-python @requires-os:linux
+  Scenario: runtime-25 - Previewing an SDK install is refused when managed Python is disabled and the host's Python is unusable
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the only Python on the host's path is not usable
+    And managed Python bootstrap is disabled
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    Then the install fails
+    And the preview is refused because managed Python is disabled, without a promise

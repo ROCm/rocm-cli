@@ -41,7 +41,7 @@ pub(crate) use self::probe::{
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 use self::python::{
-    PlannedPython, ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
+    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
 };
 use self::resolve::{
     AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
@@ -377,24 +377,8 @@ fn install_wheel_runtime(
     // download a managed `uv` and Python and save the result in the
     // configuration. It asks what a real install would do instead and prints
     // that. A real install resolves, and so prepares, exactly as it always did.
+    // It also prints the line naming the interpreter, once the decision is made.
     let python = python_for_install(paths, python_requirement, dry_run)?;
-    progress_line(match &python {
-        PlannedPython::Ready(launcher) => match launcher.source {
-            "path" => format!("Using Python from PATH: {}.", launcher.executable.display()),
-            "env" => format!(
-                "Using Python from ROCM_CLI_PYTHON: {}.",
-                launcher.executable.display()
-            ),
-            "managed" => format!(
-                "Using ROCm CLI's portable Python: {}.",
-                launcher.executable.display()
-            ),
-            _ => format!("Using Python from {}.", launcher.executable.display()),
-        },
-        PlannedPython::WouldPrepareManaged { .. } => {
-            python.skipped_preparation_line().unwrap_or_default()
-        }
-    });
     let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",

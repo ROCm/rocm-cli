@@ -460,16 +460,24 @@ pub(super) fn resolve_python_launcher(
 ///
 /// The single place the install decides between the two, so a dry run cannot
 /// reach [`resolve_python_launcher`]'s preparation by a path of its own.
+///
+/// It also prints the line that says which interpreter was chosen, once the
+/// choice is made. A preview's line is built from the same value the decision
+/// returned ([`PlannedPython::progress_text`]), so a line that says what a real
+/// install would do cannot be printed on a path that ends in a refusal: the
+/// refusal returns before any such line exists.
 pub(super) fn python_for_install(
     paths: &AppPaths,
     requirement: PythonRequirement,
     dry_run: bool,
 ) -> Result<PlannedPython> {
-    if dry_run {
-        plan_python_launcher(paths, requirement)
+    let python = if dry_run {
+        plan_python_launcher(paths, requirement)?
     } else {
-        resolve_python_launcher(paths, requirement).map(PlannedPython::Ready)
-    }
+        PlannedPython::Ready(resolve_python_launcher(paths, requirement)?)
+    };
+    progress_line(python.progress_text());
+    Ok(python)
 }
 
 /// The interpreter a *preview* of the install reports, found without preparing
@@ -595,27 +603,43 @@ impl PlannedPython {
         }
     }
 
-    /// The progress line a preview prints when it reaches a host with no usable
-    /// Python, in place of the interpreter line. Built from the same fields as
-    /// [`Self::note`], so the two cannot differ about the version or whether its
-    /// tag was checked.
-    pub(super) fn skipped_preparation_line(&self) -> Option<String> {
+    /// The progress line that names the chosen interpreter: the one an install
+    /// goes on with, or, for a preview on a host with no usable Python, what a
+    /// real install would prepare. It is the only line that predicts the
+    /// preparation, and it exists only for a decision that has already passed the
+    /// bootstrap policy and the version check, so the two cannot disagree. Built
+    /// from the same fields as [`Self::note`], so the two cannot differ about the
+    /// version or whether its tag was checked.
+    pub(super) fn progress_text(&self) -> String {
         match self {
-            Self::Ready(_) => None,
+            Self::Ready(launcher) => match launcher.source {
+                "path" => format!("Using Python from PATH: {}.", launcher.executable.display()),
+                "env" => format!(
+                    "Using Python from ROCM_CLI_PYTHON: {}.",
+                    launcher.executable.display()
+                ),
+                "managed" => format!(
+                    "Using ROCm CLI's portable Python: {}.",
+                    launcher.executable.display()
+                ),
+                _ => format!("Using Python from {}.", launcher.executable.display()),
+            },
             Self::WouldPrepareManaged {
                 version,
                 requirement,
                 tag_checked,
-            } => Some(if *tag_checked {
-                format!(
-                    "No usable Python found; a real install would prepare Python {version}. This preview does not."
-                )
-            } else {
-                format!(
-                    "No usable Python found; a real install would prepare Python {version}, whose wheel tag cannot be checked until it is installed ({} is required). This preview does not.",
-                    requirement.tag
-                )
-            }),
+            } => {
+                if *tag_checked {
+                    format!(
+                        "No usable Python found; a real install would prepare Python {version}. This preview does not."
+                    )
+                } else {
+                    format!(
+                        "No usable Python found; a real install would prepare Python {version}, whose wheel tag cannot be checked until it is installed ({} is required). This preview does not.",
+                        requirement.tag
+                    )
+                }
+            }
         }
     }
 
@@ -646,8 +670,9 @@ impl PlannedPython {
 }
 
 /// Whether a search for an interpreter is for an install or a preview of one.
-/// It changes only the wording of the progress line about a saved Python that
-/// turned out unusable: a preview must not say it is preparing one.
+/// It changes only the wording of the two progress lines about a Python that
+/// turned out unusable: an install says what it goes on to do, a preview states
+/// the finding and leaves the prediction to the decision's own line.
 #[derive(Clone, Copy)]
 enum LookupPurpose {
     Install,
@@ -705,15 +730,22 @@ fn find_python_launcher_in(
             }
         }
     }
+    // A preview states only what it found here. What a real install would then
+    // do depends on the saved Python, the bootstrap policy and the version, none
+    // of which is known yet, so the prediction waits for
+    // `PlannedPython::progress_text`, after the decision. An install's wording is
+    // unchanged.
     if skipped_path_python {
-        progress_line(format!(
-            "Python from PATH is not usable for this ROCm install ({} is required); {} ROCm CLI's managed Python.",
-            requirement.tag,
-            match purpose {
-                LookupPurpose::Install => "using",
-                LookupPurpose::Preview => "a real install would use",
-            }
-        ));
+        progress_line(match purpose {
+            LookupPurpose::Install => format!(
+                "Python from PATH is not usable for this ROCm install ({} is required); using ROCm CLI's managed Python.",
+                requirement.tag
+            ),
+            LookupPurpose::Preview => format!(
+                "Python from PATH is not usable for this ROCm install ({} is required).",
+                requirement.tag
+            ),
+        });
     }
 
     if let Some(manifest) = load_managed_python_manifest(paths)?
@@ -725,14 +757,16 @@ fn find_python_launcher_in(
                 source: "managed",
             }));
         }
-        progress_line(format!(
-            "Saved managed Python is not usable for this ROCm install ({} is required); {}.",
-            requirement.tag,
-            match purpose {
-                LookupPurpose::Install => "preparing Python again",
-                LookupPurpose::Preview => "a real install would prepare Python again",
-            }
-        ));
+        progress_line(match purpose {
+            LookupPurpose::Install => format!(
+                "Saved managed Python is not usable for this ROCm install ({} is required); preparing Python again.",
+                requirement.tag
+            ),
+            LookupPurpose::Preview => format!(
+                "Saved managed Python is not usable for this ROCm install ({} is required).",
+                requirement.tag
+            ),
+        });
     }
 
     if managed_python_bootstrap_disabled() {
@@ -1665,6 +1699,227 @@ exit 1
         Ok(())
     }
 
+    // ---- the preview's output, row by row -------------------------------------
+    //
+    // State matrix for what a dry run prints about Python and what it leaves
+    // behind. A preview line that says what a real install would do must exist
+    // only where the install would do it, so every row below is the whole output
+    // of the decision, not a spot check of one line.
+    //
+    //   PATH Python   usable | unusable | absent
+    //   saved Python  usable | unusable | absent
+    //   bootstrap     enabled | disabled (ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP)
+    //   version       default | accepted patch release | unreadable | refused tag
+    //
+    // Expected output by row (cp312 required; `P`, `S` are the PATH and saved
+    // interpreters):
+    //   PATH usable                      -> `Using Python from PATH: P.`; nothing else
+    //   PATH unusable, saved usable      -> PATH finding, `Using ROCm CLI's portable Python: S.`
+    //   neither usable, bootstrap off    -> findings only, then the refusal; no promise
+    //   neither usable, version refused  -> findings only, then the refusal; no promise
+    //   neither usable, otherwise        -> findings, then the one promise
+    //                                       `No usable Python found; a real install
+    //                                       would prepare Python V.` (V checked or not)
+    // A finding is `Python from PATH is not usable ... (cp312 is required).` or
+    // `Saved managed Python is not usable ... (cp312 is required).`, printed only
+    // for a PATH or saved Python that exists and fails. Every row leaves the
+    // config, data and cache folders as they were and never runs `uv`.
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum PathPython {
+        Usable,
+        Unusable,
+        Absent,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum SavedPython {
+        Usable,
+        Unusable,
+        Absent,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum VersionOverride {
+        Default,
+        Accepted,
+        Unreadable,
+        RefusedTag,
+    }
+
+    /// Runs one row of the matrix and checks the preview's complete output and
+    /// the state it leaves against what the row's description above says.
+    #[cfg(unix)]
+    fn check_preview_matrix_row(
+        path: PathPython,
+        saved: SavedPython,
+        bootstrap_disabled: bool,
+        version: VersionOverride,
+    ) -> Result<()> {
+        use super::super::process::PROGRESS_LINE_SINK;
+
+        let row = format!(
+            "{path:?} PATH / {saved:?} saved / disabled={bootstrap_disabled} / {version:?}"
+        );
+        let host = PythonHost::new("python-dry-run-matrix")?;
+        let path_python = match path {
+            PathPython::Usable => Some(write_fake_python_with_venv(&host.search_dir, "python3")?),
+            PathPython::Unusable => {
+                write_fake_python_reporting(&host.search_dir, "python3", "cp311", "Python 3.11.0")?;
+                None
+            }
+            PathPython::Absent => None,
+        };
+        let managed_dir = host.paths.data_dir.join("tools").join("python");
+        let saved_python = match saved {
+            SavedPython::Usable => {
+                fs::create_dir_all(&managed_dir)?;
+                let python = write_fake_python_with_venv(&managed_dir, "python")?;
+                host.save_managed_python(python.clone())?;
+                Some(python)
+            }
+            SavedPython::Unusable => {
+                fs::create_dir_all(&managed_dir)?;
+                let broken = managed_dir.join("python");
+                fs::write(&broken, "not an interpreter")?;
+                host.save_managed_python(broken)?;
+                None
+            }
+            SavedPython::Absent => None,
+        };
+        let (version_value, version_name) = match version {
+            VersionOverride::Default => (None, "3.12"),
+            VersionOverride::Accepted => (Some("3.12.4"), "3.12.4"),
+            VersionOverride::Unreadable => (Some("pypy@3.10"), "pypy@3.10"),
+            VersionOverride::RefusedTag => (Some("3.13"), "3.13"),
+        };
+        let _env = RestoredEnv::set(&[
+            (
+                "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
+                bootstrap_disabled.then_some(Path::new("1")),
+            ),
+            (
+                "ROCM_CLI_MANAGED_PYTHON_VERSION",
+                version_value.map(Path::new),
+            ),
+        ]);
+        let before = snapshot(&host.paths);
+
+        // What the row's description says, written out independently of the code.
+        let path_finding =
+            "Python from PATH is not usable for this ROCm install (cp312 is required).";
+        let saved_finding =
+            "Saved managed Python is not usable for this ROCm install (cp312 is required).";
+        let mut expected: Vec<String> = Vec::new();
+        let mut expected_error: Option<&str> = None;
+        let mut expected_promise = false;
+        if let Some(python) = &path_python {
+            expected.push(format!("Using Python from PATH: {}.", python.display()));
+        } else {
+            if matches!(path, PathPython::Unusable) {
+                expected.push(path_finding.to_owned());
+            }
+            if let Some(python) = &saved_python {
+                expected.push(format!(
+                    "Using ROCm CLI's portable Python: {}.",
+                    python.display()
+                ));
+            } else {
+                if matches!(saved, SavedPython::Unusable) {
+                    expected.push(saved_finding.to_owned());
+                }
+                if bootstrap_disabled {
+                    expected_error = Some("managed Python bootstrap is disabled");
+                } else if matches!(version, VersionOverride::RefusedTag) {
+                    expected_error = Some("Python wheel tag cp313 is not supported");
+                } else {
+                    expected_promise = true;
+                    expected.push(if matches!(version, VersionOverride::Unreadable) {
+                        format!("No usable Python found; a real install would prepare Python {version_name}, whose wheel tag cannot be checked until it is installed (cp312 is required). This preview does not.")
+                    } else {
+                        format!("No usable Python found; a real install would prepare Python {version_name}. This preview does not.")
+                    });
+                }
+            }
+        }
+
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        let result = host.python_for_install(true);
+        let lines = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+
+        assert_eq!(lines, expected, "{row}: the preview's progress lines");
+        // No line that predicts the install may exist unless the row ends in
+        // the promise: a refusal is known before any such line is built.
+        let predictions = lines
+            .iter()
+            .filter(|line| line.contains("a real install would"))
+            .count();
+        assert_eq!(
+            predictions,
+            usize::from(expected_promise),
+            "{row}: lines that predict the install: {lines:?}"
+        );
+        match (&result, expected_error) {
+            (Err(error), Some(expected)) => {
+                assert!(format!("{error:#}").contains(expected), "{row}: {error:#}");
+            }
+            (Ok(planned), None) => {
+                assert_eq!(
+                    planned.note().is_some(),
+                    expected_promise,
+                    "{row}: the note goes with the promise"
+                );
+                if expected_promise {
+                    assert!(
+                        planned.note().is_some_and(
+                            |note| note.contains(&format!("managed Python {version_name}"))
+                        ),
+                        "{row}: {planned:?}"
+                    );
+                }
+            }
+            (result, expected) => panic!("{row}: got {result:?}, expected error {expected:?}"),
+        }
+        // State: nothing was prepared and nothing was written.
+        assert!(!host.uv_was_run(), "{row}: the preview ran uv");
+        assert!(
+            !host.paths.config_path().exists(),
+            "{row}: a config was written"
+        );
+        assert_eq!(snapshot(&host.paths), before, "{row}: files changed");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_runs_whole_python_output_follows_one_decision_in_every_state() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        for path in [PathPython::Usable, PathPython::Unusable, PathPython::Absent] {
+            for saved in [
+                SavedPython::Usable,
+                SavedPython::Unusable,
+                SavedPython::Absent,
+            ] {
+                for bootstrap_disabled in [false, true] {
+                    for version in [
+                        VersionOverride::Default,
+                        VersionOverride::Accepted,
+                        VersionOverride::Unreadable,
+                        VersionOverride::RefusedTag,
+                    ] {
+                        check_preview_matrix_row(path, saved, bootstrap_disabled, version)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The same refusal for every spelling `uv` accepts for that release: a
     /// free-threaded `3.13t` and the `cpython-` and `cpython@` forms report
     /// `cp313` once installed just as `3.13` does, so a preview that did not read
@@ -1727,11 +1982,8 @@ exit 1
                 && note.ends_with("which this preview did not do"),
             "{note}"
         );
-        let line = planned
-            .skipped_preparation_line()
-            .expect("a preview that skipped a step says so");
         assert_eq!(
-            line,
+            planned.progress_text(),
             "No usable Python found; a real install would prepare Python pypy@3.10, whose wheel tag cannot be checked until it is installed (cp312 is required). This preview does not."
         );
         assert!(!host.uv_was_run());
