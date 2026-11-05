@@ -252,6 +252,10 @@ async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
 
 /// File the recording `uv` appends to, one line per invocation.
 const UV_INVOCATION_LOG: &str = "uv-invocations.log";
+
+/// The per-scenario cache folder, under the scenario root.
+const SCRATCH_CACHE_DIR: &str = "scratch-cache";
+
 /// A host where the CLI can find no Python: `PATH` is one empty folder, so the
 /// search comes up empty and no managed Python has been saved. `uv` is a
 /// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
@@ -285,6 +289,15 @@ async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
     world
         .command_env
         .push(("PATH", empty_path.into_os_string()));
+    // A cache folder of this scenario's own. The harness otherwise points the
+    // CLI at a cache shared across scenarios and, on CI, across runs, where a
+    // tool archive an earlier scenario downloaded would be mistaken for one the
+    // preview downloaded. Overrides the shared one for this scenario only.
+    let scratch_cache = scenario_root.join(SCRATCH_CACHE_DIR);
+    std::fs::create_dir_all(&scratch_cache).expect("failed to create the scratch cache folder");
+    world
+        .command_env
+        .push(("ROCM_CLI_CACHE_DIR", scratch_cache.into_os_string()));
     world
         .command_env
         .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
@@ -1108,10 +1121,13 @@ fn assert_no_python_prepared(world: &E2eWorld) {
         "the preview created the managed tools folder {}, which would hold a managed uv and Python",
         tools.display()
     );
+    // The scenario's own cache folder (see the Given), not `paths.cache_dir`,
+    // which is the shared one where a run's leftovers would already be.
+    let cache_tools = scenario_root.join(SCRATCH_CACHE_DIR).join("tools");
     assert!(
-        !paths.cache_dir.join("tools").exists(),
+        !cache_tools.exists(),
         "the preview downloaded a tool archive into {}",
-        paths.cache_dir.join("tools").display()
+        cache_tools.display()
     );
     let config = paths.config_path();
     assert!(

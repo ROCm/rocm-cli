@@ -473,8 +473,10 @@ Feature: Runtime configuration
   # run of this preview are not covered by a test.
   #
   # Technical details: the fixture serves one canonical release index, `PATH` is a
-  # single empty folder, and `ROCM_CLI_UV_BINARY` names a stand-in that appends
-  # its arguments to a log file.
+  # single empty folder, `ROCM_CLI_UV_BINARY` names a stand-in that appends its
+  # arguments to a log file, and `ROCM_CLI_CACHE_DIR` is a folder of this
+  # scenario's own, so a tool archive left in the cache the suite shares across
+  # scenarios and runs is not mistaken for one this preview downloaded.
   @id:runtime-install-preview-prepares-no-python @requires-os:linux
   Scenario: runtime-22 - Previewing an SDK install on a host with no usable Python prepares no Python
     Given a canonical release pip index fixture
