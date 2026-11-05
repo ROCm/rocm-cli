@@ -913,10 +913,22 @@ mod tests {
     }
 
     /// The text of the sole string literal in `args`, if that is all it holds.
+    /// Plain (`"..."`) and raw (`r"..."`, `r#"..."#`) literals are recognised.
     fn sole_literal(args: &str) -> Option<&str> {
-        let inner = args.trim().strip_prefix('"')?;
-        let end = inner.find('"')?;
-        inner[end + 1..].trim().is_empty().then_some(&inner[..end])
+        let args = args.trim();
+        if let Some(inner) = args.strip_prefix('"') {
+            let end = inner.find('"')?;
+            return inner[end + 1..].trim().is_empty().then_some(&inner[..end]);
+        }
+        let raw = args.strip_prefix('r')?;
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let body = raw[hashes..].strip_prefix('"')?;
+        let closing = format!("\"{}", "#".repeat(hashes));
+        let end = body.find(&closing)?;
+        body[end + closing.len()..]
+            .trim()
+            .is_empty()
+            .then_some(&body[..end])
     }
 
     /// Index of the `)` that closes the `(` at `open`, skipping string literals.
@@ -1050,18 +1062,17 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Collects the files under `dir`, skipping build output, vendored trees and
+    /// every dot-directory (`.git`, `.rocm-work`, and nested checkouts such as
+    /// `.claude/worktrees/...`, whose sources belong to another branch).
     fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
-        const SKIPPED: &[&str] = &[
-            "target",
-            ".git",
-            ".rocm-work",
-            "node_modules",
-            "third_party",
-        ];
+        const SKIPPED: &[&str] = &["target", "node_modules", "third_party"];
         for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if !SKIPPED.contains(&entry.file_name().to_str().unwrap_or_default()) {
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or_default();
+                if !name.starts_with('.') && !SKIPPED.contains(&name) {
                     walk(&path, files);
                 }
             } else {
@@ -1090,6 +1101,47 @@ mod tests {
                 (!dir.is_empty()).then_some((name, dir))
             })
             .collect()
+    }
+
+    /// A raw-string include is a cross-crate read like any other; the scanner
+    /// must not skip it.
+    #[test]
+    fn include_targets_reads_plain_and_raw_string_literals() {
+        let file = "crates/reader/src/lib.rs";
+        for text in [
+            r#"include_str!("../../../README.md")"#,
+            r##"include_str!(r#"../../../README.md"#)"##,
+            r###"include_bytes!(r##"../../../README.md"##)"###,
+            r#"include_str!(r"../../../README.md")"#,
+        ] {
+            assert_eq!(
+                include_targets(file, text),
+                vec!["README.md".to_string()],
+                "{text}"
+            );
+        }
+        assert!(include_targets(file, r#"include_str!(concat!("a", "b"))"#).is_empty());
+    }
+
+    /// A nested checkout (`.claude/worktrees/...`) holds another branch's
+    /// sources; scanning it reports reads that are not this tree's.
+    #[test]
+    fn walk_skips_dot_directories_and_build_output() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        for file in [
+            "crates/a/src/lib.rs",
+            ".claude/worktrees/w/crates/b/src/lib.rs",
+            ".git/hooks/x.rs",
+            "target/debug/y.rs",
+        ] {
+            let path = tmp.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "").expect("write");
+        }
+        let mut files = Vec::new();
+        walk(tmp.path(), &mut files);
+        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
+        assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
     }
 
     /// Fails when a crate reads a file outside its own directory that the hook's
