@@ -719,9 +719,6 @@ Expected result:
   sidebar, never `0.0%`.
 - The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
   serving-instance view, so no throughput is ever measured there.
-- In a short terminal (about 22 rows, e.g. the VS Code panel) the hero still
-  shows utilization, VRAM, temperature and power; only its lowest rows drop
-  off. It never renders as an empty box.
 - Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
   back when it ends.
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
@@ -729,6 +726,29 @@ Expected result:
   unmeasured values, with no crash.
 - No other output of this section needs a daemon: `rocm dash` must not report
   a failed daemon connection.
+
+### 4c. Dashboard Hero In A Short Terminal
+
+**Any platform.** The hero's row dropping is terminal layout, not a
+Windows-specific path, so this reproduces on Linux and WSL too.
+
+Open a terminal about 22 to 24 rows tall — the VS Code panel is one — and
+run:
+
+```
+rocm dash
+```
+
+Expected result:
+
+- The hero still shows utilization, VRAM, temperature and power. It never
+  renders as an empty box with only its "Node throughput · …" title.
+- As the terminal gets shorter the hero loses rows from the bottom only: the
+  held legend first, then `T/S`. Enlarging it brings them back.
+- With a model served whose figures are a scrape window old, the `*` held
+  marker and the `* = held (prior scrape window)` legend explaining it appear
+  and disappear together as the terminal is resized. A `*` on a reading with
+  no legend anywhere on screen is a bug; so is the legend with nothing marked.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
