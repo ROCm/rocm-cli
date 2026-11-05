@@ -520,15 +520,31 @@ mod tests {
 
     #[test]
     fn the_loader_path_finds_the_library_in_any_listed_directory() {
-        let on_disk = |file: &Path| file == Path::new("/opt/rocm-10.1.0/lib/librocdxg.so");
+        // The helper is not Linux-gated, so this runs on the Windows job too. The
+        // variable is built with the platform's own separator, and the library is
+        // matched by its parent directory rather than by a `/`-joined string.
+        let on_disk = |file: &Path| {
+            file.file_name() == Some(std::ffi::OsStr::new("librocdxg.so"))
+                && file.parent() == Some(Path::new("/opt/rocm-10.1.0/lib"))
+        };
+        let joined = |dirs: &[&str]| {
+            std::env::join_paths(dirs)
+                .expect("directories hold no separator")
+                .into_string()
+                .expect("directories are UTF-8")
+        };
         // Not the first entry: the search is over every directory, in the order
         // the loader reads them.
         assert!(librocdxg_on_loader_path(
-            Some("/usr/lib/wsl/lib:/opt/rocm-10.1.0/lib:/other"),
+            Some(&joined(&[
+                "/usr/lib/wsl/lib",
+                "/opt/rocm-10.1.0/lib",
+                "/other"
+            ])),
             on_disk
         ));
         assert!(!librocdxg_on_loader_path(
-            Some("/usr/lib/wsl/lib:/opt/rocm-9.0.0/lib"),
+            Some(&joined(&["/usr/lib/wsl/lib", "/opt/rocm-9.0.0/lib"])),
             on_disk
         ));
     }
@@ -539,10 +555,19 @@ mod tests {
         assert!(!librocdxg_on_loader_path(None, everywhere));
         assert!(!librocdxg_on_loader_path(Some(""), everywhere));
         // An empty entry is the current directory to the loader, which says
-        // nothing about where ROCm lives, so `::` must not count as a hit even
-        // when a file of that name would exist relative to it.
-        assert!(!librocdxg_on_loader_path(Some(":"), everywhere));
-        assert!(!librocdxg_on_loader_path(Some("::"), everywhere));
+        // nothing about where ROCm lives, so a variable of nothing but empty
+        // entries must not count as a hit even when a file of that name would
+        // exist relative to it. Built with the platform's separator.
+        for entries in [&["", ""][..], &["", "", ""][..]] {
+            let value = std::env::join_paths(entries)
+                .expect("empty entries hold no separator")
+                .into_string()
+                .expect("empty entries are UTF-8");
+            assert!(
+                !librocdxg_on_loader_path(Some(&value), everywhere),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
