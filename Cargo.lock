@@ -3845,7 +3845,6 @@ dependencies = [
  "rig-core",
  "rocm-dash-collectors",
  "rocm-dash-core",
- "rocm-deps",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
