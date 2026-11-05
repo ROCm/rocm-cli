@@ -884,7 +884,7 @@ async fn assert_required_contract_is_published(world: &mut E2eWorld) {
         "SKILL.md requires catalog contract version {required}, but the CLI publishes \
          {published}. Phase 0 would stop on every current CLI. Lower the requirement in \
          SKILL.md. Only a real breaking change to the catalog contract justifies raising \
-         the published version in crates/rocm-core/src/fix.rs."
+         the published version in crates/rocm-core/src/fix/manifest.rs."
     );
     // The check in SKILL.md has no upper bound, so a CLI that publishes a higher
     // number would pass Phase 0. A higher number means the catalog broke

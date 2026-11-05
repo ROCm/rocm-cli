@@ -20,13 +20,16 @@ pub mod confirm;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
+mod download;
 pub mod endpoint_key;
+mod endpoint_readiness;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
 mod gfx_target;
 pub mod hardware_root;
 pub mod host_gpu;
+mod jsonl_store;
 pub mod log_tail;
 pub mod managed_runtime;
 pub mod model_catalog;
@@ -34,6 +37,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+mod package_plan;
 pub mod paths;
 pub mod placeholder;
 mod probe_exec;
@@ -61,21 +65,22 @@ pub mod windows_driver;
 pub use amd_smi::resolve_amd_smi_binary;
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
-    AutomationTriggerEvent, BuiltinWatcherSpec, EVENT_LOG_ROTATE_BYTES,
-    EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, find_automation_proposal, generate_proposal_id, jsonl_lock_path,
-    load_automation_proposals, load_recent_audit_events, load_recent_automation_events,
-    load_recent_automation_proposals, update_automation_proposal_status,
+    AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
+    REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot, append_audit_event,
+    append_automation_event, append_automation_proposal, find_automation_proposal,
+    generate_proposal_id, load_automation_proposals, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals,
+    update_automation_proposal_status,
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
-    AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
-    EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
-    PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
+    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
+    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
+    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
+    WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::interactive_terminal;
 pub use crypto::{
@@ -93,7 +98,18 @@ pub use disk_space::{
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
+pub use download::{
+    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
+    download_file_streaming_with_progress, download_file_to_path,
+    download_file_to_path_with_progress,
+};
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
+pub use endpoint_readiness::{
+    EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
+    engine_state_inference_verified, managed_service_endpoint_model_ready,
+    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
+    openai_chat_completion_status, openai_models_endpoint_has_model,
+};
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
@@ -120,15 +136,14 @@ use host_gpu::{
     detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
+pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::tail_lines;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
     active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
 };
-use managed_runtime::{
-    collect_sdk_library_paths, managed_sdk_tool_path, managed_therock_sdk_probe_candidates,
-};
+use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
     GfxSupport, MODEL_RECIPE_STALE_AFTER_MS, ModelArtifactCacheStatus, ModelCatalogPlatform,
     ModelRecipeArtifactRecord, ModelRecipeArtifactSourcePolicyRecord, ModelRecipeEndpointRecord,
@@ -143,16 +158,9 @@ pub use model_catalog::{
     resolve_model_recipe_artifact, verify_model_recipe_index_signature,
 };
 pub use net::{
-    Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
-    DownloadRequest, EndpointReadiness, EndpointReadinessOutcome, HttpResponseParts,
-    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL, INFERENCE_PROBE_TIMEOUT,
-    INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
-    download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
-    format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
-    http_post_json_with_auth, managed_service_endpoint_model_ready,
-    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model, parse_http_endpoint,
+    DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
+    format_host_for_url, format_host_port, format_http_base_url, http_get_text,
+    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -202,7 +210,9 @@ pub use runtime::{
 };
 pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{
-    ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
+    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
+    INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
+    engine_stop_decides_confirmation,
 };
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
@@ -328,7 +338,7 @@ pub fn unix_time_millis() -> u128 {
 /// - Serializing writers: this takes no lock, so two read-modify-write
 ///   cycles that overlap still lose one update (last rename wins). A caller
 ///   whose new content depends on the old must hold a lock across the whole
-///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
+///   cycle, as the JSONL proposal store does (`jsonl_store::jsonl_lock_path`).
 ///   Two callers in the *same process* within the same millisecond are a
 ///   sharper case of this, not just a milder one: they generate the exact
 ///   same temp path below, so concurrent `fs::write`s truncating that one
