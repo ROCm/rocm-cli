@@ -2041,6 +2041,82 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         body.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || body.contains("else { 8 }")
     }
 
+    /// `CARVEOUT_MAX_MIB` in MiB, read from the harness source as text.
+    ///
+    /// Read as text rather than imported: `xtask` has no edge to `e2e-cucumber`
+    /// and this check is not a reason to add one. Only the two spellings the
+    /// constant can reasonably take are understood, `<n> * 1024` and a bare
+    /// number, and anything else fails loudly instead of guessing.
+    fn carveout_max_mib(source: &str) -> u64 {
+        let line = source
+            .lines()
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("pub const CARVEOUT_MAX_MIB: u64 =")
+            })
+            .expect("device_memory.rs declares `pub const CARVEOUT_MAX_MIB: u64 = ...;`");
+        let expr = line
+            .split_once('=')
+            .and_then(|(_, rhs)| rhs.split_once(';'))
+            .map(|(expr, _)| expr.trim().replace('_', ""))
+            .expect("the constant's value ends in a semicolon");
+        let number = |s: &str| {
+            s.trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("cannot read {s:?} in `{expr}` as a number"))
+        };
+        match expr.split_once('*') {
+            Some((a, b)) => number(a) * number(b),
+            None => number(&expr),
+        }
+    }
+
+    #[test]
+    fn carveout_max_mib_reads_both_spellings() {
+        let spelled = |v: &str| format!("/// doc\npub const CARVEOUT_MAX_MIB: u64 = {v};\n");
+        assert_eq!(carveout_max_mib(&spelled("8 * 1024")), 8192);
+        assert_eq!(carveout_max_mib(&spelled("8192")), 8192);
+        assert_eq!(carveout_max_mib(&spelled("8_192")), 8192);
+    }
+
+    #[test]
+    fn the_serve_drain_carveout_limit_is_the_apu_lanes_preflight_floor() {
+        // The serve drain wait (`tests/e2e-cucumber/src/device_memory.rs`) treats
+        // a VRAM total under `CARVEOUT_MAX_MIB` as an APU's BIOS carveout and
+        // judges GTT instead. Its doc says that limit is the floor the APU lanes
+        // pass as `GPU_PREFLIGHT_MIN_FREE_GIB`, and nothing tied the two together:
+        // moving either one left the other quietly wrong, with every unit test
+        // green. A raised limit would send a small discrete card to GTT; a lowered
+        // floor with the limit left behind would judge a real carveout by VRAM.
+        //
+        // The APU floor is the smallest one any lane sets (the discrete lanes set
+        // a larger one), so this follows the lanes rather than a copy of 8.
+        let mut floors_gib = Vec::new();
+        for (_, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text) {
+                if let Some(floor) = preflight_floor(&step) {
+                    floors_gib.push(floor.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("a preflight floor of {floor:?} is not a whole number of GiB")
+                    }));
+                }
+            }
+        }
+        let apu_floor_gib = *floors_gib
+            .iter()
+            .min()
+            .expect("the self-hosted lanes set a preflight floor");
+        let source =
+            std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/src/device_memory.rs"))
+                .expect("reading tests/e2e-cucumber/src/device_memory.rs");
+        assert_eq!(
+            carveout_max_mib(&source),
+            apu_floor_gib * 1024,
+            "CARVEOUT_MAX_MIB no longer equals the APU lanes' GPU_PREFLIGHT_MIN_FREE_GIB \
+             ({apu_floor_gib} GiB); change them together, or the serve drain wait picks \
+             the wrong memory pool"
+        );
+    }
+
     #[test]
     fn every_apu_preflight_block_measures_the_gtt_pool() {
         // A gfx1151 APU reports its BIOS carveout as VRAM total — 512 MiB on the
