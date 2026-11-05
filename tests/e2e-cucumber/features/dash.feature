@@ -691,3 +691,35 @@ Feature: Interactive dashboard
     Then the warning text is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #771: the Services manager painted every row's status in the "ok" color, so
+  # a stopped or failed service looked as healthy as a running one. A recording
+  # supplies one service per lifecycle state, so the scenario needs no daemon
+  # and no GPU. The scenario compares the colors the user sees rather than
+  # naming a theme's RGB values: running, starting and stopped must all differ,
+  # and stopped and failed, which are both errors, must match. A status cell
+  # is read only from a row that also carries its model name, and every such
+  # row must agree, because the Instances tab behind the overlay can show the
+  # same words; so no layout order can hide a wrong color. The mapping from
+  # every status to its tone is covered by the unit tests in
+  # `crates/rocm-dash-tui/src/ui/theme.rs`.
+  @id:dash-services-status-colored-by-state @requires-os:linux
+  Scenario: dash-40 - The Services manager colors each service's status by its state
+    When the user opens the dashboard replaying a recording with running, starting, stopped and failed services
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    And each service's status is colored by its state
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Home "Running" tile counts a service that is still coming up and shows
+  # its stage, so a fresh serve is visible before the readiness probe passes.
+  # The seeded record is the one dash-03 uses (`starting` / `loading`).
+  @id:dash-home-lists-starting-service @requires-os:linux
+  Scenario: dash-41 - Home counts a still-loading model as running and shows its stage
+    Given a managed model is still loading
+    When the user opens the dashboard
+    Then the Home view counts the managed model as running and shows it as loading
+    When the user quits the dashboard
+    Then the dashboard exits successfully

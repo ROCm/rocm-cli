@@ -158,9 +158,15 @@ Feature: Model serving
 
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
-  # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
-  # refuses ("no usable AMD GPU") before the index is ever validated, so the
-  # index-specific rejection can only be observed where a real device is present.
+  # fallback), and no server is started for it. Runs on GPU hardware: on a no-GPU
+  # host the GPU-required pre-flight refuses ("no usable AMD GPU") before the
+  # index is ever validated, so the index-specific rejection can only be observed
+  # where a real device is present.
+  #
+  # Runs on Windows too (ROCMAI-824). Native Windows has no KFD probe and amd-smi
+  # is usually unusable there, so `--gpu` used to be accepted unchecked and a
+  # managed service launched for it. The index is now checked against the AMD
+  # adapters Windows lists.
   #
   # This is the live coverage for an index the host does not have. The *masked*
   # sub-case — an index that exists but is hidden by an active visibility mask —
@@ -168,11 +174,12 @@ Feature: Model serving
   # The step here accepts several refusal wordings only because which authority
   # answers depends on the lane: the visible set when it could be enumerated,
   # the raw amd-smi count when it could not.
-  @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
+  @id:serve-absent-gpu-index-rejected @requires-gpu
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
+    And no local server was recorded
 
   # A runtime and an environment are two ways to pick what a serve runs against,
   # and choosing both at once is ambiguous, so the CLI rejects the combination
@@ -352,12 +359,20 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
+  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
+  # image and a 9B checkpoint on a cold runner and may wait out the full
+  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. They run only when
+  # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
+  # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
+  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
+  # skip every night (the nightly job logs whether Docker is reachable).
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default
   # 5-minute readiness cap.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
@@ -372,7 +387,7 @@ Feature: Model serving
   # on (`stop_managed_services`, via the `stop_aim_service` step), and the
   # same serve+inference fixture `serve-26` uses, rather than adding a new
   # stop/restart mechanism just for AIM.
-  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
   Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
     Given a managed runtime is active
     And a model is being served on aim
@@ -619,3 +634,39 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+  # ROCMAI-827: `rocm serve` started the background automation helper
+  # (`rocm daemon`) on every launch, even with every automation watcher off —
+  # when it has nothing to do — and that helper outlived the service. With no
+  # watcher enabled, serve now starts no helper; the scenario's fresh config
+  # has none enabled. The helper's own lifecycle once a watcher is on is
+  # `automations-helper-stops-when-no-watcher-is-enabled` on the mock lane.
+  @id:serve-stop-leaves-no-background-helper @requires-gpu @requires-engine:lemonade
+  Scenario: serve-40 - Serving a model with no automation enabled starts no background helper
+    Given a managed runtime is active
+    When the user serves a GGUF model on lemonade with no automation enabled
+    Then serving started no background helper
+
+  # The positive case for the OOM note (EAI-8059 review asked for it
+  # explicitly, alongside the withholding the unit tests pin): when
+  # THIS invocation launches a managed vLLM serve that OOMs and never becomes
+  # ready, the summary MUST name the memory knobs. A real launch cannot run on a
+  # GPU-less host, so the mock lane build compiles in a test-only fault-injection
+  # hook (feature `e2e-oom-fault-injection`, armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+  # that fabricates exactly that failed-launch state — an owned log carrying a real
+  # allocator OOM signature, status "starting", nothing reused. The hook is absent
+  # from shipped binaries, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane,
+  # where xtask builds the binary with the feature. @requires-no-gpu because the
+  # fabricated launch stands in for the GPU the mock lane does not have.
+  @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-41 - A launch that runs out of GPU memory names the memory knobs
+    Given a managed vLLM launch will run out of GPU memory
+    When the user opens the interactive serve summary for that launch
+    Then the deployment summary blames this launch for GPU memory
+    And the deployment summary names the GPU memory knobs
+    And the deployment summary quotes the engine's own failing line
+    # The fabricated launch has no process behind it, so `rocm serve` must not
+    # start the background automation daemon to supervise one. Without this the
+    # suppression was untested: deleting the guard left the scenario green and a
+    # `rocm daemon` outliving the checkout.
+    And no background automation daemon was left behind

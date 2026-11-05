@@ -191,11 +191,22 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
-    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
-    /// scenario's isolation environment — for a step whose `Given` planted
-    /// scenario-owned state (e.g. a shell rc file) that only the piped
-    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
-    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
+    ///
+    /// A step needs this when a `Given` has planted scenario-owned state that
+    /// only the piped `run_rocm_with_env` path would otherwise pick up, since
+    /// [`pty_env`]'s `HOME`/lack of `SHELL` are the PTY's own isolation rather
+    /// than that state. The sole caller today is the `fix`-prompt step in
+    /// `diagnose_steps.rs`, which overrides `HOME`/`SHELL` so the fix resolves
+    /// to the shell rc file its `Given` wrote.
+    ///
+    /// Not the route a test-only CLI switch takes: `ROCM_E2E_SIMULATE_OOM_LAUNCH`
+    /// and friends go onto `world.command_env`, which plain [`spawn`](Self::spawn)
+    /// already applies, so they need no overlay here.
+    ///
+    /// The vars are applied per-child on the `CommandBuilder`, never via the
+    /// shared process environment, so concurrent scenarios on the no-GPU lane
+    /// cannot observe each other's overrides.
     pub fn spawn_with_env(
         world: &E2eWorld,
         args: &[&str],
@@ -236,6 +247,9 @@ impl TuiSession {
         Self::spawn_binary_with_env(world, binary, args, &[], None)
     }
 
+    /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
+    /// `binary <args>` under a PTY with the isolated environment, then overlay
+    /// `extra_env` on the child.
     fn spawn_binary_with_env(
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
@@ -282,7 +296,10 @@ impl TuiSession {
             cmd.env(key, value);
         }
         // Caller-supplied overrides win over the scenario's own isolation
-        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself), but
+        // deliberately stay *above* the provider-credential strip below, so no
+        // `extra_env` entry can reinstate a credential and select a cloud
+        // backend for a journey that is meant to be deterministic local chat.
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -401,6 +418,38 @@ impl TuiSession {
             .cell(0, 0)
             .expect("screen (0, 0) must exist once a screen has been rendered");
         cell.bgcolor() == WASH
+    }
+
+    /// The foreground color of `needle` on every screen row that contains both
+    /// `anchor` and `needle`, in row order; empty if there is no such row. A row
+    /// that carries the anchor but not the needle is never read, so the result
+    /// does not depend on which panel draws the anchor first. Matches cell by
+    /// cell, so a wide glyph earlier in the row cannot shift the column.
+    /// Style-aware, unlike `screen_text`.
+    pub fn foregrounds_in_rows_with(&self, anchor: &str, needle: &str) -> Vec<vt100::Color> {
+        let wanted: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = p.screen();
+        let (_, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .enumerate()
+            .filter(|(_, text)| text.contains(anchor) && text.contains(needle))
+            .filter_map(|(row, _)| {
+                let row = row as u16;
+                (0..cols).find_map(|col| {
+                    let matches = wanted.iter().enumerate().all(|(i, ch)| {
+                        screen
+                            .cell(row, col + i as u16)
+                            .is_some_and(|cell| cell.contents() == *ch)
+                    });
+                    matches.then(|| screen.cell(row, col).map(vt100::Cell::fgcolor))?
+                })
+            })
+            .collect()
     }
 
     fn screen_snapshot(&self) -> (String, (u16, u16)) {

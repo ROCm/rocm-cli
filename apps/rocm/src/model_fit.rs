@@ -123,7 +123,9 @@ fn assess_model_with_host_paths(
 ///
 /// `examination.has_amd_gpu` cannot answer this on WSL: the hardware probes
 /// that set it are skipped there (see [`rocm_core::Examination::probe_with_interpreter`]),
-/// so it reads `false` on every WSL host, healthy or not, and this command
+/// so the probe leaves it `false` on every WSL host, healthy or not. This
+/// command reads the probe directly, never the `rocm examine --json` document
+/// that fills the field in afterwards from the Windows-side GPU target, so it
 /// would report a working machine as having no GPU at all -- `Blocked`
 /// instead of the `Undetermined` a genuinely unmeasurable host deserves.
 /// `rocm_sees_gpu`, not `has_amd_gpu`, is the WSL-native signal, per the same
@@ -764,9 +766,11 @@ mod tests {
         );
     }
 
-    /// `has_amd_gpu` is always `false` on WSL (the probes that set it are
-    /// skipped there), so `host_accelerator_memory` must read `rocm_sees_gpu`
-    /// instead on a WSL host -- and only a confirmed `Some(false)` counts as
+    /// `has_amd_gpu` is `false` on a WSL examination as the probe returns it
+    /// (the probes that set it are skipped there), and what the WSL host's
+    /// display adapter says is not what ROCm can enumerate, so
+    /// `host_accelerator_memory` must read `rocm_sees_gpu` instead on a WSL
+    /// host -- and only a confirmed `Some(false)` counts as
     /// "no GPU"; `None` means rocminfo was absent, which is not evidence of
     /// anything, per the same reasoning `fix-wsl-6-host-driver-too-old` in
     /// `diagnose.rs` already uses.

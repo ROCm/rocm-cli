@@ -45,8 +45,6 @@ pub enum BoxRole {
     Success,
     /// Caution (warn).
     Warning,
-    /// Error / danger (err).
-    Danger,
     /// Low-emphasis: logs, context, footnotes (muted).
     Muted,
     /// Generic chrome (border).
@@ -62,7 +60,6 @@ impl BoxRole {
             Self::Secondary => theme.accent_2,
             Self::Success => theme.ok,
             Self::Warning => theme.warn,
-            Self::Danger => theme.err,
             Self::Muted => theme.muted,
             Self::Neutral => theme.border,
         }

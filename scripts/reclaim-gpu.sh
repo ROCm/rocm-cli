@@ -453,21 +453,38 @@ assert_clear() {
 # Spawn a decoy whose argv[0] is a real-shaped path, so the match is tested
 # against the same string a live engine process would present.
 #
-# The executable is a copy of bash, not of sleep: where coreutils is a multicall
-# binary (uutils, the default since Ubuntu 25.10), /bin/sleep picks the tool to
-# run from argv[0], so a copy named llama-server prints "unknown program" and
-# exits before the self-test can see it. bash ignores the name it runs under.
-# The body is a loop, not `sleep 300`, because bash execs a lone simple command
-# in place and argv[0] would become `sleep`. Its `sleep 1` children name no E2E
-# root, so they are never selected, and a TERM still ends the decoy.
+# The bash running this script, started under that argv[0] with `exec -a`, so
+# no binary is copied and nothing depends on how coreutils is built. Not sleep:
+# where coreutils is a multicall binary (uutils, the default since Ubuntu 25.10),
+# /bin/sleep picks the tool to run from the name it was started under, so a copy
+# named llama-server prints "unknown program" and exits before the self-test can
+# see it, and uutils reads that name from argv[0] on some targets and from the
+# executed path on others. bash ignores its argv[0] unless it is `sh`.
+#
+# The body is the `read` builtin on a FIFO the shell holds open for reading AND
+# writing, so the read never sees end of file. Being a builtin, it forks
+# nothing: the decoy is this one pid, a TERM ends it like the engine it stands
+# in for, and killing it leaves no child behind.
 spawn_decoy() {
   local path="$1"
   mkdir -p "$(dirname "${path}")"
-  cp "$(command -v bash)" "${path}"
-  # Detach stdio: this runs inside a command substitution, and a background
-  # child holding the capture pipe open would block the caller until it exits.
-  "${path}" -c 'for _ in {1..300}; do sleep 1; done' >/dev/null 2>&1 &
+  mkfifo "${path}.hold"
+  # Detach stdout/stderr: this runs inside a command substitution, and a
+  # background child holding the capture pipe open would block the caller until
+  # it exits.
+  (exec -a "${path}" "${BASH}" -c 'read -r _' <>"${path}.hold" >/dev/null 2>&1) &
   echo $!
+}
+
+# Fail, naming the decoy, when one is no longer running. A decoy that died at
+# spawn otherwise surfaces later as a selection or containment FAIL that blames
+# the rules — which is how ubuntu-26.04's multicall `sleep` first showed up.
+selftest_require_alive() {
+  local pid="$1"
+  local what="$2"
+  process_alive "${pid}" && return 0
+  echo "FAIL: ${what} decoy (pid=${pid}) is not running; it exited at spawn, so the checks that read it test nothing"
+  return 1
 }
 
 # Spawn a process that becomes a ZOMBIE and stays one, plus the keeper holding
@@ -748,8 +765,9 @@ self_test() {
   # here — including one a later edit adds, which is the case this guards.
   #
   # The flip side is worth knowing: because a broken spawn does not abort, it
-  # yields a live-looking pid for a process that died immediately, and surfaces
-  # later as a confusing assertion failure rather than as "the spawn failed".
+  # yields a live-looking pid for a process that died immediately. The
+  # selftest_require_alive calls after the spawns turn that into a FAIL naming
+  # the decoy, rather than a confusing assertion failure further down.
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   selftest_track_decoy "${prewarm_pid}"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
@@ -773,8 +791,9 @@ self_test() {
   # `selftest_track_decoy` call is silent AND leaks for real: both the EXIT trap
   # and the final kill read this same list, so an untracked decoy is signalled
   # by nothing. It survives even a GREEN run — measured, the `/workload` fixture
-  # outlives the suite by its full 300s, because `reclaim` is supposed to spare
-  # that one and the tracked list is the only other thing that would kill it.
+  # outlived the suite (spawn_decoy's decoys never exit on their own), because
+  # `reclaim` is supposed to spare that one and the tracked list is the only
+  # other thing that would kill it.
   # (An earlier version of this comment claimed such a decoy "is still killed at
   # the end". It is not, and it is only incidentally true for the three fixtures
   # `reclaim` itself signals.)
@@ -792,6 +811,12 @@ self_test() {
   fi
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
+  selftest_require_alive "${prewarm_pid}" 'pre-warm' || failures=$((failures + 1))
+  selftest_require_alive "${workload_pid}" '/workload' || failures=$((failures + 1))
+  selftest_require_alive "${harness_pid}" 'harness' || failures=$((failures + 1))
+  selftest_require_alive "${stubborn_pid}" 'stubborn' || failures=$((failures + 1))
+  selftest_require_alive "${outside_pid}" 'bystander' || failures=$((failures + 1))
+  selftest_require_alive "${delimiter_pid}" 'delimiter' || failures=$((failures + 1))
 
   # 1. Regression guard: the patterns this script replaced could not see a
   #    pre-warm engine process. If this ever matches, the decoy stopped being
@@ -1301,6 +1326,7 @@ self_test() {
   # carries the full argv, and a read that lands in between sees a command line
   # that matches nothing — which would report this check as a pass.
   sleep 1
+  selftest_require_alive "${late_pid}" 'late leak' || failures=$((failures + 1))
   assert_clear_rc=0
   assert_clear_out="$(assert_clear 2>&1)" || assert_clear_rc=$?
   if [[ "${assert_clear_rc}" -ne 0 ]]; then
@@ -1330,7 +1356,7 @@ self_test() {
 
   # Includes prewarm_pid: on a GREEN run reclaim has already killed it, but on a
   # FAILED run it was not selected, and it would otherwise outlive the scratch
-  # tree for its full 300s as an orphan. Killing the zombie's keeper lets init
+  # tree as an orphan that never exits on its own. Killing the zombie's keeper lets init
   # reap the zombie itself.
   kill -KILL "${decoy_pids[@]}" 2>/dev/null || true
 

@@ -594,8 +594,15 @@ impl RocmCliConfig {
             .or_default()
     }
 
+    /// Whether any automation watcher is enabled, i.e. whether the background
+    /// helper (`rocm daemon`) has work. This is the single predicate behind the
+    /// helper's autostart, its self-exit and the "background checks" display, so
+    /// they cannot disagree. The stored `automations.daemon_enabled` flag is
+    /// deliberately not consulted: `automations enable`/`disable` keep it in
+    /// step with the watchers, and on its own it would describe a daemon with
+    /// nothing to run.
     pub fn automation_daemon_enabled(&self) -> bool {
-        self.automations.daemon_enabled || self.automations.watchers.values().any(|cfg| cfg.enabled)
+        self.automations.watchers.values().any(|cfg| cfg.enabled)
     }
 
     pub fn watcher_enabled(&self, watcher: &BuiltinWatcherSpec) -> bool {
