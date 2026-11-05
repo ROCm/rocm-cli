@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::discover_builds::{ROCM_SDK_10_0, ROCM_SDK_10_1, rocm_sdk_series_matches};
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
@@ -95,18 +96,10 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
-/// The ROCm SDK 10.0 release line, as it appears in both
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `wheel_builds.rs`'s discover-build table.
-pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
-/// The ROCm SDK 10.1 release line, as it appears in both
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `wheel_builds.rs`'s discover-build table.
-pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
-
-/// ROCm SDK versions keyed by a row in `wheel_builds.rs`'s discover-build table
-/// (see [`crate::wheel_builds::vllm_rocm_discover_build`] for the recipe each one
-/// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
-/// here, in the lower layer, as the single source for which versions count —
-/// `wheel_builds.rs`'s table literally uses these constants for its
+/// ROCm SDK versions keyed by a row in `discover_builds.rs`'s discover-build table
+/// (see [`crate::discover_builds::vllm_rocm_discover_build`] for the recipe each
+/// one resolves to: wheel indexes, version prefixes, interpreter tag). The
+/// table literally uses [`ROCM_SDK_10_0`] and [`ROCM_SDK_10_1`] for its
 /// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
 /// matches against the same two strings. This list and that table are still
 /// two separate pieces of data, kept in agreement only by
@@ -115,31 +108,11 @@ pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
 /// and that test is what catches it if one is missed.
 pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
 
-/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
-/// ignoring patch and any dev/pre-release suffix. See
-/// [`crate::wheel_builds::vllm_rocm_discover_build`] for why the line, not the
-/// exact release, is what a discover row covers. Lives here, not in
-/// `wheel_builds.rs`, alongside [`ROCM_DISCOVER_BUILD_VERSIONS`] so
-/// [`runtime_has_discover_build`] can match without calling into `wheel_builds`.
-pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
-    fn series(version: &str) -> Option<(u64, u64)> {
-        let mut parts = version.trim().split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor: String = parts
-            .next()?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        Some((major, minor.parse().ok()?))
-    }
-    series(recorded).is_some_and(|version| Some(version) == series(table_key))
-}
-
 /// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
 /// recipe. Exposed as runtime metadata, matched directly against
 /// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `wheel_builds` — the
 /// vLLM launch path in `process.rs`, specifically — don't need to reach into
-/// `wheel_builds`'s build-selection table for a plain yes/no check.
+/// `wheel_builds`'s build-selection code for a plain yes/no check.
 pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
     runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
         ROCM_DISCOVER_BUILD_VERSIONS
