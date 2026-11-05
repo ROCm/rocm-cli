@@ -517,4 +517,83 @@ mod tests {
             "an established cause with a fix is exactly what a report is for"
         );
     }
+
+    fn host_report() -> rocm_core::DiagnoseReport {
+        rocm_core::run_diagnose(&rocm_core::Examination::default(), "")
+    }
+
+    fn output(report: &rocm_core::DiagnoseReport, inspected_remotely: bool) -> DiagnoseOutput<'_> {
+        DiagnoseOutput {
+            report,
+            top: 5,
+            inspected_remotely,
+        }
+    }
+
+    /// `--json` prints the report itself; the extra fields on the view are for
+    /// the text form and must not leak into the document.
+    #[test]
+    fn diagnose_json_is_the_report_itself() {
+        let report = host_report();
+        assert_eq!(
+            serde_json::to_string(&output(&report, true)).expect("the view serializes"),
+            serde_json::to_string(&report).expect("the report serializes")
+        );
+    }
+
+    #[test]
+    fn diagnose_text_is_the_report_text_when_nothing_is_appended() {
+        let report = host_report();
+        assert_eq!(
+            output(&report, false).render_text(),
+            rocm_core::render_diagnose_text(&report, 5)
+        );
+    }
+
+    /// The model verdict follows the report after one blank line.
+    #[test]
+    fn diagnose_text_puts_a_blank_line_before_the_model_readiness() {
+        let mut report = host_report();
+        let readiness = rocm_core::model_readiness::ModelReadiness {
+            model_ref: "example/model".to_owned(),
+            canonical_model_id: None,
+            verdict: rocm_core::model_readiness::ModelVerdict::Undetermined,
+            evidence: vec!["no recipe was read".to_owned()],
+            engine: None,
+            engine_source: None,
+            required_gpu_memory_gib: None,
+            available_gpu_memory_gib: None,
+            alternatives: Vec::new(),
+            fix: None,
+            route: None,
+            undetermined_reason: None,
+            warnings: Vec::new(),
+        };
+        let readiness_text = rocm_core::model_readiness::render_model_readiness_text(&readiness);
+        report.model = Some(readiness);
+        let report_text = rocm_core::render_diagnose_text(&report, 5);
+        assert_eq!(
+            output(&report, false).render_text(),
+            format!("{report_text}\n{readiness_text}")
+        );
+    }
+
+    /// An inspection from outside the distribution says so after the report,
+    /// and the note ends its last line.
+    #[test]
+    fn diagnose_text_ends_the_remote_inspection_note_with_a_newline() {
+        let report = host_report();
+        let text = output(&report, true).render_text();
+        let note = text
+            .strip_prefix(&rocm_core::render_diagnose_text(&report, 5))
+            .expect("the report text comes first");
+        assert!(
+            note.starts_with("\nNote: inspected from outside the distribution"),
+            "unexpected note: {note:?}"
+        );
+        assert!(
+            note.ends_with("run `rocm diagnose` inside the distribution.\n"),
+            "unexpected note: {note:?}"
+        );
+    }
 }

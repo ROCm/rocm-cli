@@ -80,8 +80,8 @@ pub(crate) fn write_marked_row(
 /// one value with one text rendering. When the text needs a parameter (a row
 /// limit, a note about how the value was gathered), put it in a small borrowing
 /// view struct that serializes as the value and implements this trait. Output
-/// that streams, has a different shape in each mode, or does work beyond
-/// printing stays hand-written.
+/// that streams, has a different shape in each mode, or interleaves other work
+/// (side effects, audit events) with the printing stays hand-written.
 pub(crate) trait JsonOrText: Serialize {
     fn render_text(&self) -> String;
 }

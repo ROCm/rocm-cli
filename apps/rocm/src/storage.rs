@@ -905,11 +905,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     match command.unwrap_or(StorageCommand::Report { json: false }) {
         StorageCommand::Report { json } => {
             let report = build_report(&paths, &config)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", render_report(&report));
-            }
+            print_json_or_text(json, &report)?;
         }
         StorageCommand::RemoveOldInstalls { keep, dry_run, yes } => {
             let plan = build_prune_plan(&paths, &config, keep)?;
