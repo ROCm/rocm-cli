@@ -55,6 +55,7 @@ mod runtime_services;
 mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_recipe;
 mod serve_summary;
 mod service_hints;
 mod service_launch;
