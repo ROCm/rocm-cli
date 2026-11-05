@@ -27,6 +27,7 @@ mod package;
 mod paths;
 mod powershell;
 mod prepush;
+mod prepush_stamp;
 mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
@@ -116,6 +117,10 @@ pub(crate) enum Command {
     /// cannot be determined, and prints why. It is skipped only when the
     /// selection is known and has nothing for the step to check. CI always
     /// checks the whole workspace.
+    ///
+    /// A step that already passed on this exact tree (same cargo command,
+    /// toolchain and environment, clean working tree) is skipped, and a pass is
+    /// recorded after a green run; see `xtask/src/prepush_stamp.rs`.
     PrePushCheck {
         /// Which step to run.
         #[arg(value_enum)]
@@ -127,6 +132,10 @@ pub(crate) enum Command {
         /// Print the scope and the cargo command without running it.
         #[arg(long)]
         dry_run: bool,
+        /// Run the step even when this tree already passed it, and record the
+        /// new result. `ROCM_PRE_PUSH_RERUN=1` does the same, for the hook.
+        #[arg(long)]
+        rerun: bool,
     },
     /// Fail if any first-party crate has gained a normal/build dependency
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
@@ -391,7 +400,8 @@ fn run() -> Result<()> {
             check,
             base,
             dry_run,
-        } => prepush::run(check, base, dry_run)?,
+            rerun,
+        } => prepush::run(check, base, dry_run, rerun)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
@@ -477,5 +487,26 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    fn rerun(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let Command::PrePushCheck { rerun, .. } = cli.command else {
+            panic!("expected pre-push-check");
+        };
+        rerun
+    }
+
+    #[test]
+    fn pre_push_check_takes_rerun_and_defaults_to_off() {
+        assert!(rerun(&["xtask", "pre-push-check", "test", "--rerun"]));
+        assert!(!rerun(&["xtask", "pre-push-check", "test"]));
     }
 }

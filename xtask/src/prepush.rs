@@ -30,18 +30,27 @@
 //! manual run, it diffs `origin/main...HEAD` like `cargo xtask affected` does.
 //! `--base` overrides the from-ref.
 //!
+//! A step that already passed on this exact tree is skipped, and a green run is
+//! recorded: see [`crate::prepush_stamp`] for what a pass is keyed on (the
+//! step's cargo arguments, so a narrow pass never covers a wider run; the tree
+//! hash of `HEAD`; the toolchain; the environment) and why a dirty working tree
+//! neither uses nor writes one.
+//!
 //! As in [`crate::affected`], the decisions ([`push_from_env`], [`plan`],
 //! [`hook_selection`], [`resolve_selection`]) are pure and unit-tested; running
-//! git and cargo is confined to [`run`], and [`execute`] takes both as
-//! parameters so its own behavior (the range it diffs, `--dry-run`, a failing
-//! cargo) is tested too.
+//! git and cargo is confined to [`run`], and [`execute`] takes both, the stamps
+//! and the output as parameters so its own behavior (the range it diffs,
+//! `--dry-run`, a failing cargo, a skipped or recorded pass, and what it prints
+//! about each) is tested too.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::affected::{self, DEFAULT_BASE, Graph, Selection};
+use crate::prepush_stamp::{self, Lookup, Stamps};
 
 /// The e2e harness crate. `cargo test` excludes it (its scenarios run through
 /// `cargo xtask e2e`), and its harness target is linted by its own step.
@@ -344,39 +353,86 @@ impl Env {
     }
 }
 
+/// What one invocation asks for.
+#[derive(Debug, Clone, Default)]
+pub struct Request {
+    /// Replaces the range's base (`--base`).
+    pub base: Option<String>,
+    /// Print the plan without running or recording anything (`--dry-run`).
+    pub dry_run: bool,
+    /// The refs prek exported.
+    pub env: Env,
+}
+
 /// Run one step: resolve the range (an explicit `base` wins over prek's
 /// from-ref), pick the affected crates, print the scope, and hand the planned
-/// cargo arguments to `run_cargo` unless the step is skipped or `dry_run`.
+/// cargo arguments to `run_cargo` unless the step is skipped, `dry_run`, or a
+/// pass of exactly this command on this tree is on record (`stamps`).
 ///
-/// `load_graph`, `changed_files` (given the range's base and tip) and
-/// `run_cargo` are parameters so the behavior around them is unit-tested.
+/// A pass is recorded only after `run_cargo` succeeded. `load_graph`,
+/// `changed_files` (given the range's base and tip), `run_cargo` and `out` are
+/// parameters so the behavior around them is unit-tested.
 pub fn execute(
     check: Check,
-    base: Option<String>,
-    dry_run: bool,
-    env: Env,
+    request: Request,
+    stamps: &Stamps<'_>,
     load_graph: impl FnOnce() -> Result<Graph>,
     changed_files: impl FnOnce(&str, &str) -> Result<Vec<String>>,
     mut run_cargo: impl FnMut(&[String]) -> Result<()>,
+    out: &mut impl Write,
 ) -> Result<()> {
+    let label = check.label();
+    let Request { base, dry_run, env } = request;
     let push = push_from_env(base.or(env.from_ref), env.to_ref);
     let (selection, fallback) =
         resolve_selection(load_graph, || changed_files(push.base(), &push.to));
-    println!("{}", banner(check, &push, &selection, fallback.as_deref()));
+    writeln!(
+        out,
+        "{}",
+        banner(check, &push, &selection, fallback.as_deref())
+    )?;
 
     let args = match plan(check, &selection) {
         Plan::Skip(reason) => {
-            println!("pre-push-check {}: skipped, {reason}", check.label());
+            writeln!(out, "pre-push-check {label}: skipped, {reason}")?;
             return Ok(());
         }
         Plan::Cargo(args) => args,
     };
 
-    println!("pre-push-check {}: cargo {}", check.label(), args.join(" "));
+    writeln!(out, "pre-push-check {label}: cargo {}", args.join(" "))?;
+    let key = match stamps.lookup(label, &args) {
+        Lookup::Hit { name, age_secs } => {
+            if dry_run {
+                writeln!(
+                    out,
+                    "pre-push-check {label}: a real run would skip this step, it passed {} ago",
+                    prepush_stamp::age_text(age_secs)
+                )?;
+            } else {
+                let location = stamps.location();
+                for line in prepush_stamp::skip_lines(label, &args, age_secs, &name, &location) {
+                    writeln!(out, "{line}")?;
+                }
+            }
+            return Ok(());
+        }
+        Lookup::Miss { key, note } => {
+            if let Some(note) = note {
+                writeln!(out, "pre-push-check {label}: {note}")?;
+            }
+            key
+        }
+    };
     if dry_run {
         return Ok(());
     }
-    run_cargo(&args)
+
+    run_cargo(&args)?;
+    if let Some(note) = key.and_then(|key| stamps.record(&key)) {
+        writeln!(out, "pre-push-check {label}: {note}")?;
+    }
+    Ok(())
 }
 
 /// Run `cargo` with `args`, failing when it does.
@@ -393,15 +449,33 @@ fn spawn_cargo(args: &[String]) -> Result<()> {
 }
 
 /// Entry point for the `pre-push-check` subcommand.
-pub fn run(check: Check, base: Option<String>, dry_run: bool) -> Result<()> {
-    execute(
-        check,
+pub fn run(check: Check, base: Option<String>, dry_run: bool, rerun: bool) -> Result<()> {
+    let store: Box<dyn prepush_stamp::Store> = match prepush_stamp::FsStore::in_git_common_dir(None)
+    {
+        Ok(store) => Box::new(store),
+        Err(error) => Box::new(prepush_stamp::UnavailableStore(format!("{error:#}"))),
+    };
+    let probe = prepush_stamp::SystemProbe::default();
+    let stamps = Stamps::new(
+        &probe,
+        store.as_ref(),
+        prepush_stamp::now_secs(),
+        rerun,
+        |name| std::env::var(name).ok(),
+    );
+    let request = Request {
         base,
         dry_run,
-        Env::from_lookup(|name| std::env::var(name).ok()),
+        env: Env::from_lookup(|name| std::env::var(name).ok()),
+    };
+    execute(
+        check,
+        request,
+        &stamps,
         affected::load_graph,
         affected::changed_files_between,
         spawn_cargo,
+        &mut std::io::stdout().lock(),
     )
 }
 
@@ -410,6 +484,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use crate::prepush_stamp::fakes::{FakeProbe, MemStore};
+
+    /// A fixed clock for the stamp tests.
+    const NOW: u64 = 1_800_000_000;
 
     fn packages(names: &[&str]) -> Selection {
         Selection::Packages(names.iter().map(|name| (*name).to_string()).collect())
@@ -754,24 +832,32 @@ mod tests {
         }
     }
 
-    /// Run a step against canned inputs; `files` of `None` makes the diff fail.
-    /// Returns the result, every `(base, tip)` the diff was asked for, and the
-    /// argument lines handed to cargo.
-    fn run_step(
+    /// Everything one `execute` call did.
+    struct StepRun {
+        result: Result<()>,
+        ranges: Ranges,
+        /// The argument lines handed to cargo.
+        cargo: Vec<String>,
+        /// What the step printed.
+        out: String,
+    }
+
+    /// Run a step against canned inputs, with the given stamps; `files` of
+    /// `None` makes the diff fail.
+    fn run_step_with(
         check: Check,
-        base: Option<&str>,
-        dry_run: bool,
-        env: Env,
+        request: Request,
+        stamps: &Stamps<'_>,
         files: Option<&[&str]>,
         cargo_fails: bool,
-    ) -> (Result<()>, Ranges, Vec<String>) {
+    ) -> StepRun {
         let ranges = std::cell::RefCell::new(Vec::new());
         let cargo = std::cell::RefCell::new(Vec::new());
+        let mut out = Vec::new();
         let result = execute(
             check,
-            base.map(String::from),
-            dry_run,
-            env,
+            request,
+            stamps,
             || Ok(graph()),
             |base, tip| {
                 ranges
@@ -789,8 +875,44 @@ mod tests {
                 }
                 Ok(())
             },
+            &mut out,
         );
-        (result, ranges.into_inner(), cargo.into_inner())
+        StepRun {
+            result,
+            ranges: ranges.into_inner(),
+            cargo: cargo.into_inner(),
+            out: String::from_utf8(out).expect("the step prints UTF-8"),
+        }
+    }
+
+    /// Run a step with stamps that never apply (the working tree reads as dirty),
+    /// so these tests see only the range, `--dry-run` and cargo's result.
+    /// Returns the result, every `(base, tip)` the diff was asked for, and the
+    /// argument lines handed to cargo.
+    fn run_step(
+        check: Check,
+        base: Option<&str>,
+        dry_run: bool,
+        env: Env,
+        files: Option<&[&str]>,
+        cargo_fails: bool,
+    ) -> (Result<()>, Ranges, Vec<String>) {
+        let probe = FakeProbe::clean("tree");
+        *probe.tree.borrow_mut() = Err("the working tree is dirty".to_string());
+        let store = MemStore::default();
+        let stamps = Stamps {
+            probe: &probe,
+            store: &store,
+            now: NOW,
+            rerun: false,
+        };
+        let request = Request {
+            base: base.map(String::from),
+            dry_run,
+            env,
+        };
+        let run = run_step_with(check, request, &stamps, files, cargo_fails);
+        (run.result, run.ranges, run.cargo)
     }
 
     const XTASK_ONLY: Option<&[&str]> = Some(&["xtask/src/main.rs"]);
@@ -898,6 +1020,615 @@ mod tests {
             env(Some("remote-tip"), Some("pushed-tip"))
         );
         assert_eq!(Env::from_lookup(|_| None), Env::default());
+    }
+
+    // ---- pass stamps: skip a step that already passed on this exact tree ----
+
+    const XTASK_TEST: &str = "test -p xtask --all-targets";
+    const WIDE_TEST: &str = "test --workspace --all-targets --exclude e2e-cucumber";
+
+    fn stamps<'a>(probe: &'a FakeProbe, store: &'a MemStore, now: u64, rerun: bool) -> Stamps<'a> {
+        Stamps {
+            probe,
+            store,
+            now,
+            rerun,
+        }
+    }
+
+    fn run_at(
+        stamps: &Stamps<'_>,
+        check: Check,
+        files: &[&str],
+        dry_run: bool,
+        cargo_fails: bool,
+    ) -> StepRun {
+        let request = Request {
+            dry_run,
+            ..Request::default()
+        };
+        run_step_with(check, request, stamps, Some(files), cargo_fails)
+    }
+
+    #[test]
+    fn a_green_run_is_recorded_and_the_next_identical_run_is_skipped_with_the_reason() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let first = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        first.result.expect("the first run");
+        assert_eq!(first.cargo, [XTASK_TEST]);
+        assert_eq!(store.files.borrow().len(), 1, "a green run is recorded");
+
+        let second = run_at(
+            &stamps(&probe, &store, NOW + 90, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        second.result.expect("the skipped run");
+        assert!(
+            second.cargo.is_empty(),
+            "the step must not run again: {:?}",
+            second.cargo
+        );
+        assert!(
+            second
+                .out
+                .contains(&format!("pre-push-check test: skipped, this tree already passed `cargo {XTASK_TEST}` 1 min ago")),
+            "{}",
+            second.out
+        );
+        // The skip names what it does not cover and how to force a run.
+        assert!(
+            second.out.contains("user-level cargo configuration"),
+            "{}",
+            second.out
+        );
+        assert!(second.out.contains("--rerun"), "{}", second.out);
+        assert!(second.out.contains("files git ignores"), "{}", second.out);
+        assert!(second.out.contains("installed tools"), "{}", second.out);
+        assert!(second.out.contains("flaky tests"), "{}", second.out);
+        assert!(
+            second.out.contains(prepush_stamp::RERUN_VAR),
+            "{}",
+            second.out
+        );
+        assert!(second.out.contains("<memory>"), "{}", second.out);
+        assert_eq!(store.files.borrow().len(), 1, "a skip records nothing");
+    }
+
+    #[test]
+    fn a_narrow_pass_never_lets_a_wider_selection_skip() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let narrow = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert_eq!(narrow.cargo, [XTASK_TEST]);
+
+        // The same tree, but the push now also touches the lockfile: the whole
+        // workspace. The earlier `-p xtask` pass says nothing about that.
+        let wide = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &["Cargo.lock"],
+            false,
+            false,
+        );
+        assert_eq!(wide.cargo, [WIDE_TEST], "{}", wide.out);
+        assert!(!wide.out.contains("skipped"), "{}", wide.out);
+        assert_eq!(store.files.borrow().len(), 2, "both passes are on record");
+
+        // And each is skipped on its own next run.
+        let again = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert!(again.cargo.is_empty(), "{}", again.out);
+    }
+
+    #[test]
+    fn a_different_tree_runs_again() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        )
+        .result
+        .expect("first");
+        *probe.tree.borrow_mut() = Ok("tree-2".to_string());
+        let second = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert_eq!(second.cargo, [XTASK_TEST], "{}", second.out);
+        assert_eq!(store.files.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_different_toolchain_or_environment_runs_again() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        )
+        .result
+        .expect("first");
+
+        *probe.toolchain.borrow_mut() = Ok("rustc 1.97.0\ncargo 1.97.0\n".to_string());
+        let toolchain = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert_eq!(
+            toolchain.cargo,
+            [XTASK_TEST],
+            "a new toolchain must not reuse the pass"
+        );
+
+        *probe.env.borrow_mut() = "env-b".to_string();
+        let env = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert_eq!(
+            env.cargo,
+            [XTASK_TEST],
+            "a new RUSTFLAGS and the like must not reuse the pass"
+        );
+    }
+
+    #[test]
+    fn a_failed_step_records_nothing_and_a_passed_sibling_still_skips_on_retry() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Clippy,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("clippy passes");
+        let failed = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &files,
+            false,
+            true,
+        );
+        failed.result.expect_err("test fails");
+        assert_eq!(
+            store.files.borrow().len(),
+            1,
+            "only the clippy pass is on record"
+        );
+        assert!(
+            store
+                .files
+                .borrow()
+                .keys()
+                .all(|name| name.starts_with("clippy-")),
+            "{:?}",
+            store.files.borrow().keys()
+        );
+
+        // The retry skips the step that passed and re-runs the one that failed.
+        let clippy = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Clippy,
+            &files,
+            false,
+            false,
+        );
+        assert!(clippy.cargo.is_empty(), "{}", clippy.out);
+        let test = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert_eq!(test.cargo, [XTASK_TEST]);
+        assert_eq!(store.files.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_dirty_working_tree_neither_skips_nor_records_and_says_so() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("clean run");
+        assert_eq!(store.files.borrow().len(), 1);
+
+        *probe.tree.borrow_mut() =
+            Err("the working tree has 2 uncommitted or untracked path(s)".to_string());
+        let dirty = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert_eq!(
+            dirty.cargo,
+            [XTASK_TEST],
+            "a recorded pass is not honored on a dirty tree"
+        );
+        assert!(
+            dirty
+                .out
+                .contains("pass stamps are not used: the working tree has 2 uncommitted"),
+            "{}",
+            dirty.out
+        );
+        assert_eq!(*store.writes.borrow(), 1, "and no pass is recorded from it");
+    }
+
+    #[test]
+    fn a_tree_the_run_changed_is_not_recorded() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let stamps = stamps(&probe, &store, NOW, false);
+        let mut out = Vec::new();
+        execute(
+            Check::Test,
+            Request::default(),
+            &stamps,
+            || Ok(graph()),
+            |_, _| Ok(vec!["xtask/src/main.rs".to_string()]),
+            |_| {
+                // cargo rewrote a tracked file (`Cargo.lock`, say) while it ran.
+                *probe.tree.borrow_mut() =
+                    Err("the working tree has 1 uncommitted path".to_string());
+                Ok(())
+            },
+            &mut out,
+        )
+        .expect("the step itself passed");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("pass not recorded: the working tree has 1 uncommitted"),
+            "{out}"
+        );
+        assert!(
+            store.files.borrow().is_empty(),
+            "nothing is recorded for a tree cargo changed"
+        );
+    }
+
+    #[test]
+    fn rerun_ignores_a_recorded_pass_and_records_a_fresh_one() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("first");
+        let forced = run_at(
+            &stamps(&probe, &store, NOW + 100, true),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert_eq!(forced.cargo, [XTASK_TEST], "--rerun must run the step");
+        assert!(
+            forced.out.contains("recorded passes are ignored"),
+            "{}",
+            forced.out
+        );
+        assert!(
+            forced.out.contains(prepush_stamp::RERUN_VAR),
+            "{}",
+            forced.out
+        );
+        let recorded: Vec<String> = store
+            .files
+            .borrow()
+            .values()
+            .map(|(text, _)| text.clone())
+            .collect();
+        assert_eq!(recorded.len(), 1, "the new pass replaces the old one");
+        assert!(
+            recorded[0].contains(&format!("passed-at: {}", NOW + 100)),
+            "{recorded:?}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_reports_a_hit_and_never_runs_or_writes() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        let miss = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            true,
+            false,
+        );
+        assert!(miss.cargo.is_empty());
+        assert!(store.files.borrow().is_empty(), "a dry run records nothing");
+        assert!(!miss.out.contains("would skip"), "{}", miss.out);
+
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("real run");
+        let writes = *store.writes.borrow();
+        let hit = run_at(
+            &stamps(&probe, &store, NOW + 3600, false),
+            Check::Test,
+            &files,
+            true,
+            false,
+        );
+        assert!(hit.cargo.is_empty());
+        assert!(
+            hit.out
+                .contains("a real run would skip this step, it passed 1 h ago"),
+            "{}",
+            hit.out
+        );
+        assert_eq!(*store.writes.borrow(), writes);
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_and_never_fails_the_step() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        *store.fail_writes.borrow_mut() = true;
+        let run = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        run.result
+            .expect("a stamp that cannot be written must not fail a green hook");
+        assert_eq!(run.cargo, [XTASK_TEST]);
+        assert!(
+            run.out.contains(
+                "pass not recorded: could not write it under <memory> (read-only file system)"
+            ),
+            "{}",
+            run.out
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_set_up_still_runs_the_step_and_says_why() {
+        let probe = FakeProbe::clean("tree-1");
+        let store = prepush_stamp::UnavailableStore("not a git repository".to_string());
+        let stamps = Stamps {
+            probe: &probe,
+            store: &store,
+            now: NOW,
+            rerun: false,
+        };
+        let run = run_at(&stamps, Check::Test, &["xtask/src/main.rs"], false, false);
+        run.result.expect("the step runs");
+        assert_eq!(run.cargo, [XTASK_TEST]);
+        assert!(
+            run.out
+                .contains("could not read the pass stamp (not a git repository)"),
+            "{}",
+            run.out
+        );
+        assert!(
+            run.out
+                .contains("pass not recorded: could not write it under the stamp directory"),
+            "{}",
+            run.out
+        );
+    }
+
+    #[test]
+    fn a_corrupted_stamp_is_ignored_and_replaced_by_a_real_one() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("first");
+        let name = store.files.borrow().keys().next().expect("a stamp").clone();
+        store
+            .files
+            .borrow_mut()
+            .insert(name.clone(), ("not a stamp".to_string(), NOW));
+
+        let second = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert_eq!(
+            second.cargo,
+            [XTASK_TEST],
+            "garbage under the right name must not skip"
+        );
+        assert!(
+            second
+                .out
+                .contains(&format!("ignoring the pass stamp {name}")),
+            "{}",
+            second.out
+        );
+        let third = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert!(
+            third.cargo.is_empty(),
+            "the replacement is a real stamp: {}",
+            third.out
+        );
+    }
+
+    #[test]
+    fn a_skipped_selection_neither_looks_for_nor_writes_a_stamp() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let run = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["CHANGELOG.md"],
+            false,
+            false,
+        );
+        assert!(run.cargo.is_empty());
+        assert!(
+            run.out.contains("skipped, no Rust crate is affected"),
+            "{}",
+            run.out
+        );
+        assert_eq!(*store.writes.borrow(), 0);
+    }
+
+    #[test]
+    fn a_head_that_moved_during_the_step_is_not_recorded_and_the_note_names_head() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let stamps = stamps(&probe, &store, NOW, false);
+        let mut out = Vec::new();
+        execute(
+            Check::Test,
+            Request::default(),
+            &stamps,
+            || Ok(graph()),
+            |_, _| Ok(vec!["xtask/src/main.rs".to_string()]),
+            |_| {
+                // HEAD is a different commit by the time the step has finished.
+                *probe.tree.borrow_mut() = Ok("tree-2".to_string());
+                Ok(())
+            },
+            &mut out,
+        )
+        .expect("the step itself passed");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("pass not recorded: HEAD moved while the step ran"),
+            "{out}"
+        );
+        assert!(
+            store.files.borrow().is_empty(),
+            "nothing is written for a tree that was not checked"
+        );
+        assert_eq!(*store.writes.borrow(), 0);
+    }
+
+    /// A stamp for `xtask`'s test step on `tree-1`, written by a normal run.
+    fn with_a_recorded_pass() -> (FakeProbe, MemStore) {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        )
+        .result
+        .expect("the first run");
+        assert_eq!(store.files.borrow().len(), 1);
+        (probe, store)
+    }
+
+    #[test]
+    fn the_rerun_flag_forces_a_run_despite_a_matching_stamp() {
+        let (probe, store) = with_a_recorded_pass();
+        let forced = Stamps::new(&probe, &store, NOW + 5, true, |_| None);
+        let run = run_at(&forced, Check::Test, &["xtask/src/main.rs"], false, false);
+        assert_eq!(run.cargo, [XTASK_TEST], "{}", run.out);
+        assert!(
+            run.out.contains("recorded passes are ignored"),
+            "{}",
+            run.out
+        );
+        assert!(!run.out.contains("skipped"), "{}", run.out);
+    }
+
+    #[test]
+    fn the_rerun_variable_forces_a_run_despite_a_matching_stamp() {
+        let (probe, store) = with_a_recorded_pass();
+        let lookup = |name: &str| (name == prepush_stamp::RERUN_VAR).then(|| "1".to_string());
+        let forced = Stamps::new(&probe, &store, NOW + 5, false, lookup);
+        let run = run_at(&forced, Check::Test, &["xtask/src/main.rs"], false, false);
+        assert_eq!(run.cargo, [XTASK_TEST], "{}", run.out);
+        assert!(
+            run.out.contains("recorded passes are ignored"),
+            "{}",
+            run.out
+        );
+    }
+
+    #[test]
+    fn without_the_flag_or_with_the_variable_off_the_same_stamp_still_skips() {
+        let (probe, store) = with_a_recorded_pass();
+        let off = |name: &str| (name == prepush_stamp::RERUN_VAR).then(|| "0".to_string());
+        for stamps in [
+            Stamps::new(&probe, &store, NOW + 5, false, |_| None),
+            Stamps::new(&probe, &store, NOW + 5, false, off),
+        ] {
+            let run = run_at(&stamps, Check::Test, &["xtask/src/main.rs"], false, false);
+            assert!(run.cargo.is_empty(), "{}", run.out);
+            assert!(
+                run.out.contains("skipped, this tree already passed"),
+                "{}",
+                run.out
+            );
+        }
     }
 
     // ---- drift guard: every cross-crate read must be covered ----

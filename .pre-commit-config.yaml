@@ -141,6 +141,11 @@ repos:
       #   cargo clippy -p e2e-cucumber --test e2e -- -D warnings
       #   cargo test --workspace --all-targets --exclude e2e-cucumber
       # and `cargo xtask pre-push-check <step> --base <ref>` runs one by hand.
+      # A step that already passed on the same tree (same cargo command, toolchain
+      # and environment, clean working tree) is skipped and says so; a green run
+      # records the pass under the git directory. `ROCM_PRE_PUSH_RERUN=1` (or
+      # `--rerun` by hand) ignores recorded passes, and `SKIP=<hook id>` still
+      # skips a hook.
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo xtask pre-push-check clippy
