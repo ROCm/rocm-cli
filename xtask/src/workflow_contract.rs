@@ -8905,4 +8905,413 @@ permissions:
             );
         }
     }
+
+    /// The block a line of `file` opens: that line, and every line after it
+    /// indented deeper, blank lines included, up to the first that is not. So a
+    /// step's or an input's own keys, and nothing of the next one.
+    fn yaml_block(file: &str, header: &str) -> String {
+        let text = read_workflow(file);
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let mut lines = text.lines().skip_while(|line| *line != header);
+        let first = lines
+            .next()
+            .unwrap_or_else(|| panic!("{file} has a line `{header}`"));
+        let mut block = vec![first];
+        block.extend(
+            lines.take_while(|line| line.trim().is_empty() || indent(line) > indent(first)),
+        );
+        block.join("\n").trim_end().to_owned() + "\n"
+    }
+
+    /// What every queue workflow must keep, beside holding no credential: a
+    /// failed run fails the job, a run is never cancelled for a newer one, and
+    /// the lanes' files are uploaded whatever the verdict.
+    #[test]
+    fn each_queue_workflow_fails_when_its_run_does_and_cancels_nothing() {
+        for (file, group) in [
+            ("queue-run.yml", "queue-run"),
+            ("nightly-queue.yml", "nightly-queue"),
+        ] {
+            let text = read_workflow(file);
+            // A publisher that may fail without failing the job reports a
+            // failed run as green.
+            assert!(
+                !without_comments(&text).contains("continue-on-error"),
+                "{file} must not let a step fail quietly"
+            );
+            // Cancelling a waiting job for a newer one is GitHub's to do; a
+            // running one holds the runner for the run it started.
+            assert_eq!(
+                yaml_block(file, "concurrency:"),
+                format!("concurrency:\n  group: {group}\n  cancel-in-progress: false\n"),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    // `${BRANCH:-main}` is the step's shell, not a format argument.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn queue_run_starts_the_dispatched_branch_and_publishes_it() {
+        let step = yaml_block(
+            "queue-run.yml",
+            "      - name: Run on the queue and publish",
+        );
+        // Empty when scheduled, hence the default.
+        assert_eq!(
+            step,
+            "      - name: Run on the queue and publish\n\
+             \x20       env:\n\
+             \x20         # Empty when scheduled.\n\
+             \x20         BRANCH: ${{ inputs.branch }}\n\
+             \x20       # One line: the workflow contract forbids backslashes in this file.\n\
+             \x20       run: /opt/queue/bin/queue-publish --out \"${RUNNER_TEMP}/results\" \
+             --start \"${BRANCH:-main}\"\n",
+            "queue-run.yml must start a run of the dispatched branch and publish it"
+        );
+        assert_eq!(
+            yaml_block("queue-run.yml", "  schedule:"),
+            "  schedule:\n    - cron: \"17 2 * * *\"\n"
+        );
+        assert!(
+            docs_nightly_on_the_queue().contains("every night at 02:17 UTC"),
+            "docs/nightly-on-the-queue.md must give the schedule queue-run.yml has"
+        );
+    }
+
+    #[test]
+    fn nightly_queue_publishes_only_the_named_run() {
+        let step = yaml_block("nightly-queue.yml", "      - name: Publish the run");
+        assert_eq!(
+            step,
+            "      - name: Publish the run\n\
+             \x20       env:\n\
+             \x20         REQUEST_ID: ${{ inputs.request_id }}\n\
+             \x20       # One line: the workflow contract forbids backslashes in this file.\n\
+             \x20       run: /opt/queue/bin/queue-publish --out \"${RUNNER_TEMP}/results\" \
+             --request \"${REQUEST_ID}\"\n",
+            "nightly-queue.yml must publish the run it was given"
+        );
+        // No default: a run that did not happen cannot be published in its place.
+        assert_eq!(
+            yaml_block("nightly-queue.yml", "      request_id:"),
+            "      request_id:\n\
+             \x20       description: \"The id of the finished run to publish\"\n\
+             \x20       type: string\n\
+             \x20       required: true\n"
+        );
+    }
+
+    fn docs_nightly_on_the_queue() -> String {
+        let p = repo_root().join("docs/nightly-on-the-queue.md");
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+    }
+
+    #[test]
+    fn each_queue_workflow_uploads_the_artifact_the_doc_names_for_it() {
+        let doc = docs_nightly_on_the_queue();
+        for (file, artifact) in [
+            ("queue-run.yml", "queue-run-results"),
+            ("nightly-queue.yml", "nightly-queue-results"),
+        ] {
+            let upload = yaml_block(file, "      - name: Upload lane results");
+            // Uploaded whatever the run's verdict: a failed run's files are
+            // what someone needs.
+            assert!(
+                upload.contains("\n        if: always()\n"),
+                "{file}:\n{upload}"
+            );
+            assert!(
+                upload.contains(&format!("\n          name: {artifact}\n")),
+                "{file} must upload {artifact}:\n{upload}"
+            );
+            assert!(
+                doc.contains(&format!("`{artifact}`\n  from `{file}`"))
+                    || doc.contains(&format!("`{artifact}` from `{file}`")),
+                "docs/nightly-on-the-queue.md must say {file} uploads `{artifact}`"
+            );
+        }
+    }
+
+    /// What `scripts/run-e2e-lane.sh` needs from a lane image, linked into a
+    /// directory that becomes the whole `PATH`, so a test decides what is
+    /// missing.
+    #[cfg(unix)]
+    const LANE_TOOLS: [&str; 5] = ["bash", "dirname", "mkdir", "cp", "cat"];
+
+    /// One run of the lane script against stubbed tools: how often
+    /// `apt-get update` fails first, what the suite exits with, whether cargo
+    /// is already installed, and whether the out directory cannot be written.
+    #[cfg(unix)]
+    struct LaneCase {
+        apt_failures: u32,
+        suite_rc: i32,
+        cargo_installed: bool,
+        out_blocked: bool,
+    }
+
+    #[cfg(unix)]
+    impl Default for LaneCase {
+        fn default() -> Self {
+            Self {
+                apt_failures: 0,
+                suite_rc: 0,
+                cargo_installed: true,
+                out_blocked: false,
+            }
+        }
+    }
+
+    /// What a run of the lane script left: its exit code, its log, the out
+    /// directory, and the scratch directory holding the stubs' records.
+    #[cfg(unix)]
+    struct LaneRun {
+        rc: i32,
+        log: String,
+        out: PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    /// Run a copy of the lane script in a scratch checkout with every tool it
+    /// calls stubbed. Each stub logs how it was called: the preflight, `sleep`,
+    /// `curl` (whose output is a stand-in for rustup's installer), `apt-get` (to
+    /// a file), and cargo, which also logs the environment the pre-warm and the
+    /// suite get; the suite leaves a result file and exits `suite_rc`. Without
+    /// `cargo_installed`, cargo is reachable only once that installer has run.
+    #[cfg(unix)]
+    fn run_lane(case: &LaneCase) -> LaneRun {
+        use rocm_core::fake_executable::write_fake_executable;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("checkout");
+        let tools = dir.path().join("tools");
+        let out = dir.path().join("out");
+        for sub in ["scripts", ".github/scripts"] {
+            std::fs::create_dir_all(root.join(sub)).expect("scratch checkout");
+        }
+        std::fs::create_dir(&tools).expect("tools dir");
+        std::fs::copy(
+            repo_root().join("scripts/run-e2e-lane.sh"),
+            root.join("scripts/run-e2e-lane.sh"),
+        )
+        .expect("copy the lane script");
+        std::fs::write(
+            root.join(".github/scripts/gpu-preflight.sh"),
+            "echo \"preflight ran\"\n",
+        )
+        .expect("stub the preflight");
+        if case.out_blocked {
+            std::fs::write(&out, "a file where the out directory goes\n").expect("block out");
+        }
+        let host_tool = |tool: &str| {
+            ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("{tool} on this host"))
+        };
+        for tool in LANE_TOOLS.iter().chain(&["sh"]) {
+            std::os::unix::fs::symlink(host_tool(tool), tools.join(tool)).expect("link a tool");
+        }
+        let calls = dir.path().join("apt-calls");
+        let updates = dir.path().join("apt-updates");
+        write_fake_executable(
+            &tools.join("apt-get"),
+            format!(
+                "#!/bin/bash\necho \"apt-get $*\" >> {calls}\n\
+                 [ \"$1\" = update ] || exit 0\n\
+                 n=0; [ -f {updates} ] && read -r n < {updates}\n\
+                 n=$((n + 1)); echo \"$n\" > {updates}\n\
+                 [ \"$n\" -gt {failures} ]\n",
+                calls = calls.display(),
+                updates = updates.display(),
+                failures = case.apt_failures,
+            ),
+        )
+        .expect("stub apt-get");
+        write_fake_executable(&tools.join("sleep"), "#!/bin/sh\necho \"sleep $*\"\n")
+            .expect("stub sleep");
+        // Where cargo is: on PATH, or where the rustup installer puts it.
+        let home = dir.path().join("home");
+        let cargo_bin = if case.cargo_installed {
+            tools.clone()
+        } else {
+            home.join(".cargo/bin")
+        };
+        std::fs::create_dir_all(&cargo_bin).expect("cargo's directory");
+        // What rustup's installer would do: install cargo, and write the env
+        // file the script sources. It logs the arguments the script gave it.
+        write_fake_executable(
+            &tools.join("curl"),
+            format!(
+                "#!/bin/bash\necho \"curl $*\" >&2\n\
+                 echo 'echo \"rustup-init $*\"; mkdir -p \"$HOME/.cargo\"; \
+                 echo \"export PATH={bin}:\\$PATH\" > \"$HOME/.cargo/env\"'\n",
+                bin = home.join(".cargo/bin").display()
+            ),
+        )
+        .expect("stub curl");
+        write_fake_executable(
+            &cargo_bin.join("cargo"),
+            format!(
+                "#!/bin/bash\necho \"cargo $*\"\n\
+                 case \"$*\" in\n\
+                 \"xtask e2e-prewarm\"*) echo \"prewarm HF_HOME=$HF_HOME UV_CACHE_DIR=$UV_CACHE_DIR\";;\n\
+                 \"xtask e2e\")\n\
+                 echo \"suite E2E_INCLUDE_NIGHTLY=${{E2E_INCLUDE_NIGHTLY-unset}} \
+                 ROCM_CLI_BINARY=$ROCM_CLI_BINARY\"\n\
+                 mkdir -p tests/e2e-cucumber/results\n\
+                 echo suite > tests/e2e-cucumber/results/junit.xml\n\
+                 exit {rc};;\n\
+                 esac\n",
+                rc = case.suite_rc
+            ),
+        )
+        .expect("stub cargo");
+
+        let output = std::process::Command::new(tools.join("bash"))
+            .arg(root.join("scripts/run-e2e-lane.sh"))
+            .env_clear()
+            .env("PATH", &tools)
+            .env("HOME", &home)
+            .env("LANE_OUT", &out)
+            .env("E2E_LANE_WORK", dir.path().join("work"))
+            .output()
+            .expect("running the lane script");
+        let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&output.stderr));
+        LaneRun {
+            rc: exit_code(output.status, "lane"),
+            log,
+            out,
+            dir,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_runs_the_nightly_job_and_exits_with_the_suites_status() {
+        for suite_rc in [0, 1, 3] {
+            let LaneRun { rc, log, out, dir } = run_lane(&LaneCase {
+                suite_rc,
+                ..LaneCase::default()
+            });
+            let work = dir.path().join("work");
+            assert_eq!(rc, suite_rc, "{log}");
+            assert_eq!(
+                std::fs::read_to_string(out.join("results/junit.xml"))
+                    .ok()
+                    .as_deref(),
+                Some("suite\n"),
+                "the suite's results must reach the lane's out directory:\n{log}"
+            );
+            // In this order, as the nightly job runs them.
+            let steps = [
+                "preflight ran\n".to_owned(),
+                "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks\n"
+                    .to_owned(),
+                format!(
+                    "cargo xtask e2e-prewarm --channel release --prewarm-dir {}/prewarm\n",
+                    work.display()
+                ),
+                // The pre-warm's caches on the same mount as the runtimes.
+                format!(
+                    "prewarm HF_HOME={w}/shared/huggingface UV_CACHE_DIR={w}/uv-cache\n",
+                    w = work.display()
+                ),
+                // The full suite, nightly scenarios included, on the build.
+                format!(
+                    "suite E2E_INCLUDE_NIGHTLY=1 ROCM_CLI_BINARY={}/target/release/rocm\n",
+                    work.display()
+                ),
+            ];
+            let mut from = 0;
+            for step in &steps {
+                let at = log[from..]
+                    .find(step.as_str())
+                    .unwrap_or_else(|| panic!("`{step}` missing or out of order in:\n{log}"));
+                from += at + step.len();
+            }
+            assert!(!log.contains("curl"), "cargo was there already:\n{log}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_that_cannot_copy_its_results_keeps_the_suites_status() {
+        for suite_rc in [0, 1] {
+            let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+                suite_rc,
+                out_blocked: true,
+                ..LaneCase::default()
+            });
+            assert_eq!(rc, suite_rc, "{log}");
+            assert!(
+                log.contains("warning: could not copy the E2E results to"),
+                "{log}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_without_cargo_installs_rustup_and_leaves_the_toolchain_to_the_checkout() {
+        // Bound, not `..`: the scratch directory goes when `_dir` does.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            cargo_installed: false,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs"),
+            "{log}"
+        );
+        // No default toolchain: rust-toolchain.toml picks it.
+        assert!(
+            log.contains("rustup-init -y --profile minimal --default-toolchain none"),
+            "{log}"
+        );
+        assert!(log.contains("cargo xtask e2e\n"), "{log}");
+        assert!(out.join("results/junit.xml").is_file(), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_rides_out_a_mirror_mid_sync() {
+        let LaneRun { rc, log, dir, .. } = run_lane(&LaneCase {
+            apt_failures: 3,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        let calls = std::fs::read_to_string(dir.path().join("apt-calls")).expect("apt-get ran");
+        assert_eq!(calls.matches("apt-get update").count(), 4, "{calls}");
+        assert!(calls.contains("install"), "{calls}");
+        // Spaced out: a mirror's sync takes minutes.
+        assert_eq!(log.matches("sleep 60\n").count(), 3, "{log}");
+
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            apt_failures: 4,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("apt-get update failed after 4 attempts"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("cargo"),
+            "nothing is built after apt-get gave up:\n{log}"
+        );
+        assert!(!out.exists());
+    }
 }

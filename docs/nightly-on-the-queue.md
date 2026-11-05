@@ -17,11 +17,14 @@ a run that has already finished.
 
 This gates nothing yet. The scheduled GPU lanes in
 [`nightly.yml`](../.github/workflows/nightly.yml) remain the nightly coverage
-gate described in [ci-hardware-testing.md](ci-hardware-testing.md). Two
+gate described in [ci-hardware-testing.md](ci-hardware-testing.md). Three
 things must happen before this could replace them: a lane must be seen to
-build and run the suite from a cold start in the lane image, and the published
+build and run the suite from a cold start in the lane image; the published
 verdict must become trustworthy enough to gate on — see "What this does not
-protect yet" below.
+protect yet" below; and the lanes must cover what those jobs cover. A lane is
+one Linux container testing the `release` channel (see "What a run
+executes"), while `nightly.yml` also tests the `nightly` channel and native
+Windows and WSL.
 
 This page is the **contract** between this repository and the queue side: what
 a lane must do to be reported, and how to read the report. The queue side —
@@ -38,7 +41,9 @@ starts a new run. It waits for every lane to finish, up to about five hours,
 then publishes the run as below. The job log starts with the run's inputs
 (below). Only one run goes at a time: a second
 dispatch waits for the first, and the queue side refuses one while another,
-however started, is unfinished. The branch must exist in this repository;
+however started, is unfinished. GitHub keeps at most one job waiting, so a
+third dispatch, or the nightly schedule, replaces a dispatch still waiting
+and that one never runs. The branch must exist in this repository;
 otherwise the job fails at once.
 
 ## Publishing a finished run
@@ -97,8 +102,9 @@ Every lane runs the same image and command; there is no per-lane variant.
 
 **A lane must write everything it wants reported directly into `/out`.**
 
-- Each lane's `/out` lands in the `nightly-queue-results` artifact, one
-  directory per lane, next to that lane's `lane.log` (the command's combined
+- Each lane's `/out` lands in the workflow's artifact, `queue-run-results`
+  from `queue-run.yml` or `nightly-queue-results` from `nightly-queue.yml`,
+  one directory per lane, next to that lane's `lane.log` (the command's combined
   output).
 - Files keep their paths under `/out`, subdirectories included. `lane.log` is
   written by the harness; a lane must not use that name. Names ending in
@@ -189,8 +195,9 @@ read every retained run's results, including runs started by hand that were
 never published. None of this reaches the queue or its credential. Each job also receives GitHub's own short-lived
 runtime token, which a tampered runner could misuse within that job's reach,
 such as writing build caches. Together these are why this workflow must not
-gate anything until the runner is single-use (a fresh registration per job)
-or the queue side signs what it reports.
+gate anything until the runner is single-use (a fresh registration per job),
+or the queue side signs what it reports and something other than this runner
+checks the signature: a tampered runner would skip its own check.
 
 **Results move by a shared volume, not a network call.** The queue side writes
 each finished run's publishable files; the runner reads them read-only. No
