@@ -67,6 +67,13 @@ const WIDE_COLS: u16 = 180;
 const VT_ROWS: NonZeroU16 = NonZeroU16::new(ROWS).expect("ROWS must be non-zero");
 const VT_COLS: NonZeroU16 = NonZeroU16::new(COLS).expect("COLS must be non-zero");
 
+/// `(rows, cols)` of `screen` as plain `u16`s. Read the size through this, not
+/// `Screen::size`, which returns `NonZeroU16`s.
+fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get())
+}
+
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
@@ -433,7 +440,7 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = p.screen();
-        let (_, cols) = screen.size();
+        let (_, cols) = screen_size(screen);
         screen
             .rows(0, cols)
             .enumerate()
@@ -463,8 +470,7 @@ impl TuiSession {
             .parser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (rows, cols) = p.screen().size();
-        (p.screen().contents(), (rows.get(), cols.get()))
+        (p.screen().contents(), screen_size(p.screen()))
     }
 
     fn framed_screen(&self) -> String {
@@ -643,7 +649,9 @@ impl TuiSession {
         // dimension fails cleanly instead of leaving the PTY and screen at
         // different sizes.
         let (Some(vt_rows), Some(vt_cols)) = (NonZeroU16::new(rows), NonZeroU16::new(cols)) else {
-            return Err(format!("cannot resize to {cols}x{rows}: zero dimension"));
+            return Err(format!(
+                "cannot resize to rows={rows} cols={cols}: zero dimension"
+            ));
         };
         let size = PtySize {
             rows,
