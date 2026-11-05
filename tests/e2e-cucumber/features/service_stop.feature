@@ -59,6 +59,7 @@ Feature: Stopping a managed service
     Given a managed server whose recorded process is running
     When the daemon's stop_server tool stops that server
     Then the tool reports the server stopped, naming the process it stopped
+    And the tool asked the engine to stop and the engine answered
     And the recorded process is no longer running
     And the server's record reads stopped and names no process
     And the server's endpoint key file is gone
