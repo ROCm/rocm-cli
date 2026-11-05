@@ -518,7 +518,14 @@ pub(in crate::ui) mod tests {
         }
     }
 
-    const SNAP_SECS: i64 = 1_700_000_060;
+    pub(in crate::ui) fn mk_snap(insts: Vec<Instance>) -> rocm_dash_core::metrics::Snapshot {
+        rocm_dash_core::metrics::Snapshot {
+            instances: insts,
+            ..Default::default()
+        }
+    }
+
+    pub(in crate::ui) const SNAP_SECS: i64 = 1_700_000_060;
 
     pub(in crate::ui) fn state_with_snap(inst: Instance) -> AppState {
         let mut m = HashMap::new();

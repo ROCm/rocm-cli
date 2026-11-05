@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The instance Detail modal: a summary strip, scrollable launch-args and
-//! env-vars panes, and a footer, drawn over a dimmed backdrop.
+//! The instance Detail modal: a summary strip, a "recent throughput" panel,
+//! scrollable launch-args and env-vars panes, and a footer, drawn over a dimmed backdrop.
 //!
 //! Split out of `ui/tabs/instances.rs`. It reads `sorted_instances`,
 //! `clamp_sel` and `status_meta` from there, which stay single-sourced beside
@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::Instance;
 
@@ -64,21 +64,237 @@ pub(super) fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &T
     }
 
     // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness)
-    // | body (min) | footer (1)
+    // | recent throughput (recent non-idle ticks, ROCMAI-196) | body (min) | footer (1)
     let snap_ts = state.latest.as_ref().map(|s| s.timestamp);
+    let activity = recent_activity_rows(&state.history, &inst.container_id, RECENT_ACTIVITY_CAP);
+    let has_observed_throughput = has_observed_throughput(&state.history, &inst.container_id);
+    let (activity_h, visible_rows) = activity_layout(activity.len(), inner.height);
+    let total_rows = activity.len();
+    let activity = &activity[..visible_rows];
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
+            Constraint::Length(activity_h),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
 
     render_summary(f, chunks[0], inst, snap_ts, theme);
-    let max_scroll = render_body(f, chunks[1], inst, state, theme);
-    render_footer(f, chunks[2], inst, theme, max_scroll > 0);
+    render_recent_activity(
+        f,
+        chunks[1],
+        activity,
+        total_rows,
+        snap_ts,
+        has_observed_throughput,
+        theme,
+    );
+    let max_scroll = render_body(f, chunks[2], inst, state, theme);
+    render_footer(f, chunks[3], inst, theme, max_scroll > 0);
     max_scroll
+}
+
+/// Max rows shown in the detail modal's "recent throughput" summary.
+const RECENT_ACTIVITY_CAP: usize = 5;
+
+/// Fewest rows the detail body keeps below the recent-activity panel: it holds
+/// the launch args / env panes, the modal's main content, so the panel must not
+/// squeeze it to a line or two (and its scrollbar needs a border pair plus a
+/// content row to render at all).
+const BODY_FLOOR_MIN: u16 = 6;
+
+/// Rows reserved for the body in a modal `inner_h` rows tall: at least
+/// `BODY_FLOOR_MIN`, and half the modal once it is tall enough.
+fn body_floor(inner_h: u16) -> u16 {
+    (inner_h / 2).max(BODY_FLOOR_MIN)
+}
+
+/// Sizes the "recent throughput" panel for `n_rows` entries in a modal body
+/// `inner_h` rows tall; returns `(panel height, rows that fit)`.
+///
+/// The panel is capped so the body keeps its border pair plus a content row
+/// (`body_floor`) — otherwise the launch args / env panes are starved and,
+/// at 0 rows, the body's scrollbar stops rendering. The row count is derived from the same
+/// budget, so a capped panel shows fewer (newest) rows instead of being
+/// handed rows it can't draw. A panel too short for its header plus one row
+/// (or the placeholder line) collapses to `(0, 0)` so the body gets the rows.
+fn activity_layout(n_rows: usize, inner_h: u16) -> (u16, usize) {
+    let avail = inner_h.saturating_sub(4 + 1 + body_floor(inner_h));
+    // 2 border rows + (1 header row + 1 per entry), or 1 placeholder row when
+    // there's none yet; `panel::bento` adds a top-padding row once the box is
+    // tall enough (`padding_for`), which is reused here rather than re-derived.
+    let height_for = |content: u16| {
+        let raw = 2 + content;
+        raw + panel::padding_for(Rect::new(0, 0, 1, raw)).top
+    };
+    if n_rows == 0 {
+        let h = height_for(1);
+        return if h <= avail { (h, 0) } else { (0, 0) };
+    }
+    (1..=n_rows)
+        .rev()
+        .map(|k| (height_for(1 + u16::try_from(k).unwrap_or(u16::MAX)), k))
+        .find(|&(h, _)| h <= avail)
+        .unwrap_or((0, 0))
+}
+
+/// One historical tick where an instance was actually generating tokens.
+pub(crate) struct ActivityRow {
+    pub(crate) ts: DateTime<Utc>,
+    pub(crate) gen_tps: Option<f64>,
+    pub(crate) gen_tps_observation: Option<rocm_dash_core::metrics::ObservationMetadata>,
+    pub(crate) ttft_ms: Option<f64>,
+    pub(crate) tpot_ms: Option<f64>,
+}
+
+/// Scan `history` (oldest-to-newest) for the most recent snapshot ticks where
+/// `container_id` had non-zero generation throughput — i.e. was actually
+/// serving, not idle. These are per-tick samples, not discrete serving runs.
+/// The live "gen:" gauge in `render_summary` already covers the idle case, so
+/// idle ticks are skipped. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
+/// Pure — exposed for tests.
+pub(crate) fn recent_activity_rows(
+    history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
+    container_id: &str,
+    cap: usize,
+) -> Vec<ActivityRow> {
+    let mut rows: Vec<ActivityRow> = Vec::new();
+    for snap in history.iter().rev() {
+        let Some(inst) = snap
+            .instances
+            .iter()
+            .find(|i| i.container_id == container_id)
+        else {
+            continue;
+        };
+        if !inst.gen_tps.is_some_and(|v| v.is_finite() && v > 0.0) {
+            continue;
+        }
+        // A Held tick repeats an earlier scrape; age it from when the
+        // value was observed, not from the tick that re-published it.
+        let ts = inst
+            .gen_tps_observation
+            .as_ref()
+            .map_or(snap.timestamp, |o| o.observed_at);
+        let row = ActivityRow {
+            ts,
+            gen_tps: inst.gen_tps,
+            gen_tps_observation: inst.gen_tps_observation.clone(),
+            ttft_ms: inst.ttft_ms,
+            tpot_ms: inst.tpot_ms,
+        };
+        // Ticks sharing one `observed_at` are one scrape. Walking newest
+        // first, a later tick overwrites the group's row, so the group ends
+        // up represented by its oldest tick: the scrape's own (Fresh) tick,
+        // which carries that scrape's latencies, not a Held re-publication.
+        if let Some(last) = rows.last_mut().filter(|l| l.ts == ts) {
+            *last = row;
+        } else if rows.len() >= cap {
+            break;
+        } else {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// Whether `history` has ever recorded a real throughput sample — even a
+/// genuine `0.0` — for `container_id`. `recent_activity_rows` only returns
+/// non-zero ticks, so an empty result alone can't tell "has been idle" (real
+/// `Some(0.0)` samples seen) apart from "no throughput data" (too new, past
+/// the observation's validity window, a managed non-vLLM engine that never
+/// gets `gen_tps` wired up, or history freshly cleared by a replay seek).
+/// Pure — exposed for tests.
+pub(crate) fn has_observed_throughput(
+    history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
+    container_id: &str,
+) -> bool {
+    history.iter().any(|snap| {
+        snap.instances
+            .iter()
+            .any(|i| i.container_id == container_id && i.gen_tps.is_some_and(f64::is_finite))
+    })
+}
+
+/// Renders the "recent throughput" panel: the last few snapshot ticks where
+/// the instance recorded non-zero throughput, each with tok/s + TTFT/TPOT at
+/// that time (partial coverage of ROCMAI-196; no token counts). Named
+/// distinctly from the Home tab's "Activity · node" panel (jobs/actions feed)
+/// so the two aren't mistaken for the same concept.
+fn render_recent_activity(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[ActivityRow],
+    total_rows: usize,
+    snap_ts: Option<DateTime<Utc>>,
+    has_observed_throughput: bool,
+    theme: &Theme,
+) {
+    // Say so when a short terminal hides older rows instead of clipping silently.
+    // No "of N": `total_rows` is already capped, so it would understate the history.
+    let mut title = if rows.len() < total_rows {
+        format!("recent throughput (newest {})", rows.len())
+    } else {
+        "recent throughput".to_string()
+    };
+    // Explain the `*` the same way the table does, but only when a shown row has one.
+    if rows.iter().any(|r| {
+        r.gen_tps_observation
+            .as_ref()
+            .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
+    }) {
+        title.push_str(" · ");
+        title.push_str(format::HELD_LEGEND);
+    }
+    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
+    if inner.height == 0 {
+        return;
+    }
+    if rows.is_empty() {
+        let msg = if has_observed_throughput {
+            "no recent throughput — instance has been idle".to_string()
+        } else {
+            "no throughput samples".to_string()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.muted),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let header = Row::new(["TIME", "TOK/S", "TTFT", "TPOT"]).style(
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table_rows = rows.iter().map(|r| {
+        // No snapshot (dashboard disconnected): the age is unknowable, so
+        // show a placeholder rather than a fabricated "0s ago".
+        let time = snap_ts.map_or_else(
+            || "—".to_string(),
+            |ts| format!("{}s ago", (ts - r.ts).num_seconds().max(0)),
+        );
+        let tps = format::gen_tps_cell(r.gen_tps, r.gen_tps_observation.as_ref());
+        let ttft = format::ms_opt(r.ttft_ms);
+        let tpot = format::ms_opt(r.tpot_ms);
+        Row::new([time, tps, ttft, tpot]).style(Style::default().fg(theme.fg))
+    });
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(14),
+        Constraint::Length(7),
+        Constraint::Length(7),
+    ];
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 fn render_summary(
@@ -384,9 +600,10 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
 mod tests {
     use super::*;
     use crate::ui::tabs::instances::tests::{
-        buffer_text, mk_inst, mk_inst_obs, mk_state, obs, state_with_snap,
+        SNAP_SECS, buffer_text, mk_inst, mk_inst_obs, mk_snap, mk_state, obs, state_with_snap,
     };
-    use rocm_dash_core::metrics::ObservationFreshness;
+    use chrono::TimeZone;
+    use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
     use std::collections::HashMap;
 
     #[test]
@@ -888,5 +1105,609 @@ mod tests {
             out.contains("unknown"),
             "detail for legacy (None metadata) must say 'unknown'; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn recent_activity_rows_skips_idle_ticks_and_orders_newest_first() {
+        let mut busy_old = mk_inst("x");
+        busy_old.gen_tps = Some(10.0);
+        let mut idle = mk_inst("x");
+        idle.gen_tps = Some(0.0);
+        let mut no_sample = mk_inst("x");
+        no_sample.gen_tps = None;
+        let mut non_finite = mk_inst("x");
+        non_finite.gen_tps = Some(f64::INFINITY);
+        let mut busy_new = mk_inst("x");
+        busy_new.gen_tps = Some(86.0);
+
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        let mut snap = mk_snap(vec![busy_old]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![idle]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_030, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![no_sample]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_045, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![non_finite]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_050, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![busy_new]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_060, 0).unwrap();
+        history.push_back(snap);
+
+        let rows = recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP);
+        assert_eq!(
+            rows.len(),
+            2,
+            "idle, sample-less and non-finite ticks must be skipped"
+        );
+        assert_eq!(
+            rows[0].gen_tps,
+            Some(86.0),
+            "newest activity must come first"
+        );
+        assert_eq!(rows[1].gen_tps, Some(10.0));
+    }
+
+    #[test]
+    fn recent_activity_rows_caps_to_requested_len() {
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        for s in 0..10i64 {
+            let mut i = mk_inst("x");
+            i.gen_tps = Some(5.0);
+            let mut snap = mk_snap(vec![i]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap();
+            history.push_back(snap);
+        }
+        let rows = recent_activity_rows(&history, "id-x", 3);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn recent_activity_rows_collapses_held_ticks_and_ages_from_observed_at() {
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        // One scrape at t=100 (Fresh), re-published as Held on the next two
+        // ticks, then a new scrape at t=103.
+        for (tick, observed, fresh) in [
+            (100, 100, ObservationFreshness::Fresh),
+            (101, 100, ObservationFreshness::Held),
+            (102, 100, ObservationFreshness::Held),
+            (103, 103, ObservationFreshness::Fresh),
+        ] {
+            let mut i = mk_inst("x");
+            i.gen_tps = Some(86.0);
+            // A Held tick carries no latencies of its own (failed scrape).
+            let is_fresh = fresh == ObservationFreshness::Fresh;
+            i.ttft_ms =
+                is_fresh.then_some(120.0 + f64::from(u8::try_from(observed - 100).unwrap()));
+            i.tpot_ms = is_fresh.then_some(40.0);
+            i.gen_tps_observation = Some(ObservationMetadata {
+                observed_at: Utc.timestamp_opt(1_700_000_000 + observed, 0).unwrap(),
+                freshness: fresh,
+            });
+            let mut snap = mk_snap(vec![i]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + tick, 0).unwrap();
+            history.push_back(snap);
+        }
+        let rows = recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP);
+        let ts: Vec<i64> = rows
+            .iter()
+            .map(|r| r.ts.timestamp() - 1_700_000_000)
+            .collect();
+        assert_eq!(ts, vec![103, 100]);
+        // Each group is represented by its scrape's own Fresh tick, not the
+        // later Held re-publication, so no row wrongly carries the held
+        // marker and the latencies are the scrape's.
+        for r in &rows {
+            assert_eq!(
+                r.gen_tps_observation.as_ref().map(|o| o.freshness),
+                Some(ObservationFreshness::Fresh)
+            );
+        }
+        assert_eq!(rows[0].ttft_ms, Some(123.0));
+        assert_eq!(rows[1].ttft_ms, Some(120.0));
+        assert_eq!(rows[1].tpot_ms, Some(40.0));
+    }
+
+    #[test]
+    fn recent_activity_rows_ignores_sibling_instances() {
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        let mut mine = mk_inst("x");
+        mine.gen_tps = Some(11.0);
+        let mut sibling = mk_inst("y");
+        sibling.gen_tps = Some(99.0);
+        history.push_back(mk_snap(vec![sibling.clone(), mine]));
+        let mut quiet = mk_inst("x");
+        quiet.gen_tps = Some(0.0);
+        history.push_back(mk_snap(vec![sibling, quiet]));
+        let rows = recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP);
+        assert_eq!(rows.len(), 1, "only this instance's own samples");
+        assert_eq!(rows[0].gen_tps, Some(11.0));
+        assert!(has_observed_throughput(&history, "id-x"));
+        let mut only_sibling: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        let mut sib = mk_inst("y");
+        sib.gen_tps = Some(0.0);
+        only_sibling.push_back(mk_snap(vec![sib]));
+        assert!(
+            !has_observed_throughput(&only_sibling, "id-x"),
+            "a sibling's samples are not this instance's"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_no_data_placeholder_when_history_has_no_throughput_sample() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // gen_tps = None and an empty history: nothing has ever been
+        // observed for this instance, so this must not claim it's "idle" —
+        // that would be a false claim for a too-new instance, one past its
+        // observation validity window, or a managed non-vLLM engine that
+        // never gets gen_tps wired up.
+        let inst = mk_inst_obs("idle-detail", None, None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("no throughput samples"),
+            "detail with no observed sample must not claim 'idle'; got:\n{out}"
+        );
+        assert!(
+            !out.contains("has been idle"),
+            "must not show the idle placeholder when nothing was ever observed; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_idle_placeholder_when_history_has_only_zero_samples() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A real Some(0.0) sample in history means the instance has actually
+        // been observed and was genuinely idle — unlike the no-data case
+        // above, "has been idle" is a true claim here.
+        let inst = mk_inst_obs("idle-detail", None, None);
+        let mut state = state_with_snap(inst.clone());
+        let mut zero = inst;
+        zero.gen_tps = Some(0.0);
+        let mut snap = mk_snap(vec![zero]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("has been idle"),
+            "detail with an observed zero sample must show the idle placeholder; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_recent_activity_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("burst-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("86"),
+            "must show the historical burst's tok/s; got:\n{out}"
+        );
+        assert!(
+            out.contains("30s ago"),
+            "must show the burst's age relative to the live snapshot; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_held_marker_for_recent_activity_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("held-burst-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        burst.gen_tps_observation = Some(obs(ObservationFreshness::Held, 30));
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("86*"),
+            "held gen_tps in the activity row must carry the held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_all_activity_rows_up_to_the_cap() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Regression: `activity_h` must account for `panel::bento`'s
+        // top-padding row once the box reaches 5 rows tall, or
+        // RECENT_ACTIVITY_CAP = 5 only shows 4 rows (the oldest clipped).
+        let inst = mk_inst_obs("multi-burst-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        for (i, tps) in [101.0, 102.0, 103.0, 104.0, 105.0].into_iter().enumerate() {
+            let mut row = inst.clone();
+            row.gen_tps = Some(tps);
+            let mut snap = mk_snap(vec![row]);
+            snap.timestamp = Utc
+                .timestamp_opt(SNAP_SECS - 14 + i64::try_from(i).unwrap(), 0)
+                .unwrap();
+            state.history.push_back(snap);
+        }
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        for tps in ["101", "102", "103", "104", "105"] {
+            assert!(
+                out.contains(tps),
+                "activity row for {tps} tok/s must not be clipped; got:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_modal_body_scrollbar_survives_a_full_activity_panel_on_a_short_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Regression for the body floor itself (not just the padding
+        // fix above): at 90x18 the popup's inner height is 13, so the
+        // panel collapses and the body keeps its rows. Without the floor, the
+        // activity panel's `Min(0)` neighbor gets starved to 0 and the
+        // scrollbar silently stops rendering even though the body still
+        // overflows.
+        let mut inst = mk_inst_obs("overflow-short-detail", Some(0.0), None);
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut state = state_with_snap(inst.clone());
+        for (i, tps) in [101.0, 102.0, 103.0, 104.0, 105.0].into_iter().enumerate() {
+            let mut row = inst.clone();
+            row.gen_tps = Some(tps);
+            let mut snap = mk_snap(vec![row]);
+            snap.timestamp = Utc
+                .timestamp_opt(SNAP_SECS - 14 + i64::try_from(i).unwrap(), 0)
+                .unwrap();
+            state.history.push_back(snap);
+        }
+
+        let mut term = Terminal::new(TestBackend::new(90, 18)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        // At this height the panel would leave the body under its floor, so
+        // it collapses and the launch args get the rows.
+        assert!(
+            !out.contains("recent throughput"),
+            "panel must collapse rather than starve the body; got:\n{out}"
+        );
+        // ...and the body still renders its scrollbar thumb beside it.
+        assert!(
+            out.contains('█'),
+            "overflowing body must still render a scrollbar thumb next to \
+             the activity panel; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_disconnected_activity_rows_show_no_fabricated_age() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `Disconnected` clears `latest` but leaves history populated, so rows
+        // render with no snapshot timestamp to age them against.
+        let inst = mk_inst_obs("disc-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+        state.latest = None;
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("TOK/S"),
+            "panel must still list the row; got:\n{out}"
+        );
+        assert!(
+            !out.contains("0s ago"),
+            "a missing snapshot must not render a made-up age; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_activity_row_shows_ttft_and_tpot_in_their_own_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("ttft-tpot-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        burst.ttft_ms = Some(123.0);
+        burst.tpot_ms = Some(45.0);
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        let row = out
+            .lines()
+            .find(|l| l.contains("30s ago"))
+            .unwrap_or_else(|| panic!("no activity row; got:\n{out}"));
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        let at = fields.iter().position(|f| *f == "ago").unwrap();
+        assert_eq!(
+            fields.get(at + 2).copied(),
+            Some("123ms"),
+            "TTFT column; row: {row}"
+        );
+        assert_eq!(
+            fields.get(at + 3).copied(),
+            Some("45ms"),
+            "TPOT column; row: {row}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_no_data_placeholder_when_history_has_only_non_finite_samples() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("inf-detail", None, None);
+        let mut state = state_with_snap(inst.clone());
+        let mut inf = inst;
+        inf.gen_tps = Some(f64::INFINITY);
+        let mut snap = mk_snap(vec![inf]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("no throughput samples"),
+            "non-finite samples are not observations; got:\n{out}"
+        );
+        assert!(
+            !out.contains("has been idle"),
+            "must not claim idle from non-finite samples; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn activity_layout_never_exceeds_budget_and_keeps_newest_rows() {
+        for inner_h in 0..=60u16 {
+            for n in 0..=RECENT_ACTIVITY_CAP {
+                let (h, k) = activity_layout(n, inner_h);
+                let avail = inner_h.saturating_sub(4 + 1 + body_floor(inner_h));
+                assert!(h <= avail, "n={n} inner_h={inner_h}: h={h} > {avail}");
+                assert!(k <= n);
+                if n > 0 && h > 0 {
+                    // header + k rows + borders (+ top pad at >= 5 rows)
+                    assert!(h >= 2 + 1 + k as u16, "n={n} inner_h={inner_h}");
+                }
+                if n > 0 {
+                    assert!(k >= 1 || h == 0, "a drawn panel shows at least one row");
+                }
+            }
+        }
+        // Spacious: all five rows. Mid band: partial, but sized to match.
+        assert_eq!(activity_layout(5, 48).1, 5);
+        let (h, k) = activity_layout(5, 24);
+        assert!(
+            (1..5).contains(&k),
+            "mid-height band shows a partial panel: {k}"
+        );
+        assert!(h > 0);
+        // Placeholder: shown when it fits, collapsed otherwise.
+        assert_eq!(activity_layout(0, 48), (3, 0));
+        assert_eq!(activity_layout(0, 8), (0, 0));
+    }
+
+    #[test]
+    fn detail_modal_mid_height_terminal_shows_only_rows_that_fit_newest_first() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Regression: on a body height where the body floor caps the panel
+        // without collapsing the panel, the panel used to be handed all five
+        // rows and silently clip the oldest ones mid-table.
+        let inst = mk_inst_obs("mid-height-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        for (i, tps) in [101.0, 102.0, 103.0, 104.0, 105.0].into_iter().enumerate() {
+            let mut row = inst.clone();
+            row.gen_tps = Some(tps);
+            let mut snap = mk_snap(vec![row]);
+            snap.timestamp = Utc
+                .timestamp_opt(SNAP_SECS - 14 + i64::try_from(i).unwrap(), 0)
+                .unwrap();
+            state.history.push_back(snap);
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        let shown: Vec<&str> = ["105", "104", "103", "102", "101"]
+            .into_iter()
+            .filter(|t| out.contains(t))
+            .collect();
+        assert!(
+            !shown.is_empty(),
+            "panel should show some rows; got:\n{out}"
+        );
+        assert!(
+            shown.len() < 5 && out.contains(&format!("(newest {})", shown.len())),
+            "a clipped panel must say how many rows it hides; got:\n{out}"
+        );
+        // Newest-first contiguous prefix: never a newer row missing while an older one shows.
+        let prefix_len = shown.len();
+        assert_eq!(
+            shown,
+            ["105", "104", "103", "102", "101"][..prefix_len].to_vec(),
+            "rows must be the newest contiguous prefix; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_empty_history_on_short_terminal_collapses_or_shows_placeholder() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = state_with_snap(mk_inst_obs("empty-short-detail", None, None));
+        let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        // At 90x12 the placeholder panel (3 rows) can't fit beside the body
+        // floor, so it collapses entirely rather than drawing a border-only box.
+        assert!(
+            !out.contains("recent throughput") && !out.contains("no throughput data"),
+            "placeholder panel must collapse on a short terminal; got:\n{out}"
+        );
+        // On a roomy terminal the same state shows the placeholder.
+        let mut term = Terminal::new(TestBackend::new(90, 40)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        assert!(buffer_text(&term).contains("no throughput samples"));
+    }
+
+    #[test]
+    fn detail_modal_at_80x24_keeps_several_launch_args_visible_beside_activity() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs("default-size-detail", Some(0.0), None);
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut state = state_with_snap(inst.clone());
+        for (i, tps) in [101.0, 102.0, 103.0, 104.0, 105.0].into_iter().enumerate() {
+            let mut row = inst.clone();
+            row.gen_tps = Some(tps);
+            let mut snap = mk_snap(vec![row]);
+            snap.timestamp = Utc
+                .timestamp_opt(SNAP_SECS - 14 + i64::try_from(i).unwrap(), 0)
+                .unwrap();
+            state.history.push_back(snap);
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        let visible = (0..60)
+            .filter(|i| out.contains(&format!("--flag-{i}=value{i}")))
+            .count();
+        assert!(
+            visible >= 5,
+            "launch args must stay readable at 80x24 ({visible} visible); got:\n{out}"
+        );
+        assert!(out.contains("recent throughput"), "got:\n{out}");
+    }
+
+    #[test]
+    fn detail_modal_explains_held_marker_only_when_a_shown_row_is_held() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let render = |freshness| {
+            let inst = mk_inst_obs("held-legend-detail", Some(0.0), None);
+            let mut state = state_with_snap(inst.clone());
+            let mut row = inst;
+            row.gen_tps = Some(86.0);
+            row.gen_tps_observation = Some(obs(freshness, 30));
+            let mut snap = mk_snap(vec![row]);
+            snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 5, 0).unwrap();
+            state.history.push_back(snap);
+            let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            term.draw(|f| {
+                draw_detail(f, f.area(), &state, &state.theme);
+            })
+            .unwrap();
+            buffer_text(&term)
+        };
+        let held = render(ObservationFreshness::Held);
+        assert!(held.contains("86*"), "held row marker; got:\n{held}");
+        assert!(held.contains(format::HELD_LEGEND), "got:\n{held}");
+        let fresh = render(ObservationFreshness::Fresh);
+        assert!(!fresh.contains(format::HELD_LEGEND), "got:\n{fresh}");
+    }
+
+    #[test]
+    fn detail_modal_clamps_a_future_sample_age_to_zero() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("future-age-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut row = inst;
+        row.gen_tps = Some(77.0);
+        let mut snap = mk_snap(vec![row]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS + 30, 0).unwrap();
+        state.history.push_back(snap);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(out.contains("0s ago"), "got:\n{out}");
+        assert!(!out.contains("-30s"), "got:\n{out}");
     }
 }
