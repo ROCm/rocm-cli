@@ -918,19 +918,7 @@ mod tests {
     }
     #[test]
     fn launch_env_sets_vllm_rocm_target_device() -> Result<()> {
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
-        };
+        let runtime = VllmRuntime::for_test();
         let mut command = ProcessCommand::new("vllm");
 
         apply_therock_env(&mut command, &runtime)?;
@@ -962,17 +950,9 @@ mod tests {
         std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
 
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env.path().join("bin").join("python")),
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(env.path().join("sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
         let mut command = ProcessCommand::new("vllm");
 
@@ -1002,17 +982,9 @@ mod tests {
 
         let env = tempfile::tempdir()?;
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env.path().join("bin").join("python")),
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(env.path().join("sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
         let mut command = ProcessCommand::new("vllm");
 
@@ -1049,17 +1021,9 @@ mod tests {
         // `compat_dir` must not keep that directory on the loader path.
         let env = tempfile::tempdir()?;
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env.path().join("bin").join("python")),
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(env.path().join("sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         // Plant the leftover directly, bypassing `ensure_mpi_cxx_compat`:
@@ -1093,15 +1057,10 @@ mod tests {
         VllmRuntime {
             runtime_id: "test".to_owned(),
             env_id: "test".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable,
-            version: None,
             source: "test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
             rocm_sdk_version,
+            ..VllmRuntime::for_test()
         }
     }
     #[test]
