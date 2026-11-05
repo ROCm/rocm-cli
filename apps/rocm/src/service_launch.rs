@@ -18,8 +18,8 @@
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly.
-//! `ServicesCommand` stays in `main.rs` (a dedicated clap subcommand's enum
-//! usually does, per `docs/architecture.md`'s convention note). Since this
+//! `ServicesCommand` lives in `cli.rs` with the rest of the clap command
+//! tree. Since this
 //! split, `services()` has moved to `services_cmd.rs`, the record removal and
 //! pruning it dispatches to to `service_records.rs`, `record_cli_audit_event`
 //! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
