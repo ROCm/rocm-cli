@@ -64,7 +64,9 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
 /// carries that whole frame. The list is computed from a fresh read rather than
 /// from the last frame the predicate saw, because the driver checks for a
 /// crashed or exited process before consulting the predicate, so the last frame
-/// the predicate saw can be older than the one the failure reports.
+/// the predicate saw can be older than the one the failure reports. That same
+/// order means a marker that only lands as the child exits counts as an exit,
+/// not as a pass, unlike `wait_for_screen`.
 ///
 /// A negative assertion on the returned frame ("this text is not on screen")
 /// is only as strong as the frame is complete: the wait proves the positive
@@ -92,7 +94,13 @@ async fn wait_for_frame(
         )
         .await;
     if let Err(error) = outcome {
+        // The driver's own message below carries the frame it read; this read is
+        // later, so it can already be complete (a frame that finished just after
+        // the deadline), and then there is nothing to list.
         let lacked = missing(&tui.screen_text()).join(", ");
+        if lacked.is_empty() {
+            panic!("{what}: {error}");
+        }
         panic!("{what}: the screen lacked {lacked}: {error}");
     }
     ready_frame
@@ -1461,32 +1469,34 @@ async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     // once it processes the resulting SIGWINCH. Wait for that redraw by
     // polling for the hero's wide-layout content, not just "Unknown GPU"
     // (already visible pre-resize from the title bar alone).
-    tui.wait_for_screen_where(
-        "the hero's wide VRAM/TEMP/POWER layout",
-        |screen| screen.contains("Unknown GPU") && screen.contains("VRAM"),
-        default_timeout(),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("the no-GPU hero did not render: {e}"));
-    let screen = tui.screen_text();
-    for label in ["VRAM", "TEMP", "POWER"] {
-        let row = screen
-            .lines()
-            .find(|line| line.contains(label))
-            .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
-        // Check the text *after* the label, not the whole row: the
-        // utilization gauge on the same row draws its own "—" placeholder,
-        // which would make this pass even if this mini-spark's value were a
-        // fake reading instead of the placeholder.
-        let after_label = row.split_once(label).map_or_else(
-            || panic!("no text after {label} on row:\n{row}"),
-            |(_, rest)| rest,
-        );
-        assert!(
-            after_label.contains('—'),
-            "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
-        );
-    }
+    // The VRAM, TEMP and POWER rows are drawn one under the other, so VRAM on
+    // screen does not mean TEMP and POWER are. Wait until all three carry their
+    // placeholder in the same frame; a fake reading in one of them leaves it
+    // lacking, and the failure names the row.
+    wait_for_frame(tui, "the hero's wide VRAM/TEMP/POWER layout", |screen| {
+        let mut lacking = Vec::new();
+        if !screen.contains("Unknown GPU") {
+            lacking.push("\"Unknown GPU\"".to_string());
+        }
+        for label in ["VRAM", "TEMP", "POWER"] {
+            let Some(row) = screen.lines().find(|line| line.contains(label)) else {
+                lacking.push(format!("a {label} row"));
+                continue;
+            };
+            // Check the text *after* the label, not the whole row: the
+            // utilization gauge on the same row draws its own "—" placeholder,
+            // which would make this pass even if this mini-spark's value were a
+            // fake reading instead of the placeholder.
+            if !row
+                .split_once(label)
+                .is_some_and(|(_, rest)| rest.contains('—'))
+            {
+                lacking.push(format!("the \"—\" placeholder after {label}"));
+            }
+        }
+        lacking
+    })
+    .await;
 }
 
 #[then("the dashboard reports live GPU telemetry")]
@@ -1792,8 +1802,8 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
 
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
-    // The three lines sit at different depths of the help popup, so the first
-    // one on screen does not mean the popup is fully drawn.
+    // The markers sit at different depths of the help popup, so the first one
+    // on screen does not mean the popup is fully drawn.
     wait_for_all_markers(
         session(world),
         "the dashboard help",
@@ -1821,9 +1831,17 @@ async fn services_manager_closed(world: &mut E2eWorld) {
     tui.wait_until_gone("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager is still open after Escape: {e}"));
-    // The manager's text can be erased before the tab bar under it is redrawn,
-    // so wait for the tab marker rather than reading the screen once.
-    let screen = wait_for_all_markers(tui, "the Observe tab after Escape", &["● Observe"]).await;
+    // The tab bar is drawn above the manager and stays on screen while it is
+    // open, so "● Observe" alone proves nothing about the redraw. The footer is
+    // the last row drawn, and its Esc chip reads "menu" only when no manager and
+    // no modal is open (`footer.rs`): waiting for it means the frame is drawn
+    // through the rows where the main menu would be.
+    let screen = wait_for_all_markers(
+        tui,
+        "the Observe tab after Escape",
+        &["● Observe", "Esc  menu"],
+    )
+    .await;
     // Belt-and-suspenders: `wait_until_gone` above is the primary regression
     // check (the manager itself closed). This additionally guards against
     // Esc falling through to open the main menu instead — "Options"/"Quit"
@@ -1897,8 +1915,8 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
     // and "Chat", so those words are not evidence the popup is on screen. Each
     // destination is therefore looked for as a palette row (the cursor column
     // `PALETTE_DESTS` rows start with, then the label) below the "Go to…" title,
-    // which the tab bar above it cannot satisfy. Chat is the palette's last row,
-    // so the wait ends only once the popup is drawn through its bottom.
+    // which the tab bar above it cannot satisfy. Chat is the palette's last
+    // destination row, so the wait ends only once every row is drawn.
     wait_for_frame(session(world), "the command palette", |screen| {
         let Some(title_row) = screen.lines().position(|line| line.contains("Go to")) else {
             return vec!["the \"Go to\" title".to_string()];
@@ -2202,8 +2220,8 @@ async fn launcher_shows_serving(world: &mut E2eWorld) {
         .to_string();
     let tui = session(world);
     // The front door's status strip renders "Serving <model>" for a live
-    // registry instance; wait on the model name to synchronise with the first
-    // paint before inspecting the whole screen.
+    // registry instance; wait for both the model name and "Serving" so the idle
+    // check below reads the frame that showed them.
     let screen = wait_for_all_markers(
         tui,
         "the launcher's status strip",
