@@ -10,7 +10,7 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `ConfigCommand`, the clap enum the handler matches
-//! on, stays in `main.rs` with the rest of the `Command`/`Cli` definition, and
+//! on, lives in `cli.rs` with the rest of the `Command`/`Cli` definition, and
 //! `dispatch()` calls `config` through the re-import `use
 //! crate::config_cmd::{...};`. `render_config_text` is also `pub(crate)`:
 //! `chat.rs`'s read-only handling of `rocm config show` reaches it as

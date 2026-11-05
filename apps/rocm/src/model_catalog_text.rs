@@ -16,8 +16,8 @@
 //! `rocm examine` report and the engine-inventory listing. The two halves do not
 //! call each other: this module reaches only the engine-availability helpers in
 //! `engine_ipc.rs`, `PlatformRuleOut` and the platform-gate functions that
-//! `main.rs` re-imports from `model_fit.rs`, `missing_packaged_engine_reason`,
-//! and `serve_cmd.rs`'s `select_serve_engine`.
+//! `main.rs` re-imports from `model_fit.rs`, and `serve_cmd.rs`'s
+//! `select_serve_engine`.
 //!
 //! The two renderers and `format_bytes` are `pub(crate)`; `main.rs` imports them
 //! and `chat.rs`, `storage.rs` and `automations.rs` reach them as
@@ -37,7 +37,7 @@ use rocm_core::{
 use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
 use crate::engine_ipc::{builtin_engine_available, resolve_engine_binary_path_with_paths};
-use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with, missing_packaged_engine_reason};
+use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with};
 
 /// The per-hardware-group heading in `rocm model`, carrying the "this is the
 /// box you are on" marker when the group matches the detected host GPU.
@@ -808,12 +808,6 @@ fn append_model_engine_support_lines(
                     );
                 }
             }
-        } else if let Some(reason) = missing_packaged_engine_reason(engine) {
-            let _ = writeln!(
-                output,
-                "        {engine}: unavailable reason={}",
-                model_registry_reason(reason)
-            );
         } else {
             let _ = writeln!(output, "        {engine}: not_checked");
         }
