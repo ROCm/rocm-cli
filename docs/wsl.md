@@ -83,7 +83,7 @@ The equivalent manual steps, for reference or for a host where the CLI is not
 installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
 the package's maintainer scripts as root. `rocm install driver` checks the
 download against a digest pinned in the ROCm CLI source
-(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_install.rs`), which also
+(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_plan/rocdxg.rs`), which also
 catches a replaced release asset. A digest read from the release page at
 install time catches only a corrupted download. For a version listed in
 `ROCDXG_PINNED_DIGESTS`, use the pinned digest. Set `ROCDXG_VERSION` to the
@@ -303,9 +303,15 @@ below.
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
 - managed TheRock runtime count and active default runtime
 
-The driver, device-node, and group probes stay skipped. In the `--json` output,
-`has_amd_gpu` is therefore always false and `gpus` is empty on WSL, even on a
-healthy host, because both describe the bare-metal view.
+The driver, device-node, and group probes stay skipped, and `gpus` is empty on
+WSL, even on a healthy host, because it describes the bare-metal view. In the
+`--json` output, `has_amd_gpu` follows the GPU target the Windows side reports,
+the same value behind the text report's "AMD GPU detected" line, so the two
+forms agree. It says an AMD display adapter exists, not that ROCm can enumerate
+it from inside the distro: `rocm_sees_gpu` under `wsl` answers that. `has_apu`
+and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
+a listing that says whether the part is an APU or a discrete card, so
+`has_amd_gpu: true` beside both `false` is the expected WSL shape.
 
 ## Install UX Recommendations
 

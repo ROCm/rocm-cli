@@ -1146,6 +1146,14 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
+        "crates/rocm-core/src/vllm_oom.rs",
+        "rocm diagnose --symptom",
+        "shared marker prefix (`VLLM_OOM_DIAGNOSE_COMMAND`): it exists so a log \
+         line rocm-cli authored can be told apart from one the engine printed. \
+         The runnable advice is composed from it with the user's symptom \
+         appended, and those full lines are scanned on their own",
+    ),
+    (
         "apps/rocm/src/examine_report_text.rs",
         "rocm interactive shell",
         "heading of the non-interactive launcher report",
@@ -1201,12 +1209,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor started",
         "log line",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor stopped",
         "log line",
     ),
@@ -1228,7 +1236,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "report heading",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/config_cmd.rs",
         "rocm config",
         "heading of the `rocm config` report (`writeln!(output, \"rocm config\")`)",
     ),
@@ -1263,7 +1271,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
     (
-        "crates/rocm-core/src/host_gpu.rs",
+        "crates/rocm-core/src/host_gpu/capture.rs",
         "rocm debug: command capture {stage} failed for {}: {detail}",
         "debug log line",
     ),
@@ -1448,7 +1456,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --dry-run",
             Surface::CommandLine
         ),
@@ -1457,7 +1465,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --yes",
             Surface::CommandLine
         ),

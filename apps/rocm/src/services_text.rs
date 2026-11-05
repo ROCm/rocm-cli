@@ -43,15 +43,17 @@
 //!
 //! `dispatch()` calls directly into this module at several points —
 //! `render_internal_status_text`, `run_internal_sandbox_tool`,
-//! `render_service_logs_text`, `render_logs_browser_text`, `render_logs_text`,
-//! `render_services_text`, and `render_services_json` — re-imported via `use
-//! crate::services_text::{...};`. `render_service_action_result`,
-//! `run_internal_sandbox_tool`, and `validate_service_id` are also read from
-//! `main.rs`'s own `run_approved_service_action` (dispatch-adjacent, but not
-//! itself part of this cluster — see `service_launch.rs`'s doc comment for
-//! why the broader service-record-management cluster stays at the crate
-//! root); `validate_service_id` and `load_managed_service` are also read from
-//! `main.rs`'s `remove_managed_service_record`/`apply_service_prune_plan`.
+//! `render_service_logs_text`, `render_logs_browser_text`, and
+//! `render_logs_text` — re-imported via `use crate::services_text::{...};`.
+//! `services_cmd.rs`'s `services()` calls `render_services_text`,
+//! `render_services_json` and `render_service_logs_text` through its own
+//! imports, and its `run_approved_service_action` and `finish_service_action`
+//! also read `render_service_action_result`, `run_internal_sandbox_tool`,
+//! `service_stop_unconfirmed` and `validate_service_id`. `service_records.rs`
+//! reads `validate_service_id` (in `service_record_artifacts` and
+//! `remove_managed_service_record`) and
+//! `load_managed_service` (in `remove_managed_service_record` and
+//! `apply_service_prune_plan`).
 //! `load_managed_service` and `restart_internal_managed_service` are
 //! `pub(crate)` and read from `runtime_services.rs` (reconciling live servers
 //! against a runtime activation) and from `managed_service_status.rs`'s own
@@ -76,13 +78,13 @@
 //! other mechanically relocated modules do, and `runtime_services::` through
 //! its own `use crate::runtime_services;` for the handful of tests that drive
 //! this cluster's restart/stop behavior through `runtime_services`'s public
-//! entry points rather than calling it directly. Three tests that call this
-//! cluster's `load_managed_service`/`render_service_action_result` only
-//! incidentally — their primary subject is `runtime_services::
-//! pin_service_record_to_runtime`/`restore_service_record_pin`,
+//! entry points rather than calling it directly. Two tests that call this
+//! cluster's `load_managed_service` only incidentally — their primary subject
+//! is `runtime_services::pin_service_record_to_runtime`/
+//! `restore_service_record_pin` and
 //! `runtime_services::restart_service_onto_runtime_with`'s outcome
-//! classification, and `main.rs`'s own `run_approved_service_action`
-//! respectively — stay in `main.rs`'s shared `mod tests` instead.
+//! classification respectively — stay in `main.rs`'s shared `mod tests`
+//! instead.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -114,16 +116,14 @@ use crate::managed_service_status::{
     load_managed_services, local_server_sidebar_status, managed_service_is_live,
     managed_service_sidebar_counts, refresh_managed_service_runtime_liveness,
 };
-use crate::service_hints;
+use crate::service_hints::{self, service_action_past_tense};
 use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
     managed_service_process_command,
 };
-use crate::{
-    SandboxToolArg, cli_lifecycle_log_path, service_action_past_tense, status_for_readiness,
-};
+use crate::{SandboxToolArg, cli_lifecycle_log_path, status_for_readiness};
 
 pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
     render_logs_browser_text(paths, None)
@@ -535,8 +535,27 @@ fn render_service_logs_text_with_options(
     Ok(output)
 }
 
+/// [`render_service_action_result`], plus — for a stop — the note about the
+/// background automation helper when it outlives the stopped service.
+pub(crate) fn render_service_action_result_with_helper_note(
+    paths: &AppPaths,
+    tool: &str,
+    value: &serde_json::Value,
+) -> String {
+    let mut text = render_service_action_result(tool, value);
+    if tool == "stop_server"
+        && let Some(note) = crate::service_launch::background_helper_note(paths)
+    {
+        let _ = writeln!(text, "  note: {}", note.text);
+    }
+    text
+}
+
 pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String {
     let output = value.get("output").unwrap_or(value);
+    if tool == "stop_server" && service_stop_unconfirmed(value) {
+        return render_unconfirmed_service_stop(output);
+    }
     let action = service_action_past_tense(tool);
     let service = output.get("service").or_else(|| {
         output
@@ -573,6 +592,143 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
     text
 }
 
+/// A `stop_server` answer whose stop could not confirm that every recorded
+/// process is gone. The stop kept the record's processes, its stop request and
+/// any endpoint key (see [`stop_internal_managed_service_confirmed_with`]), so
+/// this says so instead of claiming a stop, with a line for each reason it
+/// found:
+///
+/// - a process that was signalled and that, or a process under it, outlived
+///   the deadline (`timed_out`);
+/// - a process that was not signalled because its identity could not be
+///   verified (`unverified`), with how to look at it. It may have exited
+///   meanwhile: the identity read can fail because the process is going away;
+/// - the record changed while the stop ran, typically because a restart
+///   recorded new processes, so the stop's verdict says nothing about what the
+///   record names now.
+///
+/// It names no command to run the stop again, like `rocmd`'s MCP answer: a
+/// second stop cannot be relied on to finish the job. When the recorded
+/// process is gone and only a process under it survived, the second stop finds
+/// the recorded one gone and confirms without reaching the survivor.
+fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
+    let result = output.get("result");
+    let service_id = result
+        .and_then(|result| result.get("service_id"))
+        .and_then(serde_json::Value::as_str);
+    let outcomes = result
+        .and_then(|result| result.get("pid_outcomes"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let with_outcome = |label: &str| -> Vec<(u64, &str)> {
+        outcomes
+            .iter()
+            .filter(|entry| entry.get("outcome").and_then(serde_json::Value::as_str) == Some(label))
+            .filter_map(|entry| {
+                Some((
+                    entry.get("pid").and_then(serde_json::Value::as_u64)?,
+                    entry
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("process"),
+                ))
+            })
+            .collect()
+    };
+    let timed_out = with_outcome(rocm_core::TerminationOutcome::TimedOut.as_str());
+    let unverified = with_outcome(rocm_core::TerminationOutcome::Unverified.as_str());
+
+    let mut text = String::new();
+    let _ = writeln!(text, "Local server stop not confirmed");
+    if let Some(service_id) = service_id {
+        let _ = writeln!(text, "  service: {service_id}");
+    }
+    // No `status:` line: a record the liveness refresh already read as
+    // `stopped` keeps that status through a stop that confirmed nothing, so
+    // printing it here would contradict the header.
+    if let Some(count) = result
+        .and_then(|result| result.get("signaled_pids"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+    {
+        let _ = writeln!(text, "  signaled processes: {count}");
+    }
+    for (pid, role) in &timed_out {
+        let _ = writeln!(
+            text,
+            "  still running: process {pid} ({role}) or a process under it did not exit after it was signaled"
+        );
+    }
+    for (pid, role) in &unverified {
+        let _ = writeln!(
+            text,
+            "  not signaled: process {pid} ({role}) could not be verified as this server's; it may still be running"
+        );
+    }
+    let record_changed = result
+        .and_then(|result| result.get("record_changed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if record_changed {
+        let _ = writeln!(
+            text,
+            "  note: the record changed while the stop ran, so it may now name processes this stop did not handle"
+        );
+    }
+    if result
+        .and_then(|result| result.get("engine_stop_unconfirmed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let why = result
+            .and_then(|result| result.pointer("/engine_stop/error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("it did not answer");
+        let _ = writeln!(text, "  not confirmed: the engine's own stop failed: {why}");
+    }
+    let endpoint_key_kept = result
+        .and_then(|result| result.get("endpoint_key_kept"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if endpoint_key_kept {
+        let _ = writeln!(
+            text,
+            "  kept: the server record, which still names its processes, and its endpoint key, which the server may still be enforcing"
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "  kept: the server record, which still names its processes"
+        );
+    }
+    for (pid, _) in &unverified {
+        let _ = writeln!(
+            text,
+            "  check: `{}` shows whether process {pid} is still running; stop it yourself only if it belongs to this server",
+            process_check_command(*pid)
+        );
+    }
+    if record_changed {
+        let _ = writeln!(
+            text,
+            "  check: `rocm services` lists what the record names now"
+        );
+    }
+    text
+}
+
+/// A stock OS command that shows whether `pid` is running, for a process a
+/// stop left alone because it could not verify it. Not a `rocm` command: the
+/// CLI deliberately does not act on that process, so the user decides.
+///
+/// A Linux command because only Linux can produce that outcome: it needs a
+/// recorded start-time that can no longer be read back, and
+/// `rocm_core::process_start_ticks` records one only on Linux.
+fn process_check_command(pid: u64) -> String {
+    format!("ps -p {pid} -o pid,args")
+}
+
 /// A managed service's record exactly as it is on disk, without the engine-state
 /// and liveness refresh [`load_managed_service`] applies (and may persist).
 fn read_managed_service_manifest(
@@ -581,14 +737,7 @@ fn read_managed_service_manifest(
 ) -> Result<(ManagedServiceRecord, PathBuf)> {
     validate_service_id(service_id)?;
     let manifest_path = paths.service_manifest_path(service_id);
-    let bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "managed service `{service_id}` not found at {}",
-            manifest_path.display()
-        )
-    })?;
-    let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let mut record = ManagedServiceRecord::read_manifest(paths, service_id)?;
     record.normalize_paths_for_host();
     Ok((record, manifest_path))
 }
@@ -651,13 +800,7 @@ pub(crate) fn run_internal_sandbox_tool(
         }
         SandboxToolArg::StopServer => {
             let service_id = service_id.context("stop_server requires --service-id")?;
-            let result = stop_internal_managed_service(paths, &service_id)?;
-            serde_json::json!({
-                "tool": tool.as_cli_value(),
-                "status": "stopped",
-                "mutating": true,
-                "result": result,
-            })
+            internal_stop_server_value(stop_internal_managed_service(paths, &service_id)?)
         }
         SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires --service-id")?;
@@ -684,6 +827,44 @@ pub(crate) fn run_internal_sandbox_tool(
 /// after `SIGTERM` before escalating to `SIGKILL` and then reporting a timeout.
 const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// One recorded PID's fate in a managed stop: the role the record gave it, and
+/// what [`rocm_core::terminate_verified`] did about it. Kept per PID because the
+/// outcomes that leave a stop unconfirmed are reported differently: a
+/// `TimedOut` PID was signalled and it or a process under it outlived the
+/// deadline, while an `Unverified` one is not signalled by this stop, and the
+/// report names a command to check on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedPidOutcome {
+    pid: u32,
+    /// `supervisor`, `engine`, or `supervisor_and_engine` when the record names
+    /// one PID for both — the same labels `rocmd`'s `pid_outcomes` uses.
+    role: &'static str,
+    outcome: rocm_core::TerminationOutcome,
+}
+
+/// What a managed stop did to the processes its record names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RecordedStopTermination {
+    /// Every PID that received a signal, including one that then outlived the
+    /// deadline.
+    signaled_pids: Vec<u32>,
+    /// Whether every recorded process is confirmed no longer running.
+    all_stopped: bool,
+    pid_outcomes: Vec<RecordedPidOutcome>,
+}
+
+impl RecordedStopTermination {
+    /// A stop stand-in that confirms every recorded process gone without
+    /// signalling any, for tests in other modules that drive the real stop path.
+    #[cfg(test)]
+    pub(crate) fn confirmed_stopped() -> Self {
+        Self {
+            all_stopped: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Terminate the processes recorded for a managed service, verifying each PID's
 /// identity first so a recycled PID never causes an unrelated process tree to be
 /// killed.
@@ -692,43 +873,52 @@ const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 /// each PID is paired with **its own** start-time token (`supervisor_start_ticks`
 /// vs `engine_start_ticks`). When they resolve to the same PID (e.g. before the
 /// engine state has been refreshed) the entry is de-duplicated, preferring a
-/// known token. Returns the PIDs actually signalled and whether every recorded
-/// process is confirmed no longer running.
-fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, bool) {
-    // Build the (pid, own-token) work list, de-duplicating on PID and preferring
-    // an entry that carries a verifiable start-time.
-    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
-    for (pid, ticks) in [
-        (Some(record.supervisor_pid), record.supervisor_start_ticks),
-        (record.engine_pid, record.engine_start_ticks),
+/// known token. Returns the PIDs actually signalled, whether every recorded
+/// process is confirmed no longer running, and each PID's own outcome.
+fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> RecordedStopTermination {
+    // Build the (pid, own-token, role) work list, de-duplicating on PID and
+    // preferring an entry that carries a verifiable start-time.
+    let mut entries: Vec<(u32, Option<u64>, &'static str)> = Vec::new();
+    for (pid, ticks, role) in [
+        (
+            Some(record.supervisor_pid),
+            record.supervisor_start_ticks,
+            "supervisor",
+        ),
+        (record.engine_pid, record.engine_start_ticks, "engine"),
     ] {
         let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
             continue;
         };
-        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
+        if let Some(existing) = entries.iter_mut().find(|(seen, _, _)| *seen == pid) {
             if existing.1.is_none() {
                 existing.1 = ticks;
             }
+            existing.2 = "supervisor_and_engine";
         } else {
-            entries.push((pid, ticks));
+            entries.push((pid, ticks, role));
         }
     }
 
-    let mut signaled_pids = Vec::new();
-    let mut all_stopped = true;
-    for (pid, ticks) in entries {
+    let mut termination = RecordedStopTermination {
+        all_stopped: true,
+        ..RecordedStopTermination::default()
+    };
+    for (pid, ticks, role) in entries {
         let identity = rocm_core::ProcessIdentity::new(pid, ticks);
         // The managed stop contract is definitive: after the adapter gets its
         // graceful opportunity, this cleanup pass forces any verified survivor
         // so the command does not report success while a GPU worker remains.
-        let outcome = rocm_core::terminate_verified(
-            &identity,
-            rocm_core::KillScope::Tree,
-            MANAGED_STOP_GRACE,
-            true,
-        );
+        let outcome = scripted_stop_outcome().unwrap_or_else(|| {
+            rocm_core::terminate_verified(
+                &identity,
+                rocm_core::KillScope::Tree,
+                MANAGED_STOP_GRACE,
+                true,
+            )
+        });
         if !outcome.stopped() {
-            all_stopped = false;
+            termination.all_stopped = false;
         }
         // Report every PID that received a signal. TimedOut belongs here because
         // signalling was attempted even though the process was not confirmed
@@ -739,10 +929,37 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
                 | rocm_core::TerminationOutcome::Forced
                 | rocm_core::TerminationOutcome::TimedOut
         ) {
-            signaled_pids.push(pid);
+            termination.signaled_pids.push(pid);
         }
+        termination
+            .pid_outcomes
+            .push(RecordedPidOutcome { pid, role, outcome });
     }
-    (signaled_pids, all_stopped)
+    termination
+}
+
+/// E2E hook: when `ROCM_E2E_STOP_OUTCOME` is `timed_out` or `unverified`, a
+/// managed stop reports that outcome for every recorded PID without signalling
+/// anything.
+///
+/// Neither outcome can be staged from outside the binary: `TimedOut` needs a
+/// process that survives `SIGKILL`, and `Unverified` one whose recorded
+/// start-time cannot be read back. Without this seam the "stop not confirmed"
+/// report, its exit status and what it keeps on disk have no live coverage.
+/// The recorded process is left untouched. Compiled only into the
+/// `e2e-test-hooks` binary; production builds never see it.
+#[cfg(feature = "e2e-test-hooks")]
+fn scripted_stop_outcome() -> Option<rocm_core::TerminationOutcome> {
+    match std::env::var("ROCM_E2E_STOP_OUTCOME").ok()?.trim() {
+        "timed_out" => Some(rocm_core::TerminationOutcome::TimedOut),
+        "unverified" => Some(rocm_core::TerminationOutcome::Unverified),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn scripted_stop_outcome() -> Option<rocm_core::TerminationOutcome> {
+    None
 }
 
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
@@ -760,7 +977,7 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
 pub(crate) fn stop_internal_managed_service_with(
     paths: &AppPaths,
     service_id: &str,
-    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+    terminate: impl FnOnce(&ManagedServiceRecord) -> RecordedStopTermination,
 ) -> Result<serde_json::Value> {
     stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
         .map(|(report, _)| report)
@@ -774,7 +991,7 @@ pub(crate) fn stop_internal_managed_service_with(
 fn stop_internal_managed_service_confirmed_with(
     paths: &AppPaths,
     service_id: &str,
-    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+    terminate: impl FnOnce(&ManagedServiceRecord) -> RecordedStopTermination,
 ) -> Result<(serde_json::Value, bool)> {
     let mut stopping = load_managed_service(paths, service_id)?;
     // Record the request on disk before anything is stopped, not only after.
@@ -802,7 +1019,11 @@ fn stop_internal_managed_service_confirmed_with(
             },
         )
     };
-    let (signaled_pids, terminated_all) = terminate(&stopping);
+    let RecordedStopTermination {
+        signaled_pids,
+        all_stopped: terminated_all,
+        pid_outcomes,
+    } = terminate(&stopping);
     // Re-read the record rather than write back the copy loaded before the
     // stop, which can be some forty seconds old by now: `write` replaces the
     // whole file, and a supervisor, the daemon's restart or another stop may
@@ -826,8 +1047,8 @@ fn stop_internal_managed_service_confirmed_with(
     // supervisor that follows it, so a failed `Stop` leaves the stop unconfirmed.
     let engine_stop_confirms =
         !rocm_core::engine_stop_decides_confirmation(&stopping.engine) || engine_stop.is_ok();
-    let all_stopped =
-        terminated_all && stopping.names_same_processes(&record) && engine_stop_confirms;
+    let record_changed = !stopping.names_same_processes(&record);
+    let all_stopped = terminated_all && !record_changed && engine_stop_confirms;
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
@@ -852,6 +1073,15 @@ fn stop_internal_managed_service_confirmed_with(
     if all_stopped {
         endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
     }
+    // `endpoint_key_kept`: whether this unconfirmed stop left a *usable* key —
+    // one the server may still be enforcing — on disk. Usable as
+    // `endpoint_api_key` decides it, the same test the managed spawn applies
+    // before handing a key to the engine: an empty or malformed key file is no
+    // key, because nothing enforces it. A loopback service started without
+    // `--require-api-key` never had one. The unconfirmed report names the key
+    // only when this is set.
+    let endpoint_key_kept =
+        !all_stopped && endpoint_keys::endpoint_api_key(paths, &record.service_id).is_some();
     let engine_stop = match engine_stop {
         Ok(response) => serde_json::json!({
             "attempted": true,
@@ -868,8 +1098,56 @@ fn stop_internal_managed_service_confirmed_with(
         "status": record.status,
         "engine_stop": engine_stop,
         "signaled_pids": signaled_pids,
+        "pid_outcomes": pid_outcomes
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "pid": entry.pid,
+                    "role": entry.role,
+                    "outcome": entry.outcome.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "record_changed": record_changed,
+        // A container engine is confirmed stopped by its own `Stop`; when that
+        // failed, the verdict is unconfirmed whatever the PIDs did.
+        "engine_stop_unconfirmed": !engine_stop_confirms,
+        "endpoint_key_kept": endpoint_key_kept,
+        "stopped": all_stopped,
     });
     Ok((report, all_stopped))
+}
+
+/// Whether a [`stop_internal_managed_service`] report confirms that every
+/// recorded process is gone. A report without the verdict counts as
+/// unconfirmed, so a missing field can never read as a completed stop. Same
+/// rule as `rocmd`'s `stop_report_confirmed`.
+fn stop_report_confirmed(report: &serde_json::Value) -> bool {
+    report.get("stopped").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// The `stop_server` sandbox tool's answer for a stop report: `stopped` only
+/// when the stop confirmed it, `stop_unconfirmed` otherwise — the same status
+/// `rocmd`'s `stop_server` tool reports, taken from the same verdict that
+/// decided what the stop wrote to the record.
+pub(crate) fn internal_stop_server_value(report: serde_json::Value) -> serde_json::Value {
+    let status = if stop_report_confirmed(&report) {
+        "stopped"
+    } else {
+        "stop_unconfirmed"
+    };
+    serde_json::json!({
+        "tool": SandboxToolArg::StopServer.as_cli_value(),
+        "status": status,
+        "mutating": true,
+        "result": report,
+    })
+}
+
+/// Whether a `stop_server` tool answer reports a stop it could not confirm.
+pub(crate) fn service_stop_unconfirmed(value: &serde_json::Value) -> bool {
+    let output = value.get("output").unwrap_or(value);
+    output.get("status").and_then(serde_json::Value::as_str) == Some("stop_unconfirmed")
 }
 
 fn unload_lemonade_service_model(record: &ManagedServiceRecord) -> Result<()> {
@@ -989,7 +1267,7 @@ fn restart_internal_managed_service_with(
     paths: &AppPaths,
     service_id: &str,
     runtime_pin: Option<&str>,
-    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+    terminate: impl FnOnce(&ManagedServiceRecord) -> RecordedStopTermination,
 ) -> Result<ManagedServiceRecord> {
     restart_internal_managed_service_inner(paths, service_id, runtime_pin, terminate, None)
 }
@@ -1004,6 +1282,16 @@ fn restart_readiness_timeout() -> Duration {
     Duration::from_secs(45)
 }
 
+/// How long a restart waits for the launch lock once its stop has completed.
+#[allow(clippy::missing_const_for_fn)] // not const under `cfg(test)`, where a test shortens it
+fn restart_launch_lock_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = tests::LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    rocm_core::MANAGED_LAUNCH_LOCK_TIMEOUT
+}
+
 /// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
 /// through `rocm_core::spawn_detached_no_inherit`). Test-only seam, so a test
 /// can observe the leased port at the exact instant production would spawn.
@@ -1014,7 +1302,7 @@ fn restart_internal_managed_service_inner(
     paths: &AppPaths,
     service_id: &str,
     runtime_pin: Option<&str>,
-    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+    terminate: impl FnOnce(&ManagedServiceRecord) -> RecordedStopTermination,
     spawn_override: Option<&RestartSpawnOverride<'_>>,
 ) -> Result<ManagedServiceRecord> {
     #[cfg(windows)]
@@ -1071,10 +1359,22 @@ fn restart_internal_managed_service_inner(
     // Close that gap the same way a fresh launch and `rocmd` recovery do —
     // under the shared launch lock, with a re-check against the disk and a
     // loopback preflight — so a concurrent launch or recovery can't claim this
-    // exact port out from under the restart. Unbounded, like every other
-    // CLI-side acquire of this lock (see `FileLock::acquire_bounded`'s doc
-    // comment for why only `rocmd`'s recovery bounds its wait).
-    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+    // exact port out from under the restart. Bounded, unlike `rocm serve`'s
+    // acquire of the same lock: the stop above has already happened, so a wedged
+    // holder would otherwise leave the service down with nothing on screen. On
+    // timeout the error says the service is stopped and names the command that
+    // brings it back.
+    let launch_lock = rocm_core::FileLock::acquire_bounded(
+        paths.managed_launch_lock_path(),
+        restart_launch_lock_timeout(),
+    )
+    .with_context(|| {
+        format!(
+            "`{service_id}` was stopped but NOT restarted: the launch lock stayed busy; once the \
+             launch holding it finishes, run `{}`",
+            service_hints::service_action_hint("restart", service_id)
+        )
+    })?;
     if let Some(collision) = load_managed_services(paths)
         .context("failed to re-read managed services under the launch lock")?
         .into_iter()
@@ -1394,12 +1694,13 @@ pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<
     Ok(lines.into_iter().collect())
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
 
     use super::*;
     use crate::providers;
     use crate::runtime_services;
+    use crate::services_cmd::finish_service_action;
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, ScopedTestEnv, plant_service_record_on_runtime,
         test_paths,
@@ -1693,6 +1994,51 @@ mod tests {
         );
 
         assert_eq!(rendered, "Install (error): line one");
+    }
+
+    /// `logs`, `stop` and `restart` for an id with no record all fail with the
+    /// shared not-found error alone — one plain line, no OS cause under it.
+    /// `remove` and `rocm logs --service` reach the same `load_managed_service`.
+    #[test]
+    fn service_commands_report_an_unknown_id_without_an_os_cause() -> Result<()> {
+        let (root, paths) = test_paths("service-unknown-id");
+        paths.ensure()?;
+        let expected = "No local server named `nope`. See `rocm services list --all`.";
+        let errors = [
+            render_service_logs_text(&paths, "nope").map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::StopServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::RestartServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+        ];
+        for error in errors {
+            let error = error.expect_err("no record exists for `nope`");
+            assert!(
+                error
+                    .downcast_ref::<rocm_core::ManagedServiceNotFound>()
+                    .is_some(),
+                "{error:?}"
+            );
+            // anyhow appends a backtrace when RUST_BACKTRACE is set, as CI does.
+            let rendered = format!("{error:?}");
+            let rendered = rendered
+                .split_once("\n\nStack backtrace:")
+                .map_or(rendered.as_str(), |(message, _)| message);
+            assert_eq!(rendered, expected);
+        }
+        assert!(!paths.service_manifest_path("nope").exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -2250,7 +2596,7 @@ mod tests {
         let report = stop_internal_managed_service_with(&paths, service_id, |_| {
             let on_disk = on_disk();
             seen_at_signal.set(Some(on_disk.stop_requested_unix_ms));
-            (Vec::new(), false)
+            bare_termination(Vec::new(), false)
         })
         .unwrap();
 
@@ -2318,7 +2664,7 @@ mod tests {
             restarted.supervisor_start_ticks = Some(7);
             restarted.stop_requested_unix_ms = None;
             restarted.write().unwrap();
-            (Vec::new(), true)
+            bare_termination(Vec::new(), true)
         })
         .unwrap();
 
@@ -2352,8 +2698,10 @@ mod tests {
         record.write().unwrap();
         endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
 
-        let report =
-            stop_internal_managed_service_with(&paths, service_id, |_| (Vec::new(), true)).unwrap();
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
         drop(env);
 
         let on_disk = raw_manifest(&paths, service_id);
@@ -2364,6 +2712,21 @@ mod tests {
         // refresh to settle, rather than cleared as for a confirmed stop.
         assert!(on_disk.stop_requested_unix_ms.is_some());
         assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+        // The report gives the engine's failed stop as its reason, since no
+        // PID outcome and no record change explains it.
+        assert_eq!(report["engine_stop_unconfirmed"], true, "{report}");
+        let rendered =
+            render_service_action_result("stop_server", &internal_stop_server_value(report));
+        assert!(
+            rendered.contains("Local server stop not confirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("not confirmed: the engine's own stop failed: "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("and its endpoint key"), "{rendered}");
+        assert_no_retry_line(&rendered);
     }
 
     #[test]
@@ -2380,7 +2743,7 @@ mod tests {
             let mut meanwhile = raw_manifest(&paths, service_id);
             meanwhile.restart_count = 7;
             meanwhile.write().unwrap();
-            (Vec::new(), true)
+            bare_termination(Vec::new(), true)
         })
         .unwrap();
 
@@ -2392,6 +2755,344 @@ mod tests {
         assert_eq!(on_disk.stop_requested_unix_ms, None);
         assert_eq!(on_disk.restart_count, 7, "a concurrent write survives");
         assert_eq!(key, None, "a confirmed stop drops the key");
+    }
+
+    #[test]
+    fn services_stop_reports_an_unconfirmed_stop_as_an_error_and_keeps_the_service() {
+        // `rocm services stop --yes` printed "Local server stopped" and exited 0
+        // from the tool name alone, even when the stop could not confirm the
+        // recorded process gone and so kept the record, its stop request and
+        // the endpoint key. The answer now carries the stop's own verdict: the
+        // message, the exit and the state on disk are checked together here.
+        let (root, paths) = test_paths("services-stop-unconfirmed");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-unconfirmed";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            timed_out_termination(999_999_999)
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let audit = last_audit_event(&paths);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
+        assert_eq!(answer["result"]["stopped"], false, "{answer}");
+        let rendered = format!(
+            "{:#}",
+            outcome.expect_err("an unconfirmed stop must not exit as a success")
+        );
+        assert!(
+            !rendered.contains("Local server stopped"),
+            "claims a stop that was not confirmed: {rendered}"
+        );
+        assert!(
+            rendered.contains("Local server stop not confirmed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("signaled processes: 1"), "{rendered}");
+        assert!(
+            rendered.contains("still running: process 999999999 (supervisor_and_engine)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("kept: the server record, which still names its processes, and its endpoint key, which the server may still be enforcing"),
+            "{rendered}"
+        );
+        assert_no_retry_line(&rendered);
+        assert!(
+            rendered.contains(
+                "process 999999999 (supervisor_and_engine) or a process under it did not exit"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("check:"), "{rendered}");
+        assert!(
+            !rendered.contains("status:"),
+            "a record status would contradict the header: {rendered}"
+        );
+        assert_eq!(audit["level"], "error", "{audit}");
+        assert_eq!(audit["action"], "stop_server", "{audit}");
+        assert_eq!(
+            audit["message"],
+            format!("stop of managed service {service_id} not confirmed"),
+            "{audit}"
+        );
+        // The claims in that message, checked against the state they describe.
+        assert_eq!(
+            on_disk.supervisor_pid, 999_999_999,
+            "the record still names the process"
+        );
+        assert!(
+            on_disk.stop_requested_unix_ms.is_some(),
+            "the stop request stays recorded"
+        );
+        assert_eq!(key.as_deref(), Some("key-123"), "the endpoint key is kept");
+    }
+
+    /// No line of an unconfirmed-stop report offers a command to run the stop
+    /// again — no `retry:` line, and no `services stop` anywhere: a second stop
+    /// can confirm without reaching a surviving process under the recorded one.
+    pub(crate) fn assert_no_retry_line(rendered: &str) {
+        assert!(
+            !rendered.lines().any(|line| {
+                line.trim_start().starts_with("retry:") || line.contains("services stop")
+            }),
+            "an unconfirmed stop names no stop command: {rendered}"
+        );
+    }
+
+    /// A stop stand-in's bare verdict, without per-PID detail.
+    fn bare_termination(signaled_pids: Vec<u32>, all_stopped: bool) -> RecordedStopTermination {
+        RecordedStopTermination {
+            signaled_pids,
+            all_stopped,
+            pid_outcomes: Vec::new(),
+        }
+    }
+
+    /// A stop stand-in whose one recorded process (the record's shared
+    /// supervisor/engine PID) was signalled and outlived the deadline.
+    fn timed_out_termination(pid: u32) -> RecordedStopTermination {
+        RecordedStopTermination {
+            signaled_pids: vec![pid],
+            all_stopped: false,
+            pid_outcomes: vec![RecordedPidOutcome {
+                pid,
+                role: "supervisor_and_engine",
+                outcome: rocm_core::TerminationOutcome::TimedOut,
+            }],
+        }
+    }
+
+    /// The most recent audit event written under `paths`.
+    fn last_audit_event(paths: &AppPaths) -> serde_json::Value {
+        let text = fs::read_to_string(paths.audit_events_path()).expect("audit log");
+        serde_json::from_str(text.lines().last().expect("an audit event")).expect("audit json")
+    }
+
+    #[test]
+    fn services_stop_reports_an_unverified_process_with_a_check() {
+        // A process whose recorded start-time cannot be read back is not
+        // signalled by this stop; the report says so and names a command to
+        // check on it.
+        let (root, paths) = test_paths("services-stop-unverified");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-unverified";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report =
+            stop_internal_managed_service_with(&paths, service_id, |_| RecordedStopTermination {
+                signaled_pids: Vec::new(),
+                all_stopped: false,
+                pid_outcomes: vec![RecordedPidOutcome {
+                    pid: 999_999_999,
+                    role: "supervisor_and_engine",
+                    outcome: rocm_core::TerminationOutcome::Unverified,
+                }],
+            })
+            .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!("{:#}", outcome.expect_err("an unverified stop fails"));
+        assert!(
+            rendered.contains("Local server stop not confirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("not signaled: process 999999999 (supervisor_and_engine)"),
+            "{rendered}"
+        );
+        assert_no_retry_line(&rendered);
+        assert!(
+            rendered.contains(&format!("check: `{}`", process_check_command(999_999_999))),
+            "{rendered}"
+        );
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+        assert_eq!(on_disk.supervisor_pid, 999_999_999);
+        assert_eq!(key.as_deref(), Some("key-123"));
+    }
+
+    #[test]
+    fn services_stop_notes_a_changed_record_even_when_a_process_timed_out() {
+        // Process A timed out, then a restart recorded B: the report must say
+        // the record changed, beside A's own line.
+        let (root, paths) = test_paths("services-stop-timeout-then-changed");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-timeout-then-changed";
+        stop_test_record(&paths, service_id).write().unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut restarted = raw_manifest(&paths, service_id);
+            restarted.supervisor_pid = 4_242_424;
+            restarted.supervisor_start_ticks = Some(7);
+            restarted.write().unwrap();
+            timed_out_termination(999_999_999)
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!("{:#}", outcome.expect_err("unconfirmed"));
+        assert!(
+            rendered.contains("the record changed while the stop ran"),
+            "{rendered}"
+        );
+        assert_no_retry_line(&rendered);
+    }
+
+    #[test]
+    fn services_stop_gives_a_mixed_result_a_line_each_and_a_check() {
+        let (root, paths) = test_paths("services-stop-mixed");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-mixed";
+        let mut record = stop_test_record(&paths, service_id);
+        record.engine_pid = Some(888_888_888);
+        record.write().unwrap();
+
+        let report =
+            stop_internal_managed_service_with(&paths, service_id, |_| RecordedStopTermination {
+                signaled_pids: vec![999_999_999],
+                all_stopped: false,
+                pid_outcomes: vec![
+                    RecordedPidOutcome {
+                        pid: 999_999_999,
+                        role: "supervisor",
+                        outcome: rocm_core::TerminationOutcome::TimedOut,
+                    },
+                    RecordedPidOutcome {
+                        pid: 888_888_888,
+                        role: "engine",
+                        outcome: rocm_core::TerminationOutcome::Unverified,
+                    },
+                ],
+            })
+            .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!("{:#}", outcome.expect_err("unconfirmed"));
+        assert_no_retry_line(&rendered);
+        assert!(
+            rendered.contains("check: `ps -p 888888888 -o pid,args`"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("the record changed"), "{rendered}");
+    }
+
+    #[test]
+    fn services_stop_mentions_no_endpoint_key_for_a_keyless_service() {
+        // A loopback service started without `--require-api-key` has no key, so
+        // an unconfirmed stop of it keeps only the record; the report must not
+        // claim it kept a key.
+        let (root, paths) = test_paths("services-stop-keyless");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-keyless";
+        stop_test_record(&paths, service_id).write().unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            timed_out_termination(999_999_999)
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!("{:#}", outcome.expect_err("unconfirmed"));
+        assert_eq!(answer["result"]["endpoint_key_kept"], false, "{answer}");
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "  kept: the server record, which still names its processes"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("endpoint key"), "{rendered}");
+        assert_eq!(key, None, "there was no key to keep");
+        assert_eq!(on_disk.supervisor_pid, 999_999_999, "the record is kept");
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+    }
+
+    #[test]
+    fn services_stop_reports_a_changed_record_with_a_note() {
+        // Every process the stop handled is gone, but the record names others
+        // now: the verdict says nothing about them, and the report says so.
+        let (root, paths) = test_paths("services-stop-record-changed");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-record-changed";
+        stop_test_record(&paths, service_id).write().unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut restarted = raw_manifest(&paths, service_id);
+            restarted.supervisor_pid = 4_242_424;
+            restarted.supervisor_start_ticks = Some(7);
+            restarted.write().unwrap();
+            bare_termination(Vec::new(), true)
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!(
+            "{:#}",
+            outcome.expect_err("a changed record is unconfirmed")
+        );
+        assert!(
+            rendered.contains("the record changed while the stop ran"),
+            "{rendered}"
+        );
+        assert_no_retry_line(&rendered);
+        assert!(
+            rendered.contains("check: `rocm services` lists what the record names now"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn services_stop_reports_a_confirmed_stop_as_stopped() {
+        let (root, paths) = test_paths("services-stop-confirmed");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-confirmed";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            bare_termination(vec![4242], true)
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(answer["status"], "stopped", "{answer}");
+        let rendered = outcome.expect("a confirmed stop succeeds");
+        assert!(rendered.contains("Local server stopped"), "{rendered}");
+        assert!(rendered.contains("stopped processes: 1"), "{rendered}");
+        assert_eq!(on_disk.status, "stopped");
+        assert_eq!(on_disk.stop_requested_unix_ms, None);
+        assert_eq!(key, None, "a confirmed stop drops the key");
+    }
+
+    #[test]
+    fn services_stop_reports_a_report_without_a_verdict_as_unconfirmed() {
+        let answer = internal_stop_server_value(serde_json::json!({
+            "service_id": "svc-legacy",
+            "status": "ready",
+            "signaled_pids": [],
+        }));
+        assert_eq!(answer["status"], "stop_unconfirmed", "{answer}");
     }
 
     #[test]
@@ -2408,7 +3109,7 @@ mod tests {
         endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
 
         let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
-            (vec![999_999_999], false)
+            bare_termination(vec![999_999_999], false)
         });
 
         let on_disk = raw_manifest(&paths, service_id);
@@ -2603,7 +3304,7 @@ mod tests {
                 started_tx.send(()).expect("signal about to restart");
                 let outcome =
                     restart_internal_managed_service_with(&paths, service_id, None, |_| {
-                        (Vec::new(), true)
+                        bare_termination(Vec::new(), true)
                     });
                 let _ = done_tx.send(outcome.map_err(|error| format!("{error:#}")));
             });
@@ -2653,6 +3354,50 @@ mod tests {
         Ok(())
     }
 
+    /// The restart's stop has already happened by the time it waits for the
+    /// launch lock, so a holder that never lets go must not leave the service
+    /// down silently: the wait is bounded, and the error says what state the
+    /// service is in and names a command that clears it. Both claims are
+    /// asserted against the real record and the real CLI hint.
+    #[test]
+    fn restart_gives_up_on_a_stuck_launch_lock_and_says_the_service_is_stopped() -> Result<()> {
+        let (root, paths) = test_paths("restart-launch-lock-timeout");
+        paths.ensure()?;
+        let service_id = "svc-restart-launch-lock-timeout";
+        stop_test_record(&paths, service_id).write()?;
+        let holder = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(Duration::from_millis(100))));
+        let started = std::time::Instant::now();
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            bare_termination(Vec::new(), true)
+        });
+        LAUNCH_LOCK_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+        let waited = started.elapsed();
+        drop(holder);
+        let (record, _) = read_managed_service_manifest(&paths, service_id)?;
+        let _ = fs::remove_dir_all(root);
+
+        let message = format!(
+            "{:#}",
+            result.expect_err("a stuck lock must fail the restart")
+        );
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        assert!(message.contains("stopped but NOT restarted"), "{message}");
+        assert!(
+            message.contains(&service_hints::service_action_hint("restart", service_id)),
+            "{message}"
+        );
+        // The claim the message makes: the service really is stopped, and no
+        // replacement child was started behind the failed wait.
+        assert_eq!(record.status, "stopped");
+        assert_eq!(
+            record.supervisor_pid, 999_999_999,
+            "no new supervisor may be recorded behind the failed wait"
+        );
+        Ok(())
+    }
+
     /// The disk re-check above only catches a recorded competitor. Something
     /// bound to the exact port without ever publishing a manifest for it — a
     /// stray process, a one-off `nc -l` — would sail through that check; only
@@ -2670,8 +3415,9 @@ mod tests {
 
         let _blocker = std::net::TcpListener::bind(("127.0.0.1", port))?;
 
-        let result =
-            restart_internal_managed_service_with(&paths, service_id, None, |_| (Vec::new(), true));
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            bare_termination(Vec::new(), true)
+        });
 
         let _ = fs::remove_dir_all(root);
         let error =
@@ -2719,7 +3465,7 @@ mod tests {
             &paths,
             service_id,
             None,
-            |_| (Vec::new(), true),
+            |_| bare_termination(Vec::new(), true),
             Some(spawn),
         );
         let _ = fs::remove_dir_all(root);
@@ -2799,7 +3545,7 @@ mod tests {
             &paths,
             service_id,
             None,
-            |_| (Vec::new(), true),
+            |_| bare_termination(Vec::new(), true),
             Some(spawn),
         );
 
@@ -2813,6 +3559,10 @@ mod tests {
     }
 
     thread_local! {
+        /// Lets a test shorten the restart's launch-lock wait.
+        pub(super) static LAUNCH_LOCK_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+            const { std::cell::Cell::new(None) };
+
         /// Lets a test that lets a restart reach its readiness wait shorten it.
         pub(super) static READINESS_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
             const { std::cell::Cell::new(None) };
@@ -2858,7 +3608,7 @@ mod tests {
             &paths,
             service_id,
             None,
-            |_| (Vec::new(), true),
+            |_| bare_termination(Vec::new(), true),
             Some(spawn),
         );
         READINESS_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
@@ -2915,7 +3665,7 @@ mod tests {
             &paths,
             service_id,
             None,
-            |_| (Vec::new(), true),
+            |_| bare_termination(Vec::new(), true),
             Some(spawn),
         );
         let _ = fs::remove_dir_all(root);
@@ -3203,7 +3953,11 @@ mod tests {
         let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
         let record = managed_record_for_pid(&paths, pid, Some(real.wrapping_add(1)));
 
-        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+        let RecordedStopTermination {
+            signaled_pids: signaled,
+            all_stopped,
+            ..
+        } = terminate_recorded_service_pids(&record);
 
         assert!(signaled.is_empty(), "must not signal a mismatched identity");
         // A recycled PID means the recorded service process itself is gone.
@@ -3237,7 +3991,11 @@ mod tests {
         record.engine_pid = Some(eng_pid);
         record.engine_start_ticks = rocm_core::process_start_ticks(eng_pid);
 
-        let (mut signaled, all_stopped) = terminate_recorded_service_pids(&record);
+        let RecordedStopTermination {
+            signaled_pids: mut signaled,
+            all_stopped,
+            ..
+        } = terminate_recorded_service_pids(&record);
         signaled.sort_unstable();
         let mut expected = vec![sup_pid, eng_pid];
         expected.sort_unstable();
@@ -3265,7 +4023,11 @@ mod tests {
         let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
         let record = managed_record_for_pid(&paths, pid, Some(real));
 
-        let (signaled, all_stopped) = terminate_recorded_service_pids(&record);
+        let RecordedStopTermination {
+            signaled_pids: signaled,
+            all_stopped,
+            ..
+        } = terminate_recorded_service_pids(&record);
 
         assert_eq!(signaled, vec![pid]);
         assert!(all_stopped);

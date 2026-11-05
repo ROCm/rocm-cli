@@ -42,6 +42,7 @@ use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// Engine inventory — index 0 is the automatic choice.
 ///
@@ -323,15 +324,9 @@ impl ServeWizardState {
 
     /// Direct typing only applies to the Model row; Host and the custom port
     /// are edited through the explicit inline editor.
-    fn type_char(&mut self, c: char) {
+    fn edit_text(&mut self, code: KeyCode) {
         if self.current_field() == Field::Model {
-            self.model.push(c);
-        }
-    }
-
-    fn backspace(&mut self) {
-        if self.current_field() == Field::Model {
-            self.model.pop();
+            apply_char_key(&mut self.model, code);
         }
     }
 
@@ -568,9 +563,7 @@ pub fn on_key(
             }
             _ => w.move_field(1),
         },
-        KeyCode::Backspace => w.backspace(),
-        KeyCode::Char(c) => w.type_char(c),
-        _ => {}
+        code => w.edit_text(code),
     }
     Vec::new()
 }
@@ -1858,7 +1851,7 @@ mod tests {
 
     // This only pins the shared constant into the approval body; the CLI's own
     // plan output proves the phrase actually appears before the resolved
-    // endpoint, in `serve-auto-port-skips-occupied` (serve-31).
+    // endpoint, in `serve-auto-port-skips-occupied` (serve-45).
     #[test]
     fn approval_shows_exact_argv_and_the_automatic_port_phrase() {
         let mut w = ServeWizardState {
@@ -1915,6 +1908,39 @@ mod tests {
         assert!(fx.is_empty());
         assert!(wiz.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_the_model_field_only_through_on_key() {
+        // Host and the custom port are edited through the explicit inline
+        // editor (see the `*_editor_*` tests), so direct typing on those rows
+        // must not change them.
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        {
+            let w = wiz.as_mut().unwrap();
+            w.model.clear();
+            w.advanced_expanded = true;
+        }
+        let (host_before, port_before) = {
+            let w = wiz.as_ref().unwrap();
+            (w.host.clone(), w.port.clone())
+        };
+        for (field, text) in [
+            (Field::Model, "ab"),
+            (Field::Host, "cd"),
+            (Field::Port, "12"),
+        ] {
+            wiz.as_mut().unwrap().focus(field);
+            for k in typed(text) {
+                on_key(&mut wiz, &mut jobs, &[], k);
+            }
+            on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Backspace));
+        }
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "a");
+        assert_eq!(w.host, host_before);
+        assert_eq!(w.port, port_before);
     }
 
     #[test]

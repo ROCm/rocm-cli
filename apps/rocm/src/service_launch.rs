@@ -15,20 +15,19 @@
 //! action of the service-record-management cluster (this module reaches only
 //! stop, via `AttachOutcome::Stop`; restart/remove/prune are not called here)
 //! — and this later pass (ROCMAI-91, Phase 6b) separates the spawning tail out
-//! from them; they stay at the crate root (see below).
+//! from them; see below for where they live now.
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
-//! services(command)` doesn't call anything in this cluster directly, and
-//! `ServicesCommand`/`services()` stay in `main.rs` (a dedicated clap
-//! subcommand's enum and dispatch function usually do, per
-//! `docs/architecture.md`'s convention note). `record_cli_audit_event`,
-//! `existing_live_managed_service_in`, and the broader "service record management"
-//! cluster (stop/restart/remove/prune, reached from `services()`; stop/restart
-//! are also reachable from the chat/LLM sandbox tool-calling path) stay at the
-//! crate root too — reached via `crate::`, same as other mechanically relocated
-//! modules. Several functions here are `pub(crate)` specifically because
-//! `main.rs`, `serve_cmd.rs`, and `automations.rs` all call into this cluster
-//! across the new module boundary.
+//! services(command)` doesn't call anything in this cluster directly.
+//! `ServicesCommand` stays in `main.rs` (a dedicated clap subcommand's enum
+//! usually does, per `docs/architecture.md`'s convention note). Since this
+//! split, `services()` has moved to `services_cmd.rs`, the record removal and
+//! pruning it dispatches to to `service_records.rs`, `record_cli_audit_event`
+//! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
+//! a re-import in `main.rs`), and `existing_live_managed_service_in` (which the port allocation transaction
+//! here uses) to `managed_service_status.rs`. Several functions here are `pub(crate)`
+//! because other modules call into this cluster across the module boundary;
+//! `main.rs` only declares the module.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -60,7 +59,10 @@ use crate::managed_service_status::{
 use crate::serve_port;
 use crate::service_hints;
 use crate::services_text::read_optional_tail_lines;
-use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::services_text::{
+    render_service_action_result, render_service_action_result_with_helper_note,
+    run_internal_sandbox_tool, service_stop_unconfirmed,
+};
 use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
@@ -405,10 +407,11 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// Order matters: a spawned child is terminated *first*, so it is not still
 /// holding the port or writing to the log by the time cleanup runs. The
 /// termination outcome is audited but not acted on: the record is marked
-/// `failed` (releasing the port) even when death was not confirmed. If no child was ever spawned (`record.engine_pid` is still `None`),
+/// abandoned (`stopped`, releasing the port) even when death was not confirmed. If no child was ever spawned (`record.engine_pid` is still `None`),
 /// every artifact this attempt created is removed: there is nothing for
 /// `rocm services`/`rocm logs` to show. If a child did run, its record and log
-/// are kept instead (marked `status = "failed"`), since the error that led here
+/// are kept instead (marked `status = "stopped"`, see
+/// [`ManagedServiceRecord::mark_launch_abandoned`]), since the error that led here
 /// already told the user to go inspect that log; only the endpoint key, which a
 /// failed attempt has no use for, is cleared.
 /// Every step is best-effort and idempotent; cleanup must never mask the
@@ -432,9 +435,9 @@ fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord
             ),
             Some(&record.service_id),
         );
-        let mut failed = record.clone();
-        failed.status = "failed".to_owned();
-        let _ = failed.write();
+        let mut abandoned = record.clone();
+        abandoned.mark_launch_abandoned();
+        let _ = abandoned.write();
         endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
         return;
     }
@@ -446,6 +449,108 @@ fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord
         let _ = fs::remove_file(path);
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+}
+
+/// The ways a live managed service that already matches on liveness, engine and
+/// canonical model id can still be unusable by this invocation.
+///
+/// Those three terms are necessary but not sufficient: three further terms can
+/// still refuse, one variant each. [`managed_service_reuse_refusal`] is the
+/// single decision procedure both callers ask, so the two cannot answer
+/// differently — which they previously did; see that function for what the
+/// disagreement cost.
+pub(crate) enum ManagedReuseRefusal {
+    /// The live service was started with different serve options.
+    RecipeMismatch,
+    /// `--require-api-key` was asked for and the live service has no key.
+    ///
+    /// The engine reads its key once, at launch, from the environment the spawn
+    /// builds — so a server started without one keeps serving anonymously no
+    /// matter what is written afterwards. Upgrading the record would be worse
+    /// than doing nothing: it would claim auth the live process does not
+    /// enforce, and `ensure_public_service_has_endpoint_key` would pass on the
+    /// strength of a key file nothing reads. `rocm remote serve` relies on this:
+    /// it publishes a loopback port onto the tailnet and prints "the API key
+    /// above is what stops anyone else calling it", which reusing an
+    /// unauthenticated service silently would make false about an endpoint the
+    /// whole tailnet can reach. Refusing is the only answer that fails closed.
+    MissingApiKey,
+    /// The live service runs under a device policy that does not satisfy this
+    /// invocation's. Reusing a `cpu_only` service to answer a `gpu_required`
+    /// serve is the silent CPU fallback AGENTS.md section 6 forbids.
+    DevicePolicyTooWeak,
+}
+
+/// Why this invocation cannot reuse `existing` — or `None` when it genuinely
+/// can. See [`ManagedReuseRefusal`] for the terms this answers on.
+///
+/// This exists because `serve()`'s reuse pre-gate lets a matching live service
+/// skip the no-usable-AMD-GPU refusal. Deciding that bypass on a *weaker* test
+/// than the spawn then uses to accept reuse produced a dead end: on a GPU-less
+/// host (`HIP_VISIBLE_DEVICES=` with a server live from another shell) a serve
+/// with different options bypassed the refusal, reached the spawn, and was told
+/// to stop the server and run the command again — and the rerun, with nothing
+/// left to reuse, hit the no-GPU refusal. The advice named a command that could
+/// not clear the condition, which AGENTS.md section 3 forbids. Sharing the
+/// predicate means a service that cannot actually be reused never buys the
+/// bypass, so the user gets the accurate refusal first and keeps their server.
+///
+/// `requested_device_policy` is taken by value, not as an `Option`, on purpose.
+/// It was optional so the spawn could opt out of the device-policy term, and
+/// that left two holes at once: the spawn's `DevicePolicyTooWeak` arm was
+/// unreachable (an untestable bail), and `serve()` — the caller that *does*
+/// gate the GPU refusal on this answer — could silently drop the term by
+/// passing `None`, with the whole suite still green. Both callers have a
+/// `DevicePolicy` in hand, so requiring it costs nothing and makes that
+/// mutation a compile error. It widens nothing observable today either: the
+/// only policy a record can carry is the one `parse_device_policy` admits
+/// (see below), so `existing.device_policy == Some("cpu_only")` is not
+/// reachable from any `rocm serve` this CLI can run.
+/// The `rocm serve` no-usable-GPU refusal, worded once.
+///
+/// Two places raise it and they must say the same thing: `serve()`'s fail-fast
+/// pre-flight, and the spawn below when the reuse that waived that pre-flight
+/// turns out not to be available after all.
+pub(crate) fn no_usable_gpu_refusal(device_policy: &DevicePolicy) -> String {
+    format!(
+        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
+         policy and does not fall back to CPU. Check the driver with `rocm examine`, \
+         confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
+         ROCR_VISIBLE_DEVICES are not masking every device.",
+        policy = device_policy_name(device_policy)
+    )
+}
+
+pub(crate) fn managed_service_reuse_refusal(
+    existing: &ManagedServiceRecord,
+    requested_recipe_json: Option<&str>,
+    require_api_key: bool,
+    requested_device_policy: &DevicePolicy,
+) -> Option<ManagedReuseRefusal> {
+    if existing.engine_recipe_json.as_deref() != requested_recipe_json {
+        return Some(ManagedReuseRefusal::RecipeMismatch);
+    }
+    if require_api_key && !existing.requires_api_key {
+        return Some(ManagedReuseRefusal::MissingApiKey);
+    }
+    // Only `gpu_required` can be let down by the record's policy, and the
+    // enumeration is exhaustive rather than narrow: `parse_device_policy`
+    // (`main.rs`) maps `auto`, `gpu`, `gpu_required` *and* `gpu_preferred` onto
+    // `GpuRequired`, and rejects `cpu_only` with an error, so `GpuRequired` is
+    // the only policy `serve()` can hand this predicate — pinned by
+    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`. There
+    // is deliberately no wider match on "anything but `CpuOnly`": it would be
+    // identical at runtime and would read as a guard against a `gpu_preferred`
+    // bypass that no CLI invocation can reach. A `cpu_only` invocation would be
+    // satisfied by anything anyway and never reaches the bail. README.md's
+    // "that is the only policy pair refused" is the contract, and this matches
+    // it exactly.
+    if matches!(requested_device_policy, DevicePolicy::GpuRequired)
+        && existing.device_policy.as_deref() == Some("cpu_only")
+    {
+        return Some(ManagedReuseRefusal::DevicePolicyTooWeak);
+    }
+    None
 }
 
 /// Spawn the detached engine child shared by the managed (background) and
@@ -474,6 +579,7 @@ fn spawn_managed_engine_child(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -506,12 +612,55 @@ fn spawn_managed_engine_child(
     )? {
         ManagedPortDecision::AlreadyLive(existing) => {
             let existing = *existing;
-            if existing.engine_recipe_json != requested_recipe_json {
-                bail!(
+            // Asked through the shared predicate rather than re-tested here, so this
+            // refusal and `serve()`'s reuse pre-gate cannot disagree about whether a
+            // service is reusable. When they disagreed, the pre-gate let a
+            // non-reusable service bypass the no-GPU refusal and the user was sent
+            // here to be told to stop a working server for nothing.
+            //
+            // The same device policy the serve path passes. This side used to pass
+            // `None` to keep the spawn's acceptance untouched, but that opted the
+            // spawn out of a term it has the input for, left its own
+            // `DevicePolicyTooWeak` bail unreachable, and made the serve path's
+            // argument droppable. Nothing observable widens: `parse_device_policy`
+            // is the only producer of a `DevicePolicy` on every path that reaches
+            // here and it rejects `cpu_only`, so no record this CLI writes can
+            // carry the policy this term refuses.
+            match managed_service_reuse_refusal(
+                &existing,
+                requested_recipe_json.as_deref(),
+                require_api_key,
+                device_policy,
+            ) {
+                Some(ManagedReuseRefusal::RecipeMismatch) => bail!(
                     "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
                     existing.service_id,
                     resolve.canonical_model_id
-                );
+                ),
+                Some(ManagedReuseRefusal::MissingApiKey) => bail!(
+                    "managed service `{}` is already running for engine `{engine}` and model `{}` \
+                     without authentication, and a running server cannot be given a key it did not \
+                     start with; stop it with `{}` and run the command again to \
+                     serve it with `--require-api-key`",
+                    existing.service_id,
+                    resolve.canonical_model_id,
+                    service_hints::service_stop_hint(&existing.service_id)
+                ),
+                // Reachable only from a record whose `device_policy` says
+                // `cpu_only`, which no `rocm serve` can write today
+                // (`parse_device_policy` refuses that policy outright) — so this is
+                // a guard against a record written by some future path, not a
+                // refusal users see now. The advice still names a command that
+                // clears the condition: stopping the service removes the only thing
+                // this term can object to, and the rerun then launches normally
+                // (AGENTS.md section 3).
+                Some(ManagedReuseRefusal::DevicePolicyTooWeak) => bail!(
+                    "managed service `{}` is already running under a device policy that cannot \
+                     satisfy this request; stop it with `{}` and run the command again",
+                    existing.service_id,
+                    service_hints::service_stop_hint(&existing.service_id)
+                ),
+                None => {}
             }
             // An explicit port is a demand, not a hint: reporting success on a
             // different port than the one asked for would silently drop it.
@@ -523,32 +672,6 @@ fn spawn_managed_engine_child(
                     existing.service_id,
                     resolve.canonical_model_id,
                     existing.port,
-                    service_hints::service_stop_hint(&existing.service_id)
-                );
-            }
-            // Reuse cannot satisfy a demand for auth the running server never got.
-            // The engine reads its key once, at launch, from the environment this
-            // function builds below — so a server started without one keeps serving
-            // anonymously no matter what is written afterwards. Upgrading the record
-            // here would be worse than doing nothing: the record would claim auth
-            // that the live process does not enforce, and
-            // `ensure_public_service_has_endpoint_key` would pass on the strength of
-            // a key file nothing reads.
-            //
-            // This is what `rocm remote serve` relies on. It publishes a loopback
-            // port onto the tailnet and prints "the API key above is what stops
-            // anyone else calling it". Reusing an unauthenticated service silently
-            // would make that sentence false about an endpoint the whole tailnet can
-            // reach. Refusing is the only answer that fails closed, and it is the
-            // same shape as the recipe mismatch above.
-            if require_api_key && !existing.requires_api_key {
-                bail!(
-                    "managed service `{}` is already running for engine `{engine}` and model `{}` \
-                     without authentication, and a running server cannot be given a key it did not \
-                     start with; stop it with `{}` and run the command again to \
-                     serve it with `--require-api-key`",
-                    existing.service_id,
-                    resolve.canonical_model_id,
                     service_hints::service_stop_hint(&existing.service_id)
                 );
             }
@@ -575,6 +698,19 @@ fn spawn_managed_engine_child(
         }
         ManagedPortDecision::Lease(lease) => lease,
     };
+
+    // Nothing live to reuse — and if the only reason this invocation got past
+    // `serve()`'s no-usable-GPU pre-flight was a reusable service, that premise
+    // has just been falsified. `serve()` decided it from a snapshot taken before
+    // GPU selection and the launch lock; the check above is the authoritative
+    // one, so a service that died in between (an OOM, say) would otherwise fall
+    // through to a real spawn on a host with no usable GPU, and the user would
+    // get whatever the engine says about having no device instead of the
+    // actionable refusal the pre-flight exists to give. Raise it here, where the
+    // premise is known to be false.
+    if gpu_refusal_waived_for_reuse {
+        bail!("{}", no_usable_gpu_refusal(device_policy));
+    }
 
     let mut record = ManagedServiceRecord::new(
         paths,
@@ -823,6 +959,108 @@ fn launch_managed_engine_child_locked(
     Ok(child_pid)
 }
 
+/// Test-only fault-injection switch, off (`const false`) in shipped binaries:
+/// the `e2e-oom-fault-injection` feature is enabled only by the `xtask e2e`
+/// mock-lane build, never by the release build. When enabled and
+/// `ROCM_E2E_SIMULATE_OOM_LAUNCH=1` is set on the process, `rocm serve` fabricates
+/// the on-disk state of a managed vLLM launch that spawned, wrote an
+/// out-of-memory traceback to the log it owns, and never became ready — so the
+/// positive OOM-guidance summary path can be verified on a GPU-less CI host,
+/// where a real launch cannot run. See [`simulate_oom_managed_launch`].
+#[cfg(feature = "e2e-oom-fault-injection")]
+pub(crate) fn e2e_simulate_oom_launch() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "1")
+}
+
+/// Release builds carry no fault-injection switch: the seam compiles out
+/// entirely, so `rocm serve` behaves identically to a build without the feature.
+#[cfg(not(feature = "e2e-oom-fault-injection"))]
+pub(crate) const fn e2e_simulate_oom_launch() -> bool {
+    false
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
+/// managed vLLM launch that spawned, OOM'd, and never became ready, then return
+/// the launch report the summary path would see for it — `already_running: false`
+/// (this invocation launched it), `status: "starting"` (it failed to become
+/// ready), and a `log_path` whose contents carry a real allocator OOM signature.
+/// [`crate::serve_summary::append_oom_serve_note`] then renders the memory-knob guidance. No process is
+/// spawned. Compiled out of shipped binaries.
+#[cfg(feature = "e2e-oom-fault-injection")]
+#[allow(clippy::too_many_arguments)]
+fn simulate_oom_managed_launch(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    port: u16,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+) -> Result<ManagedLaunchReport> {
+    paths.ensure()?;
+    fs::create_dir_all(paths.services_dir())?;
+    let mut record = ManagedServiceRecord::new(
+        paths,
+        service_id,
+        engine,
+        requested_model,
+        resolve.canonical_model_id.clone(),
+        host,
+        port,
+        "managed",
+        std::process::id(),
+        runtime_id.map(str::to_owned),
+        env_id.map(str::to_owned),
+        Some(device_policy_name(device_policy).to_owned()),
+    );
+    record.gpu_indices = gpu_indices.to_vec();
+    record.status = "starting".to_owned();
+    record.write()?;
+    // A real allocator OOM signature in the log this invocation owns, so the
+    // summary renders memory guidance for a launch that actually OOM'd.
+    //
+    // The engine's own error block is reproduced below it, because that is what
+    // a real managed launch leaves on disk, and leaving it out hid a bug this
+    // scenario should have caught: the supervisor and the engine share one log,
+    // so when vLLM OOMs the engine bails with its startup-log context — which
+    // embeds rocm-cli's own OOM hint — and `exit_code_for` writes that whole
+    // error back into the same file, *after* the real line. A fixture carrying
+    // only the raw OOM line can never see the newest-first scan land on
+    // rocm-cli's own sentence instead of the user's error.
+    let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+    fs::write(
+        &record.log_path,
+        format!(
+            "{real_line}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
+             \n\
+             Startup log, last {} lines as the terminal drew them:\n\
+             {real_line}\n\
+             \n\
+             {}{real_line}). {}\n\
+             For conditional remediation, run `{} 'vllm: {real_line}'`.\n",
+            rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
+            rocm_core::VLLM_OOM_DETECTED_PREFIX,
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+            rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+        ),
+    )
+    .with_context(|| format!("failed to write {}", record.log_path.display()))?;
+    Ok(ManagedLaunchReport {
+        service_id: service_id.to_owned(),
+        endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
+        status: "starting".to_owned(),
+        already_running: false,
+        child_pid: None,
+        log_path: Some(record.log_path),
+        manifest_path: Some(record.manifest_path),
+    })
+}
+
 /// Launch a managed service in the background: run the locked allocation and
 /// spawn transaction, release the launch lock once the record is published,
 /// then wait for HTTP readiness.
@@ -852,8 +1090,27 @@ pub(crate) fn start_managed_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
+    #[cfg(feature = "e2e-oom-fault-injection")]
+    if e2e_simulate_oom_launch() {
+        return simulate_oom_managed_launch(
+            paths,
+            engine,
+            service_id,
+            requested_model,
+            resolve,
+            host,
+            port_request
+                .explicit()
+                .unwrap_or(rocm_core::DEFAULT_LOCAL_PORT),
+            device_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+        );
+    }
     let (mut record, child_pid) = match spawn_managed_engine_child(
         paths,
         engine,
@@ -868,6 +1125,7 @@ pub(crate) fn start_managed_service(
         env_id,
         engine_recipe,
         require_api_key,
+        gpu_refusal_waived_for_reuse,
     )
     .inspect_err(|_| {
         drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
@@ -1004,12 +1262,77 @@ fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
         .is_some_and(|state| state.running && rocm_core::process_is_running(state.daemon_pid)))
 }
 
+/// What the user should be told about the background automation helper
+/// (`rocm daemon`) after stopping a service or when planning an uninstall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelperNote {
+    /// The sentence to print.
+    pub(crate) text: String,
+    /// The helper is running right now.
+    pub(crate) running: bool,
+    /// An automation watcher is enabled, so the helper stays up on its own.
+    pub(crate) outlives: bool,
+}
+
+/// The note for one combination of the two facts the helper itself acts on:
+/// whether a watcher is enabled
+/// ([`rocm_core::RocmCliConfig::automation_daemon_enabled`] gates both the spawn
+/// and the helper's exit) and whether it is running. `None` for neither.
+fn helper_note_for(enabled: &[&str], running: bool) -> Option<HelperNote> {
+    let text = match (enabled.is_empty(), running) {
+        (true, false) => return None,
+        (true, true) => "the background automation helper (`rocm daemon`) is still running; no automation is enabled, so it exits on its own within a few seconds".to_owned(),
+        (false, true) => {
+            let disable = enabled
+                .iter()
+                .map(|id| format!("`rocm automations disable {id}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "the background automation helper (`rocm daemon`) keeps running while an automation is enabled ({}); to stop it, run {disable}, after which it exits on its own within a few seconds",
+                enabled.join(", ")
+            )
+        }
+        (false, false) => format!(
+            "an automation is enabled ({}) but the background automation helper (`rocm daemon`) is not running; `rocm serve` or `rocm automations enable` starts it",
+            enabled.join(", ")
+        ),
+    };
+    Some(HelperNote {
+        text,
+        running,
+        outlives: !enabled.is_empty() && running,
+    })
+}
+
+/// [`helper_note_for`] over the facts on disk. An unreadable config counts as
+/// "no watcher enabled".
+pub(crate) fn background_helper_note(paths: &AppPaths) -> Option<HelperNote> {
+    let config = rocm_core::RocmCliConfig::load(paths).unwrap_or_default();
+    let enabled: Vec<&str> = config
+        .automations
+        .watchers
+        .iter()
+        .filter(|(_, watcher)| watcher.enabled)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let running = background_helper_already_running(paths).unwrap_or(false);
+    helper_note_for(&enabled, running)
+}
+
 /// Shared daemon-lifecycle entrypoint: ensures the background automation helper
-/// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
-/// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
-/// both the `serve --managed` path and `automations enable`. Only the spawn result
-/// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
-/// propagated; setup errors (path discovery, stdio attach) still return `Err`.
+/// (`rocm daemon`) is running when an automation watcher needs it, spawning it
+/// detached if not. Liveness is read from the file-based automation runtime
+/// state. Intentionally `pub(crate)` — reused by both the `serve --managed` path
+/// and `automations enable`. Only the spawn result itself (`command.spawn()` /
+/// `spawn_detached_no_inherit`) is logged rather than propagated; setup errors
+/// (path discovery, config load, stdio attach) still return `Err`.
+///
+/// The daemon's only work is running enabled automation watchers (server
+/// recovery included — `server-recover` is one of them and is off by default),
+/// and it exits on its own once none is enabled. So with no watcher enabled
+/// nothing is spawned: a `serve` would otherwise leave a no-op daemon running
+/// long after its service was stopped (ROCMAI-827).
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
     ensure_background_helper_running_quiet(false)
 }
@@ -1019,18 +1342,52 @@ pub(crate) fn ensure_background_helper_running() -> Result<()> {
 /// the daemon-spawn note does not appear above the deployment summary table.
 pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
-    if background_helper_already_running(&paths)? {
+    ensure_background_helper_running_with(&paths, quiet, spawn_background_helper, &|| {})
+}
+
+/// The body of [`ensure_background_helper_running_quiet`], with the actual
+/// process spawn injected so the decision around it is testable without
+/// launching a daemon. `spawn` returns `Err` for a setup failure (propagated)
+/// and `Ok(Err(..))` for a failed spawn (reported, not fatal). `on_lock_busy` is
+/// called each time the autostart lock is found held by another process, which
+/// lets a test wait for this call to be genuinely queued behind it.
+fn ensure_background_helper_running_with(
+    paths: &AppPaths,
+    quiet: bool,
+    spawn: impl FnOnce(&AppPaths) -> Result<Result<u32>>,
+    on_lock_busy: &dyn Fn(),
+) -> Result<()> {
+    // An unreadable config is "no watcher": this also runs after `serve` has
+    // already launched its child, where failing would report a launch that
+    // happened as an error.
+    if !rocm_core::RocmCliConfig::load(paths).is_ok_and(|config| config.automation_daemon_enabled())
+    {
         return Ok(());
     }
 
-    // The check above and the spawn below are a TOCTOU window: two concurrent
-    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
-    // a daemon. Serialize the decision on a lock file and re-check under it — the
-    // first holder spawns, later holders observe the now-running daemon and
-    // return without spawning. The unlocked pre-check above keeps the common
-    // already-running case lock-free.
-    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
-    if background_helper_already_running(&paths)? {
+    // Two concurrent callers (e.g. two `rocm serve`) can both read "not running"
+    // and each spawn a daemon. Serialize the decision on a lock file — the first
+    // holder spawns, later holders observe the now-running daemon and return
+    // without spawning.
+    //
+    // The "already running" read is deliberately made only under the lock, with
+    // no lock-free fast path. The daemon exits by itself once the last watcher
+    // is disabled, and it decides that under this same lock and publishes
+    // `running = false` before releasing it. Caller order is: save the enabling
+    // config, then come here. A lock-free read could still see the daemon that is
+    // about to exit as running, spawn nothing, and leave a watcher enabled with
+    // no daemon; under the lock the daemon has either seen the new config and
+    // stays, or has already published that it stopped.
+    let _autostart_lock = loop {
+        if let Some(lock) =
+            rocm_core::FileLock::try_acquire(paths.automation_autostart_lock_path())?
+        {
+            break lock;
+        }
+        on_lock_busy();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if background_helper_already_running(paths)? {
         return Ok(());
     }
 
@@ -1050,25 +1407,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
-    let exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let args = vec!["daemon".to_owned()];
-    #[cfg(windows)]
-    let spawn_result = {
-        let env_values = app_path_env_var_values(&paths, None);
-        let env_refs = app_path_env_var_refs(&env_values);
-        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
-    };
-    #[cfg(not(windows))]
-    let spawn_result = {
-        let mut command = managed_service_process_command(&exe, &args);
-        command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, None)?;
-        detach_background_command(&mut command);
-        apply_app_path_env(&mut command, &paths);
-        command.spawn().map(|child| child.id())
-    };
-    match spawn_result {
+    match spawn(paths)? {
         Ok(daemon_pid) => {
             // Record the claim before returning (and thus releasing the lock) so a
             // concurrent holder in the spawn→publish window defers. Best-effort: a
@@ -1090,6 +1429,34 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         Err(_) => {}
     }
     Ok(())
+}
+
+/// Spawn `rocm daemon` detached from this process. The outer `Result` is a setup
+/// failure (resolving the executable, attaching stdio); the inner one is the
+/// spawn itself.
+fn spawn_background_helper(paths: &AppPaths) -> Result<Result<u32>> {
+    let exe = managed_service_launcher_path()
+        .context("failed to resolve current rocm executable path")?;
+    let args = vec!["daemon".to_owned()];
+    #[cfg(windows)]
+    let spawn_result = {
+        let env_values = app_path_env_var_values(paths, None);
+        let env_refs = app_path_env_var_refs(&env_values);
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
+    };
+    #[cfg(not(windows))]
+    let spawn_result = {
+        let mut command = managed_service_process_command(&exe, &args);
+        command.stdin(Stdio::null());
+        attach_background_stdio(&mut command, None)?;
+        detach_background_command(&mut command);
+        apply_app_path_env(&mut command, paths);
+        command
+            .spawn()
+            .map(|child| child.id())
+            .map_err(anyhow::Error::from)
+    };
+    Ok(spawn_result)
 }
 
 /// How long an autostart claim is honoured before it is treated as stale even if
@@ -1187,6 +1554,7 @@ pub(crate) fn run_attached_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
 ) -> Result<()> {
     let spawn = spawn_managed_engine_child(
         paths,
@@ -1202,6 +1570,7 @@ pub(crate) fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
         require_api_key,
+        gpu_refusal_waived_for_reuse,
     )
     // Mirrors `start_managed_service`'s cleanup: a pre-spawn
     // failure (port reserved/in use, range exhausted, other bind error) returns
@@ -1242,12 +1611,17 @@ pub(crate) fn run_attached_service(
         ),
     };
 
-    // The child is a managed service that outlives this session once detached, so
-    // it needs the same supervision the background path gives it: the daemon
-    // health-checks and auto-recovers managed servers, reconciles a self-exited
-    // server's record, and feeds the dashboard. Match the background ordering
-    // (spawn, then ensure the helper) and keep it quiet so no status line breaks
-    // into the log stream.
+    // The child is a managed service that outlives this session once detached.
+    // The background helper adds one thing for it: with the `server-recover`
+    // watcher enabled, it health-checks managed servers and restarts failed ones.
+    // Every duty of the helper is watcher-gated, so with no watcher enabled no
+    // helper is started. Nothing else depends on it: a self-exited server's
+    // record is settled by its own supervisor (`supervise_service` writes the
+    // exit via `record_supervised_exit` in `apps/rocmd/src/supervise.rs`) and on
+    // every read (`refresh_managed_service_runtime_liveness`), and the dashboard
+    // has its own embedded daemon. Match the background ordering (spawn, then
+    // ensure the helper) and keep it quiet so no status line breaks into the
+    // log stream.
     ensure_background_helper_running_quiet(true)?;
 
     // The resolution detail (model, engine, runtime, GPU, warnings) was already
@@ -1270,12 +1644,8 @@ pub(crate) fn run_attached_service(
 
     match outcome {
         AttachOutcome::Detach => {
-            println!("detached - server still running");
-            println!("  service_id: {service_id}");
-            println!("  endpoint: {endpoint}");
-            println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
-            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
+            // Audit before printing: a closed stdout makes `println!` panic,
+            // which must not lose the event.
             record_cli_audit_event(
                 paths,
                 "service",
@@ -1284,33 +1654,31 @@ pub(crate) fn run_attached_service(
                 format!("detached from attached serve service_id={service_id} endpoint={endpoint}"),
                 Some(&service_id),
             );
+            println!("detached - server still running");
+            println!("  service_id: {service_id}");
+            println!("  endpoint: {endpoint}");
+            println!("  list: rocm services");
+            println!("  logs: rocm logs {service_id}");
+            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             Ok(())
         }
         AttachOutcome::Stop => {
             println!("stopping server...");
-            match run_internal_sandbox_tool(
+            let stop = run_internal_sandbox_tool(
                 paths,
                 SandboxToolArg::StopServer,
                 Some(service_id.clone()),
                 true,
-            ) {
-                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
-                Err(error) => {
-                    // Best-effort direct signal so Ctrl-C never leaves the model
-                    // orphaned when the sandbox stop path fails.
-                    let _ = rocm_core::terminate_process_tree(child_pid);
-                    println!("  note: {error}");
-                }
-            }
-            record_cli_audit_event(
-                paths,
-                "service",
-                "serve_stop",
-                "info",
-                format!("stopped attached serve service_id={service_id}"),
-                Some(&service_id),
             );
-            Ok(())
+            finish_attached_stop(
+                paths,
+                &service_id,
+                child_pid,
+                stop,
+                rocm_core::terminate_process_tree,
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+            )
         }
         AttachOutcome::ServerExited => {
             println!("server process exited");
@@ -1468,6 +1836,94 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
     }
 }
 
+/// Finish the attached `rocm serve` Ctrl-C stop once the managed stop has
+/// answered: what is printed where, what is signalled, what is audited, and
+/// how the command exits. Everything but the stop itself and the real
+/// signal is here, so a test can drive it.
+///
+/// - Confirmed: the report, with the background-helper note `rocm services
+///   stop` also prints, goes to `out` and the command succeeds.
+/// - Unconfirmed: the same report `rocm services stop` gives, check lines
+///   included, becomes the error, so it reaches stderr and the command exits
+///   non-zero. Nothing is signalled on the stop's behalf: the stop has already
+///   done what it safely could.
+/// - The stop itself failed: `signal_child` gets the child this session
+///   launched, so Ctrl-C never leaves the model orphaned when the stop path
+///   breaks. The stop's error, and the signal's if that fails too, are noted on
+///   `err`, and the audit event records whether the signal worked. The command
+///   still exits 0, as it always has here.
+fn finish_attached_stop(
+    paths: &AppPaths,
+    service_id: &str,
+    child_pid: u32,
+    stop: Result<serde_json::Value>,
+    signal_child: impl FnOnce(u32) -> Result<()>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<()> {
+    match stop {
+        Ok(result) if service_stop_unconfirmed(&result) => {
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                "error",
+                format!("stop of attached serve not confirmed service_id={service_id}"),
+                Some(service_id),
+            );
+            bail!(
+                "{}",
+                render_service_action_result("stop_server", &result).trim_end()
+            )
+        }
+        Ok(result) => {
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                "info",
+                format!("stopped attached serve service_id={service_id}"),
+                Some(service_id),
+            );
+            write!(
+                out,
+                "{}",
+                render_service_action_result_with_helper_note(paths, "stop_server", &result)
+            )?;
+            Ok(())
+        }
+        Err(error) => {
+            let signal = signal_child(child_pid);
+            // Record the audit event before writing to stderr, so a failed
+            // write cannot skip it.
+            let message = match &signal {
+                Ok(()) => format!(
+                    "stop failed; signaled attached serve child {child_pid} service_id={service_id}"
+                ),
+                Err(signal_error) => format!(
+                    "stop failed; signaling attached serve child {child_pid} also failed: {signal_error:#} service_id={service_id}"
+                ),
+            };
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                if signal.is_ok() { "warn" } else { "error" },
+                message,
+                Some(service_id),
+            );
+            writeln!(err, "  note: {error:#}")?;
+            if let Err(signal_error) = &signal {
+                writeln!(
+                    err,
+                    "  note: signaling this session's server process {child_pid} directly also failed: {signal_error:#}"
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1943,234 @@ mod tests {
         validate_bind_host("0.0.0.0", true).unwrap();
     }
 
+    /// A `stop_server` answer whose one recorded process ended with `outcome`.
+    fn stop_answer(confirmed: bool, outcome: &str) -> serde_json::Value {
+        crate::services_text::internal_stop_server_value(serde_json::json!({
+            "service_id": "svc-attached",
+            "status": "ready",
+            "signaled_pids": if outcome == "unverified" { vec![] } else { vec![4242] },
+            "pid_outcomes": [{ "pid": 4242, "role": "supervisor_and_engine", "outcome": outcome }],
+            // An attached serve on a public bind stores a key; an unconfirmed
+            // stop keeps it.
+            "endpoint_key_kept": !confirmed,
+            "stopped": confirmed,
+        }))
+    }
+
+    /// Run [`finish_attached_stop`] for `stop`, returning its result, what it
+    /// wrote to stdout, the PID it signalled (if any) and the audit event.
+    fn finish(
+        name: &str,
+        stop: Result<serde_json::Value>,
+    ) -> (Result<()>, String, Option<u32>, serde_json::Value) {
+        finish_signalling(name, stop, Ok(()))
+    }
+
+    /// [`finish`], with the direct signal answering `signal_result`.
+    fn finish_signalling(
+        name: &str,
+        stop: Result<serde_json::Value>,
+        signal_result: Result<()>,
+    ) -> (Result<()>, String, Option<u32>, serde_json::Value) {
+        let (result, out, _err, signalled, audit) = finish_capturing(name, stop, signal_result);
+        (result, out, signalled, audit)
+    }
+
+    /// [`finish_signalling`], also returning what was written to stderr.
+    fn finish_capturing(
+        name: &str,
+        stop: Result<serde_json::Value>,
+        signal_result: Result<()>,
+    ) -> (Result<()>, String, String, Option<u32>, serde_json::Value) {
+        let (root, paths) = test_paths(name);
+        paths.ensure().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut signalled = None;
+        let result = finish_attached_stop(
+            &paths,
+            "svc-attached",
+            777,
+            stop,
+            |pid| {
+                signalled = Some(pid);
+                signal_result
+            },
+            &mut out,
+            &mut err,
+        );
+        let audit_text = fs::read_to_string(paths.audit_events_path()).expect("audit log");
+        let audit = serde_json::from_str(audit_text.lines().last().expect("an audit event"))
+            .expect("audit json");
+        let _ = fs::remove_dir_all(root);
+        (
+            result,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            signalled,
+            audit,
+        )
+    }
+
+    #[test]
+    fn attached_ctrl_c_reports_a_confirmed_stop_on_stdout() {
+        let (result, out, signalled, audit) =
+            finish("attached-confirmed", Ok(stop_answer(true, "graceful")));
+        result.expect("a confirmed stop succeeds");
+        assert!(out.contains("Local server stopped"), "{out}");
+        assert_eq!(signalled, None);
+        assert_eq!(audit["level"], "info", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stopped attached serve service_id=svc-attached"
+        );
+    }
+
+    #[test]
+    fn attached_ctrl_c_fails_an_unconfirmed_stop_like_services_stop_and_signals_nothing() {
+        // The same report `rocm services stop` gives, as the error (stderr,
+        // non-zero exit), naming no retry; nothing is signalled on the stop's
+        // behalf and nothing reaches stdout.
+        let answer = stop_answer(false, "timed_out");
+        let (result, out, signalled, audit) = finish("attached-timed-out", Ok(answer.clone()));
+        let error = format!("{:#}", result.expect_err("an unconfirmed stop fails"));
+        assert_eq!(
+            error,
+            render_service_action_result("stop_server", &answer).trim_end(),
+            "the report is `rocm services stop`'s own"
+        );
+        assert!(
+            error.contains(
+                "process 4242 (supervisor_and_engine) or a process under it did not exit"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.lines().any(|line| line
+                == "  kept: the server record, which still names its processes, and its endpoint key, which the server may still be enforcing"),
+            "{error}"
+        );
+        crate::services_text::tests::assert_no_retry_line(&error);
+        assert!(out.is_empty(), "nothing on stdout: {out}");
+        assert_eq!(signalled, None, "an unconfirmed stop signals nothing more");
+        assert_eq!(audit["level"], "error", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop of attached serve not confirmed service_id=svc-attached"
+        );
+    }
+
+    #[test]
+    fn attached_ctrl_c_names_a_check_for_an_unverified_process() {
+        let (result, out, signalled, audit) =
+            finish("attached-unverified", Ok(stop_answer(false, "unverified")));
+        let error = format!("{:#}", result.expect_err("an unverified stop fails"));
+        assert!(error.contains("not signaled: process 4242"), "{error}");
+        assert!(error.contains("check: `ps -p 4242 -o pid,args`"), "{error}");
+        crate::services_text::tests::assert_no_retry_line(&error);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(signalled, None);
+        assert_eq!(audit["level"], "error", "{audit}");
+    }
+
+    #[test]
+    fn attached_ctrl_c_signals_its_own_child_when_the_stop_itself_fails() {
+        let (result, out, err, signalled, audit) = finish_capturing(
+            "attached-stop-error",
+            Err(anyhow::anyhow!("managed service `svc-attached` not found")
+                .context("failed to stop svc-attached")),
+            Ok(()),
+        );
+        result.expect("a failed stop falls back and still exits cleanly, as before");
+        assert_eq!(signalled, Some(777));
+        assert_eq!(
+            err, "  note: failed to stop svc-attached: managed service `svc-attached` not found\n",
+            "the stop's error goes to stderr, and a signal that worked adds nothing"
+        );
+        assert!(out.is_empty(), "nothing on stdout: {out}");
+        assert_eq!(audit["level"], "warn", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop failed; signaled attached serve child 777 service_id=svc-attached"
+        );
+
+        // The direct signal failing too is printed on stderr and recorded, with
+        // its error.
+        let (result, _, err, signalled, audit) = finish_capturing(
+            "attached-stop-error-signal-fails",
+            Err(anyhow::anyhow!("managed service `svc-attached` not found")),
+            Err(anyhow::anyhow!("no such process")),
+        );
+        result.expect("still exits 0, as on main");
+        assert_eq!(
+            err,
+            "  note: managed service `svc-attached` not found\n  \
+             note: signaling this session's server process 777 directly also failed: no such process\n",
+            "both notes go to stderr"
+        );
+        assert_eq!(signalled, Some(777));
+        assert_eq!(audit["level"], "error", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop failed; signaling attached serve child 777 also failed: no such process service_id=svc-attached"
+        );
+    }
+
+    /// A writer whose every write fails, standing in for a closed stdout/stderr.
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn attached_ctrl_c_records_the_audit_event_even_when_writing_the_outcome_fails() {
+        // One case per branch that writes after deciding: a confirmed stop
+        // (stdout) and a stop that itself failed (stderr notes). The write
+        // error is returned, but the audit event is already on disk.
+        let cases: [(&str, Result<serde_json::Value>, &str); 2] = [
+            (
+                "attached-broken-out",
+                Ok(stop_answer(true, "graceful")),
+                "stopped attached serve service_id=svc-attached",
+            ),
+            (
+                "attached-broken-err",
+                Err(anyhow::anyhow!("managed service `svc-attached` not found")),
+                "stop failed; signaled attached serve child 777 service_id=svc-attached",
+            ),
+        ];
+        for (name, stop, expected_message) in cases {
+            let (root, paths) = test_paths(name);
+            paths.ensure().unwrap();
+            let result = finish_attached_stop(
+                &paths,
+                "svc-attached",
+                777,
+                stop,
+                |_| Ok(()),
+                &mut BrokenWriter,
+                &mut BrokenWriter,
+            );
+            let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+            let _ = fs::remove_dir_all(root);
+            assert!(result.is_err(), "{name}: the write error is surfaced");
+            let audit: serde_json::Value = serde_json::from_str(
+                audit_text
+                    .lines()
+                    .last()
+                    .unwrap_or_else(|| panic!("{name}: no audit event recorded")),
+            )
+            .expect("audit json");
+            assert_eq!(audit["message"], expected_message, "{name}: {audit}");
+        }
+    }
+
     #[test]
     fn detach_key_ctrl_d_detaches_ctrl_c_stops() {
         assert_eq!(detach_key_outcome(true, 'd'), Some(AttachOutcome::Detach));
@@ -1501,6 +2185,88 @@ mod tests {
         // Other control combos are not detach/stop triggers.
         assert_eq!(detach_key_outcome(true, 'q'), None);
         assert_eq!(detach_key_outcome(true, 'z'), None);
+    }
+
+    /// A record with every reuse-relevant field set to the "reusable" value, so
+    /// each test below breaks exactly one term and nothing else.
+    fn reusable_record(paths: &AppPaths) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "vllm-qwen-1000",
+            "vllm",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.engine_recipe_json = None;
+        record.requires_api_key = true;
+        record
+    }
+
+    #[test]
+    fn reuse_is_refused_on_every_term_the_spawn_and_the_gpu_bail_depend_on() {
+        let (root, paths) = test_paths("managed-reuse-predicate");
+        paths.ensure().expect("paths");
+        let base = reusable_record(&paths);
+
+        // The baseline must be reusable, or the negative cases below could pass
+        // for the wrong reason.
+        assert!(
+            managed_service_reuse_refusal(&base, None, true, &DevicePolicy::GpuRequired).is_none(),
+            "a matching service with no recipe, a key, and a gpu_required policy is reusable"
+        );
+
+        // Recipe mismatch — the spawn's first refusal.
+        let mut mismatched = base.clone();
+        mismatched.engine_recipe_json = Some("{\"engine\":\"vllm\"}".to_owned());
+        assert!(matches!(
+            managed_service_reuse_refusal(&mismatched, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::RecipeMismatch)
+        ));
+
+        // Unmet `--require-api-key` — the spawn's second refusal. Also pins that
+        // it is *only* refused when the key is actually demanded.
+        let mut anonymous = base.clone();
+        anonymous.requires_api_key = false;
+        assert!(matches!(
+            managed_service_reuse_refusal(&anonymous, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::MissingApiKey)
+        ));
+        assert!(
+            managed_service_reuse_refusal(&anonymous, None, false, &DevicePolicy::GpuRequired)
+                .is_none(),
+            "an anonymous service is fine when no key was demanded"
+        );
+
+        // Device policy — the term `serve()` depends on, because it is the one
+        // gating the no-usable-GPU bail on the answer. Reusing a `cpu_only`
+        // service to answer a `gpu_required` serve is the silent CPU fallback.
+        let mut cpu_only = base;
+        cpu_only.device_policy = Some("cpu_only".to_owned());
+        assert!(matches!(
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::DevicePolicyTooWeak)
+        ));
+        // `GpuRequired` is the only policy the CLI can produce — `--device
+        // gpu_preferred`/`auto`/`gpu` all parse to it and `cpu_only` is rejected
+        // (`parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`) —
+        // so there is no second policy arm to discriminate here, and asserting
+        // one would pin an input `serve()` never produces. Both callers pass
+        // the same policy; the parameter is not optional, so neither can drop
+        // this term without a compile error.
+        //
+        // A cpu_only *invocation* never reaches the bail, so nothing to refuse.
+        assert!(
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::CpuOnly).is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1556,6 +2322,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
             )
         };
@@ -1649,6 +2416,7 @@ mod tests {
             None,
             Some(&requested_recipe),
             false,
+            false,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -1734,6 +2502,7 @@ mod tests {
             None,
             // The demand that used to be silently discarded.
             true,
+            false,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -1829,6 +2598,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
 
         // This guard fires before any child is spawned, so `record.engine_pid`
@@ -1881,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_spawn_past_the_first_write_terminates_the_child_and_keeps_a_failed_record()
+    fn a_failed_spawn_past_the_first_write_terminates_the_child_and_keeps_an_abandoned_record()
     -> Result<()> {
         // Drives the real call site's *post*-spawn cleanup branch, which
         // neither `abandoned_launch_*` test reaches (they call
@@ -1942,6 +2712,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             );
 
             if result.is_ok() && std::time::Instant::now() < deadline {
@@ -1978,9 +2749,13 @@ mod tests {
         );
         let persisted =
             persisted.expect("a post-spawn failure must leave the record on disk, not delete it");
+        // `stopped`, not `failed`: rocmd's recovery restarts a `failed` record
+        // without a stop marker, which would respawn a launch the CLI just
+        // reported as failed (pinned on the rocmd side by
+        // `abandoned_launch_record_is_not_a_recovery_candidate`).
         assert_eq!(
-            persisted.status, "failed",
-            "a post-spawn failure must mark the record failed, not leave it stuck"
+            persisted.status, "stopped",
+            "a post-spawn failure must mark the record abandoned, not leave it stuck"
         );
         assert_eq!(
             key, None,
@@ -1988,7 +2763,7 @@ mod tests {
         );
         assert!(
             live.is_empty(),
-            "a failed record must not still reserve its port"
+            "an abandoned record must not still reserve its port"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -2063,6 +2838,7 @@ mod tests {
             None,
             Some("test-key"),
             launch_lock,
+            false,
             false,
             &mut |_elapsed| {},
         );
@@ -2148,6 +2924,7 @@ mod tests {
             Some("test-key"),
             launch_lock,
             false,
+            false,
         );
         let Err(error) = result else {
             let _ = fs::remove_dir_all(root);
@@ -2220,6 +2997,7 @@ mod tests {
                     None,
                     launch_lock,
                     false,
+                    false,
                 )
             } else {
                 start_managed_service(
@@ -2237,6 +3015,7 @@ mod tests {
                     None,
                     None,
                     launch_lock,
+                    false,
                     false,
                     &mut |_elapsed| {},
                 )
@@ -2514,6 +3293,266 @@ mod tests {
             "running=false ⇒ not running even with a live pid"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-827: `rocm serve` started the background daemon on every launch,
+    /// and with no automation watcher enabled that daemon had nothing to do yet
+    /// kept running after every service was stopped. With the default config
+    /// (no watcher enabled) the helper must not be spawned at all.
+    #[test]
+    fn background_helper_not_spawned_when_no_automation_is_enabled() {
+        let (root, paths) = test_paths("helper-no-automation");
+        paths.ensure().expect("create app dirs");
+        // The stored flag alone is not "a watcher is enabled": nothing would run.
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.automations.daemon_enabled = true;
+        config.save(&paths).expect("save default config");
+
+        let mut spawned = false;
+        ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawned = true;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        )
+        .expect("ensure helper");
+
+        let claim_written = paths.automation_autostart_claim_path().exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !spawned,
+            "no watcher enabled ⇒ the daemon has no work and must not be started"
+        );
+        assert!(!claim_written, "no spawn ⇒ no autostart claim");
+    }
+
+    /// The other half of the gate: once a watcher is enabled the helper is still
+    /// started (exactly once) and its autostart claim recorded.
+    #[test]
+    fn background_helper_spawned_when_an_automation_is_enabled() {
+        let (root, paths) = test_paths("helper-automation-enabled");
+        paths.ensure().expect("create app dirs");
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = true;
+        config.save(&paths).expect("save config");
+
+        let mut spawns = 0;
+        ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawns += 1;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        )
+        .expect("ensure helper");
+
+        let claim = read_autostart_claim(&paths.automation_autostart_claim_path());
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(spawns, 1, "an enabled watcher needs the daemon");
+        assert_eq!(claim.map(|claim| claim.daemon_pid), Some(4242));
+    }
+
+    /// ROCMAI-827 race, enable side: the daemon that is about to exit still has
+    /// `running = true` and a live pid in its state when `automations enable`
+    /// (config already saved) asks for a helper. It decides under the autostart
+    /// lock and publishes "stopped" before releasing it, so the enable must wait
+    /// on that lock and then start a new helper. A lock-free "already running"
+    /// read would return here without spawning, leaving a watcher with no daemon.
+    #[test]
+    fn background_helper_is_started_when_the_exiting_daemon_publishes_stopped() {
+        let (root, paths) = test_paths("helper-exit-window");
+        paths.ensure().expect("create app dirs");
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = true;
+        config.save(&paths).expect("save config");
+        // The old daemon: alive (this process stands in) and still `running`.
+        runtime_state(true, std::process::id())
+            .write(&paths)
+            .expect("write runtime state");
+
+        // The exiting daemon holds the autostart lock while it decides.
+        let exiting_daemon_lock =
+            rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())
+                .expect("hold the lock");
+        let enable_paths = paths.clone();
+        let queued_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = queued_flag.clone();
+        let enable = std::thread::spawn(move || {
+            let mut spawns = 0;
+            ensure_background_helper_running_with(
+                &enable_paths,
+                true,
+                |_| {
+                    spawns += 1;
+                    Ok(Ok(4242))
+                },
+                &|| queued.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("ensure helper");
+            spawns
+        });
+        // Wait until the enable path has actually found the lock held and queued
+        // behind it, rather than assuming how long that takes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        // A caller that skipped the lock finishes without ever queuing.
+        while !queued_flag.load(std::sync::atomic::Ordering::SeqCst) && !enable.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "enable never queued");
+            std::thread::yield_now();
+        }
+        runtime_state(false, std::process::id())
+            .write(&paths)
+            .expect("daemon publishes stopped");
+        drop(exiting_daemon_lock);
+
+        let spawns = enable.join().expect("enable thread");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            spawns, 1,
+            "the enable must start a helper once the old one has published it stopped"
+        );
+    }
+
+    fn stop_result() -> serde_json::Value {
+        serde_json::json!({"output": {"result": {
+            "service": {"service_id": "svc-a", "status": "stopped"},
+            "signaled_pids": [1]
+        }}})
+    }
+
+    /// Put the on-disk facts in one of the four combinations: whether a watcher
+    /// is enabled, and whether the helper is running (this process stands in for
+    /// a live daemon).
+    fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
+        let mut config = rocm_core::RocmCliConfig::default();
+        config.watcher_config_mut("server-recover").enabled = watcher_enabled;
+        config.save(paths).expect("save config");
+        runtime_state(helper_running, std::process::id())
+            .write(paths)
+            .expect("write runtime state");
+    }
+
+    /// ROCMAI-827: the helper note is derived from both facts, so it cannot
+    /// disagree with the state it describes. Each combination: the exact wording,
+    /// and the running/outlives flags the uninstall plan acts on.
+    #[test]
+    fn helper_note_follows_watcher_enabled_and_helper_running() {
+        let (root, paths) = test_paths("helper-note-combos");
+        paths.ensure().expect("create app dirs");
+
+        set_helper_facts(&paths, false, false);
+        let neither = background_helper_note(&paths);
+        set_helper_facts(&paths, false, true);
+        let idle_running = background_helper_note(&paths).expect("note");
+        set_helper_facts(&paths, true, false);
+        let enabled_dead = background_helper_note(&paths).expect("note");
+        set_helper_facts(&paths, true, true);
+        let enabled_running = background_helper_note(&paths).expect("note");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(neither, None);
+        assert_eq!(
+            idle_running.text,
+            "the background automation helper (`rocm daemon`) is still running; no automation is enabled, so it exits on its own within a few seconds"
+        );
+        assert!(idle_running.running && !idle_running.outlives);
+        assert_eq!(
+            enabled_dead.text,
+            "an automation is enabled (server-recover) but the background automation helper (`rocm daemon`) is not running; `rocm serve` or `rocm automations enable` starts it"
+        );
+        assert!(!enabled_dead.running && !enabled_dead.outlives);
+        assert_eq!(
+            enabled_running.text,
+            "the background automation helper (`rocm daemon`) keeps running while an automation is enabled (server-recover); to stop it, run `rocm automations disable server-recover`, after which it exits on its own within a few seconds"
+        );
+        assert!(enabled_running.running && enabled_running.outlives);
+    }
+
+    /// `rocm services stop` prints the note for a stop only, and only the variant
+    /// that matches the state.
+    #[test]
+    fn stop_output_carries_the_helper_note_that_matches_the_state() {
+        use crate::services_text::render_service_action_result_with_helper_note as render;
+
+        let (root, paths) = test_paths("stop-helper-note");
+        paths.ensure().expect("create app dirs");
+        set_helper_facts(&paths, false, false);
+        let quiet = render(&paths, "stop_server", &stop_result());
+        set_helper_facts(&paths, true, true);
+        let outlives = render(&paths, "stop_server", &stop_result());
+        let restart = render(&paths, "restart_server", &stop_result());
+        set_helper_facts(&paths, true, false);
+        let not_running = render(&paths, "stop_server", &stop_result());
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!quiet.contains("background automation helper"), "{quiet}");
+        assert!(
+            outlives.contains("stopped processes: 1")
+                && outlives.contains("keeps running while an automation is enabled")
+                && outlives.contains("`rocm automations disable server-recover`"),
+            "{outlives}"
+        );
+        assert!(
+            not_running.contains("is not running") && !not_running.contains("keeps running"),
+            "{not_running}"
+        );
+        assert!(
+            !restart.contains("background automation helper"),
+            "{restart}"
+        );
+    }
+
+    /// The command the note names must exist and accept exactly those arguments,
+    /// and its effect (the helper exiting once the last watcher is off) is
+    /// `automations-11` in `features/automations.feature` plus the rocmd
+    /// `automation_loop_` tests.
+    #[test]
+    fn the_command_named_by_the_helper_note_parses() {
+        use clap::Parser as _;
+
+        let (root, paths) = test_paths("helper-note-command");
+        paths.ensure().expect("create app dirs");
+        set_helper_facts(&paths, true, true);
+        let note = background_helper_note(&paths).expect("a note");
+        let _ = fs::remove_dir_all(&root);
+
+        let command = note
+            .text
+            .split('`')
+            .find(|part| part.starts_with("rocm automations disable"))
+            .expect("the note names the disable command");
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(argv).is_ok(), "{command}");
+    }
+
+    /// `serve` calls the helper autostart after its child is already running. An
+    /// unreadable config must not turn that launch into an error: it reads as "no
+    /// watcher enabled" and nothing is spawned.
+    #[test]
+    fn background_helper_autostart_treats_an_unreadable_config_as_no_watcher() {
+        let (root, paths) = test_paths("helper-bad-config");
+        paths.ensure().expect("create app dirs");
+        fs::write(paths.config_path(), b"{ this is not json").expect("write bad config");
+        assert!(rocm_core::RocmCliConfig::load(&paths).is_err());
+
+        let mut spawned = false;
+        let result = ensure_background_helper_running_with(
+            &paths,
+            true,
+            |_| {
+                spawned = true;
+                Ok(Ok(4242))
+            },
+            &|| {},
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!spawned);
     }
 
     #[test]
@@ -2890,13 +3929,13 @@ mod tests {
 
         // Go through the real stop path (`rocm services stop <id> --yes`'s own
         // implementation) rather than writing `status = "stopped"` to disk
-        // directly, so this test actually proves the advice serve-29 pins: that
+        // directly, so this test actually proves the advice serve-43 pins: that
         // running the stop command frees the port. The termination closure is
         // the same seam production injects a real signal through; here it just
         // confirms every recorded process gone without touching the test
         // process itself.
         crate::services_text::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
-            (Vec::new(), true)
+            crate::services_text::RecordedStopTermination::confirmed_stopped()
         })?;
 
         let decision = resolve_managed_port_in_transaction(
@@ -3125,6 +4164,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         drop(launch_lock);
         holder.join().expect("holder thread")?;
@@ -3242,9 +4282,14 @@ mod tests {
         let persisted = persisted.expect(
             "a launch that spawned a child must keep its record so `rocm services`/`rocm logs` can show the attempt",
         );
+        // `stopped`, not `failed`: `rocmd`'s recovery restarts a `failed` record
+        // that carries no stop marker, which would respawn a launch the CLI just
+        // reported as failed. The rocmd side of the pair is
+        // `abandoned_launch_record_is_not_a_recovery_candidate` in
+        // `apps/rocmd/src/watchers.rs`.
         assert_eq!(
-            persisted.status, "failed",
-            "a spawned child's record must be marked failed, not deleted"
+            persisted.status, "stopped",
+            "a spawned child's record must be kept, but in a status recovery ignores"
         );
         Ok(())
     }

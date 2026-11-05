@@ -378,7 +378,7 @@ struct ServerState {
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
 /// route, so successive scrapes exercise the daemon's rate/average windowing
-/// (`gen_tps_from_delta`, `avg_ms_from_histogram` in
+/// (`gen_tps_from_delta`, `observe_latency` in
 /// `rocm-dash-daemon::runner`) the same way a real vLLM would:
 ///   * `vllm:generation_tokens_total` strictly increases every scrape, so the
 ///     counter-delta windowing yields a positive, visible generation rate
@@ -787,6 +787,11 @@ impl MockServer {
 /// record shape.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceRecordOptions {
+    /// Engine name recorded for the service. Defaults to `"vllm"`, the engine
+    /// the mock server stands in for. A scenario that needs the CLI to match
+    /// this record against a *different* engine — e.g. the self-managing
+    /// `lemonade` path — overrides it.
+    pub engine: &'static str,
     pub status: &'static str,
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
@@ -829,6 +834,7 @@ pub struct ServiceRecordOptions {
 impl Default for ServiceRecordOptions {
     fn default() -> Self {
         Self {
+            engine: "vllm",
             status: "ready",
             startup_phase: None,
             supervisor_pid: 0,
@@ -872,7 +878,7 @@ pub fn write_service_record_with(
     // `/v1/models` for its readiness probe, which the mock serves.
     let record = json!({
         "service_id": "e2e-mock",
-        "engine": "vllm",
+        "engine": options.engine,
         "model_ref": model,
         "canonical_model_id": model,
         "host": options.host.unwrap_or("127.0.0.1"),

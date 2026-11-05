@@ -65,6 +65,11 @@ pub struct ServiceRecord {
     /// Absent on older records and once the service reaches `ready`.
     #[serde(default)]
     pub startup_phase: Option<String>,
+    /// GPU indices the service was launched on (`rocm serve --gpu`), empty when
+    /// none were recorded. These become the instance's `gpu_ids`, which is what
+    /// joins it to GPU power and VRAM.
+    #[serde(default)]
+    pub gpu_indices: Vec<u32>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
 }
@@ -89,7 +94,7 @@ pub fn is_scrapeable_status(status: &str) -> bool {
 /// for safety.
 ///
 /// **`running` + `startup_phase` overlap:** the rocm-cli supervisor
-/// (`apps/rocmd/src/lib.rs::supervise_service`) flips the on-disk record to
+/// (`apps/rocmd/src/supervise.rs::supervise_service`) flips the on-disk record to
 /// `running` immediately after spawning the engine child — *before* it starts
 /// polling and parsing `startup_phase` from the serve log — and only clears
 /// `startup_phase` once the service reaches `ready`. So a record can be
@@ -144,10 +149,9 @@ pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
 /// collector pipeline, or `None` when the record is not in a scrapeable state.
 ///
 /// The port is taken verbatim from the registry (`record.port`) — the registry
-/// is the authority, never a hardcoded default. `gpu_ids` is left empty because
-/// the record carries no concrete device ids; VRAM and tokens/W attribution
-/// degrade gracefully (device-summed / `None`) for managed services until a
-/// richer device mapping is recorded.
+/// is the authority, never a hardcoded default. `gpu_ids` come from the
+/// record's `gpu_indices`; when none were recorded they stay empty and VRAM and
+/// tokens/W attribution degrade gracefully (device-summed / `None`).
 pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredService> {
     if !is_scrapeable_status(&record.status) {
         return None;
@@ -168,6 +172,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         model_name,
         port: Some(record.port),
         status: instance_status_for_record(&record.status, record.startup_phase.as_deref()),
+        gpu_ids: record.gpu_indices.iter().map(u32::to_string).collect(),
         ..Default::default()
     })
 }
@@ -392,6 +397,24 @@ mod tests {
     }
 
     #[test]
+    fn discovered_from_record_carries_gpu_indices_as_gpu_ids() {
+        // The recorded launch GPUs are what join an instance to GPU power and
+        // VRAM; without them a `rocm serve` model can never show tok/W.
+        let with = record_json("svc", "vllm", 8000, "ready", 1).replace(
+            r#""mode": "managed","#,
+            r#""mode": "managed", "gpu_indices": [0, 2],"#,
+        );
+        let rec: ServiceRecord = serde_json::from_str(&with).unwrap();
+        let svc = discovered_from_record(&rec).unwrap();
+        assert_eq!(svc.gpu_ids, vec!["0".to_string(), "2".to_string()]);
+
+        // Older records and `--gpu auto` selecting nothing: empty, not a guess.
+        let rec: ServiceRecord =
+            serde_json::from_str(&record_json("svc", "vllm", 8000, "ready", 1)).unwrap();
+        assert!(discovered_from_record(&rec).unwrap().gpu_ids.is_empty());
+    }
+
+    #[test]
     fn discovered_from_record_surfaces_startup_phase_while_starting() {
         // A `starting`/`recovering` record with a parsed phase must carry that
         // phase into the instance status so the dashboard can show
@@ -432,7 +455,7 @@ mod tests {
 
     #[test]
     fn discovered_from_record_surfaces_startup_phase_while_running() {
-        // The real producer (`apps/rocmd/src/lib.rs::supervise_service`) flips
+        // The real producer (`apps/rocmd/src/supervise.rs::supervise_service`) flips
         // the on-disk record to `running` *before* it starts polling and
         // parsing `startup_phase` from the serve log, and only clears
         // `startup_phase` once the service reaches `ready`. Exercise that

@@ -44,7 +44,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::examine::truncate_to_chars;
+use crate::probe_exec::truncate_to_chars;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -312,6 +312,20 @@ fn collect_process_tree(root: u32) -> Vec<u32> {
         }
     }
 
+    walk_process_tree(root, &children)
+}
+
+/// Walk `root` plus its transitive descendants over an already-built
+/// parent→children table.
+///
+/// `root` comes first, every other PID comes after its parent, and no PID is
+/// listed twice, so a cycle in the table ends the walk instead of looping it.
+///
+/// Split out of [`collect_process_tree`] so the traversal — the part that
+/// decides which PIDs get signalled — can be exercised against a synthetic
+/// table (cycles, self-parents, shared parents) without touching `/proc`.
+#[cfg(not(windows))]
+fn walk_process_tree(root: u32, children: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
@@ -405,8 +419,33 @@ pub struct FileLock {
 }
 
 impl FileLock {
-    /// Create (never truncate) the lock file and any missing parent directories.
-    fn open(path: PathBuf) -> Result<(PathBuf, fs::File)> {
+    /// Acquire an exclusive lock on `path`, creating the lock file and any
+    /// missing parent directories first. Blocks until the lock is available.
+    ///
+    /// The lock file itself carries no data; it is a rendezvous point, so an
+    /// existing file is reused (never truncated) and its contents are ignored.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -418,19 +457,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        Ok((path, file))
-    }
-
-    /// Acquire an exclusive lock on `path`, creating the lock file and any
-    /// missing parent directories first. Blocks until the lock is available.
-    ///
-    /// The lock file itself carries no data; it is a rendezvous point, so an
-    /// existing file is reused (never truncated) and its contents are ignored.
-    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let (path, file) = Self::open(path.into())?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.
@@ -444,7 +471,9 @@ impl FileLock {
     ///
     /// Used where an indefinite wait would be a worse failure mode than a
     /// clear timeout message — e.g. `rocmd`'s automatic recovery, which must
-    /// not hang forever behind a `rocm serve` launch holding the same lock.
+    /// not hang forever behind a `rocm serve` launch holding the same lock, and
+    /// `rocm services restart`, which has already stopped the service when it
+    /// waits here.
     /// A `rocm serve` launch itself uses the unbounded [`Self::acquire`]: its
     /// own worst-case hold time (the already-running probe inside the launch
     /// transaction) can exceed [`MANAGED_LAUNCH_LOCK_TIMEOUT`], so bounding it
@@ -454,7 +483,7 @@ impl FileLock {
     /// Fails when the lock file cannot be created/locked, or when another
     /// holder keeps it for the whole timeout.
     pub fn acquire_bounded(path: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
-        let (path, file) = Self::open(path.into())?;
+        let (file, path) = Self::open(path.into())?;
         let deadline = Instant::now() + timeout;
         loop {
             match file.try_lock() {
@@ -486,7 +515,8 @@ const FILE_LOCK_BOUNDED_POLL: Duration = Duration::from_millis(25);
 ///
 /// Bounds contention on [`crate::paths::AppPaths::managed_launch_lock_path`] during the
 /// port-allocation window, failing with an actionable error instead of hanging. Only
-/// `rocmd`'s recovery/restart path is bounded this way; a `rocm serve` launch holds the
+/// `rocmd`'s recovery/restart path and `rocm services restart` (whose stop has
+/// already happened by then) are bounded this way; a `rocm serve` launch holds the
 /// same lock with the unbounded [`FileLock::acquire`] (see its doc comment on
 /// [`FileLock::acquire_bounded`] for why).
 pub const MANAGED_LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1216,6 +1246,12 @@ fn assemble_output(
 
     Ok(output)
 }
+
+/// Property tests for [`walk_process_tree`]; a child module so it can reach
+/// the walk while it stays private.
+#[cfg(all(test, not(windows)))]
+#[path = "process_tree_properties.rs"]
+mod tree_properties;
 
 #[cfg(test)]
 mod tests {
@@ -2413,9 +2449,11 @@ mod tests {
         // pre-setting it to the marker is cmd's equivalent of the unix
         // `read || echo`. A stdin left open blocks in `set /p` instead.
         //
-        // Both callers in `apps/rocmd/src/common.rs` run on Windows, and
-        // `run_with_timeout` has no `cfg(windows)` branch, so this covers the
-        // same promise with the same two-sidedness as the unix case.
+        // Both callers in `rocmd` run on Windows -- the amd-smi probe in
+        // `apps/rocmd/src/host_snapshot.rs` and the `rocm` capture that
+        // `apps/rocmd/src/common.rs` makes through `run_rocm_capture_with_env`
+        // -- and `run_with_timeout` has no `cfg(windows)` branch, so this covers
+        // the same promise with the same two-sidedness as the unix case.
         let fixture = WindowsFixture::script(
             "stdin",
             &format!(

@@ -609,6 +609,30 @@ Feature: Interactive dashboard
     And the user quits the dashboard
     Then the dashboard exits successfully
 
+  # Exercises the hero's "no GPU telemetry" rendering (see
+  # `gpu_data_unavailable`/`node_throughput_title` in
+  # `crates/rocm-dash-tui/src/ui/tabs/home.rs`) with a *real* embedded daemon,
+  # not `--demo` (whose fixture always has 8 GPUs and can never reach this
+  # state). The runner's own hardware must not decide the outcome (a WSL host
+  # with a usable GPU skips the `/dev/kfd` pre-flight, and any host whose user
+  # can read `/dev/kfd` passes it), so the scenario runs on a simulated GPU-less
+  # host (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by the `e2e-test-hooks`
+  # build): the daemon's pre-flight and WSL reachability probe follow that
+  # empty root, `detect_with_binary` returns `None`, and every snapshot reports
+  # zero GPUs. The other half of that state machine, the transient "pending"
+  # placeholder shown before the first snapshot arrives at all, is not covered
+  # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
+  # pins it): it closes in well under a second and there's no hook to freeze the daemon
+  # mid-handshake, so asserting on it would be asserting on a race.
+  @id:dash-reports-no-gpu-telemetry @requires-os:linux
+  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard home view is displayed
+    And the hero reports no GPU telemetry available
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   # The Diagnose screen offers the same Doctor report the CLI prepares, and the
   # review comes first. Whether a report can be prepared is a property of the
   # machine, not of the dashboard: hardware that is not on AMD's published list,
@@ -631,7 +655,7 @@ Feature: Interactive dashboard
   # starts before an approve, are asserted where the key sequence can be driven
   # directly: the unit tests in `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
   @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
-  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+  Scenario: dash-38 - A user reviews a Doctor report in the dashboard before anything is sent
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the Diagnose screen
@@ -657,7 +681,7 @@ Feature: Interactive dashboard
   # reached when nothing else owns the keyboard, which is the event loop's
   # existing arm order and is not re-tested here.
   @id:dash-warning-badge-opens-the-warning @requires-os:linux
-  Scenario: dash-38 - A user reads the warning behind the header badge
+  Scenario: dash-39 - A user reads the warning behind the header badge
     When the user opens the dashboard replaying a recording that reports a warning
     Then the header shows that one warning is reported
     When the user opens the warnings
@@ -668,8 +692,40 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
+  # #771: the Services manager painted every row's status in the "ok" color, so
+  # a stopped or failed service looked as healthy as a running one. A recording
+  # supplies one service per lifecycle state, so the scenario needs no daemon
+  # and no GPU. The scenario compares the colors the user sees rather than
+  # naming a theme's RGB values: running, starting and stopped must all differ,
+  # and stopped and failed, which are both errors, must match. A status cell
+  # is read only from a row that also carries its model name, and every such
+  # row must agree, because the Instances tab behind the overlay can show the
+  # same words; so no layout order can hide a wrong color. The mapping from
+  # every status to its tone is covered by the unit tests in
+  # `crates/rocm-dash-tui/src/ui/theme.rs`.
+  @id:dash-services-status-colored-by-state @requires-os:linux
+  Scenario: dash-40 - The Services manager colors each service's status by its state
+    When the user opens the dashboard replaying a recording with running, starting, stopped and failed services
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    And each service's status is colored by its state
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Home "Running" tile counts a service that is still coming up and shows
+  # its stage, so a fresh serve is visible before the readiness probe passes.
+  # The seeded record is the one dash-03 uses (`starting` / `loading`).
+  @id:dash-home-lists-starting-service @requires-os:linux
+  Scenario: dash-41 - Home counts a still-loading model as running and shows its stage
+    Given a managed model is still loading
+    When the user opens the dashboard
+    Then the Home view counts the managed model as running and shows it as loading
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   @id:dash-serve-wizard-opens-collapsed @requires-os:linux
-  Scenario: dash-39 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+  Scenario: dash-42 - Opening the serve wizard shows only the model, Advanced settings, and Launch
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -680,7 +736,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
-  Scenario: dash-40 - Escape cancels an in-progress host edit without closing the serve wizard
+  Scenario: dash-43 - Escape cancels an in-progress host edit without closing the serve wizard
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -695,7 +751,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
-  Scenario: dash-41 - An automatic serve form stages a bare serve command with an automatic port
+  Scenario: dash-44 - An automatic serve form stages a bare serve command with an automatic port
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -711,7 +767,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
-  Scenario: dash-42 - A custom host with an automatic port is refused in the form
+  Scenario: dash-45 - A custom host with an automatic port is refused in the form
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -731,7 +787,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-refuses-public-host @requires-os:linux
-  Scenario: dash-43 - A public host is refused in the form with the CLI pointer
+  Scenario: dash-46 - A public host is refused in the form with the CLI pointer
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard

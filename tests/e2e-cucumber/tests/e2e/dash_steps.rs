@@ -23,27 +23,6 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// it proves both that the overlay opened and - as an absence - that it closed.
 const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
 
-/// The Observe instances table's TTFT cell while the scripted mock is serving:
-/// its histogram pins time-to-first-token at exactly 50 ms
-/// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
-/// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
-/// (`runner.rs`), so this cell changing is the screen's own proof that the
-/// frame on display was assembled after the failure — the only frame the
-/// held-throughput assertion is about.
-const SCRIPTED_TTFT_CELL: &str = "50ms";
-
-/// Zero-based index of the TTFT cell within an Observe instances row, counting
-/// from the model id: `MODEL TOK/S TOK/W TTFT TPOT POWER QUEUE KV%`
-/// (`instances.rs`).
-///
-/// The cell is read by position on the scripted instance's own row rather than
-/// matched as a substring of the whole screen. A bare substring cannot tell a
-/// cleared cell from a surviving one: any future ms-suffixed value that merely
-/// *contains* the scripted one (`150ms`, `250ms`), or a second row whose TTFT
-/// is also 50 ms, would keep the marker on screen and time this step out for a
-/// reason that has nothing to do with the scrape it synchronises on.
-const TTFT_COLUMN: usize = 3;
-
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
     world
@@ -174,18 +153,24 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
-/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// The one warning `dash-39`'s recording reports. Short and ASCII so it stays on
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
 
-#[when("the user opens the dashboard replaying a recording that reports a warning")]
-async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
-    // A snapshot with a working GPU *and* a warning: the combination where the
-    // warning text used to be drawn nowhere in the dashboard. The dashboard
-    // forgets its latest snapshot the moment a replay ends, and replay caps the
-    // wait between entries at two seconds, so a single line would be gone before
-    // the scenario looked at it. Sixty entries two seconds apart keep the
-    // recording playing for two minutes, far longer than the scenario runs.
+/// Spawn `dash --replay` on a recording of identical snapshots. The dashboard
+/// forgets its latest snapshot the moment a replay ends, and replay caps the wait
+/// between entries at two seconds, so a single line would be gone before a
+/// scenario looked at it. Sixty entries two seconds apart keep the recording
+/// playing for two minutes, far longer than any scenario runs. `gpus`,
+/// `instances` and `warnings` are the JSON array bodies (without brackets) of
+/// the snapshot's fields of those names.
+fn replay_recorded_snapshots(
+    world: &mut E2eWorld,
+    file_name: &str,
+    gpus: &str,
+    instances: &str,
+    warnings: &str,
+) {
     let snapshot = |ts_us: u64| {
         format!(
             concat!(
@@ -194,12 +179,13 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
                 r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
                 r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
                 r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
-                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
-                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
-                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+                r#""gpus":[{gpus}],"gpu_system_info":null,"instances":[{instances}],"#,
+                r#""warnings":[{warnings}]}}}}"#,
             ),
             ts_us = ts_us,
-            warning = RECORDED_WARNING
+            gpus = gpus,
+            instances = instances,
+            warnings = warnings
         )
     };
     let recording_text: String = (0..60u64)
@@ -211,13 +197,58 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
         .expect("no isolated root")
         .path()
         .to_path_buf();
-    let recording = root.join("warning-recording.ndjson");
+    let recording = root.join(file_name);
     std::fs::write(&recording, recording_text)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
     let path = recording.to_string_lossy().to_string();
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
     world.tui = Some(session);
+}
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard.
+    replay_recorded_snapshots(
+        world,
+        "warning-recording.ndjson",
+        concat!(
+            r#"{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+            r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}"#,
+        ),
+        "",
+        &format!(r#""{RECORDED_WARNING}""#),
+    );
+}
+
+/// One recorded instance per lifecycle state the Services manager colors. The
+/// model name carries the state so the scenario can find each row by it.
+fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"container_id":"{id}","container_name":"vllm-{id}","status":{status},"#,
+            r#""model_name":"{model}","gpu_ids":["0"],"tensor_parallel_size":1,"#,
+            r#""vram_used_mb":0,"vram_total_mb":0,"gen_tps":null,"launch_args":[],"env_vars":{{}}}}"#,
+        ),
+        id = id,
+        model = model,
+        status = status_json
+    )
+}
+
+#[when(
+    "the user opens the dashboard replaying a recording with running, starting, stopped and failed services"
+)]
+async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
+    let instances = [
+        recorded_instance("c1", "state-running", r#""running""#),
+        recorded_instance("c2", "state-starting", r#"{"starting":{"phase":null}}"#),
+        recorded_instance("c3", "state-stopped", r#""stopped""#),
+        recorded_instance("c4", "state-failed", r#""error""#),
+    ]
+    .join(",");
+    replay_recorded_snapshots(world, "service-states-recording.ndjson", "", &instances, "");
 }
 
 #[then("the header shows that one warning is reported")]
@@ -338,6 +369,22 @@ async fn open_chat(world: &mut E2eWorld) {
     let session = TuiSession::spawn(world, args)
         .unwrap_or_else(|e| panic!("failed to open interactive chat: {e}"));
     world.tui = Some(session);
+}
+
+/// An empty simulated host root: no `/dev/kfd`, no WSL signals, so the
+/// dashboard daemon's GPU pre-flight fails whatever the runner really has.
+#[given("a machine with no GPU")]
+async fn machine_with_no_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(&root).expect("failed to create the simulated host root");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
 }
 
 #[when("the user opens the dashboard")]
@@ -1530,6 +1577,61 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the hero reports no GPU telemetry available")]
+async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
+    let tui = session(world);
+    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
+    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    // Runs after the resize: the header line carries the socket path and is
+    // cut off before "rocm daemon" at the default 80-column pty.
+    // A client that never reached the daemon also reads "Unknown GPU" with
+    // "—" values (`Disconnected` ends the pending placeholder), so first
+    // require the connected header, which proves a snapshot channel exists.
+    // Match "rocm daemon" rather than "connected", which "disconnected"
+    // contains.
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard never connected to its daemon: {e}"));
+
+    // `use_wide_size` only resizes the pty; the TUI redraws asynchronously
+    // once it processes the resulting SIGWINCH. Wait for that redraw by
+    // polling for the hero's wide-layout content, not just "Unknown GPU"
+    // (already visible pre-resize from the title bar alone).
+    tui.wait_for_screen_where(
+        "the hero's wide VRAM/TEMP/POWER layout",
+        |screen| screen.contains("Unknown GPU") && screen.contains("VRAM"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the no-GPU hero did not render: {e}"));
+    let screen = tui.screen_text();
+    for label in ["VRAM", "TEMP", "POWER"] {
+        let row = screen
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
+        // Check the text *after* the label, not the whole row: the
+        // utilization gauge on the same row draws its own "—" placeholder,
+        // which would make this pass even if this mini-spark's value were a
+        // fake reading instead of the placeholder.
+        let after_label = row.split_once(label).map_or_else(
+            || panic!("no text after {label} on row:\n{row}"),
+            |(_, rest)| rest,
+        );
+        assert!(
+            after_label.contains('—'),
+            "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
+        );
+    }
+}
+
 #[then("the dashboard reports live GPU telemetry")]
 async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     let tui = session(world);
@@ -1803,6 +1905,31 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
     );
 }
 
+#[then("the Home view counts the managed model as running and shows it as loading")]
+async fn home_counts_loading_model_as_running(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let tui = session(world);
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen("Running · 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Home did not count the starting model: {e}"));
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the starting model did not appear on Home: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains(&model) && l.contains("loading")),
+        "the loading stage is not on the model's row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Nothing running"),
+        "Home claims nothing is running:\n{screen}"
+    );
+}
+
 #[then("live serving metrics are displayed for the managed model")]
 async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");
@@ -1846,6 +1973,60 @@ async fn services_manager_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
+}
+
+#[then("each service's status is colored by its state")]
+async fn services_status_colored_by_state(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Every row carries its model name; waiting for the last one means the whole
+    // list has rendered.
+    tui.wait_for_screen("state-failed", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services list did not render every row: {e}"));
+    // A row is read only when it carries both the model name and the status
+    // word, and every such row (the Instances tab behind the overlay can draw
+    // one too) must agree, so no layout order can hide a wrong color.
+    let color = |model: &str, label: &str| {
+        let found = tui.foregrounds_in_rows_with(model, label);
+        let first = *found.first().unwrap_or_else(|| {
+            panic!(
+                "no row shows {label} next to {model}:\n{}",
+                tui.screen_text()
+            )
+        });
+        assert!(
+            found.iter().all(|c| *c == first),
+            "{label} next to {model} is not colored consistently: {found:?}\n{}",
+            tui.screen_text()
+        );
+        first
+    };
+    let running = color("state-running", "RUNNING");
+    let starting = color("state-starting", "STARTING");
+    let stopped = color("state-stopped", "STOPPED");
+    let failed = color("state-failed", "ERROR");
+    // Before the fix every row's status was painted the "ok" color, so a stopped
+    // or failed service looked as healthy as a running one.
+    assert_ne!(
+        running, stopped,
+        "a stopped service is colored like a running one"
+    );
+    assert_ne!(
+        running, failed,
+        "a failed service is colored like a running one"
+    );
+    assert_ne!(
+        running, starting,
+        "a starting service is colored like a running one"
+    );
+    assert_ne!(
+        starting, stopped,
+        "a stopped service is colored like a starting one"
+    );
+    assert_eq!(
+        stopped, failed,
+        "stopped and failed services are both errors and share a color"
+    );
 }
 
 #[then("the services manager is closed")]
@@ -1951,7 +2132,7 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
 }
 
 /// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
-/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// `ui/menu.rs`) down to "Quit" and activates it — `j` twice from the
 /// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
 /// the menu to already be open (`the dashboard menu is displayed`).
 #[when("the user selects Quit from the dashboard menu")]
@@ -2374,19 +2555,27 @@ fn write_dash_clock(path: &std::path::Path, directive: &str) {
     std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
 }
 
-/// The TTFT cell `model`'s row is currently rendering, or `None` while that row
-/// is not on screen at all.
+/// The count on the header's `⚠ N` warnings badge, or 0 while no badge is drawn.
 ///
-/// Cells are whitespace-separated and a model id carries no spaces, so counting
-/// fields from the id yields one field per column — including the `—`
-/// placeholder a cleared cell renders, which keeps the columns aligned.
-fn scripted_ttft_cell<'a>(screen: &'a str, model: &str) -> Option<&'a str> {
+/// The badge counts the daemon's current warnings, and a failed `/metrics`
+/// scrape adds a `vllm scrape: N failed` warning to the snapshot it publishes.
+/// A TTFT or throughput cell cannot serve as proof that a failure reached the
+/// screen: those values are deliberately *held* through a failed scrape (and,
+/// with the clock held, stay marked fresh), so the badge growing is the
+/// visible evidence that a frame assembled after the failure is on display.
+fn warning_badge_count(screen: &str) -> usize {
     screen
-        .lines()
-        .find(|line| line.contains(model))?
-        .split_whitespace()
-        .skip_while(|field| *field != model)
-        .nth(TTFT_COLUMN)
+        .split('⚠')
+        .nth(1)
+        .map(|after| {
+            after
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -2430,12 +2619,17 @@ async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
 
 /// Switch the scripted mock to Failure mode and wait for the failure to reach
 /// the screen: first the mock's own counter proves the daemon was served a 503,
-/// then the cleared TTFT cell proves the frame on display is one the daemon
-/// assembled after that scrape. Both waits are synchronizations on observed
-/// events, not fixed sleeps, and — the clock being held — neither can consume
-/// the validity window they precede.
+/// then the header warnings badge growing proves the frame on display is one
+/// the daemon assembled after that scrape. Both waits are synchronizations on
+/// observed events, not fixed sleeps, and — the clock being held — neither can
+/// consume the validity window they precede.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    // Read the badge before the failure is injected: the count that matters is
+    // the one this failure adds, and other warnings (e.g. no amd-smi on a
+    // GPU-less runner) are already present and constant.
+    let before = warning_badge_count(&session(world).screen_text());
+
     let mock = world.mock.as_ref().expect("no mock server running");
     mock.set_metrics_mode(MetricsMode::Failure);
 
@@ -2455,16 +2649,10 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let model = world
-        .model_name
-        .clone()
-        .expect("the scripted-metrics Given records the model this row belongs to");
     session(world)
         .wait_for_screen_where(
-            &format!("the scripted instance's TTFT cell leaves {SCRIPTED_TTFT_CELL:?}"),
-            |screen| {
-                scripted_ttft_cell(screen, &model).is_some_and(|cell| cell != SCRIPTED_TTFT_CELL)
-            },
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
             default_timeout(),
         )
         .await
@@ -2478,8 +2666,8 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 
 /// EAI-7960 principal regression assertion.
 ///
-/// The frame under assertion is provably post-failure (the TTFT cell it used to
-/// show is gone) and the logical clock is held, so the only way "tok/s" can be
+/// The frame under assertion is provably post-failure (the header warnings
+/// badge has grown past its pre-failure count) and the logical clock is held, so the only way "tok/s" can be
 /// missing here is the regression itself: the daemon clearing a held rate on a
 /// failed scrape instead of keeping it for the validity window.
 #[then("generation throughput remains visible within the validity window")]

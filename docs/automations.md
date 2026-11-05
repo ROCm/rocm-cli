@@ -12,7 +12,10 @@ grant a new action, choose a tool, override watcher mode, or run shell.
 
 ## Local Webhook Source
 
-Start the persistent watcher loop with a loopback-only webhook source:
+Start the watcher loop with a loopback-only webhook source. The loop runs only
+while at least one watcher is enabled and exits on its own within a few seconds
+otherwise, so enable one first (for example `rocm automations enable
+gpu-metrics`):
 
 ```bash
 rocmd run --automations-enabled --local-webhook-port 18080
@@ -164,8 +167,10 @@ For `gpu-thermal-protect`, rocm-cli can also create events from local
 `gpu.thermal_pressure` or `gpu.memory_pressure`. In `observe` mode it records
 the pressure only. In `propose` and `contained` modes it queues a reviewed
 `stop_server` proposal only when the target managed server is explicit or
-there is exactly one running managed server. It does not stop a model server
-automatically:
+there is exactly one running managed server. While a stop request for a server
+is still waiting for review, a further alert for that server is recorded and
+queues no second request, however many other proposals were queued after it.
+It does not stop a model server automatically:
 
 ```powershell
 Invoke-RestMethod `

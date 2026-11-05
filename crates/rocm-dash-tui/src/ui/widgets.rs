@@ -4,6 +4,7 @@
 
 //! Small UI helpers shared across tabs.
 
+use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
@@ -15,15 +16,15 @@ pub const TEMP_WARN_C: f32 = 60.0;
 /// Temperature critical threshold (°C). At or above → err color.
 pub const TEMP_CRIT_C: f32 = 80.0;
 
-/// Board-power warning threshold (W). At or above → warn color.
+/// Fraction of a GPU's power limit at or above which power is colored warn.
 ///
-/// Fixed semantic thresholds make heatmap/gauge colors mean "near the limit"
-/// rather than "near the largest value seen this session". Tuned for
-/// MI355X-class parts (TDP ~750 W); the demo generator peaks ~740 W at 100%
-/// util. No per-GPU TDP exists in the data model, so these are constants.
-pub const POWER_WARN_W: f32 = 525.0;
-/// Board-power critical threshold (W). At or above → err color. ~TDP-adjacent.
-pub const POWER_CRIT_W: f32 = 700.0;
+/// Fixed semantic thresholds make temperature and power colors mean "near the limit"
+/// rather than "near the largest value seen this session". The power thresholds
+/// are relative to the device's own cap, so the colors mean "near this part's
+/// limit" on any GPU, not "near an MI355X's".
+pub const POWER_WARN_FRAC: f32 = 0.70;
+/// Fraction of the power limit at or above which board power is colored err.
+pub const POWER_CRIT_FRAC: f32 = 0.93;
 
 /// Truncate `s` to at most `n` characters (not bytes).
 pub fn trunc(s: &str, n: usize) -> String {
@@ -31,6 +32,39 @@ pub fn trunc(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect()
+    }
+}
+
+/// Apply an append-only text-edit key to `buf`.
+///
+/// `Char` appends and `Backspace` pops one char. Returns `true` when `key` is
+/// one of those two, whether or not `buf` changed, so callers can reset their
+/// own state on any edit key.
+pub fn apply_char_key(buf: &mut String, key: KeyCode) -> bool {
+    apply_char_key_filtered(buf, key, |_| true)
+}
+
+/// [`apply_char_key`] where a `Char` is appended only if `accept` allows it.
+///
+/// A rejected `Char` is still consumed (swallowed); `Backspace` is never
+/// filtered.
+pub fn apply_char_key_filtered(
+    buf: &mut String,
+    key: KeyCode,
+    accept: impl Fn(char) -> bool,
+) -> bool {
+    match key {
+        KeyCode::Char(c) => {
+            if accept(c) {
+                buf.push(c);
+            }
+            true
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -46,15 +80,19 @@ pub fn temperature_style(c: f32, theme: &Theme) -> Style {
     Style::default().fg(color)
 }
 
-/// Color a board-power value against the fixed [`POWER_WARN_W`] /
-/// [`POWER_CRIT_W`] thresholds, mirroring [`temperature_style`].
-pub fn power_style(w: f32, theme: &Theme) -> Style {
-    let color = if w >= POWER_CRIT_W {
-        theme.err
-    } else if w >= POWER_WARN_W {
-        theme.warn
-    } else {
-        theme.ok
+/// Color a board-power value against the GPU's own power limit
+/// ([`POWER_WARN_FRAC`] / [`POWER_CRIT_FRAC`] of it), mirroring
+/// [`temperature_style`].
+///
+/// With no known limit (or a non-positive one) there is nothing to compare
+/// against, so the value is drawn in the plain foreground color rather than
+/// judged against another part's TDP.
+pub fn power_style(w: f32, limit_w: Option<f32>, theme: &Theme) -> Style {
+    let color = match limit_w.filter(|l| l.is_finite() && *l > 0.0) {
+        None => theme.fg,
+        Some(limit) if w >= limit * POWER_CRIT_FRAC => theme.err,
+        Some(limit) if w >= limit * POWER_WARN_FRAC => theme.warn,
+        Some(_) => theme.ok,
     };
     Style::default().fg(color)
 }
@@ -138,8 +176,12 @@ pub fn gpu_stats_line<'a>(g: &'a GpuMetrics, theme: &Theme) -> Line<'a> {
             Style::default().fg(theme.muted),
         ),
         Span::styled(
-            format!("  {:>5.1}°C  {:>5.1} W", g.temperature_c, g.power_w),
+            format!("  {:>5.1}°C", g.temperature_c),
             temperature_style(g.temperature_c, theme),
+        ),
+        Span::styled(
+            format!("  {:>5.1} W", g.power_w),
+            power_style(g.power_w, g.power_limit_w, theme),
         ),
     ])
 }
@@ -182,14 +224,58 @@ mod tests {
     }
 
     #[test]
-    fn power_style_uses_fixed_thresholds() {
+    fn power_style_is_relative_to_the_gpu_limit() {
         let theme = Theme::default_dark();
-        assert_eq!(power_style(720.0, &theme).fg, Some(theme.err));
-        assert_eq!(power_style(600.0, &theme).fg, Some(theme.warn));
-        assert_eq!(power_style(300.0, &theme).fg, Some(theme.ok));
-        // boundaries are inclusive at the threshold
-        assert_eq!(power_style(POWER_CRIT_W, &theme).fg, Some(theme.err));
-        assert_eq!(power_style(POWER_WARN_W, &theme).fg, Some(theme.warn));
+        // Same wattage, different parts: 600 W is critical on a 600 W card but
+        // comfortably fine on a 1000 W one.
+        assert_eq!(power_style(600.0, Some(600.0), &theme).fg, Some(theme.err));
+        assert_eq!(power_style(600.0, Some(1000.0), &theme).fg, Some(theme.ok));
+        assert_eq!(power_style(500.0, Some(600.0), &theme).fg, Some(theme.warn));
+        assert_eq!(power_style(300.0, Some(600.0), &theme).fg, Some(theme.ok));
+        // Boundaries are inclusive.
+        assert_eq!(
+            power_style(1000.0 * POWER_CRIT_FRAC, Some(1000.0), &theme).fg,
+            Some(theme.err)
+        );
+        assert_eq!(
+            power_style(1000.0 * POWER_WARN_FRAC, Some(1000.0), &theme).fg,
+            Some(theme.warn)
+        );
+    }
+
+    #[test]
+    fn power_style_without_a_limit_is_neutral_not_judged() {
+        let theme = Theme::default_dark();
+        for limit in [None, Some(0.0), Some(f32::NAN), Some(-5.0)] {
+            assert_eq!(power_style(720.0, limit, &theme).fg, Some(theme.fg));
+        }
+    }
+
+    #[test]
+    fn full_panel_colors_power_by_limit_not_by_temperature() {
+        let theme = Theme::default_dark();
+        // A cool GPU at 95% of its cap: power is critical even though the
+        // temperature is fine, the same as in the compact row.
+        let g = GpuMetrics {
+            device_id: "gpu-0".into(),
+            temperature_c: 40.0,
+            power_w: 712.5,
+            power_limit_w: Some(750.0),
+            ..GpuMetrics::default()
+        };
+        let line = gpu_stats_line(&g, &theme);
+        let temp = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("°C"))
+            .unwrap();
+        let power = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains(" W"))
+            .unwrap();
+        assert_eq!(temp.style.fg, Some(theme.ok));
+        assert_eq!(power.style.fg, Some(theme.err));
     }
 
     #[test]
@@ -280,5 +366,66 @@ mod tests {
         };
         let eff = node_efficiency(&snap).expect("finite gen_tps must still produce a result");
         assert!((eff - 0.5).abs() < 1e-9, "got {eff}");
+    }
+
+    #[test]
+    fn apply_char_key_appends_chars_in_order() {
+        let mut buf = String::from("ab");
+        assert!(apply_char_key(&mut buf, KeyCode::Char('c')));
+        assert!(apply_char_key(&mut buf, KeyCode::Char(' ')));
+        assert_eq!(buf, "abc ");
+    }
+
+    #[test]
+    fn apply_char_key_backspace_pops_one_char_not_one_byte() {
+        let mut buf = String::from("aé");
+        assert!(apply_char_key(&mut buf, KeyCode::Backspace));
+        assert_eq!(buf, "a");
+    }
+
+    #[test]
+    fn apply_char_key_backspace_on_empty_is_consumed_and_a_no_op() {
+        let mut buf = String::new();
+        assert!(apply_char_key(&mut buf, KeyCode::Backspace));
+        assert_eq!(buf, "");
+    }
+
+    #[test]
+    fn apply_char_key_ignores_non_text_keys() {
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::Up,
+            KeyCode::Left,
+            KeyCode::Delete,
+        ] {
+            let mut buf = String::from("keep");
+            assert!(
+                !apply_char_key(&mut buf, key),
+                "{key:?} must not be consumed"
+            );
+            assert_eq!(buf, "keep", "{key:?} must not edit the buffer");
+        }
+    }
+
+    #[test]
+    fn apply_char_key_filtered_swallows_a_rejected_char() {
+        let mut buf = String::from("80");
+        assert!(apply_char_key_filtered(&mut buf, KeyCode::Char('x'), |c| c.is_ascii_digit()));
+        assert_eq!(buf, "80", "rejected char is consumed but not appended");
+        assert!(apply_char_key_filtered(&mut buf, KeyCode::Char('1'), |c| c.is_ascii_digit()));
+        assert_eq!(buf, "801");
+    }
+
+    #[test]
+    fn apply_char_key_filtered_never_filters_backspace() {
+        let mut buf = String::from("ab");
+        assert!(apply_char_key_filtered(
+            &mut buf,
+            KeyCode::Backspace,
+            |_| false
+        ));
+        assert_eq!(buf, "a");
     }
 }

@@ -105,14 +105,20 @@ impl AmdSmiCollector {
         let me = Self {
             binary: binary.into(),
         };
-        match timeout(DETECT_TIMEOUT, me.run(&["version"])).await {
-            Ok(Ok(_)) => Some(me),
+        me.probe_version(DETECT_TIMEOUT).await
+    }
+
+    /// Runs `amd-smi version` and keeps the collector only if it answers within
+    /// `limit`. Split out of detection so a test can shorten the limit.
+    async fn probe_version(self, limit: Duration) -> Option<Self> {
+        match timeout(limit, self.run(&["version"])).await {
+            Ok(Ok(_)) => Some(self),
             Ok(Err(e)) => {
-                warn!(error = %e, binary = ?me.binary, "amd-smi present but `version` failed");
+                warn!(error = %e, binary = ?self.binary, "amd-smi present but `version` failed");
                 None
             }
             Err(_) => {
-                warn!(binary = ?me.binary, "amd-smi `version` timed out");
+                warn!(binary = ?self.binary, "amd-smi `version` timed out");
                 None
             }
         }
@@ -121,6 +127,13 @@ impl AmdSmiCollector {
     pub async fn metrics(&self) -> io::Result<Vec<GpuMetrics>> {
         let v = self.run_json(&["metric", "--json"]).await?;
         Ok(parse_metrics(&v))
+    }
+
+    /// Per-GPU power caps (W) from `amd-smi static --json`, keyed by the same
+    /// `gpu-N` id [`metrics`] uses. GPUs with no readable cap are omitted.
+    pub async fn power_limits(&self) -> io::Result<std::collections::HashMap<String, f32>> {
+        let v = self.run_json(&["static", "--json"]).await?;
+        Ok(parse_power_limits(&v))
     }
 
     /// Per-process GPU VRAM usage from `amd-smi process --json`.
@@ -146,7 +159,14 @@ impl AmdSmiCollector {
     }
 
     async fn run(&self, args: &[&str]) -> io::Result<String> {
-        let out = Command::new(&self.binary).args(args).output().await?;
+        // `kill_on_drop`: both callers await this under a `timeout`, and a timeout
+        // that fires drops this future. Without it the child would keep running
+        // (and keep a GPU query open) after the caller had given up on it.
+        let out = Command::new(&self.binary)
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
                 "amd-smi {args:?} exited {}: {}",
@@ -158,7 +178,13 @@ impl AmdSmiCollector {
     }
 
     async fn run_json(&self, args: &[&str]) -> io::Result<Value> {
-        let s = timeout(RUN_TIMEOUT, self.run(args))
+        self.run_json_within(RUN_TIMEOUT, args).await
+    }
+
+    /// [`run_json`](Self::run_json) with an explicit time limit, so a test can
+    /// shorten it.
+    async fn run_json_within(&self, limit: Duration, args: &[&str]) -> io::Result<Value> {
+        let s = timeout(limit, self.run(args))
             .await
             .map_err(|_| io::Error::other(format!("amd-smi {args:?} timed out")))??;
         serde_json::from_str(&s).map_err(|e| io::Error::other(format!("parse: {e}")))
@@ -239,7 +265,47 @@ pub fn parse_metrics(v: &Value) -> Vec<GpuMetrics> {
                 temperature_c,
                 power_w: val_f32(nested(g, &["power", "socket_power", "value"])).unwrap_or(0.0),
                 clock_mhz: val_f32(nested(g, &["clock", "gfx_0", "clk", "value"])),
+                // Filled by the runner from `power_limits`; not in `metric`.
+                power_limit_w: None,
             }
+        })
+        .collect()
+}
+
+/// Candidate keys under a GPU's `limit` object for its power cap, in priority
+/// order: the cap currently in force, then the maximum the part allows.
+const POWER_LIMIT_KEYS: [&str; 2] = ["socket_power", "max_power"];
+
+/// Parse `amd-smi static --json` into per-GPU power caps (W), keyed `gpu-N`.
+///
+/// Assumed schema (not verified against every amd-smi release): top level
+/// `{ "gpu_data": [ <gpu>, ... ] }` or a bare array; each `<gpu>` has
+/// `{ "gpu": N, "limit": { "socket_power" | "max_power": <watts> } }` where the
+/// value is a raw number or a `{ "value": W, "unit": "W" }` wrapper. A missing,
+/// non-numeric, non-finite or non-positive cap (`N/A`, `0`) is omitted, so an
+/// unrecognised schema yields an empty map and callers treat the cap as
+/// unknown rather than guessing one.
+pub fn parse_power_limits(v: &Value) -> std::collections::HashMap<String, f32> {
+    let entries: Vec<&Value> = if let Some(arr) = v.get("gpu_data").and_then(|x| x.as_array()) {
+        arr.iter().collect()
+    } else if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else {
+        return std::collections::HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|g| {
+            let id = g.get("gpu").and_then(serde_json::Value::as_u64)?;
+            let limit = g.get("limit")?;
+            // Validity is judged per key, so an unreadable or zero current cap
+            // falls through to the part's maximum instead of masking it.
+            let watts = POWER_LIMIT_KEYS.iter().find_map(|k| {
+                let raw = limit.get(*k)?;
+                let w = val_f32(Some(raw)).or_else(|| val_f32(raw.get("value")))?;
+                (w.is_finite() && w > 0.0).then_some(w)
+            })?;
+            Some((format!("gpu-{id}"), watts))
         })
         .collect()
 }
@@ -485,6 +551,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn power_limits_prefer_current_cap_and_skip_unreadable() {
+        let v: Value = serde_json::from_str(
+            r#"{ "gpu_data": [
+              { "gpu": 0, "limit": { "socket_power": { "value": 600, "unit": "W" },
+                                      "max_power":    { "value": 750, "unit": "W" } } },
+              { "gpu": 1, "limit": { "max_power": 750 } },
+              { "gpu": 2, "limit": { "socket_power": "N/A" } },
+              { "gpu": 3, "limit": { "max_power": { "value": 0, "unit": "W" } } },
+              { "gpu": 4 }
+            ] }"#,
+        )
+        .unwrap();
+        let m = parse_power_limits(&v);
+        assert_eq!(m.get("gpu-0"), Some(&600.0), "current cap wins over max");
+        assert_eq!(m.get("gpu-1"), Some(&750.0), "raw number falls back to max");
+        assert_eq!(m.len(), 2, "N/A, zero and absent caps are unknown: {m:?}");
+        // Unrecognised shapes are an empty map, not a panic.
+        assert!(parse_power_limits(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_zero_current_cap_falls_through_to_the_maximum() {
+        let v: Value = serde_json::from_str(
+            r#"[ { "gpu": 0, "limit": { "socket_power": 0, "max_power": 750 } },
+                 { "gpu": 1, "limit": { "socket_power": "N/A", "max_power": 600 } } ]"#,
+        )
+        .unwrap();
+        let m = parse_power_limits(&v);
+        assert_eq!(m.get("gpu-0"), Some(&750.0), "0 must not mask max_power");
+        assert_eq!(m.get("gpu-1"), Some(&600.0), "N/A falls through too");
+    }
+
     const SAMPLE_METRIC: &str = r#"{
       "gpu_data": [
         {
@@ -643,6 +742,113 @@ mod tests {
         )
         .unwrap();
         assert!(parse_processes(&v).is_empty());
+    }
+
+    /// The limit the timeout tests give the collector. The clock starts at the
+    /// call, not when the fake script has written its pid file, so a limit near
+    /// the time a loaded runner needs to start a shell would end the run before
+    /// the child existed and fail the test as "never started".
+    #[cfg(target_os = "linux")]
+    const TEST_LIMIT: Duration = Duration::from_secs(10);
+
+    /// A fake `amd-smi` that records its own pid and then sleeps far past any
+    /// limit a test sets. `exec` makes the recorded pid the sleeper's own, so
+    /// the test watches the process the collector spawned and not a shell that
+    /// could exit separately.
+    #[cfg(target_os = "linux")]
+    fn write_sleeping_amd_smi(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pid_file = dir.join("child.pid");
+        let binary = dir.join("amd-smi");
+        rocm_core::fake_executable::write_fake_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        (binary, pid_file)
+    }
+
+    /// True while `pid` is a live process. A zombie that only awaits reaping
+    /// counts as gone: it has been killed and runs no code.
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // The state letter follows the parenthesised command name.
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .is_some_and(|state| state != 'Z' && state != 'X'),
+            Err(_) => false,
+        }
+    }
+
+    /// Waits for the process `pid` to stop running, killing it first if it is
+    /// still alive after `grace` so a failing run does not leave a sleeper
+    /// behind. Returns whether it was gone without that kill.
+    #[cfg(target_os = "linux")]
+    async fn gone_within(pid: u32, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        while process_is_running(pid) {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recorded_pid(pid_file: &Path) -> u32 {
+        std::fs::read_to_string(pid_file)
+            .expect("the fake amd-smi never started, so the timeout proved nothing")
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_json_timeout_kills_the_amd_smi_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, pid_file) = write_sleeping_amd_smi(dir.path());
+        let collector = AmdSmiCollector {
+            binary: binary.into(),
+        };
+
+        let err = collector
+            .run_json_within(TEST_LIMIT, &["metric", "--json"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let pid = recorded_pid(&pid_file);
+        assert!(
+            gone_within(pid, Duration::from_secs(5)).await,
+            "amd-smi child {pid} was still running after its timeout fired"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn detection_timeout_kills_the_amd_smi_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, pid_file) = write_sleeping_amd_smi(dir.path());
+        let collector = AmdSmiCollector {
+            binary: binary.into(),
+        };
+
+        assert!(collector.probe_version(TEST_LIMIT).await.is_none());
+
+        let pid = recorded_pid(&pid_file);
+        assert!(
+            gone_within(pid, Duration::from_secs(5)).await,
+            "amd-smi child {pid} was still running after the detection timeout fired"
+        );
     }
 
     #[tokio::test]

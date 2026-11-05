@@ -12,15 +12,16 @@
 //!
 //! This is invisible on most of CI. `ci.yml`'s `Test (affected crates)` job
 //! runs `cargo nextest` (a process per test, so the mutation cannot escape),
-//! but `windows-build-and-test` runs `cargo test --workspace --all-targets` —
-//! all tests as threads in ONE process. So the Windows lane, a required check,
-//! was the only place the race could fire, and it read as "your change broke
-//! Windows" on branches that never touched the crate. Nothing about the bug is
-//! Windows-specific; it is a property of the runner.
+//! but the `windows-debug` job (part of the required `windows-build-and-test`
+//! check) runs `cargo test --workspace --all-targets` — all tests as threads in
+//! ONE process. So the Windows lane, a required check, was the only place the
+//! race could fire, and it read as "your change broke Windows" on branches that
+//! never touched the crate. Nothing about the bug is Windows-specific; it is a
+//! property of the runner.
 //!
 //! "the Linux lanes use nextest" would be too strong: `coverage`
 //! (`cargo llvm-cov`, no `--nextest`) and `e2e` (`cargo test -p e2e-cucumber
-//! --lib`) are threaded single-process harnesses on `ubuntu-latest` too. They
+//! --lib`) are threaded single-process harnesses on the hosted Ubuntu runners too. They
 //! happen not to reach the crates that raced, which is luck rather than
 //! design — so this guard covers the whole tree rather than one crate.
 //!

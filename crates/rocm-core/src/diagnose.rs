@@ -1558,7 +1558,7 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
 /// Whether `rocm_install_method` indicates a package-manager-driven install,
 /// covering both the marker-file-based `"repo-native"` value and the
 /// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
-/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// `examine/rocm_install_probe.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
 /// but whose package manager confirms `rocm-hip-runtime` is installed is
 /// still repo-native-managed, just detected a different way.
 ///
@@ -1573,7 +1573,7 @@ fn is_repo_native_installed(method: &str) -> bool {
 /// Whether `rocm install driver --dkms` plans any commands for this host.
 ///
 /// Mirrors the full `(os_id, version_id)` / `ID_LIKE`-derivative
-/// matrix in `apps/rocm/src/driver_install.rs::build_driver_install_plan_at`
+/// matrix in `apps/rocm/src/driver_plan.rs::build_driver_install_plan_at`
 /// (`rocm-core` can't call that plan builder directly: `apps/rocm` depends
 /// on `rocm-core`, not the reverse).
 pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
@@ -1939,9 +1939,14 @@ const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 ///
 /// It carries two independent signals (the torch exception class *and* the HIP
 /// allocator message) on one anchored line, so it scores even after overlap
-/// de-duplication. The vLLM engine falls back to this when a user's actual
-/// failing line would not itself be diagnosable, so the `rocm diagnose` command
-/// it prints always reports a cause.
+/// de-duplication. Both OOM surfaces — the vLLM engine's startup-failure hint
+/// and the `rocm serve` summary note — fall back to this when the user's actual
+/// failing line cannot be rendered as one intact single-quoted shell argument
+/// (`quotable_in_single_quotes` rejects it), so the `rocm diagnose` command they
+/// print always reports a cause. Note the condition is *quotability*, not
+/// diagnosability: `vllm_oom_diagnose_symptom` returns the raw line with its
+/// control bytes intact, and an escape-bearing line scores on its rendered rows
+/// but is refused by the quoting guard, which is what sends it here.
 pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
 
 /// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
@@ -2021,10 +2026,15 @@ fn vllm_anchored_lines(symptom: &str) -> String {
 /// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
 /// mode.
 ///
-/// The vLLM engine calls this to decide whether the user's actual failing line
-/// is worth routing into a `--symptom` example, or whether to fall back to
-/// [`VLLM_OOM_CANONICAL_SYMPTOM`] so the printed command is guaranteed to report
-/// a cause rather than reading as "the tool checked and found nothing".
+/// This is the OOM *classifier* the whole stack scores against. It is not what
+/// the engine calls directly any more: `rocm_core::vllm_oom_diagnose_symptom`
+/// owns line selection for both surfaces and reaches this per rendered row, and
+/// what those surfaces then branch on before printing is
+/// `quotable_in_single_quotes` — a line this function accepts is still replaced
+/// by [`VLLM_OOM_CANONICAL_SYMPTOM`] when it cannot be rendered as one intact
+/// single-quoted argument. Scoring here and admissibility there are deliberately
+/// separate questions; keeping them straight is what stops a colourised line
+/// being printed as a runnable lookalike of the user's error.
 #[must_use]
 pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
     scores_on_every_engine_host(symptom, "fix-16-vllm-oom", run_all_checks)
@@ -3193,10 +3203,10 @@ pub fn upstream_route(target: &str) -> Route {
 /// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
 /// named arms plus the ROCm-core default are the whole reachable set.
 ///
-/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// Adding a framework to `examine/framework.rs`'s probe means adding its arm here, its
 /// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
 /// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
-/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// its own list rather than deriving one from `examine/framework.rs`, so it cannot notice
 /// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
@@ -3756,6 +3766,137 @@ mod tests {
                 .iter()
                 .map(|d| (&d.id, d.score))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// ROCMAI-830: the other host ROCMAI-546's gate has to hold on. A native
+    /// Windows Strix Halo (gfx1151) whose default engine is Lemonade, with no
+    /// system HIP SDK, diagnosed twice: before any runtime was installed, and
+    /// after `rocm install sdk` put a managed TheRock wheel runtime in place.
+    ///
+    /// Unlike the gfx90c laptop above, gfx1151 is a supported ROCm target, so
+    /// `info-20` does not fire and nothing outranks fix-13 here: on v0.2.1,
+    /// which was cut before the gate landed, fix-13 was the *only* entry and
+    /// ranked #1 at 35 on a machine serving models fine. A managed runtime is
+    /// not a HIP-based setup that needs the system SDK either -- its wheels
+    /// bundle their own HIP runtime -- whether the torch probe through it
+    /// answered (a `hip=` build) or timed out (`unknown`, as on the reporting
+    /// machine under load).
+    ///
+    /// The fields mirror that machine's `rocm examine --json`. The final
+    /// positive-control arm keeps the gate honest: the same host with an
+    /// ambient HIP-built torch on PATH does need the SDK, so fix-13 still
+    /// ranks first there.
+    #[test]
+    fn fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime() {
+        let strix_halo = |framework: &str, rocm_version: &str, source: &str| Examination {
+            os_family: "windows".to_owned(),
+            cpu_vendor: "amd".to_owned(),
+            gpus: vec![Gpu {
+                name: "AMD Radeon(TM) 8060S Graphics".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+                is_apu: Some(true),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            has_amd_gpu: true,
+            has_apu: true,
+            // No system HIP SDK: the arm that used to score 35 on its own.
+            hip_sdk_path: String::new(),
+            hipinfo_present: false,
+            adrenalin_version: "32.0.32015.7029".to_owned(),
+            msvc_redist_present: Some(true),
+            framework: framework.to_owned(),
+            framework_rocm_version: rocm_version.to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+        let summary = |report: &DiagnoseReport| {
+            report
+                .matched
+                .iter()
+                .map(|d| (d.id.clone(), d.score))
+                .collect::<Vec<_>>()
+        };
+
+        for (label, host) in [
+            (
+                "before any runtime was installed",
+                strix_halo("unknown", "", ""),
+            ),
+            // Framework "unknown" means nothing HIP-based is detected, so
+            // `needs_hip` is false whatever `framework_source` says: this arm
+            // documents the reporting machine's shape but does not exercise
+            // the managed-runtime exemption. The next arm does.
+            (
+                "managed runtime whose torch probe timed out (no HIP evidence)",
+                strix_halo("unknown", "", "managed-runtime"),
+            ),
+            (
+                "managed runtime whose torch is a HIP build",
+                strix_halo("pytorch", "hip=7.14.60850", "managed-runtime"),
+            ),
+        ] {
+            assert_eq!(
+                check_13_hip_sdk_missing(&host, "").score,
+                0,
+                "{label}: nothing on this host calls into the system HIP SDK"
+            );
+            let report = diagnose(&host, "");
+            assert!(
+                report.matched.is_empty() && !report.has_match,
+                "{label}: a healthy Lemonade host must report no match, not a WEAK \
+                 fix-13 at #1: {:?}",
+                summary(&report)
+            );
+        }
+
+        let ambient = diagnose(&strix_halo("pytorch", "hip=7.14.60850", "path"), "");
+        assert_eq!(
+            ambient.matched.first().map(|d| d.id.as_str()),
+            Some("fix-13-hip-sdk-missing"),
+            "the same host with a HIP-built torch on PATH really needs the SDK: {:?}",
+            summary(&ambient)
+        );
+    }
+
+    /// Pins what production does today for an ambient HIP-built PyTorch beside
+    /// a healthy system SDK: the +25 "PyTorch needs a working SDK" bonus is not
+    /// gated on the SDK being unusable, so fix-13 still lists (score 25, below
+    /// `MIN_SCORE_FOR_MATCH`, so advice only). The diagnose-48 oracle mirrors
+    /// this. If the bonus is later gated on `sdk_unusable`, change both.
+    #[test]
+    fn fix_13_lists_weakly_for_ambient_hip_torch_beside_a_healthy_system_sdk() {
+        let host = |hip_sdk_path: &str, hipinfo_present: bool, source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: hip_sdk_path.to_owned(),
+            hipinfo_present,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+        let sdk = r"C:\Program Files\AMD\ROCm\6.4";
+
+        let healthy = host(sdk, true, "path");
+        assert_eq!(check_13_hip_sdk_missing(&healthy, "").score, 25);
+        let report = diagnose(&healthy, "");
+        let row = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-13-hip-sdk-missing")
+            .expect("ambient HIP torch lists fix-13 even with a healthy SDK");
+        assert!(
+            row.score < MIN_SCORE_FOR_MATCH,
+            "advice only: {}",
+            row.score
+        );
+
+        // Control: the same healthy SDK under a managed runtime is silent.
+        assert_eq!(
+            check_13_hip_sdk_missing(&host(sdk, true, "managed-runtime"), "").score,
+            0
         );
     }
 
@@ -4443,7 +4584,7 @@ mod tests {
         // two installations and fire on the most common install we ship. (A
         // fixture nesting `_rocm_sdk_core` under the root, the shape the
         // installer never produces, would pass by construction without
-        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // proving that -- this one matches `apps/rocm/src/therock/probe.rs`'s
         // `ROCM_SDK_PROBE_SCRIPT` instead.)
         let mut e = linux_base();
         let root = "/data/runtimes/therock/_rocm_sdk_devel";
@@ -4647,7 +4788,7 @@ mod tests {
     fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
         // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
         // fix-18 finding answer the same question about the same machine. Both
-        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // are driven by `comgr_matches_runtime` in `examine/library_copies.rs`, so this checks
         // the two surfaces stay in lockstep across every shape the catalog
         // itself tests -- including the case that used to disagree: a runtime
         // whose own installation ships no code object manager at all.
@@ -5094,7 +5235,7 @@ mod tests {
     /// a re-added arm has to come with a probe that reaches it.
     ///
     /// The list below is **hand-maintained**: its first four entries mirror what
-    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// `Examination::probe` sets in `examine/framework.rs`, and the rest are names the
     /// probe never returns, kept so a re-added arm for one of them shows up.
     /// Neither half is derived from that code, so adding a fifth framework to
     /// the probe will not fail this test — see the note on
@@ -7608,13 +7749,11 @@ mod tests {
     /// the whole `PATH` of a shell that runs a Linux verify line.
     #[cfg(unix)]
     fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("the stub directory is created");
         for (name, script) in stubs {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("a stub is written");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("a stub is made executable");
+            crate::fake_executable::write_fake_executable(&path, format!("#!/bin/sh\n{script}\n"))
+                .expect("a stub is planted");
         }
         dir
     }
@@ -8298,7 +8437,7 @@ mod tests {
 
     #[test]
     fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
-        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // probe_rocm_install (examine/rocm_install_probe.rs) falls back to the literal "apt"/"dnf"
         // when dpkg/rpm confirms the package is installed but no marker file
         // was found. Those hosts are still repo-native-managed, so the evidence
         // line must fire for them too, not just the marker-file-detected
@@ -8379,7 +8518,7 @@ mod tests {
         // (distro_id, distro_version, distro_id_like, supported). Kept in step
         // with `build_driver_install_plan_at` by
         // `driver_plan_support_matches_rocm_core_diagnose` in
-        // `apps/rocm/src/driver_install.rs`.
+        // `apps/rocm/src/driver_plan.rs`.
         let table = [
             ("ubuntu", "22.04", "debian", true),
             ("ubuntu", "24.04", "debian", true),

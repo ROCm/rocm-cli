@@ -6,8 +6,9 @@
 //! `event_loop`, plus the frame gate and registry-probe seeding they use. Split
 //! out of `app/mod.rs` to keep the core reducer focused; terminal restoration,
 //! the shutdown latch and the termination-signal watcher live in
-//! `app/terminal.rs`, the focused-host policy in `app/focus.rs` and the
-//! Updates-tile check in `app/update_check.rs`.
+//! `app/terminal.rs`, the focused-host policy in `app/focus.rs`, the
+//! Updates-tile check in `app/update_check.rs` and the live chat backend (its
+//! startup and the edges that rebuild or call it) in `app/chat_runtime.rs`.
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -26,13 +27,12 @@ use tokio::time::interval;
 use crate::client::{self, ClientMsg};
 use crate::ui;
 
+use super::AppState;
 use super::actions::{
     apply_action, console_scroll_delta, handle_key, is_actionable_key, run_approved,
 };
-use super::chat::{
-    self, StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
-    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
-};
+use super::chat::{detect_local_chat, persist_chat_endpoint};
+use super::chat_runtime::ChatRuntime;
 use super::focus::{apply_startup_focus, focused_close_key_blocked, should_skip_daemon};
 use super::scrollbar::resolve_mouse;
 use super::summary::{parse_plan_result, summarize_slash_tool};
@@ -40,12 +40,8 @@ use super::terminal::{
     SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer, restore_after_session,
     restore_terminal, shutdown_claimed_on, spawn_termination_watcher,
 };
-use super::types::{
-    ChatKeyCtx, ChatProvider, ChatTurn, ConnState, Focus, NO_CHAT_BACKEND_MSG, PaneFocus,
-    ReplayState, ResolvedArgs,
-};
+use super::types::{ChatKeyCtx, ConnState, Focus, PaneFocus, ReplayState, ResolvedArgs};
 use super::update_check::refresh_update_status;
-use super::{AppState, ProviderSwitch};
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -248,180 +244,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // non-live data, so mark the session simulated for the honesty chrome.
     state.simulated = state.replay.is_some();
 
-    // Resolve the chat backend. `--chat-mock` short-circuits detection with a
-    // deterministic offline MockAgentClient (no live LLM, no network); otherwise
-    // we auto-detect the endpoint (the std-TCP probe runs once on a blocking
-    // thread before the first frame) and build the Rig backend.
-    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if should_skip_daemon(
-        args.focus,
-    ) {
-        // Focused host: Setup/Serve/Diagnose never chat. Skip endpoint detection
-        // and backend construction entirely — no probe, no network, no OAuth
-        // default. `chat_llm` stays `None` and the Chat tab is never drawn here.
-        None
-    } else if args.chat_mock {
-        state.set_chat_config(
-            Some(crate::llm::LlmConfig {
-                base_url: "mock://offline-demo".to_string(),
-                model: "mock-agent".to_string(),
-                api_key: None,
-                auth_header: None,
-            }),
-            true,
-        );
-        Some(std::sync::Arc::new(
-            crate::agent::MockAgentClient::with_tool_call_and_approval_trigger(
-                "GPU-2 is running hot: 87% util, 71°C, drawing 250 W (90 GB/192 GB VRAM).",
-                "gpu_status",
-                "install the sdk",
-                crate::tool_exec::ApprovalIntent {
-                    title: "Install TheRock ROCm SDK?".to_string(),
-                    body: vec![
-                        "install_sdk --channel release --format wheel --prefix ~/rocm-sdk"
-                            .to_string(),
-                    ],
-                    name: "install_sdk".to_string(),
-                    arguments: serde_json::json!({
-                        "channel": "release",
-                        "format": "wheel",
-                        "prefix": "~/rocm-sdk",
-                    }),
-                },
-                chat_tx.clone(),
-            ),
-        ) as std::sync::Arc<dyn crate::agent::AgentClient>)
-    } else {
-        // An endpoint we launched ourselves (managed-services registry) takes
-        // priority over the well-known default port — this is how a tool-launched
-        // engine on a non-default port (e.g. vLLM on :11435) is found. It does
-        // NOT override an explicitly configured `chat_url`/env URL, so config
-        // precedence is preserved (we only consult the registry when neither is
-        // set, i.e. where the well-known default would otherwise be probed).
-        // When neither an explicit URL (CLI/config) nor an env URL is set, run
-        // the SAME full local-engine detection the manual 'd' path uses:
-        // registry-first (an engine we launched ourselves, on whatever port it
-        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
-        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
-        // start with no server doesn't pay 3x the probe timeout), plus a
-        // best-effort served-model fetch. This is what lets a local server win
-        // over the ChatGPT cloud default at startup instead of only the single
-        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
-        //
-        // NOTE: unmerged PR #97 also touches this branch (model discovery when
-        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
-        // path) — this change is conflict-minimal by leaving the
-        // `resolve_llm_config` call below untouched.
-        //
-        // Gate on `chat_api_key.is_none()` too: local detection returns a
-        // keyless `detected_llm_config` (api_key/auth_header forced to None),
-        // so firing it when the user configured a key would SILENTLY DROP that
-        // key and 401 at request time. A configured key means "use my
-        // configured backend", so skip the swap and let `resolve_llm_config`
-        // carry the key through its normal precedence.
-        let detection_ran = chat::should_detect_local_chat(
-            args.chat_url.as_deref(),
-            args.chat_env_url.as_deref(),
-            args.chat_api_key.as_deref(),
-        );
-        let detected = if detection_ran {
-            detect_local_chat(state.tool_executor.clone()).await
-        } else {
-            None
-        };
-        let probe_target = args
-            .chat_url
-            .clone()
-            .or_else(|| args.chat_env_url.clone())
-            .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A detected endpoint (managed or probed) is already verified. When
-        // detection ran and found nothing it already probed the well-known
-        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
-        // fallback target here is redundant and just burns another probe
-        // timeout on a cold start — treat that as unreachable directly.
-        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
-        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
-        let probe_ok = match startup_outcome {
-            StartupChatOutcome::Local => true,
-            StartupChatOutcome::OAuth => false,
-            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
-                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
-            })
-            .await
-            .unwrap_or(false),
-        };
-        let llm = detected.or_else(|| {
-            crate::llm::resolve_llm_config(
-                args.chat_url.as_deref(),
-                args.chat_model.as_deref(),
-                None,
-                None,
-                args.chat_api_key.as_deref(),
-                args.chat_env_url.as_deref(),
-                args.chat_auth_header.as_deref(),
-                probe_ok,
-            )
-        });
-        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
-        // with no explicit model resolves to the `local-model` placeholder,
-        // which 404s on servers that register the model under its real id. Only
-        // the `Configured` outcome needs this — the `Local` outcome already
-        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
-        // `OAuth` has no config. Discovery is gated inside the helper on
-        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
-        // on the absence of an explicit model (config precedence wins).
-        let llm = match llm {
-            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
-                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
-            ),
-            other => other,
-        };
-        state.set_chat_config(llm, args.chat_auto_consent);
-        // No reachable local endpoint AND no key/url configured → the no-key
-        // ChatGPT OAuth default (device-code login surfaced in the chat tab).
-        // This restores the no-key login the vendored Codex path provided; it
-        // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
-        if no_key_no_endpoint {
-            let oauth_tx = chat_tx.clone();
-            crate::agent::ChatGptAgentClient::new(
-                args.chat_model.clone(),
-                args.inference_params(),
-                move |url, code| {
-                    let _ = oauth_tx.send(ClientMsg::ChatReply {
-                        text: format!(
-                            "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
-                        ),
-                    });
-                },
-                state.tool_executor.clone(),
-                Some(chat_tx.clone()),
-            )
-            .ok()
-            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
-            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
-        } else {
-            // A build failure leaves `agent` None; a submit surfaces an error turn.
-            match &state.chat_llm {
-                Some(cfg) => build_local_agent(
-                    cfg.clone(),
-                    args.inference_params(),
-                    state.tool_executor.clone(),
-                    chat_tx.clone(),
-                    args.chat_system_prompt.clone(),
-                )
-                .ok(),
-                None => None,
-            }
-        }
-    };
-
-    // Snapshot the auto-detected local backend so `/provider local` can restore
-    // it after a switch to a remote provider. Without this, switching to OpenAI
-    // and back to local would leave `agent` pointing at the OpenAI backend
-    // (silent wrong-backend bug) — `build_chat_agent(Local)` returns None by
-    // design (Local is the inline-built backend), so the caller must restore the
-    // saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
-    let mut local_agent = agent.clone();
+    let mut chat = ChatRuntime::start(&mut state, args, &chat_tx).await;
 
     loop {
         draw_frame_unless_shutting_down(terminal, &mut state, args.focus, &SHUTTING_DOWN)?;
@@ -449,6 +272,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         state.latest = None;
                     }
                     Some(ClientMsg::Event(ev)) => state.apply_event(*ev),
+                    Some(ClientMsg::HostGpuSnapshot(snap)) => state.push_host_gpu_snapshot(*snap),
                     Some(ClientMsg::ReplaySeek) => state.reset_for_seek(),
                     Some(ClientMsg::ReplayPosition { elapsed_s, total_s }) => {
                         if let Some(r) = state.replay.as_mut() {
@@ -882,132 +706,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
         }
 
-        // Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
-        // newly-selected backend. `Local` reuses whatever the inline launch path
-        // built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
-        // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
-        // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
-        // error turn. Construction only — no network until the next submit.
-        if let Some(ProviderSwitch { previous, target }) = state.provider_switch.take() {
-            match target {
-                ChatProvider::Local => {
-                    // Restore the auto-detected local backend saved before the
-                    // event loop. `build_chat_agent(Local)` returns None by
-                    // design, so the restore must happen here — otherwise a prior
-                    // `/provider openai` would leave requests routed to OpenAI.
-                    agent = local_agent.clone();
-                    state
-                        .chat
-                        .push(ChatTurn::system("switched to local".to_string()));
-                }
-                ChatProvider::Openai | ChatProvider::Anthropic => {
-                    if let Some(new_agent) =
-                        build_chat_agent(target, args, state.tool_executor.clone(), chat_tx.clone())
-                    {
-                        agent = Some(new_agent);
-                        state
-                            .chat
-                            .push(ChatTurn::system(format!("switched to {}", target.label())));
-                    } else {
-                        // Revert the optimistic `active_provider` set by the slash
-                        // handler back to the provider active BEFORE the switch
-                        // attempt — not unconditionally Local — so the displayed
-                        // provider stays honest (e.g. a failed openai→anthropic
-                        // switch stays on openai). `agent` is never reassigned on a
-                        // failed build, so it already matches `previous`; the two
-                        // stay consistent (no stale-remote routing under a wrong
-                        // label).
-                        state.active_provider = previous;
-                        let hint = if target == ChatProvider::Anthropic {
-                            "anthropic requires ANTHROPIC_API_KEY in env or secure store"
-                        } else {
-                            "openai requires OPENAI_API_KEY in the environment"
-                        };
-                        state.chat.push(ChatTurn::error(format!(
-                            "could not switch to {}: {hint}",
-                            target.label()
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Drain the endpoint-rebuild edge (Phase 8 sibling). An accepted
-        // detected-local offer must re-point the LIVE `agent` — and the
-        // `/provider local` restore snapshot — at the new local backend.
-        // `accept_detect_offer` swaps `chat_llm` to the auth-free local config
-        // but stays I/O-free, so without this the stale startup agent keeps
-        // routing chat to the cloud gateway (wrong-backend 401 bug). The edge
-        // carries the provider active BEFORE the optimistic switch to `Local`;
-        // on failure we revert `active_provider` to it (mirrors the
-        // `provider_switch` drain) so the tab never shows `Local` while `agent`
-        // still points elsewhere. Construction only — no network until submit.
-        if let Some(previous) = state.chat_endpoint_rebuild.take() {
-            // `revert` restores the optimistic switch and surfaces an actionable
-            // error turn so the tab does not sit on `Local` with the old agent.
-            let revert = |state: &mut AppState, msg: String| {
-                state.active_provider = previous;
-                state.chat.push(ChatTurn::error(msg));
-            };
-            match state.chat_llm.clone() {
-                Some(cfg) => {
-                    match build_local_agent(
-                        cfg,
-                        args.inference_params(),
-                        state.tool_executor.clone(),
-                        chat_tx.clone(),
-                        args.chat_system_prompt.clone(),
-                    ) {
-                        Ok(arc) => {
-                            agent = Some(arc.clone());
-                            // Refresh the restore snapshot so a later `/provider
-                            // local` restores THIS accepted backend, not the
-                            // stale startup one.
-                            local_agent = Some(arc);
-                            state
-                                .chat
-                                .push(ChatTurn::system("switched to local".to_string()));
-                        }
-                        Err(e) => revert(
-                            &mut state,
-                            format!("could not switch to the detected local endpoint: {e}"),
-                        ),
-                    }
-                }
-                // Edge raised but `chat_llm` is None (shouldn't happen after a
-                // real accept, but don't leave the tab stuck on `Local` with the
-                // old agent and no feedback).
-                None => revert(
-                    &mut state,
-                    "could not switch to the detected local endpoint: no endpoint configured"
-                        .to_string(),
-                ),
-            }
-        }
-
-        // Spawn the agent round-trip on the submit edge — keeps `apply_action`
-        // I/O-free. `chat_dispatch` is raised once by `submit_chat`; consume it
-        // so the in-flight request is spawned exactly once (not every tick).
-        if state.chat_dispatch {
-            state.chat_dispatch = false;
-            match agent.clone() {
-                Some(agent) => {
-                    let history = state.chat.clone();
-                    let snapshot = state.state_snapshot();
-                    let reply_tx = chat_tx.clone();
-                    tokio::spawn(async move {
-                        let msg = match agent.complete(&history, snapshot).await {
-                            Ok(text) => ClientMsg::ChatReply { text },
-                            Err(e) => ClientMsg::ChatError {
-                                message: e.to_string(),
-                            },
-                        };
-                        let _ = reply_tx.send(msg);
-                    });
-                }
-                None => state.on_chat_error(NO_CHAT_BACKEND_MSG.to_string()),
-            }
-        }
+        // The chat backend's one-shot edges: a `/provider` switch, an accepted
+        // detected-local endpoint, and the submit that spawns the agent round-trip.
+        chat.drain_provider_switch(&mut state, args, &chat_tx);
+        chat.drain_endpoint_rebuild(&mut state, args, &chat_tx);
+        chat.drain_dispatch(&mut state, &chat_tx);
 
         // Run the local-engine probe + `/v1/models` query on the detect edge,
         // off the reducer. Raised once by `request_detect`; result returns via
