@@ -1512,6 +1512,45 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm storage report` prints through `print_json_or_text`, which writes
+    /// `render_text()` verbatim for the text form and `Serialize` for `--json`.
+    /// Pin both halves of the `JsonOrText` impl against the report they come
+    /// from, so the text form cannot drift from `render_report` and the JSON
+    /// form cannot lose a field. The text form is asserted to be the real
+    /// report (it names the shared-folders section), not merely equal to
+    /// itself. The call site (`StorageCommand::Report` handing `json` to
+    /// `print_json_or_text`) writes to the process stdout, so its text form is
+    /// pinned black-box by `server-records-01` and `uninstall-05` in
+    /// `tests/e2e-cucumber/features/`; no scenario passes `--json`.
+    #[test]
+    fn json_or_text_impl_renders_the_report_and_serializes_it() -> Result<()> {
+        let (root, paths) = test_paths("report-json-or-text");
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        let text = report.render_text();
+        assert_eq!(text, render_report(&report));
+        assert!(
+            text.contains("Shared with other tools (never removed by ROCm CLI):"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&report)?;
+        let object = json
+            .as_object()
+            .expect("the report serializes as an object");
+        for key in [
+            "runtimes",
+            "runtimes_total_bytes",
+            "rocm_cli",
+            "shared_with_other_tools",
+        ] {
+            assert!(object.contains_key(key), "missing `{key}` in {json}");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
     /// Rendering notes in the `ROCm CLI folders` loop was needed for the row
     /// above, and it also made the two archive rows print the note they have
     /// always carried in the data and in `--json`. That is the most actionable
