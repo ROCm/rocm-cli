@@ -22,8 +22,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
+use anyhow::{Context, Result};
+use rocm_core::{
+    AppPaths, RocmCliConfig, require_yes_or_interactive, runtime_install_root_is_protected,
+};
 use serde::Serialize;
 
 use crate::runtimes_cmd::{
@@ -877,11 +879,8 @@ pub(crate) fn render_downloads_plan(plan: &UninstallPlan, dry_run: bool) -> Stri
 /// nobody to answer the prompt, so `--yes` is required (same rule as
 /// `rocm uninstall`).
 fn approved(action: &str, yes: bool) -> Result<bool> {
-    if yes {
+    if require_yes_or_interactive(yes, action)? {
         return Ok(true);
-    }
-    if !interactive_terminal() {
-        bail!("{action} requires --yes outside an interactive terminal");
     }
     confirm_uninstall()
 }
@@ -1014,6 +1013,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_core::interactive_terminal;
 
     fn manifest(
         runtime_key: &str,
