@@ -173,12 +173,12 @@ mod tests {
     /// covering.
     const EXEMPT_LITERALS: &[(&str, &str, &str)] = &[
         (
-            "apps/rocm/src/comfyui.rs",
+            "apps/rocm/src/comfyui/install.rs",
             "Resolving and installing packages with uv…",
             SPINNER_LABEL,
         ),
         (
-            "apps/rocm/src/comfyui.rs",
+            "apps/rocm/src/comfyui/install.rs",
             "Fetching ComfyUI source archive…",
             SPINNER_LABEL,
         ),
