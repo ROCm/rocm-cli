@@ -2597,10 +2597,6 @@ const fn provider_name(provider: Provider) -> &'static str {
     }
 }
 
-const fn missing_packaged_engine_reason(_engine: &str) -> Option<String> {
-    None
-}
-
 impl From<WatcherModeArg> for WatcherMode {
     fn from(value: WatcherModeArg) -> Self {
         match value {
@@ -2798,7 +2794,6 @@ pub(crate) mod tests {
 
     use rocm_core::ManagedServiceRecord;
 
-    use crate::bridge_snapshot::builtin_engine_inventory;
     use crate::runtime_install_finalize::tests::finish_sdk_install_with;
     use crate::services_text::load_managed_service;
 
@@ -3296,7 +3291,7 @@ pub(crate) mod tests {
     #[test]
     fn serve_engine_help_lists_match_engine_inventory() {
         let mut listed = serve_possible_values("engine");
-        let mut expected: Vec<String> = builtin_engine_inventory()
+        let mut expected: Vec<String> = engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
             .collect();
@@ -3304,7 +3299,7 @@ pub(crate) mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --engine possible-values must stay in sync with builtin_engine_inventory()"
+            "serve --engine possible-values must stay in sync with engine_inventory()"
         );
     }
 
@@ -4542,12 +4537,6 @@ pub(crate) mod tests {
             "the engine failure must still be recorded: {actions:?}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn missing_packaged_engine_reason_has_no_deferred_first_party_engines() {
-        assert!(missing_packaged_engine_reason("lemonade").is_none());
-        assert!(missing_packaged_engine_reason("vllm").is_none());
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of

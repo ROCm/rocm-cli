@@ -42,12 +42,12 @@
 //! `engine_request_with_env_root`; `service_launch.rs` calls into it for
 //! `builtin_engine_serve_http_args`. `find_engine_plugin_binary`,
 //! `with_scoped_builtin_engine_env`, `builtin_engine_request`, and
-//! `ScopedEnvVar` have no callers outside this module and stay private. Shared
-//! helpers this module calls back into at the crate root — `device_policy_name`
-//! and `missing_packaged_engine_reason` — stay in `main.rs` and are reached
-//! unqualified via `use crate::{...}`. `parse_device_policy` is in
-//! `gpu_policy.rs`; `apply_app_path_env`, `app_path_env_vars`, `optional_arg`,
-//! and `engine_recipe_json_arg` are in `engine_runtime_select.rs`.
+//! `ScopedEnvVar` have no callers outside this module and stay private. The
+//! one helper this module calls back into at the crate root, `device_policy_name`,
+//! stays in `main.rs` and is reached via `use crate::device_policy_name;`.
+//! `parse_device_policy` is in `gpu_policy.rs`; `app_path_env_vars` and
+//! `engine_recipe_json_arg` are in `engine_runtime_select.rs`, and
+//! `optional_arg` is in `rocm_engine_protocol`.
 
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -64,9 +64,9 @@ use rocm_engine_protocol::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::device_policy_name;
 use crate::engine_runtime_select::{app_path_env_vars, engine_recipe_json_arg};
 use crate::gpu_policy::parse_device_policy;
-use crate::{device_policy_name, missing_packaged_engine_reason};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -81,9 +81,6 @@ pub(crate) fn resolve_engine_binary_path_with_paths(
 ) -> Result<PathBuf> {
     if let Some(path) = find_engine_plugin_binary(engine, engine_plugin_dirs(paths))? {
         return Ok(path);
-    }
-    if let Some(reason) = missing_packaged_engine_reason(engine) {
-        bail!("{reason}");
     }
     engine_binary_path(engine)
 }
