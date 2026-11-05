@@ -88,10 +88,8 @@
 //! classification respectively — stay in `main.rs`'s shared `mod tests`
 //! instead.
 
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Stdio;
@@ -1565,23 +1563,12 @@ fn lifecycle_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// The last `limit` lines of a log, read through the shared bounded tail
+/// routine; `label` names the log in the error ("service log", "CLI action
+/// log").
 pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))?;
-    let reader = io::BufReader::new(file);
-    let mut lines = VecDeque::with_capacity(limit);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("failed to read {label} {}", path.display()))?;
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line);
-    }
-    Ok(lines.into_iter().collect())
+    rocm_core::tail_lines(path, limit, rocm_core::LOG_VIEW_MAX_TAIL_READ)
+        .with_context(|| format!("failed to read {label} {}", path.display()))
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1616,33 +1603,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
-        // Characterisation of the whole-file stream: a line far outside any
-        // tail window is still returned when the limit is large enough.
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not streamed whole.
         let log = tail_fixture("services-tail-large", &large_log_with_head_marker())?;
 
         let lines = read_tail_lines(&log, 10_000, "service log")?;
+        fs::remove_file(&log)?;
 
-        assert_eq!(lines.first().map(String::as_str), Some("HEAD-MARKER"));
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
         assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
-        assert_eq!(lines.len(), 5122);
+        assert!(lines.len() < 5122, "got {} lines", lines.len());
+        assert!(lines.len() > 3500, "the window holds about 4 MiB of lines");
         Ok(())
     }
 
     #[test]
-    fn read_tail_lines_fails_on_a_sixteen_bit_log_today() -> Result<()> {
+    fn read_tail_lines_shows_a_sixteen_bit_log_as_lossy_text_instead_of_failing() -> Result<()> {
+        // Service logs are the child's own bytes, read as UTF-8; a UTF-16 log
+        // is not detected here (only the ComfyUI log view does that), but it no
+        // longer aborts the view.
         let mut bytes = vec![0xff, 0xfe];
         for unit in "[INFO] one\r\n".encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         let log = tail_fixture("services-tail-utf16", &bytes)?;
 
-        let error = read_tail_lines(&log, 5, "service log")
-            .expect_err("a sixteen-bit log is not valid eight-bit text");
+        let lines = read_tail_lines(&log, 5, "service log")?;
 
-        assert_eq!(
-            error.to_string(),
-            format!("failed to read service log {}", log.display())
+        assert!(
+            lines[0].starts_with("\u{FFFD}\u{FFFD}["),
+            "the byte order mark is replaced, the rest kept: {lines:?}"
         );
         Ok(())
     }
@@ -1659,30 +1650,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn read_tail_lines_fails_on_invalid_eight_bit_text_today() -> Result<()> {
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
         let log = tail_fixture("services-tail-invalid", b"ok\nbad\xffbyte\nlast\n")?;
 
-        let error = read_tail_lines(&log, 5, "service log")
-            .expect_err("invalid UTF-8 aborts the whole read");
-
-        assert_eq!(
-            error.to_string(),
-            format!("failed to read service log {}", log.display())
-        );
-        // read_optional_tail_lines turns that error into one placeholder line
-        // instead of any of the readable lines.
-        assert_eq!(
-            read_optional_tail_lines(&log, 5, "service log"),
-            vec![format!(
-                "<failed to read service log: failed to read service log {}>",
-                log.display()
-            )]
-        );
+        let expected = vec![
+            "ok".to_owned(),
+            "bad\u{FFFD}byte".to_owned(),
+            "last".to_owned(),
+        ];
+        assert_eq!(read_tail_lines(&log, 5, "service log")?, expected);
+        // The optional reader shows the same lines, not a failure placeholder.
+        assert_eq!(read_optional_tail_lines(&log, 5, "service log"), expected);
         Ok(())
     }
 
     #[test]
-    fn read_tail_lines_missing_file_is_a_labelled_open_error() {
+    fn read_tail_lines_missing_file_is_a_labelled_error_naming_the_path() {
         let (root, _paths) = test_paths("services-tail-missing");
         let missing = root.join("absent.log");
 
@@ -1691,7 +1674,11 @@ pub(crate) mod tests {
 
         assert_eq!(
             error.to_string(),
-            format!("failed to open service log {}", missing.display())
+            format!("failed to read service log {}", missing.display())
+        );
+        assert!(
+            format!("{error:#}").contains(&format!("failed to open {}", missing.display())),
+            "the cause names the failing step: {error:#}"
         );
         // read_optional_tail_lines guards on is_file first and stays quiet.
         assert!(read_optional_tail_lines(&missing, 5, "service log").is_empty());

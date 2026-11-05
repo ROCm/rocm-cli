@@ -18,8 +18,6 @@ use rocm_core::{
 };
 use serde_json::Value;
 use serde_json::json;
-use std::collections::VecDeque;
-use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
@@ -844,17 +842,12 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
     })
 }
 
+/// The last `limit` lines of a service log joined with newlines, read through
+/// the shared bounded tail routine.
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut lines = VecDeque::with_capacity(limit);
-    for line in content.lines() {
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line.to_owned());
-    }
-    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
+    let lines = rocm_core::tail_lines(path, limit, rocm_core::LOG_VIEW_MAX_TAIL_READ)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -971,34 +964,38 @@ mod tests {
     }
 
     #[test]
-    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
-        // Characterisation of the whole-file read: a line far outside any
-        // tail window is still returned when the limit is large enough.
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not read whole into one string.
         let path = tail_fixture("large", &large_log_with_head_marker())?;
 
         let tail = read_tail_lines(&path, 10_000)?;
         fs::remove_file(&path)?;
 
-        assert!(tail.starts_with("HEAD-MARKER\n"), "head line is returned");
+        assert!(!tail.lines().any(|line| line == "HEAD-MARKER"));
         assert!(tail.ends_with("\nTAIL-MARKER"));
-        assert_eq!(tail.lines().count(), 5122);
+        assert!(tail.lines().count() < 5122);
+        assert!(tail.lines().count() > 3500, "the window holds about 4 MiB");
         Ok(())
     }
 
     #[test]
-    fn read_tail_lines_fails_on_a_sixteen_bit_log_today() -> Result<()> {
+    fn read_tail_lines_shows_a_sixteen_bit_log_as_lossy_text_instead_of_failing() -> Result<()> {
+        // The tool reads the child's own bytes as UTF-8; a UTF-16 log is not
+        // detected here (only the ComfyUI log view does that), but it no
+        // longer fails the whole tool call.
         let mut bytes = vec![0xff, 0xfe];
         for unit in "[INFO] one\r\n".encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         let path = tail_fixture("utf16", &bytes)?;
 
-        let error = read_tail_lines(&path, 5).expect_err("not valid eight-bit text");
+        let tail = read_tail_lines(&path, 5)?;
         fs::remove_file(&path)?;
 
-        assert_eq!(
-            error.to_string(),
-            format!("failed to read {}", path.display())
+        assert!(
+            tail.starts_with("\u{FFFD}\u{FFFD}["),
+            "the byte order mark is replaced, the rest kept: {tail:?}"
         );
         Ok(())
     }
@@ -1015,16 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn read_tail_lines_fails_on_invalid_eight_bit_text_today() -> Result<()> {
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
         let path = tail_fixture("invalid", b"ok\nbad\xffbyte\nlast\n")?;
 
-        let error = read_tail_lines(&path, 5).expect_err("invalid UTF-8 aborts the read");
+        let tail = read_tail_lines(&path, 5)?;
         fs::remove_file(&path)?;
 
-        assert_eq!(
-            error.to_string(),
-            format!("failed to read {}", path.display())
-        );
+        assert_eq!(tail, "ok\nbad\u{FFFD}byte\nlast");
         Ok(())
     }
 
@@ -1041,19 +1035,23 @@ mod tests {
             error.to_string(),
             format!("failed to read {}", path.display())
         );
+        assert!(
+            format!("{error:#}").contains(&format!("failed to open {}", path.display())),
+            "the cause names the failing step: {error:#}"
+        );
     }
 
     #[test]
-    fn read_tail_lines_limit_zero_returns_every_line_today() -> Result<()> {
-        // A latent bug rather than a contract: with limit 0 the window never
-        // evicts, so the whole file comes back. The tool handler clamps the
-        // limit to 1..=500, so no caller reaches it.
+    fn read_tail_lines_limit_zero_returns_nothing() -> Result<()> {
+        // With limit 0 the old reader never evicted and returned the whole
+        // file. The tool handler clamps the limit to 1..=500, so only a
+        // direct call could see it.
         let path = tail_fixture("zero", b"a\nb\nc\n")?;
 
         let tail = read_tail_lines(&path, 0)?;
         fs::remove_file(&path)?;
 
-        assert_eq!(tail, "a\nb\nc");
+        assert_eq!(tail, "");
         Ok(())
     }
 

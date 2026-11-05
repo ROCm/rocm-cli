@@ -503,66 +503,17 @@ fn comfyui_log_title(path: &Path) -> &'static str {
     }
 }
 
+/// The last `limit` lines of a saved log, read through the shared bounded tail
+/// routine. A ComfyUI log may have been redirected by a Windows shell as
+/// UTF-16 and carries the colour codes of the Python process, so it is
+/// decoded the console way: UTF-16 detected, ANSI sequences stripped.
 fn read_tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    let bytes = fs::read(path)?;
-    let text = strip_ansi_sequences(&decode_log_bytes(&bytes));
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(limit)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.reverse();
-    Ok(lines)
-}
-
-fn decode_log_bytes(bytes: &[u8]) -> String {
-    if bytes.starts_with(&[0xff, 0xfe]) || looks_like_utf16_le(bytes) {
-        let start = if bytes.starts_with(&[0xff, 0xfe]) {
-            2
-        } else {
-            0
-        };
-        let units = bytes[start..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        return String::from_utf16_lossy(&units);
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn looks_like_utf16_le(bytes: &[u8]) -> bool {
-    if bytes.len() < 8 {
-        return false;
-    }
-    let sample_len = bytes.len().min(512);
-    let zero_odd_bytes = bytes[..sample_len]
-        .iter()
-        .enumerate()
-        .filter(|(index, byte)| index % 2 == 1 && **byte == 0)
-        .count();
-    zero_odd_bytes * 4 >= sample_len
-}
-
-fn strip_ansi_sequences(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            cleaned.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            let _ = chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    cleaned
+    rocm_core::tail_lines_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::CONSOLE,
+    )
 }
 
 fn load_manifest(paths: &AppPaths) -> Result<Option<ComfyUiManifest>> {
@@ -1026,16 +977,43 @@ mod tests {
     }
 
     #[test]
-    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
-        // Characterisation of the whole-file read: a line far outside any
-        // tail window is still returned when the limit is large enough.
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not read whole.
         let log = tail_fixture("comfyui-tail-large", &large_log_with_head_marker())?;
 
         let lines = read_tail_lines(&log, 10_000)?;
+        fs::remove_file(&log)?;
 
-        assert_eq!(lines.first().map(String::as_str), Some("HEAD-MARKER"));
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
         assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
-        assert_eq!(lines.len(), 5122);
+        assert!(lines.len() < 5122, "got {} lines", lines.len());
+        assert!(lines.len() > 3500, "the window holds about 4 MiB of lines");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_sixteen_bit_log_is_read_through_a_bounded_window() -> Result<()> {
+        // The window of a UTF-16 log must start on a character boundary or
+        // every following character decodes as garbage.
+        let mut text = String::from("HEAD-MARKER\r\n");
+        let filler = format!("\u{1b}[33m{}\u{1b}[0m\r\n", "y".repeat(1000));
+        for _ in 0..3000 {
+            text.push_str(&filler);
+        }
+        text.push_str("TAIL-MARKER\r\n");
+        let log = tail_fixture("comfyui-tail-large-utf16", &utf16_le(&text, true))?;
+        assert!(fs::metadata(&log)?.len() > 6_000_000);
+
+        let lines = read_tail_lines(&log, 10_000)?;
+        fs::remove_file(&log)?;
+
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        let whole = "y".repeat(1000);
+        for line in &lines[..lines.len() - 1] {
+            assert_eq!(line, &whole, "a partial leading fragment was kept");
+        }
         Ok(())
     }
 
@@ -1070,19 +1048,26 @@ mod tests {
     }
 
     #[test]
-    fn read_tail_lines_missing_file_is_a_not_found_error() {
+    fn read_tail_lines_missing_file_is_a_not_found_error_naming_the_path() {
         let paths = test_paths("comfyui-tail-missing");
         let missing = app_root(&paths).join("logs").join("absent.log");
 
         let error = read_tail_lines(&missing, 5).expect_err("a missing log must not read");
 
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open {}", missing.display())
+        );
         let io_error = error
             .downcast_ref::<io::Error>()
-            .expect("the bare io error is returned, without a path label");
+            .expect("the io error is kept as the cause");
         assert_eq!(io_error.kind(), io::ErrorKind::NotFound);
-        // The same applies to limit 0: the file is opened before the limit is
-        // looked at.
-        assert!(read_tail_lines(&missing, 0).is_err());
+        // A limit of 0 returns before the file is looked at.
+        assert!(
+            read_tail_lines(&missing, 0)
+                .expect("limit 0 never opens the file")
+                .is_empty()
+        );
     }
 
     #[test]
