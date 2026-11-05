@@ -144,6 +144,21 @@ impl DrainTarget {
     pub const fn drained(&self) -> bool {
         self.free_mib >= self.floor_mib
     }
+
+    /// `"<free> MiB free of <total> MiB[ GTT], floor <floor> MiB"`. VRAM is the
+    /// unlabelled default, so the line keeps the shape it always had on discrete
+    /// cards; only the GTT pool is named.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let pool = match self.kind {
+            PoolKind::Vram => "",
+            PoolKind::Gtt => " GTT",
+        };
+        format!(
+            "{} MiB free of {} MiB{pool}, floor {} MiB",
+            self.free_mib, self.total_mib, self.floor_mib
+        )
+    }
 }
 
 /// The free-memory floor to wait for on a pool of `total_mib`: the
@@ -172,6 +187,136 @@ pub fn judge(sample: Probe<DeviceMemory>) -> Judgement {
         Probe::Absent => Judgement::NoTooling,
         Probe::Unreadable => Judgement::Unreadable,
         Probe::Read(memory) => Judgement::Target(select_drain_target(memory)),
+    }
+}
+
+/// Consecutive samples with no reading, from a tool that is installed and has
+/// never once produced one, after which the wait stops.
+///
+/// A tool that never reads is broken or wedged, and waiting out the whole
+/// deadline on every serve would add that deadline to each of them. A tool that
+/// has read before is not given up on: its next sample may well succeed.
+pub const UNREAD_SAMPLES_BEFORE_GIVING_UP: u32 = 3;
+
+/// The least time worth starting a probe with. With less than this left before
+/// the deadline the wait ends on what it has rather than spawn a probe that
+/// would be killed before it could answer.
+pub const MIN_PROBE_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long one probe may run: [`SMI_PROBE_TIMEOUT`], but never past `deadline`.
+///
+/// A sample makes up to three probes in a row, so without this the last sample
+/// could run several probe timeouts beyond the wait's deadline.
+#[must_use]
+pub fn probe_budget(now: Instant, deadline: Instant) -> Duration {
+    SMI_PROBE_TIMEOUT.min(deadline.saturating_duration_since(now))
+}
+
+/// How the drain wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// No device tool is installed (mock/local run): nothing was waited on.
+    NoTooling,
+    /// The pool handed back enough memory.
+    Drained(DrainTarget),
+    /// The deadline passed with the pool still below its floor.
+    NotDrained(DrainTarget),
+    /// No usable reading at the end: `samples` samples in a row gave none, and
+    /// `last_reading` is the most recent one the wait did get, if any. This is
+    /// not "not drained": the harness did not observe that.
+    Unreadable {
+        last_reading: Option<DrainTarget>,
+        samples: u32,
+    },
+}
+
+/// The drain wait's decision state, fed one [`Judgement`] per sample.
+#[derive(Debug, Default)]
+pub struct DrainWait {
+    samples: u32,
+    unread_in_a_row: u32,
+    last_reading: Option<DrainTarget>,
+}
+
+impl DrainWait {
+    /// Take the next sample. `Some` ends the wait; `None` means keep sampling.
+    pub fn observe(&mut self, judgement: Judgement) -> Option<Verdict> {
+        let first = self.samples == 0;
+        self.samples += 1;
+        match judgement {
+            Judgement::NoTooling if first => Some(Verdict::NoTooling),
+            Judgement::Target(target) => {
+                self.unread_in_a_row = 0;
+                self.last_reading = Some(target);
+                target.drained().then_some(Verdict::Drained(target))
+            }
+            // A tool that vanishes mid-wait is a sample nobody could read.
+            Judgement::NoTooling | Judgement::Unreadable => {
+                self.unread_in_a_row += 1;
+                (self.last_reading.is_none()
+                    && self.unread_in_a_row >= UNREAD_SAMPLES_BEFORE_GIVING_UP)
+                    .then(|| self.unreadable())
+            }
+        }
+    }
+
+    /// The verdict when the deadline passes: not drained if the last sample was
+    /// a reading, unreadable if it was not.
+    #[must_use]
+    pub const fn timed_out(&self) -> Verdict {
+        match self.last_reading {
+            Some(target) if self.unread_in_a_row == 0 => Verdict::NotDrained(target),
+            _ => self.unreadable(),
+        }
+    }
+
+    const fn unreadable(&self) -> Verdict {
+        Verdict::Unreadable {
+            last_reading: self.last_reading,
+            samples: self.unread_in_a_row,
+        }
+    }
+}
+
+/// The one-line `device state:` report for a verdict, after `elapsed_secs` of waiting.
+///
+/// It says only what the harness observed: "NOT drained" is for a reading below
+/// its floor, never for a sample that gave none, and a carveout-sized VRAM pool
+/// judged without GTT data says why that cannot show whether the engine's
+/// memory came back.
+#[must_use]
+pub fn describe_verdict(verdict: Verdict, elapsed_secs: u64) -> String {
+    match verdict {
+        Verdict::NoTooling => "device state: no GPU tooling (mock/local run)".to_owned(),
+        Verdict::Drained(target) => format!("device state: drained ({})", target.describe()),
+        Verdict::NotDrained(target) => {
+            let hint = if target.kind == PoolKind::Vram && is_carveout(target.total_mib) {
+                "; only the BIOS carveout was read because no GTT reading was available (is \
+                 rocm-smi installed?), so this wait could not follow the memory the engine uses"
+            } else {
+                ""
+            };
+            format!(
+                "device state: NOT drained after {elapsed_secs}s ({}) — a previous engine may \
+                 still be holding the GPU{hint}",
+                target.describe()
+            )
+        }
+        Verdict::Unreadable {
+            last_reading: None,
+            samples,
+        } => format!(
+            "device state: could not read device memory ({samples} samples in {elapsed_secs}s; \
+             the GPU tool is installed but gave no usable reading)"
+        ),
+        Verdict::Unreadable {
+            last_reading: Some(target),
+            ..
+        } => format!(
+            "device state: could not read device memory at the end of {elapsed_secs}s (last \
+             reading: {})",
+            target.describe()
+        ),
     }
 }
 
@@ -596,6 +741,195 @@ mod tests {
         assert_eq!(
             parse_rocm_smi_csv_pool("", "Total Memory", "Total Used Memory"),
             None
+        );
+    }
+
+    /// A Strix Halo host whose GTT pool has only `free_mib` MiB free of 102 400.
+    fn strix_holding(free_mib: u64) -> DeviceMemory {
+        DeviceMemory {
+            gtt: Some(Pool {
+                total_mib: 102_400,
+                free_mib,
+            }),
+            ..strix_halo()
+        }
+    }
+
+    /// A sample whose GTT pool is nearly all held: below its 92 160 MiB floor.
+    fn undrained() -> Judgement {
+        Judgement::Target(select_drain_target(strix_holding(1_000)))
+    }
+
+    /// The healthy Strix Halo reading: above its floor.
+    fn drained() -> Judgement {
+        Judgement::Target(select_drain_target(strix_halo()))
+    }
+
+    #[test]
+    fn a_target_is_described_with_its_pool_and_only_gtt_is_named() {
+        assert_eq!(
+            select_drain_target(strix_halo()).describe(),
+            "102360 MiB free of 102400 MiB GTT, floor 92160 MiB"
+        );
+        assert_eq!(
+            select_drain_target(mi300x()).describe(),
+            "196309 MiB free of 196592 MiB, floor 150000 MiB"
+        );
+    }
+
+    #[test]
+    fn a_drained_sample_ends_the_wait_and_the_line_names_the_pool_it_read() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(undrained()), None);
+        let verdict = wait.observe(drained()).expect("a drained sample ends it");
+        assert_eq!(verdict, Verdict::Drained(select_drain_target(strix_halo())));
+        assert_eq!(
+            describe_verdict(verdict, 6),
+            "device state: drained (102360 MiB free of 102400 MiB GTT, floor 92160 MiB)"
+        );
+    }
+
+    #[test]
+    fn no_tooling_ends_the_wait_on_the_first_sample_only() {
+        assert_eq!(
+            DrainWait::default().observe(Judgement::NoTooling),
+            Some(Verdict::NoTooling)
+        );
+        assert_eq!(
+            describe_verdict(Verdict::NoTooling, 0),
+            "device state: no GPU tooling (mock/local run)"
+        );
+        // A tool that disappears mid-wait is a sample nobody could read, not a
+        // reason to report a mock run.
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(undrained()), None);
+        for _ in 0..UNREAD_SAMPLES_BEFORE_GIVING_UP * 2 {
+            assert_eq!(wait.observe(Judgement::NoTooling), None);
+        }
+    }
+
+    #[test]
+    fn a_tool_that_never_reads_is_given_up_on_and_called_unreadable_not_undrained() {
+        let mut wait = DrainWait::default();
+        for _ in 1..UNREAD_SAMPLES_BEFORE_GIVING_UP {
+            assert_eq!(wait.observe(Judgement::Unreadable), None);
+        }
+        let verdict = wait
+            .observe(Judgement::Unreadable)
+            .expect("the last allowed unread sample ends the wait");
+        assert_eq!(
+            verdict,
+            Verdict::Unreadable {
+                last_reading: None,
+                samples: UNREAD_SAMPLES_BEFORE_GIVING_UP,
+            }
+        );
+        let line = describe_verdict(verdict, 24);
+        assert_eq!(
+            line,
+            "device state: could not read device memory (3 samples in 24s; the GPU tool is \
+             installed but gave no usable reading)"
+        );
+        assert!(!line.contains("NOT drained"), "{line}");
+    }
+
+    #[test]
+    fn a_tool_that_has_read_is_waited_on_through_unreadable_samples() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(Judgement::Unreadable), None);
+        assert_eq!(wait.observe(Judgement::Unreadable), None);
+        assert_eq!(wait.observe(undrained()), None);
+        for _ in 0..UNREAD_SAMPLES_BEFORE_GIVING_UP * 3 {
+            assert_eq!(wait.observe(Judgement::Unreadable), None);
+        }
+        let verdict = wait.timed_out();
+        assert_eq!(
+            verdict,
+            Verdict::Unreadable {
+                last_reading: Some(select_drain_target(strix_holding(1_000))),
+                samples: UNREAD_SAMPLES_BEFORE_GIVING_UP * 3,
+            }
+        );
+        assert_eq!(
+            describe_verdict(verdict, 120),
+            "device state: could not read device memory at the end of 120s (last reading: \
+             1000 MiB free of 102400 MiB GTT, floor 92160 MiB)"
+        );
+    }
+
+    #[test]
+    fn the_deadline_after_a_reading_is_not_drained_and_after_a_miss_it_is_not() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(undrained()), None);
+        let target = select_drain_target(strix_holding(1_000));
+        assert_eq!(wait.timed_out(), Verdict::NotDrained(target));
+        assert_eq!(
+            describe_verdict(wait.timed_out(), 120),
+            "device state: NOT drained after 120s (1000 MiB free of 102400 MiB GTT, floor \
+             92160 MiB) — a previous engine may still be holding the GPU"
+        );
+        // The most recent sample was one nobody could read: that is not a claim
+        // about the device.
+        assert_eq!(wait.observe(Judgement::Unreadable), None);
+        assert_eq!(
+            wait.timed_out(),
+            Verdict::Unreadable {
+                last_reading: Some(target),
+                samples: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn an_undrained_carveout_judged_without_gtt_says_it_could_not_follow_the_engines_memory() {
+        // The real assembly path: amd-smi read the carveout, no tool reports GTT.
+        let (memory, _) = sample(Probe::Read((512, 318)), Probe::Absent);
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe(judge(memory)), None);
+        let line = describe_verdict(wait.timed_out(), 120);
+        assert!(
+            line.starts_with(
+                "device state: NOT drained after 120s (318 MiB free of 512 MiB, floor 450 MiB)"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "only the BIOS carveout was read because no GTT reading was available (is \
+                 rocm-smi installed?)"
+            ),
+            "{line}"
+        );
+        // No such note when the pool judged is the one the engine uses.
+        for held in [
+            Verdict::NotDrained(select_drain_target(strix_holding(1_000))),
+            Verdict::NotDrained(select_drain_target(DeviceMemory {
+                vram: Pool {
+                    total_mib: 196_592,
+                    free_mib: 1_000,
+                },
+                gtt: None,
+            })),
+        ] {
+            let line = describe_verdict(held, 120);
+            assert!(!line.contains("carveout"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_probe_gets_the_probe_timeout_or_the_time_left_whichever_is_less() {
+        let now = Instant::now();
+        assert_eq!(
+            probe_budget(now, now + Duration::from_secs(100)),
+            SMI_PROBE_TIMEOUT
+        );
+        assert_eq!(
+            probe_budget(now, now + Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            probe_budget(now + Duration::from_secs(5), now),
+            Duration::ZERO
         );
     }
 

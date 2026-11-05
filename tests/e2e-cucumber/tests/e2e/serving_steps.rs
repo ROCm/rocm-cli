@@ -12,8 +12,8 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::device_memory::{
-    DeviceMemory, DrainTarget, Judgement, PoolKind, Probe, SMI_PROBE_TIMEOUT, bounded_stdout,
-    judge, parse_rocm_smi_csv_pool, sample_device_memory,
+    DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Probe, bounded_stdout, describe_verdict, judge,
+    parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
@@ -263,6 +263,9 @@ async fn ensure_serve_port_free() -> String {
 /// How long to wait for a stopped engine to hand its device memory back.
 const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
+/// Pause between two samples of the device.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Best-effort: wait until the pool the engine allocates from reports enough
 /// free memory (see [`select_drain_target`]: VRAM on a discrete card, GTT on an
 /// APU whose VRAM is only a BIOS carveout), so a just-killed serve's memory is
@@ -272,63 +275,41 @@ const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 ///
 /// The wait is bounded and best-effort: on timeout the serve still starts,
 /// because a stale reading must not turn a slow drain into a hard failure. The
-/// returned line records which of the two happened — an undrained device is the
-/// single most likely reason the serve that follows never becomes ready, and
-/// without it the failure looks identical to a genuinely broken serve.
+/// returned line records what happened — an undrained device is the single most
+/// likely reason the serve that follows never becomes ready, and without it the
+/// failure looks identical to a genuinely broken serve. A tool that is installed
+/// but never produces a reading is given up on after a few samples
+/// (`UNREAD_SAMPLES_BEFORE_GIVING_UP`) and reported as unreadable, not as
+/// undrained; the decisions and the wording live in `DrainWait` and
+/// `describe_verdict`, where they are tested.
 async fn wait_for_free_vram() -> String {
     // Started before the first probe so that probe counts against the wait.
-    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
-    let mut judgement = judge(probe_device_memory().await);
-    // No GPU tooling installed → nothing to wait on (mock/local). A tool that is
-    // present but gave no reading is a different case: it keeps waiting, and
-    // says so if it never reads.
-    if judgement == Judgement::NoTooling {
-        return "device state: no GPU tooling (mock/local run)".to_owned();
-    }
+    let started = Instant::now();
+    let deadline = started + VRAM_DRAIN_DEADLINE;
+    let mut wait = DrainWait::default();
     loop {
-        let target = match judgement {
-            Judgement::Target(target) => Some(target),
-            Judgement::NoTooling | Judgement::Unreadable => None,
-        };
-        if let Some(target) = target
-            && target.drained()
-        {
-            return format!("device state: drained ({})", describe_target(target));
+        // Every probe is held to the time left, so the wait ends at its deadline
+        // rather than a few probe timeouts after it.
+        let sample = judge(probe_device_memory(deadline).await);
+        if let Some(verdict) = wait.observe(sample) {
+            return describe_verdict(verdict, started.elapsed().as_secs());
         }
-        if Instant::now() >= deadline {
-            let held = target.map_or_else(
-                || "the memory reading was unreadable".to_owned(),
-                describe_target,
-            );
-            return format!(
-                "device state: NOT drained after {}s ({held}) — a previous engine may still \
-                 be holding the GPU",
-                VRAM_DRAIN_DEADLINE.as_secs()
-            );
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        judgement = judge(probe_device_memory().await);
+        tokio::time::sleep(left.min(DRAIN_POLL_INTERVAL)).await;
+        if deadline.saturating_duration_since(Instant::now()) < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
+        }
     }
-}
-
-/// `"<free> MiB free of <total> MiB[ GTT], floor <floor> MiB"`. VRAM is the
-/// unlabelled default, so the line keeps the shape it always had on discrete
-/// cards; only the GTT pool is named.
-fn describe_target(target: DrainTarget) -> String {
-    let pool = match target.kind {
-        PoolKind::Vram => "",
-        PoolKind::Gtt => " GTT",
-    };
-    format!(
-        "{} MiB free of {} MiB{pool}, floor {} MiB",
-        target.free_mib, target.total_mib, target.floor_mib
-    )
 }
 
 /// [`device_memory_mib`] off the async worker: it runs subprocesses, each bounded
-/// by [`SMI_PROBE_TIMEOUT`], so the blocking thread it occupies is released.
-async fn probe_device_memory() -> Probe<DeviceMemory> {
-    tokio::task::spawn_blocking(device_memory_mib)
+/// by `probe_budget` (at most the probe timeout, never past `deadline`), so the
+/// blocking thread it occupies is released.
+async fn probe_device_memory(deadline: Instant) -> Probe<DeviceMemory> {
+    tokio::task::spawn_blocking(move || device_memory_mib(deadline))
         .await
         .unwrap_or(Probe::Unreadable)
 }
@@ -339,27 +320,27 @@ async fn probe_device_memory() -> Probe<DeviceMemory> {
 /// for GTT: its output has no field this harness has been checked against,
 /// whereas the preflight step already reads `rocm-smi`'s GTT rows on these
 /// hosts.
-fn device_memory_mib() -> Probe<DeviceMemory> {
-    sample_device_memory(vram_mib, gtt_mib)
+fn device_memory_mib(deadline: Instant) -> Probe<DeviceMemory> {
+    sample_device_memory(|| vram_mib(deadline), || gtt_mib(deadline))
 }
 
 /// `(total, free)` GTT in MiB for GPU 0, via `rocm-smi`.
-fn gtt_mib() -> Probe<(u64, u64)> {
+fn gtt_mib(deadline: Instant) -> Probe<(u64, u64)> {
     use std::process::Command;
     let mut command = Command::new("rocm-smi");
     command.args(["--showmeminfo", "gtt", "--csv"]);
-    bounded_stdout(command, SMI_PROBE_TIMEOUT)
+    bounded_stdout(command, probe_budget(Instant::now(), deadline))
         .parse(|text| parse_rocm_smi_csv_pool(&text, "GTT Total Memory", "GTT Total Used Memory"))
 }
 
 /// `(total, free)` device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`).
-fn vram_mib() -> Probe<(u64, u64)> {
+fn vram_mib(deadline: Instant) -> Probe<(u64, u64)> {
     use std::process::Command;
     // amd-smi: lines like "        TOTAL_VRAM: 196592 MB" / "FREE_VRAM: 196309 MB".
     let amd_smi = || {
         let mut command = Command::new("amd-smi");
         command.args(["metric", "-m"]);
-        bounded_stdout(command, SMI_PROBE_TIMEOUT).parse(|text| {
+        bounded_stdout(command, probe_budget(Instant::now(), deadline)).parse(|text| {
             let field = |name: &str| {
                 text.lines()
                     .find_map(|l| l.trim().strip_prefix(name))
@@ -374,7 +355,7 @@ fn vram_mib() -> Probe<(u64, u64)> {
         let mut command = Command::new("rocm-smi");
         command.args(["--showmeminfo", "vram", "--csv"]);
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
-        bounded_stdout(command, SMI_PROBE_TIMEOUT)
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
             .parse(|text| parse_rocm_smi_csv_pool(&text, "Total Memory", "Total Used Memory"))
     };
     amd_smi().or_else(rocm_smi)
