@@ -80,7 +80,7 @@ async fn wait_for_frame(
     let mut ready_frame = String::new();
     let outcome = tui
         .wait_for_screen_where(
-            &format!("{what} is fully drawn"),
+            &format!("the screen shows all of {what}"),
             |screen| {
                 let ready = missing(screen).is_empty();
                 if ready {
@@ -92,8 +92,8 @@ async fn wait_for_frame(
         )
         .await;
     if let Err(error) = outcome {
-        let lacked = missing(&tui.screen_text());
-        panic!("{what}: the screen lacked {lacked:?}: {error}");
+        let lacked = missing(&tui.screen_text()).join(", ");
+        panic!("{what}: the screen lacked {lacked}: {error}");
     }
     ready_frame
 }
