@@ -4,6 +4,14 @@
 
 //! The `gpu-metrics` watcher: turning an amd-smi snapshot into telemetry and
 //! GPU-pressure events, and recording the telemetry events.
+//!
+//! This module has no test module of its own: its tests drive it through the
+//! collector and the dispatcher in `watchers.rs`
+//! (`event_collector_emits_gpu_metrics_event_when_enabled`,
+//! `event_collector_emits_gpu_thermal_pressure_event_when_enabled`,
+//! `event_collector_skips_gpu_pressure_below_thresholds` and
+//! `gpu_metrics_event_records_read_only_status_without_proposal`), and a child
+//! cannot import those without a cycle with the root.
 
 use anyhow::Result;
 use rocm_core::{
