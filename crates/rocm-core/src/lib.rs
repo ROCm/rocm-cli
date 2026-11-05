@@ -82,7 +82,7 @@ pub use config::{
     SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
     WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
-pub use confirm::interactive_terminal;
+pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
