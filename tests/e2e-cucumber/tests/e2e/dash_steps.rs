@@ -31,6 +31,75 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
         .expect("no interactive TUI session is open for this scenario")
 }
 
+/// Wait until `missing` reports nothing absent from the screen, and return the
+/// frame that satisfied the wait. The TUI writes a frame in several pty chunks,
+/// so a step that waits on one marker and then reads the screen again can read a
+/// frame that is still being drawn; asserting on the frame that ended the wait
+/// cannot.
+///
+/// `missing` names what a frame still lacks, one entry per absent piece; the
+/// frame is ready when it returns none. On failure the panic lists what a fresh
+/// read of the screen lacked, then the driver's own diagnostic, which carries
+/// the frame it read a moment earlier, so the two can differ if the screen
+/// changed between them. The list is computed from a fresh read rather than
+/// from the last frame the predicate saw, because the driver checks for a
+/// crashed or exited process before consulting the predicate, so the last frame
+/// the predicate saw can be older than the one the failure reports. That same
+/// order means a marker that only lands as the child exits counts as an exit,
+/// not as a pass, unlike `wait_for_screen`.
+///
+/// A negative assertion on the returned frame ("this text is not on screen")
+/// is only as strong as the frame is complete: the wait proves the positive
+/// markers are drawn, not that the rest of the screen is. When the absent text
+/// would be drawn in a particular region, include a marker from the end of that
+/// region (the last row of a popup, the last line of a pane) in the wait, so the
+/// frame is known to extend past where the absent text would be.
+async fn wait_for_frame(
+    tui: &mut TuiSession,
+    what: &str,
+    missing: impl Fn(&str) -> Vec<String> + Send + Sync,
+) -> String {
+    let mut ready_frame = String::new();
+    let outcome = tui
+        .wait_for_screen_where(
+            &format!("the screen shows all of {what}"),
+            |screen| {
+                let ready = missing(screen).is_empty();
+                if ready {
+                    screen.clone_into(&mut ready_frame);
+                }
+                ready
+            },
+            default_timeout(),
+        )
+        .await;
+    if let Err(error) = outcome {
+        // The driver's own message below carries the frame it read; this read is
+        // later, so it can already be complete (a frame that finished just after
+        // the deadline), and then there is nothing to list.
+        let lacked = missing(&tui.screen_text()).join(", ");
+        let clause = if lacked.is_empty() {
+            String::new()
+        } else {
+            format!("the screen lacked {lacked}: ")
+        };
+        panic!("{what}: {clause}{error}");
+    }
+    ready_frame
+}
+
+/// [`wait_for_frame`] for the common case: every marker is on screen at once.
+async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]) -> String {
+    wait_for_frame(tui, what, |screen| {
+        markers
+            .iter()
+            .filter(|marker| !screen.contains(**marker))
+            .map(|marker| format!("{marker:?}"))
+            .collect()
+    })
+    .await
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("interactive chat uses an offline assistant")]
@@ -1397,17 +1466,14 @@ async fn told_replay_file_not_found(world: &mut E2eWorld) {
 
 #[then("the dashboard home view is displayed")]
 async fn home_view_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
     // The Home tab's summary cards (Running / Health / Updates) are drawn at any
     // size; the wider "GPU UTILIZATION" hero is not, so assert on the cards.
-    tui.wait_for_screen("Updates", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the home view did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Running") && screen.contains("Health"),
-        "home summary cards missing:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the home summary cards",
+        &["Running", "Health", "Updates"],
+    )
+    .await;
 }
 
 #[then("the hero reports no GPU telemetry available")]
@@ -1437,32 +1503,34 @@ async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     // once it processes the resulting SIGWINCH. Wait for that redraw by
     // polling for the hero's wide-layout content, not just "Unknown GPU"
     // (already visible pre-resize from the title bar alone).
-    tui.wait_for_screen_where(
-        "the hero's wide VRAM/TEMP/POWER layout",
-        |screen| screen.contains("Unknown GPU") && screen.contains("VRAM"),
-        default_timeout(),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("the no-GPU hero did not render: {e}"));
-    let screen = tui.screen_text();
-    for label in ["VRAM", "TEMP", "POWER"] {
-        let row = screen
-            .lines()
-            .find(|line| line.contains(label))
-            .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
-        // Check the text *after* the label, not the whole row: the
-        // utilization gauge on the same row draws its own "—" placeholder,
-        // which would make this pass even if this mini-spark's value were a
-        // fake reading instead of the placeholder.
-        let after_label = row.split_once(label).map_or_else(
-            || panic!("no text after {label} on row:\n{row}"),
-            |(_, rest)| rest,
-        );
-        assert!(
-            after_label.contains('—'),
-            "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
-        );
-    }
+    // The VRAM, TEMP and POWER rows are drawn one under the other, so VRAM on
+    // screen does not mean TEMP and POWER are. Wait until all three carry their
+    // placeholder in the same frame; a fake reading in one of them leaves it
+    // lacking, and the failure names the row.
+    wait_for_frame(tui, "the hero's wide VRAM/TEMP/POWER layout", |screen| {
+        let mut lacking = Vec::new();
+        if !screen.contains("Unknown GPU") {
+            lacking.push("\"Unknown GPU\"".to_string());
+        }
+        for label in ["VRAM", "TEMP", "POWER"] {
+            let Some(row) = screen.lines().find(|line| line.contains(label)) else {
+                lacking.push(format!("a {label} row"));
+                continue;
+            };
+            // Check the text *after* the label, not the whole row: the
+            // utilization gauge on the same row draws its own "—" placeholder,
+            // which would make this pass even if this mini-spark's value were a
+            // fake reading instead of the placeholder.
+            if !row
+                .split_once(label)
+                .is_some_and(|(_, rest)| rest.contains('—'))
+            {
+                lacking.push(format!("the \"—\" placeholder after {label}"));
+            }
+        }
+        lacking
+    })
+    .await;
 }
 
 #[then("the dashboard reports live GPU telemetry")]
@@ -1496,13 +1564,17 @@ async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
 
 #[then("the diagnose action says it runs rocm examine")]
 async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Runs: rocm examine", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the diagnose action's `Runs:` line did not appear: {e}"));
-    let screen = tui.screen_text();
+    // The detail pane draws top to bottom and the 80x24 session clips it at the
+    // `Runs:` line, so that line is the last one drawn: once it is on screen,
+    // everything the `rocm doctor` check below could find in the pane is too.
+    let screen = wait_for_all_markers(
+        session(world),
+        "the diagnose action",
+        &["Diagnose & fix", "Runs: rocm examine"],
+    )
+    .await;
     assert!(
-        screen.contains("Diagnose & fix") && !screen.contains("rocm doctor"),
+        !screen.contains("rocm doctor"),
         "the `Runs:` line must belong to the diagnose action and name a real \
          subcommand, not `rocm doctor`:\n{screen}"
     );
@@ -1526,15 +1598,16 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
 
 #[then("a tool approval prompt is displayed")]
 async fn approval_prompt_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Review: Install TheRock ROCm SDK?", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the approval prompt did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Approve (y)") && screen.contains("Deny (n)"),
-        "approval prompt is missing its Approve/Deny buttons:\n{screen}"
-    );
+    wait_for_all_markers(
+        session(world),
+        "the approval prompt",
+        &[
+            "Review: Install TheRock ROCm SDK?",
+            "Approve (y)",
+            "Deny (n)",
+        ],
+    )
+    .await;
 }
 
 #[then("the tool call is shown as declined")]
@@ -1725,11 +1798,12 @@ async fn managed_model_shown_loading(world: &mut E2eWorld) {
     // the selected instance exposes the status a user uses to diagnose startup.
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open instance details: {e}"));
-    tui.wait_for_screen("LOADING", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the loading state did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains(&model), "managed model missing:\n{screen}");
+    let screen = wait_for_all_markers(
+        tui,
+        "the loading instance details",
+        &["LOADING", model.as_str()],
+    )
+    .await;
     assert!(
         !screen
             .lines()
@@ -1770,34 +1844,36 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     tui.wait_for_screen(&model, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
-    tui.wait_for_screen("50ms", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("TTFT metrics did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(screen.contains("20ms"), "TPOT metrics missing:\n{screen}");
-    let row = screen
-        .lines()
-        .find(|line| line.contains(&model))
-        .unwrap_or_default();
-    assert!(
-        row.contains("50ms") && row.contains("20ms") && row.contains("1/0") && row.contains("25%"),
-        "managed serving metrics were incomplete:\n{screen}"
-    );
+    // Wait for the whole row, not its first cell: the cells are drawn left to
+    // right, so "50ms" can be on screen while "20ms", "1/0" and "25%" are not.
+    wait_for_frame(tui, "the managed model's metrics row", |screen| {
+        let Some(row) = screen.lines().find(|line| line.contains(&model)) else {
+            return vec![format!("a row naming {model:?}")];
+        };
+        ["50ms", "20ms", "1/0", "25%"]
+            .into_iter()
+            .filter(|cell| !row.contains(cell))
+            .map(|cell| format!("{cell:?} in the model's row"))
+            .collect()
+    })
+    .await;
 }
 
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("toggle this help", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("next / previous tab")
-            && screen.contains("Home tab")
-            && screen.contains("jump ±60s"),
-        "navigation or contextual guidance missing:\n{screen}"
-    );
+    // The markers sit at different depths of the help popup, so the first one
+    // on screen does not mean the popup is fully drawn.
+    wait_for_all_markers(
+        session(world),
+        "the dashboard help",
+        &[
+            "toggle this help",
+            "next / previous tab",
+            "Home tab",
+            "jump ±60s",
+        ],
+    )
+    .await;
 }
 
 #[then("the services manager is displayed")]
@@ -1868,19 +1944,24 @@ async fn services_manager_closed(world: &mut E2eWorld) {
     tui.wait_until_gone("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager is still open after Escape: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("● Observe"),
-        "Escape left the Observe tab entirely, not just the manager:\n{screen}"
-    );
-    // Belt-and-suspenders: `wait_until_gone` above is the primary regression
-    // check (the manager itself closed). This additionally guards against
-    // Esc falling through to open the main menu instead — "Options"/"Quit"
-    // are unique to `Modal::Menu`.
-    assert!(
-        !screen.contains("Options") && !screen.contains("Quit"),
-        "the main menu is open on top of the closed manager:\n{screen}"
-    );
+    // The tab bar is drawn above the manager and stays on screen while it is
+    // open, so "● Observe" alone proves nothing about the redraw. The footer is
+    // the last row drawn, and its Esc chip reads "menu" only when no manager and
+    // no modal is open (`footer.rs`): waiting for it means the frame is drawn
+    // through the rows where the main menu would be. The same chip is what
+    // guards against Esc falling through to open the main menu instead: with
+    // `Modal::Menu` open it reads "close", so this wait fails rather than
+    // passing on a frame with the menu over the closed manager. The literal
+    // depends on the chip's spacing and on the "menu" arm, which the dash-tui
+    // unit test `footer_esc_chip_renders_the_text_the_e2e_dashboard_steps_wait_for`
+    // (`footer.rs`) pins for both the idle and the menu-open footer, so a change
+    // to either fails there rather than as a timeout here.
+    wait_for_all_markers(
+        tui,
+        "the Observe tab, with no main menu opened by Escape",
+        &["● Observe", "Esc  menu"],
+    )
+    .await;
 }
 
 #[then("instance details are displayed")]
@@ -1930,10 +2011,15 @@ async fn detail_footer_does_not_show_scroll_hint(world: &mut E2eWorld) {
     // enlarged pre-shrink geometry must genuinely have no hint yet, or the
     // shrink step's own wait would silently revert to a no-op (its marker
     // already present) for the same reason a prior round of this scenario
-    // was flagged for. A plain read is correct here — this runs right after
-    // `open_instance_detail`'s own wait, with no action in between that
-    // could still be in flight.
-    let screen = session(world).screen_text();
+    // was flagged for. `open_instance_detail` only waited for the popup's
+    // title, and the footer is the last thing the popup draws, so wait for its
+    // "log: " label before asserting the hint is absent from it.
+    let screen = wait_for_all_markers(
+        session(world),
+        "the instance detail footer",
+        &["Instance · ", "log: "],
+    )
+    .await;
     assert!(
         !screen.contains("↑/↓ scroll"),
         "footer must not show the scroll hint before the terminal shrinks:\n{screen}"
@@ -1965,15 +2051,21 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
 
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    tui.wait_for_screen("Go to", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("command palette did not appear: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Home") && screen.contains("Serving") && screen.contains("Observe"),
-        "command-palette destinations missing:\n{screen}"
-    );
+    // The tab bar behind the palette already draws "Home", "Serving", "Observe"
+    // and "Chat", and the dimmed backdrop can carry any of those words beside
+    // the popup, so the words alone are not evidence the popup is on screen.
+    // Each destination is therefore looked for as a palette row (the cursor
+    // column `PALETTE_DESTS` rows start with, then the label) at the popup's own
+    // text column, on a later line than the row before it
+    // (`e2e_cucumber::palette_rows`, unit-tested). Chat is the palette's last
+    // destination row, so the wait ends only once every row is drawn.
+    wait_for_frame(session(world), "the command palette", |screen| {
+        e2e_cucumber::palette_rows::palette_rows_missing(
+            screen,
+            &["Home", "ROCm", "Serving", "Observe", "Chat"],
+        )
+    })
+    .await;
 }
 
 #[then("the dashboard menu is displayed")]
@@ -2257,16 +2349,15 @@ async fn launcher_shows_serving(world: &mut E2eWorld) {
         .to_string();
     let tui = session(world);
     // The front door's status strip renders "Serving <model>" for a live
-    // registry instance; wait on the model name to synchronise with the first
-    // paint before inspecting the whole screen.
-    tui.wait_for_screen(&model, default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the launcher never showed the serving model: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("Serving"),
-        "launcher did not show the model as serving:\n{screen}"
-    );
+    // registry instance, or "Idle — nothing serving" on the same row when none
+    // is running. Wait for the model name and "Serving" together; the idle check
+    // below then names that failure mode if the strip regresses to idle.
+    let screen = wait_for_all_markers(
+        tui,
+        "the launcher's status strip",
+        &[model.as_str(), "Serving"],
+    )
+    .await;
     assert!(
         !screen.contains("Idle — nothing serving"),
         "launcher still reported idle despite a live registry instance:\n{screen}"
@@ -2648,21 +2739,22 @@ async fn prepare_doctor_report(world: &mut E2eWorld) {
 
 #[then("the report is displayed for review")]
 async fn report_displayed_for_review(world: &mut E2eWorld) {
-    let tui = session(world);
     // Whichever way this machine goes, the command prints one JSON object that
-    // carries a `schema`: the report, or the refusal envelope.
-    tui.wait_for_screen("\"schema\"", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the report preview did not appear: {e}"));
-    // The console's dismiss hint appears only once the job has finished, so
-    // the key that follows cannot land on a job still running.
-    tui.wait_for_screen("Enter/Esc dismiss", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the report preview never finished: {e}"));
+    // carries a `schema`: the report, or the refusal envelope. The console's
+    // dismiss hint appears only once the job has finished, so the key that
+    // follows cannot land on a job still running. Both are waited for together
+    // so the answer below is read from the frame that ended the wait, not from a
+    // later read of a screen that can still be changing.
+    let frame = wait_for_all_markers(
+        session(world),
+        "the report preview, finished",
+        &["\"schema\"", "Enter/Esc dismiss"],
+    )
+    .await;
     // What the CLI said, read from its own output on the console: the refusal
     // envelope is the one with a `refused` key. The card is checked against it
     // after the console is left.
-    world.dash_report_refused = Some(tui.screen_text().contains("\"refused\""));
+    world.dash_report_refused = Some(frame.contains("\"refused\""));
 }
 
 #[when("the user leaves the report review")]
