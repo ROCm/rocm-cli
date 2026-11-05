@@ -43,10 +43,12 @@ git clone https://github.com/ROCm/rocm-cli
 cd rocm-cli
 uv tool install prek        # alternative: cargo install --locked prek
 prek install                # fast checks on every commit
-prek install -t pre-push    # heavier checks on push (clippy + tests)
+prek install -t pre-push    # heavier checks on push (clippy + tests of the crates the push affects)
 ```
 
 `prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+
+The pre-push hooks (`cargo clippy`, the e2e harness clippy and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. They check the whole workspace when a change cannot be confined to specific crates (the lockfile, the root manifest, the toolchain file, workflow files, a doc an xtask test reads, or a path no crate owns), and when the affected crates cannot be determined at all, for example because the remote branch tip is not fetched locally. They also add the crates whose tests read files from outside their own crate: any Rust file adds `xtask`, whose contract tests scan every source file, and `README.md`, `docs/` and `skills/` add `rocm` and `xtask`. Each step prints the scope it chose and why. A push that changes no Rust file runs none of the cargo steps, whatever else it changes (a lockfile-only push included). A green hook is an early warning and not the gate: on pull requests CI lints the whole workspace, but its Linux test job runs only the affected crates, and the whole workspace's tests run in the Windows debug job, in the merge queue and on `main`. To see what a push would check without compiling anything, run `cargo xtask pre-push-check test --dry-run --base origin/main` (the steps are `clippy`, `clippy-e2e` and `test`).
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 

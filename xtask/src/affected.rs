@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 /// Default base ref used when none is supplied on the command line. Matches
 /// [`crate::verify_commits`] so both commands diff against the same point.
-const DEFAULT_BASE: &str = "origin/main";
+pub(crate) const DEFAULT_BASE: &str = "origin/main";
 
 /// The workspace dependency graph, reduced to what selection needs: each
 /// member's source directory (workspace-relative, `/`-separated) and the
@@ -311,9 +311,28 @@ fn build_graph(metadata: &Metadata) -> Graph {
 /// List files changed in `base...HEAD` (three-dot: relative to the merge base,
 /// the same "what this branch changed" diff layer one filters on).
 fn changed_files(base: &str) -> Result<Vec<String>> {
-    let range = format!("{base}...HEAD");
-    let output = Command::new("git")
-        .args(["diff", "--name-only", &range])
+    changed_files_between(base, "HEAD")
+}
+
+/// List files changed in `base...head`.
+///
+/// `--no-renames` makes a moved file list both its old and its new path.
+/// Without it git reports only the new path, so a file moved out of one crate
+/// into another would select the destination crate and miss the one that lost
+/// the file.
+pub(crate) fn changed_files_between(base: &str, head: &str) -> Result<Vec<String>> {
+    diff_name_only(None, base, head)
+}
+
+/// [`changed_files_between`] in `dir` (the current directory when `None`).
+fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
+    let range = format!("{base}...{head}");
+    let mut git = Command::new("git");
+    if let Some(dir) = dir {
+        git.arg("-C").arg(dir);
+    }
+    let output = git
+        .args(["diff", "--name-only", "--no-renames", &range])
         .output()
         .context("failed to run `git diff`")?;
     if !output.status.success() {
@@ -533,6 +552,51 @@ mod tests {
         );
         let want: BTreeSet<String> = ["engine", "app"].into_iter().map(String::from).collect();
         assert_eq!(sel, Selection::Packages(want));
+    }
+
+    /// Run `git` in `dir` with a fixed identity and no signing, for the
+    /// throwaway repositories below.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A file moved from one crate to another must select both crates. With git's
+    /// default rename detection only the new path is listed, the crate that lost
+    /// the file is not selected, and a push that breaks it is not checked.
+    #[test]
+    fn changed_files_between_lists_both_paths_of_a_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("crates/a/src")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("crates/b/src")).expect("mkdir b");
+        std::fs::write(root.join("crates/a/src/moved.rs"), "pub fn f() {}\n").expect("write");
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "base"]);
+        git_in(root, &["checkout", "-q", "-b", "feature"]);
+        git_in(
+            root,
+            &["mv", "crates/a/src/moved.rs", "crates/b/src/moved.rs"],
+        );
+        git_in(root, &["commit", "-q", "-m", "move"]);
+
+        let mut files = diff_name_only(Some(root), "main", "feature").expect("git diff");
+        files.sort();
+        assert_eq!(files, ["crates/a/src/moved.rs", "crates/b/src/moved.rs"]);
     }
 
     #[test]

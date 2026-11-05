@@ -373,8 +373,59 @@ change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
 `tests/e2e-cucumber/README.md`). On `main`
-and in the merge queue the full workspace always runs. For local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization.
+and in the merge queue the full workspace always runs. For a full local verification, keep using
+`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
+narrows the local pre-push hooks (next section).
+
+### Pre-push hook scope
+
+The pre-push hooks `cargo-clippy`, `cargo-clippy-e2e` and `cargo-test` in
+[.pre-commit-config.yaml](../.pre-commit-config.yaml) run through `cargo xtask pre-push-check`
+([prepush.rs](../xtask/src/prepush.rs)), which applies the same selection to the range being
+pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does not have yet;
+`origin/main...HEAD` when run by hand). Each step prints the scope it chose:
+
+- `clippy` runs `cargo clippy -p <crate> … --all-targets -- -D warnings` for the affected crates,
+  or `--workspace` when the selection is the whole workspace.
+- `clippy-e2e` lints the e2e harness target only when `e2e-cucumber` is among the affected crates.
+- `test` runs `cargo test -p <crate> … --all-targets` for the affected crates, never including
+  `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
+  `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
+
+The directory-based selection cannot see a crate's tests reading a file from outside the crate,
+so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
+file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
+test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
+selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+[prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
+`include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
+covered, so a new cross-crate read cannot be added without a decision.
+
+A step that has nothing to check says so and exits successfully. A step whose affected crates
+cannot be determined (the pushed range's base is not available locally, or `cargo metadata`
+fails) runs over the whole workspace and prints why, so narrowing never replaces a check with
+silence. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
+filter, as before, including a lockfile-only push.
+
+The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
+job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
+`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
+every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
+`--workspace`.
+
+Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed
+commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
+builds can resolve Cargo features differently from `--workspace` ones.
+
+Preview what a push would check without compiling:
+
+```bash
+cargo xtask pre-push-check test --dry-run --base origin/main
+```
+
+`--base` replaces the range's base; `clippy` and `clippy-e2e` take the same flags. The selection
+logic is unit-tested in [prepush.rs](../xtask/src/prepush.rs); as dev tooling, with no change to
+what the `rocm` binary does, it has no Gherkin scenario.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does

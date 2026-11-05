@@ -4,7 +4,7 @@
 # Setup:
 #   uv tool install prek        # or: cargo install --locked prek
 #   prek install                # install the pre-commit hook
-#   prek install -t pre-push    # install the pre-push hook (clippy + tests)
+#   prek install -t pre-push    # install the pre-push hook (clippy + tests of the affected crates)
 #
 # Run against everything on demand:
 #   prek run --all-files
@@ -130,12 +130,24 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      # The three pre-push cargo steps run through `cargo xtask pre-push-check`,
+      # which narrows each to the crates the push affects (the changed crates and
+      # everything that depends on them, selected as CI's `cargo xtask affected`
+      # does) and falls back to the whole workspace whenever it cannot tell. It
+      # prints the scope it chose, so these hooks are `verbose`. CI's Windows job,
+      # merge queue and `main` still check the whole workspace. Without the
+      # narrowing the steps are
+      #   cargo clippy --workspace --all-targets -- -D warnings
+      #   cargo clippy -p e2e-cucumber --test e2e -- -D warnings
+      #   cargo test --workspace --all-targets --exclude e2e-cucumber
+      # and `cargo xtask pre-push-check <step> --base <ref>` runs one by hand.
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: cargo xtask pre-push-check clippy
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true # shows which crates the push selected
         stages: [pre-push] # compiles the workspace; too slow for every commit
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-clippy-e2e
@@ -143,19 +155,22 @@ repos:
         # e2e-cucumber's `e2e` test sets `harness = false, test = false` (see its
         # Cargo.toml), which also excludes it from `clippy --all-targets` above --
         # leaving the ~1.6k lines of harness + step code unlinted. Clippy honours
-        # an explicit `--test`, so lint it directly, mirroring the CI job.
-        entry: cargo clippy -p e2e-cucumber --test e2e -- -D warnings
+        # an explicit `--test`, so the step lints it directly, mirroring the CI
+        # job, whenever e2e-cucumber is among the affected crates.
+        entry: cargo xtask pre-push-check clippy-e2e
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-test
         name: cargo test
-        entry: cargo test --workspace --all-targets --exclude e2e-cucumber
+        entry: cargo xtask pre-push-check test
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated build-and-test CI job
       - id: powershell-script-analyzer

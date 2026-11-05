@@ -26,6 +26,7 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod prepush;
 mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
@@ -105,6 +106,27 @@ pub(crate) enum Command {
         /// `origin/main`.
         #[arg(long)]
         base: Option<String>,
+    },
+    /// Run one cargo step of the pre-push hook over only the crates the push
+    /// affects: the changed crates plus their transitive dependents, selected
+    /// as `cargo xtask affected` does, from the range prek exports to the hook
+    /// (`PRE_COMMIT_FROM_REF`..`PRE_COMMIT_TO_REF`).
+    ///
+    /// The step runs over the whole workspace whenever the affected crates
+    /// cannot be determined, and prints why. It is skipped only when the
+    /// selection is known and has nothing for the step to check. CI always
+    /// checks the whole workspace.
+    PrePushCheck {
+        /// Which step to run.
+        #[arg(value_enum)]
+        check: prepush::Check,
+        /// Base ref for the `<base>...HEAD` range, instead of the ref prek
+        /// provides. Without either it defaults to `origin/main`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Print the scope and the cargo command without running it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Fail if any first-party crate has gained a normal/build dependency
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
@@ -365,6 +387,11 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::PrePushCheck {
+            check,
+            base,
+            dry_run,
+        } => prepush::run(check, base, dry_run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
