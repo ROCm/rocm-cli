@@ -352,6 +352,7 @@ fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
             gpu_utilization_pct,
             temperature_c,
             power_w,
+            power_limit_w: None,
             clock_mhz,
         }];
     }
@@ -371,6 +372,8 @@ fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
             gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
             temperature_c,
             power_w,
+            // No limit source on Windows: unknown, so power is not colored.
+            power_limit_w: None,
             clock_mhz,
         })
         .collect()
