@@ -9,8 +9,8 @@
 name: Nightly E2E (queue)
 
 on:
-  # Manual only, and gating nothing, until the lane image carries the suite and
-  # the published verdict can be trusted (see the doc). The run itself is not
+  # Manual only, and gating nothing, until a lane has been seen to run the suite
+  # and the published verdict can be trusted (see the doc). The run itself is not
   # scheduled before then either. A schedule will replace this, set after the
   # run's deadline, or it would find that night's run still going and fail.
   workflow_dispatch:
