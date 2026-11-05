@@ -20,3 +20,7 @@ anyhow.workspace = true
 rocm-core = { path = "../rocm-core" }
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+# The SIGPIPE disposition a test installs in a re-executed child.
+libc.workspace = true

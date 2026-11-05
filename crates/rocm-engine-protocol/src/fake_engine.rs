@@ -17,16 +17,10 @@
 //! of the client are tested on every platform without it.
 
 use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_ENGINE: AtomicU32 = AtomicU32::new(0);
-
-/// `errno` for "text file busy" (`ETXTBSY`): another thread's `fork` briefly
-/// held the script's write descriptor open when this one tried to execute it.
-const TEXT_FILE_BUSY: i32 = 26;
 
 pub struct FakeEngine {
     dir: PathBuf,
@@ -38,6 +32,10 @@ impl FakeEngine {
     /// `stdin` first (what a well-behaved engine does); pass `false` for an
     /// engine that exits without reading its request. `body` runs after the
     /// recording and may use `$dir`, the scratch directory.
+    ///
+    /// The script is written through [`rocm_core::fake_executable`], so running
+    /// it straight away cannot fail with `ETXTBSY` while other tests on parallel
+    /// threads spawn children of their own.
     pub fn new(label: &str, reads_stdin: bool, body: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "rocm-fake-engine-{label}-{}-{}",
@@ -51,7 +49,7 @@ impl FakeEngine {
         } else {
             ""
         };
-        fs::write(
+        rocm_core::fake_executable::write_fake_executable(
             &script,
             format!(
                 "#!/bin/sh\ndir='{}'\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\nenv > \"$dir/env\"\n{read_stdin}{body}\n",
@@ -59,8 +57,6 @@ impl FakeEngine {
             ),
         )
         .expect("write the fake engine script");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-            .expect("make the fake engine executable");
         Self { dir, script }
     }
 
@@ -76,11 +72,6 @@ impl FakeEngine {
 
     pub fn path(&self) -> &Path {
         &self.script
-    }
-
-    /// The scratch directory, for a test that wants to point `$dir` somewhere.
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// The arguments the fake was started with, one per entry.
@@ -105,30 +96,6 @@ impl FakeEngine {
             .lines()
             .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
     }
-
-    /// Run `launch`, retrying while the kernel refuses to execute the script
-    /// because a concurrent `fork` in this test process still holds its write
-    /// descriptor. A fresh script is executed the instant it is written, and the
-    /// test harness runs tests on parallel threads, so the window is real.
-    pub fn run<R>(&self, mut launch: impl FnMut() -> anyhow::Result<R>) -> anyhow::Result<R> {
-        for attempt in 0..50 {
-            match launch() {
-                Err(error) if attempt < 49 && is_text_file_busy(&error) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                other => return other,
-            }
-        }
-        unreachable!("the final attempt always returns")
-    }
-}
-
-fn is_text_file_busy(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.raw_os_error() == Some(TEXT_FILE_BUSY))
-    })
 }
 
 impl Drop for FakeEngine {
