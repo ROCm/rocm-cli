@@ -37,9 +37,9 @@ const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 /// release has its own digest, so bumping the pin means recording the new pair
 /// here as well.
 const EMBEDDABLE_WINDOWS_SHA256: &str =
-    "50a133bbc35c4f3f8971eafef2c9fe56c4bbbfb0f1032bf8728324d8d8c8a0e1";
+    "7ff6c5d6ab612c33690411a7e53d6d0dd62eb515a073375c35015b0778a5a344";
 const EMBEDDABLE_LINUX_SHA256: &str =
-    "bdfd3c3e5d6eda5101c8a32f36e6dd9236ceb9ab2eb66734c32628e6e86e18ac";
+    "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90";
 
 /// Embeddable asset token and archive extension for the host this adapter runs
 /// on. Only `windows-x64` and `ubuntu-x64` are wired up here; the release also
@@ -732,6 +732,23 @@ mod tests {
     }
 
     #[test]
+    fn pinned_archive_digests_are_two_distinct_sha256_hex_strings() {
+        // A digest is pasted by hand on every bump and only a live download
+        // checks it, so a dropped character or a value pasted twice would
+        // otherwise pass every offline test.
+        for digest in [EMBEDDABLE_LINUX_SHA256, EMBEDDABLE_WINDOWS_SHA256] {
+            assert_eq!(digest.len(), 64, "{digest}");
+            assert!(
+                digest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{digest}"
+            );
+        }
+        assert_ne!(EMBEDDABLE_LINUX_SHA256, EMBEDDABLE_WINDOWS_SHA256);
+    }
+
+    #[test]
     fn a_version_change_forces_re_extraction_over_the_existing_runtime() {
         let pin = rocm_deps::LEMONADE_VERSION;
         // Same version already unpacked: nothing to do.
@@ -756,21 +773,16 @@ mod tests {
 
         assert_eq!(installed_runtime_version(runtime_dir), None);
 
-        record_runtime_version(runtime_dir, "7.13.0").unwrap();
+        record_runtime_version(runtime_dir, "1.2.3").unwrap();
         let installed = installed_runtime_version(runtime_dir);
-        assert_eq!(installed.as_deref(), Some("7.13.0"));
+        assert_eq!(installed.as_deref(), Some("1.2.3"));
         assert!(!needs_extraction(
             false,
             installed.as_deref(),
-            "7.13.0",
+            "1.2.3",
             true
         ));
-        assert!(needs_extraction(
-            false,
-            installed.as_deref(),
-            "7.14.0",
-            true
-        ));
+        assert!(needs_extraction(false, installed.as_deref(), "1.3.0", true));
     }
 
     #[test]
@@ -792,7 +804,7 @@ mod tests {
             data_dir: env_root.path().join("data"), // no manifest ever written here
             cache_dir: env_root.path().join("cache"),
         };
-        let version = "7.13.0";
+        let version = "1.2.3";
         let root = lemonade_root(&paths, Some(env_root.path()));
         let runtime_dir = runtime_dir_in(&root);
         fs::create_dir_all(&runtime_dir).unwrap();
@@ -840,7 +852,7 @@ mod tests {
             data_dir: env_root.path().join("data"),
             cache_dir: env_root.path().join("cache"),
         };
-        let version = "7.13.0";
+        let version = "1.2.3";
 
         // A real, well-formed archive (unlike the stub above): this test
         // exercises the extraction branch, so `extract_archive` must succeed.
@@ -956,13 +968,13 @@ mod tests {
         fs::create_dir_all(&backend).unwrap();
         fs::write(backend.join("llama-server"), b"installed backend").unwrap();
 
-        let packaged = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#;
+        let packaged = r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}"#;
         let source = dir.join("source-archive");
         write_embeddable_with_pins(&source, packaged);
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
         let manifest = LemonadeInstallManifest {
             env_id: "test".to_owned(),
-            version: "11.5.1".to_owned(),
+            version: TEST_LEMONADE_VERSION.to_owned(),
             runtime_dir: runtime_dir.clone(),
             lemond: lemond_path_in(&runtime_dir),
             lemonade: lemonade_path_in(&runtime_dir),
@@ -1027,12 +1039,20 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Lemonade version of the restore tests' manifests: synthetic, so a bump
+    /// of the real pin does not touch these tests.
+    const TEST_LEMONADE_VERSION: &str = "1.2.3";
+
     /// Puts `source` where `prepare_embeddable_with` leaves the verified
-    /// archive of the `11.5.1` test manifests: `<root>/downloads/<name>`.
+    /// archive of the [`TEST_LEMONADE_VERSION`] test manifests: `<root>/downloads/<name>`.
     fn cache_archive(root: &Path, source: &Path) {
         let downloads = root.join("downloads");
         fs::create_dir_all(&downloads).unwrap();
-        fs::copy(source, downloads.join(embeddable_archive_name("11.5.1"))).unwrap();
+        fs::copy(
+            source,
+            downloads.join(embeddable_archive_name(TEST_LEMONADE_VERSION)),
+        )
+        .unwrap();
     }
 
     fn assert_no_pin_temp_files(dir: &Path) {
@@ -1049,13 +1069,13 @@ mod tests {
     }
 
     /// Runs the restore against a fake embeddable archive that ships
-    /// `{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}`,
+    /// `{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}`,
     /// with `current` as the pin file already on disk. Returns what the restore
     /// returned and the pin file's content afterwards.
     fn restore_over(tag: &str, current: &str) -> (Option<PinFileBackup>, String) {
         restore_over_packaged(
             tag,
-            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}"#,
             current,
         )
     }
@@ -1077,7 +1097,7 @@ mod tests {
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
         let manifest = LemonadeInstallManifest {
             env_id: "test".to_owned(),
-            version: "11.5.1".to_owned(),
+            version: TEST_LEMONADE_VERSION.to_owned(),
             runtime_dir: runtime_dir.clone(),
             lemond: lemond_path_in(&runtime_dir),
             lemonade: lemonade_path_in(&runtime_dir),
@@ -1107,8 +1127,8 @@ mod tests {
         let (backup, after) = restore_over("restore-keeps-user-edits", current);
 
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(value["therock"]["version"], "7.13.0");
-        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
+        assert_eq!(value["therock"]["version"], "10.1.0");
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b11580");
         assert_eq!(value["llamacpp"]["vulkan"], "b1111", "{after}");
         assert_eq!(value["custom"]["x"], 1, "{after}");
         assert!(backup.is_some());
@@ -1116,7 +1136,7 @@ mod tests {
 
     #[test]
     fn restore_is_a_no_op_when_only_other_entries_differ_from_the_packaged_file() {
-        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752","vulkan":"b1111"}}"#;
+        let current = r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580","vulkan":"b1111"}}"#;
         let (backup, after) = restore_over("restore-noop-other-keys", current);
 
         assert!(backup.is_none(), "the alignment pins already match");
@@ -1127,26 +1147,26 @@ mod tests {
     fn restore_removes_a_pin_the_packaged_file_does_not_have() {
         // A packaged file without `llamacpp.rocm-stable` must not leave the
         // kept alignment pin behind; the user's other entries still survive.
-        let packaged = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"vulkan":"b9747"}}"#;
-        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b11783","vulkan":"b1111"}}"#;
+        let packaged = r#"{"therock":{"version":"10.1.0"},"llamacpp":{"vulkan":"b11393"}}"#;
+        let current = r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11783","vulkan":"b1111"}}"#;
         let (backup, after) = restore_over_packaged("restore-removes-pin", packaged, current);
 
         assert!(backup.is_some(), "the kept rocm-stable pin is drift");
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(value["llamacpp"].get("rocm-stable").is_none(), "{after}");
         assert_eq!(value["llamacpp"]["vulkan"], "b1111", "{after}");
-        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["therock"]["version"], "10.1.0");
     }
 
     #[test]
     fn restore_happens_when_only_the_rocm_stable_pin_drifted() {
-        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b11783"}}"#;
+        let current = r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11783"}}"#;
         let (backup, after) = restore_over("restore-only-rocm-stable", current);
 
         assert!(backup.is_some(), "a drifted llama.cpp tag alone is drift");
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
-        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b11580");
+        assert_eq!(value["therock"]["version"], "10.1.0");
     }
 
     #[test]
@@ -1155,7 +1175,7 @@ mod tests {
 
         assert!(backup.is_some());
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["therock"]["version"], "10.1.0");
     }
 
     /// A runtime tree whose pin file holds a stale kept pin, and the manifest
@@ -1173,7 +1193,7 @@ mod tests {
         .unwrap();
         let manifest = LemonadeInstallManifest {
             env_id: "test".to_owned(),
-            version: "11.5.1".to_owned(),
+            version: TEST_LEMONADE_VERSION.to_owned(),
             runtime_dir: runtime_dir.clone(),
             lemond: lemond_path_in(&runtime_dir),
             lemonade: lemonade_path_in(&runtime_dir),
@@ -1223,7 +1243,7 @@ mod tests {
         let source = dir.join("source-archive");
         write_embeddable_with_pins(
             &source,
-            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}"#,
         );
         cache_archive(&root, &source);
 
@@ -1254,7 +1274,7 @@ mod tests {
         let source = dir.join("source-archive");
         write_embeddable_with_pins(
             &source,
-            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}"#,
         );
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
         cache_archive(&root, &source);
@@ -1278,7 +1298,7 @@ mod tests {
         );
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&pins).unwrap()).unwrap();
-        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["therock"]["version"], "10.1.0");
         assert_eq!(
             value["custom"]["x"], 1,
             "the concurrent writer's other entries survive"
@@ -1300,7 +1320,7 @@ mod tests {
         let source = dir.join("source-archive");
         write_embeddable_with_pins(
             &source,
-            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"10.1.0"},"llamacpp":{"rocm-stable":"b11580"}}"#,
         );
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
         cache_archive(&root, &source);

@@ -54,13 +54,20 @@ The rewrite tries two builds in order. The first keeps Lemonade's own pinned
 llama.cpp release and just repoints it at the active ROCm version — a
 deliberate, reproducible pin. If that attempt fails to resolve against the
 installed backend's shared libraries — for example because that release never
-shipped an asset for the active ROCm version — the second queries GitHub's
-`releases/latest` for `lemonade-sdk/llama.cpp` (an unauthenticated
-`api.github.com` call, subject to GitHub's public rate limit) and installs
-whatever build is newest at that moment. That second build is a moving
-target, not a pin: which llama.cpp commit actually gets installed depends on
-when the install ran, and the version installed is not recorded anywhere
-`rocm examine`/`rocm version` report. An attempt that cannot be verified
+shipped an asset for the active ROCm version — the second lists the 30 newest
+`lemonade-sdk/llama.cpp` releases on GitHub (an unauthenticated
+`api.github.com` call, subject to GitHub's public rate limit) and installs the
+most recently published one that ships the llama.cpp archive for the active
+ROCm version's `major.minor` on this platform
+(`llama-<tag>-bin-ubuntu-rocm-<major.minor>-x64.tar.gz` on Linux,
+`llama-<tag>-bin-win-rocm-<major.minor>-x64.zip` on Windows). The newest
+release alone is not used, because a release can be published without its
+ROCm archives. The second attempt is skipped when none of the 30 ships that
+archive, when the listing cannot be fetched, and when the build it finds is the
+one Lemonade already pins (the first attempt tried that build). That second build is a moving target, not a pin: which llama.cpp
+commit actually gets installed depends on when the install ran, and the
+version installed is not recorded anywhere `rocm examine`/`rocm version`
+report. An attempt that cannot be verified
 against the installed backend's shared libraries reverts to whichever version
 was pinned before the attempt — the packaged pin on a fresh install or after
 `--reinstall`, but whatever alignment last wrote otherwise — rather than
@@ -132,8 +139,11 @@ The versions of the third-party runtimes rocm-cli downloads are pinned in
 `runtime-deps.toml` at the repository root — one `[runtime.<name>]` table per
 runtime. That file is the only place a runtime version is written down:
 archive names, download URLs, and the dashboard's offline fallback are all
-derived from it, so a bump is a one-line edit and the tree cannot end up
-holding two different versions of the same runtime.
+derived from it, so the tree cannot end up holding two different versions of
+the same runtime. A Lemonade bump also records the new release's archive
+digests (`EMBEDDABLE_LINUX_SHA256` and `EMBEDDABLE_WINDOWS_SHA256` in
+[install.rs](../engines/lemonade/src/install.rs)): the downloaded archive is
+checked against them, and a digest cannot be derived from the version.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

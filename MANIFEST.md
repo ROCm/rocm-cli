@@ -706,11 +706,16 @@ Lemonade embeddable archive from the official Lemonade SDK GitHub releases at
 to the rocm-cli managed data directory and is reused for subsequent
 `rocm engines start lemonade` invocations. This is a self-contained binary
 distribution; no Python packages are installed for Lemonade by rocm-cli.
-On Linux/WSL, `rocm engines install lemonade` may also query
-`https://api.github.com/repos/lemonade-sdk/llama.cpp/releases/latest` (an
-unauthenticated call) while aligning Lemonade's `llamacpp:rocm` backend to
-the active ROCm SDK version; see
+On Linux/WSL and Windows, `rocm engines install lemonade` may also list
+`https://api.github.com/repos/lemonade-sdk/llama.cpp/releases` (the 30 newest
+releases, one unauthenticated call) while aligning Lemonade's `llamacpp:rocm`
+backend to the active ROCm SDK version; see
 [Lemonade backend alignment on engine install](docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install).
+Lemonade itself then downloads the llama.cpp backend it installs from the
+`lemonade-sdk/llama.cpp` GitHub releases, and the ROCm runtime that backend
+runs on from AMD's ROCm package repository (as Python wheels into a virtual
+environment of Lemonade's own, or as a TheRock tarball); those downloads are
+Lemonade's, not rocm-cli's.
 
 ### Engine-Specific Python Dependencies
 
