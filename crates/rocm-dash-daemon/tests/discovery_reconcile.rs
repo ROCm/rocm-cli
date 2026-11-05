@@ -13,9 +13,10 @@
 //! its endpoint changes. On Lemonade: the endpoint is announced once, scraped,
 //! and announced gone when it stops answering.
 //!
-//! The registry's retirement of a vanished service and Lemonade's change of id
-//! are not driven through the loop here; they are covered only by the unit tests
-//! in `runner.rs`. The Docker source has no seam that works without a container
+//! The registry's retirement of a vanished service is driven through the loop
+//! here too, for an empty registry and for one whose directory cannot be read.
+//! Lemonade's change of id is not driven through the loop here; it is covered only
+//! by the unit tests in `runner.rs`. The Docker source has no seam that works without a container
 //! daemon, so its reconcile is covered only by the unit tests next to the shared
 //! helper in `runner.rs`.
 
@@ -435,6 +436,126 @@ async fn managed_endpoint_change_starts_the_instance_clean() {
         moved.running_reqs, None,
         "the old endpoint's request count leaked onto the new one"
     );
+}
+
+// ── Managed-service registry: what the loop does when the registry changes ──
+
+/// A running loop with one managed service that has been scraped at least once,
+/// so the tests below start from an instance that carries live fields.
+struct LiveManaged {
+    rx: broadcast::Receiver<Event>,
+    services_dir: std::path::PathBuf,
+    // Held so the registry directory and the mock endpoint outlive the test body.
+    _tmp: tempfile::TempDir,
+    _server: MockServer,
+    _runner: tokio::task::JoinHandle<()>,
+}
+
+async fn start_live_managed() -> LiveManaged {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+    let server = spawn_server(|_| vllm_metrics()).await;
+    write_record(&services_dir, server.port);
+    let (mut rx, runner) = spawn_runner(managed_opts(services_dir.clone()));
+    snapshot_where(&mut rx, |snap| {
+        instance(snap, SVC_ID)
+            .filter(|i| approx(i.kv_cache_usage_pct, KV_PCT))
+            .map(|_| ())
+    })
+    .await;
+    LiveManaged {
+        rx,
+        services_dir,
+        _tmp: tmp,
+        _server: server,
+        _runner: runner,
+    }
+}
+
+/// Wait until the service is announced gone and a snapshot no longer lists it:
+/// the announcement and the snapshot are the two things a dashboard shows.
+async fn assert_service_is_retired(rx: &mut broadcast::Receiver<Event>) {
+    next_event(rx, |ev| match ev {
+        Event::InstanceGone { container_id } if container_id == SVC_ID => Some(()),
+        _ => None,
+    })
+    .await;
+    snapshot_where(rx, |snap| instance(snap, SVC_ID).is_none().then_some(())).await;
+}
+
+/// Replace the registry directory with a regular file of the same name, so
+/// listing it fails with something other than "not found". Portable: it needs no
+/// permission change, so it behaves the same for a privileged user and on Windows.
+fn replace_registry_dir_with_a_file(services_dir: &std::path::Path) {
+    std::fs::remove_dir_all(services_dir).unwrap();
+    std::fs::write(services_dir, b"not a directory").unwrap();
+}
+
+/// A registry that is confirmed empty (the directory is there and holds no
+/// record) retires the service it knew about.
+#[tokio::test]
+async fn managed_confirmed_empty_registry_retires_the_known_instance() {
+    let mut live = start_live_managed().await;
+
+    std::fs::remove_file(live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// A registry directory that does not exist is also confirmed empty: it is
+/// created the first time something is served, so its absence means no services.
+#[tokio::test]
+async fn managed_absent_registry_dir_retires_the_known_instance() {
+    let mut live = start_live_managed().await;
+
+    std::fs::remove_dir_all(&live.services_dir).unwrap();
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// A registry directory that cannot be listed retires the known service today,
+/// exactly as an empty one does: the loop cannot tell a failed read from a
+/// registry with nothing in it. This pins that defect; the next commit makes the
+/// read failure leave the instance alone and flips this test.
+#[tokio::test]
+async fn managed_unlistable_registry_dir_retires_the_known_instance_today() {
+    let mut live = start_live_managed().await;
+
+    replace_registry_dir_with_a_file(&live.services_dir);
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// Restores a directory's permissions on drop, so the temp dir can be cleaned
+/// up even when the test fails part-way.
+#[cfg(unix)]
+struct RestorePermissions(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The same defect through a permission error rather than a path error. Unix
+/// only, because Windows has no mode bits to drop; skipped when the process can
+/// still list the directory with its read bit removed (running as root).
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_registry_dir_retires_the_known_instance_today() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut live = start_live_managed().await;
+    let _restore = RestorePermissions(live.services_dir.clone());
+
+    std::fs::set_permissions(&live.services_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&live.services_dir).is_ok() {
+        eprintln!("skipped: this process can list a mode-000 directory (running as root)");
+        return;
+    }
+
+    assert_service_is_retired(&mut live.rx).await;
 }
 
 // ── Lemonade endpoint ───────────────────────────────────────────────────────
