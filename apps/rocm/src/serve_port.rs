@@ -149,7 +149,6 @@ fn hosts_overlap(a: &str, b: &str) -> bool {
     }
     fn covers(wildcard: IpAddr, other: &str) -> bool {
         match (wildcard, parse(other)) {
-            _ if !wildcard.is_unspecified() => false,
             (IpAddr::V6(_), _) => true,
             (IpAddr::V4(_), Some(IpAddr::V4(_))) => true,
             (IpAddr::V4(_), Some(IpAddr::V6(_))) => false,
@@ -420,6 +419,9 @@ mod tests {
             ("0:0:0:0:0:0:0:0", "10.0.0.7"),
             ("::0", "::1"),
             ("0.0.0.0", "0.0.0.0"),
+            ("0.0.0.0", "::"),
+            ("::", "0.0.0.0"),
+            ("::", "example.test"),
             ("example.test", "EXAMPLE.test"),
         ];
         for (a, b) in overlapping {
@@ -432,6 +434,8 @@ mod tests {
             ("10.0.0.7", "localhost"),
             ("example.test", "other.test"),
             ("127.0.0.1", "::1"),
+            ("10.0.0.7", "example.test"),
+            ("example.test", "10.0.0.7"),
         ];
         for (a, b) in disjoint {
             assert!(!hosts_overlap(a, b), "{a} should not overlap {b}");
