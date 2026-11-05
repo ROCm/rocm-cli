@@ -2146,8 +2146,13 @@ mod tests {
     fn wait_begin_shows_the_key_only_for_the_launch_it_belongs_to() {
         let own = wait_begin_client_config("svc-new", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
             .expect("own launch shows its key");
-        assert!(own.contains("api key: k-secret"), "{own}");
-        assert!(own.contains("http://0.0.0.0:8000/v1/models"), "{own}");
+        // No `{own}` in the failure messages: the text carries the dummy key,
+        // and formatting it into an assert is what CodeQL flags as logging it.
+        assert!(own.contains("api key: k-secret"), "key line missing");
+        assert!(
+            own.contains("http://0.0.0.0:8000/v1/models"),
+            "models url missing"
+        );
         // Attached to an already-starting server: its key is not this one.
         assert!(
             wait_begin_client_config("svc-old", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
