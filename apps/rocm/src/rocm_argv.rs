@@ -10,12 +10,14 @@
 //! quoted one-line command shown in plans and prompts
 //! (`format_structured_tool_call`).
 //!
-//! A leaf module with no `crate::` dependencies: `chat.rs`, `tool_policy.rs`
-//! and `freeform_planner.rs` all call into it, so the planner does not have to
-//! import `chat` for these helpers. They were relocated verbatim from `chat.rs` and
-//! `freeform_planner.rs`, which re-export the items other modules still reach
-//! as `chat::ensure_flag` and `freeform_planner::format_structured_tool_call`.
+//! A leaf module whose only `crate::` dependency is the leaf `shell_quote.rs`:
+//! `chat.rs`, `tool_policy.rs` and `freeform_planner.rs` all call into it, so
+//! the planner does not have to import `chat` for these helpers. They were
+//! relocated from `chat.rs` and `freeform_planner.rs`, which re-export the
+//! items other modules still reach as `chat::ensure_flag` and
+//! `freeform_planner::format_structured_tool_call`.
 
+use crate::shell_quote::shell_quote;
 use anyhow::{Result, bail};
 
 pub(crate) fn ensure_flag(args: &mut Vec<String>, flag: &str) {
@@ -104,20 +106,23 @@ pub(crate) fn serve_args_request_cpu_device(args: &[String]) -> bool {
     false
 }
 
+/// Render an argv as the command line a human is shown for it.
+///
+/// This is the only thing an operator sees before approving a mutating tool
+/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
+/// line) is offered to be copied and run. So it has to denote the argv it was
+/// built from: quoted with [`shell_quote`], every argument splits back to
+/// itself under a shell's own word-splitting, and nothing inside a value can
+/// read as a second command.
+///
+/// Values carrying terminal control characters never get here — they are
+/// refused at validation
+/// ([`has_terminal_control_character`](crate::shell_quote::has_terminal_control_character)),
+/// because no amount of quoting stops a `\r` from rewriting the line the
+/// operator is reading.
 pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
-}
-
-/// Quotes `value` for rendered plan text and LLM prompt text only -- never
-/// executed directly. Deliberately kept separate from `rocm_core::quoting`
-/// (ROCMAI-727); see that module's doc comment for why.
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }

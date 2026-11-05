@@ -29,6 +29,7 @@ use crate::rocm_argv::{
 };
 use crate::service_launch::is_loopback_host;
 use crate::services_text::validate_service_id;
+use crate::shell_quote::has_terminal_control_character;
 use crate::{providers, therock};
 use anyhow::{Context, Result, bail};
 use rocm_core::{DEFAULT_LOCAL_HOST, builtin_watcher, runtime_install_root_is_protected};
@@ -160,9 +161,16 @@ pub(crate) fn chat_tool_approval_request(
 }
 
 pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<()> {
+    // First, because every refusal below names the tool: a model-chosen name
+    // carrying a control character would otherwise reach the terminal inside
+    // the very error that rejects it. This one names nothing.
+    if has_terminal_control_character(&call.name) {
+        bail!("local assistant requested a ROCm tool whose name contains a control character");
+    }
     if !call.arguments.is_object() {
         bail!("ROCm tool `{}` arguments must be a JSON object", call.name);
     }
+    reject_control_characters_in_tool_arguments(&call.name, &call.arguments)?;
     match call.name.as_str() {
         "examine"
         // `doctor` is the dash-side LLM tool + `/doctor` overlay name for the
@@ -206,6 +214,86 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+/// The tools exempt from [`reject_control_characters_in_tool_arguments`].
+///
+/// Deny by default: every other tool, including one added later, has its
+/// whole arguments object screened before anything else looks at it. The
+/// criterion that used to pick tools *in* — "its arguments reach the
+/// operator's terminal" — kept missing values that reach it some other way:
+/// `port_status` echoes a refused `host` in its own error, which the CLI
+/// prints. A list of exceptions fails safe when it is forgotten; a list of
+/// guarded tools does not.
+///
+/// `rocm_command` is the one exception, and it is not unscreened: its argv is
+/// checked entry by entry in [`normalized_chat_rocm_command_args`], with the
+/// same predicate, after trimming each entry — so screening the raw object
+/// here would refuse a padded value that path legitimately accepts. Its
+/// `reason` is free-form prose that is never printed.
+///
+/// Pinned by `every_tool_but_the_exempt_one_refuses_a_control_character_anywhere`
+/// (adding a name here turns it red) and
+/// `an_unknown_tool_is_screened_before_it_is_rejected` (going back to an
+/// allow-list turns it red).
+const CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS: [&str; 1] = ["rocm_command"];
+
+/// Refuse a model-supplied string argument carrying a terminal control or
+/// format character, for every tool not in
+/// [`CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS`].
+///
+/// Those values are printed: into the command preview an operator approves,
+/// into the `request plan` / `execution` blocks `rocm <request>` emits, into
+/// the plan text `natural_language_plan` returns, into a refusal that echoes
+/// the value it refused, and — for `path_exists` — into a tool-result block
+/// with no gate at all. All of it
+/// reaches a terminal as bytes, so a `\r` returns the cursor to column one and
+/// a CSI sequence erases the line; the model, not this code, then chooses what
+/// the operator reads. Quoting cannot fix that: `'…'` makes the byte literal to
+/// a *shell*, not to a terminal.
+///
+/// Scope note, so the guarantee is not overread: this covers model-supplied
+/// *arguments*, not model-supplied prose. An assistant's reply text is still
+/// printed as it comes; `strip_ansi_sequences` in `comfyui.rs` is the tool for
+/// that surface, and is already used on ComfyUI log output.
+///
+/// Walks the whole arguments object rather than naming fields, so a new
+/// argument on one of these tools inherits the guarantee instead of having to
+/// remember it.
+fn reject_control_characters_in_tool_arguments(
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<()> {
+    if CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS.contains(&tool) {
+        return Ok(());
+    }
+    reject_control_characters(tool, arguments)
+}
+
+fn reject_control_characters(tool: &str, arguments: &serde_json::Value) -> Result<()> {
+    match arguments {
+        serde_json::Value::String(value) => {
+            if has_terminal_control_character(value) {
+                // The wording is load-bearing for the per-tool test, which
+                // asserts this refusal rather than merely `is_err()` — several
+                // of these tools would refuse a hostile value for some other
+                // reason, and a test that accepted any error would pass with
+                // this guard removed.
+                bail!(
+                    "ROCm tool `{tool}` argument contains a control character; \
+                     it would rewrite what the operator reads"
+                );
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| reject_control_characters(tool, value)),
+        serde_json::Value::Object(entries) => entries
+            .values()
+            .try_for_each(|value| reject_control_characters(tool, value)),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
@@ -426,7 +514,12 @@ pub(crate) fn normalized_chat_rocm_command_args(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .context("rocm_command `args` entries must be non-empty strings")?;
-        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
+        // Every control character, not only NUL/LF/CR. These args are rendered
+        // into the approval card and the `advanced manual command:` line, which
+        // reach a terminal as bytes — an ESC or a C1 CSI there redraws what the
+        // operator is reading just as effectively as a `\r`, and this list used
+        // to let both through. See `has_terminal_control_character`.
+        if has_terminal_control_character(arg) {
             bail!("rocm_command arguments must not contain control characters");
         }
         if arg.len() > 512 {
@@ -1125,7 +1218,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix 'D:\\ROCm\\therock_venvs'"
             )
         );
         let approval = chat_tool_approval_request(
@@ -1325,7 +1418,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
+                "rocm install sdk --channel release --format wheel --prefix 'D:\\ROCm\\therock_venvs' --build-date 06052026 --approve-replacing-active-default"
             )
         );
         let approval =
@@ -1551,7 +1644,7 @@ mod tests {
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix 'D:\\ROCm\\therock_venvs'",
                 ),
                 false,
             ),

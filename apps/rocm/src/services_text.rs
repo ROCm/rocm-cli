@@ -125,6 +125,7 @@ use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
     managed_service_process_command,
 };
+use crate::shell_quote::shell_quote;
 use crate::{SandboxToolArg, cli_lifecycle_log_path, status_for_readiness};
 
 pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
@@ -379,7 +380,13 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
     );
     let _ = writeln!(output, "  See them: rocm services list --all");
     if let Some(id) = newest_id {
-        let _ = writeln!(output, "  Read the newest: rocm services logs {id}");
+        // Quoted like every other `rocm services … <id>` hint, so the line is
+        // the argv it names even for an id that is not one inert word.
+        let _ = writeln!(
+            output,
+            "  Read the newest: rocm services logs {}",
+            shell_quote(id)
+        );
     }
     let _ = writeln!(output, "  Reclaim the space: rocm services prune");
 }
@@ -440,7 +447,11 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
-        let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
+        let _ = writeln!(
+            output,
+            "  logs: rocm services logs {}",
+            shell_quote(&record.service_id)
+        );
         if matches!(
             record.status.as_str(),
             "ready" | "running" | "starting" | "recovering"
@@ -2124,6 +2135,57 @@ pub(crate) mod tests {
         assert!(all.contains("Status: 2 not running"), "{all}");
         assert!(all.contains("- svc-newest"), "{all}");
         assert!(!all.contains("Past attempts:"), "{all}");
+        Ok(())
+    }
+
+    /// Both `rocm services logs <id>` lines the list prints — the per-row
+    /// `logs:` line and the default view's "Read the newest" pointer — are
+    /// commands a user is told to paste, so each must split back to exactly
+    /// that argv whatever the id holds. Mutation: interpolating the id bare in
+    /// either line fails this.
+    #[test]
+    fn render_services_text_logs_hints_denote_the_argv_they_name() -> Result<()> {
+        let service_id = "svc 'a b'";
+        let (root, paths) = test_paths("services-logs-hint-awkward-id");
+        paths.ensure()?;
+        // Not live, so no endpoint probe or pid check runs.
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11500,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let default_view = render_services_text(&paths, false);
+        let all_view = render_services_text(&paths, true);
+        let _ = fs::remove_dir_all(root);
+        let (default_view, all_view) = (default_view?, all_view?);
+
+        let expected = Some(
+            ["rocm", "services", "logs", service_id]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        let newest = default_view
+            .lines()
+            .find_map(|line| line.strip_prefix("  Read the newest: "))
+            .expect("the default view points at the newest past attempt");
+        assert_eq!(shlex::split(newest), expected, "{default_view}");
+        let row = all_view
+            .lines()
+            .find_map(|line| line.strip_prefix("  logs: "))
+            .expect("the --all view lists the record with its logs command");
+        assert_eq!(shlex::split(row), expected, "{all_view}");
         Ok(())
     }
 
