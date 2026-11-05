@@ -1,0 +1,266 @@
+name: Runtime dependency update
+
+# Keeps the third-party runtimes rocm-cli installs current, the way Dependabot
+# keeps the Cargo, Actions and pre-commit pins current. Dependabot cannot do
+# this part: it does not read mise.toml, and it cannot write per-OS pylock.toml
+# files against AMD's wheel indexes (docs/runtime-dependencies.md says why).
+#
+# Weekly, `runtimes/bin/mise run --cd runtimes update` moves each binary pin in
+# runtimes/mise.toml to its newest release past mise's 7-day
+# `minimum_release_age`, re-locks it, and re-locks every Python profile in
+# runtimes/profiles.toml with `--upgrade` and the same 7-day cooldown for PyPI.
+# Any change becomes one grouped pull request on the fixed branch
+# `runtime-deps/update`, with a table of what moved.
+#
+# Same split as dependabot-manifests{,-commit}.yml: resolving runs upstream
+# code (uv builds AMD's `rocm` sdist for its metadata), so `propose` holds no
+# write token; `check` runs this commit's `cargo xtask deps check` against the
+# artifact, still read-only; `open-pr` never executes anything from the
+# artifact and commits
+# through createCommitOnBranch, which GitHub signs (the `commit-signatures`
+# gate requires signed commits).
+#
+# The branch is rebuilt from scratch on every run, so a fixup a maintainer
+# pushes to it is discarded the following week: land fixups on `main` instead,
+# or merge (or close) the pull request before the next run.
+#
+# PREREQUISITE: "Allow GitHub Actions to create and approve pull requests"
+# (Settings > Actions > General) must be on, or `gh pr create` below is
+# refused after the branch has been updated.
+#
+# ONE MANUAL STEP REMAINS: a pull request opened with GITHUB_TOKEN does not
+# trigger CI. A maintainer closes and reopens it (or pushes to it) to run the
+# checks. Removing that step needs a GitHub App token, which is org-level
+# setup and out of scope here.
+
+on:
+  schedule:
+    # Mondays 05:17 UTC, off the hour.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: runtime-deps-update
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+  BRANCH: runtime-deps/update
+
+jobs:
+  propose:
+    name: Update pins and re-lock
+    # Only `main`'s pins are proposed; a dispatch from another branch would
+    # commit that branch's locks onto `main`'s tree.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04 # one LTS: runs mise and uv, which bring their own binaries; nothing here depends on the image
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    env:
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/runtimes
+      # The bootstrap wrapper takes MISE_VERSION as an override, and for any
+      # version but its own it trusts the checksum file it downloads beside the
+      # binary. Pin it empty so the wrapper's embedded checksums always apply.
+      MISE_VERSION: ""
+      # GitHub API lookups in `mise upgrade` / `mise lock`; read-only.
+      GITHUB_TOKEN: ${{ github.token }}
+      UV_NO_CACHE: "1"
+      UV_HTTP_TIMEOUT: "900"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # This job runs upstream code (uv builds AMD's `rocm` sdist), so it
+          # must not save a cache later jobs would restore.
+          cache: false
+
+      - name: Free disk space for wheel downloads
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Update pins and re-lock
+        run: runtimes/bin/mise run --cd runtimes update
+
+      - name: Summarise what moved
+        id: diff
+        run: |
+          set -euo pipefail
+          git add -N runtimes
+          if git diff --quiet -- runtimes; then
+            echo "Every runtime is current; nothing to propose."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/update"
+          cargo xtask deps diff --base HEAD > "$RUNNER_TEMP/update/summary.md"
+          cp -r runtimes/mise.toml runtimes/mise.lock runtimes/locks "$RUNNER_TEMP/update/"
+          cat "$RUNNER_TEMP/update/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the proposed update
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-deps-update
+          path: ${{ runner.temp }}/update/
+          retention-days: 7
+
+  # `deps check` from this commit's own code, against the artifact, before
+  # anything holds a write token. The artifact is data here: the validator
+  # (also this commit's) decides what it may contain, and nothing in it runs.
+  # This is what refuses a lock that points a download elsewhere, which the
+  # pull request alone would not show until someone ran CI on it.
+  check:
+    name: Check the proposed locks
+    needs: propose
+    if: needs.propose.outputs.changed == 'true'
+    runs-on: ubuntu-24.04 # one LTS: runs this commit's xtask on the artifact; nothing here depends on the image
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+
+      - name: Download the proposed update
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: runtime-deps-update
+          path: ${{ runner.temp }}/update
+
+      - name: Check the update with this commit's code
+        run: |
+          set -euo pipefail
+          python3 -I scripts/validate_runtime_update.py "$RUNNER_TEMP/update" runtimes/mise.toml
+          cp "$RUNNER_TEMP/update/mise.toml" "$RUNNER_TEMP/update/mise.lock" runtimes/
+          rm -rf runtimes/locks
+          cp -r "$RUNNER_TEMP/update/locks" runtimes/locks
+          cargo xtask deps check
+
+  open-pr:
+    name: Open or update the pull request
+    needs: [propose, check]
+    if: needs.propose.outputs.changed == 'true'
+    runs-on: ubuntu-24.04 # one LTS: GitHub API calls only; nothing here depends on the image
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Download the proposed update
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: runtime-deps-update
+          path: update
+
+      # The artifact is the only input from the job that ran upstream code.
+      # scripts/validate_runtime_update.py decides what it may contain. It is
+      # read from the commit this run updated, never from the artifact, so the
+      # only code that runs here is code already on `main`.
+      - name: Validate the artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/runtimes/mise.toml?ref=$BASE_SHA" --jq .content | base64 -d > base-mise.toml
+          gh api "repos/$REPO/contents/scripts/validate_runtime_update.py?ref=$BASE_SHA" --jq .content | base64 -d > validate_runtime_update.py
+          # An empty or truncated fetch would run as a script that checks
+          # nothing and exits 0, so refuse anything that is not the validator.
+          grep -q '^def validate(artifact: Path, base_config: Path) -> None:$' validate_runtime_update.py
+          python3 -I validate_runtime_update.py update base-mise.toml
+
+      - name: Commit to the update branch and open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: main
+          # The commit `propose` updated, not whatever `main` is by now: the
+          # files below replace mise.toml and mise.lock whole, so committing
+          # them onto a newer `main` would revert what landed in between.
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          base_sha="$BASE_SHA"
+          # The branch always restarts from that commit: one proposal,
+          # regenerated from scratch each week, never stacked on the last one.
+          if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$base_sha" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$base_sha" >/dev/null
+          fi
+
+          # Locks the update no longer produces are deleted on the branch.
+          # A 404 means `main` has no locks yet; any other failure must stop the
+          # run, or locks the update dropped would silently stay on the branch.
+          if ! committed=$(gh api "repos/$REPO/contents/runtimes/locks?ref=$base_sha" --jq '.[].path' 2>listing.err); then
+            grep -q 'HTTP 404' listing.err || { cat listing.err >&2; exit 1; }
+            committed=""
+          fi
+          python3 - "$committed" <<'PY' > payload.json
+          import base64, json, os, sys
+          from pathlib import Path
+
+          root = Path("update")
+          additions = []
+          for name in ("mise.toml", "mise.lock"):
+              additions.append({"path": f"runtimes/{name}",
+                                "contents": base64.b64encode((root / name).read_bytes()).decode()})
+          produced = set()
+          for lock in sorted((root / "locks").glob("pylock.*.toml")):
+              path = f"runtimes/locks/{lock.name}"
+              produced.add(path)
+              additions.append({"path": path, "contents": base64.b64encode(lock.read_bytes()).decode()})
+          deletions = [{"path": p} for p in sys.argv[1].split() if p not in produced]
+          print(json.dumps({
+              "query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              "variables": {"input": {
+                  "branch": {"repositoryNameWithOwner": os.environ["REPO"], "branchName": os.environ["BRANCH"]},
+                  "expectedHeadOid": os.environ["BASE_SHA"],
+                  "message": {
+                      "headline": "build(deps): update runtime pins and locks",
+                      "body": "Generated by the runtime-deps-update workflow (`runtimes/bin/mise run --cd runtimes update`).\n\n"
+                              "Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+                  },
+                  "fileChanges": {"additions": additions, "deletions": deletions},
+              }},
+          }))
+          PY
+          gh api graphql --input payload.json >/dev/null
+
+          {
+            echo "Weekly update of the third-party runtimes rocm-cli installs, from \`runtimes/bin/mise run --cd runtimes update\`."
+            echo
+            cat update/summary.md
+            echo
+            echo "Pull requests opened by this workflow do not trigger CI on their own: close and reopen this one to run the checks. The GPU lanes exercise a new Lemonade version; no installer reads the Python locks yet, so their changes are checked by \`cargo xtask deps check\` and the runtime-locks job only."
+          } > body.md
+          existing=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$REPO" --body-file body.md
+          else
+            gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+              --title "build(deps): update runtime pins and locks" --body-file body.md
+          fi
