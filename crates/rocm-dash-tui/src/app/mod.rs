@@ -16,9 +16,10 @@
 //! child modules hold no `AppState` methods: `app/types.rs` (shared type/enum
 //! defs and the menu data), `app/actions.rs` (`KeyAction` dispatch:
 //! `handle_key`, `apply_action`), `app/scrollbar.rs` (mouse hit-testing),
-//! `app/event_loop.rs` (the tick loop), `app/terminal.rs` (terminal restore,
-//! shutdown latch, signal watcher), `app/focus.rs` (focused-host policy),
-//! `app/update_check.rs` (the Updates-tile check) and `app/summary.rs`.
+//! `app/event_loop.rs` (the tick loop), `app/chat_runtime.rs` (the live chat
+//! backend the loop owns), `app/terminal.rs` (terminal restore, shutdown latch,
+//! signal watcher), `app/focus.rs` (focused-host policy), `app/update_check.rs`
+//! (the Updates-tile check) and `app/summary.rs`.
 //! `crate::app::*` paths for the public surface moved out are unchanged via
 //! the re-exports below.
 
@@ -35,6 +36,7 @@ use crate::ui::theme::Theme;
 // `crate::app::*` paths for the public surface are unchanged).
 mod actions;
 mod chat;
+mod chat_runtime;
 mod chat_state;
 mod event_loop;
 mod focus;
@@ -97,6 +99,11 @@ pub struct AppState {
     /// arrived yet — which is what `has_live_instance` consults a live
     /// registry read for (issue #145).
     pub(crate) has_received_snapshot: bool,
+    /// Sticky: set by the first snapshot of any kind, with or without GPUs (daemon or
+    /// Windows in-process), never cleared by a disconnect, reconnect, or
+    /// replay seek. Drives the hero's "Detecting GPU…" placeholder, which
+    /// must not reappear once detection has produced a result.
+    pub(crate) has_received_gpu_snapshot: bool,
     pub active_tab: ActiveTab,
     pub modal: Modal,
     /// Cursor into the Esc main-menu rows (Options / Help / Quit).
@@ -112,7 +119,7 @@ pub struct AppState {
     /// Whether the active domain tab's focus is on the Actions list or the
     /// Details pane. `→`/Enter moves focus into Details; `←`/Esc returns to it.
     pub pane_focus: PaneFocus,
-    /// Cursor into the sorted Instances grid.
+    /// Cursor into the sorted Instances table.
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
     pub bench_sel: usize,
@@ -354,6 +361,7 @@ impl AppState {
             bench_rows: VecDeque::with_capacity(BENCH_CAP),
             instances: HashMap::new(),
             has_received_snapshot: false,
+            has_received_gpu_snapshot: false,
             active_tab: ActiveTab::default(),
             modal: Modal::None,
             menu_sel: 0,
@@ -583,6 +591,28 @@ impl AppState {
             self.instances
                 .insert(inst.container_id.clone(), inst.clone());
         }
+        self.push_history_and_latest(snap);
+    }
+
+    /// Windows sibling of [`push_snapshot`](Self::push_snapshot) for
+    /// `ClientMsg::HostGpuSnapshot`: applies host/GPU metrics for
+    /// charts/history exactly like a real snapshot, but deliberately leaves
+    /// `instances` and `has_received_snapshot` untouched. The Windows
+    /// in-process ticker (`client.rs`) always sends an empty `instances`
+    /// stand-in (no instance-registry daemon exists there yet), so treating
+    /// it as authoritative the way `push_snapshot` does would permanently
+    /// blind the issue #145 quit-confirm prompt to models actually being
+    /// served — see `has_live_instance_with`'s Windows note.
+    pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
+        self.push_history_and_latest(snap);
+    }
+
+    /// Shared tail of [`push_snapshot`](Self::push_snapshot) and
+    /// [`push_host_gpu_snapshot`](Self::push_host_gpu_snapshot): the
+    /// history/latest bookkeeping both share, independent of how (or
+    /// whether) `instances` gets updated.
+    fn push_history_and_latest(&mut self, snap: Snapshot) {
+        self.has_received_gpu_snapshot = true;
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }
@@ -647,6 +677,51 @@ mod tests {
 
     use super::chat::build_chat_agent;
     use super::test_support::{args_with_anthropic_key, st};
+
+    #[test]
+    fn push_host_gpu_snapshot_leaves_instances_and_has_received_snapshot_untouched() {
+        // Mirrors push_snapshot's issue #145 authority handoff, but for the
+        // Windows in-process path: a HostGpuSnapshot must still land
+        // host/GPU metrics for charts/history, while leaving `instances` and
+        // `has_received_snapshot` exactly as they were — see
+        // `push_host_gpu_snapshot`'s doc comment for why.
+        let mut s = st();
+        s.instances.insert(
+            "id0".to_string(),
+            rocm_dash_core::metrics::Instance {
+                container_id: "id0".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(!s.has_received_snapshot);
+
+        let snap = Snapshot {
+            warnings: vec!["gpu-warning".to_string()],
+            instances: vec![rocm_dash_core::metrics::Instance {
+                container_id: "phantom".to_string(),
+                ..Default::default()
+            }],
+            ..Snapshot::default()
+        };
+        s.push_host_gpu_snapshot(snap);
+
+        assert!(
+            !s.has_received_snapshot,
+            "a HostGpuSnapshot must never flip has_received_snapshot"
+        );
+        assert_eq!(
+            s.instances.len(),
+            1,
+            "instances must stay exactly as seeded, ignoring the snapshot's own (always-empty-in-practice) instances"
+        );
+        assert!(s.instances.contains_key("id0"));
+        assert_eq!(
+            s.latest.as_ref().map(|s| s.warnings.clone()),
+            Some(vec!["gpu-warning".to_string()]),
+            "host/GPU metrics must still land for charts/history"
+        );
+        assert_eq!(s.history.len(), 1);
+    }
 
     #[test]
     fn actions_does_not_import_from_scrollbar() {

@@ -186,7 +186,8 @@ struct ContainerSpec {
     tp: u32,
     port: u16,
     /// Phase of the activity sinusoid in seconds — staggers the three
-    /// instances so the heatmap and per-GPU sparklines aren't synchronised.
+    /// instances so their curves in the Observe table (throughput, queue,
+    /// kv-cache) and the per-GPU utilization sparklines aren't synchronised.
     phase_s: f64,
     /// Mean kv-cache utilization (0..100) around which it oscillates.
     kv_mean: f32,
@@ -199,7 +200,7 @@ struct ContainerSpec {
     req_mean: u32,
     /// Quantization label shown in the detail modal.
     quantization: Option<&'static str>,
-    /// Launch args excerpt rendered in the instance card / detail modal.
+    /// Launch args excerpt rendered in the instance detail modal.
     launch_args: &'static [&'static str],
 }
 
