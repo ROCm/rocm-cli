@@ -1131,12 +1131,12 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     // Prose that happens to begin with the program name.
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat would see this result, a plain shell might not",
         "note naming the two commands a managed runtime affects, not advice",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat prepend the active managed runtime's own directories ahead of LD_LIBRARY_PATH, so the export below may not change what they load; reinstalling or repairing that runtime so it ships its own code object manager is the fix that reaches it directly.",
         "explanation of what the two commands load, not advice",
     ),
@@ -1219,19 +1219,19 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "log line",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/catalog.rs",
         "rocm diagnose covers Linux, Windows and WSL2. This host reports '{}', which the \
          catalog has no entries for, so nothing was checked -- this is not a clean bill of \
          health. Run `rocm examine --json` and report the platform upstream.",
         "out-of-scope report prose",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: out of scope for this platform.",
         "report heading",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: no known misconfiguration matched.",
         "report heading",
     ),

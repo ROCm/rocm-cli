@@ -770,7 +770,7 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // the always-on auto/manual marker) rather than a specific fix-id's exact
     // flags: the top match is environment-dependent, and a shared vocabulary
     // doesn't guarantee diagnose and the fix/catalog.rs catalog agree on the
-    // underlying values for a given fix-id -- unit tests in diagnose.rs call
+    // underlying values for a given fix-id -- unit tests in diagnose/linux.rs call
     // fix/catalog.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
     let causes = output.lines().filter(|l| l.contains("score=")).count();

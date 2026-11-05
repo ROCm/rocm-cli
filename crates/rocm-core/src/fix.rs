@@ -48,7 +48,7 @@ pub use manifest::{
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
 pub use render::list_recipes;
-// The catalog's test-only oracles, which `diagnose.rs` holds its own copies of
+// The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]
 pub(crate) use catalog::{

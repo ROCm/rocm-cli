@@ -684,7 +684,7 @@ Feature: Diagnosing failures and listing fixes
   # These three scenarios see what `rocm fix <id> --dry-run` prints from the
   # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
   # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
-  # in crates/rocm-core/src/diagnose.rs, and a printed line the rule passes is
+  # in crates/rocm-core/src/diagnose/catalog.rs, and a printed line the rule passes is
   # still not proven to run: the Windows-only tests named above do that.
   @id:diagnose-override-fix-lines-are-powershell-safe
   Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
@@ -709,7 +709,7 @@ Feature: Diagnosing failures and listing fixes
   # the binary. The exact line is asserted, and that it names `python3`: a stock
   # Ubuntu has no `python`. Text only: the line is run by
   # `the_override_fix_verify_runs_where_only_python3_exists` in
-  # crates/rocm-core/src/diagnose.rs, on Unix hosts. The Windows arms of these
+  # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
   # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
   # (text) and the Windows-only `*_verify_runs_*` tests in
   # crates/rocm-core/src/fix/catalog.rs (run); there is no Windows scenario for them.
@@ -739,7 +739,7 @@ Feature: Diagnosing failures and listing fixes
   # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
   # an ambient HIP framework needs the SDK is held by the unit test
   # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
-  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # in crates/rocm-core/src/diagnose/windows.rs. The oracle also counts a weak listing
   # (below the match threshold) as present, which is what production does for
   # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
   # bonus wrong, so whoever changes it must update this scenario's oracle too.
