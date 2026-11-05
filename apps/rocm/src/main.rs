@@ -42,6 +42,7 @@ mod gpu_policy;
 mod install_cmd;
 mod logging;
 mod managed_service_status;
+mod model_catalog_text;
 mod model_fit;
 mod prompt_text;
 mod provider_keys;
@@ -57,6 +58,7 @@ mod runtimes_cmd;
 mod serve_cmd;
 mod serve_recipe;
 mod serve_summary;
+mod service_control;
 mod service_hints;
 mod service_launch;
 mod service_records;
@@ -99,7 +101,8 @@ mod update_cmd;
 // `ensure_public_service_has_endpoint_key` are no longer needed here either:
 // their only caller outside `dispatch()`, `restart_internal_managed_service`
 // (and the endpoint-key check inside it), moved out to `services_text.rs` in
-// ROCMAI-209 (Phase 6f), reaching them via its own imports instead.
+// ROCMAI-209 (Phase 6f) and has since moved on to `service_control.rs`, which
+// reaches them via its own imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
@@ -132,20 +135,23 @@ use crate::examine_cmd::examine;
 #[cfg(test)]
 use crate::examine_report_text::append_examine_runtime_state;
 use crate::examine_report_text::{
-    format_bytes, render_engine_inventory_text_with_paths, render_examine_text,
-    render_examine_text_with_paths, render_launch_summary,
-    render_model_registry_text_with_context_and_host,
-    render_model_registry_verbose_text_with_context_and_host,
+    render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
+    render_launch_summary,
 };
 use crate::freeform_answer::render_freeform_read_only_answer;
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
 use crate::gpu_policy::parse_gpu_indices_arg;
 use crate::install_cmd::{install, therock_install_version_selector};
+use crate::model_catalog_text::{
+    format_bytes, render_model_registry_text_with_context_and_host,
+    render_model_registry_verbose_text_with_context_and_host,
+};
 use crate::model_fit::{
     PlatformRuleOut, engine_ruled_out_by_platform, engine_ruled_out_by_platform_with,
 };
 use crate::runtimes_cmd::{current_runtime_manifest, runtimes};
 use crate::serve_cmd::{ServeArgs, serve};
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 // Reached only as `super::run_approved_service_action` from
 // `advised_commands.rs`'s test, so a non-test build does not carry it.
@@ -154,7 +160,7 @@ use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
     render_internal_status_text, render_logs_browser_text, render_logs_text,
-    render_service_logs_text, run_internal_sandbox_tool,
+    render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
 use crate::uninstall::uninstall;

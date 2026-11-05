@@ -17,14 +17,18 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. It is a module of its own, rather than part of the
-//! `rocm diagnose` handler, so `examine_report_text.rs`, which reads
-//! `PlatformRuleOut` and `engine_ruled_out_by_platform`, does not have to
-//! depend on a command module. Its own dependencies are `serve_cmd.rs` and
-//! `gpu_policy.rs`; neither depends on this module. `assess_model_on_this_host`
+//! `rocm diagnose` handler, so `examine_report_text.rs` (which reads
+//! `PlatformRuleOut` and `engine_ruled_out_by_platform`) and
+//! `model_catalog_text.rs` (which reads `PlatformRuleOut` and
+//! `engine_ruled_out_by_platform_with`) do not have to depend on a command
+//! module. Its own dependencies are `serve_cmd.rs` and `gpu_policy.rs`;
+//! neither depends on this module. `assess_model_on_this_host`
 //! (called from `diagnose()` in `diagnose_cmd.rs`), `PlatformRuleOut` and
 //! `engine_ruled_out_by_platform` are `pub(crate)`; `main.rs` re-imports the
-//! last two so `examine_report_text.rs` keeps reaching them as `crate::<name>`.
-//! Every other item has no caller outside this module and stays private.
+//! last two so `examine_report_text.rs` keeps reaching them as
+//! `crate::<name>`; `model_catalog_text.rs` reaches `PlatformRuleOut` and
+//! `engine_ruled_out_by_platform_with` the same way. Every other item has no
+//! caller outside this module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
 //! `engine_ruled_out_by_platform_gates_aim_on_docker_reachability` re-runs the
