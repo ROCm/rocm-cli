@@ -165,8 +165,9 @@ pub use net::{
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
+    RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
+    terminate_recorded_pid, terminate_recorded_service_pids, terminate_verified,
 };
 pub use process::{
     FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,

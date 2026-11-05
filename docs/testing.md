@@ -1369,6 +1369,27 @@ directly, exits 0, and records whether that signal worked, adding a second
 stderr `note:` when it did not (`cargo test -p rocm --bin rocm services_stop_` and
 `cargo test -p rocm --bin rocm attached_ctrl_c_`).
 
+`rocm services stop` and `rocmd`'s `stop_server` terminate the processes a
+record names through one routine,
+[`terminate_recorded_service_pids`](../crates/rocm-core/src/proc_lifecycle.rs),
+and wait `MANAGED_STOP_GRACE` for each; neither binary keeps a copy. The
+routine is tested in `rocm-core` (`cargo test -p rocm-core proc_lifecycle::`):
+the supervisor is visited before the engine, each PID with its own start-time,
+a PID recorded under both roles once, and the stopping process's own PID is
+reported as `self` in `pid_outcomes` and never signalled, in both commands.
+On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
+`terminate_verified` cannot walk a process tree there; that step is tested
+through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
+and its neighbours), not by killing a real tree. The callers' own tests check
+that each reaches the routine and reports what it returns
+(`cargo test -p rocm --bin rocm services_text::tests::a_stop_` and
+`cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
+that no private copy of the routine or its constant has come back. No scenario
+kills a real process tree on Windows: `service-stop-01` plants PID 0 and
+`service-stop-02` is Linux-only, so the Windows tree kill has no live coverage
+beyond compiling there and the injected unit tests, which the `windows-debug`
+lane runs with `cargo test --workspace --all-targets`.
+
 No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
 `rocm serve` launch — an engine and a runtime the mock lane does not have,
 which is why the chat scenarios there plant a record behind a mock server
