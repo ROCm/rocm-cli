@@ -219,7 +219,7 @@ where
         backend,
         elapsed_ms = started.elapsed().as_millis() as u64,
         reply_len = reply.len(),
-        tools_fired = fired_tools.len(),
+        skills_fired = fired_tools.len(),
         "chat request complete"
     );
     Ok(annotate_reply(reply, &fired_tools))
