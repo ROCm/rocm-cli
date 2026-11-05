@@ -42,6 +42,7 @@ mod gpu_policy;
 mod install_cmd;
 mod logging;
 mod managed_service_status;
+mod model_catalog_text;
 mod model_fit;
 mod prompt_text;
 mod provider_keys;
@@ -132,15 +133,17 @@ use crate::examine_cmd::examine;
 #[cfg(test)]
 use crate::examine_report_text::append_examine_runtime_state;
 use crate::examine_report_text::{
-    format_bytes, render_engine_inventory_text_with_paths, render_examine_text,
-    render_examine_text_with_paths, render_launch_summary,
-    render_model_registry_text_with_context_and_host,
-    render_model_registry_verbose_text_with_context_and_host,
+    render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
+    render_launch_summary,
 };
 use crate::freeform_answer::render_freeform_read_only_answer;
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
 use crate::gpu_policy::parse_gpu_indices_arg;
 use crate::install_cmd::{install, therock_install_version_selector};
+use crate::model_catalog_text::{
+    format_bytes, render_model_registry_text_with_context_and_host,
+    render_model_registry_verbose_text_with_context_and_host,
+};
 use crate::model_fit::{
     PlatformRuleOut, engine_ruled_out_by_platform, engine_ruled_out_by_platform_with,
 };
