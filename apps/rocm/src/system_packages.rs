@@ -605,4 +605,52 @@ mod tests {
             ),
         }
     }
+
+    /// The OpenMPI, libatomic and libnuma install hints (`rocm_core::openmpi`)
+    /// name package-manager commands for the machine the process runs on, like
+    /// the plans in this module, so a simulated host root must not choose their
+    /// distro either: with a root whose `/etc/os-release` names another
+    /// distribution, each hint is still the one the real host's file produces.
+    /// A hint that read through `host_path` would be the planted distro's (the
+    /// manual advice, as `planted-distro` maps to no package manager).
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn the_install_hints_read_the_real_host_and_ignore_a_simulated_root() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-os-release-hint-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        fs::write(root.join("etc/os-release"), "ID=planted-distro\n")
+            .expect("write planted os-release");
+
+        let hints = || {
+            [
+                rocm_core::openmpi::install_hint(),
+                rocm_core::openmpi::libatomic_install_hint(),
+                rocm_core::openmpi::libnuma_install_hint(),
+            ]
+        };
+        let (real, simulated) = {
+            let mut env = ScopedTestEnv::new();
+            let real = hints();
+            env.set(
+                rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
+                &root.to_string_lossy(),
+            );
+            (real, hints())
+        };
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(simulated, real);
+        if !real[0].plan_installs {
+            // A host that maps to no package manager reads the same as the
+            // planted file, so the assertion above held without telling which
+            // one was read.
+            eprintln!("host os-release names no known distribution; nothing proven");
+        }
+    }
 }
