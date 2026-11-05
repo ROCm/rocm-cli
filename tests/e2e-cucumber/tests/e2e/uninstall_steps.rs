@@ -681,10 +681,10 @@ async fn ask_for_uninstall_help(world: &mut E2eWorld) {
 #[then("the help shows a dry run before the real run")]
 async fn help_shows_dry_run_first(world: &mut E2eWorld) {
     let stdout = output(world);
-    let examples = stdout
-        .split_once("EXAMPLES:")
-        .map(|(_, rest)| rest)
-        .unwrap_or_else(|| panic!("the help has no examples:\n{stdout}"));
+    let examples = stdout.split_once("EXAMPLES:").map_or_else(
+        || panic!("the help has no examples:\n{stdout}"),
+        |(_, rest)| rest,
+    );
     let rows: Vec<&str> = examples
         .lines()
         .map(str::trim)
