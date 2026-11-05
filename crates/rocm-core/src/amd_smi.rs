@@ -456,18 +456,25 @@ pub fn device_readable_bounded(device: &Path) -> bool {
     device_readable(device)
 }
 
-/// Off-Linux counterpart of [`device_readable_bounded`]: waves through, like
-/// [`kfd_readable`] does, because there is no `/dev/kfd` on these platforms to
-/// decline about.
+/// Off-Linux counterpart of [`device_readable_bounded`]: a direct open, with no
+/// bound and no wave-through.
 ///
-/// `const` because it has to be, and split for the same reason `kfd_readable`
-/// is: the Windows lane builds with `-D warnings`, so
-/// `clippy::missing_const_for_fn` makes a non-`const` body that only returns a
-/// literal a hard error there, while the Linux body opens a device and cannot
-/// be `const`. A `cfg`-selected pair is linted per branch, not per name.
+/// It does **not** mirror [`kfd_readable`]'s off-Linux wave-through, and an
+/// earlier revision that made it do so was wrong. The two answer different
+/// questions. `kfd_readable` gates *this crate's* `amd-smi` launch, which off
+/// Linux has no `/dev/kfd` to reason about, so waving through is right there.
+/// This function is the shared probe `rocm-dash-collectors` calls for its own
+/// pre-flight, and that pre-flight is expected to decline a missing device on
+/// every platform — `missing_kfd_and_no_reachability_fails_preflight` and
+/// `real_kfd_keeps_a_veto_over_the_host_root_view` assert exactly that, and a
+/// wave-through turns both green while removing the veto they exist to protect.
+///
+/// The bound is Linux-only because the hazard is: `/dev/kfd` is what can park a
+/// process in uninterruptible sleep. An ordinary file open elsewhere returns or
+/// errors.
 #[cfg(not(target_os = "linux"))]
-pub const fn device_readable_bounded(_device: &Path) -> bool {
-    true
+pub fn device_readable_bounded(device: &Path) -> bool {
+    std::fs::OpenOptions::new().read(true).open(device).is_ok()
 }
 
 /// Off-Linux counterpart of [`kfd_readable`]: see that function's docs for why
