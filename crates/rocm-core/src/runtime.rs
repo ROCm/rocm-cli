@@ -695,6 +695,35 @@ pub fn runtime_install_root_is_protected(path: &Path) -> bool {
     .any(|root| runtime_path_is_same_or_inside(&path, root))
 }
 
+/// Whether an install root holds anything the install put there.
+///
+/// Dot-entries do not count: the runtime's own `.rocm-cli-runtime.json` marker is
+/// one, and a root that holds only that has no payload. Any other entry does,
+/// whatever it is: a file, a directory, or a symlink that points nowhere. A path
+/// that does not exist holds nothing, so it answers `false` rather than failing;
+/// that is what lets a fresh install ask about a root it has not created yet. A
+/// root that exists but cannot be listed (not a directory, no permission) is an
+/// error, never a quiet `false`.
+///
+/// This is the one rule for "is this install root empty" in the workspace: the
+/// tarball extraction refuses a target that has a payload, a repair counts a
+/// sibling as installed only when it has one, and activation validation rejects a
+/// tarball runtime that has none.
+pub fn install_root_has_payload(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let entries =
+        std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RuntimePathSeparator {
@@ -1817,5 +1846,137 @@ mod tests {
             }
 
         }
+    }
+}
+
+#[cfg(test)]
+mod install_root_payload_tests {
+    use super::*;
+    use std::fs;
+
+    /// One path per kind of install root. An unreadable directory is only built
+    /// when this process cannot read it anyway (a root user can, and then the case
+    /// says nothing).
+    fn cases(base: &Path) -> Vec<(&'static str, PathBuf)> {
+        let mut cases = vec![("missing path", base.join("missing"))];
+        let dir = |name: &str| {
+            let path = base.join(name);
+            fs::create_dir_all(&path).expect("create case dir");
+            path
+        };
+        cases.push(("empty dir", dir("empty")));
+        let dotfile = dir("dotfile");
+        fs::write(dotfile.join(".rocm-cli-runtime.json"), b"{}").expect("write marker");
+        cases.push(("dotfile only", dotfile));
+        let dotdir = dir("dotdir");
+        fs::create_dir_all(dotdir.join(".hidden")).expect("create dot dir");
+        cases.push(("dot directory only", dotdir));
+        let file = dir("file");
+        fs::write(file.join("payload.bin"), b"x").expect("write payload");
+        cases.push(("regular file", file));
+        let sub = dir("sub");
+        fs::create_dir_all(sub.join("bin")).expect("create subdir");
+        cases.push(("subdirectory", sub));
+        let marker_and_file = dir("marker-and-file");
+        fs::write(marker_and_file.join(".rocm-cli-runtime.json"), b"{}").expect("write marker");
+        fs::write(marker_and_file.join("payload.bin"), b"x").expect("write payload");
+        cases.push(("marker plus a regular file", marker_and_file));
+        let not_a_dir = base.join("not-a-dir");
+        fs::write(&not_a_dir, b"x").expect("write file root");
+        cases.push(("root is a regular file", not_a_dir));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let dangling = dir("dangling-entry");
+            symlink(base.join("nowhere"), dangling.join("link")).expect("dangling entry");
+            cases.push(("dangling symlink entry", dangling));
+            let link_root = base.join("link-root");
+            symlink(base.join("sub"), &link_root).expect("symlink root");
+            cases.push(("root is a symlink to a populated dir", link_root));
+            let dangling_root = base.join("dangling-root");
+            symlink(base.join("nowhere"), &dangling_root).expect("dangling root");
+            cases.push(("root is a dangling symlink", dangling_root));
+            let locked = dir("locked");
+            fs::write(locked.join("payload.bin"), b"x").expect("write payload");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
+            if fs::read_dir(&locked).is_err() {
+                cases.push(("unreadable dir", locked));
+            } else {
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
+            }
+        }
+        cases
+    }
+
+    /// The single definition of a non-empty install root, over every input kind.
+    /// Each caller in `apps/rocm` goes through this function (see
+    /// `tarball_validation_follows_the_shared_payload_rule`,
+    /// `the_tarball_install_guard_follows_the_shared_payload_rule` and
+    /// `a_replacement_counts_as_installed_by_the_shared_payload_rule` there), so a
+    /// row changing here changes all three together.
+    #[test]
+    fn install_root_has_payload_answers_each_input_kind() {
+        let base = tempfile::tempdir().expect("scratch dir");
+        let mut seen: Vec<(&str, String)> = cases(base.path())
+            .into_iter()
+            .map(|(label, path)| {
+                let outcome = match install_root_has_payload(&path) {
+                    Ok(true) => "payload",
+                    Ok(false) => "empty",
+                    Err(_) => "error",
+                };
+                (label, outcome.to_owned())
+            })
+            .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                base.path().join("locked"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .ok();
+        }
+        let mut expected: Vec<(&str, String)> = vec![
+            ("missing path", "empty"),
+            ("empty dir", "empty"),
+            ("dotfile only", "empty"),
+            ("dot directory only", "empty"),
+            ("regular file", "payload"),
+            ("subdirectory", "payload"),
+            ("marker plus a regular file", "payload"),
+            ("root is a regular file", "error"),
+        ]
+        .into_iter()
+        .map(|(label, outcome)| (label, outcome.to_owned()))
+        .collect();
+        #[cfg(unix)]
+        {
+            expected.extend([
+                ("dangling symlink entry", "payload".to_owned()),
+                ("root is a symlink to a populated dir", "payload".to_owned()),
+                ("root is a dangling symlink", "empty".to_owned()),
+            ]);
+            // Absent from `seen` when running as root, which reads a mode-000
+            // directory anyway; then the case is neither built nor asserted.
+            if seen.iter().any(|(label, _)| *label == "unreadable dir") {
+                expected.push(("unreadable dir", "error".to_owned()));
+            }
+        }
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_listed_names_the_path_in_its_error() {
+        let base = tempfile::tempdir().expect("scratch dir");
+        let file = base.path().join("not-a-dir");
+        fs::write(&file, b"x").expect("write file root");
+        let error = install_root_has_payload(&file).expect_err("a file cannot be listed");
+        assert!(
+            format!("{error:#}").contains(&format!("failed to read {}", file.display())),
+            "{error:#}"
+        );
     }
 }

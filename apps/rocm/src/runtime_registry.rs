@@ -628,7 +628,7 @@ fn validate_wheel_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Resul
 }
 
 fn validate_tarball_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Result<()> {
-    if runtime_install_root_has_payload(&manifest.install_root)? {
+    if rocm_core::install_root_has_payload(&manifest.install_root)? {
         Ok(())
     } else {
         bail!(
@@ -636,16 +636,6 @@ fn validate_tarball_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Res
             manifest.install_root.display()
         )
     }
-}
-
-fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -947,103 +937,56 @@ mod tests {
         Ok(())
     }
 
-    /// What `runtime_install_root_has_payload` answers for each kind of
-    /// install-root path: the same table `therock.rs` holds
-    /// `has_nontrivial_directory_contents` to, which differs in exactly the two
-    /// rows where the path does not exist.
+    /// Activation validation of a tarball runtime follows
+    /// `rocm_core::install_root_has_payload`: the root's own `.rocm-cli-runtime.json`
+    /// marker is a dot-entry and does not make a payload, so a root holding only
+    /// that is reported unusable (by the message the runtime listing prints), and
+    /// one more entry makes it ready. A root that is gone is reported by the
+    /// earlier "install root is missing" check, never reaching the payload rule.
     #[test]
-    fn install_root_payload_characterisation() {
-        let base = tempfile::tempdir().expect("scratch dir");
-        let mut seen = Vec::new();
-        for (label, path) in install_root_cases(base.path()) {
-            let outcome = match runtime_install_root_has_payload(&path) {
-                Ok(true) => "payload",
-                Ok(false) => "empty",
-                Err(_) => "error",
-            };
-            seen.push((label, outcome));
-        }
-        let mut expected = vec![
-            ("missing path", "error"),
-            ("empty dir", "empty"),
-            ("dotfile only", "empty"),
-            ("dot directory only", "empty"),
-            ("regular file", "payload"),
-            ("subdirectory", "payload"),
-            ("root is a regular file", "error"),
-        ];
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            expected.push(("dangling symlink entry", "payload"));
-            expected.push(("root is a symlink to a populated dir", "payload"));
-            expected.push(("root is a dangling symlink", "error"));
-            // Absent from `seen` when running as root, which reads a mode-000
-            // directory anyway; then the case is neither built nor asserted.
-            if seen.iter().any(|(label, _)| *label == "unreadable dir") {
-                expected.push(("unreadable dir", "error"));
-            }
-            fs::set_permissions(
-                base.path().join("locked"),
-                fs::Permissions::from_mode(0o755),
+    fn tarball_validation_follows_the_shared_payload_rule() {
+        let (root, _) = test_paths("tarball-shared-payload-rule");
+        let install_root = root.join("tarball-runtime");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join(".rocm-cli-runtime.json"), b"{}").unwrap();
+        let manifest = InstalledRuntimeManifest {
+            format: "tarball".to_owned(),
+            install_root: install_root.clone(),
+            ..test_runtime_manifest(
+                "release-tarball-gfx120X-all-7-13-0",
+                "therock-release:gfx120X-all",
+                1,
             )
-            .ok();
-        }
-        assert_eq!(sorted(seen), sorted(expected));
-    }
-
-    fn sorted(mut rows: Vec<(&'static str, &'static str)>) -> Vec<(&'static str, &'static str)> {
-        rows.sort_unstable();
-        rows
-    }
-
-    /// One path per input kind. An unreadable directory is only built when the
-    /// process cannot read it anyway (a root user can, and then the case says
-    /// nothing).
-    fn install_root_cases(base: &Path) -> Vec<(&'static str, PathBuf)> {
-        let mut cases = vec![("missing path", base.join("missing"))];
-        let dir = |name: &str| {
-            let path = base.join(name);
-            fs::create_dir_all(&path).expect("create case dir");
-            path
         };
-        cases.push(("empty dir", dir("empty")));
-        let dotfile = dir("dotfile");
-        fs::write(dotfile.join(".rocm-cli-runtime.json"), b"{}").expect("write marker");
-        cases.push(("dotfile only", dotfile));
-        let dotdir = dir("dotdir");
-        fs::create_dir_all(dotdir.join(".hidden")).expect("create dot dir");
-        cases.push(("dot directory only", dotdir));
-        let file = dir("file");
-        fs::write(file.join("payload.bin"), b"x").expect("write payload");
-        cases.push(("regular file", file));
-        let sub = dir("sub");
-        fs::create_dir_all(sub.join("bin")).expect("create subdir");
-        cases.push(("subdirectory", sub));
-        let not_a_dir = base.join("not-a-dir");
-        fs::write(&not_a_dir, b"x").expect("write file root");
-        cases.push(("root is a regular file", not_a_dir));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{PermissionsExt, symlink};
-            let dangling = dir("dangling-entry");
-            symlink(base.join("nowhere"), dangling.join("link")).expect("dangling entry");
-            cases.push(("dangling symlink entry", dangling));
-            let link_root = base.join("link-root");
-            symlink(base.join("sub"), &link_root).expect("symlink root");
-            cases.push(("root is a symlink to a populated dir", link_root));
-            let dangling_root = base.join("dangling-root");
-            symlink(base.join("nowhere"), &dangling_root).expect("dangling root");
-            cases.push(("root is a dangling symlink", dangling_root));
-            let locked = dir("locked");
-            fs::write(locked.join("payload.bin"), b"x").expect("write payload");
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock dir");
-            if fs::read_dir(&locked).is_err() {
-                cases.push(("unreadable dir", locked));
-            } else {
-                fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
-            }
-        }
-        cases
+
+        let error = validate_runtime_manifest_for_activation(&manifest)
+            .expect_err("a root with only the dot-marker has no payload")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "tarball runtime install root has no payload files: {}",
+                install_root.display()
+            )
+        );
+        assert_eq!(
+            runtime_usability_status(&manifest),
+            format!("unusable ({error})")
+        );
+
+        fs::write(install_root.join("rocm-install-file"), b"x").unwrap();
+        validate_runtime_manifest_for_activation(&manifest)
+            .expect("one entry beside the marker is a payload");
+        assert_eq!(runtime_usability_status(&manifest), "ready");
+
+        fs::remove_dir_all(&install_root).unwrap();
+        let error = validate_runtime_manifest_for_activation(&manifest)
+            .expect_err("a missing root is unusable")
+            .to_string();
+        assert_eq!(
+            error,
+            format!("install root is missing: {}", install_root.display())
+        );
+        fs::remove_dir_all(root).ok();
     }
 }
