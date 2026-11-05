@@ -2496,6 +2496,80 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         });
 }
 
+/// Replace the managed-service registry directory with a regular file of the
+/// same name, so listing it fails the way a broken mount or a permission change
+/// would, and wait for the failure to reach the screen. The header warnings
+/// badge growing is the evidence that a frame the daemon assembled after the
+/// failed pass is on display (the daemon adds a warning for as long as the
+/// registry cannot be read); the count is read before the swap because other
+/// warnings, such as no amd-smi on a GPU-less runner, are already present and
+/// constant.
+#[when("the managed-service registry becomes unreadable")]
+async fn managed_registry_becomes_unreadable(world: &mut E2eWorld) {
+    let before = warning_badge_count(&session(world).screen_text());
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    std::fs::remove_dir_all(&services_dir).expect("failed to remove the registry directory");
+    std::fs::write(&services_dir, b"not a directory")
+        .expect("failed to put a file where the registry directory was");
+
+    session(world)
+        .wait_for_screen_where(
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the unreadable registry never reached the header warnings badge, so no \
+                 frame here is known to postdate the failed read: {e}"
+            )
+        });
+}
+
+/// The badge growing is what the `When` step waited for; this reads it back so
+/// the scenario states the expectation, and a failure here names the half that
+/// broke: the registry failure went unreported, rather than the model dropped.
+#[then("the header warns that the registry is not being read")]
+async fn header_warns_registry_unread(world: &mut E2eWorld) {
+    assert!(
+        warning_badge_count(&session(world).screen_text()) > 0,
+        "the header shows no warning after the registry became unreadable"
+    );
+}
+
+/// The model must be on screen in the frame that carries the warning and stay
+/// on every frame for a few seconds after it. A daemon that retired the model
+/// on a failed read would drop it in the same frame as the warning appears, so
+/// the first sample already catches it; the dwell covers a retirement that
+/// trails by a discovery tick.
+#[then("the managed model stays displayed")]
+async fn managed_model_stays_displayed(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let screen = session(world).screen_text();
+        assert!(
+            screen.contains(&model),
+            "the managed model left the screen while its registry could not be read:\n{screen}"
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// EAI-7960 principal regression assertion.
 ///
 /// The frame under assertion is provably post-failure (the header warnings

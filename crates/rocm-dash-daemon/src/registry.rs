@@ -32,7 +32,8 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use rocm_dash_collectors::engine_registry::EngineKind;
 use rocm_dash_core::metrics::{InstanceStatus, StartupPhase};
@@ -119,30 +120,114 @@ fn instance_status_for_record(status: &str, startup_phase: Option<&str>) -> Inst
     }
 }
 
-/// Load every managed-service record under `services_dir`, newest first.
+/// What one read of the registry directory found.
+#[derive(Debug, Default)]
+pub struct RegistryRead {
+    /// Every well-formed record, newest first.
+    pub records: Vec<ServiceRecord>,
+    /// `*.json` files that were read but are not a JSON object this module can
+    /// parse, sorted by path. They are left out of `records`, and nothing else is
+    /// hidden by them: one corrupt record does not stop the others loading.
+    pub malformed: Vec<PathBuf>,
+}
+
+/// The registry could not be read, so what it holds is unknown. This is not the
+/// same as an empty registry: a caller that retires services which are missing
+/// from a read must not do so on this.
+#[derive(Debug)]
+pub struct RegistryReadError {
+    /// The directory that could not be listed, or the record file that could not
+    /// be read.
+    pub path: PathBuf,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for RegistryReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot read {}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for RegistryReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Read every managed-service record under `services_dir`, telling a registry
+/// that is confirmed empty apart from one that could not be read.
 ///
-/// Best-effort and side-effect-free: a missing directory yields an empty list,
-/// and an individual unreadable/malformed `*.json` is skipped rather than
-/// failing the whole load (mirrors the canonical rocm-cli `load_managed_services`
-/// semantics, minus the engine-state status overlay which the supervisor owns).
-pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
-    let Ok(entries) = fs::read_dir(services_dir) else {
-        return Vec::new();
+/// * A directory that does not exist is confirmed empty: it is created the first
+///   time something is served, so its absence means there are no services. A
+///   directory that exists but cannot be listed (or a regular file where it
+///   should be) is a read failure.
+/// * A record file that vanishes between the listing and the read was removed
+///   on purpose and is skipped. Any other failure to read a record (a permission
+///   or I/O error) is a read failure for the whole pass: the record's service
+///   cannot be told apart from one that is gone, and nothing is known about which
+///   service the unreadable file belonged to.
+/// * A record that reads but does not parse is malformed. It is reported in
+///   [`RegistryRead::malformed`] and the other records still load, because the
+///   rocm-cli writer replaces a record atomically, so a corrupt file is corrupt
+///   for good rather than half-written.
+///
+/// Side-effect-free, and the canonical rocm-cli `load_managed_services` semantics
+/// minus the engine-state status overlay, which the supervisor owns.
+pub fn read_service_records(services_dir: &Path) -> Result<RegistryRead, RegistryReadError> {
+    let entries = match fs::read_dir(services_dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            let absent = matches!(
+                fs::metadata(services_dir),
+                Err(ref e) if e.kind() == ErrorKind::NotFound
+            );
+            return if absent {
+                Ok(RegistryRead::default())
+            } else {
+                Err(RegistryReadError {
+                    path: services_dir.to_path_buf(),
+                    source,
+                })
+            };
+        }
     };
-    let mut records = Vec::new();
-    for entry in entries.flatten() {
+    let mut read = RegistryRead::default();
+    for entry in entries {
+        let entry = entry.map_err(|source| RegistryReadError {
+            path: services_dir.to_path_buf(),
+            source,
+        })?;
         let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+        if path.extension().and_then(|v| v.to_str()) != Some("json") || path.is_dir() {
             continue;
         }
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(record) = serde_json::from_slice::<ServiceRecord>(&bytes)
-        {
-            records.push(record);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(source) => return Err(RegistryReadError { path, source }),
+        };
+        match serde_json::from_slice::<ServiceRecord>(&bytes) {
+            Ok(record) => read.records.push(record),
+            Err(_) => read.malformed.push(path),
         }
     }
-    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
-    records
+    read.records
+        .sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
+    read.malformed.sort();
+    Ok(read)
+}
+
+/// Load every managed-service record under `services_dir`, newest first.
+///
+/// Best-effort, for the one-shot readers (the dashboard's launcher and exit
+/// prompt) that have nothing to retire: a directory that cannot be read yields an
+/// empty list, and a malformed record is skipped. The daemon's discovery loop
+/// must not use this, because it cannot tell an unreadable registry from an empty
+/// one; it calls [`read_service_records`].
+pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
+    read_service_records(services_dir)
+        .map(|read| read.records)
+        .unwrap_or_default()
 }
 
 /// Convert a managed-service record into a [`DiscoveredService`] for the
@@ -336,6 +421,113 @@ mod tests {
         // Newest (created=200) first.
         assert_eq!(records[0].service_id, "svc-b");
         assert_eq!(records[1].service_id, "svc-a");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_missing_dir_is_confirmed_empty() {
+        let dir = test_dir("read-absent").join("nope");
+        let read = read_service_records(&dir).expect("an absent registry is confirmed empty");
+        assert!(read.records.is_empty());
+        assert!(read.malformed.is_empty());
+    }
+
+    #[test]
+    fn read_empty_dir_is_confirmed_empty() {
+        let dir = test_dir("read-empty");
+        let read = read_service_records(&dir).expect("an empty registry is confirmed empty");
+        assert!(read.records.is_empty());
+        assert!(read.malformed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_regular_file_where_the_dir_should_be_is_a_read_failure() {
+        let dir = test_dir("read-file-not-dir");
+        let not_a_dir = dir.join("services");
+        fs::write(&not_a_dir, "not a directory").unwrap();
+
+        let err = read_service_records(&not_a_dir)
+            .expect_err("a file where the registry should be must not read as empty");
+        assert_eq!(err.path, not_a_dir);
+        assert!(err.to_string().contains("cannot read"), "{err}");
+        // The best-effort wrapper keeps its old answer for the one-shot readers.
+        assert!(load_service_records(&not_a_dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_keeps_well_formed_records_beside_a_malformed_one() {
+        let dir = test_dir("read-malformed");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+        fs::write(dir.join("bad.json"), "{ not valid").unwrap();
+        fs::write(dir.join("also-bad.json"), "42").unwrap();
+        fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+
+        let read = read_service_records(&dir).expect("a malformed record is not a read failure");
+        let ids: Vec<&str> = read.records.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert_eq!(
+            read.malformed,
+            [dir.join("also-bad.json"), dir.join("bad.json")]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_skips_a_directory_named_like_a_record() {
+        let dir = test_dir("read-dir-named-json");
+        fs::create_dir(dir.join("looks-like-a-record.json")).unwrap();
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+
+        let read = read_service_records(&dir).expect("a stray directory is not a read failure");
+        assert_eq!(read.records.len(), 1);
+        assert!(read.malformed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unix only (no mode bits on Windows), and skipped when the process can
+    /// read a mode-000 file anyway (running as root).
+    #[cfg(unix)]
+    #[test]
+    fn read_unreadable_record_file_is_a_read_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("read-unreadable-record");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        let locked = dir.join("locked.json");
+        fs::write(
+            &locked,
+            record_json("svc-locked", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            eprintln!("skipped: this process can read a mode-000 file (running as root)");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let result = read_service_records(&dir);
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        let err = result.expect_err("an unreadable record must not read as a missing one");
+        assert_eq!(err.path, locked);
         let _ = fs::remove_dir_all(&dir);
     }
 

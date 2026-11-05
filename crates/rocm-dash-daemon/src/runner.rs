@@ -402,6 +402,7 @@ pub async fn run_loop(
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
     let mut docker_warn: Option<String> = None;
+    let mut registry_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
 
     loop {
@@ -588,19 +589,32 @@ pub async fn run_loop(
         // the registry's authority; non-vLLM engines are tracked so the vLLM
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
+        //
+        // Like the Docker source above, a pass that could not read the registry
+        // reconciles nothing: what is known stays known (no `Gone`, no repeat
+        // `Discovered`), and the instances keep the data they hold. Only a
+        // registry that was read, even an empty one, retires what it lacks.
         if let Some(services_dir) = opts.services_dir.as_ref()
             && discovery_due
         {
-            let records = crate::registry::load_service_records(services_dir);
-            let disc = crate::registry::discover_managed_services(&records);
-            discovery.managed_non_vllm = disc.non_vllm;
-            reconcile.reconcile_set(
-                DiscoverySource::Managed,
-                &disc.svcs,
-                &discovery.known_services,
-                &disc.seen,
-            );
-            discovery.known_services = disc.seen;
+            let read = crate::registry::read_service_records(services_dir);
+            let change = discovery.registry_health.observe(&read);
+            change.log();
+            match read {
+                Ok(read) => {
+                    let disc = crate::registry::discover_managed_services(&read.records);
+                    discovery.managed_non_vllm = disc.non_vllm;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                        &disc.seen,
+                    );
+                    discovery.known_services = disc.seen;
+                    registry_warn = None;
+                }
+                Err(e) => registry_warn = Some(registry_read_warning(&e)),
+            }
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
@@ -862,6 +876,7 @@ pub async fn run_loop(
             }
         }
         warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(registry_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1020,6 +1035,89 @@ struct DiscoveryState {
     managed_non_vllm: HashSet<String>,
     /// The id of the currently-live Lemonade instance, if any.
     lemonade_id: Option<String>,
+    /// How the registry reads have been going, so a condition that lasts many
+    /// passes is logged once rather than every discovery tick.
+    registry_health: RegistryHealth,
+}
+
+/// What the managed-service registry's reads have reported so far. A failure
+/// that lasts is logged on its first pass only, the recovery once, and a set of
+/// malformed records each time it changes; the dashboard's warning badge, which
+/// is cheap and does not scroll, carries the failure for as long as it lasts.
+#[derive(Default)]
+struct RegistryHealth {
+    /// The previous pass could not read the registry.
+    failing: bool,
+    /// The malformed records the last successful pass reported, so an unchanged
+    /// set is not reported again.
+    reported_malformed: Vec<PathBuf>,
+}
+
+/// What a discovery pass should say about the registry, apart from the services
+/// it found. Kept as data so [`RegistryHealth::observe`] can be tested without a
+/// log subscriber.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegistryChange {
+    /// The first failed pass of a streak, with the error.
+    failed: Option<String>,
+    /// The first successful pass after a streak of failures.
+    recovered: bool,
+    /// The malformed records, when the set differs from the one last reported
+    /// and is not empty.
+    malformed: Vec<PathBuf>,
+}
+
+impl RegistryHealth {
+    fn observe(
+        &mut self,
+        read: &Result<crate::registry::RegistryRead, crate::registry::RegistryReadError>,
+    ) -> RegistryChange {
+        let mut change = RegistryChange::default();
+        match read {
+            Err(e) => {
+                if !self.failing {
+                    self.failing = true;
+                    change.failed = Some(e.to_string());
+                }
+            }
+            Ok(read) => {
+                if self.failing {
+                    self.failing = false;
+                    change.recovered = true;
+                }
+                if read.malformed != self.reported_malformed {
+                    self.reported_malformed.clone_from(&read.malformed);
+                    change.malformed.clone_from(&read.malformed);
+                }
+            }
+        }
+        change
+    }
+}
+
+impl RegistryChange {
+    fn log(&self) {
+        if let Some(error) = &self.failed {
+            warn!(
+                error = %error,
+                "managed-service registry could not be read; keeping the known services until it can be"
+            );
+        }
+        if self.recovered {
+            info!("managed-service registry is readable again");
+        }
+        if !self.malformed.is_empty() {
+            warn!(
+                files = ?self.malformed,
+                "skipping managed-service records that are not valid JSON"
+            );
+        }
+    }
+}
+
+/// The header warning for a pass that could not read the registry.
+fn registry_read_warning(error: &crate::registry::RegistryReadError) -> String {
+    format!("managed registry: {error}; keeping the last known services")
 }
 
 /// Which discovery source a service came from. It only selects the log wording
@@ -2001,5 +2099,126 @@ mod tests {
 
         pass.reconcile().reconcile_lemonade(None, &mut current);
         assert!(pass.announced().is_empty(), "nothing left to retire");
+    }
+
+    // Registry read health: one test per row of the state matrix (first
+    // failure, repeated failure, recovery, empty, populated, malformed new,
+    // malformed unchanged, malformed cleared).
+
+    fn registry_read(
+        malformed: &[&str],
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Ok(crate::registry::RegistryRead {
+            records: Vec::new(),
+            malformed: malformed.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    fn registry_failure(
+        why: &str,
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Err(crate::registry::RegistryReadError {
+            path: PathBuf::from("services"),
+            source: std::io::Error::other(why),
+        })
+    }
+
+    #[test]
+    fn registry_health_reports_the_first_failure_of_a_streak_once() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_failure("disk gone"));
+        assert_eq!(
+            first.failed.as_deref(),
+            Some("cannot read services: disk gone"),
+            "the first failed pass names the error"
+        );
+        assert!(!first.recovered);
+
+        for pass in 2..=5 {
+            assert_eq!(
+                health.observe(&registry_failure("disk gone")),
+                RegistryChange::default(),
+                "failed pass {pass} of the same streak must stay quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_recovery_once_and_a_new_streak_again() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_failure("one"));
+        health.observe(&registry_failure("one"));
+
+        let recovered = health.observe(&registry_read(&[]));
+        assert!(recovered.recovered);
+        assert!(recovered.failed.is_none());
+        assert_eq!(
+            health.observe(&registry_read(&[])),
+            RegistryChange::default(),
+            "only the first good pass after a streak is a recovery"
+        );
+
+        let again = health.observe(&registry_failure("two"));
+        assert_eq!(again.failed.as_deref(), Some("cannot read services: two"));
+    }
+
+    #[test]
+    fn registry_health_is_quiet_for_an_empty_or_populated_registry() {
+        let mut health = RegistryHealth::default();
+        // A healthy read, empty or not, says nothing: there is no failure to
+        // report and no failure to have recovered from.
+        for _ in 0..3 {
+            assert_eq!(
+                health.observe(&registry_read(&[])),
+                RegistryChange::default()
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_a_malformed_set_when_it_changes() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(first.malformed, [PathBuf::from("a.json")]);
+        assert_eq!(
+            health.observe(&registry_read(&["a.json"])),
+            RegistryChange::default(),
+            "an unchanged malformed set is not reported again"
+        );
+
+        let grown = health.observe(&registry_read(&["a.json", "b.json"]));
+        assert_eq!(
+            grown.malformed,
+            [PathBuf::from("a.json"), PathBuf::from("b.json")],
+            "a newly malformed record reports the whole set"
+        );
+
+        let cleared = health.observe(&registry_read(&[]));
+        assert!(
+            cleared.malformed.is_empty(),
+            "clearing the set is not a warning"
+        );
+        let back = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(
+            back.malformed,
+            [PathBuf::from("a.json")],
+            "a record that goes bad again after being fixed is reported again"
+        );
+    }
+
+    #[test]
+    fn registry_health_keeps_the_malformed_set_across_a_read_failure() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_read(&["a.json"]));
+        health.observe(&registry_failure("blip"));
+
+        let after = health.observe(&registry_read(&["a.json"]));
+        assert!(after.recovered);
+        assert!(
+            after.malformed.is_empty(),
+            "the same corrupt record is not news just because a read failed in between"
+        );
     }
 }

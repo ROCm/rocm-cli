@@ -723,3 +723,24 @@ Feature: Interactive dashboard
     Then the Home view counts the managed model as running and shows it as loading
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # The dashboard follows the managed-service registry on a timer. A pass that
+  # cannot read the registry directory says nothing about the services in it, so
+  # it must not retire the model that is on screen: the header warns that the
+  # registry is not being read, and the model stays. The directory is swapped for
+  # a regular file, which no path or permission setup of the runner can make
+  # readable. A registry that reads but is empty does retire a service; that
+  # contrast, the recovery path and the once-per-streak log line are asserted by
+  # the daemon's own tests in `crates/rocm-dash-daemon/tests/`, where the loop
+  # runs without a terminal.
+  @id:dash-managed-model-survives-unreadable-registry @requires-os:linux
+  Scenario: dash-42 - A managed model stays on screen while its registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    Then the header warns that the registry is not being read
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
