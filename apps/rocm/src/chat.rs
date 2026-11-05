@@ -48,11 +48,13 @@ use crate::services_text::{
 };
 // The tool-call policy lives in `tool_policy.rs`. `chat_tool_approval_request`,
 // `chat_tool_call_is_read_only` and `validate_chat_tool_call` stay reachable
-// here as `chat::<item>` for `dash_seam.rs`; `ChatRocmCommandAction` and
-// `rocm_chat_tool_requested_args` are read through `chat::` only by other
-// modules' tests (`driver_plan.rs`, `system_packages.rs`), as are
-// `chat_install_driver_action` and `chat_rocm_command_action_from_args`, which
-// this module does not call itself.
+// here as `chat::<item>` for `dash_seam.rs`. `ChatRocmCommandAction` and
+// `rocm_chat_tool_requested_args` are used by this module's own code, so the
+// import cannot be `#[cfg(test)]`; it is also `pub(crate)` because other
+// modules' tests (`driver_plan.rs`, `system_packages.rs`) read both through
+// `chat::`. `chat_install_driver_action` and `chat_rocm_command_action_from_args`
+// are read through `chat::` only by those tests and this module does not call
+// them itself, so their re-export below is `#[cfg(test)]`.
 pub(crate) use crate::tool_policy::{
     ChatRocmCommandAction, chat_tool_approval_request, chat_tool_call_is_read_only,
     rocm_chat_tool_requested_args, validate_chat_tool_call,

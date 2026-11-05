@@ -6,18 +6,19 @@
 //! prompt-intent heuristics (`fallback_rocm_tool_call_for_prompt`,
 //! `fallback_config_tool_call_for_prompt`, `install_sdk_chat_approval_for_prompt`
 //! and the `prompt_*` predicates) and the freeform planner: which of a list of
-//! phrases a prompt
-//! contains (`any_substring`), which install folder, TheRock build date or
-//! TheRock version it names (`requested_install_prefix_from_prompt`,
+//! phrases a prompt contains (`any_substring`), which install folder, TheRock
+//! build date or TheRock version it names
+//! (`requested_install_prefix_from_prompt`,
 //! `requested_therock_build_date_from_prompt`,
 //! `requested_therock_version_from_prompt` and their private helpers), and
 //! which serving engine it asks for (`infer_engine_from_request`).
 //!
 //! A leaf module: it depends only on `therock::RuntimeVersionSelector`, and
 //! neither `chat.rs` nor `freeform_planner.rs` has to import the other for
-//! these helpers. `tool_policy.rs` does not use it. They were relocated verbatim from `chat.rs` and
-//! `freeform_planner.rs`; `chat.rs` re-exports `any_substring`, which
-//! `freeform_answer.rs` still reaches as `chat::any_substring`.
+//! these helpers. `tool_policy.rs` does not use it. They were relocated
+//! verbatim from `chat.rs` and `freeform_planner.rs`; `chat.rs` re-exports
+//! `any_substring`, which `freeform_answer.rs` still reaches as
+//! `chat::any_substring`.
 
 use crate::therock;
 
