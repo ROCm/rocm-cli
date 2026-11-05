@@ -925,37 +925,6 @@ fn count_vram_join_misses<S: std::hash::BuildHasher>(
         .count()
 }
 
-/// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
-/// baselines.  Call on explicit removal (Docker Gone, Lemonade Gone, managed
-/// Gone) and whenever an identity change requires a clean slate.
-pub(crate) fn purge_telemetry_state(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut LatencyWindows,
-    prev_tpot: &mut LatencyWindows,
-) {
-    gen_trackers.remove(id);
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
-/// Invalidate the generation tracker for `id` (reset baseline without
-/// removing the map entry) and clear the TTFT/TPOT latency windows.
-/// Called when an endpoint changes within the same container/service id so
-/// the new scrape address starts with a fresh rate baseline.
-pub(crate) fn invalidate_on_endpoint_change(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut LatencyWindows,
-    prev_tpot: &mut LatencyWindows,
-) {
-    if let Some(t) = gen_trackers.get_mut(id) {
-        t.invalidate();
-    }
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
 ///
 /// Status is taken from `svc.status` — the caller sets it from whatever real
@@ -1016,22 +985,25 @@ struct TelemetryState {
 }
 
 impl TelemetryState {
+    /// Remove all per-service telemetry state for `id`: tracker, TTFT, and
+    /// TPOT baselines.  Call on explicit removal (Docker Gone, Lemonade Gone,
+    /// managed Gone) and whenever an identity change requires a clean slate.
     fn purge(&mut self, id: &str) {
-        purge_telemetry_state(
-            id,
-            &mut self.gen_trackers,
-            &mut self.prev_ttft,
-            &mut self.prev_tpot,
-        );
+        self.gen_trackers.remove(id);
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
     }
 
+    /// Invalidate the generation tracker for `id` (reset baseline without
+    /// removing the map entry) and clear the TTFT/TPOT latency windows.
+    /// Called when an endpoint changes within the same container/service id so
+    /// the new scrape address starts with a fresh rate baseline.
     fn invalidate_on_endpoint_change(&mut self, id: &str) {
-        invalidate_on_endpoint_change(
-            id,
-            &mut self.gen_trackers,
-            &mut self.prev_ttft,
-            &mut self.prev_tpot,
-        );
+        if let Some(t) = self.gen_trackers.get_mut(id) {
+            t.invalidate();
+        }
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
     }
 }
 
@@ -1719,66 +1691,75 @@ mod tests {
         GenerationObservationTracker::new(Duration::from_secs(tick_secs))
     }
 
-    /// `purge_telemetry_state` removes the tracker entry, TTFT baseline, and
+    /// `TelemetryState::purge` removes the tracker entry, TTFT baseline, and
     /// TPOT baseline for the target id and leaves other ids untouched.
     #[test]
-    fn purge_telemetry_state_removes_all_three_maps_for_id() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: LatencyWindows = HashMap::new();
-        let mut tpot: LatencyWindows = HashMap::new();
+    fn telemetry_state_purge_removes_all_three_maps_for_id() {
+        let mut state = TelemetryState::default();
 
         // Populate two ids.
-        trackers.insert("a".into(), make_tracker(2));
-        trackers.insert("b".into(), make_tracker(2));
-        ttft.insert("a".into(), baseline(1.0, 1.0));
-        ttft.insert("b".into(), baseline(2.0, 2.0));
-        tpot.insert("a".into(), baseline(3.0, 3.0));
-        tpot.insert("b".into(), baseline(4.0, 4.0));
+        state.gen_trackers.insert("a".into(), make_tracker(2));
+        state.gen_trackers.insert("b".into(), make_tracker(2));
+        state.prev_ttft.insert("a".into(), baseline(1.0, 1.0));
+        state.prev_ttft.insert("b".into(), baseline(2.0, 2.0));
+        state.prev_tpot.insert("a".into(), baseline(3.0, 3.0));
+        state.prev_tpot.insert("b".into(), baseline(4.0, 4.0));
 
-        purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
+        state.purge("a");
 
         // "a" must be gone from all maps.
-        assert!(!trackers.contains_key("a"), "tracker for a must be removed");
-        assert!(!ttft.contains_key("a"), "ttft for a must be removed");
-        assert!(!tpot.contains_key("a"), "tpot for a must be removed");
+        assert!(
+            !state.gen_trackers.contains_key("a"),
+            "tracker for a must be removed"
+        );
+        assert!(
+            !state.prev_ttft.contains_key("a"),
+            "ttft for a must be removed"
+        );
+        assert!(
+            !state.prev_tpot.contains_key("a"),
+            "tpot for a must be removed"
+        );
         // "b" must be unaffected.
-        assert!(trackers.contains_key("b"), "tracker for b must survive");
-        assert!(ttft.contains_key("b"), "ttft for b must survive");
-        assert!(tpot.contains_key("b"), "tpot for b must survive");
+        assert!(
+            state.gen_trackers.contains_key("b"),
+            "tracker for b must survive"
+        );
+        assert!(state.prev_ttft.contains_key("b"), "ttft for b must survive");
+        assert!(state.prev_tpot.contains_key("b"), "tpot for b must survive");
     }
 
-    /// `invalidate_on_endpoint_change` invalidates the tracker (resets its
-    /// window so subsequent snapshots return None) and removes the latency
-    /// baselines, without removing the tracker entry itself.
+    /// `TelemetryState::invalidate_on_endpoint_change` invalidates the tracker
+    /// (resets its window so subsequent snapshots return None) and removes the
+    /// latency baselines, without removing the tracker entry itself.
     #[test]
     fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: LatencyWindows = HashMap::new();
-        let mut tpot: LatencyWindows = HashMap::new();
+        let mut state = TelemetryState::default();
 
         let mut tracker = make_tracker(2);
         // Give the tracker a reading so it has a non-None baseline.
         tracker.observe_counter(100.0, at(10));
         tracker.observe_counter(200.0, at(12));
-        trackers.insert("svc".into(), tracker);
-        ttft.insert("svc".into(), baseline(1.0, 10.0));
-        tpot.insert("svc".into(), baseline(0.5, 8.0));
+        state.gen_trackers.insert("svc".into(), tracker);
+        state.prev_ttft.insert("svc".into(), baseline(1.0, 10.0));
+        state.prev_tpot.insert("svc".into(), baseline(0.5, 8.0));
 
-        invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
+        state.invalidate_on_endpoint_change("svc");
 
         // Tracker still exists but its window is reset: snapshot returns None.
-        let (rate, _meta) = trackers
+        let (rate, _meta) = state
+            .gen_trackers
             .get_mut("svc")
             .expect("tracker entry must remain")
             .snapshot(at(12));
         assert!(rate.is_none(), "invalidated tracker must yield None rate");
         // Latency baselines must be cleared.
         assert!(
-            !ttft.contains_key("svc"),
+            !state.prev_ttft.contains_key("svc"),
             "ttft baseline must be cleared on endpoint change"
         );
         assert!(
-            !tpot.contains_key("svc"),
+            !state.prev_tpot.contains_key("svc"),
             "tpot baseline must be cleared on endpoint change"
         );
     }
