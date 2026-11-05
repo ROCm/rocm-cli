@@ -324,12 +324,34 @@ pub(crate) fn changed_files_between(base: &str, head: &str) -> Result<Vec<String
     diff_name_only(None, base, head)
 }
 
+/// The variables git reads to pick a repository. git exports an absolute
+/// `GIT_DIR` to a hook run from a linked worktree, so a child that runs
+/// `git -C <other repo>` must not inherit them, or it talks to the outer repo.
+const GIT_REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Clear [`GIT_REPO_ENV`] from `cmd`, for a git run against an explicit directory.
+pub(crate) fn scrub_git_env(cmd: &mut Command) -> &mut Command {
+    for var in GIT_REPO_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// [`changed_files_between`] in `dir` (the current directory when `None`).
 fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");
     let mut git = Command::new("git");
     if let Some(dir) = dir {
-        git.arg("-C").arg(dir);
+        scrub_git_env(&mut git).arg("-C").arg(dir);
     }
     let output = git
         .args(["diff", "--name-only", "--no-renames", &range])
@@ -557,7 +579,8 @@ mod tests {
     /// Run `git` in `dir` with a fixed identity and no signing, for the
     /// throwaway repositories below.
     fn git_in(dir: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
+        let mut git = Command::new("git");
+        let status = scrub_git_env(&mut git)
             .arg("-C")
             .arg(dir)
             .args([
@@ -572,6 +595,32 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A hook run from a linked worktree has `GIT_DIR` set; a git run against a
+    /// throwaway repository must not inherit it or it would act on the outer one.
+    #[test]
+    fn scrub_git_env_clears_every_repo_selecting_variable() {
+        let mut git = Command::new("git");
+        git.env("GIT_DIR", "/outer/.git").env("GIT_INDEX_FILE", "x");
+        scrub_git_env(&mut git);
+        let envs: std::collections::BTreeMap<_, _> = git
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_none()))
+            .collect();
+        for var in GIT_REPO_ENV {
+            assert_eq!(envs.get(*var), Some(&true), "{var} is not cleared");
+        }
+        assert!(
+            [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR"
+            ]
+            .iter()
+            .all(|var| GIT_REPO_ENV.contains(var))
+        );
     }
 
     /// A file moved from one crate to another must select both crates. With git's
