@@ -53,11 +53,12 @@ use rocm_engine_protocol::{
 
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
+use crate::engine_install_env::engine_manages_own_runtime;
 use crate::engine_ipc::engine_request;
 use crate::engine_runtime_select::{
     EngineSelection, resolve_engine_selection, validate_engine_selection_runtime,
 };
-use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
+use crate::engines_cmd::ensure_self_managed_engine_ready;
 use crate::gpu_policy::{
     GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage, parse_device_policy,
     parse_gpu_selection, pinned_index_bound, select_gpu_indices_under_launch_lock,

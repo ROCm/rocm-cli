@@ -2,8 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The chat agent backend, built on **Rig**, plus the read-only "Skills"
-//! (Rig Tools) the agent calls over cached telemetry.
+//! The chat agent backend, built on **Rig**, plus the Rig tools it calls.
+//!
+//! The telemetry tools only read the cached in-memory snapshot. The read-only
+//! ROCm tools inspect the host and perform no action that needs operator
+//! approval (see the group B comment in `tools` for the bookkeeping writes
+//! reading can still trigger), and the mutating ROCm tools only surface an
+//! approval request.
 //!
 //! THE ONLY MODULE SUBTREE THAT NAMES `rig` TYPES — only `tools` and
 //! `clients` actually import `rig::*` (this file and `snapshot` do not); no
@@ -16,7 +21,9 @@
 //! and vendored source). The local-endpoint seam is the Chat Completions API
 //! (not the default Responses API), reached via `CompletionsClient`. Tool
 //! calling uses `agent.prompt(text).max_turns(N).with_history(history)` so the
-//! model can call read-only tools and then answer — one final reply to the UI.
+//! model can call tools and then answer — one final reply to the UI. A
+//! mutating tool never runs inside that loop: it posts its intent on the
+//! approval channel for the operator and the model is told it was surfaced.
 //!
 //! Split into submodules mirroring the crate's `app/mod.rs` → `app/chat.rs`/
 //! `slash.rs`/`summary.rs` mechanical-relocation convention: this file holds
