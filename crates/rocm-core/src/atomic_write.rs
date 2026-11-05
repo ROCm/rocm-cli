@@ -335,7 +335,7 @@ where
     if let Err(error) = write(&mut file, bytes) {
         drop(file);
         let _ = fs::remove_file(&tmp);
-        return Err(disk_space::map_write_error(error, &tmp));
+        return Err(disk_space::map_write_error(error, path));
     }
     drop(file);
     Ok(tmp)
@@ -498,6 +498,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let text = format!("{error:#}");
         assert!(text.contains("ran out of disk space"), "{text}");
+        // The user knows the file they asked for, not the temp file that was
+        // already removed, so the message names the destination.
+        assert!(
+            text.contains(&destination.display().to_string()) && !text.contains(".tmp-"),
+            "{text}"
+        );
         assert!(
             leftovers.is_empty(),
             "the failed staging left files behind: {leftovers:?}"
