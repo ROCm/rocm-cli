@@ -357,8 +357,12 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
     });
+    // The marker and the legend that explains it share fate: the legend row
+    // is the first thing a short hero drops, and a bare "*" with nothing on
+    // screen to define it is worse than an unannotated prior-window value.
+    let legend_fits = lh[5].height > 0;
     let tpw_label = if tpw > 0.0 {
-        let marker = if any_tpw_held {
+        let marker = if any_tpw_held && legend_fits {
             crate::ui::format::HELD_MARKER
         } else {
             ""
@@ -496,9 +500,12 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     });
     // No instance reporting throughput is "not measured", not a measured 0 —
     // and an empty f64 sum is -0.0, which `{:.0}` renders as "-0".
+    // The held marker is suppressed with the legend row that explains it, as
+    // in `draw_hero_left`.
+    let legend_fits = rh[5].height > 0;
     let tps_str = if tps_samples.is_empty() {
         "—".to_string()
-    } else if any_tps_held {
+    } else if any_tps_held && legend_fits {
         format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
     } else {
         format!("{tps:.0}")
@@ -1114,6 +1121,37 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear when instance data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn hero_never_shows_a_held_marker_without_its_legend() {
+        // Squeezing the hero drops the legend row before the value rows, so
+        // every height has to be checked, not just the roomy one.
+        let s = state_with_instance(instance_with_obs(300.0, Some(held_obs())));
+        let marked_tps = format!("{:.0}{}", 300.0, format::HELD_MARKER);
+        let marked_tpw = format!("{:.1} tokens / watt{}", 1.0, format::HELD_MARKER);
+        let mut saw_unmarked_value = false;
+        for h in 8u16..=30 {
+            let out = render(&s, 160, h);
+            if out.contains(&marked_tps) || out.contains(&marked_tpw) {
+                assert!(
+                    out.contains(format::HELD_LEGEND),
+                    "held marker with no legend to explain it at height {h}:\n{out}"
+                );
+            }
+            // The reading itself must survive the legend being dropped.
+            if out.contains("T/S") && !out.contains(format::HELD_LEGEND) {
+                assert!(
+                    out.contains("300"),
+                    "the T/S reading must stay once the marker is dropped, at height {h}:\n{out}"
+                );
+                saw_unmarked_value = true;
+            }
+        }
+        assert!(
+            saw_unmarked_value,
+            "no height rendered T/S without the legend — the squeeze this guards never happened"
         );
     }
 
