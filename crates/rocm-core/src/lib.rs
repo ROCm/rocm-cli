@@ -43,6 +43,7 @@ pub mod quoting;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
+pub mod report_trend;
 pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
@@ -55,6 +56,7 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::resolve_amd_smi_binary;
 pub use automation::{
@@ -107,11 +109,11 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
-    default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
+    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
+    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
     detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, pinned_gpu_name,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -174,6 +176,10 @@ pub use report::{
     refusal_envelope,
 };
 pub use report_rollup::{Group as ReportGroup, Rollup as ReportRollup};
+pub use report_trend::{
+    RiseRule as ReportRiseRule, RuleProblem as ReportRuleProblem, TrendView as ReportTrendView,
+    Week as ReportWeek,
+};
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
@@ -199,11 +205,16 @@ pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{
     ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
 };
+pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
     uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+};
+pub use vllm_oom::{
+    VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
+    vllm_oom_display_line,
 };
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
@@ -267,9 +278,17 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
 /// weights of most models people actually serve, so it trades one startup
 /// failure for another. Pinned by
 /// `the_utilization_hint_example_matches_the_recipe_command`.
+///
+/// The stated bound must be the one `rocm serve` actually accepts:
+/// `parse_gpu_memory_utilization` rejects `<= 0` and accepts `1`, so the domain
+/// is `(0, 1]` and the older `<0-1>` wording wrongly advertised `0`. Pinned by
+/// `the_utilization_hint_states_the_bound_the_parser_accepts`, because this
+/// wording has already been reverted once by a merge that resolved the line from
+/// a pre-fix tree.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
 
 pub fn sanitize_component(value: &str) -> String {
     value

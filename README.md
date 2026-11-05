@@ -917,7 +917,11 @@ can:
 
 - Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
   the server keeps running. Manage it afterward with `rocm services`.
-- Press **Ctrl-C** to stop the server instead.
+- Press **Ctrl-C** to stop the server instead. If the stop answers that it
+  could not confirm the server's process exited, the command prints the same
+  report as `rocm services stop` on stderr and exits with an error. If the stop
+  itself fails, the command says why on stderr, signals the server process
+  directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
 `--no-smoke-test` skips the post-startup inference probe.
@@ -944,7 +948,20 @@ per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
 is not installed) and picks the lowest-numbered GPU that is idle and not already
 used by another ROCm CLI server (managed or foreground), falling back to the GPU
 with the most free memory. Pass a single index (`--gpu 1`) to pin a specific
-device.
+device. An index the machine does not have is refused before anything starts,
+and the error lists the indices that exist. On Windows the index is checked
+against the AMD display adapters Windows reports (and against the `amd-smi`
+count when that works, whichever is lower). That list can include an adapter the
+ROCm runtime does not support, so on Windows the check can still accept an index
+the runtime cannot use; it is a guard against a mistyped index, not a guarantee
+the device is usable. If neither the Windows list nor `amd-smi` can be read, the
+index is used unchecked and `rocm serve` prints a warning on stderr saying so.
+If a visibility mask is set but cannot be applied (on Windows `HIP_VISIBLE_DEVICES`
+holding an empty value, a UUID, or an ordinal past the adapters Windows lists; on
+Linux a mask when the GPU lists could not be read but `amd-smi` still gives a
+count), the index is still refused when it is at or past the GPU count, and one
+below the count is accepted with a warning that the mask was not applied. When
+`amd-smi` gives a count and no mask is set, the Windows list is not queried.
 
 The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
@@ -1005,6 +1022,74 @@ than they are:
   a GPU-less host whether or not a reusable service is running, and so is
   `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
 
+#### When a serve runs out of GPU memory
+
+When a vLLM serve that **this command launched** fails to become ready and its
+engine log shows an out-of-memory failure, the deployment summary adds a note
+confirming the attempt ran out of GPU memory, naming the two knobs that can fix
+it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
+`--gpu <index>` — warning that lowering the reservation will not help if the
+model simply does not fit, and printing a
+`rocm diagnose --symptom '<your failing line>'` command for the full
+busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
+in a shell-quoted argument intact — one containing an apostrophe, for instance —
+is replaced by a canonical vLLM OOM symptom, which reports the same cause.
+
+A line carrying **terminal control bytes** that an *escape sequence* is part of
+— vLLM's colourised logger, or a repaint that moves the cursor with something
+like `ESC[1A` or clears the row with `ESC[2K` — is the one case where the two
+surfaces can print different commands for the same failure, and both are sound.
+(A bare carriage-return repaint is not that case: the log is split on `\r`, so
+the allocator line comes back as a clean segment carrying no escape and the two
+surfaces quote it identically.) The engine's own failure
+message refuses the raw line and falls back to the canonical symptom. The serve
+summary reads the log *after* the engine has echoed its tail into it as the rows
+a terminal would have drawn, so the note quotes that rendered row — real text the
+terminal printed, carrying no control bytes — instead. See
+[docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
+flag itself and the quoting rule each printed command follows.
+
+The note is deliberately narrow, so its absence is not evidence that memory was
+fine. It appears only when all of the following hold:
+
+- The engine is vLLM. It is the only engine with `--gpu-memory-utilization`.
+- You are looking at the **interactive deployment summary** — the default
+  background managed launch with a terminal on stdout. A piped, redirected, or
+  otherwise scripted run prints the plain machine-readable form
+  (`readiness: <status>`), which carries no *post-launch* notes — it still
+  prints the pre-launch planning lines, including the low-VRAM `note:` when
+  amd-smi reports a tight card, so a `note:` in piped output is never this one —
+  and `--verbose`/`--foreground` streams the engine log in your terminal instead,
+  where the traceback is already in front of you. Either way, the log is on
+  disk: `rocm services logs <service-id>`.
+- The service **failed to become ready** (recorded status `starting`). A `ready`
+  service, or a `running` one whose endpoint is up while the model is still
+  loading, is healthy and is never given memory advice.
+- The log tail carries a real allocator failure — `HIP out of memory`,
+  `CUDA out of memory`, `hipErrorOutOfMemory`, or a `torch.OutOfMemoryError`
+  corroborated by an allocator message. A bare "out of memory" phrase from the
+  kernel OOM killer or an unrelated subprocess does not qualify, and a failure
+  with no memory signature is never dressed up as one.
+- **This** invocation launched the process. A `rocm serve` that reuses an
+  already-running service launches nothing, and its summary carries no log path
+  at all, so the running service's log is never read and this invocation is
+  never blamed for another process's failure. Read that service's own log with
+  `rocm services logs <service-id>` instead.
+- **The failing line is still near the end of the log.** The summary reads a
+  fixed tail of the engine log, and it reads it *after* the engine has appended
+  its own failure message — which echoes that same tail back — to the file. A
+  launch that OOMs and then logs another ~80 lines of shutdown can therefore push
+  the allocator line out of the window the summary sees, and no note appears even
+  though the engine's own message (in `rocm services logs <service-id>`, or in
+  `--verbose`/`--foreground` output) names the OOM. The engine's message is the
+  authority on whether the launch ran out of memory; this note is the convenience
+  copy.
+
+If the pre-launch low-VRAM warning already printed the
+`--gpu-memory-utilization` advice for the selected GPU, the OOM note drops that
+one sentence rather than repeating it; the rest of the note — the confirmation,
+the model-too-large caveat, and the `diagnose` command — still appears.
+
 Manage background servers started with `--managed`:
 
 ```
@@ -1015,6 +1100,16 @@ rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`stop` reports a server stopped only once every recorded process is confirmed
+gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
+stderr and exits with an error. It keeps the record, which still names the
+processes, and any endpoint key, which the server may still be enforcing. It
+names each process that, or a process under it, did not exit after it was
+signaled; for a process it could not verify as the server's, it signals nothing
+and names an operating-system command to check on it. It does not suggest
+running the stop again: when only a process under the recorded one survived, a
+second stop can report the server stopped while that process still runs.
 
 `list` asks each running server which backend and GPU it is actually on, so it
 can take a few seconds rather than returning instantly. The query is capped in
