@@ -46,17 +46,16 @@ pub(super) fn openai_local_stream_chat_request_body(
     body
 }
 
+/// The chat-template rule itself lives in
+/// [`rocm_dash_core::chat_template`], not here: the dashboard's chat client
+/// sends the same request to the same locally served model and has to decide
+/// this identically, and a rule kept in two places drifts.
 fn apply_local_model_request_defaults(model: &str, body: &mut serde_json::Value) {
-    if local_model_should_disable_thinking(model) {
+    if rocm_dash_core::chat_template::local_model_should_disable_thinking(model) {
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": false
         });
     }
-}
-
-fn local_model_should_disable_thinking(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    normalized.contains("qwen3") || normalized.contains("qwen/qwen3")
 }
 
 fn local_openai_compatible_request(request: &ChatRequest) -> ChatRequest {
