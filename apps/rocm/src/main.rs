@@ -43,9 +43,11 @@ mod install_cmd;
 mod logging;
 mod managed_service_status;
 mod model_fit;
+mod prompt_text;
 mod provider_keys;
 mod providers;
 mod remote;
+mod rocm_argv;
 mod runtime_adopt;
 mod runtime_install_finalize;
 mod runtime_registry;
@@ -66,6 +68,7 @@ mod system_packages;
 #[cfg(test)]
 mod test_support;
 mod therock;
+mod tool_policy;
 mod uninstall;
 mod uninstall_plan;
 mod update_cmd;
@@ -3200,7 +3203,7 @@ pub(crate) mod tests {
         // while every subcommand below it already said "runtime". The approval
         // modal raised by a mutating `rocm runtimes …` from chat says the same
         // noun too, but clap doesn't render that title — see
-        // `chat::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
+        // `tool_policy::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
         let help = Cli::command()
             .find_subcommand_mut("runtimes")
             .expect("runtimes subcommand")
