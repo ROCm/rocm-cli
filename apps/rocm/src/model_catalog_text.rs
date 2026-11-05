@@ -21,9 +21,7 @@
 //!
 //! The two renderers and `format_bytes` are `pub(crate)`; `main.rs` imports them
 //! and `chat.rs`, `storage.rs` and `automations.rs` reach them as
-//! `crate::<name>`. `model_registry_adapter_availability_note` is `pub(crate)`
-//! only so the engine-status test that stays in `examine_report_text.rs` can
-//! call it. Every other item is private.
+//! `crate::<name>`. Every other item is private.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -825,7 +823,7 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-pub(crate) fn model_registry_adapter_availability_note(
+fn model_registry_adapter_availability_note(
     engine: &str,
     docker_reachable: &dyn Fn() -> bool,
 ) -> Option<&'static str> {
@@ -1412,5 +1410,22 @@ mod tests {
 
         assert!(!rendered.contains("CPU fallback"));
         assert!(rendered.contains("engine_action: use /engine install <engine>"));
+    }
+
+    /// The adapter-availability note the verbose listing appends for vLLM: a
+    /// native Windows host gets the explicit `unsupported_native_windows`
+    /// status, every other host gets no note. Moved here from the
+    /// `engine_runtime_status_label` test in `examine_report_text.rs`, which
+    /// keeps the `runtime:` label half of the same check.
+    #[test]
+    fn vllm_adapter_availability_note_is_explicit_on_native_windows() {
+        if cfg!(windows) {
+            assert!(
+                model_registry_adapter_availability_note("vllm", &|| true)
+                    .is_some_and(|note| note.contains("unsupported_native_windows"))
+            );
+        } else {
+            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
+        }
     }
 }
