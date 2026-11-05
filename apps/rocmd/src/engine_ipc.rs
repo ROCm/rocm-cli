@@ -227,6 +227,70 @@ mod tests {
     }
 
     #[test]
+    fn the_recovery_refusals_are_worded_as_shipped() {
+        // Pins the shipped text of both rules so the guard can move without a
+        // silent change. `rocm`'s copy words the same two rules differently; the
+        // remediation command here is the one `rocm`'s copy names.
+        let required = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            required,
+            "refusing to recover a service that was launched with an endpoint API key but no \
+             longer has one: it would come back up without authentication, and something \
+             outside this machine may still be publishing its port. Relaunch it with \
+             `rocm serve --require-api-key` to issue a new key."
+        );
+        let public = ensure_public_service_has_endpoint_key("0.0.0.0", false, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            public,
+            "refusing to respawn a service bound to the public host `0.0.0.0` without an \
+             endpoint API key: it would come back up without authentication. Relaunch it with \
+             `rocm serve --host 0.0.0.0 --allow-public-bind` to issue a new key."
+        );
+        let both = ensure_public_service_has_endpoint_key("0.0.0.0", false, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(both, required, "the key requirement is reported first");
+    }
+
+    #[test]
+    fn the_key_file_rocm_serve_stores_clears_the_recovery_refusal() {
+        // The condition both refusals report is a missing *usable* key. Relaunching
+        // with the command they name makes `rocm serve` write the key file at the
+        // deterministic path, and the expression recovery uses to decide
+        // `key_present` must then read it as present. The parse of the named
+        // command itself is checked in `rocm`, which owns the clap tree.
+        let (_root, paths) = temp_app_paths("recovery-refusal-cleared");
+        let service_id = "svc-recovery-refusal-cleared";
+        let key_present = || {
+            rocm_engine_protocol::endpoint_key_file_if_present(&paths, service_id)
+                .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
+                .is_some()
+        };
+        for (host, requires_api_key) in [("127.0.0.1", true), ("0.0.0.0", false)] {
+            let _ = fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+                &paths, service_id,
+            ));
+            assert!(!key_present());
+            ensure_public_service_has_endpoint_key(host, key_present(), requires_api_key)
+                .expect_err("no key on disk: refused");
+
+            fs::create_dir_all(paths.services_dir()).unwrap();
+            fs::write(
+                rocm_engine_protocol::endpoint_key_file_path(&paths, service_id),
+                "freshly-issued-key\n",
+            )
+            .unwrap();
+            assert!(key_present());
+            ensure_public_service_has_endpoint_key(host, key_present(), requires_api_key)
+                .unwrap_or_else(|error| panic!("{host}: a stored key must clear it: {error:#}"));
+        }
+    }
+
+    #[test]
     fn apply_endpoint_key_env_sets_var_only_when_key_file_present() {
         let (_root, paths) = temp_app_paths("apply-endpoint-key-env");
         let service_id = "svc-endpoint-key-env";
