@@ -39,12 +39,15 @@
 # stopped before it printed a serve plan, so the plan's name line was never
 # reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
 # `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
-# shown it. Whether the empty stdout is that bug or an earlier refusal (a missing
-# active runtime, a no-GPU bail) is not known: the steps used to discard stderr.
-# They now report it, so the next lane run says which. On native Windows the stop
-# is the up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug.
-# Until the lane stderr is in, the rows keep their all-hosts scope, and their
-# reasons name both shapes so neither becomes a false claim.
+# shown it. The steps used to discard stderr, so the cause of the empty stdout was
+# not known. The first lane run that reported it (run 41811714290: Strix Halo
+# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
+# runtime is configured", before any alias handling, so on those lanes the rows are
+# red for a missing runtime and not for this bug. On native Windows the stop is the
+# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# The rows keep their all-hosts scope until the scenarios get a managed runtime or
+# are gated on the engine and the rows are narrowed to the real bug; their reasons
+# name both shapes so neither becomes a false claim.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
