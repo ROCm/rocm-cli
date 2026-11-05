@@ -1051,7 +1051,7 @@ mod tests {
         assert!(fix.verify.contains("msvcp140.dll") && fix.verify.contains("FileVersion"));
         // The plan promises it only prints. The class is checked against the
         // catalog by `the_outdated_runtime_recipe_is_print_only_on_windows` in
-        // fix.rs, which is what makes this sentence true.
+        // fix/catalog.rs, which is what makes this sentence true.
         assert!(
             fix.notes
                 .iter()

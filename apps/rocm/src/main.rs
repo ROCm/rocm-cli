@@ -29,6 +29,7 @@ mod diagnose_cmd;
 mod driver_install;
 mod driver_plan;
 mod endpoint_keys;
+mod engine_install_env;
 mod engine_ipc;
 mod engine_runtime_select;
 mod engines_cmd;
@@ -59,6 +60,7 @@ mod service_records;
 mod services_cmd;
 mod services_text;
 mod setup_cmd;
+mod shell_quote;
 mod storage;
 mod system_packages;
 #[cfg(test)]
@@ -72,19 +74,18 @@ mod update_cmd;
 // types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
 // mergeability); several helpers are re-imported for reasons other than
-// dispatch: `env_root_for_engine_install`, `runtime_manifest_for_selector`,
-// `engine_manages_own_runtime`, and `runtime_key_for_python` because other
-// root-level commands outside `dispatch()` call them directly.
-// `prepare_freeform_execution`/`render_freeform_execution_header` are
-// re-imported for the same reason: `execute_freeform_next_action` (itself only
-// called from `run_freeform`, outside `dispatch()`) calls them. Several
-// root-level chat/examine helpers call into `runtimes_cmd` directly for the
-// same reason `engines_cmd`'s runtime-resolution helpers are re-imported;
-// `current_runtime_manifest` stays re-imported here for other root-level
-// commands outside `dispatch()` that call it directly. `select_runtime_manifest`
-// is no longer needed here: `single_ready_runtime_key`/
-// `resolve_runtime_selector_to_exact_key` moved out to
-// `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
+// dispatch: `prepare_freeform_execution`/`render_freeform_execution_header`
+// because `execute_freeform_next_action` (itself only called from
+// `run_freeform`, outside `dispatch()`) calls them. The engine runtime and
+// env-root helpers (`engine_manages_own_runtime`,
+// `runtime_manifest_for_selector` and the rest) are no longer re-imported at
+// the crate root: they live in `engine_install_env.rs`, and each caller imports
+// them from there. Several root-level chat/examine helpers call into
+// `runtimes_cmd` directly; `current_runtime_manifest` stays re-imported here
+// for other root-level commands outside `dispatch()` that call it directly.
+// `select_runtime_manifest` is no longer needed here:
+// `single_ready_runtime_key`/`resolve_runtime_selector_to_exact_key` moved out
+// to `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
 // module's own grouped `use crate::runtimes_cmd::{...}` import instead.
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
@@ -117,7 +118,7 @@ use crate::config_cmd::{config, render_config_text};
 use crate::diagnose_cmd::{diagnose, fix};
 use crate::engine_ipc::{run_builtin_engine_serve_http, run_builtin_engine_stdio};
 use crate::engine_runtime_select::{daemon_run_argv, parse_engine_recipe_json_arg};
-use crate::engines_cmd::{engine_manages_own_runtime, engines, runtime_manifest_for_selector};
+use crate::engines_cmd::engines;
 use crate::examine_cmd::examine;
 // `append_examine_runtime_state` has no caller in `main.rs` itself — it is
 // re-imported only so `runtimes_cmd.rs`'s own test module can keep reaching it

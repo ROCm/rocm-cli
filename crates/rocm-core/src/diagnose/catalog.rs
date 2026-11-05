@@ -656,7 +656,7 @@ mod tests {
             "",
         );
         // fix-13 and fix-14 print a Windows verify that the Windows-only tests
-        // in `fix.rs` run from the catalog copy, so this copy has to match it.
+        // in `fix/catalog.rs` run from the catalog copy, so this copy has to match it.
         let hip_sdk_missing = check_13_hip_sdk_missing(
             &Examination {
                 os_family: "windows".to_owned(),
@@ -724,13 +724,13 @@ mod tests {
     /// The `Fix` that each checker builds for itself is shown to users of
     /// Windows PowerShell 5.1 as well as cmd, just like the `rocm fix` catalog.
     /// This runs every checker that answers on Windows and applies the same
-    /// rule as the catalog test in `fix.rs` (`fails_in_windows_powershell`), so a
+    /// rule as the catalog test in `fix/catalog.rs` (`fails_in_windows_powershell`), so a
     /// hand-built verify string or command that breaks one of the rule's known
     /// constructs fails here. A construct the rule does not list passes.
     ///
     /// Like that test it pins the text only. Nothing here runs a command in a
     /// shell. The Windows-only tests named on `fails_in_windows_powershell` in
-    /// `fix.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
+    /// `fix/catalog.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
     /// and `the_igpu_verify_pins_the_variable_it_names` runs fix-9's, all on
     /// Windows.
     #[test]

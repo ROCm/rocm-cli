@@ -112,7 +112,11 @@ impl Tool for ListInstancesTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "List discovered serving instances: name, model, status, \
-                          KV-cache usage %, and running/waiting request counts."
+                          KV-cache usage %, running/waiting request counts, \
+                          generation tok/s, TTFT/TPOT (each with a fresh/held \
+                          flag; held means the last value, not a live reading), \
+                          and attributed_power_w (this instance's share of its \
+                          GPUs' power, not whole-board power)."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -166,7 +170,8 @@ impl Tool for TokensPerWattTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Per-instance efficiency: generation tokens/sec divided by \
-                          the summed power (W) of the GPUs each instance occupies."
+                          the instance's attributed share of its GPUs' power (W). \
+                          GPUs shared by several instances are split between them."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -178,97 +183,33 @@ impl Tool for TokensPerWattTool {
     }
 }
 
-/// Read-only tool exposing the rocm-dash **skills** registry (auto-config / auto-install).
-///
-/// The agent can list skills and fetch a skill's dry-run plan;
-/// it never executes a skill (execution is `--apply`-gated in the CLI).
-pub struct ListSkillsTool {
-    pub fired: FiredLog,
-}
-
-impl Tool for ListSkillsTool {
-    const NAME: &'static str = "list_skills";
-    type Error = ToolError;
-    type Args = NoArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "List the available rocm-dash skills (auto-config / \
-                          auto-install helpers like install-lemonade and \
-                          auto-config-endpoint) the user can run."
-                .to_string(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        }
-    }
-
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        let skills: Vec<Value> = crate::skills::builtin_skills()
-            .iter()
-            .map(|s| json!({ "name": s.name, "description": s.description }))
-            .collect();
-        Ok(json!({ "skills": skills, "skill_count": skills.len() }))
-    }
-}
-
-/// Read-only tool returning a skill's ordered dry-run plan (no execution).
-pub struct SkillPlanTool {
-    pub fired: FiredLog,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SkillPlanArgs {
-    pub name: String,
-}
-
-impl Tool for SkillPlanTool {
-    const NAME: &'static str = "skill_plan";
-    type Error = ToolError;
-    type Args = SkillPlanArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Show the ordered dry-run step plan for a named skill \
-                          WITHOUT executing it. Use after list_skills."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Skill name, e.g. install-lemonade." }
-                },
-                "required": ["name"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        record(&self.fired, Self::NAME);
-        match crate::skills::builtin_skill(&args.name) {
-            Some(m) => Ok(json!({ "name": m.name, "plan": crate::skills::build_plan(&m) })),
-            None => Ok(json!({ "error": format!("unknown skill: {}", args.name) })),
-        }
-    }
-}
-
 /// All Skill names, for definition/uniqueness checks and docs.
-pub const SKILL_NAMES: [&str; 6] = [
+pub const SKILL_NAMES: [&str; 4] = [
     GpuStatusTool::NAME,
     ListInstancesTool::NAME,
     BenchSummaryTool::NAME,
     TokensPerWattTool::NAME,
-    ListSkillsTool::NAME,
-    SkillPlanTool::NAME,
 ];
 
 // ---------------------------------------------------------------------------
 // Read-only ROCm machine-inspection tools (group B). These forward the model's
 // tool-call intent across the rocm-core-free [`crate::tool_exec`] seam to the
-// bin-supplied executor (live dash only). They are READ-ONLY: no mutating tool
-// is registered here (mutating tools + the approval UI land in Phase 4). The
+// bin-supplied executor (live dash only). They are READ-ONLY in the approval
+// sense: none of them performs a mutating action (an install, start, stop,
+// uninstall, configuration change, or anything else that needs operator
+// approval). An intent the bin classifies as mutating comes back as
+// `ApprovalRequired` and [`run_rocm_read_tool`] turns it into an error, and the
+// mutating tools are group D below, which only surface an approval request
+// rather than executing. That is a narrower claim than "no side effects":
+// reading can still refresh local bookkeeping and caches. `services`,
+// `service_logs`, `port_status`, `bridge_snapshot` and the `rocm_command`
+// service views reload the managed-service records, which rewrites a record
+// whose state changed (and drops the endpoint key of a service whose requested
+// stop has finished). `doctor`/`examine` can re-register the configured setup
+// runtime in the runtime registry when its entry is missing. `update_check` and
+// `install_sdk_dry_run` cache package-index metadata under the cache folder
+// and, on a host with no usable Python on PATH, can download a managed `uv` and
+// Python into the data folder and record that Python in the saved config. The
 // boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
 // pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
@@ -732,17 +673,15 @@ where
         })
 }
 
-/// Register the telemetry + skill registry tools (GpuStatus, ListInstances,
-/// BenchSummary, TokensPerWatt — snapshot-backed; ListSkills, SkillPlan —
-/// read-only registry) on a fresh Rig `AgentBuilder`, cloning the snapshot +
-/// shared `fired` log into each. Kept generic over the builder's completion
-/// model + preamble so all three backends (RigAgentClient, ChatGptAgentClient,
-/// AnthropicAgentClient) reuse one registration site (DRY — the tool list lives
-/// in exactly one place, mirroring [`register_rocm_read_tools`]). Takes the base
-/// builder (`NoToolConfig`) and returns it in `WithBuilderTools` because the
-/// first `.tool()` transitions the type-state; the ROCm read/mutating
-/// registrations chain after it. Note: ListSkillsTool/SkillPlanTool take only
-/// `fired`; the other four take `snap` + `fired`.
+/// Register the telemetry tools (GpuStatus, ListInstances, BenchSummary,
+/// TokensPerWatt — all snapshot-backed) on a fresh Rig `AgentBuilder`, cloning
+/// the snapshot + shared `fired` log into each. Kept generic over the builder's
+/// completion model + preamble so all three backends (RigAgentClient,
+/// ChatGptAgentClient, AnthropicAgentClient) reuse one registration site (DRY —
+/// the tool list lives in exactly one place, mirroring
+/// [`register_rocm_read_tools`]). Takes the base builder (`NoToolConfig`) and
+/// returns it in `WithBuilderTools` because the first `.tool()` transitions the
+/// type-state; the ROCm read/mutating registrations chain after it.
 pub(super) fn register_telemetry_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P>,
     snap: &Arc<StateSnapshot>,
@@ -769,13 +708,6 @@ where
             snap: snap.clone(),
             fired: fired.clone(),
         })
-        // Skills registry tools (read-only: list + dry-run plan; never execute).
-        .tool(ListSkillsTool {
-            fired: fired.clone(),
-        })
-        .tool(SkillPlanTool {
-            fired: fired.clone(),
-        })
 }
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
@@ -783,8 +715,8 @@ where
 /// builder's completion model + preamble so all three backends (the
 /// OpenAI-compatible, ChatGPT, and Anthropic paths) reuse one registration
 /// site (DRY — the tool list lives in exactly one place). The builder is
-/// already in the `WithBuilderTools` state because the telemetry/skill tools
-/// were registered first.
+/// already in the `WithBuilderTools` state because the telemetry tools were
+/// registered first.
 pub(super) fn register_rocm_read_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
@@ -926,53 +858,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn skill_tools_expose_both_demo_skills() {
-        // list_skills returns both demo skills (the agent can see them).
-        let list = ListSkillsTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let def = list.definition(String::new()).await;
-        assert_eq!(def.name, "list_skills");
-        let out = list.call(NoArgs::default()).await.expect("list ok");
-        let names: Vec<String> = out["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"install-lemonade".to_string()));
-        assert!(names.contains(&"auto-config-endpoint".to_string()));
-
-        // skill_plan returns the ordered dry-run plan for a named skill.
-        let plan_tool = SkillPlanTool {
-            fired: Arc::new(Mutex::new(Vec::new())),
-        };
-        let out = plan_tool
-            .call(SkillPlanArgs {
-                name: "install-lemonade".to_string(),
-            })
-            .await
-            .expect("plan ok");
-        let plan = out["plan"].as_array().unwrap();
-        assert!(
-            plan.iter()
-                .any(|l| l.as_str().unwrap().contains("lemonade-sdk"))
-        );
-        // Unknown skill → graceful error object, not a panic.
-        let miss = plan_tool
-            .call(SkillPlanArgs {
-                name: "nope".to_string(),
-            })
-            .await
-            .unwrap();
-        assert!(miss["error"].is_string());
-    }
-
     #[test]
-    fn skill_tool_names_registered_in_skill_names() {
-        assert!(SKILL_NAMES.contains(&"list_skills"));
-        assert!(SKILL_NAMES.contains(&"skill_plan"));
+    fn retired_skill_registry_tools_are_not_advertised() {
+        // `list_skills` / `skill_plan` described install steps (a GitHub
+        // releases download plus a `tar` extraction) that are not how the product
+        // installs an engine, and no executor ever applied their plans. They
+        // must not come back in any tool set the model is offered.
+        for gone in ["list_skills", "skill_plan"] {
+            assert!(!SKILL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(!ROCM_READ_TOOL_NAMES.contains(&gone), "{gone} is retired");
+            assert!(
+                !ROCM_MUTATING_TOOL_NAMES.contains(&gone),
+                "{gone} is retired"
+            );
+        }
     }
 
     /// Minimal executor that echoes a fixed JSON value for any tool call.

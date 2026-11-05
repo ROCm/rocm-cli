@@ -663,7 +663,7 @@ Feature: Diagnosing failures and listing fixes
   # gate, so the text is the same on every lane, and the scenario asserts the
   # printed lines and not the exit code. It does not run the line. The test
   # `the_msvc_verify_runs_in_cmd_and_powershell` in
-  # crates/rocm-core/src/fix.rs does that, and only on Windows.
+  # crates/rocm-core/src/fix/catalog.rs does that, and only on Windows.
   @id:diagnose-msvc-verify-line-text-is-powershell-safe
   Scenario: diagnose-43 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
     Given a user who has chosen the fix for the missing MSVC runtime
@@ -680,7 +680,7 @@ Feature: Diagnosing failures and listing fixes
   # and Windows PowerShell 5.1 drops the empty argument, so setx failed with
   # "Invalid syntax" and cleared nothing; the step refuses an empty-string
   # argument too. Text only, like diagnose-43. `the_override_verify_runs_in_cmd_and_powershell`
-  # in crates/rocm-core/src/fix.rs runs the override verify line, on Windows.
+  # in crates/rocm-core/src/fix/catalog.rs runs the override verify line, on Windows.
   # These three scenarios see what `rocm fix <id> --dry-run` prints from the
   # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
   # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
@@ -712,7 +712,7 @@ Feature: Diagnosing failures and listing fixes
   # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
   # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
   # (text) and the Windows-only `*_verify_runs_*` tests in
-  # crates/rocm-core/src/fix.rs (run); there is no Windows scenario for them.
+  # crates/rocm-core/src/fix/catalog.rs (run); there is no Windows scenario for them.
   @id:diagnose-override-verify-line-names-python3 @requires-os:linux
   Scenario: diagnose-46 - The verify line printed for the GPU override cause reads the override and uses python3
     Given a Linux machine whose shell has a GPU override set

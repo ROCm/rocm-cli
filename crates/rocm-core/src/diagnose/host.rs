@@ -235,7 +235,7 @@ pub(super) fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis 
     }
     let fix = if windows {
         // The command printed here is the manual-paste twin of the write
-        // `crate::fix::path_export_windows` performs, and is built the same
+        // `crate::fix::runners::path_export_windows` performs, and is built the same
         // way: read the *User* scope, put `bin_dir` first, write the User
         // scope back. `setx PATH "%PATH%;{bin_dir}"` -- what this used to
         // advertise -- is not an equivalent: setx truncates the value at 1024

@@ -1247,7 +1247,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "apps/rocm/src/service_hints.rs",
-        "rocm services {action} {service_id} --yes",
+        "rocm services {action} {} --yes",
         "the verb is a format argument; every value it takes is checked against the \
          real hint by `service_action_retry_advice_parses_for_generated_ids` (the \
          `run_approved_service_action` verbs) and `every_service_action_hint_verb_parses` \
@@ -1266,7 +1266,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "crates/rocm-core/src/fix.rs",
+        "crates/rocm-core/src/fix/render.rs",
         "rocm fix can run it",
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
