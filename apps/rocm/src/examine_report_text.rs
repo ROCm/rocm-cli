@@ -39,13 +39,12 @@
 //! otherwise be an unused import in a non-test build. Every other item in this
 //! list has no caller outside this module and stays private.
 //!
-//! This module reaches four items that live at the crate root because they
+//! This module reaches three items that live at the crate root because they
 //! have other callers: `engine_inventory()` (the built-in engine list, also
-//! read from `update_cmd.rs`), `PlatformRuleOut` (which
-//! `engine_runtime_status_label` matches on) and
+//! read from `update_cmd.rs` and `bridge_snapshot.rs`), `PlatformRuleOut`
+//! (which `engine_runtime_status_label` matches on) and
 //! `engine_ruled_out_by_platform` (both defined in `model_fit.rs` and
-//! re-imported in `main.rs`), and `missing_packaged_engine_reason` (also read
-//! from `model_catalog_text.rs`) — all reached via `use crate::{...};`.
+//! re-imported in `main.rs`) — all reached via `use crate::{...};`.
 //!
 //! The regression tests for these surfaces live in this module's own
 //! `mod tests`, reaching the shared `test_paths` fixture through
@@ -76,9 +75,7 @@ use crate::runtimes_cmd::{
     runtime_keys_text, runtime_usability_status, setup_runtime_paths, toolchain_state_text,
 };
 use crate::therock;
-use crate::{
-    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform, missing_packaged_engine_reason,
-};
+use crate::{PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform};
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
     // User-facing text, so it must agree with what `serve` would pick — the same
@@ -470,13 +467,6 @@ fn append_engine_detect_summary(output: &mut String, engine: &str, paths: Option
         }
     };
     let _ = writeln!(output, "    {binary_status}");
-    if !builtin_engine_available(engine)
-        && engine_binary.is_err()
-        && let Some(reason) = missing_packaged_engine_reason(engine)
-    {
-        let _ = writeln!(output, "    note: {reason}");
-        return;
-    }
 
     let Ok(detect) = engine_request::<_, DetectResponse>(
         paths,

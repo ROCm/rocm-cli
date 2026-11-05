@@ -1384,8 +1384,7 @@ impl PermissionsModeArg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge_snapshot::builtin_engine_inventory;
-    use crate::{cli_command, device_policy_name};
+    use crate::{cli_command, device_policy_name, engine_inventory};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
 
@@ -1761,7 +1760,7 @@ mod tests {
     #[test]
     fn serve_engine_help_lists_match_engine_inventory() {
         let mut listed = serve_possible_values("engine");
-        let mut expected: Vec<String> = builtin_engine_inventory()
+        let mut expected: Vec<String> = engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
             .collect();
@@ -1769,7 +1768,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --engine possible-values must stay in sync with builtin_engine_inventory()"
+            "serve --engine possible-values must stay in sync with engine_inventory()"
         );
     }
 

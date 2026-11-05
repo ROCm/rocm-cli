@@ -1286,10 +1286,6 @@ const fn provider_name(provider: Provider) -> &'static str {
     }
 }
 
-const fn missing_packaged_engine_reason(_engine: &str) -> Option<String> {
-    None
-}
-
 /// The record status matching how far the endpoint got.
 ///
 /// `Listing` maps to `running`, not `starting`: the engine is up and loading
@@ -2492,12 +2488,6 @@ pub(crate) mod tests {
             "the engine failure must still be recorded: {actions:?}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn missing_packaged_engine_reason_has_no_deferred_first_party_engines() {
-        assert!(missing_packaged_engine_reason("lemonade").is_none());
-        assert!(missing_packaged_engine_reason("vllm").is_none());
     }
 
     pub(crate) fn test_runtime_manifest_for_update(
