@@ -1602,7 +1602,7 @@ pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
 non-terminating error, so the line would print it and still exit 0). The `where`
 and `-Command` matches ignore case.
 `fails_in_windows_powershell` in
-[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) applies it to every catalog recipe that
 applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
 line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
 `diagnose-43`, `diagnose-44` and `diagnose-45` in
@@ -1618,7 +1618,7 @@ add a case there, and a rule that gets it wrong fails on its own side.
 The rule reads text; it does not prove a line runs. On Windows,
 `cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
 fix-22 into cmd and into Windows PowerShell and checks the exit code and
-output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+output (the tests in [fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) named
 `the_override_verify_runs_in_cmd_and_powershell`,
 `the_hip_sdk_verify_runs_the_exe_under_hip_path`,
 `the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
@@ -1663,7 +1663,7 @@ catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
 `the_override_fix_verify_runs_where_only_python3_exists` run the lines
 `rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
 `hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
-([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
 Provider audit focused test:
@@ -1695,25 +1695,29 @@ Automation history stores (events, audit, proposals):
 
 ```bash
 cargo test -p rocm-core automation::tests
+cargo test -p rocm-core jsonl_store::tests
 ```
 
 These cover the three JSONL stores in
-[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+[automation.rs](../crates/rocm-core/src/automation.rs) and the generic JSONL
+store engine under them in
+[jsonl_store.rs](../crates/rocm-core/src/jsonl_store.rs): concurrent writers
 across threads and processes losing no records, size-based rotation of the
 event and audit logs under the same lock (no record lost or duplicated while
 writers rotate, recent reads spanning the rollover, a failed rotation still
 keeping the record and printing its one-shot warning to stderr, lock-free
 readers never reading a file twice or skipping a generation), and proposal
 compaction keeping every pending proposal, the
-newest reviewed ones, and legacy proposal ids. Most of those drive
+newest reviewed ones, and legacy proposal ids. The rotation tests in
+`jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests go through the public
+rotation policy; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
 itself stays covered. The repair of a torn tail, which normally replaces the
 store and falls back to cutting the debris in place when that replacement
-fails, has its own tests there: each step injected to fail, the error naming
+fails, has its own tests in `jsonl_store::tests`: each step injected to fail, the error naming
 both causes when both fail, and a real fault on each platform (a directory
 that takes no new files on Unix, a handle without delete sharing on Windows).
 The user-visible side is `automations-07` through `automations-09`, plus
@@ -2540,7 +2544,9 @@ Every Rust reader of `/etc/os-release` parses it with
 value `sh` would assign or nothing: the driver plan
 ([`driver_plan.rs`](../apps/rocm/src/driver_plan.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
-naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
+naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs), with the
+os-release seam they share in
+[`package_plan.rs`](../crates/rocm-core/src/package_plan.rs)), `rocm
 examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
 ([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
@@ -2613,6 +2619,7 @@ through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
 cargo test -p rocm-core --lib os_release
 cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
 cargo test -p rocm-core --lib openmpi::tests
+cargo test -p rocm-core --lib package_plan::tests
 cargo test -p rocm --bin rocm os_release
 cargo test -p rocm --bin rocm -- a_fallback_read_plans an_unreadable_file_plans_nothing_and_names_itself
 cargo test -p rocm-core --lib hardware_root::tests::read_os_release
@@ -2715,7 +2722,7 @@ a KFD node planted under the scenario's own root reports `gfx_target_version
 90012`, so it runs on **every** Linux lane, WSL2 included — `@requires-os:linux`
 matches a host whose `os_family` is `linux`, and WSL2's is. Every `rocm` call in
 that scenario therefore has to carry `ROCM_CLI_TEST_HOST_ROOT`: `rocm fix` gates
-on the OS, and `fix::current_os` resolves WSL *through* the host root, so an
+on the OS, and `fix::consent::current_os` resolves WSL *through* the host root, so an
 unrooted call on a WSL2 runner is read as `wsl` — an OS this entry deliberately
 does not apply on — and exits 3.
 

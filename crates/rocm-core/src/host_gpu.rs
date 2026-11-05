@@ -8,10 +8,7 @@
 //! and the driver-summary and gfx-target fallback chains that feed it. The
 //! gfx-target and TheRock-family tables those chains consult live in
 //! [`crate::gfx_target`], and this module re-exports the public ones so their
-//! `crate::host_gpu::` paths keep resolving. The TheRock-managed-SDK gfx-target
-//! probe (`detect_managed_therock_sdk_gfx_target`) stays here, since its only
-//! caller is this module's own gfx-target fallback chain; the registry reading
-//! it uses lives in [`crate::managed_runtime`]. `interactive_terminal` lives in
+//! `crate::host_gpu::` paths keep resolving. `interactive_terminal` lives in
 //! [`crate::confirm`] and is re-exported here too, so the
 //! `crate::host_gpu::interactive_terminal` path keeps resolving.
 //!
@@ -35,24 +32,17 @@ pub use crate::gfx_target::{
 };
 #[cfg(target_os = "linux")]
 use crate::gfx_target::{parse_windows_display_gfx_target, parse_windows_display_name};
-use crate::managed_runtime::{managed_sdk_ld_library_path, managed_therock_sdk_probe_candidates};
 use crate::{
     AppPaths, LegacyRocmSummary, detect_legacy_rocm_summary, detect_managed_therock_family,
-    host_path, managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    unix_time_millis,
+    host_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
 };
 use anyhow::Result;
-use capture::{OPTIONAL_COMMAND_TIMEOUT, capture_optional_command};
 pub(crate) use os_facts::detect_distro_name;
 pub use os_facts::detect_system_ram_gib;
 use os_facts::{detect_cpu_model, detect_kernel_version};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 mod capture;
 mod diagnostics;
@@ -73,11 +63,13 @@ pub use engine_default::{
 pub use gpu_visibility::{
     WindowsGpuListing, has_usable_amd_gpu, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
+use linux::detect_linux_amdgpu_driver_version;
+#[cfg(target_os = "linux")]
+use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
-use linux::{detect_linux_amdgpu_driver_version, detect_linux_primary_gpu_name};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
@@ -95,10 +87,7 @@ pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
     ldconfig_cache, ldconfig_lists_librocdxg,
 };
-use wsl::{
-    detect_wsl_windows_display_gfx_target, detect_wsl_windows_display_gfx_target_fast,
-    detect_wsl_windows_display_name_fast, wsl_driver_summary,
-};
+use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 
 pub fn detect_host_gfx_target() -> Option<String> {
     let paths = AppPaths::discover().ok();
@@ -117,97 +106,6 @@ fn detect_examine_gfx_target_fast(
     }
 
     None
-}
-
-#[allow(dead_code)]
-fn detect_host_gfx_target_with_context(
-    windows_inventory: Option<&WindowsExamineInventory>,
-    wsl: Option<&WslSummary>,
-    paths: Option<&AppPaths>,
-) -> Option<String> {
-    if runtime_is_windows() {
-        return detect_windows_display_gfx_target_with_inventory(windows_inventory)
-            .or_else(|| {
-                capture_optional_command("rocm_agent_enumerator", &[])
-                    .and_then(|output| extract_first_gfx_token(&output))
-            })
-            .or_else(|| {
-                capture_optional_command("rocminfo", &[])
-                    .and_then(|output| extract_first_gfx_token(&output))
-            });
-    }
-
-    detect_linux_sysfs_gfx_target()
-        .or_else(|| {
-            capture_optional_command("rocm_agent_enumerator", &[])
-                .and_then(|output| extract_first_gfx_token(&output))
-        })
-        .or_else(|| {
-            capture_optional_command("rocminfo", &[])
-                .and_then(|output| extract_first_gfx_token(&output))
-        })
-        .or_else(|| paths.and_then(detect_managed_therock_sdk_gfx_target))
-        .or_else(|| detect_wsl_windows_display_gfx_target(wsl))
-        .or_else(|| detect_windows_display_gfx_target_with_inventory(windows_inventory))
-}
-
-fn capture_optional_path_command_with_env(
-    program: &Path,
-    args: &[&str],
-    envs: &[(&str, OsString)],
-    timeout: Duration,
-) -> Option<String> {
-    let output_path = std::env::temp_dir().join(format!(
-        "rocm-cli-command-{}-{}.out",
-        std::process::id(),
-        unix_time_millis()
-    ));
-    let output_file = fs::File::create(&output_path).ok()?;
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output_file))
-        .stderr(Stdio::null());
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let Ok(mut child) = command.spawn() else {
-        let _ = fs::remove_file(&output_path);
-        return None;
-    };
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let bytes = if status.success() {
-                    fs::read(&output_path).ok()
-                } else {
-                    None
-                };
-                let _ = fs::remove_file(&output_path);
-                return bytes.and_then(|bytes| String::from_utf8(bytes).ok());
-            }
-            Ok(None) if start.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = fs::remove_file(&output_path);
-                return None;
-            }
-        }
-    }
-}
-
-fn detect_wsl_windows_display_name(wsl: Option<&WslSummary>) -> Option<String> {
-    if !runtime_is_linux() || !wsl.is_some_and(|summary| summary.is_wsl) {
-        return None;
-    }
-
-    detect_wsl_windows_display_name_fast()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,45 +462,6 @@ fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
     HostGpuSummary::default()
 }
 
-#[allow(dead_code)]
-fn detect_host_gpu_summary_full(paths: Option<&AppPaths>) -> HostGpuSummary {
-    let windows_inventory = detect_windows_examine_inventory();
-    let wsl = detect_wsl_summary();
-    let gfx_target =
-        detect_host_gfx_target_with_context(windows_inventory.as_ref(), wsl.as_ref(), paths);
-    let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
-    let name = detect_host_gpu_name_with_context(windows_inventory.as_ref(), wsl.as_ref());
-    HostGpuSummary {
-        name,
-        gfx_target,
-        therock_family,
-    }
-}
-
-fn detect_host_gpu_name_with_context(
-    windows_inventory: Option<&WindowsExamineInventory>,
-    wsl: Option<&WslSummary>,
-) -> Option<String> {
-    windows_inventory
-        .and_then(WindowsExamineInventory::amd_display_name)
-        .or_else(detect_linux_primary_gpu_name)
-        .or_else(|| detect_wsl_windows_display_name(wsl))
-}
-
-fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
-    managed_therock_sdk_probe_candidates(&paths.data_dir.join("runtimes").join("registry"))
-        .into_iter()
-        .find_map(|candidate| {
-            let tool = managed_sdk_tool_path(&candidate.bin_path, "rocm_agent_enumerator")?;
-            let mut envs = Vec::new();
-            if let Some(ld_library_path) = managed_sdk_ld_library_path(&candidate) {
-                envs.push(("LD_LIBRARY_PATH", ld_library_path));
-            }
-            capture_optional_path_command_with_env(&tool, &[], &envs, OPTIONAL_COMMAND_TIMEOUT)
-                .and_then(|output| extract_first_gfx_token(&output))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,85 +469,8 @@ mod tests {
     use std::path::PathBuf;
     use windows_inventory::WindowsInventorySources;
 
-    fn write_fake_rocm_agent_enumerator(bin_dir: &Path, target: &str) -> Result<()> {
-        if cfg!(windows) {
-            let path = bin_dir.join("rocm_agent_enumerator.cmd");
-            fs::write(path, format!("@echo off\r\necho {target}\r\n"))?;
-        } else {
-            let path = bin_dir.join("rocm_agent_enumerator");
-            crate::fake_executable::write_fake_executable(
-                &path,
-                format!("#!/bin/sh\necho {target}\n"),
-            )?;
-        }
-        Ok(())
-    }
-
     #[test]
-    fn managed_sdk_probe_detects_gfx_from_therock_tool() -> Result<()> {
-        let (root, paths) = temp_app_paths("managed-sdk-gfx");
-        let registry = paths.data_dir.join("runtimes").join("registry");
-        let site_packages = root.join("site-packages");
-        let sdk_root = site_packages.join("_rocm_sdk_devel");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&sdk_bin)?;
-        write_fake_rocm_agent_enumerator(&sdk_bin, "gfx1201")?;
-        fs::create_dir_all(&registry)?;
-        fs::write(
-            registry.join("runtime.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "runtime_id": "therock-release:gfx120X-all",
-                "family": "gfx120X-all",
-                "installed_at_unix_ms": 10,
-                "rocm_sdk": {
-                    "import_ok": true,
-                    "site_packages": site_packages,
-                    "root_path": sdk_root,
-                    "bin_path": sdk_bin
-                }
-            }))?,
-        )?;
-
-        assert_eq!(
-            detect_managed_therock_sdk_gfx_target(&paths),
-            Some("gfx1201".to_owned())
-        );
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn managed_sdk_probe_skips_non_therock_manifests() -> Result<()> {
-        let (root, paths) = temp_app_paths("managed-sdk-skip-non-therock");
-        let registry = paths.data_dir.join("runtimes").join("registry");
-        let site_packages = root.join("site-packages");
-        let sdk_root = site_packages.join("_rocm_sdk_devel");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&sdk_bin)?;
-        write_fake_rocm_agent_enumerator(&sdk_bin, "gfx9999")?;
-        fs::create_dir_all(&registry)?;
-        fs::write(
-            registry.join("runtime.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "runtime_id": "external-runtime",
-                "family": "gfx120X-all",
-                "installed_at_unix_ms": 10,
-                "rocm_sdk": {
-                    "import_ok": true,
-                    "site_packages": site_packages,
-                    "root_path": sdk_root,
-                    "bin_path": sdk_bin
-                }
-            }))?,
-        )?;
-
-        assert_eq!(detect_managed_therock_sdk_gfx_target(&paths), None);
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn windows_examine_gfx_detection_uses_inventory_without_rocm_tools() {
+    fn windows_examine_gfx_detection_uses_the_display_inventory() {
         if !cfg!(windows) {
             return;
         }
@@ -697,7 +479,7 @@ mod tests {
         );
 
         assert_eq!(
-            detect_host_gfx_target_with_context(Some(&inventory), None, None),
+            detect_windows_display_gfx_target_with_inventory(Some(&inventory)),
             Some("gfx1201".to_owned())
         );
     }

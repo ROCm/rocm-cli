@@ -877,7 +877,10 @@ is rejected too, but without naming the holder. `--host` to anything other
 than the default
 loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
 requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
-cannot promise a free port anywhere else.
+cannot promise a free port anywhere else. An explicit `--port` on such a host
+is not checked against the ports managed services already hold (those records
+do not say which interface they bound), so a clash is reported by the engine
+when it starts.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or

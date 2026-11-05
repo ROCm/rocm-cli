@@ -38,9 +38,9 @@ pub(crate) const AUTO_PORT_SPAN: u16 = 100;
 pub(crate) const AUTO_PORT_LAST: u16 = AUTO_PORT_FIRST + AUTO_PORT_SPAN;
 
 /// The one phrase used wherever a port must be described *before* it is
-/// resolved. Re-exported from the Dash approval card's own constant so the CLI
-/// plan output and the wizard can never drift apart in wording.
-pub(crate) use rocm_dash_tui::ui::serve_wizard::AUTO_PORT_NOTE as AUTOMATIC_PORT_DISCLOSURE;
+/// resolved. Defined in `rocm-dash-core`, which the Dash approval card also
+/// reads, so the CLI plan output and the wizard can never drift apart in wording.
+pub(crate) use rocm_dash_core::AUTO_PORT_NOTE as AUTOMATIC_PORT_DISCLOSURE;
 
 /// What the user asked for on the command line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +151,9 @@ pub(crate) fn resolve_serve_port(
         // or failure stays engine-owned. Automatic is refused here as well as in
         // `serve()`, because this is the shared choke point every caller reaches
         // — and it is refused by returning an error, never by panicking.
+        // The managed-service reservation check below is deliberately skipped:
+        // a record stores a port but not the interface it bound, so applying it
+        // to another host could refuse a launch on a different interface.
         validate_port_request(host, request)?;
         let Some(port) = request.explicit() else {
             bail!("automatic port selection is not available on host {host}");

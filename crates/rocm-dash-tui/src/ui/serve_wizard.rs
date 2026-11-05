@@ -66,12 +66,9 @@ pub const DEVICE_POLICY: &str = "GPU required (automatic)";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "11435";
 
-/// The shared phrase for an automatic port.
-///
-/// The wizard cannot truthfully promise a concrete port before the CLI leases
-/// one, so the approval card says exactly this and the launch output prints the
-/// resolved endpoint.
-pub const AUTO_PORT_NOTE: &str = "Port: automatic; endpoint shown after launch";
+/// The shared phrase for an automatic port; defined in `rocm-dash-core` so the
+/// CLI plan output can use it without depending on this TUI module.
+pub use rocm_dash_core::AUTO_PORT_NOTE;
 
 /// The exact cross-field guidance for a custom host left on an automatic port.
 ///

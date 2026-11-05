@@ -770,7 +770,7 @@ fn spawn_managed_engine_child(
             // The single cleanup choke point for every failure path below the
             // record's first write: `record.engine_pid` tells it whether a child
             // ever ran, so a pre-spawn failure deletes everything and a post-spawn
-            // one keeps the record and log (marked `status = "failed"`) instead.
+            // one keeps the record and log (marked `status = "stopped"`) instead.
             abandon_failed_managed_launch(paths, &record);
             Err(error)
         }
@@ -2662,7 +2662,8 @@ mod tests {
         // `launch_managed_engine_child_locked` has already set
         // `record.engine_pid` — so cleanup must terminate (already-dead) the
         // child, keep the record and log for inspection, mark the record
-        // `failed`, and clear only the endpoint key.
+        // `stopped` (a `failed` one would be respawned by rocmd recovery), and
+        // clear only the endpoint key.
         //
         // The child always dies near-instantly, but `spawn_managed_engine_child`
         // only reports that within a fixed startup-check window. On a loaded or

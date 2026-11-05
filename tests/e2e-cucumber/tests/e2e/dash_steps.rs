@@ -2242,15 +2242,14 @@ async fn approval_preview_quotes_whitespace_root(world: &mut E2eWorld) {
         .join(ADOPT_WHITESPACE_ROOT)
         .canonicalize()
         .unwrap_or_else(|e| panic!("failed to canonicalize the scenario root: {e}"));
-    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`, #500) wraps
-    // any whitespace-containing argument value in a pair of quote characters
-    // with no other transformation (our path has no embedded quote to
-    // escape), so the rendered `--root` argument is this exact string,
-    // quoted. #693's contract is "rendered as one unambiguous, quoted unit" —
-    // not any particular quote character — so this accepts either common
-    // convention rather than pinning the double-quote `quote_display_arg`
-    // happens to use today; a future change to the escaping character alone
-    // should not read as a regression here.
+    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`) wraps any
+    // value that is not one inert word in POSIX single quotes, escaping only
+    // an embedded `'` (our path has none), so the rendered `--root` argument
+    // is this exact string, single-quoted. #500 first introduced it with
+    // double quotes. #693's contract is "rendered as one unambiguous, quoted
+    // unit" — not any particular quote character — so this accepts either
+    // convention; a change to the quote character alone should not read as a
+    // regression here.
     //
     // Deliberately *without* a `--root ` prefix, and matched against
     // `TuiSession::popup_body_text` rather than the raw `screen_text()` grid
