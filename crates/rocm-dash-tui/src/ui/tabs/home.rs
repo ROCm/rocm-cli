@@ -1020,19 +1020,38 @@ mod tests {
     }
 
     #[test]
-    fn hero_keeps_its_readings_in_a_short_terminal() {
-        // A ~22-row terminal leaves the Home tab ~14 rows, which squeezes the
-        // hero card below the six rows its columns ask for. The readings must
-        // still draw (the bottom rows go first), not leave an empty card.
+    fn hero_drops_only_its_lowest_rows_in_a_short_terminal() {
+        // A ~22-row terminal leaves the Home tab fewer rows than the six the
+        // hero's columns ask for. The readings must still draw, and they must
+        // go bottom-first: at every height the visible rows form a prefix of
+        // this list, so one is missing only when all below it are too. That is
+        // the promise docs/manual-testing.md 4c makes, pinned without naming
+        // the height each row happens to appear at (POWER at 13, T/S at 15 —
+        // thresholds that would otherwise drift silently).
         let s = state_with_gpu();
-        for h in 12u16..=18 {
-            let out = render(&s, 72, h);
-            for label in ["GPU UTILIZATION", "VRAM", "TEMP"] {
-                assert!(
-                    out.contains(label),
-                    "{label} missing from the hero at height {h}:\n{out}"
-                );
-            }
+        let top_down = ["VRAM", "TEMP", "POWER", "T/S"];
+        for h in 8u16..=24 {
+            let out = render(&s, 160, h);
+            assert!(
+                out.contains("GPU UTILIZATION"),
+                "the hero must never render as an empty card, at height {h}:\n{out}"
+            );
+            let present: Vec<bool> = top_down.iter().map(|l| out.contains(l)).collect();
+            let kept = present.iter().take_while(|p| **p).count();
+            assert!(
+                present[kept..].iter().all(|p| !*p),
+                "the hero dropped {} but kept a row below it, at height {h}:\n{out}",
+                top_down[kept]
+            );
+        }
+        // Without this the prefix check above would pass on a hero that
+        // renders none of these rows at any height.
+        let roomy = render(&s, 160, 24);
+        for label in top_down {
+            assert!(
+                roomy.contains(label),
+                "{label} missing from a hero with room for it:\n{roomy}"
+            );
         }
     }
 
