@@ -65,6 +65,31 @@ pub fn reported_engine(serve_stdout: &str) -> Option<&str> {
         .filter(|engine| !engine.is_empty())
 }
 
+/// The engine named on a `rocm serve` command line.
+///
+/// Accepts `--engine X` and `--engine=X`. `None` when no engine was requested:
+/// the CLI then picks a default, which only the printed plan reveals (see
+/// [`reported_engine`]).
+#[must_use]
+pub fn engine_from_serve_args<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let value = if let Some(inline) = arg.strip_prefix("--engine=") {
+            Some(inline)
+        } else if arg == "--engine" {
+            args.next()
+        } else {
+            continue;
+        };
+        return value.filter(|engine| !engine.is_empty());
+    }
+    None
+}
+
+/// What a failed serve's report says when no engine could be determined, so a
+/// skipped backend inventory is visible rather than silently absent.
+pub const ENGINE_UNKNOWN_EVIDENCE: &str = "engine unknown: backend evidence skipped";
+
 /// The last `max` lines of `text`.
 fn tail_lines(text: &str, max: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -273,8 +298,9 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, parse_log_path, read_clamped,
-        reported_engine, serve_attempt_report, service_log_tail, slugify, tail_lines,
+        MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, engine_from_serve_args,
+        parse_log_path, read_clamped, reported_engine, serve_attempt_report, service_log_tail,
+        slugify, tail_lines,
     };
 
     const SERVE_PLAN: &str = "\
@@ -293,6 +319,27 @@ managed service launched
         assert_eq!(reported_engine("  engine: lemonade\n"), Some("lemonade"));
         for output in ["", "serve failed", "  engine:   \n"] {
             assert_eq!(reported_engine(output), None);
+        }
+    }
+
+    #[test]
+    fn engine_is_read_from_both_flag_forms_and_absent_otherwise() {
+        assert_eq!(
+            engine_from_serve_args(&["serve", "m", "--engine", "lemonade", "--managed"]),
+            Some("lemonade")
+        );
+        assert_eq!(
+            engine_from_serve_args(&["serve", "m", "--engine=lemonade", "--managed"]),
+            Some("lemonade")
+        );
+        for args in [
+            &["serve", "m", "--managed"][..],
+            &["serve", "m", "--engine"],
+            &["serve", "m", "--engine="],
+            &["serve", "m", "--engine", ""],
+            &["serve", "--engine-version=1"],
+        ] {
+            assert_eq!(engine_from_serve_args(args), None, "{args:?}");
         }
     }
 

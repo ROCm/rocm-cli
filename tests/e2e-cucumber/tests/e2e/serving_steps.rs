@@ -13,7 +13,8 @@ use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, reported_engine, serve_attempt_report, service_log_tail,
+    ENGINE_UNKNOWN_EVIDENCE, ServeAttempt, archive_service_log, engine_from_serve_args,
+    reported_engine, serve_attempt_report, service_log_tail,
 };
 
 /// Model id of the live managed service the reuse scenarios plant.
@@ -140,7 +141,7 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 /// reports the same evidence wherever it happens.
 async fn serve_failure_evidence(
     world: &mut E2eWorld,
-    engine: &str,
+    engine: Option<&str>,
     headline: &str,
     device_state: &str,
     stdout: &str,
@@ -155,8 +156,8 @@ async fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
-    let backend_evidence = if engine == "lemonade" {
-        Some(
+    let backend_evidence = match engine {
+        Some("lemonade") => Some(
             e2e_cucumber::lemonade_diagnostics::backend_evidence(
                 &world
                     .app_paths()
@@ -164,9 +165,9 @@ async fn serve_failure_evidence(
                     .join("runtime.json"),
             )
             .await,
-        )
-    } else {
-        None
+        ),
+        Some(_) => None,
+        None => Some(ENGINE_UNKNOWN_EVIDENCE.to_owned()),
     };
     let stop_status = stop_scenario_services(world);
     serve_attempt_report(&ServeAttempt {
@@ -218,9 +219,7 @@ async fn serve_and_wait(
         "{}",
         serve_failure_evidence(
             world,
-            args.windows(2)
-                .find(|pair| pair[0] == "--engine")
-                .map_or("", |pair| pair[1]),
+            engine_from_serve_args(args).or_else(|| reported_engine(&stdout)),
             &headline,
             &device_state,
             &stdout,
@@ -636,7 +635,7 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         diagnostics.push(
             serve_failure_evidence(
                 world,
-                engine,
+                Some(engine),
                 &format!("attempt {attempt} of {attempts} (rc={rc})"),
                 &device_state,
                 &stdout,
@@ -1012,7 +1011,7 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             "{}",
             serve_failure_evidence(
                 world,
-                reported_engine(&stdout).unwrap_or(""),
+                reported_engine(&stdout),
                 &headline,
                 &device_state,
                 &stdout,

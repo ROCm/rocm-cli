@@ -239,18 +239,21 @@ async fn probe(server: &Path, flag: &str, timeout: Duration) -> String {
         })
         .await
     {
-        format!(
-            "{}\nstdout capture: {stdout_result:?}; stderr capture: {stderr_result:?}",
-            status.map_or_else(|error| error.to_string(), |status| status.to_string())
-        )
+        let mut status = status.map_or_else(|error| error.to_string(), |status| status.to_string());
+        for (stream, result) in [("stdout", stdout_result), ("stderr", stderr_result)] {
+            if let Err(error) = result {
+                let _ = write!(status, "\n{stream} capture failed: {error}");
+            }
+        }
+        status
     } else {
         // kill_on_drop also covers cancellation of the whole reporter.
         // Explicitly wait here so a normal timeout leaves no zombie child.
-        let result = child.kill().await;
-        format!(
-            "probe timed out after {}s; kill/reap: {result:?}",
-            timeout.as_secs_f64()
-        )
+        let mut status = format!("probe timed out after {}s", timeout.as_secs_f64());
+        if let Err(error) = child.kill().await {
+            let _ = write!(status, "; kill/reap failed: {error}");
+        }
+        status
     };
     format!(
         "{status}\nstdout:\n{}{}\nstderr:\n{}{}",
@@ -550,7 +553,12 @@ esac
         assert!(report.contains(&server.display().to_string()), "{report}");
         assert!(report.contains("version: 9752 (fixture-build)"), "{report}");
         assert!(report.contains("version.txt: cached-build"), "{report}");
-        assert!(report.contains("--help:\nexit status: 2"), "{report}");
+        assert!(
+            report.contains("--help:\nexit status: 2\nstdout:"),
+            "{report}"
+        );
+        assert!(!report.contains("capture"), "{report}");
+        assert!(!report.contains("Ok("), "{report}");
         assert!(report.contains("--mmap, --no-mmap"), "{report}");
         assert!(report.contains("fixture help stderr"), "{report}");
         assert!(
@@ -573,7 +581,10 @@ esac
         .unwrap();
         let start = std::time::Instant::now();
         let report = probe(&server, "--help", Duration::from_secs(1)).await;
-        assert!(report.contains("probe timed out after 1s"), "{report}");
+        assert!(
+            report.contains("probe timed out after 1s\nstdout:"),
+            "{report}"
+        );
         assert!(start.elapsed() < Duration::from_secs(5));
         let pid = report
             .split("stdout:\n")

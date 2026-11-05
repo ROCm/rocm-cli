@@ -134,6 +134,10 @@ serve_timeout_secs = 90
 flaky = true
 
 # serve-40 has the same serve precondition; this is not an automation-helper bug.
+# xfail + flaky tolerates either outcome, so on this lane the "no background
+# helper" assertion carries no signal until #897 is closed: a pass here does not
+# show the scenario's own behaviour is healthy, and a failure is not attributed
+# to it. Remove the row once #897 is fixed.
 [["serve-stop-leaves-no-background-helper"]]
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "#897"

@@ -818,8 +818,10 @@ relying on this coverage.
 ### Lemonade managed-serve failure evidence
 
 On a failed serve, the shared serve steps preserve the full service log under
-`service-logs/` in the E2E results artifact before stopping the service. Lemonade
-failures also include the installed runtime manifest's version/backend, configured
+`service-logs/` in the E2E results artifact before stopping the service. The engine
+is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
+neither names one, the report says `engine unknown: backend evidence skipped`.
+Lemonade failures also include the installed runtime manifest's version/backend, configured
 `backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
 and `version.txt`,
 and each candidate's `--version` and `--help` output. At most eight candidates
