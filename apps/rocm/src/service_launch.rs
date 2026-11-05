@@ -25,8 +25,8 @@
 //! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
 //! a re-import in `main.rs`), and `existing_live_managed_service` to
 //! `managed_service_status.rs`. Several functions here are `pub(crate)`
-//! specifically because `main.rs`, `serve_cmd.rs`, and `automations.rs` all
-//! call into this cluster across the new module boundary.
+//! because other modules call into this cluster across the module boundary;
+//! `main.rs` only declares the module.
 
 use std::fmt::Write as _;
 use std::fs;
