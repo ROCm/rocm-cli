@@ -1214,13 +1214,19 @@ jobs:
 
     /// Run `ci.yml`'s E2E "Decide whether to run" step under bash, as a `run:`
     /// step does, with each `${{ … }}` expression replaced by the value given
-    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT`.
+    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT` together
+    /// with what it printed to stdout (where a `::notice::` annotation goes).
     ///
     /// An expression the table does not name fails the test rather than
     /// expanding to nothing, so the gate cannot start reading a new context
     /// that this test silently feeds as empty.
     #[cfg(unix)]
-    fn run_e2e_gate(event: &str, build_and_test: &str, heavy: &str) -> String {
+    fn run_e2e_gate(
+        event: &str,
+        clippy: &str,
+        build_and_test: &str,
+        heavy: &str,
+    ) -> (String, String) {
         let ci = read_workflow("ci.yml");
         let step = job_steps(job_block(&ci, "e2e"))
             .expect("ci.yml's `e2e` job has a `steps:` list")
@@ -1234,6 +1240,7 @@ jobs:
         .expect("the gate step's script is not empty");
         let values = [
             ("github.event_name", event),
+            ("needs.clippy.result", clippy),
             ("needs.build-and-test.result", build_and_test),
             ("needs.changes.outputs.heavy", heavy),
         ];
@@ -1278,7 +1285,10 @@ jobs:
             1,
             "the E2E gate writes `run=` exactly once; wrote {written:?}"
         );
-        runs[0].to_owned()
+        (
+            runs[0].to_owned(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
     }
 
     /// The E2E scenarios run whenever `build-and-test` reached a verdict, not
@@ -1292,7 +1302,9 @@ jobs:
     #[cfg(unix)]
     #[test]
     fn e2e_gate_runs_scenarios_whenever_build_and_test_reached_a_verdict() {
-        // (event, build-and-test result, heavy, expected run=)
+        // (event, build-and-test result, heavy, expected run=); clippy passed
+        // in every case, which `e2e_gate_skips_scenarios_unless_clippy_passed`
+        // varies.
         let cases = [
             ("pull_request", "success", "true", "true"),
             ("pull_request", "failure", "true", "true"),
@@ -1305,11 +1317,67 @@ jobs:
         ];
         for (event, result, heavy, expected) in cases {
             assert_eq!(
-                run_e2e_gate(event, result, heavy),
+                run_e2e_gate(event, "success", result, heavy).0,
                 expected,
                 "ci.yml E2E gate with event={event}, build-and-test={result}, heavy={heavy:?}"
             );
         }
+    }
+
+    /// A lint-red run spends no E2E runner time: the scenarios run only when
+    /// `clippy` succeeded, whatever `build-and-test` did, and the skip says why.
+    ///
+    /// `clippy` is a required check of its own, so a red one blocks the merge
+    /// regardless of E2E. The skipped E2E check then reports green without
+    /// having run a scenario, which is the same shape as a skipped build; the
+    /// `::notice::` the gate prints is what keeps that from being silent. The
+    /// notice's claim that no scenario ran is the `run=false` asserted next to
+    /// it, and `ci_e2e_steps_after_the_gate_follow_its_decision` is what makes
+    /// every later step honour that decision.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_gate_skips_scenarios_unless_clippy_passed() {
+        for event in ["push", "pull_request", "merge_group"] {
+            for build in ["success", "failure"] {
+                for clippy in ["failure", "cancelled", "skipped"] {
+                    let (run, stdout) = run_e2e_gate(event, clippy, build, "true");
+                    assert_eq!(
+                        run, "false",
+                        "{event}: clippy={clippy} must keep the scenarios from running \
+                         (build-and-test={build})"
+                    );
+                    assert!(
+                        stdout.contains("::notice")
+                            && stdout.contains(&format!("result: {clippy}")),
+                        "{event}: skipping on clippy={clippy} must print a notice naming it, \
+                         got {stdout:?}"
+                    );
+                }
+                let (run, stdout) = run_e2e_gate(event, "success", build, "true");
+                assert_eq!(
+                    run, "true",
+                    "{event}: clippy passed, build-and-test={build}"
+                );
+                assert!(
+                    !stdout.contains("::notice"),
+                    "{event}: a passing clippy must not print the skip notice, got {stdout:?}"
+                );
+            }
+            // A change with no heavy work has no E2E work to skip, so the clippy
+            // notice would be noise: it is for the run that would have run.
+            for clippy in ["success", "failure"] {
+                let (run, stdout) = run_e2e_gate(event, clippy, "success", "false");
+                assert_eq!(run, "false", "{event}: clippy={clippy}, no heavy change");
+                assert!(
+                    !stdout.contains("::notice"),
+                    "{event}: no heavy change, clippy={clippy}: no notice expected, got {stdout:?}"
+                );
+            }
+        }
+        // `clippy` skips itself on a dispatch, which opens the gate regardless.
+        let (run, stdout) = run_e2e_gate("workflow_dispatch", "skipped", "skipped", "");
+        assert_eq!(run, "true", "a dispatch ignores clippy");
+        assert!(!stdout.contains("::notice"), "dispatch: got {stdout:?}");
     }
 
     /// The runner image a hosted Linux job's caches must be keyed by, as it
@@ -5344,10 +5412,12 @@ fi
 
     /// The other half of the ordering above: with `clippy` no longer ahead of
     /// `build-and-test`, a clippy-red run reaches the E2E job, so what keeps a
-    /// failed or skipped build from being read as a pass is the E2E job's own
-    /// gate. The job must need `build-and-test`, and every step after the gate step
-    /// must follow the gate's decision. What the gate decides is checked by
-    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict`.
+    /// lint-red, failed or skipped run from being read as a pass is the E2E job's
+    /// own gate. The job must need `clippy` and `build-and-test`, the two results
+    /// the gate reads, and every step after the gate step must follow the gate's
+    /// decision. What the gate decides is checked by
+    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict` and
+    /// `e2e_gate_skips_scenarios_unless_clippy_passed`.
     #[test]
     fn ci_e2e_steps_after_the_gate_follow_its_decision() {
         let ci = read_workflow("ci.yml");
@@ -5355,8 +5425,10 @@ fi
         let needs = yaml_value_at(&e2e, 4, "needs").expect("e2e declares `needs:`");
         assert_eq!(
             flattened_list_items(&needs),
-            ["changes", "build-and-test"],
-            "the e2e job must need `build-and-test`, which it consumes"
+            ["changes", "clippy", "build-and-test"],
+            "the e2e job must need `clippy` and `build-and-test`, which its gate reads; \
+             without `clippy` in `needs:` the gate's clippy result is empty and a lint-red \
+             run would be skipped, or run, by accident"
         );
         let steps = job_steps(&e2e).expect("e2e has steps");
         let gate_at = steps
@@ -5395,8 +5467,11 @@ fi
             .expect("e2e has a gate step named `Decide whether to run`");
         let script = preflight_body_code(&gate.1);
         let run = |event: &str, build: &str, heavy: &str| -> String {
+            // `clippy` passed throughout; `e2e_gate_skips_scenarios_unless_clippy_passed`
+            // varies it.
             let script = script
                 .replace("${{ github.event_name }}", event)
+                .replace("${{ needs.clippy.result }}", "success")
                 .replace("${{ needs.build-and-test.result }}", build)
                 .replace("${{ needs.changes.outputs.heavy }}", heavy);
             assert!(
