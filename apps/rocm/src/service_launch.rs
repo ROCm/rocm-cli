@@ -55,12 +55,13 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_hints;
 #[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
 use crate::services_text::{
     render_service_action_result, render_service_action_result_with_helper_note,
-    run_internal_sandbox_tool, service_stop_unconfirmed,
+    service_stop_unconfirmed,
 };
 use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 

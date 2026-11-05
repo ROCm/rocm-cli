@@ -915,7 +915,6 @@ cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_key_includes_version_for_side_by_side_installs
 cargo test -p rocm --bin rocm engine_plugin
-cargo test -p rocm --bin rocm missing_packaged_engine_reason
 cargo test -p rocm --bin rocm model_registry
 cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
@@ -1630,7 +1629,7 @@ also must exit non-zero when their DLL is missing, fix-15 in
 `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
 that only `rocm diagnose` prints
 (`the_igpu_verify_pins_the_variable_it_names` in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
 (`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
@@ -1657,7 +1656,7 @@ in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
 the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
 Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
 GPU or not, and are skipped on Windows. The arms are also checked against the
-catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 (`the_override_fix_verify_matches_the_catalog_copy`,
 `the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
 `the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
@@ -1757,7 +1756,12 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper).
+(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
+that runs it with lemonade it is an expected failure in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
+serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
+the row also matches other Linux lemonade hosts, where a pass is tolerated).
 
 Natural-language plan handoff tests:
 
@@ -2700,8 +2704,10 @@ On a machine whose runtime is older than 14.40, `diagnose` reports
 and runs nothing: the update needs the Windows administrator prompt. After the
 update, the plan's verify command prints the new version.
 
-The version comparison and the symptom keywords are covered by unit tests in
-`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+The version comparison is covered by unit tests in
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs), and the
+symptom keywords by `outdated_runtime_symptom_keywords_score_honestly` in
+[scoring.rs](../crates/rocm-core/src/diagnose/scoring.rs). No end-to-end scenario drives this check, because the e2e suite
 cannot give a Linux host a Windows runtime: the check is gated to Windows. The
 catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
 scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
@@ -2750,7 +2756,7 @@ just because no HIP SDK is installed — has no Linux end-to-end coverage.
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs)
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
 `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
 and their neighbours) and by the Windows manual check in
