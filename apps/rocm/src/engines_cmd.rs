@@ -2,26 +2,22 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm engines` command handlers and env-root/runtime resolution.
+//! `rocm engines` command handlers.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`engines(command)`,
-//! re-imported via `use crate::engines_cmd::{engine_manages_own_runtime,
-//! engines, env_root_for_engine_install, env_root_for_service,
-//! runtime_key_for_python, runtime_manifest_for_selector};`). `EnginesCommand`
+//! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
 //! lives in `cli.rs` and is reached via `use crate::EnginesCommand`, a
 //! re-import in `main.rs`;
-//! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
-//! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
-//! only caller is `serve_cmd.rs`; `env_root_for_service` and
-//! `runtime_key_for_python` are used only from other root-level commands in
-//! `main.rs`, while `env_root_for_engine_install` and
-//! `runtime_manifest_for_selector` are also called within this file, in
-//! addition to other root-level commands in `main.rs`; all four stay
-//! `pub(crate)` rather than private.
-//! `render_engine_inventory_text` is also `pub(crate)`, but its caller is an
-//! exception to the others: its only caller is `engines()` in this same
-//! file, not `main.rs`.
+//! `Cli` is not referenced from this file.
+//!
+//! Which runtime an engine installs into and where its environment lives is
+//! answered in `engine_install_env.rs`, which this module imports from;
+//! `runtime_install_finalize.rs` imports from it too, so neither of the two
+//! imports the other for those helpers. `ensure_self_managed_engine_ready` and
+//! `env_root_for_service` stay here and are `pub(crate)` for their callers in
+//! other modules. `render_engine_inventory_text` is `pub(crate)` too, but is
+//! called only from `engines()` in this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,6 +35,10 @@ use rocm_engine_protocol::{
 use serde::Deserialize;
 
 use crate::EnginesCommand;
+use crate::engine_install_env::{
+    engine_manages_own_runtime, env_root_for_engine_install, env_root_for_runtime,
+    env_root_for_self_managed_engine,
+};
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
 use crate::engine_runtime_select::{
     apply_app_path_env, resolve_engine_selection, resolve_runtime_selector_to_exact_key,
@@ -48,11 +48,7 @@ use crate::runtime_install_finalize::{
     ensure_libatomic_for_torch, ensure_libnuma_for_torch, ensure_openmpi_for_vllm,
     settle_engine_install,
 };
-use crate::runtimes_cmd::{
-    normalize_path_for_compare, recover_setup_runtime_registration, select_runtime_manifest,
-    validate_runtime_manifest_for_activation,
-};
-use crate::therock;
+use crate::runtimes_cmd::normalize_path_for_compare;
 use crate::{
     GatedEngineAction, ensure_engine_allowed_on_platform, record_cli_audit_event,
     render_engine_inventory_text_with_paths,
@@ -183,136 +179,6 @@ fn resolve_engine_install_runtime_id(
         );
     };
     resolve_runtime_selector_to_exact_key(paths, &selector, "engine install runtime selection")
-}
-
-pub(crate) fn engine_manages_own_runtime(engine: &str) -> bool {
-    engine == "lemonade" || engine == "aim"
-}
-
-fn env_root_for_runtime(
-    paths: &AppPaths,
-    engine: &str,
-    runtime_id: &str,
-) -> Result<Option<PathBuf>> {
-    if engine_manages_own_runtime(engine) {
-        return Ok(None);
-    }
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let manifest = select_runtime_manifest(&manifests, runtime_id)?;
-    Ok(Some(manifest.install_root.join("engines")))
-}
-
-pub(crate) fn env_root_for_engine_install(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    engine: &str,
-    runtime_id: &str,
-) -> Result<Option<PathBuf>> {
-    if engine_manages_own_runtime(engine) {
-        return env_root_for_self_managed_engine(paths, config, engine);
-    }
-    env_root_for_runtime(paths, engine, runtime_id)
-}
-
-/// Only `lemonade` installs into a therock-managed Python runtime; `aim` runs
-/// entirely in Docker and has no env root to match against. Answering `None`
-/// for it here (rather than returning whatever unrelated runtime happens to
-/// be active) keeps `detect_runtime_matches_env_root` from failing aim's
-/// Detect response for a reason that has nothing to do with aim.
-fn env_root_for_self_managed_engine(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    engine: &str,
-) -> Result<Option<PathBuf>> {
-    if engine != "lemonade" {
-        return Ok(None);
-    }
-    recover_setup_runtime_registration(paths, config)?;
-    let manifests = therock::load_runtime_manifests(paths)?;
-    for selector in [
-        config.active_runtime_key.as_deref(),
-        config.default_runtime_id.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(manifest) = runtime_manifest_for_selector(&manifests, selector) {
-            return Ok(Some(manifest.install_root.join("engines")));
-        }
-    }
-    let ready = manifests
-        .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
-        .collect::<Vec<_>>();
-    Ok(match ready.as_slice() {
-        [manifest] => Some(manifest.install_root.join("engines")),
-        _ => None,
-    })
-}
-
-pub(crate) fn runtime_manifest_for_selector<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    selector: &str,
-) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests
-        .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-        .or_else(|| {
-            let mut matches = manifests
-                .iter()
-                .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector));
-            let first = matches.next()?;
-            if matches.next().is_none() {
-                Some(first)
-            } else {
-                None
-            }
-        })
-}
-
-/// The `runtime_key` of the runtime whose install root contains `python`.
-pub(crate) fn runtime_key_for_python(paths: &AppPaths, python: &Path) -> Option<String> {
-    let manifests = therock::load_runtime_manifests(paths).ok()?;
-    runtime_key_owning_python(&manifests, python).map(str::to_owned)
-}
-
-/// Which runtime owns an interpreter, decided by install root.
-///
-/// Split from the registry read so the decision can be tested without a
-/// registry on disk, matching `sdk_torch_build_from_manifest`.
-///
-/// `runtime_id` cannot answer this: it is shared by every side-by-side install
-/// of one channel and family, which is exactly the situation an engine install
-/// has to be attributed in. An install root contains one runtime by
-/// construction, so the interpreter's path settles it.
-///
-/// Both sides are compared verbatim *and* canonicalized. The CLI writes
-/// `install_root` canonicalized while an engine adapter reports back whatever
-/// path it was handed, and comparing a single form makes ownership fail
-/// silently on a symlinked runtimes directory. Roots can nest, so the longest
-/// containing root wins.
-fn runtime_key_owning_python<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    python: &Path,
-) -> Option<&'a str> {
-    fn both_forms(path: &Path) -> Vec<PathBuf> {
-        let verbatim = path.to_path_buf();
-        match path.canonicalize() {
-            Ok(resolved) if resolved != verbatim => vec![verbatim, resolved],
-            _ => vec![verbatim],
-        }
-    }
-
-    let pythons = both_forms(python);
-    manifests
-        .iter()
-        .filter(|manifest| {
-            both_forms(&manifest.install_root)
-                .iter()
-                .any(|root| pythons.iter().any(|python| python.starts_with(root)))
-        })
-        .max_by_key(|manifest| manifest.install_root.as_os_str().len())
-        .map(|manifest| manifest.runtime_key.as_str())
 }
 
 pub(crate) fn env_root_for_service(
@@ -743,30 +609,7 @@ fn load_engine_env_manifest(
 mod tests {
     use super::*;
     use crate::test_support::write_test_pip_runtime;
-    use crate::tests::{test_paths, test_runtime_manifest_for_update};
-
-    /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
-    ///
-    /// They differ in `runtime_key`, `version` and install root, and share one
-    /// `runtime_id` — that is what the field means, so this is not a corrupt
-    /// registry.
-    fn side_by_side_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
-        let mut older = test_runtime_manifest_for_update(
-            "release-wheel-gfx94x-dcgpu-7-13-0",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.13.0",
-        );
-        older.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0");
-        let mut newer = test_runtime_manifest_for_update(
-            "release-wheel-gfx94x-dcgpu-7-14-0",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.14.0",
-        );
-        newer.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
-        vec![older, newer]
-    }
+    use crate::tests::test_paths;
 
     #[test]
     fn engine_install_runtime_selection_requires_configured_runtime() -> Result<()> {
@@ -805,51 +648,6 @@ mod tests {
             )?,
             "release-pip-gfx120x-all"
         );
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn env_root_for_runtime_uses_runtime_install_root() -> Result<()> {
-        let (root, paths) = test_paths("engine-env-root-runtime");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            1,
-        )?;
-
-        let engine_root = env_root_for_runtime(&paths, "vllm", &manifest.runtime_key)?;
-
-        assert_eq!(engine_root, Some(manifest.install_root.join("engines")));
-        assert_eq!(
-            env_root_for_runtime(&paths, "lemonade", &manifest.runtime_key)?,
-            None
-        );
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn env_root_for_engine_install_uses_active_runtime_root_for_lemonade() -> Result<()> {
-        let (root, paths) = test_paths("lemonade-engine-env-root-runtime");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            1,
-        )?;
-        let config = RocmCliConfig {
-            active_runtime_key: Some(manifest.runtime_key.clone()),
-            ..RocmCliConfig::default()
-        };
-
-        let engine_root =
-            env_root_for_engine_install(&paths, &config, "lemonade", "lemonade-embeddable")?;
-
-        assert_eq!(engine_root, Some(manifest.install_root.join("engines")));
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -897,74 +695,6 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
-    }
-
-    /// The interpreter names its runtime where the shared `runtime_id` cannot.
-    ///
-    /// This is the cross-wiring that settled the active runtime's torch into an
-    /// older runtime's environment: the engine's env id drops the version, so
-    /// the environment belongs to 7.13.0 while the caller's selector says only
-    /// "release, gfx94X-dcgpu". Resolving by install root has to pick 7.13.0.
-    #[test]
-    fn the_runtime_is_resolved_by_its_interpreter_not_the_shared_runtime_id() {
-        let manifests = side_by_side_runtimes();
-
-        assert_eq!(
-            runtime_manifest_for_selector(&manifests, "therock-release:gfx94X-dcgpu")
-                .map(|manifest| manifest.runtime_key.as_str()),
-            None,
-            "the shared runtime_id names two runtimes, so a selector cannot resolve it"
-        );
-        assert_eq!(
-            runtime_key_owning_python(
-                &manifests,
-                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0/bin/python3"),
-            ),
-            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
-            "the interpreter's install root names the runtime being settled"
-        );
-    }
-
-    /// An interpreter outside every install root leaves the caller's selector alone.
-    ///
-    /// External and self-managed environments live outside the registry, and
-    /// inventing an owner for them would settle a runtime nobody asked about.
-    #[test]
-    fn an_interpreter_outside_every_install_root_owns_nothing() {
-        assert_eq!(
-            runtime_key_owning_python(
-                &side_by_side_runtimes(),
-                Path::new("/opt/somewhere-else/bin/python3"),
-            ),
-            None
-        );
-    }
-
-    /// A prefix match alone is ambiguous once roots nest, so the longest wins.
-    #[test]
-    fn the_longest_containing_install_root_owns_the_interpreter() {
-        let mut outer = test_runtime_manifest_for_update(
-            "outer",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.13.0",
-        );
-        outer.install_root = PathBuf::from("/runtimes");
-        let mut inner = test_runtime_manifest_for_update(
-            "inner",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.14.0",
-        );
-        inner.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
-
-        assert_eq!(
-            runtime_key_owning_python(
-                &[outer, inner],
-                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0/bin/python3"),
-            ),
-            Some("inner")
-        );
     }
 
     #[test]

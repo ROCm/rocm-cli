@@ -317,8 +317,8 @@ mod tests {
         assert!(collector.fetch_stats().await.is_err());
     }
 
-    /// Integration-gated: scrape a REAL local Lemonade server (start it first via
-    /// `rocm skill run install-lemonade --apply`). Not run in CI.
+    /// Integration-gated: scrape a REAL local Lemonade server (install the engine
+    /// with `rocm engines install lemonade` and start it first). Not run in CI.
     #[tokio::test]
     #[ignore = "requires a running Lemonade server on :13305"]
     async fn live_lemonade_scrape_produces_instance() {
