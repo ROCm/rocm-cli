@@ -724,6 +724,7 @@ mod tests {
                 gpu_utilization_pct: 62.0,
                 temperature_c: 51.0,
                 power_w: 420.0,
+                power_limit_w: None,
                 clock_mhz: Some(2100.0),
             }],
             gpu_system_info: Some(GpuSystemInfo {
@@ -785,6 +786,7 @@ mod tests {
                 gpu_utilization_pct: 0.0,
                 temperature_c: 0.0,
                 power_w: 0.0,
+                power_limit_w: None,
                 clock_mhz: None,
             }],
             gpu_system_info: None,
@@ -837,6 +839,7 @@ mod tests {
                 gpu_utilization_pct: 12.0,
                 temperature_c: 0.0,
                 power_w: 0.0,
+                power_limit_w: None,
                 clock_mhz: None,
             }],
             gpu_system_info: Some(GpuSystemInfo {
@@ -978,6 +981,7 @@ mod tests {
                 gpu_utilization_pct: 0.5,
                 temperature_c: 0.0,
                 power_w: 0.0,
+                power_limit_w: None,
                 clock_mhz: None,
             }],
             ..Default::default()
@@ -995,6 +999,7 @@ mod tests {
             gpu_utilization_pct: 0.0,
             temperature_c: 0.0,
             power_w: 0.0,
+            power_limit_w: None,
             clock_mhz: None,
         };
         let snap = Snapshot {

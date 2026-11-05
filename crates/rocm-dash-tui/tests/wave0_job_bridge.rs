@@ -216,7 +216,7 @@ fn approval_snapshot_quotes_args_containing_spaces() {
     });
 
     assert!(
-        out.contains("--prefix \"/mnt/my folder\""),
+        out.contains("--prefix '/mnt/my folder'"),
         "space-containing arg is rendered quoted:\n{out}"
     );
 }
@@ -238,7 +238,7 @@ fn job_console_snapshot_quotes_args_containing_spaces() {
     });
 
     assert!(
-        out.contains("\"/mnt/my folder\""),
+        out.contains("'/mnt/my folder'"),
         "space-containing arg is rendered quoted:\n{out}"
     );
 }

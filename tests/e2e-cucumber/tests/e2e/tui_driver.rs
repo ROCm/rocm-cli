@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,7 @@ use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
+use e2e_cucumber::terminal_size::non_zero_dimensions;
 
 use crate::E2eWorld;
 
@@ -60,6 +62,18 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+
+/// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
+/// stay `u16` because `PtySize` takes that. A zero here fails the build.
+const VT_ROWS: NonZeroU16 = NonZeroU16::new(ROWS).expect("ROWS must be non-zero");
+const VT_COLS: NonZeroU16 = NonZeroU16::new(COLS).expect("COLS must be non-zero");
+
+/// `(rows, cols)` of `screen` as plain `u16`s. Read the size through this, not
+/// `Screen::size`, which returns `NonZeroU16`s.
+fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get())
+}
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -339,7 +353,7 @@ impl TuiSession {
             .take_writer()
             .map_err(|e| reap_orphan(format!("failed to take pty writer: {e}")))?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(VT_ROWS, VT_COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
         let reader = spawn_reader(
@@ -427,7 +441,7 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = p.screen();
-        let (_, cols) = screen.size();
+        let (_, cols) = screen_size(screen);
         screen
             .rows(0, cols)
             .enumerate()
@@ -457,7 +471,7 @@ impl TuiSession {
             .parser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (p.screen().contents(), p.screen().size())
+        (p.screen().contents(), screen_size(p.screen()))
     }
 
     fn framed_screen(&self) -> String {
@@ -632,6 +646,9 @@ impl TuiSession {
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        // Validate before resizing the PTY so a zero dimension fails cleanly
+        // instead of leaving the PTY and the emulated screen at different sizes.
+        let (vt_rows, vt_cols) = non_zero_dimensions(rows, cols)?;
         let size = PtySize {
             rows,
             cols,
@@ -648,7 +665,7 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
-            .set_size(rows, cols);
+            .set_size(vt_rows, vt_cols);
         Ok(())
     }
 

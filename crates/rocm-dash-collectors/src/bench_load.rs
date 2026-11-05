@@ -542,10 +542,9 @@ fn prom_latency(
 /// ever handled — earlier ramp cells and other clients included — so writing it
 /// into this cell's immutable CSV row would describe a different population than
 /// the row names, with nothing to flag it. A blank column therefore honestly
-/// means "not measured for this cell". (This is narrower than the telemetry
-/// daemon's `avg_ms_from_histogram`, which *does* fall back: it is a repeated
-/// live poll with a rolling baseline that self-corrects on the next tick and
-/// persists nothing, so the trade-offs differ.)
+/// means "not measured for this cell". (The telemetry daemon's live TTFT/TPOT
+/// follow the same rule: only a window with new requests yields a value, and
+/// it is held for a bounded time and then cleared.)
 fn latency_ms(
     sum_before: Option<f64>,
     count_before: Option<f64>,

@@ -39,6 +39,7 @@ fn synthetic_snapshot() -> Snapshot {
             gpu_utilization_pct: 66.0,
             temperature_c: 61.0,
             power_w: 410.0,
+            power_limit_w: None,
             clock_mhz: Some(2050.0),
         }],
         gpu_system_info: Some(GpuSystemInfo {

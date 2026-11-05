@@ -222,7 +222,9 @@ mod tests {
 
         assert!(action.has_placeholders);
         assert!(error.contains("placeholder values"));
-        assert!(error.contains("rocm serve <model>"));
+        // Quoted: `<` and `>` are redirects, so an unquoted placeholder would
+        // read as a redirect rather than as the value the operator must supply.
+        assert!(error.contains("rocm serve '<model>'"), "{error}");
     }
 
     #[test]
@@ -279,7 +281,7 @@ mod tests {
         assert_eq!(
             freeform_planner::format_structured_tool_call("rocm", &action.args),
             "rocm install sdk --channel nightly --format wheel --prefix \
-             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
+             'D:\\ROCm\\therock_venvs' --approve-replacing-active-default"
         );
         // The narrow flag, never `--yes`: this surface has no terminal promise to
         // make about a sudo password prompt for system packages.

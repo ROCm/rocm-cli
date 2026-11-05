@@ -11294,7 +11294,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - vt100 0.16.2 <https://github.com/doy/vt100-rust>
+  - vt100 0.18.1 <https://github.com/doy/vt100-rust>
 
 The MIT License (MIT)
 

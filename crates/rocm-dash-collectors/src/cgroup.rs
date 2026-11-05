@@ -40,6 +40,15 @@ pub fn parse_container_id_from_cgroup(contents: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether `id` has the shape [`parse_container_id_from_cgroup`] produces.
+///
+/// That shape is 64 lowercase-hex characters. A managed `rocm serve` service is named by its
+/// service id, which never has this shape, so it can never be a key of the
+/// per-container VRAM map built from `/proc/<pid>/cgroup`.
+pub fn is_container_id(id: &str) -> bool {
+    id.len() == 64 && id.chars().all(is_lower_hex)
+}
+
 /// Resolve the docker container id owning host process `pid` by reading `/proc/<pid>/cgroup`.
 ///
 /// Returns `None` on any read error (process gone,
@@ -117,6 +126,17 @@ mod tests {
             parse_container_id_from_cgroup("0::/short/0123456789abcdef0123456789abcdef\n"),
             None
         );
+    }
+
+    #[test]
+    fn is_container_id_accepts_only_the_cgroup_join_shape() {
+        assert!(is_container_id(ID));
+        assert!(!is_container_id(
+            "vllm-qwen-qwen2-5-0-5b-instru-1793361705247"
+        ));
+        assert!(!is_container_id(&ID.to_uppercase()));
+        assert!(!is_container_id(&ID[..63]));
+        assert!(!is_container_id(""));
     }
 
     #[test]

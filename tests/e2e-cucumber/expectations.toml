@@ -32,16 +32,31 @@
 #
 # An empty `when = {}` means "always xfail" (platform-independent bug).
 
-# --- EAI-7219: short-name expansion not surfaced in serve output (any engine) ---
+# --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
+# What the lane logs show, so the scope below is not read as more than it is:
+# lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
+# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
+# stopped before it printed a serve plan, so the plan's name line was never
+# reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
+# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
+# shown it. The steps used to discard stderr, so the cause of the empty stdout was
+# not known. The first lane run that reported it (run 41811714290: Strix Halo
+# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
+# runtime is configured", before any alias handling, so on those lanes the rows are
+# red for a missing runtime and not for this bug. On native Windows the stop is the
+# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# The rows keep their all-hosts scope until the scenarios get a managed runtime or
+# are gated on the engine and the rows are narrowed to the real bug; their reasons
+# name both shapes so neither becomes a false claim.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
-reason = "Serve output does not surface the expanded full model name for a short name."
+reason = "A vLLM serve of a short name shows no expanded full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "Engines do not report a consistent resolved model name for a short name."
+reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
 # EAI-7423 was INTERMITTENT on Strix Halo Ubuntu as of 2026-08-05, not fixed:
 # which of its scenarios pass varied run to run (run 30995473578: 2 XPASS; run

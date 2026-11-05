@@ -291,6 +291,7 @@ mod tests {
                 gpu_utilization_pct: 50.0,
                 temperature_c: 55.0,
                 power_w: 300.0,
+                power_limit_w: None,
                 clock_mhz: Some(2000.0),
             }],
             ..Default::default()
