@@ -3,13 +3,54 @@
 // SPDX-License-Identifier: MIT
 
 //! Scroll state: the job-console, log-dock, chat and instance-detail scroll
-//! offsets, and recording the scrollbar tracks a mouse grab resolves against.
+//! offsets (clamped through the shared `ScrollState`), and recording the
+//! scrollbar tracks a mouse grab resolves against.
 //!
 //! A further `impl AppState` block, split out of `app/mod.rs` to keep the core
 //! reducer focused. Deliberately not named `scrollbar`: `app/scrollbar.rs` is
 //! the mouse hit-testing module, and `actions.rs` must never name that token.
 
 use super::{AppState, ScrollDrag, ScrollTarget, ScrollbarHandle};
+
+/// A scroll offset together with the largest offset it may take.
+///
+/// The one place the "add a signed delta, clamp into `[0, max]`, saturate to
+/// `u16`" arithmetic lives, so the job console (both axes), the LOGS dock and
+/// the instance Detail modal clamp identically. It is a short-lived value:
+/// `AppState` keeps its plain `u16` offsets (the renderer and the scrollbar
+/// hit-testing read those directly), and the scroll methods below build a
+/// `ScrollState` from the stored offset and the bound they currently know,
+/// call [`ScrollState::scroll_by`], then store `pos` back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScrollState {
+    /// Current offset, in lines (or columns for a horizontal axis).
+    pub(crate) pos: u16,
+    /// Largest offset `scroll_by` will produce.
+    pub(crate) max: u16,
+}
+
+impl ScrollState {
+    pub(crate) const fn new(pos: u16, max: u16) -> Self {
+        Self { pos, max }
+    }
+
+    /// Like [`ScrollState::new`] for a bound computed as a `usize` content
+    /// length; a bound beyond `u16::MAX` saturates to it, the same ceiling a
+    /// `u16` offset saturates to.
+    pub(crate) fn capped_at(pos: u16, max: usize) -> Self {
+        Self::new(pos, u16::try_from(max).unwrap_or(u16::MAX))
+    }
+
+    /// Move by `delta` (negative = toward 0), landing in `[0, max]`. An offset
+    /// already past `max` (content shrank since it was set) is pulled back to
+    /// `max`. A delta larger than the remaining distance stops at `0`/`max`
+    /// instead of overflowing, so `i16::MIN`/`i16::MAX` ("jump to start/end")
+    /// reach the ends for any range of up to 32767 lines.
+    pub(crate) fn scroll_by(&mut self, delta: i16) {
+        let next = (i32::from(self.pos) + i32::from(delta)).clamp(0, i32::from(self.max));
+        self.pos = u16::try_from(next).unwrap_or(u16::MAX);
+    }
+}
 
 impl AppState {
     /// Pan the active job console. `dv`/`dh` are line/column deltas (negative =
@@ -19,7 +60,6 @@ impl AppState {
     pub(crate) fn scroll_console(&mut self, dv: i16, dh: i16) {
         let job = self.active_job_id().and_then(|id| self.jobs.job(id));
         let max_v = job.map_or(0, |j| j.output.len().saturating_sub(1));
-        let max_v = i32::try_from(max_v).unwrap_or(i32::MAX);
         let max_h = job.map_or(0, |j| {
             j.output
                 .iter()
@@ -28,13 +68,12 @@ impl AppState {
                 .unwrap_or(0)
                 .saturating_sub(1)
         });
-        let max_h = i32::try_from(max_h).unwrap_or(i32::MAX);
-        let v = u16::try_from((i32::from(self.console_scroll) + i32::from(dv)).clamp(0, max_v))
-            .unwrap_or(u16::MAX);
-        let h = u16::try_from((i32::from(self.console_hscroll) + i32::from(dh)).clamp(0, max_h))
-            .unwrap_or(u16::MAX);
-        self.console_scroll = v;
-        self.console_hscroll = h;
+        let mut v = ScrollState::capped_at(self.console_scroll, max_v);
+        let mut h = ScrollState::capped_at(self.console_hscroll, max_h);
+        v.scroll_by(dv);
+        h.scroll_by(dh);
+        self.console_scroll = v.pos;
+        self.console_hscroll = h.pos;
     }
 
     /// Total log lines the wide-layout LOGS dock aggregates across all jobs.
@@ -50,10 +89,12 @@ impl AppState {
         let cap = self
             .last_dock_area
             .map_or(0, |r| r.height.saturating_sub(3) as usize);
-        let max = i32::try_from(self.dock_logs_total().saturating_sub(cap)).unwrap_or(i32::MAX);
-        self.dock_logs_scroll =
-            u16::try_from((i32::from(self.dock_logs_scroll) + i32::from(dv)).clamp(0, max))
-                .unwrap_or(u16::MAX);
+        let mut scroll = ScrollState::capped_at(
+            self.dock_logs_scroll,
+            self.dock_logs_total().saturating_sub(cap),
+        );
+        scroll.scroll_by(dv);
+        self.dock_logs_scroll = scroll.pos;
     }
 
     /// Apply an absolute chat offset against the latest measured viewport and
@@ -123,17 +164,79 @@ impl AppState {
     /// `0`/`instance_detail_max_scroll` instead of overflowing into an offset
     /// far past the real content length.
     pub fn scroll_instance_detail(&mut self, delta: i16) {
-        let cur = i32::from(self.instance_detail_scroll);
-        let max = i32::from(self.instance_detail_max_scroll);
-        let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
-        self.instance_detail_scroll = next;
+        let mut scroll =
+            ScrollState::new(self.instance_detail_scroll, self.instance_detail_max_scroll);
+        scroll.scroll_by(delta);
+        self.instance_detail_scroll = scroll.pos;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ScrollState;
     use crate::app::test_support::st;
     use ratatui::layout::Rect;
+
+    fn scrolled(pos: u16, max: u16, delta: i16) -> u16 {
+        let mut s = ScrollState::new(pos, max);
+        s.scroll_by(delta);
+        s.pos
+    }
+
+    #[test]
+    fn scroll_state_moves_within_bounds() {
+        assert_eq!(scrolled(3, 10, 4), 7);
+        assert_eq!(scrolled(7, 10, -4), 3);
+        assert_eq!(scrolled(3, 10, 0), 3, "zero delta is a no-op");
+    }
+
+    #[test]
+    fn scroll_state_clamps_at_zero() {
+        assert_eq!(scrolled(3, 10, -4), 0, "overshoot up clamps to 0");
+        assert_eq!(scrolled(0, 10, -1), 0, "already at 0 stays at 0");
+    }
+
+    #[test]
+    fn scroll_state_clamps_at_max() {
+        assert_eq!(scrolled(8, 10, 5), 10, "overshoot down clamps to max");
+        assert_eq!(scrolled(10, 10, 1), 10, "already at max stays at max");
+        assert_eq!(scrolled(0, 0, 5), 0, "zero max pins to 0");
+        assert_eq!(scrolled(0, 0, -5), 0);
+    }
+
+    #[test]
+    fn scroll_state_pulls_a_stale_offset_back_to_max() {
+        // The content shrank after the offset was set: even a no-op or an
+        // upward nudge that stays past `max` lands on `max`.
+        assert_eq!(scrolled(50, 10, 0), 10);
+        assert_eq!(scrolled(50, 10, -5), 10);
+        assert_eq!(scrolled(50, 10, -45), 5, "a move back inside max is kept");
+    }
+
+    #[test]
+    fn scroll_state_large_deltas_land_exactly_on_the_ends() {
+        assert_eq!(scrolled(4, 9, i16::MAX), 9, "jump to end");
+        assert_eq!(scrolled(4, 9, i16::MIN), 0, "jump to start");
+        assert_eq!(scrolled(u16::MAX, u16::MAX, i16::MIN), 32_767);
+    }
+
+    #[test]
+    fn scroll_state_saturates_at_the_u16_ceiling() {
+        assert_eq!(scrolled(u16::MAX, u16::MAX, i16::MAX), u16::MAX);
+        assert_eq!(scrolled(u16::MAX - 1, u16::MAX, 5), u16::MAX);
+        assert_eq!(scrolled(u16::MAX, u16::MAX, 0), u16::MAX);
+    }
+
+    #[test]
+    fn scroll_state_capped_at_saturates_an_oversized_bound() {
+        let mut s = ScrollState::capped_at(0, usize::MAX);
+        assert_eq!(s.max, u16::MAX, "bound saturates to the u16 ceiling");
+        s.scroll_by(i16::MAX);
+        s.scroll_by(i16::MAX);
+        s.scroll_by(i16::MAX);
+        assert_eq!(s.pos, u16::MAX, "offset saturates rather than wrapping");
+        assert_eq!(ScrollState::capped_at(2, 7), ScrollState::new(2, 7));
+    }
 
     #[test]
     fn scroll_dock_clamps_against_buffer() {
