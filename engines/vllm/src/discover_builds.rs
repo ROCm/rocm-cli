@@ -50,7 +50,7 @@ impl DiscoverVersion {
 /// A ROCm SDK version whose vLLM/flash-attn/amd-aiter wheels aren't published
 /// under a fixed filename (AMD rotates the dev-tag suffix constantly), so the
 /// exact wheel must be discovered from the index at install time instead of
-/// pinned in [`VLLM_ROCM_BUILD_TABLE`].
+/// pinned in `wheel_builds::VLLM_ROCM_BUILD_TABLE`.
 pub(crate) struct VllmRocmDiscoverBuild {
     pub(crate) rocm_sdk_version: &'static str,
     /// PEP 425 interpreter tag this row's wheels are published for. AMD builds
@@ -84,7 +84,7 @@ pub(crate) struct VllmRocmDiscoverBuild {
     ///
     /// An [`DiscoverVersion::Exact`] torchaudio is also the hardware-verified
     /// build for the row's ROCm line, and `rocm install sdk` pins it too, via
-    /// [`verified_torchaudio_release`]: set one only for a build confirmed to
+    /// [`verified_torchaudio_release`](crate::wheel_builds::verified_torchaudio_release): set one only for a build confirmed to
     /// load against the row's torch on real hardware, never as a guess.
     pub(crate) torchaudio_version: DiscoverVersion,
 }
