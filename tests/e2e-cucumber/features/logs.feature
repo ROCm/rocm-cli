@@ -24,3 +24,13 @@ Feature: Log inspection
     Given recorded command logs containing several lines about a topic
     When the user asks for one service's logs and a search term together
     Then the CLI refuses and explains only one may be used
+
+  # A log is read as text but a stray byte that is not valid text must not hide
+  # the readable lines around it: the view decodes it lossily and the search
+  # still finds every matching line. Before, one such byte made `rocm logs`
+  # show a single "failed to read" placeholder instead of the whole file.
+  @id:logs-invalid-byte-keeps-matching-lines
+  Scenario: logs-04 - A log with a byte that is not valid text still yields its matching lines
+    Given recorded command logs containing several lines about a topic and one byte that is not valid text
+    When the user searches the logs for that topic
+    Then the CLI reports the matching recent lines
