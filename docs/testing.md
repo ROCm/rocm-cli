@@ -780,6 +780,15 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-15` covers which runtime `rocm comfyui install` uses when none is
+chosen: it recovers the runtime `rocm setup` created before counting the ready
+ones, as `rocm serve` does, so a runtime whose registry entry was lost is found
+and its entry written back. It runs with no GPU, through the install's dry run:
+
+```bash
+cargo xtask e2e -- -n "comfyui-15"
+```
+
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed
 runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
 added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`

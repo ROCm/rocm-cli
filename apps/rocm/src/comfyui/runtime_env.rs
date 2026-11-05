@@ -17,6 +17,7 @@
 //! ComfyUI types.
 
 use super::{ComfyUiManifest, ComfyUiRuntimeEnvironment, SelectedRuntime};
+use crate::runtime_adopt::{SingleReadyRuntime, select_single_ready_runtime};
 use crate::runtimes_cmd::runtime_usability_status;
 use crate::therock;
 use anyhow::{Context, Result, bail};
@@ -33,15 +34,11 @@ pub(super) fn select_runtime(
     config: &RocmCliConfig,
     selector: Option<&str>,
 ) -> Result<SelectedRuntime> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    if manifests.is_empty() {
-        bail!(
-            "Install ROCm first: run `rocm` and pick \"Set up this system\", then install ComfyUI."
-        );
-    }
     let manifest = match selector.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(selector) => select_runtime_by_selector(&manifests, selector)?.clone(),
-        None => select_default_runtime(config, &manifests)?.clone(),
+        Some(selector) => {
+            select_runtime_by_selector(&registered_runtimes(paths)?, selector)?.clone()
+        }
+        None => select_default_runtime(paths, config)?,
     };
     if runtime_usability_status(&manifest) != "ready" {
         bail!(
@@ -119,16 +116,41 @@ fn format_runtime_statuses<'a>(
         .join(", ")
 }
 
-fn select_default_runtime<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    if let Some(active_key) = config.active_runtime_key.as_deref() {
-        return select_runtime_by_selector(manifests, active_key);
+/// Every registered runtime, or the refusal to install ROCm when there is none.
+fn registered_runtimes(paths: &AppPaths) -> Result<Vec<therock::InstalledRuntimeManifest>> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    if manifests.is_empty() {
+        return Err(install_rocm_first());
     }
-    let Some(default_runtime_id) = config.default_runtime_id.as_deref() else {
-        return select_single_ready_runtime(manifests);
-    };
+    Ok(manifests)
+}
+
+fn install_rocm_first() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Install ROCm first: run `rocm` and pick \"Set up this system\", then install ComfyUI."
+    )
+}
+
+fn select_default_runtime(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<therock::InstalledRuntimeManifest> {
+    if let Some(active_key) = config.active_runtime_key.as_deref() {
+        return select_runtime_by_selector(&registered_runtimes(paths)?, active_key).cloned();
+    }
+    match config.default_runtime_id.as_deref() {
+        Some(default_runtime_id) => {
+            select_runtime_by_default_id(&registered_runtimes(paths)?, default_runtime_id).cloned()
+        }
+        // Nothing says which runtime to use: the rule the engine paths share.
+        None => single_ready_runtime_or_refusal(select_single_ready_runtime(paths, config)?),
+    }
+}
+
+fn select_runtime_by_default_id<'a>(
+    manifests: &'a [therock::InstalledRuntimeManifest],
+    default_runtime_id: &str,
+) -> Result<&'a therock::InstalledRuntimeManifest> {
     let matches = manifests
         .iter()
         .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id))
@@ -156,23 +178,24 @@ fn select_default_runtime<'a>(
     }
 }
 
-fn select_single_ready_runtime(
-    manifests: &[therock::InstalledRuntimeManifest],
-) -> Result<&therock::InstalledRuntimeManifest> {
-    let ready = manifests
-        .iter()
-        .filter(|manifest| runtime_usability_status(manifest) == "ready")
-        .collect::<Vec<_>>();
-    match ready.as_slice() {
-        [manifest] => Ok(*manifest),
-        [] => {
-            let statuses = format_runtime_statuses(manifests);
+/// ComfyUI's words for what [`select_single_ready_runtime`] found. The rule
+/// itself, including which runtimes count as ready, is not decided here.
+fn single_ready_runtime_or_refusal(
+    found: SingleReadyRuntime,
+) -> Result<therock::InstalledRuntimeManifest> {
+    match found {
+        SingleReadyRuntime::One(manifest) => Ok(*manifest),
+        SingleReadyRuntime::Zero { registered } if registered.is_empty() => {
+            Err(install_rocm_first())
+        }
+        SingleReadyRuntime::Zero { registered } => {
+            let statuses = format_runtime_statuses(&registered);
             bail!(
                 "No ROCm runtime is ready. Fix one or install another: run `rocm` and pick \"Set up this system\" (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
             )
         }
-        _ => {
-            let available = format_available_runtime_keys(ready.iter().copied());
+        SingleReadyRuntime::Many { ready } => {
+            let available = format_available_runtime_keys(&ready);
             bail!(
                 "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
             )
@@ -397,6 +420,7 @@ mod tests {
     use super::*;
     use crate::comfyui::render_status;
     use crate::comfyui::tests::{ready_runtime_manifest, test_paths, write_runtime_manifest};
+    use crate::runtime_adopt::classify_single_ready_runtime;
     use crate::test_support::{runtime_registry_entry_names, write_test_pip_runtime};
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::fs;
@@ -462,7 +486,8 @@ mod tests {
         };
 
         let manifests = [manifest];
-        let selected = select_default_runtime(&RocmCliConfig::default(), &manifests)?;
+        let selected =
+            single_ready_runtime_or_refusal(classify_single_ready_runtime(manifests.to_vec()))?;
         assert_eq!(
             selected.runtime_key,
             "release-pip-gfx120x-all-7-13-0a20260511"
@@ -511,8 +536,9 @@ mod tests {
         let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
 
         let manifests = [release, nightly];
-        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
-            .expect_err("two ready runtimes should be ambiguous");
+        let error =
+            single_ready_runtime_or_refusal(classify_single_ready_runtime(manifests.to_vec()))
+                .expect_err("two ready runtimes should be ambiguous");
         let message = error.to_string();
 
         assert_actionable(&message);
@@ -546,8 +572,9 @@ mod tests {
         let unusable = unusable_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
 
         let manifests = [unusable];
-        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
-            .expect_err("an unusable runtime is not ready");
+        let error =
+            single_ready_runtime_or_refusal(classify_single_ready_runtime(manifests.to_vec()))
+                .expect_err("an unusable runtime is not ready");
         let message = error.to_string();
 
         assert!(
@@ -654,11 +681,7 @@ mod tests {
         let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
 
         let manifests = [ready, unusable];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("no-such-runtime-id".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
+        let error = select_runtime_by_default_id(&manifests, "no-such-runtime-id")
             .expect_err("configured default id matches nothing");
         let message = error.to_string();
 
@@ -690,11 +713,7 @@ mod tests {
         let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
 
         let manifests = [release, nightly];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
+        let error = select_runtime_by_default_id(&manifests, "therock-release:gfx120X-all")
             .expect_err("two manifests share the configured default id");
         let message = error.to_string();
 
@@ -722,11 +741,7 @@ mod tests {
         );
 
         let manifests = [ready, unusable];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
+        let error = select_runtime_by_default_id(&manifests, "therock-release:gfx120X-all")
             .expect_err("two manifests share the configured default id");
         let message = error.to_string();
 
@@ -1087,15 +1102,14 @@ mod tests {
         Ok(())
     }
 
-    /// The setup-recovery half of the rule, today's behaviour: a ready runtime
-    /// that only `recover_setup_runtime_registration` can make visible is not
-    /// found by the ComfyUI path. It reports an empty registry and writes
-    /// nothing, where the engine path (see `engine_runtime_select.rs`'s
-    /// `engine_selection_recovers_the_setup_runtime_the_registry_lost`) selects it.
+    /// The setup-recovery half of the rule: a ready runtime that only
+    /// `recover_setup_runtime_registration` can make visible is found by the
+    /// ComfyUI path, as it is by the engine paths, and finding it re-files its
+    /// registry entry, so the selection names a key `rocm runtimes list` shows.
     #[test]
-    fn comfyui_selection_does_not_recover_a_setup_runtime_the_registry_lost() -> Result<()> {
+    fn comfyui_selection_recovers_the_setup_runtime_the_registry_lost() -> Result<()> {
         let paths = test_paths("comfyui-selection-setup-recovery");
-        crate::test_support::write_test_setup_runtime_missing_from_registry(
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
             &paths,
             "release-pip-gfx120x-all-7-14-0",
         )?;
@@ -1106,12 +1120,122 @@ mod tests {
         );
         assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
 
-        let message = select_runtime(&paths, &config, None)
-            .expect_err("the registry is empty and ComfyUI does not recover")
-            .to_string();
+        let selected = select_runtime(&paths, &config, None)?;
 
-        assert!(message.contains("Install ROCm first"), "got: {message}");
-        assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
+        assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
+        assert_eq!(
+            runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)]
+        );
+        Ok(())
+    }
+
+    /// The two paths that pick "the one ready runtime" must not drift apart:
+    /// for each registry state below, ComfyUI selects a runtime exactly when
+    /// the engine paths do, and the same one. Both reach the rule through
+    /// `select_single_ready_runtime`, so a copy of it re-introduced in either
+    /// caller (a different readiness test, a missing setup recovery) shows up as
+    /// a disagreement on one of these states.
+    #[test]
+    fn comfyui_and_engine_paths_agree_on_the_single_ready_runtime() -> Result<()> {
+        use crate::engine_runtime_select::{
+            resolve_engine_selection, validate_engine_selection_runtime,
+        };
+
+        #[derive(Clone, Copy)]
+        enum State {
+            Empty,
+            OneUnusable,
+            OneReady,
+            TwoReady,
+            ReadyAndUnusable,
+            SetupRuntimeLost,
+            SetupRuntimeLostBesideAReadyOne,
+        }
+        for (label, state, expected) in [
+            ("empty", State::Empty, None),
+            ("one-unusable", State::OneUnusable, None),
+            ("one-ready", State::OneReady, Some("runtime-a")),
+            ("two-ready", State::TwoReady, None),
+            (
+                "ready-and-unusable",
+                State::ReadyAndUnusable,
+                Some("runtime-a"),
+            ),
+            (
+                "setup-runtime-lost",
+                State::SetupRuntimeLost,
+                Some("runtime-s"),
+            ),
+            (
+                "setup-runtime-lost-beside-a-ready-one",
+                State::SetupRuntimeLostBesideAReadyOne,
+                None,
+            ),
+        ] {
+            // Each path gets its own copy of the state: a recovery run by one
+            // writes the registry, which would otherwise hand the other path a
+            // state it could not have found for itself.
+            let plant_state = |paths: &AppPaths| -> Result<()> {
+                let plant = |key: &str| {
+                    write_test_pip_runtime(paths, key, "therock-release:gfx120X-all", "7.14.0", 20)
+                };
+                let break_runtime = |manifest: &therock::InstalledRuntimeManifest| -> Result<()> {
+                    fs::remove_file(
+                        manifest
+                            .python_executable
+                            .as_deref()
+                            .context("the fixture records an interpreter")?,
+                    )?;
+                    Ok(())
+                };
+                match state {
+                    State::Empty => {}
+                    State::OneUnusable => break_runtime(&plant("runtime-a")?)?,
+                    State::OneReady => {
+                        plant("runtime-a")?;
+                    }
+                    State::TwoReady => {
+                        plant("runtime-a")?;
+                        plant("runtime-b")?;
+                    }
+                    State::ReadyAndUnusable => {
+                        plant("runtime-a")?;
+                        break_runtime(&plant("runtime-b")?)?;
+                    }
+                    State::SetupRuntimeLost => {
+                        crate::test_support::write_test_setup_runtime_missing_from_registry(
+                            paths,
+                            "runtime-s",
+                        )?;
+                    }
+                    State::SetupRuntimeLostBesideAReadyOne => {
+                        plant("runtime-a")?;
+                        crate::test_support::write_test_setup_runtime_missing_from_registry(
+                            paths,
+                            "runtime-s",
+                        )?;
+                    }
+                }
+                Ok(())
+            };
+            let comfyui_paths = test_paths(&format!("comfyui-engine-agree-{label}-comfyui"));
+            plant_state(&comfyui_paths)?;
+            let comfyui =
+                select_runtime(&comfyui_paths, &RocmCliConfig::load(&comfyui_paths)?, None)
+                    .ok()
+                    .map(|selected| selected.manifest.runtime_key);
+            let engine_paths = test_paths(&format!("comfyui-engine-agree-{label}-engine"));
+            plant_state(&engine_paths)?;
+            let engine = validate_engine_selection_runtime(
+                &engine_paths,
+                resolve_engine_selection(&RocmCliConfig::load(&engine_paths)?, "vllm", None, None),
+            )?
+            .runtime_id;
+
+            assert_eq!(comfyui, engine, "{label}: the two paths disagree");
+            assert_eq!(comfyui.as_deref(), expected, "{label}");
+        }
         Ok(())
     }
 

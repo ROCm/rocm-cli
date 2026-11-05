@@ -5,9 +5,13 @@
 //! Registering a runtime that was not installed by `rocm install sdk`:
 //! importing a manifest written elsewhere, adopting an existing Python
 //! environment by probing it, and recovering the registration of the runtime
-//! `rocm setup` created.
+//! `rocm setup` created. It also holds the one rule for picking "the one ready
+//! runtime" when nothing else says which to use
+//! ([`select_single_ready_runtime`]), which sits here because it recovers the
+//! setup registration first; `rocm comfyui install` and the engine paths both
+//! ask it and each words the zero and several cases itself.
 //!
-//! Relocated from `runtimes_cmd.rs` with no behavior change. `runtimes_cmd.rs`
+//! The rest was relocated from `runtimes_cmd.rs` with no behavior change. `runtimes_cmd.rs`
 //! calls into this module for `rocm runtimes import` and `rocm runtimes adopt`,
 //! and re-exports `newest_installed_runtime_manifest`,
 //! `recover_setup_runtime_registration` and `setup_runtime_paths` for the
@@ -436,6 +440,64 @@ pub(crate) fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
+/// What picking "the one ready runtime" found. The caller decides how to report
+/// the two cases that are not a pick, because the advice differs by command
+/// (`rocm comfyui install` and `rocm serve` name different remedies).
+#[derive(Debug)]
+pub(crate) enum SingleReadyRuntime {
+    /// Exactly one registered runtime is ready.
+    One(Box<therock::InstalledRuntimeManifest>),
+    /// No registered runtime is ready. `registered` is everything the registry
+    /// holds, unusable entries included and possibly none, so a caller can say
+    /// why each one does not count.
+    Zero {
+        registered: Vec<therock::InstalledRuntimeManifest>,
+    },
+    /// More than one is ready, so there is nothing to pick without a choice.
+    Many {
+        ready: Vec<therock::InstalledRuntimeManifest>,
+    },
+}
+
+/// Pick the one ready runtime when nothing else says which to use: no
+/// `--runtime-id`, no active runtime, no configured default. This is the only
+/// place that rule lives; `rocm comfyui install` and the engine paths
+/// (`rocm serve`, `rocm engines install`) both call it.
+///
+/// Ready means `validate_runtime_manifest_for_activation` accepts the runtime,
+/// the same check `rocm runtimes activate` applies. Setup is recovered first
+/// (`recover_setup_runtime_registration`), so the runtime `rocm setup` created
+/// counts even if its registry entry was lost, and recovering it writes that
+/// entry back.
+pub(crate) fn select_single_ready_runtime(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<SingleReadyRuntime> {
+    recover_setup_runtime_registration(paths, config)?;
+    Ok(classify_single_ready_runtime(
+        therock::load_runtime_manifests(paths)?,
+    ))
+}
+
+/// The pure half of [`select_single_ready_runtime`]: which of `registered` are
+/// ready, and whether that is none, one or several.
+pub(crate) fn classify_single_ready_runtime(
+    registered: Vec<therock::InstalledRuntimeManifest>,
+) -> SingleReadyRuntime {
+    let ready: Vec<_> = registered
+        .iter()
+        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
+        .cloned()
+        .collect();
+    if ready.is_empty() {
+        return SingleReadyRuntime::Zero { registered };
+    }
+    match <[therock::InstalledRuntimeManifest; 1]>::try_from(ready) {
+        Ok([manifest]) => SingleReadyRuntime::One(Box::new(manifest)),
+        Err(ready) => SingleReadyRuntime::Many { ready },
+    }
+}
+
 /// The folder setup was configured for and its pip cache — the pair both
 /// `examine` forms report. Shared so the two cannot name different folders.
 ///
@@ -817,6 +879,87 @@ mod tests {
         )?;
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn pip_runtime(paths: &AppPaths, key: &str) -> Result<therock::InstalledRuntimeManifest> {
+        write_test_pip_runtime(paths, key, "therock-release:gfx120X-all", "7.14.0", 20)
+    }
+
+    /// Readiness is the activation check and nothing looser: a runtime whose
+    /// interpreter is gone is registered but does not count, and neither is it
+    /// "the only one".
+    #[test]
+    fn single_ready_runtime_counts_only_what_activation_accepts() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-classify");
+        let ready = pip_runtime(&paths, "runtime-a")?;
+        let broken = pip_runtime(&paths, "runtime-b")?;
+        fs::remove_file(
+            broken
+                .python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        )?;
+        assert!(validate_runtime_manifest_for_activation(&ready).is_ok());
+        assert!(validate_runtime_manifest_for_activation(&broken).is_err());
+
+        match classify_single_ready_runtime(vec![ready.clone(), broken.clone()]) {
+            SingleReadyRuntime::One(manifest) => assert_eq!(manifest.runtime_key, "runtime-a"),
+            other => panic!("expected the one ready runtime, got {other:?}"),
+        }
+        match classify_single_ready_runtime(vec![broken.clone()]) {
+            SingleReadyRuntime::Zero { registered } => {
+                assert_eq!(registered.len(), 1, "unusable entries stay listed");
+            }
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        match classify_single_ready_runtime(Vec::new()) {
+            SingleReadyRuntime::Zero { registered } => assert!(registered.is_empty()),
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        let second = pip_runtime(&paths, "runtime-c")?;
+        match classify_single_ready_runtime(vec![ready, broken, second]) {
+            SingleReadyRuntime::Many { ready } => {
+                let keys: Vec<_> = ready.iter().map(|m| m.runtime_key.as_str()).collect();
+                assert_eq!(keys, ["runtime-a", "runtime-c"], "only ready ones listed");
+            }
+            other => panic!("expected several ready runtimes, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The selection recovers the setup runtime first, so a runtime the registry
+    /// lost is the one found, and finding it is what writes its entry back.
+    #[test]
+    fn select_single_ready_runtime_recovers_setup_before_counting() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-recovers-setup");
+        let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "runtime-s",
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        assert!(crate::test_support::runtime_registry_entry_names(&paths).is_empty());
+
+        match select_single_ready_runtime(&paths, &config)? {
+            SingleReadyRuntime::One(manifest) => assert_eq!(manifest.runtime_key, "runtime-s"),
+            other => panic!("expected the recovered setup runtime, got {other:?}"),
+        }
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", lost.runtime_key)]
+        );
+
+        // Without setup naming a folder there is nothing to recover and the
+        // registry is not touched.
+        let (other_root, other_paths) = test_paths("single-ready-no-setup");
+        match select_single_ready_runtime(&other_paths, &RocmCliConfig::default())? {
+            SingleReadyRuntime::Zero { registered } => assert!(registered.is_empty()),
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        assert!(crate::test_support::runtime_registry_entry_names(&other_paths).is_empty());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(other_root);
         Ok(())
     }
 }

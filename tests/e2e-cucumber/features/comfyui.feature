@@ -328,3 +328,19 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch stack is unchanged
     And no nvidia-* packages were added to the runtime
+
+  # With no runtime chosen, `rocm comfyui install` uses the one ready runtime,
+  # and it finds it the way `rocm serve` and `rocm engines install` do: it
+  # recovers the runtime `rocm setup` created first. A runtime whose registry
+  # entry was lost, but whose install tree still holds its own manifest and that
+  # setup names, therefore counts as the ready runtime and its entry is written
+  # back, instead of the install refusing with "Install ROCm first" while setup
+  # has finished. The dry run is the cheapest way to see which runtime the
+  # install chose: it prints the `--runtime-id` of the command it would run.
+  # No GPU is needed: readiness is filesystem and manifest state.
+  @id:comfyui-install-finds-the-runtime-setup-created
+  Scenario: comfyui-15 - ComfyUI install finds the runtime setup created when the registry lost its entry
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    And the runtime registry has an entry for it again

@@ -57,7 +57,10 @@
 //! `resolve_runtime_selector_to_exact_key` is also `pub(crate)`: `engines_cmd.rs`
 //! calls it in production, and `runtimes_cmd.rs`'s own test module calls it
 //! directly too. `single_ready_runtime_key` is called only from
-//! `validate_engine_selection_runtime` in this same module and stays private.
+//! `validate_engine_selection_runtime` in this same module and stays private;
+//! it does not decide which runtime counts as "the one ready runtime" itself,
+//! it asks `runtime_adopt::select_single_ready_runtime`, the rule
+//! `rocm comfyui install` shares.
 //! `optional_arg` and
 //! `engine_recipe_json_arg` are `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
@@ -103,10 +106,8 @@ use rocm_core::{
 };
 use rocm_engine_protocol::EngineRecipeHint;
 
-use crate::runtimes_cmd::{
-    recover_setup_runtime_registration, select_runtime_manifest,
-    validate_runtime_manifest_for_activation,
-};
+use crate::runtime_adopt::{SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtimes_cmd::{recover_setup_runtime_registration, select_runtime_manifest};
 use crate::therock;
 
 #[derive(Debug, Clone)]
@@ -211,15 +212,11 @@ pub(crate) fn validate_engine_selection_runtime(
 
 fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
-    recover_setup_runtime_registration(paths, &config)?;
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let ready = manifests
-        .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
-        .collect::<Vec<_>>();
-    Ok(match ready.as_slice() {
-        [manifest] => Some(manifest.runtime_key.clone()),
-        _ => None,
+    // Zero or several ready runtimes leave the selection open: the caller that
+    // needs a runtime says so in its own words.
+    Ok(match select_single_ready_runtime(paths, &config)? {
+        SingleReadyRuntime::One(manifest) => Some(manifest.runtime_key),
+        SingleReadyRuntime::Zero { .. } | SingleReadyRuntime::Many { .. } => None,
     })
 }
 
@@ -611,6 +608,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::runtime_registry::validate_runtime_manifest_for_activation;
     use crate::status_for_readiness;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{test_app_paths, test_paths};
