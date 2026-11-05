@@ -272,7 +272,7 @@ Feature: GPU detection and system inspection
   # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
   # the WSL lane, where the managed runtime really does carry a `.so`. This
   # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
-  # diagnose.rs -- the same boundary, stated once there and once here.
+  # diagnose/catalog.rs -- the same boundary, stated once there and once here.
   @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
   Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
     Given a managed runtime is active

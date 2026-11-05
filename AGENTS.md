@@ -334,9 +334,10 @@ on two counts, and both change how you edit it:
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in [fix/catalog.rs](crates/rocm-core/src/fix/catalog.rs)
-  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
-  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
-  means changing the CLI **first**, then the two docs. That feature is what
+  (the `RECIPES` list) and [diagnose.rs](crates/rocm-core/src/diagnose.rs) with
+  the modules it declares, such as [catalog.rs](crates/rocm-core/src/diagnose/catalog.rs)
+  (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
+  failure mode means changing the CLI **first**, then the two docs. That feature is what
   catches you if you forget. Two sentences in
   [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
   sentence "requires `contract_version` N or higher": scenario skill-07 parses

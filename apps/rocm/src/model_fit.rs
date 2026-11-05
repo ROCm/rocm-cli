@@ -129,7 +129,7 @@ fn assess_model_with_host_paths(
 /// would report a working machine as having no GPU at all -- `Blocked`
 /// instead of the `Undetermined` a genuinely unmeasurable host deserves.
 /// `rocm_sees_gpu`, not `has_amd_gpu`, is the WSL-native signal, per the same
-/// reasoning `fix-wsl-6-host-driver-too-old` already uses in `diagnose.rs`.
+/// reasoning `fix-wsl-6-host-driver-too-old` already uses in `diagnose/wsl.rs`.
 /// Only `Some(false)` -- rocminfo positively enumerating no device -- counts
 /// as "no GPU"; `None` means rocminfo was absent so the question went unasked,
 /// which is not evidence of anything and must not read as a confident no.
@@ -773,7 +773,7 @@ mod tests {
     /// host -- and only a confirmed `Some(false)` counts as
     /// "no GPU"; `None` means rocminfo was absent, which is not evidence of
     /// anything, per the same reasoning `fix-wsl-6-host-driver-too-old` in
-    /// `diagnose.rs` already uses.
+    /// `diagnose/wsl.rs` already uses.
     #[test]
     fn examination_reports_amd_gpu_reads_rocm_sees_gpu_on_wsl() {
         let wsl_examination = |rocm_sees_gpu: Option<bool>| rocm_core::Examination {
