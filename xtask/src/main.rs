@@ -13,6 +13,7 @@
 mod affected;
 mod ascii_output_contract;
 mod catalog;
+mod chat_import_contract;
 mod coverage;
 mod crate_edges;
 mod demos;

@@ -39,7 +39,7 @@
 //! alternative and satisfies this guard.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     fn repo_root() -> PathBuf {
@@ -237,7 +237,7 @@ mod tests {
     ///
     /// Both directions are silent, which is the one failure mode a permanent
     /// guard must not have, so literals are tokenized rather than approximated.
-    fn strip_literals_and_comments(text: &str) -> String {
+    pub(crate) fn strip_literals_and_comments(text: &str) -> String {
         #[derive(Clone, Copy)]
         enum State {
             Code,
