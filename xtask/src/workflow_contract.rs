@@ -1655,8 +1655,8 @@ jobs:
     }
 
     /// Both self-hosted workflows that run GPU lanes, so a lane added to either is
-    /// covered. `nightly-queue.yml` also runs self-hosted but runs no GPU lane;
-    /// `queue_nightly_publisher_holds_no_credential` covers it.
+    /// covered. `nightly-queue.yml` and `queue-run.yml` also run self-hosted but
+    /// run no GPU lane; `assert_queue_workflow_holds_no_credential` covers them.
     fn self_hosted_workflows() -> [(&'static str, String); 2] {
         [
             ("e2e-selfhosted.yml", read_workflow("e2e-selfhosted.yml")),
@@ -8636,8 +8636,49 @@ permissions:
         );
     }
 
+    /// The workflows that may run on the queue-report runner.
+    const QUEUE_WORKFLOWS: [&str; 2] = ["nightly-queue.yml", "queue-run.yml"];
+
     #[test]
     fn queue_nightly_publisher_holds_no_credential() {
+        assert_queue_workflow_holds_no_credential(
+            "nightly-queue.yml",
+            &["${{inputs.request_id}}", "${{runner.temp}}"],
+            &["workflow_dispatch:"],
+        );
+    }
+
+    #[test]
+    fn queue_run_holds_no_credential() {
+        assert_queue_workflow_holds_no_credential(
+            "queue-run.yml",
+            &["${{inputs.branch}}", "${{runner.temp}}"],
+            &["workflow_dispatch:", "schedule:"],
+        );
+    }
+
+    /// Whether `line` is a schedule entry, `- cron: "..."`, holding nothing
+    /// but a cron expression's characters: the one place a queue workflow
+    /// needs `*`, which no anchor or alias can hide in.
+    fn is_cron_line(line: &str) -> bool {
+        line.trim()
+            .strip_prefix("- cron: \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .is_some_and(|cron| {
+                !cron.is_empty()
+                    && cron
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '*' | '/' | ',' | '-'))
+            })
+    }
+
+    /// The checks every workflow on the queue-report runner must pass: `file`
+    /// may evaluate only `expressions` and be triggered only by `triggers`.
+    fn assert_queue_workflow_holds_no_credential(
+        file: &str,
+        expressions: &[&str],
+        triggers: &[&str],
+    ) {
         // The queue-report runner is persistent, and any job that names its label
         // can run on it, so the publishing job must not bring a credential onto
         // it. A credential reaches a job through an expression, an action that
@@ -8646,7 +8687,7 @@ permissions:
         // a list of known spellings where one is possible: expressions and actions
         // are allowlisted, permissions must be empty, and environments and
         // runtime-token variables are refused outright.
-        let text = read_workflow("nightly-queue.yml");
+        let text = read_workflow(file);
 
         // The checks below read text, not parsed YAML, so first rule out the YAML
         // that decodes to something other than it reads: escape sequences (only
@@ -8655,7 +8696,7 @@ permissions:
         // workflow needs none of them.
         assert!(
             !text.contains('\\'),
-            "nightly-queue.yml contains a backslash; a YAML escape could spell a forbidden \
+            "{file} contains a backslash; a YAML escape could spell a forbidden \
              key or expression past these checks"
         );
         assert!(
@@ -8663,11 +8704,15 @@ permissions:
                 let line = line.trim_start().trim_start_matches('-').trim_start();
                 line == "?" || line.starts_with("? ")
             }),
-            "nightly-queue.yml uses an explicit `? key` entry, which these checks cannot read"
+            "{file} uses an explicit `? key` entry, which these checks cannot read"
         );
+        let uncommented = without_comments(&text);
         assert!(
-            !without_comments(&text).contains(['&', '*']),
-            "nightly-queue.yml contains `&` or `*`, banned outright here because a YAML anchor \
+            !uncommented
+                .lines()
+                .filter(|line| !is_cron_line(line))
+                .any(|line| line.contains(['&', '*'])),
+            "{file} contains `&` or `*`, banned outright here because a YAML anchor \
              or alias could stand in for a key these checks read"
         );
 
@@ -8681,21 +8726,20 @@ permissions:
                 .collect()
         };
         let flat = flatten(&text);
-        let expressions: Vec<&str> = flat
+        let found_expressions: Vec<&str> = flat
             .match_indices("${{")
             .map(|(start, _)| {
                 let end = flat[start..]
                     .find("}}")
-                    .expect("every ${{ in nightly-queue.yml is closed");
+                    .unwrap_or_else(|| panic!("every ${{{{ in {file} is closed"));
                 &flat[start..start + end + 2]
             })
             .collect();
-        for expression in &expressions {
+        for expression in &found_expressions {
             assert!(
-                ["${{inputs.request_id}}", "${{runner.temp}}"].contains(expression),
-                "nightly-queue.yml evaluates `{expression}`: only the request id and the \
-                 runner's temp directory may be read, so no secret or token can reach the \
-                 shared runner (see docs/nightly-on-the-queue.md)"
+                expressions.contains(expression),
+                "{file} evaluates `{expression}`: only {expressions:?} may be read, so no \
+                 secret or token can reach the shared runner (see docs/nightly-on-the-queue.md)"
             );
         }
 
@@ -8713,46 +8757,45 @@ permissions:
                 .is_some_and(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(
                 pinned,
-                "nightly-queue.yml uses `{value}`: only upload-artifact, pinned to a full commit \
+                "{file} uses `{value}`: only upload-artifact, pinned to a full commit \
                  SHA, may run there, since another action could take the job token by default"
             );
         }
         for forbidden in ["environment:", "actions_runtime_token", "actions_id_token"] {
             assert!(
                 !keys.contains(forbidden),
-                "nightly-queue.yml mentions `{forbidden}`, which would bring a credential to \
+                "{file} mentions `{forbidden}`, which would bring a credential to \
                  the shared runner"
             );
         }
         assert_eq!(
             keys.matches("permissions:").count(),
             1,
-            "nightly-queue.yml must declare permissions once, at the top, so no job widens them"
+            "{file} must declare permissions once, at the top, so no job widens them"
         );
         assert_eq!(
             top_level_block(&without_comments(&text), "permissions").trim(),
             "{}",
-            "nightly-queue.yml must grant no permissions: the job only uploads files"
+            "{file} must grant no permissions: the job only uploads files"
         );
 
         // The workflow itself: dispatched by hand only, routed to the reporting
         // runner, uploading only the results it was given, and never hidden files.
         let plain = without_comments(&text);
         let on = top_level_block(&plain, "on");
-        let triggers: Vec<&str> = on
+        let found_triggers: Vec<&str> = on
             .lines()
             .filter(|line| indent_of(line) == 2)
             .map(str::trim)
             .collect();
         assert_eq!(
-            triggers,
-            ["workflow_dispatch:"],
-            "nightly-queue.yml must be dispatched by hand only"
+            found_triggers, triggers,
+            "{file} may be triggered by {triggers:?} only"
         );
         assert_eq!(
             runs_on_values(&plain),
             ["[queue-report]"],
-            "nightly-queue.yml must run on the queue-report runner, which carries that label \
+            "{file} must run on the queue-report runner, which carries that label \
              alone"
         );
         let upload: Vec<&str> = plain
@@ -8766,7 +8809,7 @@ permissions:
                 "path: ${{ runner.temp }}/results",
                 "include-hidden-files: false"
             ],
-            "nightly-queue.yml must upload only the published results, and no hidden files"
+            "{file} must upload only the published results, and no hidden files"
         );
 
         // The runner is registered with `queue-report` alone, without GitHub's
@@ -8781,14 +8824,16 @@ permissions:
         for entry in std::fs::read_dir(&dir).expect("reading .github/workflows") {
             let name = entry.expect("workflow dir entry").file_name();
             let name = name.to_string_lossy();
-            if name == "nightly-queue.yml" || !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            if QUEUE_WORKFLOWS.contains(&name.as_ref())
+                || !(name.ends_with(".yml") || name.ends_with(".yaml"))
+            {
                 continue;
             }
             let found = queue_runner_references(&read_workflow(&name), &workflow_name);
             assert!(
                 found.is_empty(),
-                "{name} names {found:?}: only nightly-queue.yml may use the queue-report runner, \
-                 and no workflow may depend on nightly-queue.yml, which gates nothing (see \
+                "{name} names {found:?}: only {QUEUE_WORKFLOWS:?} may use the queue-report \
+                 runner, and no workflow may depend on them, which gate nothing (see \
                  docs/nightly-on-the-queue.md)"
             );
         }
@@ -8810,6 +8855,7 @@ permissions:
         [
             "queue-report".to_owned(),
             "nightly-queue".to_owned(),
+            "queue-run".to_owned(),
             squeeze(queue_workflow_name),
         ]
         .into_iter()
@@ -8840,6 +8886,10 @@ permissions:
             (
                 job("    uses: ./.github/workflows/nightly-queue.yml"),
                 vec!["nightly-queue"],
+            ),
+            (
+                job("    uses: ./.github/workflows/queue-run.yml"),
+                vec!["queue-run"],
             ),
             (job("    runs-on: ubuntu-latest"), vec![]),
             (job("    runs-on: [self-hosted, linux, mi300x]"), vec![]),

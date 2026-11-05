@@ -9,11 +9,13 @@ SPDX-License-Identifier: MIT
 The nightly GPU lanes can run on a shared queue of GPU workers: one lane per
 GPU model in the queue's fleet. The run itself happens next to the queue, which
 submits the lanes, waits for them and collects their results.
-[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) then publishes a
-finished run here: its lane matrix in the job log and summary, the lanes'
-files as the `nightly-queue-results` artifact, and a pass or fail.
+[`queue-run.yml`](../.github/workflows/queue-run.yml) starts a run of one
+branch, waits for it and publishes it here: its lane matrix in the job log and
+summary, the lanes' files as the `queue-run-results` artifact, and a pass or
+fail. [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) publishes
+a run that has already finished.
 
-This is **manual-only** and gates nothing yet. The scheduled GPU lanes in
+This gates nothing yet. The scheduled GPU lanes in
 [`nightly.yml`](../.github/workflows/nightly.yml) remain the nightly coverage
 gate described in [ci-hardware-testing.md](ci-hardware-testing.md). Two
 things must happen before this could replace them: a lane must be seen to
@@ -27,7 +29,18 @@ how runs are scheduled and executed, and the `queue-publish` command the
 workflow calls — is maintained privately with the queue, not in this
 repository.
 
-## Publishing a run
+## Starting a run
+
+Dispatch `queue-run.yml` with the branch to test (`main` by default); it also
+runs every night at 02:17 UTC on `main`. The job asks the queue side for a run
+of that branch, named for the job's run id and attempt, so re-running the job
+starts a new run. It waits for every lane to finish, up to about five hours,
+then publishes the run as below. Only one run goes at a time: a second
+dispatch waits for the first, and the queue side refuses one while another,
+however started, is unfinished. The branch must exist in this repository;
+otherwise the job fails at once.
+
+## Publishing a finished run
 
 Dispatch `nightly-queue.yml`. With no input it publishes the newest scheduled
 run, which fails the job while that run is still going or if it never
@@ -143,15 +156,18 @@ rather than at a regression.
 - a registered runner name and host name that do not identify internal
   infrastructure, since GitHub prints both into every job log
 
-It requires **no secret**, and a contract test in
+Both workflows require **no secret** and no permission, and contract tests in
 [workflow_contract.rs](../xtask/src/workflow_contract.rs)
-(`queue_nightly_publisher_holds_no_credential`) keeps it that way.
+(`queue_nightly_publisher_holds_no_credential`, `queue_run_holds_no_credential`)
+keep it that way.
 
 That test reads the workflow files on `main`. A workflow on another branch of
 this repository can still name the runner's label, which is one reason the
-runner is treated as untrusted below. On `main`, the test also refuses any
-other workflow that names the `queue-report` label or this workflow, so none
-sends a job to the runner or waits on this one by mistake. Whether this
+runner is treated as untrusted below. On `main`, the tests also refuse any
+other workflow that names the `queue-report` label or these workflows, so none
+sends a job to the runner or waits on them by mistake. The runner itself
+refuses, before any step runs, every job that is not one of these two
+workflows as it is on `main`. Whether this
 workflow's check is required before merging is a repository setting the test
 cannot see. It must not be: a manual-only workflow never reports on a pull
 request, so requiring it would block every merge.
@@ -182,13 +198,15 @@ or the queue side signs what it reports.
 
 **Results move by a shared volume, not a network call.** The queue side writes
 each finished run's publishable files; the runner reads them read-only. No
-credential, service or network path is needed between the two.
+credential is needed between the two, and the only call the runner makes is
+the request for a run.
 
-**A run is published, never started, from here.** That is the cost of the
-above: GitHub cannot trigger a run. Every input of a run is a parameter of the
-queue side's job and results are kept per request, so a trigger started from
-GitHub — for example for pull requests — can be added in front later without
-changing how runs execute or how they are published.
+**A run is asked for, not submitted, from here.** `queue-run.yml` holds no
+credential and sends nothing to the queue: the runner, which sits next to the
+queue side, asks it for a run of a branch, and the queue side starts it with
+its own credential. It believes the request because of where it comes from,
+which is why the runner runs only these two workflows from `main`. The worst a
+request can do is start a run of a branch already in this repository.
 
 **Only `/out` is published, and a missing run is never green.** Publishing by
 origin is the main control on what reaches public results, with the scan
