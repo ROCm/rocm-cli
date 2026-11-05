@@ -112,7 +112,8 @@ pub struct Pool {
 /// `gtt` is `None` when GTT was not read: a discrete card, or a host with no
 /// tool that reports it. A GTT read
 /// that failed never gets here (the sample is `Unreadable`, see
-/// [`sample_device_memory`]), so a `Some` pool always has a non-zero total.
+/// [`sample_device_memory`]), so every pool here has a non-zero total, VRAM and
+/// GTT alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceMemory {
     pub vram: Pool,
@@ -236,9 +237,11 @@ pub fn sample_device_memory(
     gtt: impl FnOnce() -> Probe<(u64, u64)>,
 ) -> Probe<DeviceMemory> {
     let (vram_total, vram_free) = match vram() {
-        Probe::Read(reading) => reading,
+        // A zero total is a failed read, not a pool: its floor would be zero and
+        // every sample would count as drained.
+        Probe::Read((total, free)) if total > 0 => (total, free),
+        Probe::Read(_) | Probe::Unreadable => return Probe::Unreadable,
         Probe::Absent => return Probe::Absent,
-        Probe::Unreadable => return Probe::Unreadable,
     };
     let vram = Pool {
         total_mib: vram_total,
@@ -481,6 +484,15 @@ mod tests {
     fn a_zero_gtt_total_is_a_failed_reading_not_a_pool() {
         let (result, _) = sample(Probe::Read((512, 500)), Probe::Read((0, 0)));
         assert_eq!(result, Probe::Unreadable);
+    }
+
+    #[test]
+    fn a_zero_vram_total_is_a_failed_reading_not_a_drained_host() {
+        // With no GTT tool the sample would otherwise be judged by a VRAM pool
+        // whose floor is zero, which is drained by definition.
+        let (result, gtt_asked) = sample(Probe::Read((0, 0)), Probe::Absent);
+        assert_eq!(result, Probe::Unreadable);
+        assert!(!gtt_asked);
     }
 
     #[test]
