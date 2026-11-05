@@ -1124,6 +1124,32 @@ mod tests {
             PathBuf::from("/opt/venv")
         );
     }
+    /// Today's rule for a runtime's venv: the interpreter's grandparent
+    /// whatever its own folder is called, refused only when there is no
+    /// grandparent at all.
+    #[test]
+    fn vllm_venv_root_takes_the_grandparent_whatever_the_folder_is_called() {
+        for (python, expected) in [
+            ("/opt/venv/bin/python", Some("/opt/venv")),
+            ("/opt/venv/Scripts/python.exe", Some("/opt/venv")),
+            ("/opt/venv/SCRIPTS/python.exe", Some("/opt/venv")),
+            ("/opt/venv/tools/python", Some("/opt/venv")),
+            ("python", None),
+            ("/python", None),
+        ] {
+            let runtime = test_vllm_runtime(Some(PathBuf::from(python)), None);
+            let root = vllm_venv_root(&runtime);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(root.unwrap(), PathBuf::from(expected), "{python}");
+                }
+                None => {
+                    let error = root.expect_err(python).to_string();
+                    assert!(error.contains("is not inside a venv"), "{python}: {error}");
+                }
+            }
+        }
+    }
     #[test]
     fn venv_site_packages_dir_finds_the_single_python3_dir() -> Result<()> {
         let venv = tempfile::tempdir()?;

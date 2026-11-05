@@ -964,4 +964,64 @@ mod tests {
             .find(|(name, _)| name.to_string_lossy() == key)
             .and_then(|(_, value)| value.map(OsString::from))
     }
+
+    /// The environment folder ComfyUI exports as `VIRTUAL_ENV`, by the folder
+    /// the interpreter sits in. Today only a `bin` or `Scripts` folder
+    /// (any case) identifies a venv; anything else leaves `VIRTUAL_ENV` unset
+    /// rather than pointing it at a guessed folder.
+    #[test]
+    fn runtime_environment_exports_virtual_env_only_for_a_bin_or_scripts_folder() -> Result<()> {
+        let cases: [(&str, Option<&str>); 7] = [
+            ("/opt/venv/bin/python", Some("/opt/venv")),
+            ("/opt/venv/Scripts/python.exe", Some("/opt/venv")),
+            ("/opt/venv/SCRIPTS/python.exe", Some("/opt/venv")),
+            ("/opt/venv/BIN/python", Some("/opt/venv")),
+            ("/opt/venv/tools/python", None),
+            ("python", None),
+            ("/python", None),
+        ];
+        for (python, expected) in cases {
+            let python = PathBuf::from(python);
+            let manifest = minimal_runtime_manifest(&python);
+
+            let env = runtime_environment_from_runtime(&manifest, &python);
+            let mut command = Command::new(&python);
+            apply_runtime_environment(&mut command, &env)?;
+
+            assert_eq!(
+                command_env_value(&command, "VIRTUAL_ENV").as_deref(),
+                expected.map(std::ffi::OsStr::new),
+                "{}",
+                python.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn minimal_runtime_manifest(python: &Path) -> therock::InstalledRuntimeManifest {
+        therock::InstalledRuntimeManifest {
+            runtime_key: "therock-release-gfx120x-all".to_owned(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            channel: "release".to_owned(),
+            format: "wheel".to_owned(),
+            family: "gfx120X-all".to_owned(),
+            family_source: "test".to_owned(),
+            version: "7.13.0a20260511".to_owned(),
+            install_root: PathBuf::from("/nonexistent/runtime"),
+            selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            source_layout_generation: None,
+            index_url: None,
+            tarball_file_name: None,
+            python_launcher: None,
+            python_executable: Some(python.display().to_string()),
+            pip_cache_dir: None,
+            rocm_sdk: None,
+            sdk_torch: None,
+            wheel_composition: None,
+            read_only: false,
+            imported_from: None,
+            devel: true,
+            installed_at_unix_ms: 100,
+        }
+    }
 }

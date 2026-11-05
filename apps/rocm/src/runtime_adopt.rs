@@ -819,4 +819,60 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
+
+    /// Today's rule for `rocm runtimes adopt --python <file>` without `--root`:
+    /// the environment folder is the interpreter's grandparent no matter what
+    /// the interpreter's own folder is called. The `bin`/`Scripts` check in
+    /// `infer_python_env_root` returns the same value on both branches, so an
+    /// interpreter in an unrelated folder is guessed at rather than refused.
+    #[test]
+    fn adopt_python_file_infers_the_grandparent_whatever_the_folder_is_called() -> Result<()> {
+        let (root, _) = test_paths("runtime-adopt-infer-root");
+        for folder in ["bin", "Scripts", "SCRIPTS", "tools"] {
+            let env_root = root.join(format!("env-{folder}"));
+            let python = env_root.join(folder).join("python");
+            fs::create_dir_all(python.parent().unwrap())?;
+            fs::write(&python, "python")?;
+
+            let (resolved, inferred) = resolve_adopt_python_input(&python)?;
+
+            assert_eq!(resolved, python, "{folder}");
+            assert_eq!(inferred.as_deref(), Some(env_root.as_path()), "{folder}");
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn adopt_infer_python_env_root_gives_up_only_without_a_grandparent() {
+        // A bare file name has an empty parent and a root-level file's parent
+        // is the filesystem root: neither names a folder to take the parent of.
+        assert_eq!(infer_python_env_root(Path::new("python")), None);
+        assert_eq!(infer_python_env_root(Path::new("/python")), None);
+        // One level deep the folder's own name is ignored.
+        assert_eq!(
+            infer_python_env_root(Path::new("/opt/venv/tools/python")).as_deref(),
+            Some(Path::new("/opt/venv"))
+        );
+    }
+
+    /// What the `None` above costs the user: the request is refused and asks
+    /// for `--root`, so nothing is registered.
+    #[test]
+    fn adopt_request_without_an_inferred_root_asks_for_root() {
+        let error = infer_adopt_runtime_request(
+            PathBuf::from("python"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            &therock::RocmSdkPythonProbe::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("pass --root"), "{error}");
+    }
 }
