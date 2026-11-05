@@ -646,17 +646,6 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
-
-  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
-  # so it cannot be combined with the attached modes, which already stay on the
-  # terminal. The waiting itself (a live server that becomes ready, one that
-  # exits first) is covered by `wait_past_readiness_budget_*` in
-  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
-  @id:serve-wait-conflicts-with-attached-modes
-  Scenario: serve-42 - Waiting for readiness cannot be combined with attached mode
-    When the user serves a model with both --wait and --verbose
-    Then the CLI refuses and names the conflicting flags
-
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -681,3 +670,14 @@ Feature: Model serving
     # suppression was untested: deleting the guard left the scenario green and a
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
+
+
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-42 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags
