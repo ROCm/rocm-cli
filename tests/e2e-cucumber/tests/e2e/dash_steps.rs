@@ -52,36 +52,62 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
         .expect("no interactive TUI session is open for this scenario")
 }
 
-/// Wait until every marker is on the screen at once, and return the frame that
-/// satisfied the wait. The TUI writes a frame in several pty chunks, so a step
-/// that waits on one marker and then reads the screen again can read a frame
-/// that is still being drawn; asserting on the frame that ended the wait cannot.
-/// On failure the panic names the markers the last frame lacked.
-async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]) -> String {
-    let wanted = markers
-        .iter()
-        .map(|marker| format!("{marker:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut last_frame = String::new();
+/// Wait until `missing` reports nothing absent from the screen, and return the
+/// frame that satisfied the wait. The TUI writes a frame in several pty chunks,
+/// so a step that waits on one marker and then reads the screen again can read a
+/// frame that is still being drawn; asserting on the frame that ended the wait
+/// cannot.
+///
+/// `missing` names what a frame still lacks, one entry per absent piece; the
+/// frame is ready when it returns none. On failure the panic lists what the
+/// screen lacked when the wait ended, then the driver's own diagnostic, which
+/// carries that whole frame. The list is computed from a fresh read rather than
+/// from the last frame the predicate saw, because the driver checks for a
+/// crashed or exited process before consulting the predicate, so the last frame
+/// the predicate saw can be older than the one the failure reports.
+///
+/// A negative assertion on the returned frame ("this text is not on screen")
+/// is only as strong as the frame is complete: the wait proves the positive
+/// markers are drawn, not that the rest of the screen is. When the absent text
+/// would be drawn in a particular region, include a marker from the end of that
+/// region (the last row of a popup, the last line of a pane) in the wait, so the
+/// frame is known to extend past where the absent text would be.
+async fn wait_for_frame(
+    tui: &mut TuiSession,
+    what: &str,
+    missing: impl Fn(&str) -> Vec<String>,
+) -> String {
+    let mut ready_frame = String::new();
     let outcome = tui
         .wait_for_screen_where(
-            &format!("{what} shows all of {wanted}"),
+            &format!("{what} is fully drawn"),
             |screen| {
-                screen.clone_into(&mut last_frame);
-                markers.iter().all(|marker| screen.contains(marker))
+                let ready = missing(screen).is_empty();
+                if ready {
+                    screen.clone_into(&mut ready_frame);
+                }
+                ready
             },
             default_timeout(),
         )
         .await;
     if let Err(error) = outcome {
-        let missing: Vec<&&str> = markers
-            .iter()
-            .filter(|marker| !last_frame.contains(**marker))
-            .collect();
-        panic!("{what}: the last frame read lacked {missing:?}: {error}");
+        let lacked = missing(&tui.screen_text());
+        panic!("{what}: the screen lacked {lacked:?}: {error}");
     }
-    last_frame
+    ready_frame
+}
+
+/// [`wait_for_frame`] for the common case: every marker is on screen at once.
+async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]) -> String {
+    wait_for_frame(tui, what, |screen| {
+        markers
+            .iter()
+            .filter(|marker| !screen.contains(**marker))
+            .map(|marker| format!("{marker:?}"))
+            .collect()
+    })
+    .await
 }
 
 // ── Given ──────────────────────────────────────────────────────────
@@ -1494,6 +1520,9 @@ async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
 
 #[then("the diagnose action says it runs rocm examine")]
 async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
+    // The detail pane draws top to bottom and the 80x24 session clips it at the
+    // `Runs:` line, so that line is the last one drawn: once it is on screen,
+    // everything the `rocm doctor` check below could find in the pane is too.
     let screen = wait_for_all_markers(
         session(world),
         "the diagnose action",
@@ -1748,28 +1777,17 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the managed model did not appear: {e}"));
     // Wait for the whole row, not its first cell: the cells are drawn left to
     // right, so "50ms" can be on screen while "20ms", "1/0" and "25%" are not.
-    let mut last_frame = String::new();
-    let outcome = tui
-        .wait_for_screen_where(
-            "the managed model's row shows TTFT, TPOT, queue and KV cache",
-            |screen| {
-                screen.clone_into(&mut last_frame);
-                screen
-                    .lines()
-                    .find(|line| line.contains(&model))
-                    .is_some_and(|row| {
-                        row.contains("50ms")
-                            && row.contains("20ms")
-                            && row.contains("1/0")
-                            && row.contains("25%")
-                    })
-            },
-            default_timeout(),
-        )
-        .await;
-    if let Err(error) = outcome {
-        panic!("managed serving metrics were incomplete: {error}\nlast frame read:\n{last_frame}");
-    }
+    wait_for_frame(tui, "the managed model's metrics row", |screen| {
+        let Some(row) = screen.lines().find(|line| line.contains(&model)) else {
+            return vec![format!("a row naming {model:?}")];
+        };
+        ["50ms", "20ms", "1/0", "25%"]
+            .into_iter()
+            .filter(|cell| !row.contains(cell))
+            .map(|cell| format!("{cell:?} in the model's row"))
+            .collect()
+    })
+    .await;
 }
 
 #[then("navigation and next-step guidance are displayed")]
@@ -1875,11 +1893,30 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
 
 #[then("dashboard destinations are displayed")]
 async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
-    wait_for_all_markers(
-        session(world),
-        "the command palette",
-        &["Go to", "Home", "Serving", "Observe"],
-    )
+    // The tab bar behind the palette already draws "Home", "Serving", "Observe"
+    // and "Chat", so those words are not evidence the popup is on screen. Each
+    // destination is therefore looked for as a palette row (the cursor column
+    // `PALETTE_DESTS` rows start with, then the label) below the "Go to…" title,
+    // which the tab bar above it cannot satisfy. Chat is the palette's last row,
+    // so the wait ends only once the popup is drawn through its bottom.
+    wait_for_frame(session(world), "the command palette", |screen| {
+        let Some(title_row) = screen.lines().position(|line| line.contains("Go to")) else {
+            return vec!["the \"Go to\" title".to_string()];
+        };
+        let below_title = screen
+            .lines()
+            .skip(title_row + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ["Home", "ROCm", "Serving", "Observe", "Chat"]
+            .into_iter()
+            .filter(|label| {
+                !below_title.contains(&format!("▸ {label}"))
+                    && !below_title.contains(&format!("  {label}"))
+            })
+            .map(|label| format!("the palette row {label:?}"))
+            .collect()
+    })
     .await;
 }
 
