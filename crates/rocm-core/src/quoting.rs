@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Argument-quoting helpers with real execution stakes: their output is
-//! embedded into a command string that a shell or interpreter actually runs,
-//! not text a human only reads.
+//! Argument-quoting helpers whose output must read back as exactly the value given.
+//!
+//! The output is either embedded into a command string a shell or interpreter
+//! actually runs, or shown as a command a person is asked to approve or paste.
 //!
 //! [`posix_shell_quote`] and [`powershell_quote`]/`ps_single_quote_escape`
 //! are two different escaping domains -- POSIX `sh`/`bash` single-quoting and
@@ -15,25 +16,26 @@
 //! `powershell_quote`'s output is written into a `.ps1` script executed via
 //! `powershell.exe -File` (`apps/rocm/src/comfyui/process.rs`'s Windows
 //! runtime launch) or interpolated into a `-Command` string
-//! (`crate::fix::path_export_windows`, `crate::diagnose`'s matching
+//! (`crate::fix::runners::path_export_windows`, `crate::diagnose`'s matching
 //! printed copy). A mistake in either one is a real command-injection or
 //! script-corruption bug, which is why both carry direct unit coverage here
 //! (ROCMAI-727 consolidated them out of per-call-site near-duplicates).
 //!
-//! What is deliberately **not** here: `apps/rocm/src/therock.rs`'s
-//! `quote_display_arg` (a dry-run preview line, never executed),
-//! `apps/rocm/src/comfyui.rs`'s `quote_log_arg` (log text, Rust's own
-//! `{value:?}` Debug-format escaping, with the real unquoted args going to
-//! `Command::args` alongside it), `apps/rocm/src/freeform_planner.rs`'s
-//! `quote_tool_arg` (rendered plan/LLM prompt text, never executed
-//! directly), and `crates/rocm-dash-tui/src/ui/exec.rs`'s own
-//! `quote_display_arg` (an approval-preview line, same display-only
-//! contract as `therock.rs`'s). Each of those uses a materially different,
-//! currently-inconsistent escaping convention for display/log/prompt text
-//! that has zero execution stakes, so forcibly unifying them with the two
-//! functions here would be a silent behavior change to printed/logged
-//! output -- out of scope for ROCMAI-727, which only asks to consolidate what
-//! is safely shareable.
+//! [`posix_shell_quote`] is also what `apps/rocm`'s `shell_quote` uses for
+//! the command lines the CLI *shows*: the chat approval card, the free-form
+//! request plan, the install dry-run's `command:` line and the `rocm …` hints
+//! it tells a user to run. Those are offered to be copied, and an approval is
+//! given for what they say, so a value that reads back as a different argv is
+//! the same defect whether a shell or a person runs it.
+//! `crates/rocm-dash-tui/src/ui/exec.rs`'s `quote_display_arg` is a copy for
+//! the dash's previews, because `rocm-dash-tui` may not depend on this crate;
+//! two tests in `apps/rocm/src/shell_quote.rs` hold the two to the
+//! same output.
+//!
+//! What is deliberately **not** here: `apps/rocm/src/comfyui.rs`'s
+//! `quote_log_arg` (log text, Rust's own `{value:?}` Debug-format escaping,
+//! with the real unquoted args going to `Command::args` alongside it), which
+//! uses a different convention; unifying it would change logged output.
 
 /// Escapes a value for embedding inside a PowerShell single-quoted string
 /// literal.
@@ -45,7 +47,7 @@
 ///
 /// This matters for any value of filesystem/environment origin embedded into
 /// a generated PowerShell command -- for example
-/// `crate::fix::path_export_windows`'s write script, built from the real
+/// `crate::fix::runners::path_export_windows`'s write script, built from the real
 /// existing User PATH read back from the host, and `crate::diagnose`'s
 /// matching printed copy of that same command. A path containing an
 /// apostrophe (`C:\Users\O'Brien\bin` is an ordinary Windows path, not a
@@ -81,14 +83,22 @@ pub fn powershell_quote(value: &str) -> String {
 /// trick for including a literal single quote inside a single-quoted string,
 /// since POSIX shells have no escape sequence that works *inside* one.
 ///
-/// This is the one quoting convention in this module with real
-/// command-injection stakes end to end: its output is embedded into a
-/// command string sent over SSH to a remote shell
-/// (`apps/rocm/src/remote/mod.rs`), so a hostile value (`$(id)`, `` `id` ``,
+/// Its output is embedded into a command string sent over SSH to a remote
+/// shell (`apps/rocm/src/remote/mod.rs`), and it renders the command lines the
+/// CLI shows for approval or pasting, so a hostile value (`$(id)`, `` `id` ``,
 /// `; rm -rf ~`) must come back as inert, byte-identical shell text. See the
 /// `hostile_values_survive_a_real_shell_as_one_literal_argument` test below,
 /// which execs a real `sh -c` and round-trips such inputs rather than only
 /// asserting on the escaped string's shape.
+///
+/// `=` is left bare, which is safe only *after* the command word: POSIX gives
+/// it meaning only in a word ahead of the command name, where `A=b` is an
+/// assignment rather than an argument. Every caller quotes arguments after a
+/// fixed program word, never argv[0]. Nothing enforces that, so a caller that
+/// puts a quoted value in command position must quote `=` as well. zsh is the
+/// other exception — with its default `EQUALS` option a word *starting* with
+/// `=` expands to a command path — and is outside the POSIX contract stated
+/// here.
 pub fn posix_shell_quote(value: &str) -> String {
     let inert = |character: char| {
         character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
