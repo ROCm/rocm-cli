@@ -1107,20 +1107,24 @@ mod tests {
     /// must not skip it.
     #[test]
     fn include_targets_reads_plain_and_raw_string_literals() {
+        // Built with `format!` so this file never contains a literal embed that
+        // `ascii_output_contract` would count as a data file compiled into a binary.
+        let call = |name: &str, arg: &str| format!("{name}!({arg})");
+        let target = "../../../README.md";
         let file = "crates/reader/src/lib.rs";
         for text in [
-            r#"include_str!("../../../README.md")"#,
-            r##"include_str!(r#"../../../README.md"#)"##,
-            r###"include_bytes!(r##"../../../README.md"##)"###,
-            r#"include_str!(r"../../../README.md")"#,
+            call("include_str", &format!("\"{target}\"")),
+            call("include_str", &format!("r\"{target}\"")),
+            call("include_str", &format!("r#\"{target}\"#")),
+            call("include_bytes", &format!("r##\"{target}\"##")),
         ] {
             assert_eq!(
-                include_targets(file, text),
+                include_targets(file, &text),
                 vec!["README.md".to_string()],
                 "{text}"
             );
         }
-        assert!(include_targets(file, r#"include_str!(concat!("a", "b"))"#).is_empty());
+        assert!(include_targets(file, &call("include_str", "concat!(\"a\", \"b\")")).is_empty());
     }
 
     /// A nested checkout (`.claude/worktrees/...`) holds another branch's
