@@ -18,7 +18,7 @@ pub const TEMP_CRIT_C: f32 = 80.0;
 
 /// Board-power warning threshold (W). At or above → warn color.
 ///
-/// Fixed semantic thresholds make heatmap/gauge colors mean "near the limit"
+/// Fixed semantic thresholds make temperature and power colors mean "near the limit"
 /// rather than "near the largest value seen this session". Tuned for
 /// MI355X-class parts (TDP ~750 W); the demo generator peaks ~740 W at 100%
 /// util. No per-GPU TDP exists in the data model, so these are constants.

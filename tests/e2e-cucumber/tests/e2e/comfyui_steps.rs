@@ -1771,7 +1771,7 @@ async fn assert_install_succeeded(world: &mut E2eWorld) {
 async fn assert_dependencies_installed(world: &mut E2eWorld) {
     // Closes the last vacuity path a zero exit code leaves open. `comfyui::install`
     // guards the whole `uv` install with `if !packages.is_empty()`
-    // (`apps/rocm/src/comfyui.rs`), so an empty filtered requirement list skips it
+    // (`apps/rocm/src/comfyui/install.rs`), so an empty filtered requirement list skips it
     // and still exits 0 — leaving the runtime untouched and every invariant below
     // passing having installed nothing.
     //

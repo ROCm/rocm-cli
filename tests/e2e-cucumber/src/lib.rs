@@ -21,6 +21,7 @@ pub mod quit_and_wait;
 pub mod reader_failure;
 pub mod send_until;
 pub mod serve_log;
+pub mod serve_plan;
 pub mod shared_runtime;
 
 use std::path::{Path, PathBuf};
@@ -122,6 +123,33 @@ pub fn cli_failure_report(args: &[&str], rc: i32, stdout: &str, stderr: &str) ->
     )
 }
 
+/// One line summing up a failed `rocm services stop`.
+///
+/// That is its `Error:` line, which is the report's header (`Local server stop
+/// not confirmed`) for an unconfirmed stop, rather than the report's last detail
+/// line; otherwise the last non-blank line.
+pub fn stop_failure_summary(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("Error:"))
+        .map_or_else(|| last_line(stderr), last_line)
+}
+
+/// The last non-blank line of `text`, clipped, for a one-line failure summary.
+fn last_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_owned()
+    }
+}
+
 pub fn chat_response_is_successful(response: &serde_json::Value) -> bool {
     response
         .get("choices")
@@ -177,9 +205,39 @@ pub use e2e_report as report;
 mod tests {
     use super::{
         chat_response_is_successful, cli_failure_report, lifecycle_binary_dir, number_after_phrase,
-        user_path_write_region,
+        stop_failure_summary, user_path_write_region,
     };
     use std::path::Path;
+
+    #[test]
+    fn stop_failure_summary_prefers_the_error_line_over_the_last_line() {
+        let stderr = "Error: Local server stop not confirmed\n  \
+                      kept: the server record\n  check: `ps -p 4242`\n\n";
+        assert_eq!(
+            stop_failure_summary(stderr),
+            "Error: Local server stop not confirmed"
+        );
+    }
+
+    #[test]
+    fn stop_failure_summary_falls_back_to_the_last_non_blank_line() {
+        let stderr = "warning: something earlier\nthread panicked at main.rs\n  \n";
+        assert_eq!(stop_failure_summary(stderr), "thread panicked at main.rs");
+        assert_eq!(stop_failure_summary(""), "");
+        assert_eq!(
+            stop_failure_summary("warning\n  indented detail  \n"),
+            "indented detail",
+            "the chosen line is trimmed"
+        );
+        let long = format!("Error: {}", "x".repeat(300));
+        let summary = stop_failure_summary(&long);
+        assert_eq!(
+            summary.chars().count(),
+            201,
+            "clipped to 200 plus an ellipsis"
+        );
+        assert!(summary.ends_with('…'), "{summary}");
+    }
 
     /// What `rocm fix fix-6-path --yes` prints *before* it does anything: the
     /// catalog recipe, reproduced here as `print_recipe` lays it out. The

@@ -76,6 +76,9 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// One entry per `rocm serve` run a scenario made, with the stderr and exit
+    /// code `cli_outputs` has no room for (see `e2e_cucumber::serve_plan`).
+    pub serve_runs: Option<Vec<e2e_cucumber::serve_plan::ServeRun>>,
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
@@ -189,6 +192,10 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// The `rocmd run` a daemon-driven automations scenario started, with the
+    /// local webhook it listens on. Held here so `Drop` can kill and reap it
+    /// whatever the scenario's outcome.
+    pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -324,6 +331,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            serve_runs: None,
             cli_elapsed: None,
             remote_env: Vec::new(),
             launch_release: None,
@@ -345,6 +353,7 @@ impl Default for E2eWorld {
             helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
+            automation_daemon: None,
         }
     }
 }
@@ -670,6 +679,11 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        // Stop the automation daemon before the isolated directory it writes its
+        // state and logs into is removed, so it never outlives the scenario.
+        if let Some(daemon) = self.automation_daemon.take() {
+            drop(daemon);
+        }
         // Let `service-cleanup-07`'s staged launch finish and join it, so its last
         // write lands while the isolated root still exists rather than panicking
         // in a detached thread after the TempDir below is gone. Dropping the
@@ -774,7 +788,7 @@ fn stop_managed_services(root: &std::path::Path) -> String {
             Ok(out) => format!(
                 "{service_id}: STOP FAILED (rc={}) {}",
                 out.status.code().unwrap_or(-1),
-                last_line(&String::from_utf8_lossy(&out.stderr))
+                e2e_cucumber::stop_failure_summary(&String::from_utf8_lossy(&out.stderr))
             ),
             Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
         });
@@ -783,21 +797,6 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         return format!("no services recorded in {}", services_dir.display());
     }
     outcomes.join("; ")
-}
-
-/// The last non-blank line of `text`, clipped, for a one-line failure summary.
-fn last_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > 200 {
-        format!("{}…", line.chars().take(200).collect::<String>())
-    } else {
-        line.to_owned()
-    }
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────
