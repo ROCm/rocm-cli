@@ -254,6 +254,7 @@ CLI:
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
 - [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtimes list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`JsonOrText`**/**`print_json_or_text`** — a command with a `--json` flag that prints one value either way implements `JsonOrText` (`render_text` returns the whole text form) and calls `print_json_or_text(json, &value)`, which writes pretty JSON plus one newline or the text verbatim and returns an error if serialization or the write fails (e.g. `rocm storage report`, `rocm diagnose`); new commands should use it instead of writing `if json { serde_json::to_string_pretty(..) } else { .. }`, and existing `--json` call sites move over as they are touched. Streaming output, output whose JSON and text differ in shape, and commands that interleave other work (side effects, audit events) with the printing stay hand-written
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
@@ -334,9 +335,10 @@ on two counts, and both change how you edit it:
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in [fix/catalog.rs](crates/rocm-core/src/fix/catalog.rs)
-  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
-  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
-  means changing the CLI **first**, then the two docs. That feature is what
+  (the `RECIPES` list) and [diagnose.rs](crates/rocm-core/src/diagnose.rs) with
+  the modules it declares, such as [catalog.rs](crates/rocm-core/src/diagnose/catalog.rs)
+  (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
+  failure mode means changing the CLI **first**, then the two docs. That feature is what
   catches you if you forget. Two sentences in
   [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
   sentence "requires `contract_version` N or higher": scenario skill-07 parses

@@ -26,7 +26,8 @@ use rocm_core::{AppPaths, ManagedServiceRecord};
 
 use crate::engine_install_env::{engine_manages_own_runtime, runtime_manifest_for_selector};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
-use crate::services_text::{load_managed_service, restart_internal_managed_service};
+use crate::service_control::restart_internal_managed_service;
+use crate::services_text::load_managed_service;
 use crate::shell_quote::shell_quote;
 use crate::therock;
 
