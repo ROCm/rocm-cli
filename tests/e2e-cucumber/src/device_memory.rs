@@ -42,7 +42,9 @@ pub const MAX_FREE_FLOOR_MIB: u64 = 150_000;
 /// 8 GiB floor the Strix Halo preflight lanes pass as
 /// `GPU_PREFLIGHT_MIN_FREE_GIB`, which `gpu-preflight.sh` compares the VRAM
 /// total against for the same purpose. Every discrete card the lanes run on is
-/// far above it (48 GiB and up).
+/// far above it (48 GiB and up). The xtask test
+/// `the_serve_drain_carveout_limit_is_the_apu_lanes_preflight_floor` fails if
+/// this stops matching the lanes' floor.
 pub const CARVEOUT_MAX_MIB: u64 = 8 * 1024;
 
 /// Whether a VRAM total is an APU's carveout rather than private device memory.
