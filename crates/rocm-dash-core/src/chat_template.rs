@@ -22,9 +22,12 @@
 /// visible answer at all. Matching is case-insensitive and by substring, so a
 /// repository-qualified and quantization-suffixed id such as
 /// `Qwen/Qwen3-1.7B-GGUF:Q4_K_M` matches too.
+///
+/// The decision is made on the name alone and is therefore approximate: every
+/// id that spells `qwen3` anywhere matches, whether or not what is actually
+/// served behind that name has a hybrid-thinking chat template.
 pub fn local_model_should_disable_thinking(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    normalized.contains("qwen3") || normalized.contains("qwen/qwen3")
+    model.to_ascii_lowercase().contains("qwen3")
 }
 
 #[cfg(test)]
@@ -35,17 +38,39 @@ mod tests {
     fn qwen3_ids_match_in_every_spelling_a_serving_endpoint_reports() {
         // A served model id reaches this helper in whatever shape the engine
         // reports it: bare, repository-qualified, quantization-suffixed, and
-        // in any case. All of them name the same chat template.
+        // in any case. All of them name the same chat template. `qwen32b` is
+        // the awkward one: a catalog alias where the parameter count runs
+        // straight on from `qwen3` with no separator at all.
         for model in [
             "qwen3",
             "Qwen3-0.6B-GGUF",
             "Qwen/Qwen3-8B",
             "QWEN3-32B-AWQ",
             "unsloth/Qwen3-1.7B-GGUF:Q4_K_M",
+            "qwen32b",
         ] {
             assert!(
                 local_model_should_disable_thinking(model),
                 "`{model}` names a hybrid-thinking chat template and must match"
+            );
+        }
+    }
+
+    #[test]
+    fn later_qwen3_families_match_on_the_strength_of_the_name_alone() {
+        // Pins the approximation the doc comment above describes, rather than
+        // endorsing it. `qwen3.5` and `qwen3.6-27b` are real catalog aliases
+        // (`crates/rocm-core/src/model_catalog.json`) that spell `qwen3` as a
+        // prefix, so they match on their names alone — nothing here has
+        // looked at the chat template actually served behind them. Narrowing
+        // the rule to exclude them would change behaviour for a model that
+        // matches today, so it has to be a deliberate decision taken against
+        // this test and that doc comment together.
+        for model in ["qwen3.5", "qwen3.6-27b"] {
+            assert!(
+                local_model_should_disable_thinking(model),
+                "`{model}` matches by name today; excluding it is a behaviour \
+                 change, not a refactor"
             );
         }
     }
