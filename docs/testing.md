@@ -815,6 +815,44 @@ Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
 relying on this coverage.
 
+### Lemonade managed-serve failure evidence
+
+On a failed serve, the shared serve steps preserve the full service log under
+`service-logs/` in the E2E results artifact before stopping the service. The engine
+is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
+neither names one, the report says `engine unknown: backend evidence skipped`.
+Lemonade failures also include the installed runtime manifest's version/backend, configured
+`backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
+and `version.txt`,
+and each candidate's `--version` and `--help` output. At most eight candidates
+are hashed and probed, with two read-only probes per candidate. Each probe retains
+up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
+marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
+output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
+Each probe has a five-second timeout. Hashing and probes share a 20-second budget
+after inventory discovery; hashing runs off the async executor, rejects files
+over 32 MiB, and checks its deadline between 64 KiB reads. Filesystem operations
+and process cleanup are not preemptible, so this is not a hard wall-clock limit
+on the entire report.
+A candidate or configured build pin is **not proof** of which binary the router
+launched; a failed probe is retained as evidence, not treated as an identity.
+Probes inherit the harness environment rather than reconstructing the engine's
+managed library paths, so a probe loader error alone does not establish why the
+serve failed.
+
+Use the evidence to distinguish backend startup, download, and router readiness
+failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the
+Strix Halo Ubuntu investigation. A backend's ready line does not establish that
+the router serves the requested model, and a readiness timeout alone does not
+establish a shutdown. Diagnostics do not change the CLI's asynchronous
+managed-launch contract or imply a backend fix.
+
+Exercise the diagnostics and expectation scoping without a GPU:
+
+```bash
+cargo test -p e2e-cucumber --lib lemonade
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:

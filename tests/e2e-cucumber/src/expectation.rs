@@ -826,6 +826,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lemonade_serve_failures_track_897_without_xfailing_mock_or_windows() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        for id in [
+            "bench-load-real-serve",
+            "chat-tool-definitions-accepted",
+            "chat-end-to-end-local-model",
+            "serve-lemonade-inference",
+            "serve-stop-leaves-no-background-helper",
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            assert!(
+                matches!(
+                    resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
+                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "#897"
+                ),
+                "{id}"
+            );
+            assert_eq!(
+                matrix.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+                Some(90),
+                "{id}",
+            );
+            for platform in ["mock", "strix-windows"] {
+                assert_eq!(
+                    resolve(&scenario, &cap(platform), &matrix, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} on {platform}",
+                );
+            }
+        }
+    }
+
     fn decl(tags: &[&str]) -> ScenarioDecl {
         ScenarioDecl::from_tags(tags)
     }

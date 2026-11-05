@@ -13,7 +13,8 @@ use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
+    ENGINE_UNKNOWN_EVIDENCE, ServeAttempt, archive_service_log, engine_from_serve_args,
+    reported_engine, serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -139,8 +140,9 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-fn serve_failure_evidence(
-    world: &E2eWorld,
+async fn serve_failure_evidence(
+    world: &mut E2eWorld,
+    engine: Option<&str>,
     headline: &str,
     device_state: &str,
     stdout: &str,
@@ -155,6 +157,19 @@ fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
+    let backend_evidence = match engine {
+        Some("lemonade") => Some(
+            e2e_cucumber::lemonade_diagnostics::backend_evidence(
+                &world
+                    .app_paths()
+                    .engine_manifests_dir("lemonade")
+                    .join("runtime.json"),
+            )
+            .await,
+        ),
+        Some(_) => None,
+        None => Some(ENGINE_UNKNOWN_EVIDENCE.to_owned()),
+    };
     let stop_status = stop_scenario_services(world);
     serve_attempt_report(&ServeAttempt {
         headline,
@@ -164,6 +179,7 @@ fn serve_failure_evidence(
         log_tail: &log_tail,
         archived_log: &archived_log,
         stop_status: &stop_status,
+        backend_evidence: backend_evidence.as_deref(),
     })
 }
 
@@ -202,7 +218,15 @@ async fn serve_and_wait(
     };
     panic!(
         "{}",
-        serve_failure_evidence(world, &headline, &device_state, &stdout, &stderr)
+        serve_failure_evidence(
+            world,
+            engine_from_serve_args(args).or_else(|| reported_engine(&stdout)),
+            &headline,
+            &device_state,
+            &stdout,
+            &stderr,
+        )
+        .await
     );
 }
 
@@ -609,13 +633,17 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         // outcome is quoted: a stop that found no record (the launch had not yet
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
-        diagnostics.push(serve_failure_evidence(
-            world,
-            &format!("attempt {attempt} of {attempts} (rc={rc})"),
-            &device_state,
-            &stdout,
-            &stderr,
-        ));
+        diagnostics.push(
+            serve_failure_evidence(
+                world,
+                Some(engine),
+                &format!("attempt {attempt} of {attempts} (rc={rc})"),
+                &device_state,
+                &stdout,
+                &stderr,
+            )
+            .await,
+        );
         if attempt == attempts {
             break;
         }
@@ -992,15 +1020,19 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             &ready_substr,
             timeout_secs,
         );
+        let stdout = world.cli_output.clone().unwrap_or_default();
+        let stderr = world.cli_stderr.clone().unwrap_or_default();
         panic!(
             "{}",
             serve_failure_evidence(
                 world,
+                reported_engine(&stdout),
                 &headline,
                 &device_state,
-                world.cli_output.as_deref().unwrap_or_default(),
-                world.cli_stderr.as_deref().unwrap_or_default(),
+                &stdout,
+                &stderr,
             )
+            .await
         );
     }
 }
@@ -2453,11 +2485,7 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
 
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
-    let Some(engine) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("engine:"))
-        .map(str::trim)
-    else {
+    let Some(engine) = reported_engine(output) else {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
