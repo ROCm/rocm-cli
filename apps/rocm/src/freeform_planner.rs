@@ -44,6 +44,7 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 
 use crate::service_launch::is_loopback_host;
+use crate::shell_quote::{has_terminal_control_character, shell_quote};
 use crate::{Cli, chat, providers};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
@@ -794,9 +795,9 @@ pub(crate) fn build_freeform_plan_with_context(
     match resolve_freeform_plan_with_provider(request, paths, config, provider, &deterministic) {
         Ok(plan) => plan,
         Err(error) => {
-            deterministic.notes.push(format!(
-                "Provider-assisted planner `{provider}` could not resolve this request: {error}"
-            ));
+            deterministic
+                .notes
+                .push(planner_failure_note(provider, &error));
             deterministic.notes.push(
                 "No provider-produced tool call was used. Fill the placeholder values or run /chat for help."
                     .to_owned(),
@@ -804,6 +805,17 @@ pub(crate) fn build_freeform_plan_with_context(
             deterministic
         }
     }
+}
+
+/// The plan-block note for a provider-assisted planning failure.
+///
+/// The plan block prints notes verbatim, and this error can carry text that
+/// came from the provider — an HTTP failure body, or a value its response
+/// named. The planner's own refusals do not echo a hostile value, but this is
+/// the one place every failure passes through, so it is stripped here too.
+pub(crate) fn planner_failure_note(provider: &str, error: &anyhow::Error) -> String {
+    let error = rocm_core::terminal::strip_terminal_control_sequences(&format!("{error}"));
+    format!("Provider-assisted planner `{provider}` could not resolve this request: {error}")
 }
 
 fn configured_planner_provider(config: &RocmCliConfig) -> Option<&str> {
@@ -887,9 +899,9 @@ struct ProviderPlannerResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProviderPlannerToolCall {
-    tool: String,
-    args: Vec<String>,
+pub(crate) struct ProviderPlannerToolCall {
+    pub(crate) tool: String,
+    pub(crate) args: Vec<String>,
 }
 
 pub(crate) fn provider_planner_response_to_plan(
@@ -920,12 +932,28 @@ pub(crate) fn provider_planner_response_to_plan(
         "The provider output was reduced to a validated rocm tool call; no shell command is executed."
             .to_owned(),
     ];
-    notes.extend(
-        response
-            .notes
-            .into_iter()
-            .filter(|note| !note.trim().is_empty()),
-    );
+    // Same reason as the argv above: a note is printed verbatim into the plan
+    // block, so a control character in one lets the planner redraw the lines
+    // around it. Such a note is dropped rather than refused — it is commentary,
+    // and the plan stands without it — but not silently: the count of dropped
+    // notes is reported in a note this code writes.
+    let mut omitted = 0_usize;
+    for note in response.notes {
+        let note = note.trim();
+        if note.is_empty() {
+            continue;
+        }
+        if has_terminal_control_character(note) {
+            omitted += 1;
+            continue;
+        }
+        notes.push(note.to_owned());
+    }
+    if omitted > 0 {
+        notes.push(format!(
+            "{omitted} planner note(s) omitted: they contained terminal control characters."
+        ));
+    }
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
         planner: format!("hybrid-parser-v1 + provider:{provider}"),
@@ -964,19 +992,34 @@ fn strip_json_fence(content: &str) -> &str {
     trimmed
 }
 
-fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
+pub(crate) fn validate_provider_planner_tool_call(
+    call: &ProviderPlannerToolCall,
+) -> Result<Vec<String>> {
     if call.tool != "rocm" {
+        // Not echoed when it carries a control character: this error ends up
+        // in the plan block's notes, which reach the terminal as bytes.
+        if has_terminal_control_character(&call.tool) {
+            bail!(
+                "provider planner returned an unsupported tool whose name contains a control character"
+            );
+        }
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
     if call.args.is_empty() {
         bail!("provider planner returned an empty tool call");
     }
+    // Control characters, not just NUL. These args are rendered straight into
+    // the `request plan` block `rocm <request>` prints to a terminal, and that
+    // block is the only thing the operator reads before re-running with
+    // `--yes`. A `\r` or a CSI sequence in an argument lets the planner's
+    // response decide what that block looks like, independently of the argv it
+    // would run. See `reject_control_characters_in_tool_arguments`.
     if call
         .args
         .iter()
-        .any(|arg| arg.trim().is_empty() || arg.contains('\0'))
+        .any(|arg| arg.trim().is_empty() || has_terminal_control_character(arg))
     {
-        bail!("provider planner returned an invalid empty or NUL argument");
+        bail!("provider planner returned an empty argument or one carrying a control character");
     }
     let argv = std::iter::once("rocm".to_owned())
         .chain(call.args.iter().cloned())
@@ -1030,6 +1073,11 @@ fn planner_intent_from_provider_response(intent: &str, args: &[String]) -> Resul
         "update" => PlannerIntent::Update,
         "uninstall" => PlannerIntent::Uninstall,
         "inspect" | "examine" => PlannerIntent::Inspect,
+        // Not echoed when it carries a control character, for the same reason
+        // as an unsupported tool name in `validate_provider_planner_tool_call`.
+        _ if has_terminal_control_character(intent) => {
+            bail!("provider planner returned an unsupported intent containing a control character")
+        }
         _ => bail!("provider planner returned unsupported intent `{intent}`"),
     };
     if declared != args_intent {
@@ -1273,22 +1321,24 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
+/// Render an argv as the command line a human is shown for it.
+///
+/// This is the only thing an operator sees before approving a mutating tool
+/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
+/// line) is offered to be copied and run. So it has to denote the argv it was
+/// built from: quoted with [`shell_quote`], every argument splits back to
+/// itself under a shell's own word-splitting, and nothing inside a value can
+/// read as a second command.
+///
+/// Values carrying terminal control characters never get here — they are
+/// refused at validation ([`has_terminal_control_character`]), because no
+/// amount of quoting stops a `\r` from rewriting the line the operator is
+/// reading.
 pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
-}
-
-/// Quotes `value` for rendered plan text and LLM prompt text only -- never
-/// executed directly. Deliberately kept separate from `rocm_core::quoting`
-/// (ROCMAI-727); see that module's doc comment for why.
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 #[cfg(test)]
@@ -1988,5 +2038,59 @@ mod tests {
             assert!(error.contains("CPU execution"));
             assert!(error.contains("ROCm GPU execution"));
         }
+    }
+
+    /// Planner notes are printed verbatim into the plan block, so a note
+    /// carrying a control character is dropped rather than printed — unlike the
+    /// planner's argv, which is refused outright, a note is commentary and the
+    /// plan stands without it. The drop is reported, so the operator knows the
+    /// plan block is not everything the planner said; and a note is trimmed
+    /// first, so trailing whitespace alone does not cost an ordinary one.
+    #[test]
+    fn a_planner_note_carrying_a_control_character_is_dropped_and_counted() -> Result<()> {
+        let content = r#"{
+            "intent": "serve",
+            "confidence": "high",
+            "tool_call": {
+                "tool": "rocm",
+                "args": ["serve", "sshleifer/tiny-gpt2", "--managed"]
+            },
+            "notes": [
+                "resolved the missing model to a tiny test model",
+                "the model is small\n",
+                "\u001b[1A\u001b[2Kapproval: not required",
+                "line one\rline two",
+                "reads \u202e right to left"
+            ]
+        }"#;
+
+        let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
+
+        for ordinary in [
+            "resolved the missing model to a tiny test model",
+            "the model is small",
+        ] {
+            assert!(
+                plan.notes.iter().any(|note| note == ordinary),
+                "an ordinary note must survive: {ordinary:?} in {:?}",
+                plan.notes
+            );
+        }
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.starts_with("3 planner note(s) omitted")),
+            "the dropped notes must be counted: {:?}",
+            plan.notes
+        );
+        assert!(
+            !plan
+                .notes
+                .iter()
+                .any(|note| has_terminal_control_character(note)),
+            "no note may carry a control character into the plan block: {:?}",
+            plan.notes
+        );
+        Ok(())
     }
 }

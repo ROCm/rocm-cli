@@ -23,7 +23,7 @@ use super::{
     ComfyUiProbe, ComfyUiRuntimeEnvironment, capture_configured_command,
     comfyui_source_archive_url, install_log_path_from_app_root, interrupted_reinstall_advice,
     models_folder_for_source, probe_comfyui, quote_log_arg, reused_source_url, runtime_app_root,
-    save_manifest, source_path_from_app_root, source_swap,
+    save_manifest, source_path_from_app_root, source_swap, unfinished_install_advice,
 };
 use crate::cli_progress::AnimatedSpinner;
 use crate::freeform_planner::format_structured_tool_call;
@@ -293,10 +293,9 @@ pub(crate) fn install(
         let changes = swap_changes_summary(&swap)
             .map(|summary| format!(" ({summary})"))
             .unwrap_or_default();
-        error.context(format!(
-            "the new ComfyUI code is in place{changes}, but the install did not finish; once \
-             the cause below is fixed, run `rocm comfyui install --runtime-id {}` to finish it",
-            runtime.manifest.runtime_key
+        error.context(unfinished_install_advice(
+            &changes,
+            &runtime.manifest.runtime_key,
         ))
     })?;
 
