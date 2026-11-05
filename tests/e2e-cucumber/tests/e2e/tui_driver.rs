@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +61,11 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+
+/// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
+/// stay `u16` because `PtySize` takes that. A zero here fails the build.
+const VT_ROWS: NonZeroU16 = NonZeroU16::new(ROWS).expect("ROWS must be non-zero");
+const VT_COLS: NonZeroU16 = NonZeroU16::new(COLS).expect("COLS must be non-zero");
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -322,7 +328,7 @@ impl TuiSession {
             .take_writer()
             .map_err(|e| reap_orphan(format!("failed to take pty writer: {e}")))?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(VT_ROWS, VT_COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
         let reader = spawn_reader(
@@ -408,7 +414,8 @@ impl TuiSession {
             .parser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (p.screen().contents(), p.screen().size())
+        let (rows, cols) = p.screen().size();
+        (p.screen().contents(), (rows.get(), cols.get()))
     }
 
     fn framed_screen(&self) -> String {
@@ -583,6 +590,12 @@ impl TuiSession {
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        // `vt100` takes `NonZeroU16`s; check before resizing the PTY so a zero
+        // dimension fails cleanly instead of leaving the PTY and screen at
+        // different sizes.
+        let (Some(vt_rows), Some(vt_cols)) = (NonZeroU16::new(rows), NonZeroU16::new(cols)) else {
+            return Err(format!("cannot resize to {cols}x{rows}: zero dimension"));
+        };
         let size = PtySize {
             rows,
             cols,
@@ -599,7 +612,7 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
-            .set_size(rows, cols);
+            .set_size(vt_rows, vt_cols);
         Ok(())
     }
 
