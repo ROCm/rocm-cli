@@ -23,20 +23,42 @@ const MATCH_COUNT: usize = 9;
 
 #[given("recorded command logs containing several lines about a topic")]
 async fn plant_command_logs(world: &mut E2eWorld) {
+    plant_logs(world, false);
+}
+
+#[given(
+    "recorded command logs containing several lines about a topic and one byte that is not valid text"
+)]
+async fn plant_command_logs_with_an_invalid_byte(world: &mut E2eWorld) {
+    plant_logs(world, true);
+}
+
+/// Plant one action log. With `invalid_byte`, an unrelated leading line carries
+/// a lone `0xff` — a byte no UTF-8 text contains — which the matching lines
+/// after it must survive.
+fn plant_logs(world: &E2eWorld, invalid_byte: bool) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let cli_logs = root.path().join("data").join("logs").join("cli");
     std::fs::create_dir_all(&cli_logs).expect("failed to create cli logs dir");
     // Write the matching lines LAST so they fall within the per-file tail window
     // `rocm logs` reads (a few leading non-matching lines are harmless context).
-    let mut body = String::new();
+    let mut body: Vec<u8> = Vec::new();
     for i in 0..3 {
-        let _ = writeln!(body, "2026-01-01T00:00:0{i} unrelated startup line");
+        let mut line = String::new();
+        let _ = writeln!(line, "2026-01-01T00:00:0{i} unrelated startup line");
+        if invalid_byte && i == 1 {
+            body.extend_from_slice(b"2026-01-01T00:00:01 unrelated line with a stray \xff byte\n");
+        } else {
+            body.extend_from_slice(line.as_bytes());
+        }
     }
     for i in 1..=MATCH_COUNT {
+        let mut line = String::new();
         let _ = writeln!(
-            body,
+            line,
             "2026-01-01T00:01:00 event {TOPIC} occurred number {i}"
         );
+        body.extend_from_slice(line.as_bytes());
     }
     std::fs::write(cli_logs.join("e2e-probe.log"), body).expect("failed to write log file");
 }
