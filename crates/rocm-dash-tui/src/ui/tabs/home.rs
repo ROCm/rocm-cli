@@ -104,6 +104,25 @@ fn snap_util(s: &rocm_dash_core::metrics::Snapshot) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Sums the finite values `pick` yields across instances, or `None` when no
+/// instance contributed one. The `Option` is the point: "nothing reported a
+/// value" has to stay distinct from "every reporter measured zero", which a
+/// bare sum cannot express. A single NaN/Infinity sample is dropped rather
+/// than allowed to poison the total, as `gen_tps_cell` does per instance.
+/// `Iterator::sum` is deliberately avoided — its `f64` identity is `-0.0`, so
+/// an empty iterator sums to `-0.0` and renders as `"-0"`.
+fn instance_aggregate<F>(state: &AppState, pick: F) -> Option<f64>
+where
+    F: Fn(&rocm_dash_core::metrics::Instance) -> Option<f64>,
+{
+    state
+        .instances
+        .values()
+        .filter_map(pick)
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, v| Some(acc.unwrap_or(0.0) + v))
+}
+
 /// A labeled one-row instrument: `LABEL ▁▂▃▅▆▇  value`. Port of the mock's
 /// `mini_spark`; `accent` picks the flat throughput tint, else value-gradient.
 fn mini_spark(
@@ -341,16 +360,7 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Tokens/watt: summed across running instances when available.
     // Mark held if any contributing instance has a held gen_tps observation
     // (tok/W derives from gen_tps; aggregate inherits held status).
-    // A single NaN/Infinity instance would otherwise poison the whole sum
-    // (and, for `any_tpw_held`, count as held without ever being displayed) —
-    // filtered out the same way `tokens_per_watt` is guarded per-instance
-    // elsewhere in this tab.
-    let tpw: f64 = state
-        .instances
-        .values()
-        .filter_map(|i| i.tokens_per_watt)
-        .filter(|v| v.is_finite())
-        .sum();
+    let tpw = instance_aggregate(state, |i| i.tokens_per_watt);
     let any_tpw_held = state.instances.values().any(|i| {
         i.tokens_per_watt.is_some_and(f64::is_finite)
             && i.gen_tps_observation
@@ -361,15 +371,16 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // is the first thing a short hero drops, and a bare "*" with nothing on
     // screen to define it is worse than an unannotated prior-window value.
     let legend_fits = lh[5].height > 0;
-    let tpw_label = if tpw > 0.0 {
-        let marker = if any_tpw_held && legend_fits {
-            crate::ui::format::HELD_MARKER
-        } else {
-            ""
-        };
-        format!("⎓ {tpw:.1} tokens / watt{marker}")
-    } else {
-        "⎓ tokens / watt —".to_string()
+    let tpw_label = match tpw {
+        None => "⎓ tokens / watt —".to_string(),
+        Some(v) => {
+            let marker = if any_tpw_held && legend_fits {
+                crate::ui::format::HELD_MARKER
+            } else {
+                ""
+            };
+            format!("⎓ {v:.1} tokens / watt{marker}")
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -381,10 +392,10 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[4],
     );
     // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
-    // held AND rendered with a marker — `tpw > 0.0` mirrors the gate on
-    // `tpw_label` above so a zero-throughput aggregate (which prints
+    // held AND rendered with a marker — `tpw.is_some()` mirrors the gate on
+    // `tpw_label` above so an unmeasured aggregate (which prints
     // "tokens / watt —" with no marker) never shows an unexplained legend.
-    if tpw > 0.0 && any_tpw_held {
+    if tpw.is_some() && any_tpw_held {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format::HELD_LEGEND,
@@ -481,34 +492,22 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         false,
         theme,
     );
-    // A single NaN/Infinity instance would otherwise poison the whole sum
-    // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
-    // without ever contributing a displayed value — guarded the same way
-    // `gen_tps_cell` guards a single instance's value.
-    let tps_samples: Vec<f64> = state
-        .instances
-        .values()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
-        .collect();
-    let tps: f64 = tps_samples.iter().sum();
+    let tps = instance_aggregate(state, |i| i.gen_tps);
     let any_tps_held = state.instances.values().any(|i| {
         i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
     });
-    // No instance reporting throughput is "not measured", not a measured 0 —
-    // and an empty f64 sum is -0.0, which `{:.0}` renders as "-0".
     // The held marker is suppressed with the legend row that explains it, as
     // in `draw_hero_left`.
     let legend_fits = rh[5].height > 0;
-    let tps_str = if tps_samples.is_empty() {
-        "—".to_string()
-    } else if any_tps_held && legend_fits {
-        format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
-    } else {
-        format!("{tps:.0}")
+    let tps_str = match tps {
+        None => "—".to_string(),
+        Some(v) if any_tps_held && legend_fits => {
+            format!("{:.0}{}", v, crate::ui::format::HELD_MARKER)
+        }
+        Some(v) => format!("{v:.0}"),
     };
     mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
     // Show the shared HELD_LEGEND only when the tok/s aggregate is actually
@@ -1181,27 +1180,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn home_tpw_legend_absent_when_aggregate_is_zero_even_if_held() {
-        // tokens_per_watt sums to 0.0 (the "tokens / watt —" branch, no marker
-        // rendered) while gen_tps is absent (so the tok/s side never fires
-        // either). Held metadata alone must not add an unexplained legend.
-        let inst = Instance {
+    /// An instance whose only reading is `tokens_per_watt`, held.
+    fn tpw_only_instance(tokens_per_watt: Option<f64>) -> Instance {
+        Instance {
             container_id: "m".into(),
             container_name: "m".into(),
             status: InstanceStatus::Running,
             model_name: "m".into(),
             gpu_ids: vec!["0".into()],
             gen_tps: None,
-            tokens_per_watt: Some(0.0),
+            tokens_per_watt,
             gen_tps_observation: Some(held_obs()),
             ..Default::default()
-        };
-        let out = render(&state_with_instance(inst), 160, 30);
+        }
+    }
+
+    #[test]
+    fn home_tpw_shows_a_measured_zero_rather_than_a_dash() {
+        // An instance that reports 0.0 tok/W measured it; only "no instance
+        // reported one at all" is unmeasured. Mirrors the tok/s side, which
+        // renders a reported 0 as "0" and reserves "—" for nothing reporting.
+        let out = render(&state_with_instance(tpw_only_instance(Some(0.0))), 160, 30);
         assert!(
-            !out.contains(format::HELD_LEGEND),
-            "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
+            out.contains(&format!("0.0 tokens / watt{}", format::HELD_MARKER)),
+            "a measured zero tok/W must render as 0.0, not —; got:\n{out}"
         );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the marked zero aggregate must still be explained; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_legend_absent_when_no_instance_reports_a_finite_value() {
+        // The invariant the aggregate change must not break: held metadata
+        // alone, with nothing finite to mark, must not conjure a legend.
+        for tpw in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            let out = render(&state_with_instance(tpw_only_instance(tpw)), 160, 30);
+            assert!(
+                out.contains("tokens / watt —"),
+                "unmeasured tok/W must read —; got for {tpw:?}:\n{out}"
+            );
+            assert!(
+                !out.contains(format::HELD_LEGEND),
+                "HELD_LEGEND must not appear with nothing marked; got for {tpw:?}:\n{out}"
+            );
+        }
     }
 
     #[test]
