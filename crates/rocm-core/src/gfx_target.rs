@@ -151,6 +151,7 @@ pub(crate) fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     name_fallback.or_else(|| unsupported_match.map(str::to_owned))
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_windows_display_name(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
