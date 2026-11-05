@@ -950,6 +950,146 @@ mod tests {
         Ok(())
     }
 
+    fn tail_fixture(label: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-{label}-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
+        // Characterisation of the whole-file read: a line far outside any
+        // tail window is still returned when the limit is large enough.
+        let path = tail_fixture("large", &large_log_with_head_marker())?;
+
+        let tail = read_tail_lines(&path, 10_000)?;
+        fs::remove_file(&path)?;
+
+        assert!(tail.starts_with("HEAD-MARKER\n"), "head line is returned");
+        assert!(tail.ends_with("\nTAIL-MARKER"));
+        assert_eq!(tail.lines().count(), 5122);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_fails_on_a_sixteen_bit_log_today() -> Result<()> {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "[INFO] one\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let path = tail_fixture("utf16", &bytes)?;
+
+        let error = read_tail_lines(&path, 5).expect_err("not valid eight-bit text");
+        fs::remove_file(&path)?;
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read {}", path.display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_ansi_colour_codes() -> Result<()> {
+        let path = tail_fixture("ansi", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "\u{1b}[32mgreen\u{1b}[0m done");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_fails_on_invalid_eight_bit_text_today() -> Result<()> {
+        let path = tail_fixture("invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        let error = read_tail_lines(&path, 5).expect_err("invalid UTF-8 aborts the read");
+        fs::remove_file(&path)?;
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read {}", path.display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_labelled_read_error() {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-missing-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+
+        let error = read_tail_lines(&path, 5).expect_err("a missing log must not read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read {}", path.display())
+        );
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_every_line_today() -> Result<()> {
+        // A latent bug rather than a contract: with limit 0 the window never
+        // evicts, so the whole file comes back. The tool handler clamps the
+        // limit to 1..=500, so no caller reaches it.
+        let path = tail_fixture("zero", b"a\nb\nc\n")?;
+
+        let tail = read_tail_lines(&path, 0)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb\nc");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let path = tail_fixture("few", b"a\nb\n")?;
+
+        let tail = read_tail_lines(&path, 50)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let path = tail_fixture("no-newline", b"a\nb\nc")?;
+
+        let tail = read_tail_lines(&path, 2)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "b\nc");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let path = tail_fixture("crlf", b"a\r\nb\r\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
+        Ok(())
+    }
+
     fn mcp_stop_server(paths: &AppPaths, service_id: &str) -> Result<Value> {
         handle_mcp_tool_call(
             paths,

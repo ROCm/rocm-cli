@@ -997,6 +997,126 @@ mod tests {
         Ok(())
     }
 
+    fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let paths = test_paths(name);
+        let dir = app_root(&paths).join("logs");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("start-fixture.log");
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    fn utf16_le(text: &str, bom: bool) -> Vec<u8> {
+        let mut bytes = if bom { vec![0xff, 0xfe] } else { Vec::new() };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
+        // Characterisation of the whole-file read: a line far outside any
+        // tail window is still returned when the limit is large enough.
+        let log = tail_fixture("comfyui-tail-large", &large_log_with_head_marker())?;
+
+        let lines = read_tail_lines(&log, 10_000)?;
+
+        assert_eq!(lines.first().map(String::as_str), Some("HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        assert_eq!(lines.len(), 5122);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_a_bomless_utf16_log_and_strips_ansi() -> Result<()> {
+        let text = "\u{1b}[32m[INFO]\u{1b}[0m one\r\n\u{1b}[1;31mtwo\u{1b}[0m\r\n";
+        let log = tail_fixture("comfyui-tail-utf16-nobom", &utf16_le(text, false))?;
+
+        let lines = read_tail_lines(&log, 5)?;
+
+        assert_eq!(lines, vec!["[INFO] one", "two"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_ansi_from_an_eight_bit_log() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-ansi-utf8", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5)?, vec!["green done"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        assert_eq!(
+            read_tail_lines(&log, 5)?,
+            vec!["ok", "bad\u{FFFD}byte", "last"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_not_found_error() {
+        let paths = test_paths("comfyui-tail-missing");
+        let missing = app_root(&paths).join("logs").join("absent.log");
+
+        let error = read_tail_lines(&missing, 5).expect_err("a missing log must not read");
+
+        let io_error = error
+            .downcast_ref::<io::Error>()
+            .expect("the bare io error is returned, without a path label");
+        assert_eq!(io_error.kind(), io::ErrorKind::NotFound);
+        // The same applies to limit 0: the file is opened before the limit is
+        // looked at.
+        assert!(read_tail_lines(&missing, 0).is_err());
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing_for_an_existing_log() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-zero", b"a\nb\n")?;
+
+        assert!(read_tail_lines(&log, 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-few", b"a\nb\n")?;
+
+        assert_eq!(read_tail_lines(&log, 50)?, vec!["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-no-newline", b"a\nb\nc")?;
+
+        assert_eq!(read_tail_lines(&log, 2)?, vec!["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-crlf", b"a\r\nb\r\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5)?, vec!["a", "b"]);
+        Ok(())
+    }
+
     #[test]
     fn unmanaged_running_url_reports_reachable_loopback_endpoint() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;

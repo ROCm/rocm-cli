@@ -1596,6 +1596,141 @@ pub(crate) mod tests {
         test_paths,
     };
 
+    fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let (root, _paths) = test_paths(name);
+        fs::create_dir_all(&root)?;
+        let path = root.join("service.log");
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_whole_today() -> Result<()> {
+        // Characterisation of the whole-file stream: a line far outside any
+        // tail window is still returned when the limit is large enough.
+        let log = tail_fixture("services-tail-large", &large_log_with_head_marker())?;
+
+        let lines = read_tail_lines(&log, 10_000, "service log")?;
+
+        assert_eq!(lines.first().map(String::as_str), Some("HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        assert_eq!(lines.len(), 5122);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_fails_on_a_sixteen_bit_log_today() -> Result<()> {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "[INFO] one\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let log = tail_fixture("services-tail-utf16", &bytes)?;
+
+        let error = read_tail_lines(&log, 5, "service log")
+            .expect_err("a sixteen-bit log is not valid eight-bit text");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read service log {}", log.display())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_ansi_colour_codes() -> Result<()> {
+        let log = tail_fixture("services-tail-ansi", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        assert_eq!(
+            read_tail_lines(&log, 5, "service log")?,
+            vec!["\u{1b}[32mgreen\u{1b}[0m done"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_fails_on_invalid_eight_bit_text_today() -> Result<()> {
+        let log = tail_fixture("services-tail-invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        let error = read_tail_lines(&log, 5, "service log")
+            .expect_err("invalid UTF-8 aborts the whole read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read service log {}", log.display())
+        );
+        // read_optional_tail_lines turns that error into one placeholder line
+        // instead of any of the readable lines.
+        assert_eq!(
+            read_optional_tail_lines(&log, 5, "service log"),
+            vec![format!(
+                "<failed to read service log: failed to read service log {}>",
+                log.display()
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_labelled_open_error() {
+        let (root, _paths) = test_paths("services-tail-missing");
+        let missing = root.join("absent.log");
+
+        let error =
+            read_tail_lines(&missing, 5, "service log").expect_err("a missing log must not read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open service log {}", missing.display())
+        );
+        // read_optional_tail_lines guards on is_file first and stays quiet.
+        assert!(read_optional_tail_lines(&missing, 5, "service log").is_empty());
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing_without_opening_the_file() {
+        let (root, _paths) = test_paths("services-tail-zero");
+
+        let lines = read_tail_lines(&root.join("absent.log"), 0, "service log")
+            .expect("limit 0 returns before the file is opened");
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let log = tail_fixture("services-tail-few", b"a\nb\n")?;
+
+        assert_eq!(read_tail_lines(&log, 50, "service log")?, vec!["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let log = tail_fixture("services-tail-no-newline", b"a\nb\nc")?;
+
+        assert_eq!(read_tail_lines(&log, 2, "service log")?, vec!["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let log = tail_fixture("services-tail-crlf", b"a\r\nb\r\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5, "service log")?, vec!["a", "b"]);
+        Ok(())
+    }
+
     #[test]
     fn lemonade_stop_unloads_selected_model_over_http() -> Result<()> {
         use std::io::{Read, Write};

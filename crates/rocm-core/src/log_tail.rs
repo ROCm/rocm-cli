@@ -220,6 +220,68 @@ mod tests {
     }
 
     #[test]
+    fn tail_lines_on_a_large_file_returns_only_whole_lines_from_the_window() -> Result<()> {
+        // 1 MiB of 1 KiB lines under a 64 KiB budget, with a marked first and
+        // last line. The first line lies far outside the window, so a read
+        // that returned it was not bounded; the window starts mid-line (the
+        // budget is not a multiple of the line length), so a leading fragment
+        // that was kept would be shorter than a whole line.
+        let mut content = String::from("HEAD-MARKER\n");
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..1024 {
+            content.push_str(&filler);
+        }
+        content.push_str("TAIL-MARKER\n");
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-large-{}.log", unique_suffix()));
+        fs::write(&path, &content)?;
+
+        let lines = tail_lines(&path, usize::MAX, 64 * 1024 + 7)?;
+        fs::remove_file(&path).ok();
+
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        assert!(lines.len() <= 65, "got {} lines", lines.len());
+        for line in &lines[..lines.len() - 1] {
+            assert_eq!(line.len(), 1023, "a partial leading fragment was kept");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_missing_file_is_an_open_error_naming_the_path() {
+        let path = Path::new("/does/not/exist/rocm-core-tail-missing.log");
+
+        let error = tail_lines(path, 5, TEST_MAX_TAIL_READ).expect_err("missing file");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open {}", path.display())
+        );
+    }
+
+    #[test]
+    fn tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("rocm-core-tail-few-{}.log", unique_suffix()));
+        fs::write(&path, "a\nb\n")?;
+        let lines = tail_lines(&path, 50, TEST_MAX_TAIL_READ)?;
+        fs::remove_file(&path).ok();
+        assert_eq!(lines, vec!["a".to_owned(), "b".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-no-nl-{}.log", unique_suffix()));
+        fs::write(&path, "a\nb\nc")?;
+        let lines = tail_lines(&path, 2, TEST_MAX_TAIL_READ)?;
+        fs::remove_file(&path).ok();
+        assert_eq!(lines, vec!["b".to_owned(), "c".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
     fn tail_lines_limit_zero_returns_empty_without_opening_file() -> Result<()> {
         let path = Path::new("/does/not/exist/rocm-core-tail-limit-zero.log");
         let lines = tail_lines(path, 0, TEST_MAX_TAIL_READ)?;
