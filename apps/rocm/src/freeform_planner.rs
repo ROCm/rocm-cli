@@ -47,8 +47,6 @@ use std::fmt::Write as _;
 // as `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
 // `freeform_execution.rs` and `providers.rs`'s tests).
 pub(crate) use crate::rocm_argv::format_structured_tool_call;
-use crate::rocm_argv::serve_args_request_cpu_device;
-use crate::service_launch::is_loopback_host;
 use crate::shell_quote::has_terminal_control_character;
 use crate::{Cli, prompt_text, providers, rocm_argv, tool_policy};
 
@@ -1016,24 +1014,7 @@ pub(crate) fn validate_provider_planner_tool_call(
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
         [command, ..] if command == "serve" => {
-            if rocm_argv::chat_cli_has_flag(&call.args, "--allow-public-bind") {
-                bail!("provider planner cannot request public network binding");
-            }
-            if serve_args_request_cpu_device(&call.args) {
-                bail!(
-                    "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution"
-                );
-            }
-            if let Some(host) = rocm_argv::chat_cli_arg_value(&call.args, "--host")
-                && !is_loopback_host(host)
-            {
-                bail!("provider planner cannot request non-local host `{host}`");
-            }
-            if rocm_argv::chat_cli_has_flag(&call.args, "--foreground")
-                || !rocm_argv::chat_cli_has_flag(&call.args, "--managed")
-            {
-                bail!("provider planner must request managed serving with --managed");
-            }
+            tool_policy::validate_serve_command_safety(&call.args, "provider planner")?;
         }
         [command, ..] if command == "uninstall" => {}
         _ => bail!(
@@ -2117,7 +2098,7 @@ mod tests {
                     "0.0.0.0",
                     "--foreground",
                 ][..],
-                "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+                "provider planner cannot request CPU execution; ROCm GPU execution is required",
             ),
             (
                 &["serve", "qwen", "--host", "0.0.0.0", "--foreground"][..],
@@ -2139,11 +2120,11 @@ mod tests {
         }
     }
 
-    /// Where the planner's serve rules and the chat tool policy's differ today,
-    /// pinned in one place. The rules are the same four, in the same order, over
-    /// the same argv helpers; what differs is the words.
+    /// The planner and the chat tool policy enforce one set of serve rules, so
+    /// they refuse an argv with the same words and differ only in who is named
+    /// at the front of the message.
     #[test]
-    fn planner_and_chat_serve_refusals_differ_in_actor_and_cpu_wording_only() {
+    fn planner_and_chat_serve_refusals_differ_in_the_actor_only() {
         use crate::test_support::SERVE_SAFETY_REFUSALS;
 
         for case in SERVE_SAFETY_REFUSALS {
@@ -2157,17 +2138,7 @@ mod tests {
                 .unwrap_or_else(|| {
                     panic!("planner refusal names the planner: {}", case.planner_error)
                 });
-            if case.rule == "cpu device" {
-                assert_eq!(
-                    (chat, planner),
-                    (
-                        "cannot request CPU execution; ROCm GPU execution is required",
-                        "cannot request CPU execution; rocm-cli requires ROCm GPU execution",
-                    )
-                );
-            } else {
-                assert_eq!(chat, planner, "{}: {:?}", case.rule, case.args);
-            }
+            assert_eq!(chat, planner, "{}: {:?}", case.rule, case.args);
         }
     }
 

@@ -283,19 +283,19 @@ pub(crate) const SERVE_SAFETY_REFUSALS: &[ServeSafetyCase] = &[
             "--managed",
         ],
         chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
-        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
     },
     ServeSafetyCase {
         rule: "cpu device",
         args: &["serve", "qwen", "--device=cpu", "--managed"],
         chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
-        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
     },
     ServeSafetyCase {
         rule: "cpu device",
         args: &["serve", "qwen", "--device", "cpu_only", "--managed"],
         chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
-        planner_error: "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
     },
     ServeSafetyCase {
         rule: "non-loopback host",

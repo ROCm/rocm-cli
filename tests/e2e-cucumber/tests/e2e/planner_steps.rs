@@ -168,6 +168,30 @@ async fn planning_assistant_with_distinct_plans(world: &mut E2eWorld) {
     start_planning_assistant(world, vec![examine_plan_reply(), engines_list_plan_reply()]).await;
 }
 
+/// The model the planning assistant names in an unsafe serve plan. The CLI's own
+/// plan for the vague request names no model, so this appearing in the output
+/// means the assistant's plan was shown.
+const UNSAFE_PLAN_MODEL: &str = "sshleifer/tiny-gpt2";
+
+#[given(expr = "a local planning assistant that suggests serving a model with {string}")]
+async fn planning_assistant_suggests_serve_with(world: &mut E2eWorld, flags: String) {
+    let mut args = vec!["serve", UNSAFE_PLAN_MODEL];
+    args.extend(flags.split_whitespace());
+    let plan = json!({
+        "intent": "serve",
+        "tool_call": {"tool": "rocm", "args": args}
+    });
+    // One reply: a second planning request would be an unscripted HTTP 500.
+    start_planning_assistant(
+        world,
+        vec![chat_text_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            &plan.to_string(),
+        )],
+    )
+    .await;
+}
+
 #[given(
     "a local chat assistant that hands a vague request to the planning assistant, which suggests a different plan each time it is asked"
 )]
@@ -202,6 +226,15 @@ async fn chat_assistant_that_asks_the_planning_assistant(world: &mut E2eWorld) {
 async fn user_approves_vague_request(world: &mut E2eWorld) {
     // Not `run_rocm_ok`: the request is expected to be refused (non-zero).
     let (stdout, stderr, rc) = crate::run_rocm(world, &["--yes", VAGUE_REQUEST]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to plan a vague request")]
+async fn user_asks_cli_to_plan_vague_request(world: &mut E2eWorld) {
+    // No `--yes`: the CLI prints the plan and runs nothing.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &[VAGUE_REQUEST]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -305,6 +338,43 @@ fn assert_plan_text_is_the_first_answer(text: &str) {
         [format!("next_tool_call: {first}")],
         "the plan shown must be the assistant's first answer (`{first}`, not the \
          `{second}` a second planning call would give):\n{text}"
+    );
+}
+
+#[then(expr = "the CLI plans the request itself and says the planning assistant's plan {string}")]
+async fn cli_plans_itself_and_says_why(world: &mut E2eWorld, reason: String) {
+    let out = cli_output(world);
+    let rc = world.cli_rc.expect("no command was run");
+    assert_eq!(
+        rc,
+        0,
+        "planning must still succeed with the CLI's own plan:\n{out}\n{}",
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    // The behavior: the assistant's serve is not the plan shown, and nothing
+    // ran. The plan comes from the CLI's own planner alone (no provider in its
+    // name), names none of the assistant's model, and has no execution section.
+    assert!(
+        !out.contains(UNSAFE_PLAN_MODEL),
+        "the planning assistant's unsafe plan must not be shown:\n{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.trim() == "planner: hybrid-parser-v1"),
+        "the plan shown must be the CLI's own:\n{out}"
+    );
+    assert!(
+        !out.contains("\nexecution\n"),
+        "nothing may be executed:\n{out}"
+    );
+    // The message, asserted together with the behavior above: it gives the
+    // rule's reason and names the assistant's plan as what was refused.
+    let note = format!(
+        "Provider-assisted planner `local` could not resolve this request: provider planner {reason}"
+    );
+    assert!(
+        out.lines().any(|line| line.contains(&note)),
+        "the CLI must say why the assistant's plan was not used (`{note}`):\n{out}"
     );
 }
 

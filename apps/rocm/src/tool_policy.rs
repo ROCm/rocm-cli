@@ -835,24 +835,41 @@ fn canonicalize_chat_rocm_command(args: &mut [String]) -> Result<()> {
     Ok(())
 }
 
+/// The rules a model-proposed `rocm serve` must satisfy, whoever proposes it.
+///
+/// Four, checked in this order and reported first-failure-wins: no
+/// `--allow-public-bind`, no CPU device, a loopback `--host` if one is given,
+/// and `--managed` without `--foreground`. `args` is the whole argv, starting
+/// at `serve`; the caller has already decided it is one.
+///
+/// `actor` names who proposed the call and opens every refusal (`{actor}
+/// cannot request ...`), so each surface keeps saying who was refused while the
+/// rules, their order and the rest of the wording stay in this one place. The
+/// chat policy passes `local assistant`; the provider-assisted planner passes
+/// `provider planner`. Deleting a rule here removes it from both.
+pub(crate) fn validate_serve_command_safety(args: &[String], actor: &str) -> Result<()> {
+    if chat_cli_has_flag(args, "--allow-public-bind") {
+        bail!("{actor} cannot request public network binding");
+    }
+    if serve_args_request_cpu_device(args) {
+        bail!("{actor} cannot request CPU execution; ROCm GPU execution is required");
+    }
+    if let Some(host) = chat_cli_arg_value(args, "--host")
+        && !is_loopback_host(host)
+    {
+        bail!("{actor} cannot request non-local host `{host}`");
+    }
+    if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
+        bail!("{actor} must request managed serving with --managed");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
     if let Some(first) = args.first()
         && first.eq_ignore_ascii_case("serve")
     {
-        if chat_cli_has_flag(args, "--allow-public-bind") {
-            bail!("local assistant cannot request public network binding");
-        }
-        if serve_args_request_cpu_device(args) {
-            bail!("local assistant cannot request CPU execution; ROCm GPU execution is required");
-        }
-        if let Some(host) = chat_cli_arg_value(args, "--host")
-            && !is_loopback_host(host)
-        {
-            bail!("local assistant cannot request non-local host `{host}`");
-        }
-        if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
-            bail!("local assistant must request managed serving with --managed");
-        }
+        validate_serve_command_safety(args, "local assistant")?;
     }
     if args
         .first()
@@ -2609,6 +2626,27 @@ mod tests {
                 .expect_err("unsafe")
                 .to_string();
             assert_eq!(error, expected, "{args:?}");
+        }
+    }
+
+    /// The shared serve check opens every refusal with the actor its caller
+    /// names, so each surface keeps saying who it refused.
+    #[test]
+    fn serve_safety_refusals_open_with_the_actor_the_caller_names() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let error = validate_serve_command_safety(&owned_argv(case.args), "some caller")
+                .expect_err(case.rule)
+                .to_string();
+            assert_eq!(
+                error,
+                case.chat_error
+                    .replacen("local assistant", "some caller", 1),
+                "{}: {:?}",
+                case.rule,
+                case.args
+            );
         }
     }
 
