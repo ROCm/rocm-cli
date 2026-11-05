@@ -131,20 +131,35 @@ pub fn reverse_closure(
 ///   test reads.
 /// - `docs/ci-hardware-testing.md` and `tests/e2e-cucumber/README.md`: both
 ///   read by `hardware_testing_docs_cover_all_self_hosted_platforms` (xtask).
+/// - `docs/runtime-dependencies.md`, `docs/testing.md` and
+///   `docs/engine-plugins.md`: read by
+///   `the_remediation_command_is_spelled_the_same_everywhere` (xtask).
 pub(crate) const XTASK_READ_DOCS: &[&str] = &[
     "MANIFEST.md",
     "CONTRIBUTING.md",
     "docs/ci-hardware-testing.md",
     "tests/e2e-cucumber/README.md",
+    "docs/runtime-dependencies.md",
+    "docs/testing.md",
+    "docs/engine-plugins.md",
 ];
 
+/// Source files outside `xtask/` that xtask compiles in with `#[path]`. The
+/// crate graph maps them to their own crate only, so an edit to one alone
+/// would never re-run the xtask tests built from it.
+/// - `crates/rocm-deps/src/pins_gen.rs`: `cargo xtask deps check` runs the
+///   `rocm-deps` generator over `runtimes/mise.lock`.
+pub(crate) const XTASK_COMPILED_FILES: &[&str] = &["crates/rocm-deps/src/pins_gen.rs"];
+
 /// True for changed files that force a full-workspace run: anything that can
-/// affect resolution, the build for every crate, CI itself, or a doc an xtask
-/// test reads ([`XTASK_READ_DOCS`]).
+/// affect resolution, the build for every crate, CI itself, a doc an xtask
+/// test reads ([`XTASK_READ_DOCS`]), or code xtask compiles in by path
+/// ([`XTASK_COMPILED_FILES`]).
 fn forces_full_workspace(file: &str) -> bool {
     file == "Cargo.lock"
         || file == "Cargo.toml" // workspace root manifest
         || XTASK_READ_DOCS.contains(&file)
+        || XTASK_COMPILED_FILES.contains(&file)
         || file.starts_with("rust-toolchain")
         || file.starts_with(".github/workflows/")
 }
@@ -352,6 +367,9 @@ mod tests {
             ("protocol".to_string(), "crates/protocol".to_string()),
             ("engine".to_string(), "engines/engine".to_string()),
             ("leaf".to_string(), "crates/leaf".to_string()),
+            // Present so `select_pins_gen_forces_workspace` tests the
+            // compiled-file rule rather than the unknown-path fallback.
+            ("rocm-deps".to_string(), "crates/rocm-deps".to_string()),
             ("app".to_string(), "apps/app".to_string()),
         ];
         // forward: protocol->core, engine->{core,protocol}, app->{engine,leaf}
@@ -362,6 +380,7 @@ mod tests {
         rev_deps.insert("engine".into(), vec!["app".into()]);
         rev_deps.insert("leaf".into(), vec!["app".into()]);
         rev_deps.insert("app".into(), vec![]);
+        rev_deps.insert("rocm-deps".into(), vec![]);
         Graph {
             crate_dirs,
             rev_deps,
@@ -485,6 +504,34 @@ mod tests {
         let g = graph();
         assert_eq!(
             select(&["docs/ci-hardware-testing.md".to_string()], &g),
+            Selection::Workspace
+        );
+    }
+
+    #[test]
+    fn select_runtime_docs_read_by_xtask_force_workspace() {
+        // Read by the_remediation_command_is_spelled_the_same_everywhere.
+        let g = graph();
+        for doc in [
+            "docs/runtime-dependencies.md",
+            "docs/testing.md",
+            "docs/engine-plugins.md",
+        ] {
+            assert_eq!(
+                select(&[doc.to_string()], &g),
+                Selection::Workspace,
+                "{doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_pins_gen_forces_workspace() {
+        // Compiled into xtask by path, so its own crate's selection misses
+        // the `deps check` tests built from it.
+        let g = graph();
+        assert_eq!(
+            select(&["crates/rocm-deps/src/pins_gen.rs".to_string()], &g),
             Selection::Workspace
         );
     }

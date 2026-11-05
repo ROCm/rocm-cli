@@ -315,6 +315,50 @@ These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules 
 covered source. That inflates the numbers and damps the gate — see the module comment in
 `xtask/src/coverage.rs` for what the measurement is and is not good for.
 
+## Runtime locks
+
+The third-party runtime pins and locks under `runtimes/` (see
+[runtime-dependencies.md](runtime-dependencies.md)) are checked in these ways
+(a profile without a committed lock fails the first of them; see "Bootstrapping
+a profile's first lock" there):
+
+- `cargo test -p xtask` runs `cargo xtask deps check` against the committed
+  files, offline: every lock exists and no stray one does, starts with the
+  generated header, was resolved from the profile's and `uv.toml`'s current
+  inputs (a digest in that header), satisfies its profile, locks each package once with a
+  version and an artifact, takes every artifact from PyPI or AMD's indexes and
+  AMD-only packages from AMD's indexes only, keeps every `+rocm…` build on the
+  profile's ROCm line, and carries only wheels for its OS; every binary is
+  locked for exactly Linux and Windows x64 as a release asset of the
+  repository its `mise.toml` key names, from the release its version names,
+  built for that OS, and the lock passes the same generator the `rocm-deps`
+  build runs.
+- The `runtime-locks` CI job re-locks at the committed pins on a pull request
+  that changes `runtimes/`, [`xtask/src/deps/`](../xtask/src/deps/) or
+  [`pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs),
+  and fails if anything differs,
+  uploading the re-locked files as the `runtime-locks` artifact. It downloads
+  every AMD wheel the locks name (about 17 GiB), which is why it is
+  path-filtered, does not run on pushes or in the merge queue, and runs on a
+  GitHub-hosted runner rather than locally.
+- `python scripts/validate_runtime_update.py --self-test`
+  ([script](../scripts/validate_runtime_update.py); run by the
+  "Acceptance harness self-tests" CI step) covers the script the weekly update
+  workflow uses to refuse an update artifact that changes anything but
+  versions, or whose pull-request summary is not `cargo xtask deps diff`
+  output. The commit step's payload builder is run on a fixture by the xtask
+  test `the_update_commit_replaces_the_pins_and_deletes_only_dropped_locks`;
+  the rest of that workflow runs only from `main`, weekly or when dispatched.
+- The Windows bootstrap launcher, [`runtimes/bin/mise.cmd`](../runtimes/bin/mise.cmd), is run by the
+  "Bootstrap mise through the Windows launcher" step of the `windows-debug`
+  CI job, which downloads the pinned mise through it and checks its version.
+  The mise tasks themselves (`lock`, `update`) are not run on Windows.
+
+```bash
+cargo xtask deps check                       # offline
+runtimes/bin/mise run --cd runtimes lock    # network; slow, see above
+```
+
 ## Remote control-channel checks
 
 `rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
@@ -370,9 +414,11 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, CI config, or a doc an xtask test reads —
+file, the workspace root manifest, CI config, a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). On `main`
+`tests/e2e-cucumber/README.md`, [`docs/runtime-dependencies.md`](runtime-dependencies.md),
+this file, [`docs/engine-plugins.md`](engine-plugins.md) — or code xtask compiles in
+by path, [`crates/rocm-deps/src/pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs)). On `main`
 and in the merge queue the full workspace always runs. For local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization.
 
