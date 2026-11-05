@@ -397,6 +397,7 @@ mod tests {
     use super::*;
     use crate::comfyui::render_status;
     use crate::comfyui::tests::{ready_runtime_manifest, test_paths, write_runtime_manifest};
+    use crate::test_support::{runtime_registry_entry_names, write_test_pip_runtime};
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::fs;
 
@@ -955,6 +956,162 @@ mod tests {
             assert!(library_entries.contains(&runtime_lib));
             assert!(library_entries.contains(&runtime_sysdeps));
         }
+        Ok(())
+    }
+
+    /// Zero runtimes registered: the refusal points at the launcher's setup row,
+    /// and selecting wrote nothing.
+    #[test]
+    fn comfyui_selection_with_no_registered_runtime_says_to_install_rocm_and_writes_nothing()
+    -> Result<()> {
+        let paths = test_paths("comfyui-selection-none-registered");
+
+        let message = select_runtime(&paths, &RocmCliConfig::default(), None)
+            .expect_err("no registered runtime means no selection")
+            .to_string();
+
+        assert!(
+            message.contains("Install ROCm first")
+                && message.contains("pick \"Set up this system\""),
+            "unexpected refusal: {message}"
+        );
+        assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// One ready runtime and nothing chosen: it is the selection.
+    #[test]
+    fn comfyui_selection_with_one_ready_runtime_selects_it() -> Result<()> {
+        let paths = test_paths("comfyui-selection-one-ready");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+
+        let selected = select_runtime(&paths, &RocmCliConfig::default(), None)?;
+
+        assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
+        assert_eq!(
+            Some(selected.python.display().to_string()),
+            manifest.python_executable
+        );
+        Ok(())
+    }
+
+    /// Registered but none ready: the refusal lists the runtime with the reason
+    /// it is unusable, and fixing that reason (here: putting the interpreter
+    /// back) is what clears it.
+    #[test]
+    fn comfyui_selection_with_only_an_unusable_runtime_clears_once_it_is_fixed() -> Result<()> {
+        let paths = test_paths("comfyui-selection-none-ready");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        let python = PathBuf::from(
+            manifest
+                .python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        );
+        fs::remove_file(&python)?;
+
+        let message = select_runtime(&paths, &RocmCliConfig::default(), None)
+            .expect_err("an unusable runtime is not ready")
+            .to_string();
+
+        assert!(
+            message.contains("No ROCm runtime is ready")
+                && message.contains("rocm runtimes list")
+                && message.contains(&format!("`{}` (unusable", manifest.runtime_key)),
+            "unexpected refusal: {message}"
+        );
+        assert_eq!(
+            runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)]
+        );
+
+        fs::write(&python, "python")?;
+        let selected = select_runtime(&paths, &RocmCliConfig::default(), None)?;
+        assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
+        Ok(())
+    }
+
+    /// Several ready runtimes and none chosen: the refusal names the remedies,
+    /// and each one clears it. `rocm runtimes activate <key>` is run as
+    /// `activate_runtime`, its implementation, and `--runtime-id` as the selector.
+    #[test]
+    fn comfyui_selection_with_several_ready_runtimes_names_remedies_that_clear_it() -> Result<()> {
+        let paths = test_paths("comfyui-selection-several-ready");
+        let first = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let second = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+
+        let message = select_runtime(&paths, &config, None)
+            .expect_err("several ready runtimes and no choice must not select")
+            .to_string();
+
+        assert!(
+            message.contains("Multiple ROCm runtimes are ready")
+                && message.contains("rocm runtimes activate <key>")
+                && message.contains("--runtime-id <key>")
+                && message.contains(&first.runtime_key)
+                && message.contains(&second.runtime_key),
+            "unexpected refusal: {message}"
+        );
+
+        let selected = select_runtime(&paths, &config, Some(&first.runtime_key))?;
+        assert_eq!(selected.manifest.runtime_key, first.runtime_key);
+
+        crate::runtimes_cmd::activate_runtime(&paths, &mut config, &second.runtime_key)?;
+        let selected = select_runtime(&paths, &config, None)?;
+        assert_eq!(selected.manifest.runtime_key, second.runtime_key);
+        Ok(())
+    }
+
+    /// The setup-recovery half of the rule, today's behaviour: a ready runtime
+    /// that only `recover_setup_runtime_registration` can make visible is not
+    /// found by the ComfyUI path. It reports an empty registry and writes
+    /// nothing, where the engine path (see `engine_runtime_select.rs`'s
+    /// `engine_selection_recovers_the_setup_runtime_the_registry_lost`) selects it.
+    #[test]
+    fn comfyui_selection_does_not_recover_a_setup_runtime_the_registry_lost() -> Result<()> {
+        let paths = test_paths("comfyui-selection-setup-recovery");
+        crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        assert!(
+            config.setup.therock_venv.is_some(),
+            "setup must name the folder for this test to mean anything"
+        );
+        assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
+
+        let message = select_runtime(&paths, &config, None)
+            .expect_err("the registry is empty and ComfyUI does not recover")
+            .to_string();
+
+        assert!(message.contains("Install ROCm first"), "got: {message}");
+        assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
         Ok(())
     }
 
