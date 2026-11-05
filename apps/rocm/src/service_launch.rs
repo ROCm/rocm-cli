@@ -880,6 +880,77 @@ fn simulate_oom_managed_launch(
     })
 }
 
+/// Probe `record`'s endpoint until it answers: once within the readiness
+/// budget, or (with `wait_until_ready`) for as long as the server stays alive.
+fn wait_for_record_ready(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    wait_until_ready: bool,
+    endpoint_api_key: Option<&str>,
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> EndpointReadiness {
+    let probe = |on_tick: &mut dyn FnMut(Duration)| {
+        wait_for_service_http_ready_with_progress(
+            &record.engine,
+            &record.host,
+            record.port,
+            &|| {
+                let mut latest = record.clone();
+                let _ = latest.refresh_from_engine_state();
+                latest.served_model_name().to_owned()
+            },
+            endpoint_api_key,
+            READINESS_WAIT,
+            on_tick,
+        )
+    };
+    if wait_until_ready {
+        wait_past_readiness_budget(
+            || probe(&mut *on_wait_tick),
+            || service_still_live(paths, &record.service_id, service_pid_is_alive),
+        )
+    } else {
+        probe(on_wait_tick)
+    }
+}
+
+/// An equivalent service is already live. Without `--wait`, or once it is
+/// serving, report it as is; otherwise wait for it like a fresh launch would.
+fn wait_on_existing_service(
+    paths: &AppPaths,
+    mut report: ManagedLaunchReport,
+    wait_until_ready: bool,
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> Result<ManagedLaunchReport> {
+    if !wait_until_ready || report.status == "ready" {
+        return Ok(report);
+    }
+    let Ok(mut record) = ManagedServiceRecord::read_manifest(paths, &report.service_id) else {
+        return Ok(report);
+    };
+    // The key the caller generated belongs to a launch that did not happen; the
+    // existing service answers to its own.
+    let stored_key = endpoint_keys::endpoint_api_key(paths, &report.service_id);
+    let readiness =
+        wait_for_record_ready(paths, &record, true, stored_key.as_deref(), on_wait_tick);
+    if let Some(error) = died_during_wait(
+        paths,
+        &report.service_id,
+        true,
+        readiness,
+        service_pid_is_alive,
+    ) {
+        return Err(error);
+    }
+    report.status = status_for_readiness(readiness).to_owned();
+    record.status.clone_from(&report.status);
+    if readiness == EndpointReadiness::Serving {
+        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
+    record.write()?;
+    Ok(report)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     engine: &str,
@@ -933,7 +1004,12 @@ pub(crate) fn start_managed_service(
         require_api_key,
         gpu_refusal_waived_for_reuse,
     )? {
-        ManagedSpawn::AlreadyRunning(report) => return Ok(report),
+        ManagedSpawn::AlreadyRunning(report) => {
+            // `--wait` applies to a service that is still starting too: the
+            // natural retry after `rocm serve m` printed `starting`.
+            drop(launch_lock);
+            return wait_on_existing_service(&paths, report, wait_until_ready, on_wait_tick);
+        }
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
     // The claiming service record is now persisted, so the selected GPU is
@@ -945,29 +1021,13 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    let probe = |on_tick: &mut dyn FnMut(Duration)| {
-        wait_for_service_http_ready_with_progress(
-            engine,
-            host,
-            port,
-            &|| {
-                let mut latest = record.clone();
-                let _ = latest.refresh_from_engine_state();
-                latest.served_model_name().to_owned()
-            },
-            endpoint_api_key,
-            READINESS_WAIT,
-            on_tick,
-        )
-    };
-    let readiness = if wait_until_ready {
-        wait_past_readiness_budget(
-            || probe(&mut *on_wait_tick),
-            || service_still_live(&paths, service_id, service_pid_is_alive),
-        )
-    } else {
-        probe(on_wait_tick)
-    };
+    let readiness = wait_for_record_ready(
+        &paths,
+        &record,
+        wait_until_ready,
+        endpoint_api_key,
+        on_wait_tick,
+    );
     if let Some(error) = died_during_wait(
         &paths,
         service_id,
@@ -1868,6 +1928,42 @@ mod tests {
         settle_exited_service(&paths, &record.service_id);
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_on_existing_service_only_waits_for_one_that_is_not_serving_yet() {
+        // The probing path itself blocks for the readiness budget, so only the
+        // cases that must return at once are driven here; a manifest planted
+        // as `starting` would hang a wrong guard for 45 seconds and fail it.
+        let (root, paths) = test_paths("wait-existing");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.write().expect("write");
+        let report = |status: &str| ManagedLaunchReport {
+            service_id: record.service_id.clone(),
+            endpoint_url: record.endpoint_url.clone(),
+            status: status.to_owned(),
+            already_running: true,
+            child_pid: None,
+            log_path: None,
+            manifest_path: None,
+        };
+        let mut no_tick = |_: Duration| panic!("must not probe");
+
+        let untouched = wait_on_existing_service(&paths, report("starting"), false, &mut no_tick)
+            .expect("no --wait");
+        assert_eq!(untouched.status, "starting");
+        let ready = wait_on_existing_service(&paths, report("ready"), true, &mut no_tick)
+            .expect("already ready");
+        assert_eq!(ready.status, "ready");
+        record.status = "starting".to_owned();
+        assert_eq!(
+            ManagedServiceRecord::read_manifest(&paths, &record.service_id)
+                .unwrap()
+                .status,
+            "starting"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

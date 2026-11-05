@@ -6,8 +6,10 @@
 //! the internal sandbox-tool execution (stop/restart/list) behind the
 //! chat/LLM tool-calling path and the daemon-free managed-service lifecycle.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
+//! Mostly relocated from `main.rs` with no behavior change — Phase 6f
 //! (ROCMAI-209) of the `main.rs` modularization (see `docs/architecture.md`).
+//! The `--follow` tail (`LogTail`, `FollowFooter`, `follow_service_logs`) is new
+//! code written here, not relocated.
 //!
 //! This module owns: the CLI/TUI logs browser (`render_logs_text`,
 //! `render_logs_browser_text`, `render_logs_browser_page_text`,
@@ -623,7 +625,10 @@ impl LogTail {
             }
             if byte == b'\n' || byte == b'\r' {
                 let mut redraw = byte == b'\r';
-                let text = String::from_utf8_lossy(&self.pending[start..index]).into_owned();
+                // The footer's row bookkeeping assumes the log text moves no cursor.
+                let text = rocm_core::terminal::strip_terminal_control_sequences(
+                    &String::from_utf8_lossy(&self.pending[start..index]),
+                );
                 // `\r\n` is one line break, not a redraw followed by an empty line.
                 if redraw && self.pending.get(index + 1) == Some(&b'\n') {
                     redraw = false;
@@ -684,12 +689,16 @@ struct FollowFooter {
     open_row: bool,
 }
 
+/// Led by the part that says the server keeps running: service ids run 40+
+/// characters, so on a narrow terminal the end of the hint is what gets cut.
+fn follow_hint(service_id: &str) -> String {
+    format!("Ctrl-C stops following, the server keeps running. Following {service_id}")
+}
+
 impl FollowFooter {
     fn new(service_id: &str) -> Self {
         Self {
-            text: format!(
-                "Following {service_id} - Ctrl-C stops following and leaves the server running."
-            ),
+            text: follow_hint(service_id),
             drawn: false,
             open_row: false,
         }
@@ -718,7 +727,9 @@ impl FollowFooter {
             writeln!(out)?;
         }
         let shown: String = match cols {
-            Some(cols) => self.text.chars().take(cols.saturating_sub(1)).collect(),
+            Some(cols) => {
+                crate::cli_progress::truncate_to_width(&self.text, cols.saturating_sub(1))
+            }
             None => self.text.clone(),
         };
         write!(out, "\r\x1b[2K{shown}")?;
@@ -769,6 +780,13 @@ pub(crate) fn follow_service_logs(paths: &AppPaths, service_id: &str) -> Result<
     )
 }
 
+/// True once, the first time `status` reads `ready`.
+fn newly_ready(announced: &mut bool, status: &str) -> bool {
+    let ready = status == "ready" && !*announced;
+    *announced |= ready;
+    ready
+}
+
 fn follow_service_logs_with(
     paths: &AppPaths,
     service_id: &str,
@@ -779,7 +797,9 @@ fn follow_service_logs_with(
     cols: &dyn Fn() -> Option<usize>,
 ) -> Result<()> {
     let record = load_managed_service(paths, service_id)?;
-    // Open the tail before the snapshot so output written in between is not lost.
+    // Open the tail before the snapshot: output written in between is then shown
+    // twice (in the snapshot and by the first poll) rather than lost, and the
+    // tail can start mid-line.
     let mut tail = LogTail::at_end(&record.log_path);
     write!(out, "{}", render_service_logs_text(paths, service_id)?)?;
     if !managed_service_is_live(&record) {
@@ -795,13 +815,11 @@ fn follow_service_logs_with(
     let mut footer = tty.then(|| FollowFooter::new(service_id));
     match footer.as_mut() {
         Some(footer) => footer.draw(out, false, cols())?,
-        None => writeln!(
-            out,
-            "\nFollowing {service_id} - Ctrl-C stops following and leaves the server running."
-        )?,
+        None => writeln!(out, "\n{}", follow_hint(service_id))?,
     }
     out.flush()?;
 
+    let mut announced_ready = record.status == "ready";
     let mut since_check = Duration::ZERO;
     loop {
         thread::sleep(poll);
@@ -817,6 +835,18 @@ fn follow_service_logs_with(
         }
         since_check = Duration::ZERO;
         let record = load_managed_service(paths, service_id)?;
+        if newly_ready(&mut announced_ready, &record.status) {
+            let line = [LogSegment {
+                text: format!("Service {service_id} is ready."),
+                redraw: false,
+            }];
+            match footer.as_mut() {
+                Some(footer) => footer.write_batch(out, &line, cols())?,
+                None => {
+                    write_log_segments(out, &line, tty)?;
+                }
+            }
+        }
         if !managed_service_is_live(&record) {
             // Output written between the last poll and the exit.
             let mut last = tail.poll();
@@ -835,6 +865,10 @@ fn follow_service_logs_with(
                 "Service {service_id} is {}; stopped following.",
                 record.status
             )?;
+            // Same outcome as `serve --wait`: a server that failed is not a success.
+            if record.status == "failed" {
+                bail!("service {service_id} failed; see the log output above");
+            }
             return Ok(());
         }
     }
@@ -2396,9 +2430,28 @@ pub(crate) mod tests {
     fn follow_footer_is_cut_to_one_terminal_row() -> Result<()> {
         let mut footer = FollowFooter::new("svc_a");
         let mut out = Vec::new();
-        footer.draw(&mut out, false, Some(11))?;
-        // One column short of the width, so it never wraps.
-        assert_eq!(String::from_utf8(out)?, format!("{ERASE}Following "));
+        footer.draw(&mut out, false, Some(30))?;
+        // One column short of the width, so it never wraps, and what is kept is
+        // the head of the hint: the part saying the server keeps running.
+        let drawn = String::from_utf8(out)?;
+        let shown = drawn.strip_prefix(ERASE).expect("erase prefix");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(shown), 29, "{shown}");
+        assert!(shown.starts_with("Ctrl-C stops following, the"), "{shown}");
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_strips_cursor_escapes_from_engine_output() -> Result<()> {
+        let (root, _paths) = test_paths("tail-escapes");
+        fs::create_dir_all(&root)?;
+        let log = root.join("engine.log");
+        fs::write(&log, "")?;
+        let mut tail = LogTail::at_end(&log);
+        fs::write(&log, "before\x1b[1Aafter\n")?;
+        let segments = tail.poll();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "beforeafter");
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -2603,6 +2656,68 @@ pub(crate) mod tests {
         assert!(
             out.contains("Service svc_follow_stopped is stopped; not following."),
             "{out}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn newly_ready_fires_once_on_the_first_ready_status() {
+        let mut announced = false;
+        assert!(!newly_ready(&mut announced, "starting"));
+        assert!(newly_ready(&mut announced, "ready"));
+        assert!(!newly_ready(&mut announced, "ready"));
+        // A follow that began on an already-ready server has announced nothing new.
+        let mut announced = true;
+        assert!(!newly_ready(&mut announced, "ready"));
+    }
+
+    #[test]
+    fn follow_service_logs_fails_when_the_service_failed() -> Result<()> {
+        let (root, paths) = test_paths("follow-ready-failed");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_fail",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11438,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(200));
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_fail")?;
+            record.status = "failed".to_owned();
+            record.write()
+        });
+        let mut out = Vec::new();
+        let result = follow_service_logs_with(
+            &paths,
+            "svc_follow_fail",
+            &mut out,
+            false,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            &|| None,
+        );
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        assert!(out.contains("is failed; stopped following"), "{out}");
+        let error = result.expect_err("a failed service must not exit 0");
+        assert!(
+            error.to_string().contains("svc_follow_fail failed"),
+            "{error}"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())

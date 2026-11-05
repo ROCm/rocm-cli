@@ -609,7 +609,8 @@ rocm serve qwen --verbose --device gpu_required")]
         managed: bool,
         /// Keep waiting until the server answers requests, however long a first-time
         /// model download takes, instead of returning `starting` after 45 seconds.
-        /// Fails with a pointer to the logs if the server exits first. Cannot be
+        /// Also waits on a matching server that is already starting. Fails with a
+        /// pointer to the logs if the server exits first. Cannot be
         /// combined with --foreground or --verbose, which already stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
         wait: bool,

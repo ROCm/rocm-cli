@@ -918,8 +918,8 @@ seconds; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background. It cannot be combined with `--foreground` or `--verbose`, and
-it applies only to a launch: when the model is already being served, `rocm serve`
-reports its current status and returns without waiting. Watch the download with
+when the model is already being served and still starting, it waits on that
+server instead (an already-serving one is reported at once). Watch the download with
 `rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
@@ -1091,7 +1091,7 @@ Manage background servers started with `--managed`:
 
 ```
 rocm services list [--all] [--json]
-rocm services logs <service-id>
+rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
@@ -1401,8 +1401,9 @@ rocm uninstall [--yes] [--dry-run]
 ```
 
 `--follow` (`-f`) keeps printing a server's new log output, such as a model
-download's progress, until the server stops. Ctrl-C ends the follow and leaves
-the server running. On a terminal, a `Following <id> - Ctrl-C stops following ...`
+download's progress, until the server stops (a server that ends `failed` makes the command exit
+non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
+ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
 line stays on the row under the newest output; piped or redirected output prints
 it once.
 

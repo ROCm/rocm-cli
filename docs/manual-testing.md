@@ -403,7 +403,7 @@ rocm services
 rocm services list --all
 rocm services logs <service-id>
 rocm services logs <service-id> --follow
-rocm serve <model> --wait   # a fresh launch: waits past 45s and returns once the server answers (an already-running model returns its current status at once)
+rocm serve <model> --wait   # waits past 45s and returns once the server answers (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -424,8 +424,9 @@ Expected result:
 - `rocm services logs <service-id> --follow` prints the recent output, then new
   output as it arrives (a download bar redraws on one terminal row), and returns
   by itself with `Service <id> is <status>; stopped following.` once the server
-  stops; Ctrl-C ends the follow and the server keeps running.
-  On a terminal, a `Following <id> - Ctrl-C stops following ...` line stays on the
+  stops (exit non-zero if it ended `failed`), with a `Service <id> is ready.`
+  line when it finishes starting; Ctrl-C ends the follow and the server keeps running.
+  On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>` line stays on the
   row directly under the newest output (and under the download bar) as the log
   grows; with output piped to a file it is printed once instead.
 - `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
