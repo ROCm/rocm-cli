@@ -421,6 +421,137 @@ mod tests {
         }
     }
 
+    /// The ROCm SDK versions the discover-build table serves, in table order.
+    ///
+    /// Pinned on purpose: adding, removing or reordering a row changes which
+    /// runtimes are installed by discovery and which get the discovery launch
+    /// environment, so it has to show up as a reviewed edit of this list
+    /// rather than slip through a test that only compares the data with itself.
+    #[test]
+    fn discover_build_table_pins_the_versions_it_serves_in_order() {
+        let versions: Vec<&str> = VLLM_ROCM_DISCOVER_BUILD_TABLE
+            .iter()
+            .map(|build| build.rocm_sdk_version)
+            .collect();
+        assert_eq!(
+            versions,
+            ["10.0.0", "10.1.0"],
+            "the discover-build table's versions or order changed: install routing, the \
+             launch environment and the fail-closed static fallback all follow it"
+        );
+    }
+
+    fn runtime_recording_sdk_version(version: Option<&str>) -> crate::runtime::VllmRuntime {
+        crate::runtime::VllmRuntime {
+            runtime_id: "wheel-gfx1151".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: std::path::PathBuf::from("/rocm/runtimes/wheel/gfx1151/bin/vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:wheel-gfx1151".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: version.map(ToOwned::to_owned),
+        }
+    }
+
+    /// What every reader of the discover-build data decides for one recorded
+    /// ROCm SDK version: the row the install lookup finds, the install route,
+    /// whether launch-time env setup treats the runtime as a discover build, and
+    /// how the static-pin fallback answers (`Some(true)` resolves a pin,
+    /// `Some(false)` fails closed, `None` when no version is recorded).
+    #[derive(Debug, PartialEq, Eq)]
+    struct DiscoverReaders {
+        row: Option<&'static str>,
+        route: VllmInstallRoute,
+        launch_treats_as_discover: bool,
+        static_pin_resolves: Option<bool>,
+    }
+
+    fn discover_readers(version: Option<&str>) -> DiscoverReaders {
+        DiscoverReaders {
+            row: version
+                .and_then(vllm_rocm_discover_build)
+                .map(|build| build.rocm_sdk_version),
+            route: vllm_install_route(None, version),
+            launch_treats_as_discover: crate::runtime::runtime_has_discover_build(
+                &runtime_recording_sdk_version(version),
+            ),
+            static_pin_resolves: version.map(|v| install_target(None, Some(v)).is_ok()),
+        }
+    }
+
+    /// Install routing and launch-time env setup are two readers of the same
+    /// discover-build data. For every table row, spelled the way a real probe
+    /// spells it (exact, with a patch, with a dev suffix), both must agree that
+    /// the runtime is a discover build, and the static-pin fallback must fail
+    /// closed for it. For a version outside the table, both must agree it is not.
+    #[test]
+    fn every_discover_row_routes_installs_and_launch_env_the_same_way() {
+        for build in VLLM_ROCM_DISCOVER_BUILD_TABLE {
+            let key = build.rocm_sdk_version;
+            let (major_minor, _) = key
+                .rsplit_once('.')
+                .expect("table key is major.minor.patch");
+            for spelling in [
+                key.to_owned(),
+                format!("{major_minor}.7"),
+                format!("{key}a20260822"),
+                format!("{key}.dev0+abc"),
+            ] {
+                assert_eq!(
+                    discover_readers(Some(&spelling)),
+                    DiscoverReaders {
+                        row: Some(key),
+                        route: VllmInstallRoute::RocmDiscover,
+                        launch_treats_as_discover: true,
+                        static_pin_resolves: Some(false),
+                    },
+                    "readers disagree for {spelling}, a spelling of table row {key}"
+                );
+            }
+        }
+
+        // Outside the table: no row, static route, no discovery env. A 10.x line
+        // with no row still fails closed instead of taking the 7.2.3 default
+        // pin; other lines (and unparsable text) resolve that default.
+        assert_eq!(
+            discover_readers(Some("10.2.0")),
+            DiscoverReaders {
+                row: None,
+                route: VllmInstallRoute::Static,
+                launch_treats_as_discover: false,
+                static_pin_resolves: Some(false),
+            }
+        );
+        for outside in ["7.2.3", "999.0.0", "not-a-version"] {
+            assert_eq!(
+                discover_readers(Some(outside)),
+                DiscoverReaders {
+                    row: None,
+                    route: VllmInstallRoute::Static,
+                    launch_treats_as_discover: false,
+                    static_pin_resolves: Some(true),
+                },
+                "readers disagree for {outside}, which is outside the table"
+            );
+        }
+        assert_eq!(
+            discover_readers(None),
+            DiscoverReaders {
+                row: None,
+                route: VllmInstallRoute::Static,
+                launch_treats_as_discover: false,
+                static_pin_resolves: None,
+            }
+        );
+        // `static_pin_resolves: None` above means no version was recorded; the
+        // fallback itself fails for that case, with its own message.
+        assert!(install_target(None, None).is_err());
+    }
+
     fn install_target(
         index: Option<&str>,
         rocm_sdk_version: Option<&str>,
