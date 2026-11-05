@@ -78,7 +78,7 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
 async fn wait_for_frame(
     tui: &mut TuiSession,
     what: &str,
-    missing: impl Fn(&str) -> Vec<String>,
+    missing: impl Fn(&str) -> Vec<String> + Send + Sync,
 ) -> String {
     let mut ready_frame = String::new();
     let outcome = tui
@@ -99,10 +99,12 @@ async fn wait_for_frame(
         // later, so it can already be complete (a frame that finished just after
         // the deadline), and then there is nothing to list.
         let lacked = missing(&tui.screen_text()).join(", ");
-        if lacked.is_empty() {
-            panic!("{what}: {error}");
-        }
-        panic!("{what}: the screen lacked {lacked}: {error}");
+        let clause = if lacked.is_empty() {
+            String::new()
+        } else {
+            format!("the screen lacked {lacked}: ")
+        };
+        panic!("{what}: {clause}{error}");
     }
     ready_frame
 }
