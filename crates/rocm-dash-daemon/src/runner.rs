@@ -317,7 +317,7 @@ pub async fn run_loop(
 
     // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
     // configured). Distinct from Docker/vLLM discovery — a local server, not a
-    // container — so it is tracked separately from `known_instances`.
+    // container — so it is tracked separately from the Docker known set.
     let lemonade = if opts.enable_lemonade {
         info!(
             host = %opts.lemonade_host,
@@ -332,9 +332,6 @@ pub async fn run_loop(
     } else {
         None
     };
-    // The id of the currently-live Lemonade instance, if any.
-    let mut lemonade_id: Option<String> = None;
-
     let mut bench = opts.bench_csv.as_ref().map(|p| {
         info!(path = %p.display(), "tailing benchmark CSV");
         CsvBenchTailer::new(p.clone())
@@ -351,20 +348,8 @@ pub async fn run_loop(
     } else {
         None
     };
-    let mut known_instances: HashSet<String> = HashSet::new();
-    // Managed-service registry: ids surfaced from the rocm-cli
-    // `serve` registry, and the subset whose engine is NOT vLLM (excluded from
-    // the vLLM Prometheus scrape so they aren't mis-parsed).
-    let mut known_services: HashSet<String> = HashSet::new();
-    let mut managed_non_vllm: HashSet<String> = HashSet::new();
-    // Per-instance generation-throughput tracker. Keyed by container_id.
-    // Constructed lazily from opts.instance_tick; survives scrape failures so
-    // the last-observed rate is held for the validity window before clearing.
-    let mut gen_trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-    // Previous TTFT / TPOT histogram readings plus a freshness tracker per
-    // instance, for the windowed avg-ms derivation (mirrors `gen_trackers`).
-    let mut prev_ttft: LatencyWindows = HashMap::new();
-    let mut prev_tpot: LatencyWindows = HashMap::new();
+    let mut discovery = DiscoveryState::default();
+    let mut telemetry = TelemetryState::default();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
     // on the instance cadence and reused every tick so the attributed value is
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
@@ -558,76 +543,30 @@ pub async fn run_loop(
             last_sysinfo_refresh = tick_count;
         }
 
-        // Service discovery — every DISCOVERY_TICKS ticks, diff vs known set,
-        // emit Discovered/Gone events, and update reducer state.
+        // Service discovery — every `discovery_ticks` ticks, reconcile each
+        // source against what it had live before, emit Discovered/Gone events,
+        // and update reducer state.
+        let discovery_due = tick_count == 1 || tick_count.is_multiple_of(discovery_ticks);
+        let mut reconcile = Reconcile {
+            state: &mut runner.state,
+            telemetry: &mut telemetry,
+            tx: &tx,
+            persist: persist.as_ref(),
+        };
         if let Some(d) = docker.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
             match d.discover_async().await {
                 Ok(svcs) => {
                     let seen: HashSet<String> =
                         svcs.iter().map(|s| s.container_id.clone()).collect();
-                    for svc in &svcs {
-                        let existing = runner.state.instances.get(&svc.container_id).cloned();
-                        // Endpoint change: same container-id, new port → new logical service.
-                        // Invalidate the rate baseline and latency windows so the new
-                        // scrape address starts fresh.
-                        let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                        if !same_endpoint {
-                            invalidate_on_endpoint_change(
-                                &svc.container_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                        let inst = merge_discovery_refresh(
-                            svc,
-                            if same_endpoint {
-                                existing.as_ref()
-                            } else {
-                                None
-                            },
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceUpserted(inst.clone()));
-                        if !known_instances.contains(&svc.container_id) {
-                            info!(
-                                id = %svc.container_id,
-                                name = %svc.container_name,
-                                model = %svc.model_name,
-                                "instance discovered"
-                            );
-                            // InstanceDiscovered is a discovery-metadata event; broadcast
-                            // a clean instance (no prior collector-owned telemetry).
-                            broadcast_and_persist(
-                                &tx,
-                                persist.as_ref(),
-                                Event::InstanceDiscovered(instance_from_discovered(svc)),
-                            );
-                        }
-                    }
-                    for gone in known_instances.difference(&seen) {
-                        info!(id = %gone, "instance gone");
-                        purge_telemetry_state(
-                            gone,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceRemoved(gone.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone {
-                                container_id: gone.clone(),
-                            },
-                        );
-                    }
-                    known_instances = seen;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Docker,
+                        &svcs,
+                        &discovery.known_instances,
+                        &seen,
+                    );
+                    discovery.known_instances = seen;
                     docker_warn = None;
                 }
                 Err(e) => docker_warn = Some(format!("docker discover: {e}")),
@@ -637,70 +576,11 @@ pub async fn run_loop(
         // Lemonade discovery — probe the endpoint on the discovery cadence; add a
         // Lemonade Instance when reachable, emit Gone when it disappears, and stay
         // a clean no-op (no warning/panic) when no endpoint is configured.
-        //
-        // The Lemonade `container_id` encodes the host and port
-        // (`<host>:<port>`), so a port or host change produces a new id string
-        // and is treated as a full identity change (old gone, new discovered).
         if let Some(l) = lemonade.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
-            match l.discover().await {
-                Some(svc) => {
-                    let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
-                    if is_new_id {
-                        // New identity: purge all telemetry state for the old id so
-                        // stale rate baseline, TTFT, and TPOT do not bleed across.
-                        if let Some(old_id) = lemonade_id.as_deref() {
-                            purge_telemetry_state(
-                                old_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                    }
-                    let existing = runner.state.instances.get(&svc.container_id).cloned();
-                    let inst = merge_discovery_refresh(
-                        &svc,
-                        if is_new_id { None } else { existing.as_ref() },
-                    );
-                    runner
-                        .state
-                        .apply(StateEvent::InstanceUpserted(inst.clone()));
-                    if is_new_id {
-                        info!(
-                            id = %svc.container_id,
-                            model = %svc.model_name,
-                            "lemonade instance discovered"
-                        );
-                        // InstanceDiscovered is a discovery-metadata event; broadcast
-                        // a clean instance (no prior collector-owned telemetry).
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceDiscovered(instance_from_discovered(&svc)),
-                        );
-                        lemonade_id = Some(svc.container_id.clone());
-                    }
-                }
-                None => {
-                    if let Some(id) = lemonade_id.take() {
-                        info!(id = %id, "lemonade instance gone");
-                        purge_telemetry_state(
-                            &id,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone { container_id: id },
-                        );
-                    }
-                }
-            }
+            let probed = l.discover().await;
+            reconcile.reconcile_lemonade(probed, &mut discovery.lemonade_id);
         }
 
         // Managed-service registry discovery — read the rocm-cli
@@ -709,63 +589,18 @@ pub async fn run_loop(
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
         if let Some(services_dir) = opts.services_dir.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
             let records = crate::registry::load_service_records(services_dir);
             let disc = crate::registry::discover_managed_services(&records);
-            managed_non_vllm = disc.non_vllm;
-            for svc in disc.svcs {
-                let id = svc.container_id.clone();
-                let is_new = !known_services.contains(&id);
-                let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; reset rate baseline and
-                // latency windows so the new port starts fresh.
-                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                if !same_endpoint {
-                    invalidate_on_endpoint_change(
-                        &id,
-                        &mut gen_trackers,
-                        &mut prev_ttft,
-                        &mut prev_tpot,
-                    );
-                }
-                let inst = merge_discovery_refresh(
-                    &svc,
-                    if same_endpoint {
-                        existing.as_ref()
-                    } else {
-                        None
-                    },
-                );
-                runner
-                    .state
-                    .apply(StateEvent::InstanceUpserted(inst.clone()));
-                if is_new {
-                    info!(id = %id, "managed service discovered");
-                    // InstanceDiscovered is a discovery-metadata event; broadcast
-                    // a clean instance (no prior collector-owned telemetry).
-                    broadcast_and_persist(
-                        &tx,
-                        persist.as_ref(),
-                        Event::InstanceDiscovered(instance_from_discovered(&svc)),
-                    );
-                }
-            }
-            for gone in known_services.difference(&disc.seen) {
-                info!(id = %gone, "managed service gone");
-                purge_telemetry_state(gone, &mut gen_trackers, &mut prev_ttft, &mut prev_tpot);
-                runner
-                    .state
-                    .apply(StateEvent::InstanceRemoved(gone.clone()));
-                broadcast_and_persist(
-                    &tx,
-                    persist.as_ref(),
-                    Event::InstanceGone {
-                        container_id: gone.clone(),
-                    },
-                );
-            }
-            known_services = disc.seen;
+            discovery.managed_non_vllm = disc.non_vllm;
+            reconcile.reconcile_set(
+                DiscoverySource::Managed,
+                &disc.svcs,
+                &discovery.known_services,
+                &disc.seen,
+            );
+            discovery.known_services = disc.seen;
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
@@ -783,8 +618,8 @@ pub async fn run_loop(
                 .state
                 .instances
                 .values()
-                .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
-                .filter(|i| !managed_non_vllm.contains(&i.container_id))
+                .filter(|i| Some(i.container_id.as_str()) != discovery.lemonade_id.as_deref())
+                .filter(|i| !discovery.managed_non_vllm.contains(&i.container_id))
                 .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
                 .collect();
             let prom = prom.clone();
@@ -809,7 +644,8 @@ pub async fn run_loop(
                         // cumulative counter when present; omitted counter leaves
                         // the tracker (and its held value) untouched.
                         if let Some(cur) = sample.gen_tokens_total {
-                            gen_trackers
+                            telemetry
+                                .gen_trackers
                                 .entry(id.clone())
                                 .or_insert_with(|| {
                                     GenerationObservationTracker::new(opts.instance_tick)
@@ -824,7 +660,7 @@ pub async fn run_loop(
                         // value; the tracker holds it, then expires it, in the
                         // snapshot assembly below.
                         observe_latency(
-                            &mut prev_ttft,
+                            &mut telemetry.prev_ttft,
                             &id,
                             opts.instance_tick,
                             sample.ttft_sum_s,
@@ -832,7 +668,7 @@ pub async fn run_loop(
                             cycle_at,
                         );
                         observe_latency(
-                            &mut prev_tpot,
+                            &mut telemetry.prev_tpot,
                             &id,
                             opts.instance_tick,
                             sample.tpot_sum_s,
@@ -868,8 +704,8 @@ pub async fn run_loop(
                         // Drop the TTFT/TPOT baselines so recovery re-baselines
                         // from the next successful scrape; the trackers keep the
                         // last windowed value Held until its validity lapses.
-                        rebaseline_latency(&mut prev_ttft, &id);
-                        rebaseline_latency(&mut prev_tpot, &id);
+                        rebaseline_latency(&mut telemetry.prev_ttft, &id);
+                        rebaseline_latency(&mut telemetry.prev_tpot, &id);
                     }
                 }
             }
@@ -884,7 +720,7 @@ pub async fn run_loop(
         // Lemonade per-instance scrape — reports an instantaneous rate directly
         // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
         // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone())
+        if let (Some(l), Some(id)) = (lemonade.as_ref(), discovery.lemonade_id.clone())
             && tick_count.is_multiple_of(instance_ticks)
         {
             match l.fetch_stats().await {
@@ -894,7 +730,8 @@ pub async fn run_loop(
                     // erase or refresh the tracker; the held value stays valid until
                     // the validity window expires.
                     if let Some(rate) = sample.gen_tps {
-                        gen_trackers
+                        telemetry
+                            .gen_trackers
                             .entry(id.clone())
                             .or_insert_with(|| {
                                 GenerationObservationTracker::new(opts.instance_tick)
@@ -956,15 +793,16 @@ pub async fn run_loop(
         // metadata) before computing tokens_per_watt so the efficiency field
         // always derives from the current cycle's valid/held/expired rate.
         for inst in &mut instances {
-            let (gen_tps, meta) = gen_trackers
+            let (gen_tps, meta) = telemetry
+                .gen_trackers
                 .get_mut(&inst.container_id)
                 .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
             (inst.ttft_ms, inst.ttft_observation) =
-                snapshot_latency(&mut prev_ttft, &inst.container_id, cycle_at);
+                snapshot_latency(&mut telemetry.prev_ttft, &inst.container_id, cycle_at);
             (inst.tpot_ms, inst.tpot_observation) =
-                snapshot_latency(&mut prev_tpot, &inst.container_id, cycle_at);
+                snapshot_latency(&mut telemetry.prev_tpot, &inst.container_id, cycle_at);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -1087,37 +925,6 @@ fn count_vram_join_misses<S: std::hash::BuildHasher>(
         .count()
 }
 
-/// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
-/// baselines.  Call on explicit removal (Docker Gone, Lemonade Gone, managed
-/// Gone) and whenever an identity change requires a clean slate.
-pub(crate) fn purge_telemetry_state(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut LatencyWindows,
-    prev_tpot: &mut LatencyWindows,
-) {
-    gen_trackers.remove(id);
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
-/// Invalidate the generation tracker for `id` (reset baseline without
-/// removing the map entry) and clear the TTFT/TPOT latency windows.
-/// Called when an endpoint changes within the same container/service id so
-/// the new scrape address starts with a fresh rate baseline.
-pub(crate) fn invalidate_on_endpoint_change(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut LatencyWindows,
-    prev_tpot: &mut LatencyWindows,
-) {
-    if let Some(t) = gen_trackers.get_mut(id) {
-        t.invalidate();
-    }
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
 ///
 /// Status is taken from `svc.status` — the caller sets it from whatever real
@@ -1164,6 +971,209 @@ pub(crate) fn merge_discovery_refresh(
     inst
 }
 
+/// Per-instance telemetry the loop carries between scrapes, keyed by container id.
+#[derive(Default)]
+struct TelemetryState {
+    /// Generation-throughput trackers. Constructed lazily from
+    /// `opts.instance_tick`; they survive scrape failures so the last-observed
+    /// rate is held for the validity window before clearing.
+    gen_trackers: HashMap<String, GenerationObservationTracker>,
+    /// Previous TTFT / TPOT histogram readings plus a freshness tracker per
+    /// instance, for the windowed avg-ms derivation (mirrors `gen_trackers`).
+    prev_ttft: LatencyWindows,
+    prev_tpot: LatencyWindows,
+}
+
+impl TelemetryState {
+    /// Remove all per-service telemetry state for `id`: tracker, TTFT, and
+    /// TPOT baselines.  Call on explicit removal (Docker Gone, Lemonade Gone,
+    /// managed Gone) and whenever an identity change requires a clean slate.
+    fn purge(&mut self, id: &str) {
+        self.gen_trackers.remove(id);
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
+    }
+
+    /// Invalidate the generation tracker for `id` (reset baseline without
+    /// removing the map entry) and clear the TTFT/TPOT latency windows.
+    /// Called when an endpoint changes within the same container/service id so
+    /// the new scrape address starts with a fresh rate baseline.
+    fn invalidate_on_endpoint_change(&mut self, id: &str) {
+        if let Some(t) = self.gen_trackers.get_mut(id) {
+            t.invalidate();
+        }
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
+    }
+}
+
+/// What each discovery source currently has live, so a pass can tell a new
+/// service from a known one and a known one from one that has gone.
+#[derive(Default)]
+struct DiscoveryState {
+    /// Container ids the last Docker pass saw.
+    known_instances: HashSet<String>,
+    /// Ids the last managed-service registry pass surfaced.
+    known_services: HashSet<String>,
+    /// The subset of the registry ids whose engine is NOT vLLM, excluded from
+    /// the vLLM Prometheus scrape so they aren't mis-parsed.
+    managed_non_vllm: HashSet<String>,
+    /// The id of the currently-live Lemonade instance, if any.
+    lemonade_id: Option<String>,
+}
+
+/// Which discovery source a service came from. It only selects the log wording
+/// in [`Reconcile::announce`] and [`Reconcile::retire`]; those two steps behave
+/// the same for every source. How a pass decides what is new, known or gone
+/// differs: Docker and the registry go through `reconcile_set`, Lemonade through
+/// `reconcile_lemonade`.
+#[derive(Clone, Copy)]
+enum DiscoverySource {
+    Docker,
+    Lemonade,
+    Managed,
+}
+
+impl DiscoverySource {
+    fn log_discovered(self, svc: &DiscoveredService) {
+        match self {
+            Self::Docker => info!(
+                id = %svc.container_id,
+                name = %svc.container_name,
+                model = %svc.model_name,
+                "instance discovered"
+            ),
+            Self::Lemonade => info!(
+                id = %svc.container_id,
+                model = %svc.model_name,
+                "lemonade instance discovered"
+            ),
+            Self::Managed => info!(id = %svc.container_id, "managed service discovered"),
+        }
+    }
+
+    fn log_gone(self, id: &str) {
+        match self {
+            Self::Docker => info!(id = %id, "instance gone"),
+            Self::Lemonade => info!(id = %id, "lemonade instance gone"),
+            Self::Managed => info!(id = %id, "managed service gone"),
+        }
+    }
+}
+
+/// The loop state a discovery pass changes, and the stream it announces on.
+struct Reconcile<'a> {
+    state: &'a mut State,
+    telemetry: &'a mut TelemetryState,
+    tx: &'a broadcast::Sender<Event>,
+    persist: Option<&'a Arc<Mutex<SessionWriter>>>,
+}
+
+impl Reconcile<'_> {
+    /// Upsert a (re)discovered service. Collector-owned fields carry over from
+    /// the instance already in state unless `carry_live` is false, which is how
+    /// a changed identity starts from a clean baseline.
+    fn upsert(&mut self, svc: &DiscoveredService, carry_live: bool) {
+        let existing = self.state.instances.get(&svc.container_id).cloned();
+        let inst = merge_discovery_refresh(svc, if carry_live { existing.as_ref() } else { None });
+        self.state.apply(StateEvent::InstanceUpserted(inst));
+    }
+
+    /// Announce a newly discovered service. InstanceDiscovered is a
+    /// discovery-metadata event: it carries a clean instance, with no prior
+    /// collector-owned telemetry.
+    fn announce(&self, source: DiscoverySource, svc: &DiscoveredService) {
+        source.log_discovered(svc);
+        broadcast_and_persist(
+            self.tx,
+            self.persist,
+            Event::InstanceDiscovered(instance_from_discovered(svc)),
+        );
+    }
+
+    /// Drop a service that has gone: purge its telemetry, remove it from state
+    /// and announce it.
+    fn retire(&mut self, source: DiscoverySource, id: &str) {
+        source.log_gone(id);
+        self.telemetry.purge(id);
+        self.state
+            .apply(StateEvent::InstanceRemoved(id.to_string()));
+        broadcast_and_persist(
+            self.tx,
+            self.persist,
+            Event::InstanceGone {
+                container_id: id.to_string(),
+            },
+        );
+    }
+
+    /// Reconcile a source that reports its whole set each pass (Docker, the
+    /// managed-service registry). `known` is what the previous pass saw and
+    /// `seen` what this one saw; the caller stores `seen` as the next `known`.
+    ///
+    /// A service whose port changed under the same id has a new scrape address:
+    /// its rate baseline and latency windows are reset and no live fields carry
+    /// over. It is still the same service, so it is not announced again.
+    fn reconcile_set(
+        &mut self,
+        source: DiscoverySource,
+        svcs: &[DiscoveredService],
+        known: &HashSet<String>,
+        seen: &HashSet<String>,
+    ) {
+        for svc in svcs {
+            let same_endpoint = self
+                .state
+                .instances
+                .get(&svc.container_id)
+                .is_none_or(|ex| ex.port == svc.port);
+            if !same_endpoint {
+                self.telemetry
+                    .invalidate_on_endpoint_change(&svc.container_id);
+            }
+            self.upsert(svc, same_endpoint);
+            if !known.contains(&svc.container_id) {
+                self.announce(source, svc);
+            }
+        }
+        for gone in known.difference(seen) {
+            self.retire(source, gone);
+        }
+    }
+
+    /// Reconcile the probe-based Lemonade source, which has at most one service.
+    ///
+    /// Its `container_id` encodes the host and port, so a port or host change
+    /// yields a new id: the old id's telemetry is purged so a stale rate
+    /// baseline, TTFT and TPOT do not bleed across, and the new id is announced.
+    /// The old instance is not retired here. `None` means the endpoint did not
+    /// answer, which retires the current one.
+    fn reconcile_lemonade(
+        &mut self,
+        probed: Option<DiscoveredService>,
+        current: &mut Option<String>,
+    ) {
+        match probed {
+            Some(svc) => {
+                let is_new_id = current.as_deref() != Some(svc.container_id.as_str());
+                if is_new_id && let Some(old_id) = current.as_deref() {
+                    self.telemetry.purge(old_id);
+                }
+                self.upsert(&svc, !is_new_id);
+                if is_new_id {
+                    self.announce(DiscoverySource::Lemonade, &svc);
+                    *current = Some(svc.container_id.clone());
+                }
+            }
+            None => {
+                if let Some(id) = current.take() {
+                    self.retire(DiscoverySource::Lemonade, &id);
+                }
+            }
+        }
+    }
+}
+
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process
 /// attribution map, falling back to device-summed VRAM over the instance's
 /// GPUs when its container has no per-process entry. Pure — the runner does the
@@ -1187,7 +1197,6 @@ fn enrich_instance_vram(
     }
 }
 
-/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 /// Broadcast `ev` to subscribers and, if a session writer is wired, append
 /// the same event to disk for `--replay`. Persistence is best-effort — a
 /// write failure logs at warn level but does not interrupt the loop.
@@ -1205,6 +1214,7 @@ fn broadcast_and_persist(
     let _ = tx.send(ev);
 }
 
+/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 fn ticks_per(period: Duration, tick: Duration) -> u64 {
     let n = (period.as_secs_f64() / tick.as_secs_f64()).round() as i64;
     n.max(1) as u64
@@ -1681,67 +1691,315 @@ mod tests {
         GenerationObservationTracker::new(Duration::from_secs(tick_secs))
     }
 
-    /// `purge_telemetry_state` removes the tracker entry, TTFT baseline, and
+    /// `TelemetryState::purge` removes the tracker entry, TTFT baseline, and
     /// TPOT baseline for the target id and leaves other ids untouched.
     #[test]
-    fn purge_telemetry_state_removes_all_three_maps_for_id() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: LatencyWindows = HashMap::new();
-        let mut tpot: LatencyWindows = HashMap::new();
+    fn telemetry_state_purge_removes_all_three_maps_for_id() {
+        let mut state = TelemetryState::default();
 
         // Populate two ids.
-        trackers.insert("a".into(), make_tracker(2));
-        trackers.insert("b".into(), make_tracker(2));
-        ttft.insert("a".into(), baseline(1.0, 1.0));
-        ttft.insert("b".into(), baseline(2.0, 2.0));
-        tpot.insert("a".into(), baseline(3.0, 3.0));
-        tpot.insert("b".into(), baseline(4.0, 4.0));
+        state.gen_trackers.insert("a".into(), make_tracker(2));
+        state.gen_trackers.insert("b".into(), make_tracker(2));
+        state.prev_ttft.insert("a".into(), baseline(1.0, 1.0));
+        state.prev_ttft.insert("b".into(), baseline(2.0, 2.0));
+        state.prev_tpot.insert("a".into(), baseline(3.0, 3.0));
+        state.prev_tpot.insert("b".into(), baseline(4.0, 4.0));
 
-        purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
+        state.purge("a");
 
         // "a" must be gone from all maps.
-        assert!(!trackers.contains_key("a"), "tracker for a must be removed");
-        assert!(!ttft.contains_key("a"), "ttft for a must be removed");
-        assert!(!tpot.contains_key("a"), "tpot for a must be removed");
+        assert!(
+            !state.gen_trackers.contains_key("a"),
+            "tracker for a must be removed"
+        );
+        assert!(
+            !state.prev_ttft.contains_key("a"),
+            "ttft for a must be removed"
+        );
+        assert!(
+            !state.prev_tpot.contains_key("a"),
+            "tpot for a must be removed"
+        );
         // "b" must be unaffected.
-        assert!(trackers.contains_key("b"), "tracker for b must survive");
-        assert!(ttft.contains_key("b"), "ttft for b must survive");
-        assert!(tpot.contains_key("b"), "tpot for b must survive");
+        assert!(
+            state.gen_trackers.contains_key("b"),
+            "tracker for b must survive"
+        );
+        assert!(state.prev_ttft.contains_key("b"), "ttft for b must survive");
+        assert!(state.prev_tpot.contains_key("b"), "tpot for b must survive");
     }
 
-    /// `invalidate_on_endpoint_change` invalidates the tracker (resets its
-    /// window so subsequent snapshots return None) and removes the latency
-    /// baselines, without removing the tracker entry itself.
+    /// `TelemetryState::invalidate_on_endpoint_change` invalidates the tracker
+    /// (resets its window so subsequent snapshots return None) and removes the
+    /// latency baselines, without removing the tracker entry itself.
     #[test]
     fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: LatencyWindows = HashMap::new();
-        let mut tpot: LatencyWindows = HashMap::new();
+        let mut state = TelemetryState::default();
 
         let mut tracker = make_tracker(2);
         // Give the tracker a reading so it has a non-None baseline.
         tracker.observe_counter(100.0, at(10));
         tracker.observe_counter(200.0, at(12));
-        trackers.insert("svc".into(), tracker);
-        ttft.insert("svc".into(), baseline(1.0, 10.0));
-        tpot.insert("svc".into(), baseline(0.5, 8.0));
+        state.gen_trackers.insert("svc".into(), tracker);
+        state.prev_ttft.insert("svc".into(), baseline(1.0, 10.0));
+        state.prev_tpot.insert("svc".into(), baseline(0.5, 8.0));
 
-        invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
+        state.invalidate_on_endpoint_change("svc");
 
         // Tracker still exists but its window is reset: snapshot returns None.
-        let (rate, _meta) = trackers
+        let (rate, _meta) = state
+            .gen_trackers
             .get_mut("svc")
             .expect("tracker entry must remain")
             .snapshot(at(12));
         assert!(rate.is_none(), "invalidated tracker must yield None rate");
         // Latency baselines must be cleared.
         assert!(
-            !ttft.contains_key("svc"),
+            !state.prev_ttft.contains_key("svc"),
             "ttft baseline must be cleared on endpoint change"
         );
         assert!(
-            !tpot.contains_key("svc"),
+            !state.prev_tpot.contains_key("svc"),
             "tpot baseline must be cleared on endpoint change"
         );
+    }
+
+    // ── Discovery reconcile ─────────────────────────────────────────────────
+    //
+    // The Docker source cannot be driven end to end without a container
+    // daemon, and `reconcile_set` is the code both it and the managed-service
+    // registry run, so these tests exercise it directly. The registry and
+    // Lemonade sources are also driven end to end in
+    // `tests/discovery_reconcile.rs`, except the registry's retirement of a
+    // vanished service and Lemonade's change of id, which only these tests
+    // cover.
+
+    fn discovered(id: &str, port: u16) -> DiscoveredService {
+        DiscoveredService {
+            container_id: id.into(),
+            container_name: format!("name-{id}"),
+            model_name: "model".into(),
+            port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    fn id_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The reducer state, telemetry and event stream a reconcile pass works on.
+    struct Pass {
+        state: State,
+        telemetry: TelemetryState,
+        tx: broadcast::Sender<Event>,
+        rx: broadcast::Receiver<Event>,
+    }
+
+    impl Pass {
+        fn new() -> Self {
+            let (tx, rx) = broadcast::channel(64);
+            Self {
+                state: State::default(),
+                telemetry: TelemetryState::default(),
+                tx,
+                rx,
+            }
+        }
+
+        fn reconcile(&mut self) -> Reconcile<'_> {
+            Reconcile {
+                state: &mut self.state,
+                telemetry: &mut self.telemetry,
+                tx: &self.tx,
+                persist: None,
+            }
+        }
+
+        /// The announcements broadcast since the last call, as `discovered <id>`
+        /// and `gone <id>` strings.
+        fn announced(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(ev) = self.rx.try_recv() {
+                match ev {
+                    Event::InstanceDiscovered(i) => {
+                        out.push(format!("discovered {}", i.container_id));
+                    }
+                    Event::InstanceGone { container_id } => {
+                        out.push(format!("gone {container_id}"));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        /// Give `id` a live KV reading and a latency baseline, as a scrape would.
+        fn scrape(&mut self, id: &str) {
+            let mut inst = self.state.instances.get(id).cloned().expect("instance");
+            inst.kv_cache_usage_pct = Some(25.0);
+            self.state.apply(StateEvent::InstanceUpserted(inst));
+            self.telemetry
+                .prev_ttft
+                .insert(id.into(), baseline(1.0, 10.0));
+            self.telemetry
+                .prev_tpot
+                .insert(id.into(), baseline(0.5, 8.0));
+        }
+
+        fn kv(&self, id: &str) -> Option<f32> {
+            self.state
+                .instances
+                .get(id)
+                .and_then(|i| i.kv_cache_usage_pct)
+        }
+    }
+
+    #[test]
+    fn reconcile_set_announces_a_new_service_once() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000)];
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        assert_eq!(pass.announced(), ["discovered a"]);
+        assert!(pass.state.instances.contains_key("a"));
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+        assert!(
+            pass.announced().is_empty(),
+            "a known service must not be announced again"
+        );
+    }
+
+    #[test]
+    fn reconcile_set_keeps_live_fields_while_the_endpoint_is_unchanged() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000)];
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        pass.scrape("a");
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.kv("a"), Some(25.0));
+        assert!(pass.telemetry.prev_ttft.contains_key("a"));
+        assert!(pass.telemetry.prev_tpot.contains_key("a"));
+    }
+
+    #[test]
+    fn reconcile_set_starts_clean_when_the_port_moves_under_the_same_id() {
+        let mut pass = Pass::new();
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &[discovered("a", 8000)],
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        pass.scrape("a");
+        pass.announced();
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &[discovered("a", 9000)],
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.state.instances["a"].port, Some(9000));
+        assert_eq!(pass.kv("a"), None, "the old endpoint's reading leaked");
+        assert!(!pass.telemetry.prev_ttft.contains_key("a"));
+        assert!(!pass.telemetry.prev_tpot.contains_key("a"));
+        assert!(
+            pass.announced().is_empty(),
+            "a port change is not a new or a gone service"
+        );
+    }
+
+    #[test]
+    fn reconcile_set_retires_a_vanished_service_and_keeps_the_others() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000), discovered("b", 8001)];
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Managed,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a", "b"]),
+        );
+        pass.scrape("a");
+        pass.scrape("b");
+        pass.announced();
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Managed,
+            &svcs[..1],
+            &id_set(&["a", "b"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.announced(), ["gone b"]);
+        assert!(!pass.state.instances.contains_key("b"));
+        assert!(!pass.telemetry.prev_ttft.contains_key("b"));
+        assert!(pass.state.instances.contains_key("a"));
+        assert!(pass.telemetry.prev_ttft.contains_key("a"));
+    }
+
+    #[test]
+    fn reconcile_lemonade_follows_one_endpoint_through_its_lifecycle() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
+        assert_eq!(pass.announced(), ["discovered l1"]);
+        assert_eq!(current.as_deref(), Some("l1"));
+
+        pass.scrape("l1");
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
+        assert!(
+            pass.announced().is_empty(),
+            "same id must not be re-announced"
+        );
+        assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
+
+        // A new id (the host or port changed) purges the old id's telemetry and
+        // announces the new one.
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
+        assert_eq!(pass.announced(), ["discovered l2"]);
+        assert_eq!(current.as_deref(), Some("l2"));
+        assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
+        // Pins current behaviour, not a goal: the superseded instance stays in
+        // state (and so in every snapshot) because only its telemetry is purged.
+        // Retiring it later is a deliberate behaviour change, and this assertion
+        // is the one to update when that happens.
+        assert!(pass.state.instances.contains_key("l1"));
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert_eq!(pass.announced(), ["gone l2"]);
+        assert_eq!(current, None);
+        assert!(!pass.state.instances.contains_key("l2"));
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert!(pass.announced().is_empty(), "nothing left to retire");
     }
 }
