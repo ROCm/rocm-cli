@@ -495,9 +495,12 @@ impl LiveGgufSource {
     }
 
     fn agent() -> ureq::Agent {
-        // The same User-Agent the CLI's other downloads send.
+        // The same User-Agent the CLI's other downloads send. Redirects (the hub
+        // sends `resolve/main` to its CDN) are followed at most five deep, which
+        // is ureq's default, stated here so it is not changed by accident.
         ureq::AgentBuilder::new()
             .user_agent("rocm-cli")
+            .redirects(5)
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -1471,6 +1474,10 @@ mod tests {
         NoContentRange,
         /// A `HEAD` answered with no `Content-Length`; ranges are honoured.
         HeadWithoutLength,
+        /// A `206` whose `Content-Range` is right but whose body, with no
+        /// `Content-Length`, goes on past the range: the bytes asked for, then
+        /// 8 MiB of `0xFF`, then the connection closes.
+        Overlong,
     }
 
     /// A hub on loopback. The "model" is a real header followed by zeros out to
@@ -1561,7 +1568,8 @@ mod tests {
                             | Serve::ShortConsistent
                             | Serve::Slow
                             | Serve::NoContentRange
-                            | Serve::HeadWithoutLength,
+                            | Serve::HeadWithoutLength
+                            | Serve::Overlong,
                         ) => {
                             let (start, end) = range.split_once('-').unwrap();
                             let (start, end): (u64, u64) =
@@ -1587,6 +1595,15 @@ mod tests {
                                     "Content-Range: bytes {claimed_start}-{end}/{virtual_size}\r\n"
                                 )
                             };
+                            if serve == Serve::Overlong {
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 206 Partial Content\r\n{content_range}Connection: close\r\n\r\n"
+                                );
+                                let _ = stream.write_all(&body);
+                                let _ = stream.write_all(&vec![0xFF_u8; 8 << 20]);
+                                continue;
+                            }
                             let _ = write!(
                                 stream,
                                 "HTTP/1.1 206 Partial Content\r\n{content_range}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2094,6 +2111,81 @@ mod tests {
                 .to_string();
             assert!(error.contains("is larger than 16 MiB"), "{error}");
         }
+    }
+
+    /// A range answer that runs on past the bytes asked for is read only as far
+    /// as asked. The header spans two windows, so a window that kept the extra
+    /// bytes would hand the parser `0xFF` where the second window should begin.
+    #[test]
+    fn a_range_answer_longer_than_asked_is_read_only_as_far_as_asked() {
+        let header = llama_like(400_000).header_bytes();
+        assert!(
+            header.len() as u64 > WINDOW_BYTES,
+            "the header must span two windows"
+        );
+        let hub = fake_hub_with(
+            header.clone(),
+            1 << 30,
+            Serve::Overlong,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf","size":1073741824}]}"#.to_owned(),
+        );
+        let mut opened = LiveGgufSource::with_hub(&hub.base)
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        let parsed = parse_gguf_header(&mut opened.reader).unwrap();
+        let direct = parse_gguf_header(&mut Cursor::new(header)).unwrap();
+        assert_eq!(parsed.data_offset, direct.data_offset);
+        assert!(hub.ranges.lock().unwrap().len() >= 2);
+    }
+
+    /// A listing that never ends is cut at the cap and refused as too large,
+    /// promptly: the read stops one byte past the cap rather than waiting for a
+    /// body that does not end.
+    #[test]
+    fn an_endless_listing_is_cut_at_the_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: \
+                         close\r\n\r\n{{\"siblings\":[],\"pad\":\""
+                    );
+                    // Twice the cap, then the connection is held open: a reader
+                    // with no cap would wait here until its timeout.
+                    let chunk = vec![b'x'; 1 << 20];
+                    for _ in 0..((2 * MAX_LISTING_BYTES) >> 20) {
+                        if stream.write_all(&chunk).is_err() {
+                            return;
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(90));
+                });
+            }
+        });
+        let began = Instant::now();
+        let error = LiveGgufSource::with_hub(&base)
+            .open(&hub_ref("Q4_K_M"))
+            .err()
+            .expect("an endless listing is refused")
+            .to_string();
+        assert!(error.contains("is larger than 16 MiB"), "{error}");
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "took {:?}",
+            began.elapsed()
+        );
     }
 
     #[test]

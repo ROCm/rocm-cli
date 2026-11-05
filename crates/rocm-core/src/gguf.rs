@@ -490,7 +490,11 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
                 if key.ends_with(".attention.sliding_window") {
                     sliding_window |= uint(Some(&value)).is_some_and(|window| window > 0);
                 }
-                if keep && matches!(value, Value::Uint(_) | Value::Ints(_)) {
+                // The sliding-window key is decoded as kept (so a per-layer array
+                // is read, not skipped) for the flag above; its value is not
+                // read again, so it does not take one of the kept slots.
+                let read_later = !key.ends_with(".attention.sliding_window");
+                if keep && read_later && matches!(value, Value::Uint(_) | Value::Ints(_)) {
                     if kept.len() >= MAX_KEPT_KEYS && !kept.contains_key(&key) {
                         return Err(GgufError::Malformed(format!(
                             "more than {MAX_KEPT_KEYS} distinct model-shape keys is not a \
@@ -511,7 +515,11 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
     let mut token_embd_offset = None;
     let mut has_output = false;
     for _ in 0..tensor_count {
-        let name = reader.string(MAX_KEY_LEN)?;
+        // Held to the same bound as a metadata key: a real tensor name is a few
+        // dozen bytes.
+        let name = reader
+            .string(MAX_KEY_LEN)?
+            .ok_or_else(|| GgufError::Malformed("a tensor name is implausibly long".to_owned()))?;
         let dims = reader.u32()?;
         if dims > MAX_TENSOR_DIMS {
             return Err(GgufError::Malformed(format!(
@@ -527,10 +535,10 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
         param_count = param_count.saturating_add(elements);
         offsets.push(offset);
         reader.check_size()?;
-        if name.as_deref() == Some(TOKEN_EMBD_NAME) {
+        if name == TOKEN_EMBD_NAME {
             token_embd_offset = Some(offset);
         }
-        has_output |= name.as_deref() == Some(OUTPUT_NAME);
+        has_output |= name == OUTPUT_NAME;
     }
     let token_embd = token_embd_offset.map(|offset| TensorSpan {
         offset,
@@ -969,10 +977,43 @@ mod tests {
 
     #[test]
     fn implausible_counts_are_refused_before_they_become_a_loop() {
-        let mut bytes = llama_like(3).header_bytes();
-        // Overwrite the metadata count (bytes 16..24) with something absurd.
-        bytes[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(parse(&bytes), Err(GgufError::Malformed(_))));
+        // The tensor count (bytes 8..16) and the metadata count (16..24), each
+        // made absurd in turn. The message names the count, so the test fails if
+        // the guard is removed and the parser fails somewhere else instead.
+        for (range, what) in [(8..16, "tensor entries"), (16..24, "metadata entries")] {
+            let mut bytes = llama_like(3).header_bytes();
+            bytes[range].copy_from_slice(&u64::MAX.to_le_bytes());
+            let error = parse(&bytes).unwrap_err();
+            assert!(
+                matches!(&error, GgufError::Malformed(message) if message.contains(what)),
+                "{what}: {error}"
+            );
+        }
+    }
+
+    /// A tensor's element count is a product of dimensions the file states; one
+    /// that overflows saturates rather than panicking.
+    #[test]
+    fn tensor_dimensions_that_overflow_saturate() {
+        let file = Builder::new()
+            .string("general.architecture", "x")
+            .tensor("huge", &[u64::MAX, u64::MAX])
+            .file(0);
+        assert_eq!(parse(&file).unwrap().param_count, u64::MAX);
+    }
+
+    /// A tensor name longer than any real one is refused, as a metadata key is.
+    #[test]
+    fn an_implausibly_long_tensor_name_is_refused() {
+        let file = Builder::new()
+            .string("general.architecture", "x")
+            .tensor(&"t".repeat(5000), &[8])
+            .file(0);
+        let error = parse(&file).unwrap_err();
+        assert!(
+            matches!(&error, GgufError::Malformed(message) if message.contains("tensor name")),
+            "{error}"
+        );
     }
 
     #[test]
