@@ -1141,10 +1141,12 @@ impl Reconcile<'_> {
     /// Reconcile the probe-based Lemonade source, which has at most one service.
     ///
     /// Its `container_id` encodes the host and port, so a port or host change
-    /// yields a new id: the old id's telemetry is purged so a stale rate
-    /// baseline, TTFT and TPOT do not bleed across, and the new id is announced.
-    /// The old instance is not retired here. `None` means the endpoint did not
-    /// answer, which retires the current one.
+    /// yields a new id. The old id is retired first (its telemetry is purged, so
+    /// a stale rate baseline, TTFT and TPOT do not bleed across; it leaves the
+    /// state and is announced gone), then the new id is announced, so the state
+    /// and every snapshot carry one Lemonade instance and the vLLM scrape never
+    /// polls the old endpoint. `None` means the endpoint did not answer, which
+    /// retires the current one.
     fn reconcile_lemonade(
         &mut self,
         probed: Option<DiscoveredService>,
@@ -1153,8 +1155,8 @@ impl Reconcile<'_> {
         match probed {
             Some(svc) => {
                 let is_new_id = current.as_deref() != Some(svc.container_id.as_str());
-                if is_new_id && let Some(old_id) = current.as_deref() {
-                    self.telemetry.purge(old_id);
+                if is_new_id && let Some(old_id) = current.take() {
+                    self.retire(DiscoverySource::Lemonade, &old_id);
                 }
                 self.upsert(&svc, !is_new_id);
                 if is_new_id {
@@ -2107,44 +2109,46 @@ mod tests {
     }
 
     #[test]
-    fn lemonade_host_change_pins_the_stale_old_instance() {
+    fn lemonade_host_change_retires_the_old_instance_and_announces_the_new_one() {
         let old = lemonade_svc("127.0.0.1", 13305);
         let new = lemonade_svc("10.0.0.7", 13305);
         let (pass, current, announced) = lemonade_identity_change(&old, &new);
 
         assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
-        assert_eq!(announced, ["discovered lemonade-10.0.0.7-13305"]);
-        assert!(!pass.has_telemetry(&old.container_id));
-        // Pins current behaviour, not a goal: the old instance is neither
-        // announced gone nor removed, stays in every snapshot, and is polled as
-        // a vLLM target because the scrape filter only skips the current id.
         assert_eq!(
-            pass.instance_ids(),
-            ids(&["lemonade-10.0.0.7-13305", "lemonade-127.0.0.1-13305"])
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-10.0.0.7-13305"
+            ]
         );
-        assert_eq!(
-            pass.scrape_targets(current.as_deref()),
-            ids(&[&old.container_id])
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-10.0.0.7-13305"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
         );
     }
 
     #[test]
-    fn lemonade_port_change_pins_the_stale_old_instance() {
+    fn lemonade_port_change_retires_the_old_instance_and_announces_the_new_one() {
         let old = lemonade_svc("127.0.0.1", 13305);
         let new = lemonade_svc("127.0.0.1", 13306);
         let (pass, current, announced) = lemonade_identity_change(&old, &new);
 
         assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
-        assert_eq!(announced, ["discovered lemonade-127.0.0.1-13306"]);
-        assert!(!pass.has_telemetry(&old.container_id));
-        // Pins current behaviour, not a goal: see the host-change row.
         assert_eq!(
-            pass.instance_ids(),
-            ids(&["lemonade-127.0.0.1-13305", "lemonade-127.0.0.1-13306"])
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
         );
-        assert_eq!(
-            pass.scrape_targets(current.as_deref()),
-            ids(&[&old.container_id])
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13306"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
         );
     }
 
@@ -2211,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn lemonade_endpoint_moving_away_and_back_pins_the_stale_instances() {
+    fn lemonade_endpoint_moving_away_and_back_is_retired_each_time() {
         let a = lemonade_svc("127.0.0.1", 13305);
         let b = lemonade_svc("127.0.0.1", 13306);
         let mut pass = Pass::new();
@@ -2220,25 +2224,27 @@ mod tests {
             .reconcile_lemonade(Some(a.clone()), &mut current);
         pass.announced();
 
-        pass.reconcile()
-            .reconcile_lemonade(Some(b.clone()), &mut current);
-        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13306"]);
+        pass.reconcile().reconcile_lemonade(Some(b), &mut current);
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
+        );
         pass.reconcile()
             .reconcile_lemonade(Some(a.clone()), &mut current);
 
-        // Pins current behaviour, not a goal: the first endpoint is announced
-        // as discovered for a second time without ever being announced gone, and
-        // the endpoint that was left stays behind as a vLLM scrape target.
-        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13306",
+                "discovered lemonade-127.0.0.1-13305"
+            ]
+        );
         assert_eq!(current.as_deref(), Some(a.container_id.as_str()));
-        assert_eq!(
-            pass.instance_ids(),
-            ids(&[&a.container_id, &b.container_id])
-        );
-        assert_eq!(
-            pass.scrape_targets(current.as_deref()),
-            ids(&[&b.container_id])
-        );
+        assert_eq!(pass.instance_ids(), ids(&[&a.container_id]));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
     }
 
     #[test]
@@ -2260,18 +2266,16 @@ mod tests {
         );
         assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
 
-        // A new id (the host or port changed) purges the old id's telemetry and
-        // announces the new one.
+        // A new id (the host or port changed) retires the old id, telemetry
+        // included, and announces the new one.
         pass.reconcile()
             .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
-        assert_eq!(pass.announced(), ["discovered l2"]);
+        assert_eq!(pass.announced(), ["gone l1", "discovered l2"]);
         assert_eq!(current.as_deref(), Some("l2"));
         assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
-        // Pins current behaviour, not a goal: the superseded instance stays in
-        // state (and so in every snapshot) because only its telemetry is purged.
-        // Retiring it later is a deliberate behaviour change, and this assertion
-        // is the one to update when that happens.
-        assert!(pass.state.instances.contains_key("l1"));
+        // The superseded instance leaves the state (and so every snapshot), not
+        // only its telemetry.
+        assert!(!pass.state.instances.contains_key("l1"));
 
         pass.reconcile().reconcile_lemonade(None, &mut current);
         assert_eq!(pass.announced(), ["gone l2"]);
