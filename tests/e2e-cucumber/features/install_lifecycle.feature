@@ -436,3 +436,32 @@ Feature: Release install lifecycle
     Then every download progress frame stays within the terminal
     And the download prints no request logging around the bar
     And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
+  Scenario: lifecycle-35 - Linux - piping the installer into a shell still sizes the bar from the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed by piping the installer into a shell
+    Then every download progress frame stays within the terminal
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - a terminal reporting no size still gets a progress bar
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed where the terminal reports no size
+    Then the installer still draws a progress bar
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
+  Scenario: lifecycle-37 - Linux - a zero-padded COLUMNS does not abort the install
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with a zero-padded COLUMNS and no way to measure
+    Then every download progress frame stays within the terminal
+    And the installed rocm binary is present

@@ -72,6 +72,10 @@ pub struct LifecycleState {
     /// bytes answer "how wide was each frame", this answers "what did the user
     /// end up looking at".
     last_terminal_screen: String,
+    /// The pty width the last run used. Assertions read this rather than the
+    /// `PTY_COLS` constant, so a scenario driving a different width is checked
+    /// against the terminal it actually had instead of silently against 80.
+    last_pty_cols: u16,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -548,6 +552,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         custom_profile: None,
         last_terminal_output: String::new(),
         last_terminal_screen: String::new(),
+        last_pty_cols: 0,
     });
 }
 
@@ -1767,10 +1772,42 @@ const STALE_COLUMNS: u16 = 96;
 /// A terminal narrow enough that curl would ignore the width handed to it, so
 /// the installer declines to draw a bar at all.
 const NARROW_PTY_COLS: u16 = 20;
+/// Deliberately not 80. ncurses falls back to 80 columns when it cannot read a
+/// terminal, so a measurement that consults the wrong file descriptor lands on
+/// exactly that and is indistinguishable from a correct one at this suite's
+/// usual width. At 100 the two answers differ and the test can tell them apart.
+const WIDE_PTY_COLS: u16 = 100;
 
 /// Downloads a release install performs: the archive, its checksum sidecar and
 /// its signature sidecar. One progress bar each.
 const EXPECTED_DOWNLOADS: usize = 3;
+
+/// The shape of one pty run: how wide the terminal is, what `COLUMNS` the
+/// installer inherits, and how it is started.
+#[derive(Clone, Copy)]
+struct PtyRun<'a> {
+    /// The terminal's real width.
+    pty_cols: u16,
+    /// What the installer inherits as `COLUMNS`; `None` leaves it unset. A raw
+    /// string rather than a number so a malformed value such as a zero-padded
+    /// width can be expressed. Disagreeing with `pty_cols` is the condition
+    /// several of these scenarios exist to test.
+    columns_env: Option<&'a str>,
+    invocation: Invocation,
+}
+
+/// How the installer is started under the pty.
+#[derive(Clone, Copy)]
+enum Invocation {
+    /// `sh install.sh <channel>`, with the pty on every descriptor.
+    Direct,
+    /// `cat install.sh | sh -s <channel>`, mirroring the documented
+    /// `curl ... | sh`. The script arrives on stdin, so stdin is a pipe and
+    /// only stdout and stderr are still the terminal. This is the shape the
+    /// installer actually ships in, and the reason it measures the terminal
+    /// through fd 2 rather than whatever stdin happens to be.
+    PipedIntoShell,
+}
 
 /// Run the installer attached to a real pseudo-terminal, returning both what it
 /// wrote and what a terminal drawing those bytes would show.
@@ -1779,21 +1816,23 @@ const EXPECTED_DOWNLOADS: usize = 3;
 /// installer only draws a bar when its stderr is a terminal, so under a pipe it
 /// takes the quiet branch. Only a PTY puts it on the drawing path.
 ///
-/// `pty_cols` is the terminal's real width. `columns_env` is what the installer
-/// inherits as `COLUMNS`; `None` leaves it unset. The two are separate on
-/// purpose, because disagreeing is exactly the condition under test.
 fn run_installer_pty(
     world: &E2eWorld,
     install_dir: &Path,
     download_base: &str,
     public_key_env: &[(&str, String)],
     extra_env: &[(&str, String)],
-    pty_cols: u16,
-    columns_env: Option<u16>,
+    shape: PtyRun<'_>,
 ) -> (String, String) {
     use std::io::Read as _;
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let PtyRun {
+        pty_cols,
+        columns_env,
+        invocation,
+    } = shape;
 
     let root = workspace_root();
     let st = state(world);
@@ -1814,9 +1853,24 @@ fn run_installer_pty(
     // would also use to resolve this program, and `sh` must stay findable
     // regardless of what that PATH shadows out.
     let shell = which_on_path("sh").unwrap_or_else(|| PathBuf::from("/bin/sh"));
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.arg(root.join("install.sh"));
-    cmd.arg("release");
+    let script = root.join("install.sh");
+    let mut cmd = CommandBuilder::new(&shell);
+    match invocation {
+        Invocation::Direct => {
+            cmd.arg(&script);
+            cmd.arg("release");
+        }
+        Invocation::PipedIntoShell => {
+            cmd.arg("-c");
+            // Single-quoted so a path with spaces survives; neither path can
+            // contain a single quote, both being repo-relative.
+            cmd.arg(format!(
+                "cat '{}' | '{}' -s release",
+                script.display(),
+                shell.display()
+            ));
+        }
+    }
     cmd.cwd(&root);
     for (key, value) in std::env::vars_os() {
         cmd.env(key, value);
@@ -1827,7 +1881,7 @@ fn run_installer_pty(
     cmd.env("HOME", &st.home_dir);
     cmd.env("TERM", "xterm-256color");
     match columns_env {
-        Some(cols) => cmd.env("COLUMNS", cols.to_string()),
+        Some(cols) => cmd.env("COLUMNS", cols),
         // The harness's own COLUMNS would otherwise leak in and stand in for a
         // value the scenario meant to leave unset.
         None => cmd.env_remove("COLUMNS"),
@@ -1907,7 +1961,12 @@ fn progress_rows(screen: &str) -> Vec<&str> {
 }
 
 /// Serve the signed dist over loopback and install from it under a pty.
-fn install_under_pty(world: &mut E2eWorld, pty_cols: u16, columns_env: Option<u16>) {
+fn install_under_pty(
+    world: &mut E2eWorld,
+    pty_cols: u16,
+    columns_env: Option<&str>,
+    invocation: Invocation,
+) {
     let st = state(world);
     let dist_dir = st.dist_dir.clone();
     let install_dir = st.install_dir.clone();
@@ -1927,23 +1986,83 @@ fn install_under_pty(world: &mut E2eWorld, pty_cols: u16, columns_env: Option<u1
         &base,
         &key_env,
         &no_path,
-        pty_cols,
-        columns_env,
+        PtyRun {
+            pty_cols,
+            columns_env,
+            invocation,
+        },
     );
     let st = state_mut(world);
     st.last_terminal_output = raw;
     st.last_terminal_screen = screen;
+    st.last_pty_cols = pty_cols;
+    drop(server);
+}
+
+/// Install under a pty with extra environment on top of the usual isolation.
+fn install_with_env(
+    world: &mut E2eWorld,
+    pty_cols: u16,
+    columns_env: Option<&str>,
+    extra: &[(&str, String)],
+) {
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let mut env: Vec<(&str, String)> = vec![("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
+    env.extend(extra.iter().cloned());
+    let (raw, screen) = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &env,
+        PtyRun {
+            pty_cols,
+            columns_env,
+            invocation: Invocation::Direct,
+        },
+    );
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
+    st.last_pty_cols = pty_cols;
     drop(server);
 }
 
 #[when("the signed bundle is installed through a pseudo-terminal narrower than COLUMNS")]
 async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
-    install_under_pty(world, PTY_COLS, Some(STALE_COLUMNS));
+    install_under_pty(
+        world,
+        PTY_COLS,
+        Some(&STALE_COLUMNS.to_string()),
+        Invocation::Direct,
+    );
 }
 
 #[when("the signed bundle is installed through a terminal too narrow for a progress bar")]
 async fn when_install_pty_narrow(world: &mut E2eWorld) {
-    install_under_pty(world, NARROW_PTY_COLS, None);
+    install_under_pty(world, NARROW_PTY_COLS, None, Invocation::Direct);
+}
+
+#[when("the signed bundle is installed with a zero-padded COLUMNS and no way to measure")]
+async fn when_install_pty_zero_padded_columns(world: &mut E2eWorld) {
+    // COLUMNS is the last source the width falls back to, so it is only
+    // consulted when neither stty nor tput can answer. With a real pty, stty
+    // answers first and this branch is unreachable: hide both tools.
+    //
+    // "080" passes a digits-only check but is an octal literal to POSIX
+    // arithmetic, and dash aborts the whole script on it. Only a raw string can
+    // express that, which is why columns_env is not a number.
+    let path = shadow_path(world, &["stty", "tput"], &[]);
+    install_with_env(world, PTY_COLS, Some("080"), &[("PATH", path)]);
 }
 
 #[then("every download progress frame stays within the terminal")]
@@ -1954,7 +2073,7 @@ async fn then_progress_fits_terminal(world: &mut E2eWorld) {
         !frames.is_empty(),
         "the installer drew no progress at all under a pty:\n{output}"
     );
-    let width = usize::from(PTY_COLS);
+    let width = usize::from(state(world).last_pty_cols);
     // A frame wider than the terminal certainly wraps, and one exactly as wide
     // as it sits on the right margin, where terminals disagree about whether
     // the next write moves down a row. Either way the carriage return ending
@@ -2030,18 +2149,36 @@ async fn then_narrow_notice(world: &mut E2eWorld) {
     );
 }
 
-/// A single directory that shadows `PATH`, holding a symlink to every
-/// executable reachable on it except `name`.
+/// A single directory that shadows `PATH`: a symlink to every executable
+/// reachable on it, minus `remove`, plus a shim script for each `shims` entry.
 ///
-/// Dropping whole directories the way [`path_without_openssl`] does cannot work
-/// for curl: it lives in `/usr/bin` beside `sh`, `tar`, `awk` and ~980 other
-/// tools the installer and the harness both need, so removing that directory
-/// leaves nothing able to run. Shadowing one name keeps everything else exactly
-/// where the installer expects to find it, and `command -v curl` then genuinely
-/// misses, which is what sends `fetch()` down its wget branch.
-fn path_shadowing_out(world: &E2eWorld, name: &str) -> String {
-    let farm = root(world).join("path-without").join(name);
+/// Dropping whole directories cannot work here: the tools these scenarios need
+/// out of the way live in `/usr/bin` beside `sh`, `tar`, `awk` and ~980 others
+/// the installer and harness both need, so removing that directory leaves
+/// nothing able to run. Shadowing individual names keeps everything else where
+/// the installer expects it, and `command -v <name>` then genuinely misses.
+///
+/// Shims exist because some branches are only reachable when a tool answers a
+/// particular way: a terminal that never had its size set reports `0 0`, which
+/// no real pty here will do on demand.
+fn shadow_path(world: &E2eWorld, remove: &[&str], shims: &[(&str, &str)]) -> String {
+    let tag: String = remove
+        .iter()
+        .chain(shims.iter().map(|(name, _)| name))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("-");
+    let farm = root(world).join("shadow-path").join(if tag.is_empty() {
+        "none".to_owned()
+    } else {
+        tag
+    });
     std::fs::create_dir_all(&farm).expect("failed to create the shadow PATH directory");
+    let hidden: Vec<&str> = remove
+        .iter()
+        .chain(shims.iter().map(|(name, _)| name))
+        .copied()
+        .collect();
     for dir in std::env::var("PATH").unwrap_or_default().split(':') {
         if dir.is_empty() {
             continue;
@@ -2051,7 +2188,7 @@ fn path_shadowing_out(world: &E2eWorld, name: &str) -> String {
         };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            if file_name == name {
+            if hidden.iter().any(|name| file_name == *name) {
                 continue;
             }
             let link = farm.join(&file_name);
@@ -2072,10 +2209,23 @@ fn path_shadowing_out(world: &E2eWorld, name: &str) -> String {
             }
         }
     }
-    assert!(
-        !farm.join(name).exists(),
-        "{name} is still resolvable through the shadow PATH"
-    );
+    for (name, body) in shims {
+        let path = farm.join(name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, body).expect("failed to write a PATH shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("failed to make a PATH shim executable");
+        }
+    }
+    for name in remove {
+        assert!(
+            !farm.join(name).exists(),
+            "{name} is still resolvable through the shadow PATH"
+        );
+    }
     farm.to_string_lossy().into_owned()
 }
 
@@ -2098,7 +2248,7 @@ async fn when_install_pty_without_curl(world: &mut E2eWorld) {
     )];
     let extra = [
         ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
-        ("PATH", path_shadowing_out(world, "curl")),
+        ("PATH", shadow_path(world, &["curl"], &[])),
     ];
     let (raw, screen) = run_installer_pty(
         world,
@@ -2106,12 +2256,16 @@ async fn when_install_pty_without_curl(world: &mut E2eWorld) {
         &base,
         &key_env,
         &extra,
-        PTY_COLS,
-        Some(STALE_COLUMNS),
+        PtyRun {
+            pty_cols: PTY_COLS,
+            columns_env: Some(&STALE_COLUMNS.to_string()),
+            invocation: Invocation::Direct,
+        },
     );
     let st = state_mut(world);
     st.last_terminal_output = raw;
     st.last_terminal_screen = screen;
+    st.last_pty_cols = PTY_COLS;
     drop(server);
 }
 
@@ -2141,4 +2295,69 @@ async fn then_no_request_logging(world: &mut E2eWorld) {
              narrating the request instead of just drawing the bar:\n{output}"
         );
     }
+}
+
+#[when("the signed bundle is installed by piping the installer into a shell")]
+async fn when_install_pty_piped(world: &mut E2eWorld) {
+    install_under_pty(world, WIDE_PTY_COLS, None, Invocation::PipedIntoShell);
+}
+
+#[when("the signed bundle is installed where the terminal reports no size")]
+async fn when_install_pty_unsized(world: &mut E2eWorld) {
+    // A pty that never had its window size set reports `0 0`. No real pty here
+    // will do that on demand, so stand in a stty that says so.
+    //
+    // tput is deliberately left available, and the terminal is deliberately not
+    // 80 columns wide. Treating the 0 as a width suppresses the bar, but a
+    // later guard would then rescue it to the 80-column default, which at this
+    // suite's usual width is indistinguishable from success. Falling through to
+    // tput instead yields the terminal's real width, so the two outcomes differ
+    // and the assertion can tell them apart.
+    let path = shadow_path(world, &[], &[("stty", "#!/bin/sh\nprintf '0 0\\n'\n")]);
+    install_with_env(world, WIDE_PTY_COLS, None, &[("PATH", path)]);
+}
+
+#[then("each completed bar spans the measured terminal width")]
+async fn then_bar_spans_terminal(world: &mut E2eWorld) {
+    let st = state(world);
+    let screen = st.last_terminal_screen.clone();
+    let cols = usize::from(st.last_pty_cols);
+    let expected = cols - 1;
+    let rows = progress_rows(&screen);
+    assert!(
+        !rows.is_empty(),
+        "the installer drew no progress bar at all:\n{screen}"
+    );
+    // The width is the assertion. A bar drawn to some other width still fits
+    // the terminal and still redraws in place, so the width check alone cannot
+    // see it, yet it means the measurement came from somewhere other than this
+    // terminal: ncurses answers 80 when it is asked about a pipe rather than
+    // the real descriptor.
+    let wrong: Vec<(usize, &&str)> = rows
+        .iter()
+        .map(|row| (row.chars().count(), row))
+        .filter(|(len, _)| *len != expected)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "a completed bar should span {expected} of this terminal's {cols} \
+         columns, reserving only the last; got widths {:?}. A narrower bar \
+         means the width was not read from this terminal:\n{screen}",
+        wrong.iter().map(|(len, _)| *len).collect::<Vec<_>>(),
+    );
+}
+
+#[then("the installer still draws a progress bar")]
+async fn then_bar_still_drawn(world: &mut E2eWorld) {
+    // Asserted on the byte stream, not a rendered screen: a pty that never had
+    // a size cannot be drawn into meaningfully, and the question here is only
+    // whether the installer gave up on progress or not.
+    let output = state(world).last_terminal_output.clone();
+    let frames = progress_frames(&output);
+    assert!(
+        !frames.is_empty(),
+        "an unsized terminal reports 0 columns, which means unmeasured rather \
+         than unusably narrow; the installer should still draw a bar at a \
+         fallback width instead of downloading in silence:\n{output}"
+    );
 }

@@ -1753,8 +1753,10 @@ inputs come from the environment for parity with those scripts:
 ### Install lifecycle (opt-in `@lifecycle` E2E)
 
 The full install lifecycle — packaging, signature-verified install, tamper
-rejection, reinstall, PATH handling, and uninstall — is expressed as
-`@lifecycle` scenarios in the [E2E cucumber suite](../tests/e2e-cucumber/README.md)
+rejection, reinstall, PATH handling, uninstall, and how download progress is
+drawn (one bar per download that stays inside the terminal, a terminal too
+narrow for a bar saying so rather than going silent, and the wget fallback) —
+is expressed as `@lifecycle` scenarios in the [E2E cucumber suite](../tests/e2e-cucumber/README.md)
 (`features/install_lifecycle.feature`). They drive `cargo xtask package`, the
 real root installer (`install.sh` / `install.ps1`), and the installed binaries
 end to end, replacing the former
