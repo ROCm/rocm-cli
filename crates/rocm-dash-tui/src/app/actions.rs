@@ -13,8 +13,8 @@ use crate::ui;
 use super::AppState;
 use super::summary::summarize_json_value;
 use super::types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, MENU_ITEMS, Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus,
-    ScrollTarget,
+    ActiveTab, ChatConsent, ChatKeyCtx, MENU_ITEMS, MenuItem, Modal, OPTIONS_TABS, PALETTE_DESTS,
+    PaneFocus, ScrollTarget,
 };
 #[cfg(test)]
 use super::types::{ChatProvider, ChatRole};
@@ -284,7 +284,7 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::MenuMove(d) => match state.modal {
             Modal::Menu => {
-                state.menu_sel = wrap_cursor(state.menu_sel, d, MENU_ITEMS);
+                state.menu_sel = wrap_cursor(state.menu_sel, d, MENU_ITEMS.len());
             }
             Modal::Palette => {
                 state.palette_sel = wrap_cursor(state.palette_sel, d, PALETTE_DESTS.len());
@@ -297,12 +297,12 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             }
         }
         KeyAction::MenuActivate => match state.modal {
-            Modal::Menu => match state.menu_sel {
-                0 => {
+            Modal::Menu => match MENU_ITEMS.get(state.menu_sel) {
+                Some(MenuItem::Options) => {
                     state.modal = Modal::Options;
                     state.options_tab = 0;
                 }
-                1 => {
+                Some(MenuItem::Help) => {
                     state.modal = Modal::GlobalHelp;
                 }
                 // Issue #145: this must share `KeyAction::Quit`'s own gate —
@@ -312,7 +312,10 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 // `open_quit_confirm` closes the Esc menu itself when a
                 // prompt opens, so a decline doesn't strand the user back in
                 // it (same as every other row here already does on success).
-                _ => return request_quit(state),
+                // A selection past the list (never set by `OpenMenu` or
+                // `MenuMove`, which keep it in range) still quits, as it did
+                // when this arm was the index fallback.
+                Some(MenuItem::Quit) | None => return request_quit(state),
             },
             Modal::Palette => {
                 if let Some((_, tab)) = PALETTE_DESTS.get(state.palette_sel) {
@@ -1500,6 +1503,17 @@ mod tests {
         assert_eq!(s.modal, Modal::GlobalHelp);
         s.modal = Modal::Menu;
         s.menu_sel = 2;
+        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+    }
+
+    #[test]
+    fn esc_menu_selection_past_the_last_row_still_quits() {
+        // Nothing sets `menu_sel` out of range (`OpenMenu` resets it and
+        // `MenuMove` wraps it), but the activation match has always treated
+        // every index after Help as Quit; the list lookup keeps that.
+        let mut s = st();
+        s.modal = Modal::Menu;
+        s.menu_sel = MENU_ITEMS.len() + 4;
         assert!(apply_action(&mut s, KeyAction::MenuActivate));
     }
 

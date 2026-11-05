@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{AppState, OPTIONS_TABS, PALETTE_DESTS};
+use crate::app::{AppState, MENU_ITEMS, OPTIONS_TABS, PALETTE_DESTS};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::theme::Theme;
 
@@ -25,8 +25,9 @@ use crate::ui::theme::Theme;
 /// Row (relative to `inner.y`) where the Esc menu's selectable items begin,
 /// just below the 5-row logo (rows 1..=5).
 const MENU_ITEMS_Y: u16 = 8;
-/// Number of selectable rows in the Esc menu (Options / Help / Quit).
-const MENU_ITEM_COUNT: u16 = 3;
+/// Number of selectable rows in the Esc menu, counted from the one list
+/// ([`MENU_ITEMS`]) the key handling and the drawn rows also use.
+const MENU_ITEM_COUNT: u16 = MENU_ITEMS.len() as u16;
 /// Minimum inner width the logo needs before the menu will render.
 const MENU_MIN_WIDTH: u16 = 31;
 
@@ -54,9 +55,8 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
     draw_logo(f, cx, inner.y + 1, theme);
 
-    let items = ["Options", "Help", "Quit"];
     let mx = inner.x + 4;
-    for (i, label) in items.iter().enumerate() {
+    for (i, item) in MENU_ITEMS.iter().enumerate() {
         let y = inner.y + MENU_ITEMS_Y + i as u16;
         if y >= inner.y + inner.height {
             break;
@@ -75,7 +75,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(cur, Style::default().fg(theme.accent)),
-                Span::styled(*label, st),
+                Span::styled(item.label(), st),
             ])),
             Rect::new(mx, y, inner.width.saturating_sub(4), 1),
         );
@@ -267,7 +267,7 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_logo, grey_overlay, opt_row};
+    use super::{MENU_ITEMS, draw_logo, grey_overlay, opt_row};
     use crate::ui::tests::flat;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
@@ -414,11 +414,17 @@ mod tests {
     }
 
     #[test]
-    fn esc_menu_draws_exactly_as_many_rows_as_the_selection_can_reach() {
-        // "How many items the menu has" is stated in the drawn rows here and
-        // in `MENU_ITEMS` (`app/types.rs`), the wrap bound of
-        // `KeyAction::MenuMove`. They must agree.
-        assert_eq!(drawn_item_rows(120, 30, 0).len(), crate::app::MENU_ITEMS);
+    fn esc_menu_draws_the_rows_of_the_list_the_selection_walks() {
+        // The drawn rows and the wrap bound of `KeyAction::MenuMove` both come
+        // from `MENU_ITEMS` (`app/types.rs`), so what is drawn is exactly what
+        // the selection can reach, label for label.
+        let drawn = drawn_item_rows(120, 30, 0);
+        let drawn: Vec<&str> = drawn
+            .iter()
+            .map(|(_, t)| t.trim_start_matches("▸ "))
+            .collect();
+        let listed: Vec<&str> = MENU_ITEMS.iter().map(|i| i.label()).collect();
+        assert_eq!(drawn, listed);
     }
 
     #[test]
