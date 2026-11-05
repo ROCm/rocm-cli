@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT
 
 //! Shared fixtures for building a throwaway [`AppPaths`] under a per-test,
-//! per-process directory.
+//! per-process directory, and for seeding the automation audit store that both
+//! `automation.rs`'s and `jsonl_store.rs`'s tests drive.
 //!
 //! Used from every module split out of this crate's former `lib.rs` god file
 //! so the naming/uniqueness scheme for test artifact directories stays in one
 //! place rather than drifting across copies.
 
-use crate::{AppPaths, ManagedServiceRecord, unix_time_millis};
+use crate::{AppPaths, AuditEventRecord, ManagedServiceRecord, unix_time_millis};
+use anyhow::Result;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -144,6 +147,35 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
         CALLERS,
         "two calls with one label must not share a root"
     );
+}
+
+pub(crate) fn audit_record(tag: &str) -> AuditEventRecord {
+    AuditEventRecord {
+        at_unix_ms: 1,
+        source: "test".to_owned(),
+        category: "concurrency".to_owned(),
+        actor: "writer".to_owned(),
+        level: "info".to_owned(),
+        action: "append".to_owned(),
+        message: tag.to_owned(),
+        watcher_id: None,
+        service_id: None,
+    }
+}
+
+/// Write `contents` as the audit store, creating its directory.
+pub(crate) fn seed_audit_store(paths: &AppPaths, contents: &str) -> Result<()> {
+    paths.ensure()?;
+    fs::write(paths.audit_events_path(), contents)?;
+    Ok(())
+}
+
+pub(crate) fn audit_line(tag: &str) -> String {
+    serde_json::to_string(&audit_record(tag)).expect("serialize audit record")
+}
+
+pub(crate) fn audit_messages(records: &[AuditEventRecord]) -> Vec<&str> {
+    records.iter().map(|r| r.message.as_str()).collect()
 }
 
 /// Case count for a property test that sets its own count: `PROPTEST_CASES`

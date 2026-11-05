@@ -120,7 +120,7 @@ Feature: Automation watchers
   # automations-07 only exercises a single rollover: a live file at the cap
   # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
   # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
-  # pinned only by unit tests in `automation.rs`. This seeds a full chain of
+  # pinned only by unit tests in `jsonl_store.rs`. This seeds a full chain of
   # four already-rotated generations plus a live file at the cap, forces one
   # more rotation, and checks the whole chain shifted down by one and the
   # oldest generation's content is gone, not just that `.1` exists.
@@ -143,7 +143,7 @@ Feature: Automation watchers
   # The fault is a directory permission, which does not bind root (the
   # self-hosted WSL2 guest runs the suite as root), so `@requires-dir-permissions`
   # skips it there rather than let it pass without testing anything. The unit
-  # tests in `automation.rs` cover the other triggers (an injected failure of
+  # tests in `jsonl_store.rs` cover the other triggers (an injected failure of
   # each step, and on Windows a handle without delete sharing).
   @id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced @requires-os:linux @requires-dir-permissions
   Scenario: automations-10 - A command still records its audit event when the torn audit log cannot be replaced
