@@ -859,6 +859,69 @@ mod tests {
         }
     }
 
+    /// The rows that carry `therock_family` and `has_amd_gpu` exist so that the
+    /// no-GPU lane, where the same scenarios run against MockServer instead of a
+    /// real Lemonade serve, stays expect-pass. `cap("mock")` cannot prove that:
+    /// its `os_family` is `other`, so the `os = "linux"` condition excludes it
+    /// before either GPU guard is consulted. These hosts are Linux, so each guard
+    /// is the only thing standing between them and an xfail. The two partial
+    /// hosts isolate the guards from each other: dropping `has_amd_gpu` from a row
+    /// fails the host that reports only a gfx target, and dropping `therock_family`
+    /// fails the host that reports only a GPU.
+    #[test]
+    fn real_gpu_lemonade_rows_do_not_xfail_linux_hosts_without_a_usable_gpu() {
+        let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let linux_lemonade = cap("strix-ubuntu");
+        let hosts = [
+            (
+                "linux, no GPU, no gfx target",
+                HostCapability {
+                    gfx_target: None,
+                    has_amd_gpu: false,
+                    amd_gpu_count: Some(0),
+                    ..linux_lemonade.clone()
+                },
+            ),
+            (
+                "linux, gfx target reported but no usable GPU",
+                HostCapability {
+                    has_amd_gpu: false,
+                    amd_gpu_count: Some(0),
+                    ..linux_lemonade.clone()
+                },
+            ),
+            (
+                "linux, usable GPU but no gfx target reported",
+                HostCapability {
+                    gfx_target: None,
+                    ..linux_lemonade.clone()
+                },
+            ),
+        ];
+        for id in [
+            "bench-load-real-serve",
+            "chat-tool-definitions-accepted",
+            "chat-end-to-end-local-model",
+        ] {
+            let scenario = decl(&[&format!("id:{id}")]);
+            for (label, host) in &hosts {
+                assert_eq!(
+                    resolve(&scenario, host, &matrix, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} on {label}",
+                );
+            }
+            // The full real-GPU host is the one that must still be xfailed.
+            assert!(
+                matches!(
+                    resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
+                    Expectation::ExpectXfail { bug, .. } if bug == "#897"
+                ),
+                "{id} on a real GPU host",
+            );
+        }
+    }
+
     fn decl(tags: &[&str]) -> ScenarioDecl {
         ScenarioDecl::from_tags(tags)
     }
