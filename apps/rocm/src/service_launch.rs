@@ -4425,7 +4425,7 @@ mod tests {
         // confirms every recorded process gone without touching the test
         // process itself.
         crate::service_control::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
-            crate::service_control::RecordedStopTermination::confirmed_stopped()
+            Vec::new()
         })?;
 
         let decision = resolve_managed_port_in_transaction(
