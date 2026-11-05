@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod fake_engine;
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;

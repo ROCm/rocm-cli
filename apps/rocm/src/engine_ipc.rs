@@ -151,6 +151,22 @@ where
             "unable to locate engine binary for {engine}; build the workspace or install the engine package"
         )
     })?;
+    engine_stdio_child_request(&engine_binary, paths, &envelope, env_root, stream_progress)
+}
+
+/// The out-of-process half of [`engine_request_with_env_root`]: run
+/// `engine_binary stdio`, send `envelope` on its stdin and decode its answer.
+/// Split out so a test can point it at a stand-in binary.
+fn engine_stdio_child_request<R>(
+    engine_binary: &Path,
+    paths: Option<&AppPaths>,
+    envelope: &EngineRequestEnvelope,
+    env_root: Option<&Path>,
+    stream_progress: bool,
+) -> Result<R>
+where
+    R: DeserializeOwned,
+{
     let mut command = ProcessCommand::new(engine_binary);
     command.arg("stdio");
     if let Some(paths) = paths {
@@ -181,7 +197,7 @@ where
         // surface as the normal "failed to write engine request" error and then
         // let `wait()` report why the engine exited.
         with_sigpipe_ignored(|| {
-            serde_json::to_writer(&mut stdin, &envelope)
+            serde_json::to_writer(&mut stdin, envelope)
                 .context("failed to write engine request")?;
             stdin.write_all(b"\n")?;
             Ok::<(), anyhow::Error>(())
@@ -494,5 +510,290 @@ mod tests {
 
         assert_eq!(discovered, Some(primary_path));
         Ok(())
+    }
+
+    // ---- The stdio client, driven against a stand-in engine child. ----
+    //
+    // These pin what `rocm` puts on an engine child's command line, environment
+    // and stdin and how it reads the answer back. `rocmd` keeps its own client
+    // with a different contract; its tests are in `apps/rocmd/src/engine_ipc.rs`.
+
+    fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
+        EngineRequestEnvelope { method, payload }
+    }
+
+    #[test]
+    fn decode_engine_response_reports_each_way_an_answer_can_be_unusable() {
+        let failed = EngineResponseEnvelope {
+            ok: false,
+            data: None,
+            error: Some(rocm_engine_protocol::EngineErrorDetail {
+                code: "stop_failed".to_owned(),
+                message: "it broke".to_owned(),
+            }),
+        };
+        let error = decode_engine_response::<serde_json::Value>(failed).unwrap_err();
+        assert_eq!(error.to_string(), "stop_failed: it broke");
+
+        let unexplained = EngineResponseEnvelope {
+            ok: false,
+            data: None,
+            error: None,
+        };
+        let error = decode_engine_response::<serde_json::Value>(unexplained).unwrap_err();
+        assert_eq!(error.to_string(), "unknown engine error");
+
+        let empty = EngineResponseEnvelope {
+            ok: true,
+            data: None,
+            error: None,
+        };
+        let error = decode_engine_response::<serde_json::Value>(empty).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "engine response envelope did not contain data"
+        );
+
+        let wrong_shape = EngineResponseEnvelope::success(serde_json::json!({"stopped": "yes"}));
+        let error =
+            decode_engine_response::<rocm_engine_protocol::StopResponse>(wrong_shape).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to decode engine response payload"
+        );
+    }
+
+    #[cfg(unix)]
+    mod stdio_child {
+        use super::*;
+        use rocm_engine_protocol::fake_engine::FakeEngine;
+        use serde_json::{Value, json};
+        use std::os::unix::process::ExitStatusExt as _;
+
+        const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
+
+        fn stop_request() -> EngineRequestEnvelope {
+            envelope(EngineMethod::Stop, json!({"service_id": "svc"}))
+        }
+
+        fn request(
+            engine: &FakeEngine,
+            paths: Option<&AppPaths>,
+            env_root: Option<&Path>,
+            stream_progress: bool,
+        ) -> Result<Value> {
+            engine.run(|| {
+                engine_stdio_child_request::<Value>(
+                    engine.path(),
+                    paths,
+                    &stop_request(),
+                    env_root,
+                    stream_progress,
+                )
+            })
+        }
+
+        fn ambient(key: &str) -> Option<String> {
+            std::env::var(key).ok()
+        }
+
+        #[test]
+        fn the_child_gets_the_stdio_verb_and_one_line_of_request() {
+            let engine = FakeEngine::answering("rocm-framing", STOPPED, 0);
+            let answer = request(&engine, None, None, false).unwrap();
+
+            assert_eq!(answer, json!({"stopped": true}));
+            assert_eq!(engine.argv(), ["stdio"]);
+            assert_eq!(
+                engine.stdin(),
+                "{\"method\":\"stop\",\"payload\":{\"service_id\":\"svc\"}}\n"
+            );
+        }
+
+        #[test]
+        fn the_child_runs_on_the_callers_app_paths_when_given_them() {
+            let (root, paths) = crate::tests::test_paths("engine-ipc-app-paths");
+            let engine = FakeEngine::answering("rocm-app-paths", STOPPED, 0);
+            request(&engine, Some(&paths), None, false).unwrap();
+            let _ = fs::remove_dir_all(root);
+
+            assert_eq!(
+                engine.env("ROCM_CLI_CONFIG_DIR").as_deref(),
+                paths.config_dir.to_str()
+            );
+            assert_eq!(
+                engine.env("ROCM_CLI_DATA_DIR").as_deref(),
+                paths.data_dir.to_str()
+            );
+            assert_eq!(
+                engine.env("ROCM_CLI_CACHE_DIR").as_deref(),
+                paths.cache_dir.to_str()
+            );
+        }
+
+        #[test]
+        fn the_child_inherits_the_callers_environment_when_no_app_paths_are_given() {
+            let engine = FakeEngine::answering("rocm-no-app-paths", STOPPED, 0);
+            request(&engine, None, None, false).unwrap();
+
+            for key in [
+                "ROCM_CLI_CONFIG_DIR",
+                "ROCM_CLI_DATA_DIR",
+                "ROCM_CLI_CACHE_DIR",
+            ] {
+                assert_eq!(engine.env(key), ambient(key), "{key}");
+            }
+        }
+
+        #[test]
+        fn an_env_root_reaches_the_child_as_the_engine_envs_root() {
+            let engine = FakeEngine::answering("rocm-env-root", STOPPED, 0);
+            let env_root = Path::new("/an/engine/envs/root");
+            request(&engine, None, Some(env_root), false).unwrap();
+            assert_eq!(
+                engine.env("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref(),
+                Some("/an/engine/envs/root")
+            );
+
+            let without = FakeEngine::answering("rocm-no-env-root", STOPPED, 0);
+            request(&without, None, None, false).unwrap();
+            assert_eq!(
+                without.env("ROCM_CLI_ENGINE_ENVS_ROOT"),
+                ambient("ROCM_CLI_ENGINE_ENVS_ROOT")
+            );
+        }
+
+        #[test]
+        fn progress_streaming_is_asked_for_only_when_the_caller_wants_it() {
+            let streaming = FakeEngine::answering("rocm-progress-on", STOPPED, 0);
+            request(&streaming, None, None, true).unwrap();
+            assert_eq!(
+                streaming.env("ROCM_ENGINE_PROGRESS_STDERR").as_deref(),
+                Some("1")
+            );
+
+            let quiet = FakeEngine::answering("rocm-progress-off", STOPPED, 0);
+            request(&quiet, None, None, false).unwrap();
+            assert_eq!(
+                quiet.env("ROCM_ENGINE_PROGRESS_STDERR"),
+                ambient("ROCM_ENGINE_PROGRESS_STDERR")
+            );
+        }
+
+        #[test]
+        fn the_endpoint_key_is_not_passed_to_the_child() {
+            // `rocm`'s requests are not about a running service's endpoint (detect,
+            // install, resolve-model, stop), so this client has no service to find
+            // a key for. `rocmd`'s healthcheck is the call that threads one.
+            let engine = FakeEngine::answering("rocm-no-key", STOPPED, 0);
+            request(&engine, None, None, false).unwrap();
+            assert_eq!(
+                engine.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
+                ambient(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV)
+            );
+        }
+
+        #[test]
+        fn a_nonzero_exit_with_no_answer_reports_the_status_and_stderr() {
+            let engine = FakeEngine::new("rocm-crash", true, "echo boom >&2\nexit 3");
+            let error = request(&engine, None, None, false).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine stdio process exited with status exit status: 3: boom"
+            );
+
+            let silent = FakeEngine::new("rocm-silent-crash", true, "exit 4");
+            let error = request(&silent, None, None, false).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine stdio process exited with status exit status: 4"
+            );
+        }
+
+        #[test]
+        fn a_nonzero_exit_that_still_answered_is_decoded_not_discarded() {
+            // The engine's own error envelope is the useful diagnostic, so an
+            // answer on stdout wins over the exit status.
+            let engine = FakeEngine::answering(
+                "rocm-answers-then-fails",
+                r#"{"ok":false,"error":{"code":"stop_failed","message":"it broke"}}"#,
+                1,
+            );
+            let error = request(&engine, None, None, false).unwrap_err();
+            assert_eq!(error.to_string(), "stop_failed: it broke");
+
+            let engine = FakeEngine::answering("rocm-answers-then-exits-2", STOPPED, 2);
+            assert_eq!(
+                request(&engine, None, None, false).unwrap(),
+                json!({"stopped": true})
+            );
+        }
+
+        #[test]
+        fn an_unparseable_answer_carries_the_childs_stderr() {
+            let engine = FakeEngine::new(
+                "rocm-garbage",
+                true,
+                "printf 'not json'\necho oops >&2\nexit 0",
+            );
+            let error = request(&engine, None, None, false).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope; stderr: oops"
+            );
+
+            let silent = FakeEngine::new("rocm-garbage-quiet", true, "printf 'not json'");
+            let error = request(&silent, None, None, false).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope"
+            );
+        }
+
+        /// The write of a request to an engine that has already exited must come
+        /// back as an error even where SIGPIPE is at its default action, which is
+        /// how `main` runs `rocm`. Re-executes this test in a fresh process that
+        /// installs `SIG_DFL` first (the test harness leaves SIGPIPE ignored, and
+        /// changing it process-wide would race sibling tests).
+        #[test]
+        fn a_request_to_an_engine_that_already_exited_is_an_error_under_sig_dfl() {
+            if std::env::var_os("ROCM_TEST_ENGINE_SIGPIPE_ARM").is_some() {
+                crate::reset_sigpipe();
+                let engine = FakeEngine::new("rocm-sigpipe", false, "exit 3");
+                // Larger than a pipe buffer, so the write reaches the closed read end.
+                let big = "x".repeat(1 << 20);
+                let result = engine.run(|| {
+                    engine_stdio_child_request::<Value>(
+                        engine.path(),
+                        None,
+                        &envelope(EngineMethod::Stop, json!({ "blob": big })),
+                        None,
+                        false,
+                    )
+                });
+                let error = result.expect_err("the engine never answered");
+                assert!(
+                    format!("{error:#}").contains("failed to write engine request"),
+                    "{error:#}"
+                );
+                return;
+            }
+
+            let status = ProcessCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "engine_ipc::tests::stdio_child::a_request_to_an_engine_that_already_exited_is_an_error_under_sig_dfl",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_ENGINE_SIGPIPE_ARM", "1")
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                None,
+                "SIGPIPE killed the process instead of surfacing as an error: {status:?}"
+            );
+            assert!(status.success(), "{status:?}");
+        }
     }
 }
