@@ -72,7 +72,8 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
         return Ok(());
     }
 
-    if !require_yes_or_interactive(options.yes, "uninstall")? && !confirm_uninstall()? {
+    let already_approved = require_yes_or_interactive(options.yes, "uninstall")?;
+    if !already_approved && !confirm_uninstall()? {
         println!("uninstall cancelled");
         return Ok(());
     }
