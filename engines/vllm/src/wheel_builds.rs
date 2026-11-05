@@ -249,16 +249,10 @@ mod tests {
     fn runtime_recording_sdk_version(version: Option<&str>) -> crate::runtime::VllmRuntime {
         crate::runtime::VllmRuntime {
             runtime_id: "wheel-gfx1151".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: std::path::PathBuf::from("/rocm/runtimes/wheel/gfx1151/bin/vllm"),
-            python_executable: None,
-            version: None,
             source: "managed_runtime_manifest:wheel-gfx1151".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
             rocm_sdk_version: version.map(ToOwned::to_owned),
+            ..crate::runtime::VllmRuntime::for_test()
         }
     }
 

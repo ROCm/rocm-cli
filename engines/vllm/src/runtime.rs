@@ -29,6 +29,31 @@ pub(crate) struct VllmRuntime {
     pub(crate) rocm_sdk_version: Option<String>,
 }
 
+#[cfg(test)]
+impl VllmRuntime {
+    /// The one place tests outside this struct's own definition get a runtime
+    /// from: a managed TheRock runtime with every optional part empty. A test
+    /// overrides only the fields it is about, with struct-update syntax
+    /// (`VllmRuntime { sdk_root: Some(root), ..VllmRuntime::for_test() }`), so a
+    /// field added to the struct is defaulted here once instead of breaking
+    /// every test module that builds one.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct TheRockRuntimeManifest {
     #[serde(default)]
@@ -821,21 +846,14 @@ mod tests {
     #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let mut runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
                 "/home/user/.venv/bin/vllm"
             }),
-            python_executable: None,
             version: Some("test".to_owned()),
             source: "managed_runtime_manifest:vllm-source-pip-gfx120x-all".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         assert!(runtime_is_managed(&runtime));
@@ -861,18 +879,13 @@ mod tests {
         // assessed environment or it fixes an interpreter nobody found broken.
         let assessed = VllmRuntime {
             runtime_id: "nightly-wheel-gfx94x-dcgpu-7-14-0a20260611".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
             python_executable: Some(PathBuf::from(
                 "/rocm/runtimes/wheel/nightly-gfx94x/bin/python",
             )),
             version: Some("0.26.0".to_owned()),
             source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         let target = assessed_python_for_repair(&assessed).expect("a managed runtime has a python");
@@ -959,16 +972,10 @@ mod tests {
     fn runtime_with_sdk_version(version: Option<&str>) -> VllmRuntime {
         VllmRuntime {
             runtime_id: "nightly-wheel-gfx94x-dcgpu".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
-            python_executable: None,
-            version: None,
             source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
             rocm_sdk_version: version.map(ToOwned::to_owned),
+            ..VllmRuntime::for_test()
         }
     }
     #[test]
@@ -1000,17 +1007,11 @@ mod tests {
         // for the step that does).
         let root = PathBuf::from("/tmp/rocm-sdk");
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(root.clone()),
             sdk_bin: Some(root.join("bin")),
             sdk_bin_paths: vec![root.join("runtime").join("bin")],
             sdk_library_paths: vec![root.join("runtime").join("lib")],
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
         let entries = therock_library_path_entries(&runtime);
         assert!(entries.contains(&root.join("runtime").join("lib")));
@@ -1038,17 +1039,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn runtime_with_compat_dir(env_root: &Path) -> VllmRuntime {
         VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env_root.join("bin").join("python")),
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(env_root.join("sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         }
     }
 
@@ -1146,15 +1139,9 @@ mod tests {
         let runtime = VllmRuntime {
             runtime_id: "external-vllm-python".to_owned(),
             env_id: "external-vllm-python".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env.path().join("bin").join("python")),
-            version: None,
             source: "environment python".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         let shim = ensure_therock_compat_shims(&runtime, rocm_core::openmpi::ensure_mpi_cxx_compat);
