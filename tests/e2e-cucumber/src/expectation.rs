@@ -375,6 +375,18 @@ impl Expectations {
             .min()
     }
 
+    /// The serve-readiness window a scenario runs with on this host, as the
+    /// harness's `before` hook hands it to the serve steps
+    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): a
+    /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
+    /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
+    /// no `@id:` tag or with neither, which keeps the step default.
+    pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
+        let id = decl.id.as_deref()?;
+        decl.serve_timeout_secs
+            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
+    }
+
     /// Whether any declared condition for this scenario matches this host — the
     /// scenario is a known bug here and failing is its expected outcome.
     ///
@@ -2245,20 +2257,16 @@ flaky = true
         ));
     }
 
-    /// serve-40 serves through the same lemonade managed serve as serve-07, so
-    /// its row is scoped the same way: xfail on a lemonade Linux host, with the
-    /// same shortened serve wait, and not an expected failure on native Windows.
-    /// The row must stay `flaky` (a fixed #897 would otherwise turn the Ubuntu
-    /// lanes red as a stale XPASS) and must name #897.
+    /// serve-40 serves through the same lemonade managed serve as the other
+    /// lemonade serve rows, so its row is scoped the same way: xfail on a
+    /// lemonade Linux host, with a 90s serve wait, and not an expected failure
+    /// on native Windows. The row must stay `flaky` (a fixed #897 would
+    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name #897.
     #[test]
     fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         let id = "serve-stop-leaves-no-background-helper";
         assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
-        assert_eq!(
-            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
-            m.serve_timeout_for("serve-lemonade-inference", &cap("strix-ubuntu"), "lemonade"),
-        );
         assert_eq!(
             m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
             Some(90)
@@ -2268,6 +2276,50 @@ flaky = true
         assert_eq!(entries.len(), 1);
         assert!(entries[0].flaky);
         assert_eq!(entries[0].bug, "#897");
+    }
+
+    /// The row's 90s only matters if the harness hands it to the serve steps:
+    /// the `before` hook stores `serve_timeout_override(decl, cap)` on the world
+    /// and `serve_and_wait` waits that long instead of the 300s/600s default.
+    /// Resolve it from serve-40's REAL tag line, so dropping the `@id:` or the
+    /// `@requires-engine:lemonade` pin from the feature file fails here rather
+    /// than silently restoring the full wait. The pin also decides the engine on
+    /// a host whose default is another engine (MI300X serves vLLM by default).
+    #[test]
+    fn serve_40_gets_the_shortened_serve_window_from_its_own_tags() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let tags = feature_tags(
+            include_str!("../features/model_serving.feature"),
+            "serve-stop-leaves-no-background-helper",
+        );
+        let decl = ScenarioDecl::from_tags(&tags);
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
+            Some(90)
+        );
+        assert_eq!(m.serve_timeout_override(&decl, &cap("mi300x")), Some(90));
+        assert_eq!(m.serve_timeout_override(&decl, &cap("strix-windows")), None);
+    }
+
+    #[test]
+    fn serve_timeout_override_prefers_the_tag_and_needs_an_id() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        // The row says 90s on this host; a `@serve-timeout` tag lengthens it.
+        let tagged = decl(&[
+            "id:serve-stop-leaves-no-background-helper",
+            "requires-engine:lemonade",
+            "serve-timeout:2400",
+        ]);
+        assert_eq!(
+            m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            Some(2400)
+        );
+        // No `@id:` tag, nothing to look up: the step default stays.
+        let anonymous = decl(&["requires-engine:lemonade"]);
+        assert_eq!(
+            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu")),
+            None
+        );
     }
 
     #[test]

@@ -1361,9 +1361,7 @@ async fn main() {
                 // genuinely slow serve, e.g. a large model) takes precedence;
                 // otherwise fall back to any xfail matrix override (fail-fast for
                 // a known-bug serve). Absent both → the step default.
-                world.serve_timeout_override = decl
-                    .serve_timeout_secs
-                    .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})
