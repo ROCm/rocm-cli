@@ -21,6 +21,12 @@ use super::{AppState, ScrollDrag, ScrollTarget, ScrollbarHandle};
 /// hit-testing read those directly), and the scroll methods below build a
 /// `ScrollState` from the stored offset and the bound they currently know,
 /// call [`ScrollState::scroll_by`], then store `pos` back.
+///
+/// Because it is rebuilt per call rather than stored, "one implementation"
+/// holds by convention, not by construction: nothing stops a new scrollable
+/// surface from repeating the clamp arithmetic inline instead of building a
+/// `ScrollState`. Storing it in `AppState` would enforce it, at the cost of
+/// changing the plain `u16` offsets the renderer and hit-testing read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScrollState {
     /// Current offset, in lines (or columns for a horizontal axis).
@@ -48,6 +54,8 @@ impl ScrollState {
     /// reach the ends for any range of up to 32767 lines.
     pub(crate) fn scroll_by(&mut self, delta: i16) {
         let next = (i32::from(self.pos) + i32::from(delta)).clamp(0, i32::from(self.max));
+        // `next` is in `[0, max]` and `max` is a `u16`, so the conversion cannot
+        // fail; `unwrap_or` is a no-panic guard, not a reachable fallback.
         self.pos = u16::try_from(next).unwrap_or(u16::MAX);
     }
 }
