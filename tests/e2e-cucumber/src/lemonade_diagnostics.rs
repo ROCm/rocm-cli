@@ -297,6 +297,22 @@ mod tests {
         manifest
     }
 
+    /// The candidate paths a report lists, parsed back into paths.
+    ///
+    /// Compared as paths, never as printed text: the inventory joins
+    /// `bin/llamacpp` as one string, so on Windows a report line mixes `/` and
+    /// `\` while a test that builds the expected path another way prints it
+    /// differently. `Path` equality compares components, so both spellings agree,
+    /// and a negative check ("this candidate was skipped") cannot pass vacuously
+    /// just because the two spellings differ.
+    fn candidate_paths(report: &str) -> Vec<PathBuf> {
+        report
+            .lines()
+            .filter_map(|line| line.strip_prefix("candidate (not proof of selection): "))
+            .map(PathBuf::from)
+            .collect()
+    }
+
     #[test]
     fn executable_identity_does_not_depend_on_the_dynamic_loader() {
         let root = tempfile::tempdir().unwrap();
@@ -390,7 +406,16 @@ mod tests {
         let skipped = root
             .path()
             .join(format!("bin/llamacpp/rocm-stable/08/{binary}"));
-        assert!(!report.contains(&skipped.display().to_string()), "{report}");
+        let listed = candidate_paths(&report);
+        assert_eq!(listed.len(), MAX_CANDIDATES, "{report}");
+        assert!(!listed.contains(&skipped), "{report}");
+        let first = root
+            .path()
+            .join(format!("bin/llamacpp/rocm-stable/00/{binary}"));
+        assert!(
+            listed.contains(&first),
+            "the comparison must be able to match a listed candidate: {report}"
+        );
     }
 
     /// An executable past the hash cap is not fingerprinted, but the report says
@@ -415,7 +440,7 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("sha256: "), "{report}");
-        assert!(report.contains(&server.display().to_string()), "{report}");
+        assert_eq!(candidate_paths(&report), vec![server], "{report}");
         assert!(report.contains("--version:"), "{report}");
     }
 
