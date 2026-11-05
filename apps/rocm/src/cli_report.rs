@@ -173,7 +173,10 @@ mod tests {
             name: "gpu",
             count: 2,
         };
-        assert_eq!(written(true, &sample), "{\n  \"name\": \"gpu\",\n  \"count\": 2\n}\n");
+        assert_eq!(
+            written(true, &sample),
+            "{\n  \"name\": \"gpu\",\n  \"count\": 2\n}\n"
+        );
     }
 
     #[test]

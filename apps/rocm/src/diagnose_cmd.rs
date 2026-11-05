@@ -133,7 +133,9 @@ impl JsonOrText for DiagnoseOutput<'_> {
         let mut text = rocm_core::render_diagnose_text(self.report, self.top);
         if let Some(readiness) = &self.report.model {
             text.push('\n');
-            text.push_str(&rocm_core::model_readiness::render_model_readiness_text(readiness));
+            text.push_str(&rocm_core::model_readiness::render_model_readiness_text(
+                readiness,
+            ));
         }
         // Inspecting a distribution from outside it collects no environment, so
         // the checks that read one never run. Without saying so, "no known
