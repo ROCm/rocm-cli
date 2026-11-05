@@ -504,6 +504,40 @@ mod tests {
         );
     }
 
+    /// When every temp name the writer tries is taken, it gives up after a
+    /// bounded number of tries with an error that says so, rather than
+    /// looping or writing through a file another writer reserved.
+    #[test]
+    fn staging_gives_up_when_every_temp_name_is_taken() {
+        let root = scratch_dir("atomic-names-exhausted");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("active.json");
+        let taken = temp_sibling_path(&destination, OsStr::new("taken")).unwrap();
+        fs::write(&taken, b"another writer's staged file").unwrap();
+        let mut tries = 0;
+
+        let error = stage_file_for_atomic_publish_with(&destination, b"payload", |_| {
+            tries += 1;
+            OsString::from("taken")
+        })
+        .expect_err("a writer that finds every name taken must fail");
+
+        let foreign = fs::read(&taken);
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        let text = format!("{error:#}");
+        assert_eq!(tries, ATOMIC_WRITE_TEMP_ATTEMPTS);
+        assert!(
+            text.contains(&format!("after {ATOMIC_WRITE_TEMP_ATTEMPTS} attempts")),
+            "{text}"
+        );
+        assert_eq!(foreign.unwrap(), b"another writer's staged file");
+        assert_eq!(leftovers, vec![OsString::from("active.json.tmp-taken")]);
+    }
+
     /// The temp name keeps every extension, so a cleanup sweep over a cache
     /// directory can still tell what a leftover was going to be.
     #[test]
