@@ -247,10 +247,6 @@ pub(crate) fn attach_background_stdio(
     Ok(())
 }
 
-/// `status_clause` is a pre-formatted fragment inserted right after "exited
-/// immediately" (e.g. `" with status exit status: 1"` on Unix, where a real
-/// `ExitStatus` is available; empty on Windows, where the liveness check
-/// below only has a yes/no answer, not an exit code).
 /// Windows spawn-liveness check: wait out the startup window, then fail with the
 /// startup log when the child is already gone. The wait and the liveness probe
 /// are injected so a unit test runs the exit-detected path on every platform,
@@ -273,6 +269,10 @@ fn ensure_spawned_child_survives_startup(
     }
 }
 
+/// `status_clause` is a pre-formatted fragment inserted right after "exited
+/// immediately" (e.g. `" with status exit status: 1"` on Unix, where a real
+/// `ExitStatus` is available; empty on Windows, where the liveness check
+/// below only has a yes/no answer, not an exit code).
 pub(crate) fn managed_engine_startup_failure_detail(
     status_clause: &str,
     log_path: &Path,
@@ -1964,6 +1964,7 @@ mod tests {
             || settled.set(true),
             |pid| {
                 assert_eq!(pid, 4242);
+                assert!(settled.get(), "liveness must be probed after the wait");
                 false
             },
         )

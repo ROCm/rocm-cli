@@ -878,8 +878,9 @@ than the default
 loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
 requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
 cannot promise a free port anywhere else. An explicit `--port` on such a host
-is refused when a live managed service already holds that port on the same host
-or on a wildcard (`0.0.0.0`, `::`) listener; the OS is not probed on such a
+is refused when a live managed service already holds that port on the same
+address (`localhost` counts as both loopback addresses) or on a wildcard
+listener that covers it (`0.0.0.0` for IPv4 addresses, `::` for any); the OS is not probed on such a
 host, so any other clash is reported by the engine when it starts.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's

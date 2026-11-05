@@ -128,11 +128,54 @@ pub(crate) fn loopback_bind_probe(port: u16) -> io::Result<LoopbackPortLease> {
     rocm_core::lease_loopback_port(port)
 }
 
-/// Whether two bind hosts can contend for the same port: identical spellings, or
-/// either side a wildcard listener, which also covers every specific address.
+/// Whether two bind hosts can contend for the same port.
+///
+/// Hosts are compared as addresses, not spellings: whitespace, brackets and case
+/// are ignored, `localhost` covers both loopback addresses, and a wildcard
+/// listener covers every address it can serve — `0.0.0.0` the IPv4 ones, `::`
+/// all of them (dual-stack). An IPv4 wildcard and an IPv6 address do not overlap.
 fn hosts_overlap(a: &str, b: &str) -> bool {
-    const WILDCARDS: [&str; 3] = ["0.0.0.0", "::", "[::]"];
-    a.eq_ignore_ascii_case(b) || WILDCARDS.contains(&a) || WILDCARDS.contains(&b)
+    use std::net::IpAddr;
+
+    fn parse(host: &str) -> Option<IpAddr> {
+        host.trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()
+    }
+    fn is_localhost(host: &str) -> bool {
+        host.trim().eq_ignore_ascii_case("localhost")
+    }
+    fn covers(wildcard: IpAddr, other: &str) -> bool {
+        match (wildcard, parse(other)) {
+            _ if !wildcard.is_unspecified() => false,
+            (IpAddr::V6(_), _) => true,
+            (IpAddr::V4(_), Some(IpAddr::V4(_))) => true,
+            (IpAddr::V4(_), Some(IpAddr::V6(_))) => false,
+            // A name such as `localhost` resolves to IPv4 loopback among others.
+            (IpAddr::V4(_), None) => true,
+        }
+    }
+
+    let (pa, pb) = (parse(a), parse(b));
+    if let Some(wildcard) = pa.filter(IpAddr::is_unspecified)
+        && covers(wildcard, b)
+    {
+        return true;
+    }
+    if let Some(wildcard) = pb.filter(IpAddr::is_unspecified)
+        && covers(wildcard, a)
+    {
+        return true;
+    }
+    match (pa, pb) {
+        (Some(x), Some(y)) => x == y,
+        (Some(ip), None) if is_localhost(b) => ip.is_loopback(),
+        (None, Some(ip)) if is_localhost(a) => ip.is_loopback(),
+        (None, None) => a.trim().eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    }
 }
 
 fn reserved_message(host: &str, port: u16, owner: &ReservedPort) -> String {
@@ -341,7 +384,6 @@ mod tests {
         let mut probe = |_port: u16| -> io::Result<LoopbackPortLease> {
             panic!("custom hosts must not be preflighted against IPv4 loopback")
         };
-        // Same spelling, and a wildcard holder against a specific host.
         for (holder, requested) in [("localhost", "localhost"), ("0.0.0.0", "localhost")] {
             let mut owner = reserved(11_435, "svc-a", "running");
             owner.host = holder.to_owned();
@@ -355,6 +397,44 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains("svc-a"), "{holder}/{requested}: {text}");
             assert!(text.contains(&format!("{requested}:11435")), "{text}");
+        }
+    }
+
+    #[test]
+    fn hosts_overlap_compares_addresses_not_spellings() {
+        let overlapping = [
+            ("127.0.0.1", "localhost"),
+            ("localhost", "127.0.0.1"),
+            ("::1", "localhost"),
+            ("::1", "[::1]"),
+            ("[::1]", "::1"),
+            ("LOCALHOST", "localhost"),
+            (" localhost ", "localhost"),
+            ("0.0.0.0", "10.0.0.7"),
+            ("10.0.0.7", "0.0.0.0"),
+            ("0.0.0.0", "localhost"),
+            ("::", "10.0.0.7"),
+            ("::", "::1"),
+            ("[::]", "10.0.0.7"),
+            ("10.0.0.7", "[::]"),
+            ("0:0:0:0:0:0:0:0", "10.0.0.7"),
+            ("::0", "::1"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("example.test", "EXAMPLE.test"),
+        ];
+        for (a, b) in overlapping {
+            assert!(hosts_overlap(a, b), "{a} should overlap {b}");
+        }
+        let disjoint = [
+            ("192.168.1.5", "10.0.0.7"),
+            ("0.0.0.0", "::1"),
+            ("::1", "0.0.0.0"),
+            ("10.0.0.7", "localhost"),
+            ("example.test", "other.test"),
+            ("127.0.0.1", "::1"),
+        ];
+        for (a, b) in disjoint {
+            assert!(!hosts_overlap(a, b), "{a} should not overlap {b}");
         }
     }
 
