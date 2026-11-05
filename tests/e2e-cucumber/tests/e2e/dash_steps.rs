@@ -59,9 +59,10 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
 /// cannot.
 ///
 /// `missing` names what a frame still lacks, one entry per absent piece; the
-/// frame is ready when it returns none. On failure the panic lists what the
-/// screen lacked when the wait ended, then the driver's own diagnostic, which
-/// carries that whole frame. The list is computed from a fresh read rather than
+/// frame is ready when it returns none. On failure the panic lists what a fresh
+/// read of the screen lacked, then the driver's own diagnostic, which carries
+/// the frame it read a moment earlier, so the two can differ if the screen
+/// changed between them. The list is computed from a fresh read rather than
 /// from the last frame the predicate saw, because the driver checks for a
 /// crashed or exited process before consulting the predicate, so the last frame
 /// the predicate saw can be older than the one the failure reports. That same
@@ -1835,21 +1836,16 @@ async fn services_manager_closed(world: &mut E2eWorld) {
     // open, so "● Observe" alone proves nothing about the redraw. The footer is
     // the last row drawn, and its Esc chip reads "menu" only when no manager and
     // no modal is open (`footer.rs`): waiting for it means the frame is drawn
-    // through the rows where the main menu would be.
-    let screen = wait_for_all_markers(
+    // through the rows where the main menu would be. The same chip is what
+    // guards against Esc falling through to open the main menu instead: with
+    // `Modal::Menu` open it reads "close", so this wait fails rather than
+    // passing on a frame with the menu over the closed manager.
+    wait_for_all_markers(
         tui,
-        "the Observe tab after Escape",
+        "the Observe tab, with no main menu opened by Escape",
         &["● Observe", "Esc  menu"],
     )
     .await;
-    // Belt-and-suspenders: `wait_until_gone` above is the primary regression
-    // check (the manager itself closed). This additionally guards against
-    // Esc falling through to open the main menu instead — "Options"/"Quit"
-    // are unique to `Modal::Menu`.
-    assert!(
-        !screen.contains("Options") && !screen.contains("Quit"),
-        "the main menu is open on top of the closed manager:\n{screen}"
-    );
 }
 
 #[then("instance details are displayed")]
@@ -1876,10 +1872,15 @@ async fn detail_footer_does_not_show_scroll_hint(world: &mut E2eWorld) {
     // enlarged pre-shrink geometry must genuinely have no hint yet, or the
     // shrink step's own wait would silently revert to a no-op (its marker
     // already present) for the same reason a prior round of this scenario
-    // was flagged for. A plain read is correct here — this runs right after
-    // `open_instance_detail`'s own wait, with no action in between that
-    // could still be in flight.
-    let screen = session(world).screen_text();
+    // was flagged for. `open_instance_detail` only waited for the popup's
+    // title, and the footer is the last thing the popup draws, so wait for its
+    // "log: " label before asserting the hint is absent from it.
+    let screen = wait_for_all_markers(
+        session(world),
+        "the instance detail footer",
+        &["Instance · ", "log: "],
+    )
+    .await;
     assert!(
         !screen.contains("↑/↓ scroll"),
         "footer must not show the scroll hint before the terminal shrinks:\n{screen}"
@@ -2220,8 +2221,9 @@ async fn launcher_shows_serving(world: &mut E2eWorld) {
         .to_string();
     let tui = session(world);
     // The front door's status strip renders "Serving <model>" for a live
-    // registry instance; wait for both the model name and "Serving" so the idle
-    // check below reads the frame that showed them.
+    // registry instance, or "Idle — nothing serving" on the same row when none
+    // is running. Wait for the model name and "Serving" together; the idle check
+    // below then names that failure mode if the strip regresses to idle.
     let screen = wait_for_all_markers(
         tui,
         "the launcher's status strip",
