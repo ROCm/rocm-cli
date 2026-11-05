@@ -26,7 +26,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::stream;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use tower_http::services::ServeDir;
 
 use crate::http_server::{self, ServerHandle};
