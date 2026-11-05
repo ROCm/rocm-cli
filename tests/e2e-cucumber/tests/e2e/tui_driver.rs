@@ -36,6 +36,7 @@ use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
+use e2e_cucumber::terminal_size::non_zero_dimensions;
 
 use crate::E2eWorld;
 
@@ -645,14 +646,9 @@ impl TuiSession {
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
-        // `vt100` takes `NonZeroU16`s; check before resizing the PTY so a zero
-        // dimension fails cleanly instead of leaving the PTY and screen at
-        // different sizes.
-        let (Some(vt_rows), Some(vt_cols)) = (NonZeroU16::new(rows), NonZeroU16::new(cols)) else {
-            return Err(format!(
-                "cannot resize to rows={rows} cols={cols}: zero dimension"
-            ));
-        };
+        // Validate before resizing the PTY so a zero dimension fails cleanly
+        // instead of leaving the PTY and the emulated screen at different sizes.
+        let (vt_rows, vt_cols) = non_zero_dimensions(rows, cols)?;
         let size = PtySize {
             rows,
             cols,

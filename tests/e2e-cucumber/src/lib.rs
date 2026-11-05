@@ -22,6 +22,7 @@ pub mod reader_failure;
 pub mod send_until;
 pub mod serve_log;
 pub mod shared_runtime;
+pub mod terminal_size;
 
 use std::path::{Path, PathBuf};
 
