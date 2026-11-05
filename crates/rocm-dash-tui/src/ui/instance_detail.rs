@@ -7,7 +7,7 @@
 //!
 //! Split out of `ui/tabs/instances.rs`. It reads `sorted_instances`,
 //! `clamp_sel` and `status_meta` from there, which stay single-sourced beside
-//! the table and card code that also use them; nothing in `instances.rs` calls
+//! the table code that also uses them; nothing in `instances.rs` calls
 //! back into this module. `ui/mod.rs` calls `draw_detail` for `Modal::Detail`
 //! on the Observe tab and writes the returned max scroll offset to
 //! `AppState::instance_detail_max_scroll`.

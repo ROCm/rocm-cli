@@ -245,7 +245,7 @@ pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> Stri
     }
 }
 
-/// Full-unit gen_tps for cards, pane rows, and services views.
+/// Full-unit gen_tps for pane rows and services views.
 /// Mirrors [`tps_opt`] format and appends [`HELD_MARKER`] when metadata is Held.
 ///
 /// - `None` → `"-"`

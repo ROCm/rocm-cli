@@ -117,7 +117,7 @@ pub struct AppState {
     /// Whether the active domain tab's focus is on the Actions list or the
     /// Details pane. `→`/Enter moves focus into Details; `←`/Esc returns to it.
     pub pane_focus: PaneFocus,
-    /// Cursor into the sorted Instances grid.
+    /// Cursor into the sorted Instances table.
     pub instance_sel: usize,
     /// Cursor into the bench_rows VecDeque (0 = oldest, len-1 = newest).
     pub bench_sel: usize,
