@@ -40,16 +40,18 @@
 # reached. Since ROCMAI-863 lemonade prints no name either: `qwen2.5` expands to
 # `Qwen/Qwen2.5-1.5B-Instruct`, a repo with no GGUF build, and lemonade now refuses
 # it on the pre-launch resolve -- which runs before the serve plan prints, so
-# neither engine reaches the name line any more. These rows stay red for that
-# reason on the lemonade half and the reasons below say so. EAI-7219 as reported
-# describes the other shape: a vLLM plan that prints
-# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
-# shown it. The steps used to discard stderr, so the cause of the empty stdout was
-# not known. The first lane run that reported it (run 41811714290: Strix Halo
-# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
-# runtime is configured", before any alias handling, so on those lanes the rows are
-# red for a missing runtime and not for this bug. On native Windows the stop is the
-# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# neither engine reaches the name line any more. Only
+# serve-short-name-consistent-across-engines runs lemonade, so only that row
+# stays red for that reason and its reason below says so;
+# serve-short-name-expansion serves vLLM only. EAI-7219 as reported describes
+# the other shape: a vLLM plan that prints `resolved model: qwen2.5`, the alias
+# left unexpanded; the lane logs have not shown it. The steps used to discard
+# stderr, so the cause of the empty stdout was not known. The first lane run
+# that reported it (run 41811714290: Strix Halo Ubuntu release and nightly, and
+# MI300X) shows vLLM stopping at "no active ROCm runtime is configured", before
+# any alias handling, so on those lanes the rows are red for a missing runtime
+# and not for this bug. On native Windows the stop is the up-front vLLM refusal
+# (ROCMAI-823), a designed refusal and not this bug either.
 # The rows keep their all-hosts scope until the scenarios get a managed runtime or
 # are gated on the engine and the rows are narrowed to the real bug; their reasons
 # name both shapes so neither becomes a false claim.
