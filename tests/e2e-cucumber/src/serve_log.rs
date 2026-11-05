@@ -120,14 +120,14 @@ fn slugify(name: &str) -> String {
 ///
 /// The log may still be being written, so `len` is a snapshot: the head and tail
 /// are always real, and only the elided count can be slightly stale.
-fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+pub(crate) fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     if len <= max {
         let mut body = Vec::new();
-        file.read_to_end(&mut body)?;
+        file.take(max).read_to_end(&mut body)?;
         return Ok((body, String::new()));
     }
     // `len > max >= 2 * half`, so the two halves can never overlap.

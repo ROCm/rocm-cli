@@ -815,6 +815,38 @@ Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
 relying on this coverage.
 
+### Lemonade managed-serve failure evidence
+
+On a failed serve, the shared serve steps preserve the full service log under
+`service-logs/` in the E2E results artifact before stopping the service. Lemonade
+failures also include the installed runtime manifest's version/backend, configured
+`backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
+and `version.txt`,
+and each candidate's `--version` and `--help` output. Probes are read-only,
+time-bounded (5 seconds each, 20 seconds total), and output-capped at 64 KiB each.
+A candidate or configured build pin is **not proof** of which binary the router
+launched; a failed probe is retained as evidence, not treated as an identity.
+Probes inherit the harness environment rather than reconstructing the engine's
+managed library paths, so a probe loader error alone does not establish why the
+serve failed.
+
+[Issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the distinct
+Ubuntu signatures: `--no-mmap` rejection, backend-ready/router-unavailable, and
+backend download failure. Do not equate the backend's ready line on port 8001
+with a working model on port 11435, or infer a shutdown without lifecycle evidence.
+The existing hardware scenarios `@id:bench-load-real-serve`,
+`@id:chat-tool-definitions-accepted`, `@id:chat-end-to-end-local-model`,
+`@id:serve-lemonade-inference`, and `@id:serve-stop-leaves-no-background-helper`
+exercise these paths on the Strix Halo Ubuntu release/nightly lanes. This change
+only adds harness diagnostics and corrects xfail attribution; it does not change
+the CLI's asynchronous managed-launch contract or claim to fix a backend.
+
+Exercise the diagnostics and expectation scoping without a GPU:
+
+```bash
+cargo test -p e2e-cucumber --lib lemonade
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:

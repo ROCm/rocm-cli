@@ -138,8 +138,9 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-fn serve_failure_evidence(
+async fn serve_failure_evidence(
     world: &E2eWorld,
+    engine: &str,
     headline: &str,
     device_state: &str,
     stdout: &str,
@@ -154,8 +155,19 @@ fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
+    let backend_evidence = if engine == "lemonade" {
+        e2e_cucumber::lemonade_diagnostics::backend_evidence(
+            &world
+                .app_paths()
+                .engine_manifests_dir("lemonade")
+                .join("runtime.json"),
+        )
+        .await
+    } else {
+        "not a Lemonade serve".to_owned()
+    };
     let stop_status = stop_scenario_services(world);
-    serve_attempt_report(&ServeAttempt {
+    let report = serve_attempt_report(&ServeAttempt {
         headline,
         device_state,
         stdout,
@@ -163,7 +175,8 @@ fn serve_failure_evidence(
         log_tail: &log_tail,
         archived_log: &archived_log,
         stop_status: &stop_status,
-    })
+    });
+    format!("{report}\n--- Lemonade backend evidence ---\n{backend_evidence}")
 }
 
 /// Launch a managed serve and wait until the endpoint really serves it, failing
@@ -201,7 +214,17 @@ async fn serve_and_wait(
     };
     panic!(
         "{}",
-        serve_failure_evidence(world, &headline, &device_state, &stdout, &stderr)
+        serve_failure_evidence(
+            world,
+            args.windows(2)
+                .find(|pair| pair[0] == "--engine")
+                .map_or("", |pair| pair[1]),
+            &headline,
+            &device_state,
+            &stdout,
+            &stderr,
+        )
+        .await
     );
 }
 
@@ -608,13 +631,17 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         // outcome is quoted: a stop that found no record (the launch had not yet
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
-        diagnostics.push(serve_failure_evidence(
-            world,
-            &format!("attempt {attempt} of {attempts} (rc={rc})"),
-            &device_state,
-            &stdout,
-            &stderr,
-        ));
+        diagnostics.push(
+            serve_failure_evidence(
+                world,
+                engine,
+                &format!("attempt {attempt} of {attempts} (rc={rc})"),
+                &device_state,
+                &stdout,
+                &stderr,
+            )
+            .await,
+        );
         if attempt == attempts {
             break;
         }
@@ -981,11 +1008,13 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             "{}",
             serve_failure_evidence(
                 world,
+                selected_engine(world.cli_output.as_deref().unwrap_or_default()),
                 &headline,
                 &device_state,
                 world.cli_output.as_deref().unwrap_or_default(),
                 world.cli_stderr.as_deref().unwrap_or_default(),
             )
+            .await
         );
     }
 }
