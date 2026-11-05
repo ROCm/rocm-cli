@@ -878,6 +878,7 @@ pub(crate) mod tests {
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
+    use crate::runtime_registry::{ManifestOverwrite, write_runtime_manifest};
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
@@ -2486,7 +2487,7 @@ pub(crate) mod tests {
         let (root, paths) = test_paths("runtime-files-install");
         let manifest = installed_runtime_without_manifest_files(&paths)?;
 
-        crate::runtime_registry::save_runtime_manifest(&paths, &manifest)?;
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
 
         assert_eq!(
             registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
@@ -2496,7 +2497,7 @@ pub(crate) mod tests {
             version: "7.14.0".to_owned(),
             ..manifest.clone()
         };
-        crate::runtime_registry::save_runtime_manifest(&paths, &reinstalled)?;
+        write_runtime_manifest(&paths, &reinstalled, ManifestOverwrite::Replace)?;
         for path in [
             runtime_manifest_path(&paths, &manifest.runtime_key),
             manifest.install_root.join(".rocm-cli-runtime.json"),
@@ -2607,6 +2608,45 @@ pub(crate) mod tests {
             "entry written since",
             "recovery only fills a missing entry"
         );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The writer gives a runtime a manifest in its folder exactly when
+    /// uninstall, which prune asks the same question of, may delete that folder.
+    /// The two are written in different modules; this is what ties them.
+    #[test]
+    fn a_runtime_gets_an_install_root_manifest_exactly_when_uninstall_may_remove_its_folder()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-ownership");
+        for (label, read_only, imported) in [
+            ("owned", false, false),
+            ("read-only", true, false),
+            ("imported", false, true),
+        ] {
+            let mut manifest = write_test_pip_runtime(
+                &paths,
+                &format!("release-pip-{label}"),
+                "therock-release:gfx120X-all",
+                "7.13.0",
+                20,
+            )?;
+            manifest.read_only = read_only;
+            manifest.imported_from = imported.then(|| PathBuf::from("elsewhere/manifest.json"));
+            fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+
+            write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+
+            let has_manifest = manifest
+                .install_root
+                .join(".rocm-cli-runtime.json")
+                .is_file();
+            let may_remove =
+                should_remove_runtime_install_root(&manifest)? == InstallRootDecision::Remove;
+            assert_eq!(has_manifest, may_remove, "{label}");
+            assert_eq!(has_manifest, manifest.owns_install_root(), "{label}");
+        }
 
         let _ = fs::remove_dir_all(root);
         Ok(())

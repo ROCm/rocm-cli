@@ -22,8 +22,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, RocmCliConfig, managed_pip_cache_dir, runtime_python_executable_in_env};
 
 use crate::runtime_registry::{
-    paths_equivalent, runtime_manifest_path, runtime_registry_dir,
-    validate_runtime_manifest_for_activation,
+    ManifestOverwrite, paths_equivalent, runtime_manifest_path, runtime_registry_dir,
+    validate_runtime_manifest_for_activation, write_runtime_manifest,
 };
 use crate::therock;
 
@@ -58,7 +58,11 @@ pub(crate) fn import_runtime_manifest(
     validate_runtime_manifest_for_activation(&manifest)
         .with_context(|| format!("imported runtime `{}` is not usable", manifest.runtime_key))?;
 
-    write_runtime_registry_manifest(paths, &manifest, replace)?;
+    write_runtime_manifest(
+        paths,
+        &manifest,
+        ManifestOverwrite::for_replace_flag(replace),
+    )?;
 
     Ok(manifest)
 }
@@ -314,7 +318,11 @@ pub(crate) fn adopt_runtime_from_probe(
     };
     validate_runtime_manifest_for_activation(&manifest)
         .with_context(|| format!("adopted runtime `{}` is not usable", manifest.runtime_key))?;
-    write_runtime_registry_manifest(paths, &manifest, request.replace)?;
+    write_runtime_manifest(
+        paths,
+        &manifest,
+        ManifestOverwrite::for_replace_flag(request.replace),
+    )?;
     Ok(manifest)
 }
 
@@ -348,33 +356,6 @@ fn parse_therock_runtime_id(runtime_id: &str) -> Result<(String, String)> {
         ),
     };
     Ok((channel.to_owned(), family.to_owned()))
-}
-
-fn write_runtime_registry_manifest(
-    paths: &AppPaths,
-    manifest: &therock::InstalledRuntimeManifest,
-    replace: bool,
-) -> Result<()> {
-    let manifest = manifest.clone().normalize_storage_paths();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    if registry_path.exists() && !replace {
-        bail!(
-            "runtime registry entry already exists: {}; pass --replace to overwrite it",
-            registry_path.display()
-        );
-    }
-    fs::create_dir_all(
-        registry_path
-            .parent()
-            .context("runtime registry path has no parent directory")?,
-    )?;
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&manifest)
-            .context("failed to serialize runtime registry manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", registry_path.display()))?;
-    Ok(())
 }
 
 pub(crate) fn recover_setup_runtime_registration(
@@ -425,7 +406,7 @@ pub(crate) fn recover_setup_runtime_registration(
     })?;
 
     if !runtime_manifest_path(paths, &manifest.runtime_key).is_file() {
-        write_runtime_registry_manifest(paths, &manifest, false).with_context(|| {
+        write_runtime_manifest(paths, &manifest, ManifestOverwrite::Refuse).with_context(|| {
             format!(
                 "failed to restore setup runtime `{}` into {}",
                 manifest.runtime_key,

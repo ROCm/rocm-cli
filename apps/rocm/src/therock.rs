@@ -72,7 +72,8 @@ pub(crate) use crate::runtime_registry::{
     validate_rocm_sdk_runtime_probe,
 };
 use crate::runtime_registry::{
-    runtime_manifest_path, save_runtime_manifest, wheel_composition_includes_devel,
+    ManifestOverwrite, runtime_manifest_path, wheel_composition_includes_devel,
+    write_runtime_manifest,
 };
 use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
@@ -735,7 +736,7 @@ fn install_wheel_runtime(
         devel: include_devel,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(
         output,
@@ -1012,7 +1013,7 @@ fn install_tarball_runtime(
         devel: true,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(output, "  extracted: {}", install_root.display());
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());

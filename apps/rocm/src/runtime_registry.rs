@@ -121,6 +121,15 @@ impl InstalledRuntimeManifest {
         wheel_composition_includes_devel(self.wheel_composition.as_ref()).unwrap_or(self.devel)
     }
 
+    /// Whether ROCm CLI owns the folder this runtime lives in: it installed it,
+    /// rather than importing or adopting somebody else's. Ownership is what
+    /// decides whether the install root carries a `.rocm-cli-runtime.json` (see
+    /// [`write_runtime_manifest`]) and whether uninstall and prune may delete
+    /// the folder, so those cannot disagree about which runtimes are whose.
+    pub(crate) const fn owns_install_root(&self) -> bool {
+        !self.read_only && self.imported_from.is_none()
+    }
+
     fn normalize_host_paths(mut self) -> Self {
         self.install_root = normalize_manifest_path(self.install_root);
         self.python_launcher = self
@@ -336,30 +345,79 @@ pub(crate) fn runtime_manifest_path(paths: &AppPaths, runtime_key: &str) -> Path
     runtime_registry_dir(paths).join(format!("{runtime_key}.json"))
 }
 
-pub(crate) fn save_runtime_manifest(
+/// What [`write_runtime_manifest`] does when the registry already holds an entry
+/// under the manifest's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestOverwrite {
+    /// Write over it. An install of a runtime ROCm CLI already installed is the
+    /// same runtime again.
+    Replace,
+    /// Refuse, and name `--replace`. Importing or adopting a runtime must not
+    /// displace a registration the user made earlier unless they ask to.
+    Refuse,
+}
+
+impl ManifestOverwrite {
+    /// The policy for a command with a `--replace` flag.
+    pub(crate) const fn for_replace_flag(replace: bool) -> Self {
+        if replace { Self::Replace } else { Self::Refuse }
+    }
+}
+
+/// Write the manifest files of a runtime: the registry entry, and, for a
+/// runtime ROCm CLI owns ([`InstalledRuntimeManifest::owns_install_root`]), the
+/// `.rocm-cli-runtime.json` in its install root.
+///
+/// Every way a runtime gets registered goes through this one routine: an SDK
+/// install, `rocm runtimes import`, `rocm runtimes adopt`, and the recovery of
+/// the runtime `rocm setup` created. `overwrite` is the only thing a caller
+/// chooses.
+///
+/// The file in the install root is ROCm CLI's proof that it owns the folder:
+/// uninstall and prune delete a folder only when it carries one that matches
+/// the registry, and activation requires one of a runtime that is not
+/// read-only. An imported or adopted runtime is somebody else's folder, which
+/// uninstall and prune never delete and activation accepts without one, so it
+/// gets none: a root the user may not be able to write to must not make
+/// registering it fail, and an import's source manifest may be that very file
+/// in another install.
+/// The file is not rewritten when it already holds exactly what would be
+/// written, so recovering a runtime from its own manifest leaves it alone.
+///
+/// Neither file is written atomically; that is a separate piece of work shared
+/// with the other writers in the workspace.
+pub(crate) fn write_runtime_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    overwrite: ManifestOverwrite,
 ) -> Result<()> {
     let manifest = manifest.clone().normalize_storage_paths();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
+    if overwrite == ManifestOverwrite::Refuse && registry_path.exists() {
+        bail!(
+            "runtime registry entry already exists: {}; pass --replace to overwrite it",
+            registry_path.display()
+        );
+    }
     fs::create_dir_all(
         registry_path
             .parent()
             .context("runtime manifest registry path has no parent directory")?,
     )?;
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&manifest).context("failed to serialize runtime manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", registry_path.display()))?;
+    let encoded =
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize runtime manifest")?;
+    fs::write(&registry_path, &encoded)
+        .with_context(|| format!("failed to write {}", registry_path.display()))?;
 
-    let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
-    fs::write(
-        &local_manifest_path,
-        serde_json::to_vec_pretty(&manifest)
-            .context("failed to serialize local runtime manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
+    if manifest.owns_install_root() {
+        let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
+        let already_current =
+            fs::read(&local_manifest_path).is_ok_and(|existing| existing == encoded);
+        if !already_current {
+            fs::write(&local_manifest_path, &encoded)
+                .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -791,13 +849,13 @@ mod tests {
     /// that neither `rocm runtimes list` nor `rocm examine` surfaces `devel`,
     /// so the state is invisible.
     ///
-    /// LIMIT: this covers `save_runtime_manifest` only. It does NOT reach
+    /// LIMIT: this covers `write_runtime_manifest` only. It does NOT reach
     /// `install_sdk`, which is what actually threads `include_devel` into the
     /// manifest — that call needs `uv`, a live index, and a real `rocm_sdk`
     /// probe, so it has no unit coverage here. Hardcoding `devel: true` at that
     /// write site passes this test and the rest of the suite.
     #[test]
-    fn save_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
+    fn write_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
         let (root, paths) = test_paths("manifest-replaces-devel");
         let install_root = root.join("install-root");
         fs::create_dir_all(&install_root)?;
@@ -813,14 +871,14 @@ mod tests {
             with_devel.devel,
             "test fixture should start with devel: true"
         );
-        save_runtime_manifest(&paths, &with_devel)?;
+        write_runtime_manifest(&paths, &with_devel, ManifestOverwrite::Replace)?;
 
         let without_devel = InstalledRuntimeManifest {
             devel: false,
             installed_at_unix_ms: 2,
             ..with_devel.clone()
         };
-        save_runtime_manifest(&paths, &without_devel)?;
+        write_runtime_manifest(&paths, &without_devel, ManifestOverwrite::Replace)?;
 
         let manifests = load_runtime_manifests(&paths)?;
         let reloaded = manifests
@@ -834,6 +892,211 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    /// A manifest for `runtime_key` whose install root is a folder under `root`.
+    fn manifest_in(
+        root: &Path,
+        runtime_key: &str,
+        read_only: bool,
+        imported_from: Option<PathBuf>,
+    ) -> Result<InstalledRuntimeManifest> {
+        let install_root = root.join(runtime_key);
+        fs::create_dir_all(&install_root)?;
+        Ok(InstalledRuntimeManifest {
+            install_root,
+            read_only,
+            imported_from,
+            ..test_runtime_manifest(runtime_key, "therock-release:gfx120X-all", 1)
+        })
+    }
+
+    /// The policy is the only thing a caller chooses, and it decides one thing:
+    /// whether an existing registry entry is replaced or left alone. The refusal
+    /// is asserted as message and state together, and with the entry still the
+    /// old bytes, because a refusal that wrote first would print the same text.
+    #[test]
+    fn write_runtime_manifest_refuses_an_existing_entry_only_under_the_refuse_policy() -> Result<()>
+    {
+        let (root, paths) = test_paths("manifest-overwrite-policy");
+        let manifest = manifest_in(&root, "release-wheel-gfx120X-all-7.13.0", false, None)?;
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Refuse)?;
+        assert!(
+            entry.is_file(),
+            "nothing registered yet, so nothing to refuse"
+        );
+
+        fs::write(&entry, "stale entry")?;
+        let error = write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Refuse)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already exists") && error.contains("--replace"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&entry)?, "stale entry");
+
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+        let replaced: InstalledRuntimeManifest = serde_json::from_slice(&fs::read(&entry)?)?;
+        assert_eq!(replaced.runtime_key, manifest.runtime_key);
+
+        assert_eq!(
+            ManifestOverwrite::for_replace_flag(true),
+            ManifestOverwrite::Replace
+        );
+        assert_eq!(
+            ManifestOverwrite::for_replace_flag(false),
+            ManifestOverwrite::Refuse
+        );
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Which manifests get a `.rocm-cli-runtime.json` in the install root:
+    /// exactly the ones ROCm CLI owns. A read-only runtime and an imported one
+    /// (the two ways a runtime is not ROCm CLI's) get a registry entry and leave
+    /// their folder alone, whichever policy registered them.
+    #[test]
+    fn write_runtime_manifest_writes_the_install_root_manifest_only_for_an_owned_runtime()
+    -> Result<()> {
+        let (root, paths) = test_paths("manifest-install-root-file");
+        let cases = [
+            ("owned", false, None, true),
+            ("read-only", true, None, false),
+            (
+                "imported",
+                false,
+                Some(PathBuf::from("elsewhere/manifest.json")),
+                false,
+            ),
+        ];
+        for overwrite in [ManifestOverwrite::Replace, ManifestOverwrite::Refuse] {
+            for (label, read_only, imported_from, gets_the_file) in &cases {
+                let key = format!("{label}-{overwrite:?}");
+                let manifest = manifest_in(&root, &key, *read_only, imported_from.clone())?;
+
+                write_runtime_manifest(&paths, &manifest, overwrite)?;
+
+                assert_eq!(
+                    manifest.owns_install_root(),
+                    *gets_the_file,
+                    "{label} / {overwrite:?}"
+                );
+                assert!(
+                    runtime_manifest_path(&paths, &key).is_file(),
+                    "{label} / {overwrite:?}: registry entry"
+                );
+                assert_eq!(
+                    manifest
+                        .install_root
+                        .join(".rocm-cli-runtime.json")
+                        .is_file(),
+                    *gets_the_file,
+                    "{label} / {overwrite:?}: install root manifest"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Recovering a runtime from its own install-root manifest must not touch
+    /// that file when it already holds what would be written, so a setup folder
+    /// the user cannot write to does not turn a recovery into an error. The file
+    /// is made read-only: a write would fail where a skip succeeds. (Not
+    /// asserted when the file stays writable regardless, as for an
+    /// administrator.)
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn write_runtime_manifest_leaves_a_current_install_root_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("manifest-current-install-root-file");
+        let manifest = manifest_in(&root, "release-wheel-gfx120X-all-7.13.0", false, None)?;
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+        let local = manifest.install_root.join(".rocm-cli-runtime.json");
+        let mut permissions = fs::metadata(&local)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&local, permissions.clone())?;
+        let still_writable = fs::OpenOptions::new().append(true).open(&local).is_ok();
+
+        let unchanged = write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace);
+        let changed = InstalledRuntimeManifest {
+            version: "7.14.0".to_owned(),
+            ..manifest
+        };
+        let rewritten = write_runtime_manifest(&paths, &changed, ManifestOverwrite::Replace);
+
+        permissions.set_readonly(false);
+        fs::set_permissions(&local, permissions)?;
+        unchanged.context("an install root manifest that is already current is not rewritten")?;
+        if !still_writable {
+            assert!(
+                rewritten.is_err(),
+                "a different manifest is written, which the read-only file refuses"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Every way of registering a runtime goes through
+    /// [`write_runtime_manifest`]. A second writer would be free to drift again
+    /// (a different overwrite rule, a missing install-root manifest), so no
+    /// production code outside this file may open a registry entry for writing.
+    /// This reads the sources: the writers differ only in how they are called,
+    /// which no behavioural test of one caller can see in another.
+    #[test]
+    fn only_the_shared_routine_writes_a_registry_entry() {
+        fn production_part(source: &str) -> &str {
+            [
+                "#[cfg(test)]\nmod tests",
+                "#[cfg(test)]\npub(crate) mod tests",
+            ]
+            .iter()
+            .filter_map(|marker| source.find(marker))
+            .min()
+            .map_or(source, |end| &source[..end])
+        }
+        fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("source folder readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(sources.len() > 50, "the scan found the source tree");
+        // This file holds the routine; `test_support.rs` is fixtures throughout.
+        let exempt = [
+            Path::new(file!()).file_name(),
+            Some("test_support.rs".as_ref()),
+        ];
+        for path in sources {
+            if exempt.contains(&path.file_name()) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("source readable");
+            let production = production_part(&source);
+            for (at, _) in production.match_indices("fs::write(") {
+                let call = &production[at..(at + 200).min(production.len())];
+                let call = call.split(';').next().unwrap_or(call);
+                assert!(
+                    !call.contains("runtime_manifest_path(")
+                        && !call.contains("registry_path")
+                        && !call.contains("runtime_registry_dir("),
+                    "{} writes a registry entry itself instead of calling write_runtime_manifest: {call}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// A manifest written before `devel` became opt-in has no such field, and
