@@ -22,7 +22,7 @@
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`), which only `chat.rs` reads. `service_records.rs`
+//! (`friendly_engine_label`), which only `chat/summaries.rs` reads. `service_records.rs`
 //! calls into it for the in-use check behind service-record removal and pruning
 //! (`managed_service_is_live`, `recorded_service_pids`) and for
 //! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
