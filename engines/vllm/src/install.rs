@@ -11,15 +11,17 @@ use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
+use crate::discover_builds::{
+    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, vllm_rocm_discover_build,
+};
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
     assessed_python_for_repair, describe_skipped_managed_runtimes, resolve_managed_runtime_python,
-    resolve_vllm_runtime, rocm_sdk_series_matches, runtime_is_managed, vllm_runtime_warnings,
+    resolve_vllm_runtime, runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 use crate::wheel_builds::{
-    DiscoverVersion, VllmInstallRoute, VllmInstallTarget, VllmRocmDiscoverBuild,
-    vllm_install_route, vllm_install_target, vllm_rocm_discover_build,
+    VllmInstallRoute, VllmInstallTarget, vllm_install_route, vllm_install_target,
 };
 
 pub(crate) fn install_response(request: InstallRequest) -> Result<InstallResponse> {

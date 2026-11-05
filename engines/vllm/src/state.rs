@@ -503,16 +503,12 @@ mod tests {
             engine_recipe: None,
         };
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
                 "/home/user/.venv/bin/vllm"
             }),
-            python_executable: None,
             version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk"
             } else {
@@ -533,7 +529,7 @@ mod tests {
             } else {
                 "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
             })],
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         write_running_state(&request, &runtime, own_pid)?;
@@ -671,17 +667,8 @@ mod tests {
             engine_recipe: Some(recipe),
         };
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
             version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         write_running_state(&request, &runtime, std::process::id())?;
