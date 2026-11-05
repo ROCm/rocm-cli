@@ -697,7 +697,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-wsl-4-rocdxg-not-linked",
         title: "Refresh the linker cache so ROCDXG is loadable",
-        rationale: "librocdxg is installed but absent from the linker cache, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
+        rationale: "librocdxg is installed but absent from the linker cache and from the LD_LIBRARY_PATH of the shell running the check, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
         commands: &["sudo ldconfig"],
         needs_sudo: true,
         needs_reboot: false,

@@ -144,7 +144,7 @@ reporting confident nonsense.
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
 | `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | print-only |
-| `fix-wsl-4-rocdxg-not-linked` | wsl | `librocdxg` installed but not in the linker cache, so it is unloadable | `librocdxg` present on disk yet absent from `ldconfig -p` | print-only |
+| `fix-wsl-4-rocdxg-not-linked` | wsl | `librocdxg` installed but not in the linker cache, so it is unloadable | `librocdxg` present on disk yet absent from `ldconfig -p` and from the `LD_LIBRARY_PATH` of the shell running the check | print-only |
 | `fix-wsl-5-distro-too-old` | wsl | Distro release below the floor the WSL path requires | distro release under the supported floor (e.g. Ubuntu 22.04, whose glibc 2.35 is below the 2.38 / `GLIBCXX_3.4.32` the engines need) | print-only |
 | `fix-wsl-6-host-driver-too-old` | wsl | Windows host driver too old or absent, with the distro side already complete | the Windows host reports no AMD display adapter | print-only |
 | `fix-wsl-7-wsl1` | wsl | Distro running under WSL 1, which exposes no GPU device at all | the running kernel is a WSL 1 kernel | print-only |

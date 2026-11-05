@@ -1271,6 +1271,7 @@ pub(crate) mod tests {
                 librocdxg: false,
                 rocdxg_dids: false,
                 ldconfig_librocdxg: false,
+                librocdxg_on_ld_library_path: false,
                 rocminfo: false,
                 cargo: false,
                 detail: Some("missing librocdxg".to_owned()),

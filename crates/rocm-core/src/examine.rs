@@ -113,6 +113,14 @@ pub struct WslFacts {
     /// unreadable cache is not an unregistered library, and reporting it as one
     /// told users with a working install to re-run `ldconfig`.
     pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the
+    /// loader searches before the linker cache. A library there loads without
+    /// being registered, so only [`Self::librocdxg_unloadable`] -- not the cache
+    /// answer alone -- says the runtime cannot find it. `false` from the
+    /// `--distro` probe, which runs a non-login shell and sees none of the
+    /// user's environment.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
     /// Whether `rocminfo` is on PATH.
     pub rocminfo: bool,
     /// Whether ROCm can actually enumerate a GPU here.
@@ -141,6 +149,16 @@ pub struct WslFacts {
     /// run, and a caller must say so rather than let "nothing matched" read as
     /// a clean bill of health.
     pub locally_probed: bool,
+}
+
+impl WslFacts {
+    /// The linker cache positively lacks ROCDXG and nothing on `LD_LIBRARY_PATH`
+    /// supplies it either. `None` from the cache (ldconfig could not run) is not
+    /// evidence, so it is not "unloadable".
+    #[must_use]
+    pub const fn librocdxg_unloadable(&self) -> bool {
+        matches!(self.ldconfig_librocdxg, Some(false)) && !self.librocdxg_on_ld_library_path
+    }
 }
 
 /// One copy of a ROCm library found on the machine.

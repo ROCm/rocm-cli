@@ -508,3 +508,30 @@ Feature: GPU detection and system inspection
     Given the KFD device cannot be opened
     When the daemon gathers a bridge snapshot
     Then the snapshot says amd-smi was never launched and names the device
+
+  # ROCDXG is found by the dynamic loader through LD_LIBRARY_PATH as well as
+  # through the linker cache, and a TheRock tarball under /opt/rocm-<version> is
+  # reachable only the first way: nothing registers it with `ldconfig`. The
+  # inspection used to require the cache entry regardless, so a working WSL GPU
+  # read `wsl_rocdxg_missing` and the CLI refused to serve on it (ROCMAI-870).
+  #
+  # The planted root supplies `/dev/dxg`, DXCore and the library under
+  # `/opt/rocm`, and a stand-in `ldconfig` on PATH answers with a cache that
+  # does not list it, so the verdict rests on LD_LIBRARY_PATH alone on every
+  # Linux lane, WSL or not. The `@id:examine-rocdxg-missing-without-loader-path`
+  # scenario below is its control: the same machine without the variable.
+  @id:examine-rocdxg-ready-from-ld-library-path @requires-os:linux
+  Scenario: examine-32 - The inspection reports ROCDXG ready when the loader reaches it through LD_LIBRARY_PATH
+    Given a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  @id:examine-rocdxg-missing-without-loader-path @requires-os:linux
+  Scenario: examine-33 - The inspection reports ROCDXG missing when neither the linker cache nor LD_LIBRARY_PATH reaches it
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_missing"
+    And the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail says the library is missing from the linker cache

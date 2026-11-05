@@ -35,6 +35,9 @@ pub(super) fn probe_wsl(e: &mut Examination) {
         // `None` when ldconfig itself could not be run, which the summary's
         // bool cannot express -- recover it from the same source the summary used.
         ldconfig_librocdxg: crate::ldconfig_lists_librocdxg(),
+        librocdxg_on_ld_library_path: summary
+            .as_ref()
+            .is_some_and(|s| s.librocdxg_on_ld_library_path),
         rocminfo,
         rocm_sees_gpu: rocminfo.then(probe_rocminfo_sees_gpu),
         distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
@@ -221,6 +224,9 @@ pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, S
         librocdxg: parse_remote_flag(&fields, "librocdxg"),
         rocdxg_dids: parse_remote_flag(&fields, "dids"),
         ldconfig_librocdxg: parse_remote_tristate(&fields, "ldconfig"),
+        // The remote script runs in a non-login shell with none of the user's
+        // environment, so there is no `LD_LIBRARY_PATH` to ask about.
+        librocdxg_on_ld_library_path: false,
         rocminfo,
         rocm_sees_gpu: rocminfo.then(|| parse_remote_flag(&fields, "rocmgfx")),
         distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),

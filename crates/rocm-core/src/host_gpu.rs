@@ -161,6 +161,11 @@ pub struct WslSummary {
     pub librocdxg: bool,
     pub rocdxg_dids: bool,
     pub ldconfig_librocdxg: bool,
+    /// `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the loader
+    /// searches before the linker cache. Absent from output written before the
+    /// field existed, hence the default.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
     pub rocminfo: bool,
     pub cargo: bool,
     pub detail: Option<String>,

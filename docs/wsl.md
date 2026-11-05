@@ -181,7 +181,7 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
 | `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
 | `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
-| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache and from the `LD_LIBRARY_PATH` of the shell running the check |
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
@@ -264,7 +264,12 @@ collects a fixed set of data. This leaves four limits:
   distro reports.
 - **No environment checks.** The script collects no environment, so the checks
   that read one do not run: `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the
-  framework and ROCm version pairing.
+  framework and ROCm version pairing. That includes `LD_LIBRARY_PATH`: a
+  library the loader reaches only through that variable is not in the linker
+  cache, so `--distro` can still report `fix-wsl-4` for an install that
+  `rocm diagnose` inside the distro finds healthy. The finding's evidence says
+  the variable could not be checked from outside the distribution, rather than
+  claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
   that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
   not run either.
@@ -298,6 +303,12 @@ below.
 - `librocdxg.so` presence, resolved across every ROCm install rather than
   assuming `/opt/rocm`
 - `librocdxg` linker-cache visibility from `ldconfig -p`
+- whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`
+  (`wsl_librocdxg_on_ld_library_path`). The loader searches that variable
+  before the cache, so a TheRock tarball under `/opt/rocm-<version>`, which
+  nothing registers with `ldconfig`, is reachable this way. `driver_status`
+  is `wsl_rocdxg_ready` when the library is found by either source, and
+  `wsl_rocdxg_missing` only when neither finds it
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
