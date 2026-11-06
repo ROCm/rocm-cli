@@ -1160,24 +1160,214 @@ mod tests {
         Ok(())
     }
 
+    /// Calls that put bytes in a file, which is what a second writer of a registry
+    /// entry would use. Matched as text, so `tokio::fs::write(` counts too.
+    const WRITE_PRIMITIVES: [&str; 8] = [
+        "fs::write(",
+        "File::create(",
+        "File::create_new(",
+        "OpenOptions::new(",
+        "fs::copy(",
+        "fs::rename(",
+        "fs::hard_link(",
+        "write_all(",
+    ];
+
+    /// `source` as the compiler sees production code, for a text scan: everything
+    /// from the file's `#[cfg(test)]` test module on is cut, and comments are
+    /// removed, so neither a fixture nor a sentence in a comment can be mistaken
+    /// for a writer. String literals stay, because the path segments of the
+    /// registry directory are string literals. The scan is not a lexer: a raw
+    /// string that holds a double quote would confuse it.
+    fn production_code(source: &str) -> String {
+        let end = [
+            "#[cfg(test)]\nmod tests",
+            "#[cfg(test)]\npub(crate) mod tests",
+        ]
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .unwrap_or(source.len());
+        let chars: Vec<char> = source[..end].chars().collect();
+        let mut code = String::with_capacity(end);
+        let mut at = 0;
+        let mut in_string = false;
+        while at < chars.len() {
+            let c = chars[at];
+            if in_string {
+                code.push(c);
+                if c == '\\' && at + 1 < chars.len() {
+                    code.push(chars[at + 1]);
+                    at += 2;
+                    continue;
+                }
+                in_string = c != '"';
+                at += 1;
+                continue;
+            }
+            match (c, chars.get(at + 1)) {
+                ('/', Some('/')) => {
+                    while at < chars.len() && chars[at] != '\n' {
+                        at += 1;
+                    }
+                }
+                ('/', Some('*')) => {
+                    at += 2;
+                    while at + 1 < chars.len() && !(chars[at] == '*' && chars[at + 1] == '/') {
+                        at += 1;
+                    }
+                    at += 2;
+                }
+                // The character literal `'"'` must not open a string.
+                ('\'', Some('"')) if chars.get(at + 2) == Some(&'\'') => {
+                    code.push_str("'\"'");
+                    at += 3;
+                }
+                ('"', _) => {
+                    in_string = true;
+                    code.push(c);
+                    at += 1;
+                }
+                _ => {
+                    code.push(c);
+                    at += 1;
+                }
+            }
+        }
+        code
+    }
+
+    /// The ways production code can name the registry directory: through the
+    /// two helpers in this file, or by spelling the path itself (the `runtimes`
+    /// and `registry` segments, or one literal holding both).
+    fn registry_location_spellings(production: &str) -> Vec<&'static str> {
+        let mut spellings = Vec::new();
+        for helper in ["runtime_manifest_path(", "runtime_registry_dir("] {
+            if production.contains(helper) {
+                spellings.push(helper);
+            }
+        }
+        if production.contains("\"runtimes\"") && production.contains("\"registry\"") {
+            spellings.push("the \"runtimes\" and \"registry\" path segments");
+        }
+        if production.contains("runtimes/registry") || production.contains("runtimes\\\\registry") {
+            spellings.push("a literal path through runtimes/registry");
+        }
+        spellings
+    }
+
+    /// Why `production` writes a registry entry on its own, one line per way it
+    /// can reach the registry, or nothing. A file that both writes (any of
+    /// [`WRITE_PRIMITIVES`]) and names the registry directory (by any of
+    /// [`registry_location_spellings`]) is a writer, however far apart the two
+    /// are and whatever the path variable is called. A file that only reads or
+    /// removes entries has no write call and is not one.
+    fn registry_writer_findings(production: &str) -> Vec<String> {
+        let writes: Vec<&str> = WRITE_PRIMITIVES
+            .iter()
+            .copied()
+            .filter(|primitive| production.contains(primitive))
+            .collect();
+        if writes.is_empty() {
+            return Vec::new();
+        }
+        registry_location_spellings(production)
+            .into_iter()
+            .map(|spelling| format!("{spelling} in a file that calls {}", writes.join(", ")))
+            .collect()
+    }
+
+    /// The detector sees a writer however it builds its path, and nothing that
+    /// only reads. The cases are the ways the previous scan (a 200-character
+    /// window after `fs::write(` looking for three names) went blind: a path built
+    /// from literals, a path held in a variable away from the write, one literal,
+    /// a `//` inside a string literal before the write.
+    #[test]
+    fn registry_writer_detector_sees_every_way_of_building_the_path() {
+        let filler = "// padding\n".repeat(40);
+        let far_apart = format!(
+            "fn dir(p: &AppPaths) -> PathBuf {{ p.data_dir.join(\"runtimes\").join(\"registry\") }}\n{filler}fn save(d: &Path) {{ fs::write(d.join(\"x.json\"), b\"\").ok(); }}"
+        );
+        let cases: [(&str, String, bool); 9] = [
+            (
+                "through the helper",
+                "fn f(p: &AppPaths) { fs::write(runtime_manifest_path(p, \"k\"), b\"\").ok(); }"
+                    .to_owned(),
+                true,
+            ),
+            ("segments, far from the write", far_apart, true),
+            (
+                "one literal",
+                "fn f(base: &Path) { let d = base.join(\"runtimes/registry\"); File::create(d.join(\"k.json\")).ok(); }"
+                    .to_owned(),
+                true,
+            ),
+            (
+                "a // inside a string before the write",
+                "fn f(p: &AppPaths) { let note = \"see http://x\"; fs::write(runtime_registry_dir(p).join(note), b\"\").ok(); }"
+                    .to_owned(),
+                true,
+            ),
+            (
+                "reads only",
+                "fn f(p: &AppPaths) { let _ = fs::read_dir(p.data_dir.join(\"runtimes\").join(\"registry\")); }"
+                    .to_owned(),
+                false,
+            ),
+            (
+                "writes something else",
+                "fn f(p: &Path) { fs::write(p.join(\"config.json\"), b\"\").ok(); }".to_owned(),
+                false,
+            ),
+            (
+                "only a comment names the writer",
+                "// fs::write(runtime_manifest_path(p, k), b\"\")\nfn f() {}".to_owned(),
+                false,
+            ),
+            (
+                "the writer is in the test module",
+                "fn f() {}\n#[cfg(test)]\nmod tests {\n fn t(p: &AppPaths) { fs::write(runtime_manifest_path(p, \"k\"), b\"\").ok(); }\n}"
+                    .to_owned(),
+                false,
+            ),
+            (
+                "a block comment holds the path",
+                "fn f(p: &Path) { /* runtime_registry_dir( */ fs::write(p, b\"\").ok(); }"
+                    .to_owned(),
+                false,
+            ),
+        ];
+        for (label, source, is_a_writer) in cases {
+            assert_eq!(
+                !registry_writer_findings(&production_code(&source)).is_empty(),
+                is_a_writer,
+                "{label}"
+            );
+        }
+    }
+
     /// Every way of registering a runtime goes through
     /// [`write_runtime_manifest`]. A second writer would be free to drift again
     /// (a different overwrite rule, a missing install-root manifest), so no
-    /// production code outside this file may open a registry entry for writing.
-    /// This reads the sources: the writers differ only in how they are called,
-    /// which no behavioural test of one caller can see in another.
+    /// production code outside this file may both name the registry directory and
+    /// write a file. This reads the sources of the `rocm` app, `rocmd`,
+    /// `rocm-core` and the engines: the writers differ only in how they are
+    /// called, which no behavioural test of one caller can see in another.
+    ///
+    /// Two further rules keep that from being walked around. The files that call
+    /// the two path helpers are an explicit list, each with the reason it needs
+    /// the path and none of them writing, so a new caller is reviewed rather than
+    /// passed, and a stale entry fails too. The two fixture modules are exempt
+    /// because the modules are `#[cfg(test)]` where they are declared, which is
+    /// checked, not because of what they are called.
+    ///
+    /// What this does not catch, by design: a writer that is handed the registry
+    /// path by a function in another file and never spells it, a write primitive
+    /// that is not in [`WRITE_PRIMITIVES`] (a new helper with its own name), and
+    /// code outside the source roots it reads. Review catches those; this test
+    /// catches the ordinary ways of growing a second writer.
     #[test]
     fn only_the_shared_routine_writes_a_registry_entry() {
-        fn production_part(source: &str) -> &str {
-            [
-                "#[cfg(test)]\nmod tests",
-                "#[cfg(test)]\npub(crate) mod tests",
-            ]
-            .iter()
-            .filter_map(|marker| source.find(marker))
-            .min()
-            .map_or(source, |end| &source[..end])
-        }
         fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(dir).expect("source folder readable").flatten() {
                 let path = entry.path();
@@ -1188,35 +1378,85 @@ mod tests {
                 }
             }
         }
-        let mut sources = Vec::new();
-        rust_files(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut sources,
-        );
-        assert!(sources.len() > 50, "the scan found the source tree");
-        // This file holds the routine; `test_support.rs` is fixtures throughout.
-        let exempt = [
-            Path::new(file!()).file_name(),
-            Some("test_support.rs".as_ref()),
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the app sits two levels below the workspace root");
+        let mut roots = vec![
+            workspace.join("apps/rocm/src"),
+            workspace.join("apps/rocmd/src"),
+            workspace.join("crates/rocm-core/src"),
         ];
+        for engine in fs::read_dir(workspace.join("engines"))
+            .expect("engines folder readable")
+            .flatten()
+        {
+            roots.push(engine.path().join("src"));
+        }
+        let mut sources = Vec::new();
+        for root in &roots {
+            rust_files(root, &mut sources);
+        }
+        assert!(sources.len() > 100, "the scan found the source tree");
+
+        // This file holds the routine.
+        let routine = "apps/rocm/src/runtime_registry.rs";
+        // Fixture modules, each with the file that declares it.
+        let fixtures = [
+            ("apps/rocm/src/test_support.rs", "apps/rocm/src/main.rs"),
+            (
+                "apps/rocm/src/therock/test_support.rs",
+                "apps/rocm/src/therock.rs",
+            ),
+        ];
+        for (fixture, declared_in) in fixtures {
+            let declaration =
+                fs::read_to_string(workspace.join(declared_in)).expect("declaring file readable");
+            assert!(
+                declaration.contains("#[cfg(test)]\nmod test_support;"),
+                "{fixture} is exempt only while {declared_in} declares it under #[cfg(test)]"
+            );
+        }
+        // Production files that name an entry's path without writing it, and why
+        // (in sorted order, which is how they are compared).
+        let path_helper_callers = [
+            // Whether setup's runtime is registered, and the error that names the registry.
+            "apps/rocm/src/runtime_adopt.rs",
+            // The entry uninstall removes.
+            "apps/rocm/src/runtime_uninstall.rs",
+            // The path an activation, import or adopt report prints.
+            "apps/rocm/src/runtimes_cmd.rs",
+            // The path an install plan prints.
+            "apps/rocm/src/therock.rs",
+        ];
+
+        let mut helper_callers = Vec::new();
         for path in sources {
-            if exempt.contains(&path.file_name()) {
+            let relative = path
+                .strip_prefix(workspace)
+                .expect("source under the workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == routine || fixtures.iter().any(|(fixture, _)| *fixture == relative) {
                 continue;
             }
-            let source = fs::read_to_string(&path).expect("source readable");
-            let production = production_part(&source);
-            for (at, _) in production.match_indices("fs::write(") {
-                let call = &production[at..(at + 200).min(production.len())];
-                let call = call.split(';').next().unwrap_or(call);
-                assert!(
-                    !call.contains("runtime_manifest_path(")
-                        && !call.contains("registry_path")
-                        && !call.contains("runtime_registry_dir("),
-                    "{} writes a registry entry itself instead of calling write_runtime_manifest: {call}",
-                    path.display()
-                );
+            let production = production_code(&fs::read_to_string(&path).expect("source readable"));
+            let findings = registry_writer_findings(&production);
+            assert!(
+                findings.is_empty(),
+                "{relative} writes a registry entry itself instead of calling write_runtime_manifest: {findings:?}"
+            );
+            if production.contains("runtime_manifest_path(")
+                || production.contains("runtime_registry_dir(")
+            {
+                helper_callers.push(relative);
             }
         }
+        helper_callers.sort();
+        assert_eq!(
+            helper_callers, path_helper_callers,
+            "the files that call runtime_manifest_path or runtime_registry_dir changed: a new caller must be reviewed (and listed with its reason) and a file that stopped calling them removed"
+        );
     }
 
     /// A manifest written before `devel` became opt-in has no such field, and
