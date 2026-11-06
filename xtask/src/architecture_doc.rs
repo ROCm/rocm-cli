@@ -13,9 +13,11 @@
 //!
 //! This check starts from the source tree instead. Every tracked `.rs` file
 //! under `apps/*/src`, `crates/*/src` and `engines/*/src` must be cited by a
-//! relative markdown link in `docs/architecture.md` (one that renders as a
-//! link: a path inside an HTML comment, a code block or a code span does not
-//! count), or be listed in [`EXEMPT`], or be a test-only helper (see
+//! relative markdown link in `docs/architecture.md` (a complete inline link,
+//! `[text](path)`, with its text on one line, that renders as a link: a path
+//! inside an HTML comment, a code block or a code span does not count, and
+//! neither does a link missing its `[` or `)` or one with an escaped bracket),
+//! or be listed in [`EXEMPT`], or be a test-only helper (see
 //! [`is_test_helper`]). It reads the
 //! index and the working tree, never a git diff, so it behaves the same in CI,
 //! in the pre-commit hook and in the pre-push hook.
@@ -290,20 +292,142 @@ fn link_source_text(doc: &str) -> String {
     out
 }
 
-/// Every `.rs` file [`DOC`] links to, as repo-relative paths. Links inside HTML
-/// comments, code blocks and code spans are not counted.
-fn cited_paths(doc: &str) -> BTreeSet<String> {
-    let doc = link_source_text(doc);
-    let mut cited = BTreeSet::new();
-    let mut rest = doc.as_str();
-    while let Some(at) = rest.find("](") {
-        rest = &rest[at + 2..];
-        let end = rest.find([')', ' ', '\n']).unwrap_or(rest.len());
-        if let Some(path) = resolve_link(&rest[..end]) {
-            cited.insert(path);
+/// Whether the byte at `at` is a backslash that escapes the ASCII punctuation
+/// character after it.
+fn escapes_next(bytes: &[u8], at: usize) -> bool {
+    bytes[at] == b'\\' && bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation)
+}
+
+/// `text` with the backslash removed from every escaped punctuation character.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if escapes_next(bytes, at) {
+            at += 1;
         }
+        // Every byte skipped above or copied here is ASCII, so `at` stays on a
+        // character boundary.
+        let Some(character) = text[at..].chars().next() else {
+            break;
+        };
+        out.push(character);
+        at += character.len_utf8();
     }
-    cited
+    out
+}
+
+/// Advance `at` past spaces, tabs and newlines.
+fn skip_space(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n')) {
+        at += 1;
+    }
+    at
+}
+
+/// Parse the rest of an inline link, `text` being everything after its `(`:
+/// `destination`, an optional title, and the closing `)`. Returns the
+/// destination (its `<...>` delimiters and escapes removed) and the byte length
+/// consumed through the `)`, or `None` if it is not a complete inline link.
+fn inline_destination(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut at = skip_space(bytes, 0);
+    let destination;
+    if bytes.get(at) == Some(&b'<') {
+        let start = at + 1;
+        at = start;
+        loop {
+            match *bytes.get(at)? {
+                b'>' => break,
+                b'<' | b'\n' => return None,
+                _ if escapes_next(bytes, at) => at += 2,
+                _ => at += 1,
+            }
+        }
+        destination = unescape(&text[start..at]);
+        at += 1;
+    } else {
+        let start = at;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(at) {
+                None => return None,
+                Some(b' ' | b'\t' | b'\n') => break,
+                Some(b'(') => {
+                    depth += 1;
+                    at += 1;
+                }
+                Some(b')') if depth == 0 => break,
+                Some(b')') => {
+                    depth -= 1;
+                    at += 1;
+                }
+                Some(_) if escapes_next(bytes, at) => at += 2,
+                Some(_) => at += 1,
+            }
+        }
+        destination = unescape(&text[start..at]);
+    }
+    at = skip_space(bytes, at);
+    if let Some(&opener @ (b'"' | b'\'' | b'(')) = bytes.get(at) {
+        let closer = if opener == b'(' { b')' } else { opener };
+        at += 1;
+        loop {
+            match *bytes.get(at)? {
+                byte if byte == closer => break,
+                _ if escapes_next(bytes, at) => at += 2,
+                _ => at += 1,
+            }
+        }
+        at = skip_space(bytes, at + 1);
+    }
+    (bytes.get(at) == Some(&b')')).then_some((destination, at + 1))
+}
+
+/// The destination of every complete inline link, `[text](destination)`, in
+/// `text`. A bracket or parenthesis escaped with a backslash does not count,
+/// the `[` must be on the same line as its `]`, and a link missing its `[`, its
+/// `)` or its destination is not a link: the rendered page shows it as plain
+/// text, so it must not count as a citation either.
+fn link_destinations(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut open = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        if escapes_next(bytes, at) {
+            at += 2;
+            continue;
+        }
+        match bytes[at] {
+            b'\n' => open = 0,
+            b'[' => open += 1,
+            b']' if open > 0 => {
+                open -= 1;
+                if bytes.get(at + 1) == Some(&b'(')
+                    && let Some((destination, length)) = inline_destination(&text[at + 2..])
+                {
+                    found.push(destination);
+                    at += 2 + length;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Every `.rs` file [`DOC`] links to, as repo-relative paths. Only a complete
+/// inline link counts, and not one inside an HTML comment, a code block or a
+/// code span.
+fn cited_paths(doc: &str) -> BTreeSet<String> {
+    link_destinations(&link_source_text(doc))
+        .iter()
+        .filter_map(|destination| resolve_link(destination))
+        .collect()
 }
 
 /// Check the tracked files against the doc's citations and `exempt`, returning
@@ -611,6 +735,88 @@ mod tests {
     fn crlf_documents_are_read_the_same() {
         assert!(!cited_cli(&format!("```\r\n{CLI}\r\n```\r\n")));
         assert!(cited_cli(&format!("a ` stray\r\n\r\n{CLI}")));
+    }
+
+    #[test]
+    fn an_angle_bracketed_destination_is_a_citation() {
+        assert!(cited_cli("[cli](<../apps/rocm/src/cli.rs>)"));
+        assert!(cited_cli("[cli](<../apps/rocm/src/cli.rs#L10>)"));
+        assert!(cited_cli("[cli](  <../apps/rocm/src/cli.rs>  )"));
+        assert!(cited_cli(
+            "[cli](<../apps/rocm/src/cli.rs> \"the command tree\")"
+        ));
+        // The delimiters are not part of the path: a destination with a space is
+        // read whole, and an unterminated one is not a link.
+        assert_eq!(
+            cited_paths("[x](<../crates/a b/src/c.rs>)"),
+            cites(&["crates/a b/src/c.rs"])
+        );
+        assert!(!cited_cli("[cli](<../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli](<../apps/rocm/src/cli.rs\n>)"));
+    }
+
+    #[test]
+    fn a_link_missing_its_closing_parenthesis_is_not_a_citation() {
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs"));
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs and more text)"));
+        assert!(!cited_cli(
+            "[cli](../apps/rocm/src/cli.rs \"unterminated title)"
+        ));
+        assert!(!cited_cli(
+            "[cli](../apps/rocm/src/cli.rs\n\nnext paragraph)"
+        ));
+    }
+
+    #[test]
+    fn a_link_missing_its_opening_bracket_is_not_a_citation() {
+        assert!(!cited_cli("cli](../apps/rocm/src/cli.rs)"));
+        // A stray `[` on an earlier line is not this link's text.
+        assert!(!cited_cli("a [ stray\ncli](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn an_escaped_bracket_or_parenthesis_is_not_a_citation() {
+        assert!(!cited_cli("\\[cli](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli\\](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli]\\(../apps/rocm/src/cli.rs)"));
+        // An escaped backslash does not escape the bracket after it.
+        assert!(cited_cli("[cli\\\\](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn breaking_the_only_entry_leaves_the_file_uncited() {
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        for broken in [
+            "[cli](../apps/rocm/src/cli.rs",
+            "cli](../apps/rocm/src/cli.rs)",
+            "\\[cli](../apps/rocm/src/cli.rs)",
+        ] {
+            let violations = check(&tracked, &cited_paths(broken), &[]);
+            assert_eq!(violations.len(), 1, "{broken:?} must not cite the file");
+        }
+    }
+
+    #[test]
+    fn nested_brackets_and_parentheses_do_not_break_a_link() {
+        assert!(cited_cli("[a [b] c](../apps/rocm/src/cli.rs)"));
+        assert_eq!(
+            cited_paths("[x](../crates/a/src/b(1).rs)"),
+            cites(&["crates/a/src/b(1).rs"])
+        );
+        assert!(cited_cli("![image](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn several_links_on_a_line_are_all_found() {
+        let doc = "[a](../apps/rocm/src/a.rs), [b](../apps/rocm/src/b.rs) and [c](<../apps/rocm/src/c.rs>)";
+        assert_eq!(
+            cited_paths(doc),
+            cites(&[
+                "apps/rocm/src/a.rs",
+                "apps/rocm/src/b.rs",
+                "apps/rocm/src/c.rs"
+            ])
+        );
     }
 
     #[test]
