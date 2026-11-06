@@ -237,8 +237,9 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
     let mut walk = Walk {
         root: normalize(root),
         counted: Vec::new(),
-        seen_ungated: BTreeSet::new(),
-        seen_gated: BTreeSet::new(),
+        counted_files: BTreeSet::new(),
+        reached_files: BTreeSet::new(),
+        seen: BTreeSet::new(),
     };
     for package in packages {
         for target_root in &package.roots {
@@ -272,11 +273,15 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
 struct Walk {
     root: PathBuf,
     counted: Vec<(String, usize)>,
-    /// Files already visited as production code, and files already visited only
-    /// through a test-gated declaration. They are separate because a file declared
-    /// twice, once behind a test gate and once not, must still be counted.
-    seen_ungated: BTreeSet<PathBuf>,
-    seen_gated: BTreeSet<PathBuf>,
+    /// Files already counted, so a file loaded twice is charged once.
+    counted_files: BTreeSet<PathBuf>,
+    /// Files some declaration reaches, gated or not.
+    reached_files: BTreeSet<PathBuf>,
+    /// Visits already made, keyed by file, `mod_rs_like` and gating. The same file
+    /// can be declared twice, for example by `#[path]` alias, and then its child
+    /// modules resolve differently each way; it can also be declared once behind a
+    /// test gate and once not, and must still be counted.
+    seen: BTreeSet<(PathBuf, bool, bool)>,
 }
 
 impl Walk {
@@ -295,7 +300,7 @@ impl Walk {
     }
 
     fn reached(&self, file: &Path) -> bool {
-        self.seen_ungated.contains(file) || self.seen_gated.contains(file)
+        self.reached_files.contains(file)
     }
 
     /// Visit `file`: count it unless it is test-only, then follow its external
@@ -304,20 +309,17 @@ impl Walk {
     /// a directory named after it. Everything below a gated file is gated.
     fn visit(&mut self, file: &Path, mod_rs_like: bool, gated: bool) -> Result<()> {
         let file = normalize(file);
-        if gated {
-            if self.seen_ungated.contains(&file) || !self.seen_gated.insert(file.clone()) {
-                return Ok(());
-            }
-        } else if !self.seen_ungated.insert(file.clone()) {
+        if !self.seen.insert((file.clone(), mod_rs_like, gated)) {
             return Ok(());
         }
+        self.reached_files.insert(file.clone());
         let shown = self.relative(&file)?;
         let source =
             fs::read_to_string(&file).with_context(|| format!("failed to read {shown}"))?;
         let analysis = analyze(&source).with_context(|| format!("failed to parse {shown}"))?;
 
         let gated = gated || analysis.gated_file;
-        if !gated && !is_excluded(&shown) {
+        if !gated && !is_excluded(&shown) && self.counted_files.insert(file.clone()) {
             let total = source.lines().count();
             self.counted
                 .push((shown.clone(), production_lines(total, &analysis)));
@@ -433,7 +435,8 @@ struct Analysis {
 struct Child {
     name: String,
     path_attr: Option<String>,
-    /// Names of the inline `mod a { .. }` blocks the declaration sits in.
+    /// Directory names of the inline `mod a { .. }` blocks the declaration sits
+    /// in: the block's name, or its `#[path]` value when it has one.
     inline: Vec<String>,
     gated: bool,
 }
@@ -467,7 +470,9 @@ fn walk_items(
         match item {
             Item::Mod(module) => match &module.content {
                 Some((_, inner)) => {
-                    inline.push(module.ident.unraw().to_string());
+                    let directory = path_attribute(&module.attrs)?
+                        .unwrap_or_else(|| module.ident.unraw().to_string());
+                    inline.push(directory);
                     walk_items(inner, inline, item_gated, analysis)?;
                     inline.pop();
                 }
@@ -998,6 +1003,77 @@ trait T {
             names,
             ["src/lib.rs", "src/other/below.rs", "src/other/imp.rs"]
         );
+    }
+
+    #[test]
+    fn a_path_attribute_on_an_inline_module_names_the_directory_of_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "#[path = \"custom\"]\nmod api {\n    mod child;\n}\n",
+        );
+        write(dir.path(), "src/custom/child.rs", "fn c() {}\n");
+        let names: Vec<String> = counted(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(names, ["src/custom/child.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn a_file_loaded_two_ways_resolves_its_children_both_ways_in_either_order() {
+        for lib in [
+            "#[path = \"foo.rs\"]\nmod alias;\nmod foo;\n",
+            "mod foo;\n#[path = \"foo.rs\"]\nmod alias;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "src/lib.rs", lib);
+            write(dir.path(), "src/foo.rs", "mod child;\n");
+            write(dir.path(), "src/child.rs", &filler(1600));
+            write(dir.path(), "src/foo/child.rs", &filler(1700));
+            let files = counted(dir.path()).unwrap();
+            assert!(
+                files.contains(&("src/child.rs".to_string(), 1600)),
+                "{lib:?}: {files:?}"
+            );
+            assert!(
+                files.contains(&("src/foo/child.rs".to_string(), 1700)),
+                "{lib:?}: {files:?}"
+            );
+            assert_eq!(
+                files
+                    .iter()
+                    .filter(|(path, _)| path == "src/foo.rs")
+                    .count(),
+                1,
+                "a file loaded twice is counted once: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_gated_alias_of_a_file_does_not_change_which_children_count() {
+        for lib in [
+            "#[cfg(test)]\n#[path = \"foo.rs\"]\nmod alias;\nmod foo;\n",
+            "mod foo;\n#[cfg(test)]\n#[path = \"foo.rs\"]\nmod alias;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "src/lib.rs", lib);
+            write(dir.path(), "src/foo.rs", "mod child;\n");
+            write(dir.path(), "src/child.rs", &filler(3000));
+            write(dir.path(), "src/foo/child.rs", &filler(1700));
+            let files = counted(dir.path()).unwrap();
+            assert!(
+                files.contains(&("src/foo/child.rs".to_string(), 1700)),
+                "{lib:?}: {files:?}"
+            );
+            assert!(
+                !files.iter().any(|(path, _)| path == "src/child.rs"),
+                "the gated alias's child is test-only: {lib:?}: {files:?}"
+            );
+        }
     }
 
     #[test]
