@@ -6801,6 +6801,75 @@ fi
         }
     }
 
+    /// `cargo xtask check-architecture-doc` is only a gate if all three places
+    /// that can fail a change actually run it: the pre-commit hook, the pre-push
+    /// hook (which reads the working tree, so it catches a commit made with
+    /// `--no-verify` only when the tree is clean) and a `rust`-gated
+    /// step in the `clippy` CI job. The hook must also see every commit: the
+    /// answer depends on the whole tree, so a `files:` filter would let a
+    /// delete-only or doc-only commit skip it. CI's `rust` path filter must
+    /// include the doc itself, because deleting an entry changes the answer
+    /// though no `*.rs` file moved.
+    #[test]
+    fn architecture_doc_check_runs_in_hooks_and_ci() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "architecture-doc");
+        assert!(
+            hook_block_sets(block, "entry: cargo xtask check-architecture-doc"),
+            "architecture-doc hook must run `cargo xtask check-architecture-doc`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "stages: [pre-commit, pre-push]"),
+            "architecture-doc hook must run at both pre-commit and pre-push:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "always_run: true"),
+            "architecture-doc hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "architecture-doc hook must set `pass_filenames: false`:\n{block}"
+        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "architecture-doc hook must not have a file filter (`{filter_key}`): the check \
+                 reads the whole tree, so narrowing it would let a commit skip it:\n{block}"
+            );
+        }
+
+        let ci = read_workflow("ci.yml");
+        let command = "run: cargo xtask check-architecture-doc";
+        let at = ci
+            .find(command)
+            .unwrap_or_else(|| panic!("ci.yml must run `{command}`"));
+        let gate = ci[..at]
+            .lines()
+            .rev()
+            .take(2)
+            .any(|line| line.trim() == "if: needs.changes.outputs.rust == 'true'");
+        assert!(
+            gate,
+            "the `{command}` step must be gated on `needs.changes.outputs.rust == 'true'`, \
+             like the other xtask checks in the clippy job"
+        );
+
+        let start = ci
+            .find("            rust:\n")
+            .expect("ci.yml defines the `rust` path filter");
+        let end = start
+            + ci[start..]
+                .find("            heavy:\n")
+                .expect("ci.yml defines the `heavy` path filter after `rust`");
+        assert!(
+            ci[start..end].contains("- 'docs/architecture.md'"),
+            "the `rust` path filter must include docs/architecture.md, so a doc-only edit \
+             re-runs `{command}`"
+        );
+    }
+
     // Extractor guards: prove the helpers above actually parse the shapes they
     // claim to — multiline hook blocks, comment-stripping, and single-line pin
     // tokens alike — so the contract tests above can't silently false-pass on a

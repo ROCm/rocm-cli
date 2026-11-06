@@ -119,6 +119,26 @@ repos:
         stages: [pre-commit]
         groups: [local-tools] # runs in the dedicated `docs-links` CI job
 
+  # Module map: every production source file needs an entry in
+  # docs/architecture.md. `lychee` above only checks that links already in the
+  # doc resolve; this is the other direction, so a new file nobody wrote an
+  # entry for fails. Pre-commit for fast feedback, pre-push for a commit made
+  # with --no-verify: it reads the working tree, not the pushed commits, so it
+  # only agrees with CI when the tree is clean, and CI is the gate. It reads the
+  # whole tree, so it is not narrowed to changed files: a rename or deletion
+  # anywhere can change the answer, and a delete-only commit has no changed
+  # files to match a filter.
+  - repo: local
+    hooks:
+      - id: architecture-doc
+        name: every source file is in docs/architecture.md
+        entry: cargo xtask check-architecture-doc
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+        groups: [local-tools] # runs in the `clippy` CI job (compiles xtask)
+
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
     hooks:
