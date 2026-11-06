@@ -118,8 +118,11 @@ pub(crate) enum Command {
     /// in `xtask/src/module_size.rs`.
     CheckModuleSize,
     /// The same check as `check-module-size`, but it only reports: it prints the
-    /// offenders and exits successfully, including when the check cannot run.
-    /// The local pre-commit hook runs this until the limit is enforced.
+    /// offenders and exits successfully, including when the check itself cannot
+    /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
+    /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
+    /// non-zero before this code runs. The local pre-commit hook runs this until
+    /// the limit is enforced.
     CheckModuleSizeAdvisory,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {

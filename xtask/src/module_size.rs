@@ -47,6 +47,13 @@
 //! `cfg(all(test, ..))` spellings cannot confuse it. It does not see inside macro
 //! bodies or function bodies, so a `#[cfg(test)]` item nested in either counts as
 //! production. A file `syn` cannot parse fails the check; it is never skipped.
+//!
+//! The same limit means the walk follows only `mod` declarations it can see. A
+//! file under a package's `src/` that is loaded by `include!`, or by a `mod`
+//! declared inside a macro body, is not reached, so it is reported as a stray file
+//! (an error that names it) rather than counted. That is deliberately loud: the
+//! fix is to declare the module in plain source, not to teach the walk about
+//! macros.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -109,8 +116,9 @@ pub fn run() -> Result<()> {
 }
 
 /// `cargo xtask check-module-size-advisory`: the same check, but it only reports.
-/// This is the wrapper the local hook runs while the limit is not yet blocking; it
-/// cannot fail a commit, including when the check itself cannot run.
+/// This is the wrapper the local hook runs while the limit is not yet blocking; once
+/// xtask has built it cannot fail a commit, including when the check itself cannot
+/// run. A compile failure in xtask or `rocm-core` never reaches this function.
 pub fn run_advisory() -> Result<()> {
     advisory_to(evaluate(), &mut std::io::stdout())
 }
@@ -155,8 +163,14 @@ fn failed_text(outcome: &Outcome) -> String {
 
 fn evaluate() -> Result<Outcome> {
     let stdout = paths::run_cargo_metadata(&["--no-deps"])?;
+    evaluate_metadata(&stdout)
+}
+
+/// The whole check on one `cargo metadata --no-deps` document, so a test can feed
+/// it the output for a workspace of its own.
+fn evaluate_metadata(stdout: &[u8]) -> Result<Outcome> {
     let metadata: Metadata =
-        serde_json::from_slice(&stdout).context("failed to parse `cargo metadata` output")?;
+        serde_json::from_slice(stdout).context("failed to parse `cargo metadata` output")?;
     let packages: Vec<Package> = metadata.packages.iter().map(Package::from).collect();
     let files = collect(&metadata.workspace_root, &packages)?;
     outcome_of(&files, MAX_PRODUCTION_LINES)
@@ -261,7 +275,8 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
         stray.sort();
         bail!(
             "source file(s) that no `mod` declaration reaches, so they would escape the size count \
-             (declare them, or delete them):\n  {}",
+             (declare them with a plain `mod`, or delete them; a file loaded only by `include!` or \
+             by a `mod` inside a macro body is not reached either):\n  {}",
             stray.join("\n  ")
         );
     }
@@ -1242,6 +1257,133 @@ trait T {
         write(dir.path(), "src/lib.rs", "mod missing;\n");
         let error = counted(dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("missing"), "{error:#}");
+    }
+
+    // --- the whole check, on a real cargo workspace -------------------------
+
+    /// `cargo metadata --no-deps` output for the workspace at `root`, from the same
+    /// cargo the tests run under.
+    fn real_metadata(root: &Path) -> Vec<u8> {
+        let output =
+            std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+                .args(["metadata", "--format-version", "1", "--no-deps"])
+                .arg("--manifest-path")
+                .arg(root.join("Cargo.toml"))
+                .output()
+                .expect("run cargo metadata");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn manifest(name: &str) -> String {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n")
+    }
+
+    #[test]
+    fn evaluate_reads_target_roots_and_counts_from_real_cargo_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"big\", \"small\"]\nresolver = \"2\"\n",
+        );
+        write(root, "big/Cargo.toml", &manifest("big"));
+        write(
+            root,
+            "big/src/lib.rs",
+            &format!("mod inner;\n#[cfg(test)]\nmod tests;\n{}", filler(1500)),
+        );
+        write(root, "big/src/inner.rs", &filler(10));
+        write(root, "big/src/tests.rs", &filler(3000));
+        write(root, "big/build.rs", "fn main() {}\n");
+        write(root, "big/tests/it.rs", &filler(3000));
+        write(root, "small/Cargo.toml", &manifest("small"));
+        write(root, "small/src/main.rs", "fn main() {}\n");
+
+        let outcome = evaluate_metadata(&real_metadata(root)).unwrap();
+
+        // lib.rs, inner.rs and build.rs of `big`, and main.rs of `small`; the
+        // gated `tests.rs` and the integration test are not source files.
+        assert_eq!(outcome.checked, 4);
+        assert_eq!(
+            outcome.offenders,
+            [Offender {
+                path: "big/src/lib.rs".to_string(),
+                lines: 1501,
+            }]
+        );
+    }
+
+    #[test]
+    fn evaluate_rejects_a_document_that_is_not_cargo_metadata() {
+        let error = evaluate_metadata(b"not json").unwrap_err();
+        assert!(format!("{error:#}").contains("cargo metadata"), "{error:#}");
+    }
+
+    // --- unreadable attributes are errors, not skips -------------------------
+
+    #[test]
+    fn a_path_attribute_that_is_not_a_string_assignment_is_an_error() {
+        for attribute in ["#[path]", "#[path(\"x.rs\")]", "#[path = 5]"] {
+            let source = format!("{attribute}\nmod x;\n");
+            let error = analyze(&source).err().unwrap_or_else(|| {
+                panic!("{attribute} should not parse as a module path");
+            });
+            assert!(
+                format!("{error:#}").contains("`#[path]`"),
+                "{attribute}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cfg_predicate_that_cannot_be_read_is_an_error_not_a_guess() {
+        for (source, expected) in [
+            (
+                "#[cfg]\nfn f() {}\n",
+                "cannot parse a `#[cfg(..)]` predicate",
+            ),
+            (
+                "#[cfg(\"test\")]\nfn f() {}\n",
+                "cannot parse a `#[cfg(..)]` predicate",
+            ),
+            (
+                "#[cfg(all(1))]\nfn f() {}\n",
+                "cannot parse a cfg combinator's terms",
+            ),
+            (
+                "#[cfg(any(test, 1))]\nfn f() {}\n",
+                "cannot parse a cfg combinator's terms",
+            ),
+        ] {
+            let error = analyze(source).err().unwrap_or_else(|| {
+                panic!("{source:?} should not be accepted");
+            });
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{source:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_loaded_only_by_include_is_reported_as_a_stray_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "include!(\"generated.rs\");\nmacro_rules! m { () => { mod hidden; } }\n",
+        );
+        write(dir.path(), "src/generated.rs", &filler(4000));
+        write(dir.path(), "src/hidden.rs", &filler(4000));
+        let error = format!("{:#}", counted(dir.path()).unwrap_err());
+        assert!(error.contains("src/generated.rs"), "{error}");
+        assert!(error.contains("src/hidden.rs"), "{error}");
     }
 
     // --- the advisory wrapper ----------------------------------------------

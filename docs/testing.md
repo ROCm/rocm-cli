@@ -41,7 +41,9 @@ It exits non-zero and names each offending file with its count. There is one lim
 every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
 CI job and in the `cargo-module-size` pre-commit hook, which run
 `cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
-offenders without failing; the second is the same check that always exits successfully.
+offenders without failing; the second is the same check that exits successfully even
+when the check itself cannot run. That holds once xtask has built: a commit that leaves
+xtask or `rocm-core` not compiling still fails the hook.
 The counting rules are unit-tested in `xtask/src/module_size.rs`:
 
 ```bash
