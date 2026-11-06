@@ -987,8 +987,9 @@ fn launch_managed_engine_child_locked(
     // alive: a stop pairs every recorded PID with its own token, and the two
     // PIDs diverge as soon as `rocmd` restarts the service — at which point an
     // engine PID recorded without one could only be signalled blind.
+    // The engine's token was already captured right after the spawn (so cleanup
+    // can bind to it); re-capturing here could replace it with a later owner's.
     record.record_supervisor_identity(child_pid);
-    record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     if let Err(error) = record.write() {
         // Cleanup is the caller's job now: `record.engine_pid` (set above) is
