@@ -135,10 +135,15 @@ cargo test -p xtask chat_import_contract
 
 It flags `crate::chat`, `super::chat` and `self::chat` as a path, `chat` as a
 member of a `use crate::{..}` group, and `mod chat`, and a raw identifier
-(`r#chat`) counts as `chat`. It does not flag what a `#[cfg(test)]` gate
-covers, so a `mod tests` block may use `chat`; the gate covers only the one
-item, struct field, enum variant, parameter, match arm or statement it sits on,
-and the production code after it is still scanned. It does not flag the
+(`r#chat`) counts as `chat`. The one thing it skips is a
+`#[cfg(test)] mod name { .. }` block, so a `mod tests` may use `chat`; a
+`#[cfg(test)]` on anything else (a `use`, a function, a field, an expression)
+skips nothing, and a test that needs `chat` belongs in the test module. A route
+that never writes the `crate::chat` path is not seen: an alias
+(`use crate as root; root::chat::f()`), a glob (`use crate::*;` then
+`chat::f()`) or a `#[path = ".."] mod` that points at `chat.rs`; and
+`#[cfg(all(test, ..))]` is read as production code, so it can only cause a false
+alarm. It does not flag the
 identifiers and prose that merely contain the word, such as
 `chat_cli_arg_value`. It reads the four listed files only, not the modules they
 import. If one of them moves or is renamed, update `GUARDED` in the test; the

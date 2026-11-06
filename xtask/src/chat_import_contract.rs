@@ -21,28 +21,20 @@
 //! member of a `use crate::{..}` group, and `mod chat`. A raw identifier
 //! (`r#chat`) is the same name and is flagged the same way.
 //!
-//! Test code is exempt. A `#[cfg(test)]` item (a `mod tests` block, or a single
-//! `#[cfg(test)] use`/`fn`) may reach into `chat`: a test is not part of the
-//! module graph the shipped binary has. The scan removes what a gate covers by
-//! matching brackets over text from which comments and literals have already
-//! been blanked, by [`crate::rust_source`]'s
-//! `strip_literals_and_comments`, so a brace inside a string cannot move where a
-//! test item appears to end. The gate covers one thing, which is not always an
-//! item: it can sit on a struct field, an enum variant, a parameter, a
-//! struct-literal field, a match arm or a statement, and then it ends with that
-//! element (see `gated_end`), not with the next function in the file. Whether
-//! the gate sits on a list element or on an item is decided by the bracket
-//! around it: anything inside `(..)` or `[..]` is an element (so the
-//! function-pointer fields of `struct S(#[cfg(test)] unsafe fn(), T);` end at
-//! the comma and `T` stays scanned), and inside `{..}` by the first word of
-//! what is gated (`fn`, `use`, `let` begin an item or statement, a field's
-//! name does not).
+//! Test code is exempt, one way only: a `#[cfg(test)] mod name { .. }` block
+//! (or `mod name;`, with any attributes and a visibility between the gate and
+//! `mod`) is removed before the scan, by matching brackets over text from which
+//! comments and literals have already been blanked by [`crate::rust_source`]'s
+//! `strip_literals_and_comments`, so a brace inside a string cannot move where
+//! the block appears to end. A `#[cfg(test)]` on anything else (a `use`, a
+//! function, a field, a variant, an expression) exempts nothing: what it covers
+//! is scanned like production code, which fails toward a false alarm rather
+//! than a missed import. A test that needs `chat` goes in the test module.
 //!
 //! Known limits, stated rather than hidden:
 //!
 //! * Only `#[cfg(test)]` exactly is recognised as a test gate. `#[cfg(all(test,
-//!   ..))]` reads as production code, which fails toward a false alarm rather
-//!   than a missed import.
+//!   ..))]` reads as production code, which fails toward a false alarm.
 //! * The scan covers the files in `GUARDED`, not the modules they import. A
 //!   module the planner depends on that imports `chat` would re-form the cycle
 //!   one step away; add it to `GUARDED` if that ever needs pinning.
@@ -51,18 +43,6 @@
 //!   A route that never writes that path is not seen: an alias (`use crate as
 //!   root; root::chat::f()`), a glob (`use crate::*;` then `chat::f()`) or a
 //!   `#[path = ".."] mod` that points at `chat.rs`. None is used in these files.
-//! * Where a gate ends is decided from the tokens, not from a parse. A `<` that
-//!   follows an identifier counts as the start of generic arguments when the
-//!   gate sits on a list element, so a comparison at the top level of a gated
-//!   element can extend the exemption to the closing bracket of its list; that
-//!   hides at most the elements after it in the same braces.
-//! * An item gated inside a macro invocation written with `(..)` or `[..]`
-//!   (`lazy_static!( #[cfg(test)] fn f<A, B>() where A: X, B: Y {..} )`) is
-//!   read as a list element, so a comma in its generics or `where` clause ends
-//!   the exemption early; what follows is then scanned as production, which
-//!   can only make the scan stricter. A match arm in `{..}` whose pattern
-//!   starts with an item keyword (an inline `const { .. }` pattern) is read as
-//!   an item and ends at its block or `;` instead of at its comma.
 
 #[cfg(test)]
 mod tests {
@@ -241,154 +221,35 @@ mod tests {
         }
     }
 
-    /// Whether the token at `index` begins an item or a statement, as opposed
-    /// to one element of a comma-separated list (a field, a variant, a
-    /// parameter, a struct-literal field, a match arm).
-    ///
-    /// The difference is where the gated thing ends. An item or statement ends
-    /// at its `;` or its block, and the commas in its generics and `where`
-    /// clause are not its end (`fn f<A, B>() where A: X, B: Y {..}`). An
-    /// element ends at the comma that separates it from the next one.
-    fn begins_item_or_statement(tokens: &[Token], index: usize) -> bool {
-        const STARTERS: &[&str] = &[
-            "fn", "const", "static", "struct", "enum", "impl", "trait", "type", "mod", "use",
-            "extern", "unsafe", "async", "let", "if", "match", "for", "while", "loop", "return",
-            "break", "continue",
-        ];
-        let followed_by_a_name =
-            matches!(tokens.get(index + 1).map(|t| &t.tok), Some(Tok::Ident(_)));
-        match tokens.get(index).map(|t| &t.tok) {
-            Some(Tok::Ident(name)) => {
-                STARTERS.contains(&name.as_str())
-                    // `union` is only a keyword where it declares one; a field
-                    // may be called `union`.
-                    || (name == "union" && followed_by_a_name)
-            }
-            Some(Tok::Punct('{')) => true,
-            _ => false,
+    /// The index just past the `#[cfg(test)] mod name { .. }` (or `mod name;`)
+    /// whose gate ends just before `start`, or `None` when the gate is on
+    /// anything else.
+    fn past_test_module(tokens: &[Token], start: usize) -> Option<usize> {
+        let module = first_token_gated(tokens, start);
+        if !is_ident(tokens, module, "mod") {
+            return None;
+        }
+        let after_name = module + 2;
+        if is_punct(tokens, after_name, '{') {
+            Some(past_balanced(tokens, after_name))
+        } else if is_punct(tokens, after_name, ';') {
+            Some(after_name + 1)
+        } else {
+            None
         }
     }
 
-    /// The bracket that most closely encloses the token at `index`: the `(`,
-    /// `[` or `{` whose closer has not yet been read there, or `None` at the
-    /// top level of the file.
-    fn enclosing_opener(tokens: &[Token], index: usize) -> Option<char> {
-        let mut closers = 0usize;
-        for token in tokens[..index.min(tokens.len())].iter().rev() {
-            match token.tok {
-                Tok::Punct(')' | ']' | '}') => closers += 1,
-                Tok::Punct(open @ ('(' | '[' | '{')) => {
-                    if closers == 0 {
-                        return Some(open);
-                    }
-                    closers -= 1;
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Whether the gate at `gate`, covering what starts at `start`, sits on one
-    /// element of a comma-separated list rather than on an item or statement.
-    ///
-    /// Inside `(..)` or `[..]` that is always so: a tuple struct's or variant's
-    /// fields, a parameter list, call arguments and array elements are lists,
-    /// and none holds an item or a statement. That matters because such an
-    /// element can start with the same word as an item, and only the
-    /// enclosing bracket tells them apart: the field type `fn()`, `unsafe fn()`
-    /// or `extern "C" fn()` is not a function item. In a `{..}` the first word
-    /// decides (see [`begins_item_or_statement`]), since a braced struct's
-    /// field starts with its name and no list element there starts with a
-    /// keyword that begins an item.
-    fn gate_is_on_a_list_element(tokens: &[Token], gate: usize, start: usize) -> bool {
-        matches!(enclosing_opener(tokens, gate), Some('(' | '['))
-            || !begins_item_or_statement(tokens, first_token_gated(tokens, start))
-    }
-
-    /// The index just past what the `#[cfg(test)]` gate covers, where `gate` is
-    /// the index of the gate's `#` and `start` is the first token after it.
-    ///
-    /// The gate covers one item, statement or list element, so the exemption
-    /// ends at the first of:
-    ///
-    /// * a `;` outside brackets (consumed);
-    /// * for a list element only, a `,` outside brackets and outside generic
-    ///   arguments (consumed);
-    /// * the end of the first `{..}` block that opens outside brackets
-    ///   (consumed), which is where an item with a body, a match arm with a
-    ///   block and a struct-like variant end;
-    /// * a closer that has no opener inside the gate: the `}` of the struct,
-    ///   enum, block or match the gated field, variant, parameter or tail
-    ///   expression sits in, or the `)` of its parameter list (not consumed,
-    ///   so what follows it is scanned as the production code it is).
-    ///
-    /// Without the last rule a gate on the last field of a struct, with no
-    /// trailing comma, carried on past the struct's `}` and swallowed the next
-    /// function. Any attributes stacked under the gate need no handling of
-    /// their own: their brackets are tracked like any others. Brackets are
-    /// tracked so the `;` of `[u8; 2]` or of `fn f(x: [u8; 2])` is not taken
-    /// for the end. A `;` right after a closing `}` (`use a::{b, c};`,
-    /// `const X: Foo = Foo { .. };`) is left behind as a stray token, which
-    /// nothing here looks at. A value with a second block, such as
-    /// `if c { 1 } else { 2 }`, ends at the first `}` and leaves the rest as
-    /// production code, which can only make the scan stricter.
-    ///
-    /// Generic arguments are told apart from a comparison by one test: a `<`
-    /// that follows an identifier or `::`. A list element has no comparison at
-    /// its top level in practice, and a miscount in this direction only ever
-    /// extends the exemption to the enclosing closer, so a gated element with
-    /// an odd `<` hides at most the elements after it in the same braces.
-    fn gated_end(tokens: &[Token], gate: usize, start: usize) -> usize {
-        let element = gate_is_on_a_list_element(tokens, gate, start);
-        let mut nesting = 0usize;
-        let mut generics = 0usize;
-        let mut i = start;
-        while i < tokens.len() {
-            match tokens[i].tok {
-                Tok::Punct('(' | '[') => nesting += 1,
-                Tok::Punct('{') if nesting == 0 => return past_balanced(tokens, i),
-                Tok::Punct('{') => nesting += 1,
-                Tok::Punct(')' | ']' | '}') => {
-                    if nesting == 0 {
-                        return i;
-                    }
-                    nesting -= 1;
-                }
-                Tok::Punct(';') if nesting == 0 => return i + 1,
-                Tok::Punct(',') if element && nesting == 0 && generics == 0 => return i + 1,
-                Tok::Punct('<')
-                    if element
-                        && nesting == 0
-                        && i > start
-                        && matches!(tokens[i - 1].tok, Tok::Ident(_) | Tok::PathSep) =>
-                {
-                    generics += 1;
-                }
-                Tok::Punct('>')
-                    if element
-                        && nesting == 0
-                        && generics > 0
-                        // `->` and `=>` are not the end of generic arguments.
-                        && !is_punct(tokens, i.wrapping_sub(1), '-')
-                        && !is_punct(tokens, i.wrapping_sub(1), '=') =>
-                {
-                    generics -= 1;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        tokens.len()
-    }
-
-    /// The tokens left once everything a `#[cfg(test)]` gate covers is removed.
-    fn without_test_items(tokens: &[Token]) -> Vec<Token> {
+    /// The tokens left once every `#[cfg(test)] mod` block is removed. A gate on
+    /// anything else removes nothing, so what it covers is scanned as the
+    /// production code it may be.
+    fn without_test_modules(tokens: &[Token]) -> Vec<Token> {
         let mut kept = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
-            if let Some(len) = cfg_test_attribute_len(tokens, i) {
-                i = gated_end(tokens, i, i + len);
+            if let Some(len) = cfg_test_attribute_len(tokens, i)
+                && let Some(end) = past_test_module(tokens, i + len)
+            {
+                i = end;
                 continue;
             }
             kept.push(tokens[i].clone());
@@ -408,7 +269,7 @@ mod tests {
     /// Takes the raw file text, so a caller (the real-tree test, the fixtures)
     /// cannot forget to strip comments and literals first.
     fn chat_imports_in_production_code(source: &str) -> Vec<Offense> {
-        let tokens = without_test_items(&tokenize(&strip_literals_and_comments(source)));
+        let tokens = without_test_modules(&tokenize(&strip_literals_and_comments(source)));
         let mut offenses = Vec::new();
         // One entry per open `{`: whether it directly follows `crate::`,
         // `super::` or `self::`, so its members are children of the root.
@@ -547,20 +408,25 @@ mod tests {
             ("fn f() {\n    let _ = crate::chat::f();\n}\n", 2),
             ("mod chat;\n", 1),
             ("#[cfg(not(test))]\nuse crate::chat;\n", 2),
+            // A re-export, and the shape the cycle had before the leaf modules:
+            // `chat` in the import group, then bare `chat::f()` calls.
+            ("pub use crate::chat::any_substring;\n", 1),
+            ("pub(crate) use crate::chat::{A, B};\n", 1),
+            (
+                "use crate::{Cli, chat, providers};\nfn f() { chat::any_substring(); }\n",
+                1,
+            ),
         ] {
             assert_eq!(lines_of(source), vec![line], "{source:?}");
         }
     }
 
     #[test]
-    fn a_chat_import_inside_a_test_item_is_allowed() {
+    fn a_chat_import_inside_a_test_module_is_allowed() {
         for source in [
             "fn prod() {}\n\n#[cfg(test)]\nmod tests {\n    use crate::chat;\n    use crate::{Cli, chat as c};\n    #[test]\n    fn t() {\n        crate::chat::f();\n    }\n}\n",
-            "#[cfg(test)]\nuse crate::chat::any_substring;\n",
-            "#[cfg(test)]\nuse crate::{Cli, chat};\n",
-            "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) fn only_in_tests() -> bool {\n    crate::chat::f()\n}\n",
-            "#[cfg(test)]\nconst X: Foo = Foo { a: crate::chat::A };\n",
-            "#[cfg(test)]\nstatic T: [&str; 2] = [crate::chat::A, crate::chat::B];\n",
+            "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod helpers {\n    pub fn f() -> bool {\n        crate::chat::f()\n    }\n}\n",
+            "#[cfg(test)]\n#[path = \"planner_tests.rs\"]\nmod tests;\n",
         ] {
             assert!(
                 chat_imports_in_production_code(source).is_empty(),
@@ -570,16 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn production_code_after_a_test_item_is_still_scanned() {
-        let source = "#[cfg(test)]\nuse crate::chat::A;\n\
-                      use crate::chat::B;\n\
-                      #[cfg(test)]\nfn only_in_tests() {\n    crate::chat::f();\n}\n\
-                      fn prod() {\n    crate::chat::g();\n}\n";
-        assert_eq!(lines_of(source), vec![3, 9]);
+    fn production_code_around_a_test_module_is_still_scanned() {
+        let source = "use crate::chat::A;\n\
+                      #[cfg(test)]\nmod tests {\n    use crate::chat::B;\n}\n\
+                      use crate::chat::C;\n\
+                      #[cfg(test)]\nmod more {\n    fn f() { crate::chat::D; }\n}\n\
+                      fn prod() {\n    crate::chat::E;\n}\n";
+        assert_eq!(lines_of(source), vec![1, 6, 12]);
     }
 
     #[test]
-    fn a_test_item_ends_at_its_own_closing_brace_not_at_a_brace_in_a_literal() {
+    fn a_test_module_ends_at_its_own_closing_brace_not_at_a_brace_in_a_literal() {
         // The `use` between the two literals is test code and stays exempt: a
         // `}` read out of the first literal would close the item before it.
         let source = "#[cfg(test)]\nmod tests {\n    const S: &str = \"}\";\n    use crate::chat;\n    const T: &str = \"{\";\n}\n\nuse crate::chat;\n";
@@ -668,213 +535,34 @@ mod tests {
     }
 
     #[test]
-    fn a_test_gate_on_a_field_or_variant_covers_only_that_element() {
-        // Each case is (source, lines expected). The gated element is exempt;
-        // everything after it, in the same braces or after them, is not.
-        let cases: [(&str, &[usize]); 15] = [
-            // `->` inside the generic arguments is not their closing `>`.
+    fn a_test_gate_on_anything_but_a_module_exempts_nothing() {
+        // Only a `#[cfg(test)] mod` block is exempt. A gate on a `use`, a
+        // function, a field, a variant, a parameter or an expression covers
+        // nothing the scan skips, so it cannot hide what follows it either:
+        // this is the shape that let a comparison `<` inside a gated element
+        // swallow the production elements after it when the scan tried to find
+        // where each such gate ends. Every line below must still be reported.
+        for (source, lines) in [
+            ("#[cfg(test)]\nuse crate::chat::any_substring;\n", &[2][..]),
             (
-                "struct S { #[cfg(test)] m: HashMap<fn() -> V, crate::chat::K> }\n",
-                &[],
-            ),
-            // The shape Copilot reported: a gated last field with no comma.
-            (
-                "struct State { #[cfg(test)] marker: () }\nfn production() { crate::chat::f(); }\n",
-                &[2],
-            ),
-            (
-                "struct State {\n    #[cfg(test)]\n    marker: (),\n}\nfn production() {\n    crate::chat::f();\n}\n",
-                &[6],
+                "#[cfg(test)]\nfn only_in_tests() {\n    crate::chat::f();\n}\n",
+                &[3],
             ),
             (
-                "struct State { a: u8, #[cfg(test)] pub(crate) marker: () }\nfn production() { crate::chat::f(); }\n",
-                &[2],
-            ),
-            // Stacked attributes, and a field after the gated one.
-            (
-                "struct State {\n    #[cfg(test)]\n    #[allow(dead_code)]\n    marker: (),\n    real: crate::chat::T,\n}\n",
-                &[5],
-            ),
-            // A comma inside the gated field's generic arguments is not its end.
-            (
-                "struct S {\n    #[cfg(test)]\n    m: HashMap<A, crate::chat::T>,\n    n: crate::chat::U,\n}\n",
-                &[4],
-            ),
-            ("struct S { #[cfg(test)] m: crate::chat::T }\n", &[]),
-            // Enum variants: bare, tuple, struct-like, and the last one.
-            (
-                "enum E { A, #[cfg(test)] B }\nfn production() { crate::chat::f(); }\n",
-                &[2],
+                "struct S {\n    #[cfg(test)]\n    m: crate::chat::T,\n    n: crate::chat::U,\n}\n",
+                &[3, 4],
             ),
             (
-                "enum E {\n    A,\n    #[cfg(test)]\n    B(crate::chat::T),\n    C(crate::chat::U),\n}\n",
-                &[5],
-            ),
-            (
-                "enum E {\n    #[cfg(test)]\n    B { x: crate::chat::T },\n    C { y: crate::chat::U },\n}\n",
-                &[4],
-            ),
-            // A tuple struct's field closes with `)`, not `}`.
-            (
-                "struct S(u8, #[cfg(test)] u8);\nfn production() { crate::chat::f(); }\n",
-                &[2],
-            ),
-            // A parameter: the body after the parameter list is production.
-            (
-                "fn f(a: u8, #[cfg(test)] b: u8) {\n    crate::chat::f();\n}\n",
-                &[2],
-            ),
-            // A tail expression with no `;` before the closing brace.
-            (
-                "fn f() {\n    #[cfg(test)]\n    g()\n}\nfn production() { crate::chat::f(); }\n",
-                &[5],
-            ),
-            // A field of a struct literal, and an arm of a match.
-            (
-                "fn f() -> S {\n    S {\n        #[cfg(test)]\n        a: crate::chat::A,\n        b: crate::chat::B,\n    }\n}\n",
+                "fn f() -> S {\n    S {\n        #[cfg(test)]\n        a: x < 1,\n        b: crate::chat::B,\n    }\n}\n",
                 &[5],
             ),
             (
                 "fn f(x: u8) {\n    match x {\n        #[cfg(test)]\n        0 => crate::chat::f(),\n        _ => crate::chat::g(),\n    }\n}\n",
-                &[5],
+                &[4, 5],
             ),
-        ];
-        // Every case is checked before failing, so one run shows them all.
-        let wrong: Vec<String> = cases
-            .iter()
-            .filter(|(source, expected)| lines_of(source) != *expected)
-            .map(|(source, expected)| {
-                format!(
-                    "{source:?}: expected {expected:?}, got {:?}",
-                    lines_of(source)
-                )
-            })
-            .collect();
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    }
-
-    #[test]
-    fn a_test_gate_inside_parentheses_or_brackets_covers_one_list_element() {
-        // Inside `(..)` or `[..]` there are no items or statements, only list
-        // elements, so a function-pointer type that starts with `fn`, `unsafe`
-        // or `extern` is a field to end at its comma, not an item to end at a
-        // `;` or a block. Each case keeps the production field after it
-        // visible. Cases that already held (a `{` block as the element, a
-        // field that starts with a name) pin the boundary of the rule.
-        let cases: [(&str, &[usize]); 12] = [
-            // The shape Copilot reported, and its `unsafe` twin.
-            ("struct State(#[cfg(test)] fn(), crate::chat::T);\n", &[1]),
-            (
-                "struct State(#[cfg(test)] unsafe fn(), crate::chat::T);\n",
-                &[1],
-            ),
-            (
-                "struct State(#[cfg(test)] extern \"C\" fn(u8), crate::chat::T);\n",
-                &[1],
-            ),
-            (
-                "struct State(#[cfg(test)] unsafe extern \"C\" fn(u8, u8) -> u8, crate::chat::T);\n",
-                &[1],
-            ),
-            (
-                "struct State(#[cfg(test)] pub unsafe fn(), crate::chat::T);\n",
-                &[1],
-            ),
-            (
-                "struct State(#[cfg(test)] for<'a> fn(&'a u8), crate::chat::T);\n",
-                &[1],
-            ),
-            // The same fields in an enum variant, over several lines.
-            (
-                "enum E {\n    V(\n        #[cfg(test)]\n        unsafe fn(),\n        crate::chat::T,\n    ),\n}\n",
-                &[5],
-            ),
-            // A gated function-pointer field is exempt, and so is the chat
-            // path inside it: only what follows the comma is production.
-            ("struct State(#[cfg(test)] fn(crate::chat::T), u8);\n", &[]),
-            // A gated last field with no comma ends at the closing `)`.
-            (
-                "struct State(u8, #[cfg(test)] unsafe fn());\nfn production() { crate::chat::f(); }\n",
-                &[2],
-            ),
-            // Braced fields start with a name, and an array element or a call
-            // argument that is a block ends with the block: both already held.
-            (
-                "struct S {\n    #[cfg(test)]\n    f: unsafe fn(),\n    x: crate::chat::T,\n}\n",
-                &[4],
-            ),
-            (
-                "fn f() { g([#[cfg(test)] unsafe { 1 }, crate::chat::A]); }\n",
-                &[1],
-            ),
-            (
-                "fn f() { g(#[cfg(test)] unsafe { h() }, crate::chat::A); }\n",
-                &[1],
-            ),
-        ];
-        // Every case is checked before failing, so one run shows them all.
-        let wrong: Vec<String> = cases
-            .iter()
-            .filter(|(source, expected)| lines_of(source) != *expected)
-            .map(|(source, expected)| {
-                format!(
-                    "{source:?}: expected {expected:?}, got {:?}",
-                    lines_of(source)
-                )
-            })
-            .collect();
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    }
-
-    #[test]
-    fn a_gated_item_or_statement_is_not_ended_by_a_comma_in_its_generics() {
-        // The comma rule is for elements of a list. An item or a statement
-        // has commas in its generics and where clause that are not its end.
-        let cases: [(&str, &[usize]); 7] = [
-            // A visibility, and attributes stacked under the gate, come before
-            // the keyword that shows this is an item.
-            (
-                "#[cfg(test)]\npub(crate) fn only_in_tests<A, B>() {\n    crate::chat::f();\n}\n",
-                &[],
-            ),
-            (
-                "#[cfg(test)]\n#[allow(dead_code)]\nfn only_in_tests<A, B>() {\n    crate::chat::f();\n}\n",
-                &[],
-            ),
-            // `union` declares a type only when a name follows; a field can
-            // be called `union`.
-            (
-                "#[cfg(test)]\nunion U<A, B> {\n    a: crate::chat::X,\n}\n",
-                &[],
-            ),
-            (
-                "struct S {\n    #[cfg(test)]\n    union: u8,\n    x: crate::chat::T,\n}\n",
-                &[4],
-            ),
-            (
-                "#[cfg(test)]\nfn only_in_tests<A, B>(a: A, b: B) where A: X, B: Y {\n    crate::chat::f();\n}\nfn production() { crate::chat::g(); }\n",
-                &[5],
-            ),
-            (
-                "#[cfg(test)]\nimpl<A, B> Foo for Bar<A, B> {\n    fn f() { crate::chat::f(); }\n}\n",
-                &[],
-            ),
-            (
-                "fn p() {\n    #[cfg(test)]\n    let x: HashMap<A, B> = crate::chat::f();\n    crate::chat::g();\n}\n",
-                &[4],
-            ),
-        ];
-        // Every case is checked before failing, so one run shows them all.
-        let wrong: Vec<String> = cases
-            .iter()
-            .filter(|(source, expected)| lines_of(source) != *expected)
-            .map(|(source, expected)| {
-                format!(
-                    "{source:?}: expected {expected:?}, got {:?}",
-                    lines_of(source)
-                )
-            })
-            .collect();
-        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+            ("#[cfg(all(test, unix))]\nuse crate::chat;\n", &[2]),
+        ] {
+            assert_eq!(lines_of(source), lines, "{source:?}");
+        }
     }
 }
