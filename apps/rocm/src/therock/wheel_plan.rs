@@ -78,7 +78,7 @@ pub(super) struct ResolvedStack<'a> {
 /// The `compatibility_key` the install is recorded under is the `rocm` build every
 /// package in the stack shares, so a plan that has not chosen the stack still
 /// knows it: the `rocm` version.
-fn compatibility_key<'a>(plan: &'a WheelPlan<'a>) -> &'a str {
+const fn compatibility_key<'a>(plan: &'a WheelPlan<'a>) -> &'a str {
     match &plan.stack {
         PlanStack::Resolved(stack) => stack.compatibility_key,
         PlanStack::NeedsUv { .. } => plan.latest_version,

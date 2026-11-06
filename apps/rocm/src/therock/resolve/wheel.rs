@@ -59,7 +59,7 @@ use rocm_core::{
     normalize_therock_family, runtime_is_windows, uv_command_env,
 };
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -1512,6 +1512,7 @@ mod tests {
     use super::super::super::test_support::test_runtime_manifest;
     use super::*;
     use crate::runtime_registry::{InstalledRuntimeManifest, wheel_composition_includes_devel};
+    use std::path::PathBuf;
 
     /// A representative slice of what the canonical aggregate index publishes.
     /// Notably it has no `gfx943`: MI300 steppings other than `gfx942` have no
@@ -2539,9 +2540,11 @@ mod tests {
 
     #[cfg(unix)]
     fn wheel_links(package: &str, versions: &[&str]) -> String {
+        use std::fmt::Write as _;
+
         versions.iter().fold(String::new(), |mut html, version| {
             let file = format!("{package}-{version}-py3-none-any.whl");
-            html.push_str(&format!("<a href=\"{file}\">{file}</a>\n"));
+            let _ = writeln!(html, "<a href=\"{file}\">{file}</a>");
             html
         })
     }
