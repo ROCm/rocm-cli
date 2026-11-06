@@ -79,6 +79,7 @@ use crate::service_launch::{
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
     managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
     resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
+    wait_begin_client_config,
 };
 use crate::{
     GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
@@ -483,6 +484,7 @@ pub(crate) struct ServeArgs {
     pub(crate) port: u16,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
+    pub(crate) wait: bool,
     pub(crate) verbose: bool,
     pub(crate) no_smoke_test: bool,
     pub(crate) allow_public_bind: bool,
@@ -508,6 +510,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         port,
         foreground,
         managed,
+        wait,
         verbose,
         no_smoke_test,
         allow_public_bind,
@@ -1114,10 +1117,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let mut spinner =
-            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
-        spinner.tick();
-        let report = start_managed_service(
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
+            "Starting {model} on {selected_engine}…"
+        )));
+        spinner.borrow_mut().tick();
+        // The key is shown when the wait begins, since Ctrl-C or a failed wait
+        // would otherwise leave a running authenticated server whose key was never
+        // printed. It is then not repeated in the summary below.
+        let key_shown_before_wait = std::cell::Cell::new(false);
+        let launched = start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -1133,8 +1141,41 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             gpu_refusal_waived_for_reuse,
-            &mut |_elapsed| spinner.tick(),
-        )?;
+            wait,
+            // Named with the id the launch resolved to: an already-starting
+            // server keeps its own, not the one generated above. The spinner
+            // has no id on it, and a non-TTY stderr gets no spinner at all.
+            &mut |waiting_on| {
+                spinner.borrow_mut().clear();
+                eprintln!(
+                    "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
+                     Follow: rocm logs --service {waiting_on} --follow"
+                );
+                if let Some(config) = wait_begin_client_config(
+                    waiting_on,
+                    &service_id,
+                    &host,
+                    port,
+                    endpoint_auth.as_deref(),
+                ) {
+                    key_shown_before_wait.set(true);
+                    // Same intentional one-time key display as
+                    // `print_managed_launch_plain`; see its rationale.
+                    // codeql[rust/cleartext-logging]
+                    print!("{config}");
+                }
+            },
+            &mut |_elapsed| spinner.borrow_mut().tick(),
+        );
+        // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
+        let report = match launched {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.borrow_mut().clear();
+                return Err(error);
+            }
+        };
+        let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
         // writes a `starting` record for a process that never existed, so the
         // helper would be left watching a pid that will never appear, with
@@ -1169,7 +1210,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         }
         // Safe to move `endpoint_auth` here: this branch always returns, so the
         // fall-through (attached) path below never observes it moved.
-        let launched_key = if report.already_running {
+        let launched_key = if report.already_running || key_shown_before_wait.get() {
             None
         } else {
             endpoint_auth

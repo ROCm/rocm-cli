@@ -662,6 +662,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -673,7 +674,6 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
-
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -698,3 +698,35 @@ Feature: Model serving
     # suppression was untested: deleting the guard left the scenario green and a
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
+
+  # ROCMAI-873: on WSL the GPU is reached through /dev/dxg and ROCDXG, and there
+  # is no /dev/kfd. The no-usable-GPU refusal used to tell every user to "confirm
+  # /dev/kfd is present", which a WSL user cannot do. It now names the status
+  # `rocm examine` reports for the path the probe actually asked about, and the
+  # last step runs that command on the same machine to show it exists and reports
+  # the condition (`wsl_rocdxg_missing`).
+  #
+  # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
+  # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
+  # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
+  # verdict) and the unit tests on the serve gate; there is no scenario for the
+  # launch that follows, because it would start preparing a real engine.
+  @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
+  Scenario: serve-42 - Serving on a WSL host whose ROCDXG library the loader cannot find is refused with WSL advice
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user serves a model under the GPU-required default on that machine
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the refusal points the user at the WSL driver status instead of /dev/kfd
+    And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
+
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags

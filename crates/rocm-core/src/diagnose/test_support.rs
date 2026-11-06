@@ -52,6 +52,8 @@ pub(super) fn wsl_base() -> Examination {
         librocdxg: true,
         rocdxg_dids: true,
         ldconfig_librocdxg: Some(true),
+        librocdxg_on_ld_library_path: false,
+        librocdxg_beside_runtime: false,
         rocminfo: true,
         rocm_sees_gpu: Some(true),
         distro_supported: Some(true),
