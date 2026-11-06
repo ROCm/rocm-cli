@@ -324,6 +324,13 @@ async fn probe_device_memory(deadline: Instant) -> Probe<DeviceMemory> {
 /// GTT for GPU 0, via `rocm-smi`. The command is named in the report when its
 /// output is not understood, so the first run on a host shows the CSV header the
 /// column names were meant to match.
+///
+/// What is and is not checked: `gpu-preflight.sh` matches the labels
+/// `GTT Total Memory` and `GTT Total Used Memory` in `rocm-smi`'s plain-text
+/// `--showmeminfo vram gtt` output, so those labels are known to exist there.
+/// That `--showmeminfo gtt --csv` uses the same words as its column headers is
+/// not checked against real output; it is assumed by analogy with the VRAM CSV.
+/// Warning lines before the header are skipped (see [`parse_rocm_smi_csv_pool`]).
 fn gtt_pool(deadline: Instant) -> Probe<Pool> {
     use std::process::Command;
     let mut command = Command::new("rocm-smi");

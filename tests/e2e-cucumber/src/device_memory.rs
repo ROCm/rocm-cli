@@ -440,13 +440,19 @@ pub fn select_drain_target(memory: DeviceMemory) -> DrainTarget {
 /// `total_column` and `used_column` are substrings of the two header
 /// names (`Total Memory` and `Total Used Memory` for VRAM; the `GTT ` forms for
 /// GTT); the first data row is the first GPU. Values are bytes in the output.
+///
+/// The header is the first line that names both columns, not the first line:
+/// the tool can print warning lines before the CSV, and taking one of those as
+/// the header would make every sample unreadable.
 #[must_use]
 pub fn parse_rocm_smi_csv_pool(text: &str, total_column: &str, used_column: &str) -> Option<Pool> {
     let mut lines = text.lines();
-    let header = lines.next()?;
-    let cols: Vec<&str> = header.split(',').collect();
-    let total_idx = cols.iter().position(|c| c.contains(total_column))?;
-    let used_idx = cols.iter().position(|c| c.contains(used_column))?;
+    let (total_idx, used_idx) = lines.find_map(|line| {
+        let cols: Vec<&str> = line.split(',').collect();
+        let total_idx = cols.iter().position(|c| c.contains(total_column))?;
+        let used_idx = cols.iter().position(|c| c.contains(used_column))?;
+        Some((total_idx, used_idx))
+    })?;
     let row = lines.next()?;
     let vals: Vec<&str> = row.split(',').collect();
     let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
@@ -850,6 +856,31 @@ mod tests {
         );
         assert_eq!(
             parse_rocm_smi_csv_pool("", "Total Memory", "Total Used Memory"),
+            None
+        );
+    }
+
+    #[test]
+    fn rocm_smi_csv_with_warning_lines_before_the_header_is_still_read() {
+        let text = "WARNING: a device is in a low-power state\n\
+                    a warning that only says GTT Total Memory\n\
+                    \n\
+                    device,GTT Total Memory (B),GTT Total Used Memory (B)\n\
+                    card0,107374182400,41787392\n\
+                    card1,1,1\n";
+        assert_eq!(
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory"),
+            Some(Pool::new(102_400, 102_360)),
+            "the header is the first line naming both columns, and the first row after it is GPU 0"
+        );
+    }
+
+    #[test]
+    fn rocm_smi_csv_with_a_header_but_no_data_row_is_none() {
+        let text = "WARNING: nothing to report\n\
+                    device,GTT Total Memory (B),GTT Total Used Memory (B)\n";
+        assert_eq!(
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory"),
             None
         );
     }
