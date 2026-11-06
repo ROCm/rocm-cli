@@ -23,10 +23,14 @@
 //!
 //! Test code is exempt. A `#[cfg(test)]` item (a `mod tests` block, or a single
 //! `#[cfg(test)] use`/`fn`) may reach into `chat`: a test is not part of the
-//! module graph the shipped binary has. The scan removes those items by matching
-//! braces over text from which comments and literals have already been blanked,
-//! by [`crate::env_mutation_contract`]'s `strip_literals_and_comments`, so a
-//! brace inside a string cannot move where a test item appears to end.
+//! module graph the shipped binary has. The scan removes what a gate covers by
+//! matching brackets over text from which comments and literals have already
+//! been blanked, by [`crate::env_mutation_contract`]'s
+//! `strip_literals_and_comments`, so a brace inside a string cannot move where a
+//! test item appears to end. The gate covers one thing, which is not always an
+//! item: it can sit on a struct field, an enum variant, a parameter, a
+//! struct-literal field, a match arm or a statement, and then it ends with that
+//! element (see `gated_end`), not with the next function in the file.
 //!
 //! Known limits, stated rather than hidden:
 //!
@@ -36,6 +40,16 @@
 //! * The scan covers the files in `GUARDED`, not the modules they import. A
 //!   module the planner depends on that imports `chat` would re-form the cycle
 //!   one step away; add it to `GUARDED` if that ever needs pinning.
+//! * `chat` is found only as a path segment after `crate::`, `super::` or
+//!   `self::`, as a member of a group opened by one of those, or as `mod chat`.
+//!   A route that never writes that path is not seen: an alias (`use crate as
+//!   root; root::chat::f()`), a glob (`use crate::*;` then `chat::f()`) or a
+//!   `#[path = ".."] mod` that points at `chat.rs`. None is used in these files.
+//! * Where a gate ends is decided from the tokens, not from a parse. A `<` that
+//!   follows an identifier counts as the start of generic arguments when the
+//!   gate sits on a list element, so a comparison at the top level of a gated
+//!   element can extend the exemption to the closing bracket of its list; that
+//!   hides at most the elements after it in the same braces.
 
 #[cfg(test)]
 mod tests {
@@ -176,43 +190,19 @@ mod tests {
         matches.then_some(7)
     }
 
-    /// The index just past the item that begins at `index`: up to the first
-    /// `;` outside parentheses and brackets, or, when a `{` comes first, past
-    /// its matching `}`.
-    ///
-    /// Any attributes stacked under the gate need no handling of their own:
-    /// their brackets are tracked like any others, so the item still ends where
-    /// it should. Parentheses and brackets are tracked so the `;` of `[u8; 2]`
-    /// or of `fn f(x: [u8; 2])` is not taken for the end of the item. A `;`
-    /// right after the closing `}` (`use a::{b, c};`, `const X: Foo = Foo { .. };`)
-    /// is left behind as a stray token, which nothing here looks at. A const
-    /// whose value has a second block, such as `if c { 1 } else { 2 }`, ends at
-    /// the first `}` and leaves the rest as production code, which can only
-    /// make the scan stricter.
-    fn item_end(tokens: &[Token], index: usize) -> usize {
-        let mut nesting = 0usize;
-        let mut i = index;
+    /// The index just past the `(`, `[` or `{` at `open`, once its matching
+    /// closer has been consumed (the end of the input when it has none).
+    fn past_balanced(tokens: &[Token], open: usize) -> usize {
+        let mut depth = 0usize;
+        let mut i = open;
         while i < tokens.len() {
             match tokens[i].tok {
-                Tok::Punct('(' | '[') => nesting += 1,
-                Tok::Punct(')' | ']') => nesting = nesting.saturating_sub(1),
-                Tok::Punct(';') if nesting == 0 => return i + 1,
-                Tok::Punct('{') if nesting == 0 => {
-                    let mut depth = 0usize;
-                    while i < tokens.len() {
-                        match tokens[i].tok {
-                            Tok::Punct('{') => depth += 1,
-                            Tok::Punct('}') => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        i += 1;
+                Tok::Punct('(' | '[' | '{') => depth += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return i + 1;
                     }
-                    return i + 1;
                 }
                 _ => {}
             }
@@ -221,13 +211,134 @@ mod tests {
         tokens.len()
     }
 
-    /// The tokens left once every `#[cfg(test)]` item is removed.
+    /// The first token of what a gate covers: past any attributes stacked under
+    /// the gate and a `pub` or `pub(..)` visibility.
+    fn first_token_gated(tokens: &[Token], mut index: usize) -> usize {
+        loop {
+            if is_punct(tokens, index, '#') && is_punct(tokens, index + 1, '[') {
+                index = past_balanced(tokens, index + 1);
+            } else if is_ident(tokens, index, "pub") {
+                index += 1;
+                if is_punct(tokens, index, '(') {
+                    index = past_balanced(tokens, index);
+                }
+            } else {
+                return index;
+            }
+        }
+    }
+
+    /// Whether the token at `index` begins an item or a statement, as opposed
+    /// to one element of a comma-separated list (a field, a variant, a
+    /// parameter, a struct-literal field, a match arm).
+    ///
+    /// The difference is where the gated thing ends. An item or statement ends
+    /// at its `;` or its block, and the commas in its generics and `where`
+    /// clause are not its end (`fn f<A, B>() where A: X, B: Y {..}`). An
+    /// element ends at the comma that separates it from the next one.
+    fn begins_item_or_statement(tokens: &[Token], index: usize) -> bool {
+        const STARTERS: &[&str] = &[
+            "fn", "const", "static", "struct", "enum", "impl", "trait", "type", "mod", "use",
+            "extern", "unsafe", "async", "let", "if", "match", "for", "while", "loop", "return",
+            "break", "continue",
+        ];
+        let followed_by_a_name =
+            matches!(tokens.get(index + 1).map(|t| &t.tok), Some(Tok::Ident(_)));
+        match tokens.get(index).map(|t| &t.tok) {
+            Some(Tok::Ident(name)) => {
+                STARTERS.contains(&name.as_str())
+                    // `union` is only a keyword where it declares one; a field
+                    // may be called `union`.
+                    || (name == "union" && followed_by_a_name)
+            }
+            Some(Tok::Punct('{')) => true,
+            _ => false,
+        }
+    }
+
+    /// The index just past what the `#[cfg(test)]` gate covers, where `start`
+    /// is the first token after the gate.
+    ///
+    /// The gate covers one item, statement or list element, so the exemption
+    /// ends at the first of:
+    ///
+    /// * a `;` outside brackets (consumed);
+    /// * for a list element only, a `,` outside brackets and outside generic
+    ///   arguments (consumed);
+    /// * the end of the first `{..}` block that opens outside brackets
+    ///   (consumed), which is where an item with a body, a match arm with a
+    ///   block and a struct-like variant end;
+    /// * a closer that has no opener inside the gate: the `}` of the struct,
+    ///   enum, block or match the gated field, variant, parameter or tail
+    ///   expression sits in, or the `)` of its parameter list (not consumed,
+    ///   so what follows it is scanned as the production code it is).
+    ///
+    /// Without the last rule a gate on the last field of a struct, with no
+    /// trailing comma, carried on past the struct's `}` and swallowed the next
+    /// function. Any attributes stacked under the gate need no handling of
+    /// their own: their brackets are tracked like any others. Brackets are
+    /// tracked so the `;` of `[u8; 2]` or of `fn f(x: [u8; 2])` is not taken
+    /// for the end. A `;` right after a closing `}` (`use a::{b, c};`,
+    /// `const X: Foo = Foo { .. };`) is left behind as a stray token, which
+    /// nothing here looks at. A value with a second block, such as
+    /// `if c { 1 } else { 2 }`, ends at the first `}` and leaves the rest as
+    /// production code, which can only make the scan stricter.
+    ///
+    /// Generic arguments are told apart from a comparison by one test: a `<`
+    /// that follows an identifier or `::`. A list element has no comparison at
+    /// its top level in practice, and a miscount in this direction only ever
+    /// extends the exemption to the enclosing closer, so a gated element with
+    /// an odd `<` hides at most the elements after it in the same braces.
+    fn gated_end(tokens: &[Token], start: usize) -> usize {
+        let element = !begins_item_or_statement(tokens, first_token_gated(tokens, start));
+        let mut nesting = 0usize;
+        let mut generics = 0usize;
+        let mut i = start;
+        while i < tokens.len() {
+            match tokens[i].tok {
+                Tok::Punct('(' | '[') => nesting += 1,
+                Tok::Punct('{') if nesting == 0 => return past_balanced(tokens, i),
+                Tok::Punct('{') => nesting += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    if nesting == 0 {
+                        return i;
+                    }
+                    nesting -= 1;
+                }
+                Tok::Punct(';') if nesting == 0 => return i + 1,
+                Tok::Punct(',') if element && nesting == 0 && generics == 0 => return i + 1,
+                Tok::Punct('<')
+                    if element
+                        && nesting == 0
+                        && i > start
+                        && matches!(tokens[i - 1].tok, Tok::Ident(_) | Tok::PathSep) =>
+                {
+                    generics += 1;
+                }
+                Tok::Punct('>')
+                    if element
+                        && nesting == 0
+                        && generics > 0
+                        // `->` and `=>` are not the end of generic arguments.
+                        && !is_punct(tokens, i.wrapping_sub(1), '-')
+                        && !is_punct(tokens, i.wrapping_sub(1), '=') =>
+                {
+                    generics -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        tokens.len()
+    }
+
+    /// The tokens left once everything a `#[cfg(test)]` gate covers is removed.
     fn without_test_items(tokens: &[Token]) -> Vec<Token> {
         let mut kept = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
             if let Some(len) = cfg_test_attribute_len(tokens, i) {
-                i = item_end(tokens, i + len);
+                i = gated_end(tokens, i + len);
                 continue;
             }
             kept.push(tokens[i].clone());
@@ -504,5 +615,143 @@ mod tests {
         assert_eq!(names("r#match r#fn"), vec!["r#match", "r#fn"]);
         // An `r` that is only the start of an ordinary identifier is untouched.
         assert_eq!(names("r rest #[x]"), vec!["r", "rest", "x"]);
+    }
+
+    #[test]
+    fn a_test_gate_on_a_field_or_variant_covers_only_that_element() {
+        // Each case is (source, lines expected). The gated element is exempt;
+        // everything after it, in the same braces or after them, is not.
+        let cases: [(&str, &[usize]); 15] = [
+            // `->` inside the generic arguments is not their closing `>`.
+            (
+                "struct S { #[cfg(test)] m: HashMap<fn() -> V, crate::chat::K> }\n",
+                &[],
+            ),
+            // The shape Copilot reported: a gated last field with no comma.
+            (
+                "struct State { #[cfg(test)] marker: () }\nfn production() { crate::chat::f(); }\n",
+                &[2],
+            ),
+            (
+                "struct State {\n    #[cfg(test)]\n    marker: (),\n}\nfn production() {\n    crate::chat::f();\n}\n",
+                &[6],
+            ),
+            (
+                "struct State { a: u8, #[cfg(test)] pub(crate) marker: () }\nfn production() { crate::chat::f(); }\n",
+                &[2],
+            ),
+            // Stacked attributes, and a field after the gated one.
+            (
+                "struct State {\n    #[cfg(test)]\n    #[allow(dead_code)]\n    marker: (),\n    real: crate::chat::T,\n}\n",
+                &[5],
+            ),
+            // A comma inside the gated field's generic arguments is not its end.
+            (
+                "struct S {\n    #[cfg(test)]\n    m: HashMap<A, crate::chat::T>,\n    n: crate::chat::U,\n}\n",
+                &[4],
+            ),
+            ("struct S { #[cfg(test)] m: crate::chat::T }\n", &[]),
+            // Enum variants: bare, tuple, struct-like, and the last one.
+            (
+                "enum E { A, #[cfg(test)] B }\nfn production() { crate::chat::f(); }\n",
+                &[2],
+            ),
+            (
+                "enum E {\n    A,\n    #[cfg(test)]\n    B(crate::chat::T),\n    C(crate::chat::U),\n}\n",
+                &[5],
+            ),
+            (
+                "enum E {\n    #[cfg(test)]\n    B { x: crate::chat::T },\n    C { y: crate::chat::U },\n}\n",
+                &[4],
+            ),
+            // A tuple struct's field closes with `)`, not `}`.
+            (
+                "struct S(u8, #[cfg(test)] u8);\nfn production() { crate::chat::f(); }\n",
+                &[2],
+            ),
+            // A parameter: the body after the parameter list is production.
+            (
+                "fn f(a: u8, #[cfg(test)] b: u8) {\n    crate::chat::f();\n}\n",
+                &[2],
+            ),
+            // A tail expression with no `;` before the closing brace.
+            (
+                "fn f() {\n    #[cfg(test)]\n    g()\n}\nfn production() { crate::chat::f(); }\n",
+                &[5],
+            ),
+            // A field of a struct literal, and an arm of a match.
+            (
+                "fn f() -> S {\n    S {\n        #[cfg(test)]\n        a: crate::chat::A,\n        b: crate::chat::B,\n    }\n}\n",
+                &[5],
+            ),
+            (
+                "fn f(x: u8) {\n    match x {\n        #[cfg(test)]\n        0 => crate::chat::f(),\n        _ => crate::chat::g(),\n    }\n}\n",
+                &[5],
+            ),
+        ];
+        // Every case is checked before failing, so one run shows them all.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(source, expected)| lines_of(source) != *expected)
+            .map(|(source, expected)| {
+                format!(
+                    "{source:?}: expected {expected:?}, got {:?}",
+                    lines_of(source)
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_gated_item_or_statement_is_not_ended_by_a_comma_in_its_generics() {
+        // The comma rule is for elements of a list. An item or a statement
+        // has commas in its generics and where clause that are not its end.
+        let cases: [(&str, &[usize]); 7] = [
+            // A visibility, and attributes stacked under the gate, come before
+            // the keyword that shows this is an item.
+            (
+                "#[cfg(test)]\npub(crate) fn only_in_tests<A, B>() {\n    crate::chat::f();\n}\n",
+                &[],
+            ),
+            (
+                "#[cfg(test)]\n#[allow(dead_code)]\nfn only_in_tests<A, B>() {\n    crate::chat::f();\n}\n",
+                &[],
+            ),
+            // `union` declares a type only when a name follows; a field can
+            // be called `union`.
+            (
+                "#[cfg(test)]\nunion U<A, B> {\n    a: crate::chat::X,\n}\n",
+                &[],
+            ),
+            (
+                "struct S {\n    #[cfg(test)]\n    union: u8,\n    x: crate::chat::T,\n}\n",
+                &[4],
+            ),
+            (
+                "#[cfg(test)]\nfn only_in_tests<A, B>(a: A, b: B) where A: X, B: Y {\n    crate::chat::f();\n}\nfn production() { crate::chat::g(); }\n",
+                &[5],
+            ),
+            (
+                "#[cfg(test)]\nimpl<A, B> Foo for Bar<A, B> {\n    fn f() { crate::chat::f(); }\n}\n",
+                &[],
+            ),
+            (
+                "fn p() {\n    #[cfg(test)]\n    let x: HashMap<A, B> = crate::chat::f();\n    crate::chat::g();\n}\n",
+                &[4],
+            ),
+        ];
+        // Every case is checked before failing, so one run shows them all.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(source, expected)| lines_of(source) != *expected)
+            .map(|(source, expected)| {
+                format!(
+                    "{source:?}: expected {expected:?}, got {:?}",
+                    lines_of(source)
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
