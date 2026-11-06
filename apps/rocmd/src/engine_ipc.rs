@@ -19,7 +19,19 @@ pub(crate) fn engine_healthcheck_response(
     engine: &str,
     service_id: &str,
 ) -> Result<HealthcheckResponse> {
-    engine_request::<_, HealthcheckResponse>(
+    engine_healthcheck_response_on(&DaemonHost::detect()?, paths, engine, service_id)
+}
+
+/// [`engine_healthcheck_response`] on a given host. The supervisor polls
+/// through the host it started its engine on, so a test can supply both.
+pub(crate) fn engine_healthcheck_response_on(
+    daemon_host: &DaemonHost,
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Result<HealthcheckResponse> {
+    engine_request_on::<_, HealthcheckResponse>(
+        daemon_host,
         paths,
         engine,
         service_id,
@@ -377,17 +389,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd() -> Result<()> {
-        use crate::test_support::{lock_script_tests, write_executable_script};
+        use crate::test_support::{lock_script_tests, script_tools, write_executable_script};
 
         let _serial = lock_script_tests();
-        assert!(
-            std::path::Path::new("/bin/sh").exists(),
-            "this test needs /bin/sh to stand in for rocm"
-        );
+        let tools = script_tools();
         let (root, paths) = temp_app_paths("engine-request-on-rocm");
         let seen = root.join("rocm-args.txt");
         write_executable_script(
             &root.join("rocm"),
+            &tools,
             &format!(
                 "printf '%s\\n' \"$@\" > '{}'\nread -r _request\n{}\n",
                 seen.display(),

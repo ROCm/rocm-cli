@@ -254,18 +254,50 @@ pub(crate) fn lock_script_tests() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Write `body` as a `/bin/sh` script at `path` and make it executable. Every
-/// writer is closed before this returns, so the first exec cannot find the
-/// file open for writing. The script may use only the shell's own commands
-/// and `/bin` tools, and the caller is expected to say so by name when one is
-/// missing.
+/// The tools a stand-in script needs, each found once on `PATH` as an absolute
+/// path. A missing one fails the test by name, rather than being skipped or
+/// surfacing as a confusing exec error.
 #[cfg(unix)]
-pub(crate) fn write_executable_script(path: &std::path::Path, body: &str) -> Result<()> {
+pub(crate) struct ScriptTools {
+    pub(crate) sh: PathBuf,
+    pub(crate) sleep: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(unix)]
+pub(crate) fn script_tools() -> ScriptTools {
+    let find = |name: &str| {
+        find_on_path(name)
+            .unwrap_or_else(|| panic!("this test needs `{name}` on PATH to stand in for a binary"))
+    };
+    ScriptTools {
+        sh: find("sh"),
+        sleep: find("sleep"),
+    }
+}
+
+/// Write `body` as a script for `tools.sh` at `path` and make it executable.
+/// Every writer is closed before this returns, so the first exec cannot find
+/// the file open for writing. The script may use the shell's own commands and
+/// the tools in `tools`.
+#[cfg(unix)]
+pub(crate) fn write_executable_script(
+    path: &std::path::Path,
+    tools: &ScriptTools,
+    body: &str,
+) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let mut file = fs::File::create(path)?;
-    write!(file, "#!/bin/sh\n{body}")?;
+    write!(file, "#!{}\n{body}", tools.sh.display())?;
     file.set_permissions(fs::Permissions::from_mode(0o755))?;
     file.sync_all()?;
     Ok(())

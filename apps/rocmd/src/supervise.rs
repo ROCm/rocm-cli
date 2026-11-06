@@ -205,6 +205,7 @@ fn supervise_service_on(
     })?;
 
     let became_ready = wait_for_service_ready(
+        daemon_host,
         paths,
         &record.engine,
         &record.service_id,
@@ -390,9 +391,14 @@ fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
     phase
 }
 
-fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
+fn engine_healthcheck_ready(
+    daemon_host: &DaemonHost,
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Result<bool> {
     Ok(crate::engine_ipc::healthcheck_response_ready(
-        &crate::engine_ipc::engine_healthcheck_response(paths, engine, service_id)?,
+        &crate::engine_ipc::engine_healthcheck_response_on(daemon_host, paths, engine, service_id)?,
     ))
 }
 
@@ -400,6 +406,7 @@ fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) ->
 /// timeout elapses), tailing its log file meanwhile and reporting each coarse
 /// startup phase transition via `on_phase`.
 fn wait_for_service_ready(
+    daemon_host: &DaemonHost,
     paths: &AppPaths,
     engine: &str,
     service_id: &str,
@@ -417,7 +424,7 @@ fn wait_for_service_ready(
             last_phase = Some(phase);
             on_phase(phase);
         }
-        if engine_healthcheck_ready(paths, engine, service_id).unwrap_or(false) {
+        if engine_healthcheck_ready(daemon_host, paths, engine, service_id).unwrap_or(false) {
             return true;
         }
         thread::sleep(Duration::from_millis(200));
@@ -596,9 +603,11 @@ mod tests {
     use crate::persistence::load_service_record;
     #[cfg(target_os = "linux")]
     use crate::test_support::UNCONFIRMED_STOP_PID;
-    use crate::test_support::{identity_probe_record, temp_app_paths, unique_test_root};
     #[cfg(target_os = "linux")]
-    use crate::test_support::{lock_script_tests, write_executable_script};
+    use crate::test_support::{
+        find_on_path, lock_script_tests, script_tools, write_executable_script,
+    };
+    use crate::test_support::{identity_probe_record, temp_app_paths, unique_test_root};
     use crate::watchers::find_recoverable_service;
 
     /// Drive `supervise_service` far enough to reach the key guard, and return
@@ -1194,7 +1203,11 @@ mod tests {
             "precondition: the seeded record carries no token"
         );
 
-        let _ = restart_managed_service(&paths, &mut record);
+        let _ = restart_managed_service_on(
+            &paths,
+            &mut record,
+            &DaemonHost::test_binary_standing_in_for_rocmd(),
+        );
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
@@ -1229,7 +1242,11 @@ mod tests {
         record.status = "failed".to_owned();
         record.write()?;
 
-        let _ = restart_managed_service(&paths, &mut record);
+        let _ = restart_managed_service_on(
+            &paths,
+            &mut record,
+            &DaemonHost::test_binary_standing_in_for_rocmd(),
+        );
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
@@ -1288,7 +1305,11 @@ mod tests {
                 Ok(false)
             })
         };
-        let outcome = restart_managed_service(&paths, &mut record);
+        let outcome = restart_managed_service_on(
+            &paths,
+            &mut record,
+            &DaemonHost::test_binary_standing_in_for_rocmd(),
+        );
         let stop_landed = stop.join().expect("stop thread");
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
@@ -1313,19 +1334,17 @@ mod tests {
     /// `rocm` itself and the new supervisor died on an unrecognised subcommand.
     ///
     /// The stand-in is a script that records its arguments, so what the restart
-    /// actually ran can be read back. It needs only `/bin/sh` and `/bin/sleep`,
-    /// and fails by name when they are missing; `setsid` is what the restart
-    /// itself runs.
+    /// actually ran can be read back. Its shell and `sleep` are found once and
+    /// asserted by name, and so is `setsid`, which the restart itself runs.
     #[cfg(target_os = "linux")]
     #[test]
     fn restart_runs_supervise_on_the_rocmd_it_is_given() -> Result<()> {
         let _serial = lock_script_tests();
-        for tool in ["/bin/sh", "/bin/sleep"] {
-            assert!(
-                Path::new(tool).exists(),
-                "this test needs {tool} to stand in for rocmd"
-            );
-        }
+        let tools = script_tools();
+        assert!(
+            find_on_path("setsid").is_some(),
+            "this test needs `setsid` on PATH: the restart runs it"
+        );
         let (root, paths) = temp_app_paths("restart-runs-given-rocmd");
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
@@ -1336,9 +1355,11 @@ mod tests {
         let stand_in = root.join("rocmd");
         write_executable_script(
             &stand_in,
+            &tools,
             &format!(
-                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 3\n",
-                seen.display()
+                "printf '%s\\n' \"$@\" > '{}'\nexec '{}' 3\n",
+                seen.display(),
+                tools.sleep.display()
             ),
         )?;
 
@@ -1415,45 +1436,54 @@ mod tests {
 
     /// A supervisor run by the `rocmd` binary starts its engine on the `rocm`
     /// beside it: `__engine-serve-http` is a hidden command of `rocm` alone, and
-    /// `rocmd` answered it with an unrecognised-subcommand error.
+    /// `rocmd` answered it with an unrecognised-subcommand error. It polls the
+    /// engine's readiness through the same `rocm`.
     ///
-    /// The stand-in `rocm` is a script that records its arguments. The supervisor
-    /// waits for its engine for minutes, so it runs on a thread that is left
-    /// behind; the test reads what the engine was started with.
+    /// The stand-in `rocm` is the only binary involved: it records the engine
+    /// start, answers the readiness check, and lets the engine exit, so the
+    /// supervisor finishes by itself and nothing is left running. The test host
+    /// is the only host the supervisor has, so no other `rocm` can be reached.
     #[cfg(target_os = "linux")]
     #[test]
     fn supervise_runs_the_engine_on_the_rocm_beside_rocmd() -> Result<()> {
         let _serial = lock_script_tests();
-        for tool in ["/bin/sh", "/bin/sleep"] {
-            assert!(
-                Path::new(tool).exists(),
-                "this test needs {tool} to stand in for rocm"
-            );
-        }
+        let tools = script_tools();
         let (root, paths) = temp_app_paths("supervise-engine-on-rocm");
         paths.ensure()?;
-        let seen = root.join("rocm-args.txt");
-        let stand_in = root.join("rocm");
+        let served = root.join("rocm-serve-args.txt");
+        let asked = root.join("rocm-stdio-args.txt");
+        let ready = serde_json::to_string(&rocm_engine_protocol::EngineResponseEnvelope::success(
+            rocm_engine_protocol::HealthcheckResponse {
+                status: "ready".to_owned(),
+                model_loaded: true,
+                device: "cpu".to_owned(),
+                uptime_sec: 1,
+                queue_depth: 0,
+                last_error: None,
+                tokens_per_sec: None,
+            },
+        ))?;
         write_executable_script(
-            &stand_in,
+            &root.join("rocm"),
+            &tools,
             &format!(
-                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 5\n",
-                seen.display()
+                "case \"$1\" in\n\
+                 __engine-serve-http)\n  printf '%s\\n' \"$@\" > '{served}'\n  exec '{sleep}' 2\n  ;;\n\
+                 __engine-stdio)\n  printf '%s\\n' \"$@\" > '{asked}'\n  read -r _request\n  printf '%s\\n' '{ready}'\n  ;;\n\
+                 *) exit 2 ;;\nesac\n",
+                served = served.display(),
+                asked = asked.display(),
+                sleep = tools.sleep.display(),
             ),
         )?;
 
         let service_id = "svc-supervise-engine-on-rocm";
-        let mut attempts = 0;
-        while !seen.exists() && attempts < 10 {
-            attempts += 1;
+        let mut outcome = Err("not attempted".to_owned());
+        for _ in 0..10 {
             let (sender, receiver) = std::sync::mpsc::channel();
             // The daemon is `rocmd`, which does not exist here; the `rocm` beside
             // it is the stand-in.
-            let (paths, daemon_host, service_id) = (
-                paths.clone(),
-                DaemonHost::new(root.join("rocmd"), false),
-                service_id,
-            );
+            let (paths, daemon_host) = (paths.clone(), DaemonHost::new(root.join("rocmd"), false));
             thread::spawn(move || {
                 let outcome = supervise_service_on(
                     &daemon_host,
@@ -1472,29 +1502,36 @@ mod tests {
                 );
                 let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
             });
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !seen.exists() && std::time::Instant::now() < deadline {
-                // The first exec of a new file can lose a race with an unrelated
-                // fork (ETXTBSY): the spawn fails at once, and the next attempt
-                // starts again. Any other early return is a real failure.
-                if let Ok(Err(error)) = receiver.try_recv() {
-                    assert!(
-                        error.contains("Text file busy"),
-                        "supervisor stopped: {error}"
-                    );
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
+            outcome = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the supervisor did not finish: it was not polling the stand-in `rocm`, \
+                         which answers its readiness check and lets the engine exit"
+                    )
+                });
+            // The first exec of a new file can lose a race with an unrelated
+            // fork (ETXTBSY): the spawn fails at once, and the next attempt
+            // starts again.
+            if !matches!(&outcome, Err(error) if error.contains("Text file busy")) {
+                break;
             }
         }
-        let args = fs::read_to_string(&seen).unwrap_or_default();
+        let serve_args = fs::read_to_string(&served).unwrap_or_default();
+        let stdio_args = fs::read_to_string(&asked).unwrap_or_default();
         fs::remove_dir_all(&root).ok();
 
-        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(outcome, Ok(()), "the supervisor must finish cleanly");
+        let serve_args: Vec<&str> = serve_args.lines().collect();
         assert_eq!(
-            args.get(..3),
+            serve_args.get(..3),
             Some(&["__engine-serve-http", "llamacpp", service_id][..]),
-            "the engine must be started as `rocm __engine-serve-http <engine> <service>`: {args:?}"
+            "the engine must be started as `rocm __engine-serve-http <engine> <service>`: {serve_args:?}"
+        );
+        assert_eq!(
+            stdio_args.lines().collect::<Vec<_>>(),
+            ["__engine-stdio", "llamacpp"],
+            "readiness must be polled through the same `rocm`"
         );
         Ok(())
     }

@@ -29,6 +29,10 @@ pub(crate) fn mark_embedded_in_rocm() {
     EMBEDDED_IN_ROCM.store(true, Ordering::Relaxed);
 }
 
+fn is_embedded_in_rocm() -> bool {
+    EMBEDDED_IN_ROCM.load(Ordering::Relaxed)
+}
+
 /// The host the daemon is running in, with the one executable path that every
 /// decision and every sibling lookup is made from, so they cannot disagree.
 pub(crate) struct DaemonHost {
@@ -37,13 +41,21 @@ pub(crate) struct DaemonHost {
 }
 
 impl DaemonHost {
+    /// The host this process is running in.
+    ///
+    /// A unit test never gets this one: it passes the code under test a host of
+    /// its own, so that nothing outside the test's stand-in binaries can run,
+    /// not even a `rocm` that happens to sit in the build directory.
     pub(crate) fn detect() -> Result<Self> {
+        if cfg!(test) {
+            anyhow::bail!(
+                "a unit test reached `DaemonHost::detect`; pass it a host so that no binary \
+                 outside its stand-ins can run"
+            );
+        }
         let current_exe = rocm_core::current_executable_path()
             .context("failed to resolve the current executable path")?;
-        Ok(Self::new(
-            current_exe,
-            EMBEDDED_IN_ROCM.load(Ordering::Relaxed),
-        ))
+        Ok(Self::new(current_exe, is_embedded_in_rocm()))
     }
 
     pub(crate) const fn new(current_exe: PathBuf, embedded_in_rocm: bool) -> Self {
@@ -102,6 +114,16 @@ impl DaemonHost {
         Self::new(
             std::env::current_exe().expect("the test binary has a path"),
             true,
+        )
+    }
+
+    /// The same for a test that restarts a service: the test binary is the
+    /// `rocmd` that is re-executed.
+    #[cfg(test)]
+    pub(crate) fn test_binary_standing_in_for_rocmd() -> Self {
+        Self::new(
+            std::env::current_exe().expect("the test binary has a path"),
+            false,
         )
     }
 }
@@ -234,7 +256,16 @@ mod tests {
     /// A process that did not enter through `run_from_args` is not embedded.
     #[test]
     fn a_plain_process_is_not_embedded_in_rocm() {
-        assert!(!DaemonHost::detect().unwrap().embedded_in_rocm);
+        assert!(!is_embedded_in_rocm());
+    }
+
+    /// The real host is not reachable from a unit test, whatever sits beside it.
+    #[test]
+    fn a_unit_test_cannot_reach_the_real_host() {
+        let error = DaemonHost::detect()
+            .err()
+            .expect("detect is refused in tests");
+        assert!(format!("{error:#}").contains("pass it a host"), "{error:#}");
     }
 
     /// `rocm daemon run` enters through `run_from_args`, and that is what marks
@@ -248,7 +279,7 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             // `--help` stops clap before anything runs; the marking comes first.
             let _ = crate::run_from_args(vec!["rocmd".into(), "--help".into()]);
-            assert!(DaemonHost::detect().unwrap().embedded_in_rocm);
+            assert!(is_embedded_in_rocm());
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
