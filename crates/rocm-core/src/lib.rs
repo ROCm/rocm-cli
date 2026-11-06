@@ -62,7 +62,7 @@ mod test_support;
 pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
-pub use amd_smi::resolve_amd_smi_binary;
+pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
@@ -124,11 +124,12 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
-    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
-    detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
+    DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
+    WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
+    detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
+    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
+    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -260,6 +261,27 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
 /// captured output: stderr if non-blank after trimming, else stdout, else a
 /// literal "no output"; the result is trimmed.
 pub fn command_failure_detail(output: &std::process::Output) -> String {
+    command_failure_detail_or_else(output, || "no output".to_owned())
+}
+
+/// The stderr-then-stdout precedence behind [`command_failure_detail`], with the
+/// both-blank fallback left to the caller.
+///
+/// Exists so the precedence rule lives in exactly one place. [`amd_smi_json`]
+/// needs the same ordering but a different last resort — `exit status <code>`
+/// rather than `no output`, because a silent amd-smi's exit code is the only
+/// diagnostic left — and inlining the two `is_empty` checks there to get it put
+/// the same rule in two places. `fallback` is a closure because formatting an
+/// `ExitStatus` is wasted work on the overwhelmingly common non-blank path.
+///
+/// `pub(crate)`, not `pub`: the only caller outside this module is
+/// [`amd_smi_json`], also in this crate. External callers that want the
+/// precedence rule want [`command_failure_detail`], which is the public pair of
+/// this and carries the fallback they would otherwise have to supply.
+pub(crate) fn command_failure_detail_or_else(
+    output: &std::process::Output,
+    fallback: impl FnOnce() -> String,
+) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return stderr;
@@ -268,7 +290,7 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
     if !stdout.is_empty() {
         return stdout;
     }
-    "no output".to_owned()
+    fallback()
 }
 
 /// The `--gpu-memory-utilization` workaround for a shared/busy GPU.
