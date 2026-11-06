@@ -233,6 +233,14 @@ raises the signal. `FakeEngine` quotes the response and its scratch directory
 for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
 apostrophe, reaches the client intact.
 
+A child whose answer cannot be read is killed and reaped before the error is
+returned, as it is when the request cannot be written, so the long-lived daemon
+does not collect a running engine or a zombie per failure.
+`a_failed_read_of_the_answer_kills_and_reaps_the_child` (Linux only) runs the
+read step on a real child with a reader that fails and checks that the child's
+`/proc` entry is gone: a killed child that was never waited on would keep it as a
+zombie.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
