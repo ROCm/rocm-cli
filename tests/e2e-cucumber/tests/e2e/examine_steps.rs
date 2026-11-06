@@ -2382,9 +2382,10 @@ fn plant_stand_in_rocminfo(dir: &std::path::Path) {
 }
 
 /// Replace the `PATH` the planted WSL machine gives the next `rocm` run with
-/// `entries`, followed by the runner's own entries that hold no `rocminfo`, so a
-/// runner with ROCm installed cannot be the reason the tool reads as found. The
-/// planted machine's `fake-bin` (its stand-in `ldconfig`) comes first.
+/// `entries`, then the machine's `fake-bin` (its stand-in `ldconfig`), then the
+/// runner's own entries that hold no `rocminfo`, so a runner with ROCm installed
+/// cannot be the reason the tool reads as found. How the runner's entries are
+/// resolved and filtered is [`e2e_cucumber::planted_path::planted_path_entries`].
 ///
 /// An entry that is an empty path is how a test writes the empty `PATH` entry
 /// the shell reads as the current directory.
@@ -2395,16 +2396,15 @@ fn set_planted_wsl_path(world: &mut E2eWorld, entries: &[PathBuf]) {
         .expect("no isolated root")
         .path()
         .to_owned();
-    let runner_path = std::env::var_os("PATH").unwrap_or_default();
-    let runner = std::env::split_paths(&runner_path)
-        .filter(|dir| !dir.as_os_str().is_empty() && !dir.join("rocminfo").exists());
-    let path = std::env::join_paths(
-        entries
-            .iter()
-            .cloned()
-            .chain(std::iter::once(root.join("fake-bin")))
-            .chain(runner),
-    )
+    // The runner's relative entries are resolved from this process's directory
+    // before they are checked, because the child may run from another one.
+    let path = std::env::join_paths(e2e_cucumber::planted_path::planted_path_entries(
+        entries,
+        &root.join("fake-bin"),
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &std::env::current_dir().expect("the harness has a working directory"),
+        |dir| dir.join(e2e_cucumber::planted_path::PLANTED_TOOL).exists(),
+    ))
     .expect("PATH entries cannot hold a separator");
     world.command_env.retain(|(key, _)| *key != "PATH");
     world.command_env.push(("PATH", path));

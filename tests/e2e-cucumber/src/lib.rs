@@ -16,6 +16,7 @@ pub mod monotonic_clock;
 pub mod paced_download;
 pub mod palette_rows;
 pub mod panic_capture;
+pub mod planted_path;
 pub mod polled_deadline;
 pub mod powershell_text_rule;
 pub mod quit_and_wait;
