@@ -75,7 +75,7 @@ Feature: Model serving
   # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
   # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
   # managed-lemonade fallback would mask the identical failure behind the
-  # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
+  # #897 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
   # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
   # fast per-PR canary rather than needing the @nightly large-checkpoint path.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
