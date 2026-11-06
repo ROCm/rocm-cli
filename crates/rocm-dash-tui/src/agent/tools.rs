@@ -208,12 +208,13 @@ pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
 // stop has finished). `doctor`/`examine` can re-register the configured setup
 // runtime in the runtime registry when its entry is missing. `update_check` and
 // `install_sdk_dry_run` cache package-index metadata under the cache folder.
-// `update_check` can also, on a host with no usable Python on PATH, download a
-// managed `uv` and Python into the data folder and record that Python in the
-// saved config; `install_sdk_dry_run` prepares no Python and saves no Python
-// path: on such a host it reports the Python a real install would prepare. (A
-// ROCm 10 preview still resolves package versions with `uv` and can fetch the
-// managed `uv` into the data folder.) The boundary type
+// Neither prepares a Python or saves a Python path: on a host with no usable
+// Python on PATH they report the Python a real update or install would prepare
+// (`update_check` runs `rocm update`, whose text report then carries a
+// `python_note:` line saying so), and only a real apply or install, which these
+// tools never run, prepares it. (A ROCm 10 or newer check or preview still
+// resolves package versions with `uv` and can fetch the managed `uv` into the
+// data folder, though never a Python.) The boundary type
 // (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
 // `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
