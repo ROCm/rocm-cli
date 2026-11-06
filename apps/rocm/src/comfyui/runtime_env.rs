@@ -21,7 +21,8 @@
 
 use super::{ComfyUiManifest, ComfyUiRuntimeEnvironment, SelectedRuntime};
 use crate::runtime_adopt::{
-    SetupRecovery, SingleReadyRuntime, registered_runtimes_with_setup, select_single_ready_runtime,
+    SetupRecovery, SingleReadyRuntime, recover_setup_runtime_registration,
+    registered_runtimes_with_setup, select_single_ready_runtime,
 };
 use crate::runtimes_cmd::runtime_usability_status;
 use crate::therock;
@@ -131,6 +132,14 @@ fn format_runtime_statuses<'a>(
 /// runtime to the list without writing its entry, so the `--runtime-id` an
 /// install preview prints is a command that works from the state the preview
 /// left. If setup's runtime cannot be used, the registry's own answer stands.
+///
+/// The two failures are not alike. Not finding a usable setup runtime leaves the
+/// registry's refusal, because the user named something else or setup left
+/// nothing. Failing to write the entry of a setup runtime that was found and
+/// picked is not a refusal about a missing runtime, and swallowing it would
+/// answer "Install ROCm first" about a runtime that is there, so that error is
+/// returned as it is. The runtime is therefore found and picked without writing,
+/// and written back only for a pick that is going to be used.
 fn pick_from_registry(
     paths: &AppPaths,
     config: &RocmCliConfig,
@@ -148,10 +157,18 @@ fn pick_from_registry(
             Err(error) => error,
         }
     };
-    match registered_runtimes_with_setup(paths, config, recovery) {
-        Ok(with_setup) if with_setup.len() > registered.len() => pick(&with_setup).cloned(),
-        _ => Err(refusal),
+    // Found without writing, whichever recovery was asked for: the write comes
+    // after the pick, so its failure is reported as what it is.
+    let with_setup = match registered_runtimes_with_setup(paths, config, SetupRecovery::PreviewOnly)
+    {
+        Ok(with_setup) if with_setup.len() > registered.len() => with_setup,
+        _ => return Err(refusal),
+    };
+    let picked = pick(&with_setup)?.clone();
+    if recovery == SetupRecovery::Persist {
+        recover_setup_runtime_registration(paths, config)?;
     }
+    Ok(picked)
 }
 
 fn install_rocm_first() -> anyhow::Error {
@@ -1252,6 +1269,150 @@ mod tests {
                     runtime_registry_entry_names(&paths),
                     expected_entries,
                     "{label}, {recovery:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Finding the setup runtime for a named choice must not hide that its
+    /// registry entry cannot be written back. The preview of such an install
+    /// succeeds, because it writes nothing; the printed command is the real run,
+    /// and it has to say why it cannot restore the entry rather than answer as if
+    /// there were no runtime ("Install ROCm first"). Each row asserts the error
+    /// and the registry together: the failing run leaves the registry as it
+    /// found it, and the runtime was still found (the preview, and the
+    /// unwritable registry's own refusal for a name that is not setup's).
+    #[test]
+    fn a_choice_naming_the_setup_runtime_reports_a_registry_that_cannot_take_it_back() -> Result<()>
+    {
+        type Choice = fn(&therock::InstalledRuntimeManifest, &mut RocmCliConfig) -> Option<String>;
+        let choices: [(&str, Choice); 5] = [
+            ("explicit key", |manifest, _| {
+                Some(manifest.runtime_key.clone())
+            }),
+            ("explicit id", |manifest, _| {
+                Some(manifest.runtime_id.clone())
+            }),
+            ("active runtime", |manifest, config| {
+                config.active_runtime_key = Some(manifest.runtime_key.clone());
+                None
+            }),
+            ("configured default", |manifest, config| {
+                config.default_runtime_id = Some(manifest.runtime_id.clone());
+                None
+            }),
+            // Not a named choice, but the same persistence, reported the same way.
+            ("no choice", |_, _| None),
+        ];
+        for (label, choice) in choices {
+            let paths = test_paths(&format!(
+                "comfyui-choice-unwritable-{}",
+                label.replace(' ', "-")
+            ));
+            let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                &paths,
+                "release-pip-gfx120x-all-7-14-0",
+            )?;
+            let mut config = RocmCliConfig::load(&paths)?;
+            let selector = choice(&manifest, &mut config);
+            let registry = crate::test_support::make_runtime_registry_unwritable(&paths)?;
+
+            let previewed = select_runtime(
+                &paths,
+                &config,
+                selector.as_deref(),
+                SetupRecovery::PreviewOnly,
+            )
+            .with_context(|| format!("{label}: the preview writes nothing"))?;
+            assert_eq!(
+                previewed.manifest.runtime_key, manifest.runtime_key,
+                "{label}"
+            );
+
+            let error =
+                select_runtime(&paths, &config, selector.as_deref(), SetupRecovery::Persist)
+                    .expect_err("a registry that cannot be written cannot take the entry back");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "failed to restore setup runtime `{}`",
+                    manifest.runtime_key
+                )),
+                "{label}: got: {message}"
+            );
+            assert!(
+                !message.contains("Install ROCm first") && !message.contains("not found"),
+                "{label}: the persistence error must not be replaced by a refusal about a missing runtime: {message}"
+            );
+            assert_eq!(
+                fs::read_to_string(&registry)?,
+                "not a directory",
+                "{label}: a failed restore leaves the registry as it was"
+            );
+        }
+        Ok(())
+    }
+
+    /// The same, with the registry readable and holding another runtime, which is
+    /// the state a read-only registry directory leaves. The refusal that stands
+    /// without the fix is then the registry's "not found", so the error is
+    /// compared with that. Where the directory stays writable regardless (an
+    /// administrator), the write succeeds and the test checks the restore
+    /// instead, so it cannot pass by writing nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_registry_directory_is_reported_not_hidden_behind_a_not_found() -> Result<()> {
+        use crate::runtimes_cmd::runtime_registry_dir;
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("comfyui-choice-read-only-registry");
+        let setup = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        let registry = runtime_registry_dir(&paths);
+        let original = fs::metadata(&registry)?.permissions();
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o555))?;
+
+        let selected = select_runtime(
+            &paths,
+            &config,
+            Some(&setup.runtime_key),
+            SetupRecovery::Persist,
+        );
+
+        fs::set_permissions(&registry, original)?;
+        match selected {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(&format!(
+                        "failed to restore setup runtime `{}`",
+                        setup.runtime_key
+                    )) && !message.contains("not found"),
+                    "got: {message}"
+                );
+                assert!(
+                    !runtime_registry_entry_names(&paths)
+                        .contains(&format!("{}.json", setup.runtime_key)),
+                    "a failed restore writes no entry"
+                );
+            }
+            Ok(selected) => {
+                assert_eq!(selected.manifest.runtime_key, setup.runtime_key);
+                assert!(
+                    runtime_registry_entry_names(&paths)
+                        .contains(&format!("{}.json", setup.runtime_key)),
+                    "the directory stayed writable, so the entry is restored"
                 );
             }
         }

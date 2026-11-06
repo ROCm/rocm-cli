@@ -376,3 +376,23 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     When the user runs the install command the preview printed
     Then the install uses the runtime setup created
     And the runtime registry has an entry for it again
+
+  # The same printed command, when the registry cannot take the entry back (a
+  # file stands where its directory should be, which stops an administrator as
+  # well; a read-only directory would not). The preview writes nothing, so it
+  # still succeeds and names the runtime. The real run finds that runtime the
+  # same way, fails to restore its entry, and says so, rather than answering
+  # "Install ROCm first" as if setup had left no runtime. The registry is left as
+  # it was. A read-only registry directory with other runtimes in it, the other
+  # way to reach this, is covered by a unit test: the suite can run as root, for
+  # whom a read-only directory is writable.
+  @id:comfyui-install-reports-a-registry-it-cannot-write
+  Scenario: comfyui-18 - The install command a ComfyUI install preview prints reports a registry that cannot take the runtime back
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    And the runtime registry cannot be written
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    When the user runs the install command the preview printed
+    Then the install is refused because the runtime's registry entry could not be restored
+    And the runtime registry is as it was

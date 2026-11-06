@@ -780,7 +780,7 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
-`comfyui-15` to `comfyui-17` cover which runtime `rocm comfyui install` uses
+`comfyui-15` to `comfyui-18` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
 was lost is found. The real run (`comfyui-16`, against an existing checkout that
@@ -790,10 +790,17 @@ promises not to change files. The preview prints the install command with that
 runtime's `--runtime-id`, and `comfyui-17` runs that command as printed from the
 state the preview left: an explicit `--runtime-id`, like an active or default
 runtime, finds the runtime setup created when the registry alone cannot answer,
-so the command works and writes the entry back. All three run with no GPU:
+so the command works and writes the entry back. `comfyui-18` runs the same
+printed command when the registry cannot take that entry back (a plain file
+stands where its directory should be, which also stops `root`; a read-only
+directory would not): the preview still succeeds, and the real run fails naming
+the runtime whose entry it could not restore, rather than saying "Install ROCm
+first", and leaves the registry as it was. The variant with a read-only registry
+directory that holds other runtimes is a unit test, because a read-only
+directory is writable to `root`. All four run with no GPU:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-1[567]"
+cargo xtask e2e -- -n "comfyui-1[5678]"
 ```
 
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed

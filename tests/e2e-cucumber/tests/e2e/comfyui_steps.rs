@@ -34,7 +34,7 @@
 //! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
-//! `comfyui-15` to `comfyui-17` cover the other half of that selection: with
+//! `comfyui-15` to `comfyui-18` cover the other half of that selection: with
 //! nothing chosen, the install recovers the runtime `rocm setup` created before
 //! it counts the ready ones, as `rocm serve` does, so a runtime the registry
 //! lost is found. They plant a ready runtime and the setup folder that names it,
@@ -43,7 +43,9 @@
 //! so the registry still has no entry afterwards; `comfyui-16` runs the install
 //! against an existing checkout and finds the entry written back; `comfyui-17`
 //! runs the command the preview printed, from the state the preview left, and
-//! finds the same entry written back.
+//! finds the same entry written back. `comfyui-18` runs that command with a
+//! registry that cannot be written and finds the failure to restore the entry
+//! reported.
 //!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
 //! mirroring `download_progress_pty.feature`'s tarball scenario but for
@@ -683,6 +685,54 @@ async fn comfyui_checkout_needing_no_dependencies(world: &mut E2eWorld) {
     write_fixture(
         &source_dir.join("requirements.txt"),
         "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
+    );
+}
+
+/// What stands where the registry directory should be for `comfyui-18`. A plain
+/// file stops every user, an administrator included, from creating the registry,
+/// where a read-only directory would not stop `root`.
+const UNWRITABLE_REGISTRY_CONTENTS: &str = "not a directory";
+
+#[given("the runtime registry cannot be written")]
+async fn runtime_registry_cannot_be_written(world: &mut E2eWorld) {
+    let registry = registry_dir(world);
+    assert!(
+        !registry.exists(),
+        "the registry must not exist yet for this step to mean anything"
+    );
+    write_fixture(&registry, UNWRITABLE_REGISTRY_CONTENTS);
+}
+
+/// The failing install names the entry it could not restore, so the user learns
+/// why, and is not told that setup left no runtime: the runtime exists, and the
+/// preview just named it.
+#[then("the install is refused because the runtime's registry entry could not be restored")]
+async fn install_refused_for_the_registry_entry(world: &mut E2eWorld) {
+    let text = refusal_text(world);
+    assert!(
+        world.cli_rc.is_some_and(|rc| rc != 0),
+        "the install should fail when the registry cannot take the runtime back, got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "failed to restore setup runtime `{SETUP_RUNTIME_KEY}`"
+        )),
+        "the failure should name the runtime whose entry could not be restored, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Install ROCm first"),
+        "the failure must not tell the user to install ROCm when setup left a runtime, got:\n{text}"
+    );
+}
+
+#[then("the runtime registry is as it was")]
+async fn runtime_registry_is_as_it_was(world: &mut E2eWorld) {
+    let registry = registry_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(&registry).ok().as_deref(),
+        Some(UNWRITABLE_REGISTRY_CONTENTS),
+        "a failed restore must leave {} as it found it",
+        registry.display()
     );
 }
 

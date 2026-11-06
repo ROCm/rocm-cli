@@ -1139,4 +1139,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
+
+    /// Recovering the setup runtime writes its registry entry, and a registry
+    /// that cannot take it is reported as that on every path that recovers:
+    /// an explicit `--runtime-id` and the one-ready-runtime default (which
+    /// `serve` and `engines install` both reach). Neither may answer as if there
+    /// were no runtime, or carry on without one: the runtime is there, and the
+    /// failure is what stops the command. The error and the registry are
+    /// asserted together.
+    #[test]
+    fn engine_selection_reports_a_registry_that_cannot_take_the_setup_runtime_back() -> Result<()> {
+        for explicit in [true, false] {
+            let (root, paths) = test_paths("setup-recovery-unwritable-registry");
+            let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                &paths,
+                "release-pip-gfx120x-all-7-14-0",
+            )?;
+            let registry = crate::test_support::make_runtime_registry_unwritable(&paths)?;
+            let runtime_id = explicit.then_some(manifest.runtime_key.as_str());
+
+            let error = validate_engine_selection_runtime(
+                &paths,
+                resolve_engine_selection(&RocmCliConfig::load(&paths)?, "vllm", runtime_id, None),
+            )
+            .expect_err("a registry that cannot be written cannot take the entry back");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "failed to restore setup runtime `{}`",
+                    manifest.runtime_key
+                )),
+                "explicit: {explicit}, got: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&registry)?,
+                "not a directory",
+                "explicit: {explicit}: a failed restore leaves the registry as it was"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+        Ok(())
+    }
 }

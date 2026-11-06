@@ -252,6 +252,21 @@ pub(crate) fn write_test_setup_runtime_missing_from_registry(
     Ok(manifest)
 }
 
+/// Make the runtime registry impossible to write for any user, an administrator
+/// included: a plain file stands where its directory should be, so listing the
+/// registry finds nothing and creating it fails. A read-only directory would
+/// not do, because it does not stop `root`, which is who the e2e suite can run as.
+/// Returns the path of that file, so a test can show it was left as it was.
+pub(crate) fn make_runtime_registry_unwritable(paths: &AppPaths) -> Result<PathBuf> {
+    let registry = runtime_registry_dir(paths);
+    let _ = fs::remove_dir_all(&registry);
+    if let Some(parent) = registry.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&registry, "not a directory")?;
+    Ok(registry)
+}
+
 /// File names in the runtime registry directory, sorted; empty when the
 /// directory does not exist. Lets a test assert that a selection did, or did
 /// not, write a registry entry.
