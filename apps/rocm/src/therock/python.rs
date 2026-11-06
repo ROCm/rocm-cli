@@ -587,19 +587,10 @@ impl PlannedPython {
                 version,
                 requirement,
                 tag_checked,
-            } => {
-                let unchecked = if *tag_checked {
-                    String::new()
-                } else {
-                    format!(
-                        " (its wheel tag cannot be checked until it is installed; {} is required)",
-                        requirement.tag
-                    )
-                };
-                Some(format!(
-                    "no usable Python was found; a real install would use uv to install managed Python {version}{unchecked} and save its path in the configuration, which this preview did not do"
-                ))
-            }
+            } => Some(format!(
+                "no usable Python was found; a real install would use uv to install managed Python {version}{} and save its path in the configuration, which this preview did not do",
+                unchecked_tag_caveat(*tag_checked, *requirement)
+            )),
         }
     }
 
@@ -628,18 +619,10 @@ impl PlannedPython {
                 version,
                 requirement,
                 tag_checked,
-            } => {
-                if *tag_checked {
-                    format!(
-                        "No usable Python found; a real install would prepare Python {version}. This preview does not."
-                    )
-                } else {
-                    format!(
-                        "No usable Python found; a real install would prepare Python {version}, whose wheel tag cannot be checked until it is installed ({} is required). This preview does not.",
-                        requirement.tag
-                    )
-                }
-            }
+            } => format!(
+                "No usable Python found; a real install would prepare Python {version}{}. This preview does not.",
+                unchecked_tag_caveat(*tag_checked, *requirement)
+            ),
         }
     }
 
@@ -666,6 +649,22 @@ impl PlannedPython {
                 "internal error: Python {version} was not prepared before the install needed it"
             ),
         }
+    }
+}
+
+/// The parenthetical a preview adds after the Python it would prepare when that
+/// version's wheel tag could not be read off its name, and nothing when it
+/// could. One function for [`PlannedPython::note`] and
+/// [`PlannedPython::progress_text`], so the two cannot word the same caveat
+/// differently.
+fn unchecked_tag_caveat(tag_checked: bool, requirement: PythonRequirement) -> String {
+    if tag_checked {
+        String::new()
+    } else {
+        format!(
+            " (its wheel tag cannot be checked until it is installed; {} is required)",
+            requirement.tag
+        )
     }
 }
 
@@ -1849,7 +1848,7 @@ exit 1
                 } else {
                     expected_promise = true;
                     expected.push(if matches!(version, VersionOverride::Unreadable) {
-                        format!("No usable Python found; a real install would prepare Python {version_name}, whose wheel tag cannot be checked until it is installed (cp312 is required). This preview does not.")
+                        format!("No usable Python found; a real install would prepare Python {version_name} (its wheel tag cannot be checked until it is installed; cp312 is required). This preview does not.")
                     } else {
                         format!("No usable Python found; a real install would prepare Python {version_name}. This preview does not.")
                     });
@@ -1995,7 +1994,7 @@ exit 1
         );
         assert_eq!(
             planned.progress_text(),
-            "No usable Python found; a real install would prepare Python pypy@3.10, whose wheel tag cannot be checked until it is installed (cp312 is required). This preview does not."
+            "No usable Python found; a real install would prepare Python pypy@3.10 (its wheel tag cannot be checked until it is installed; cp312 is required). This preview does not."
         );
         assert!(!host.uv_was_run());
         assert_eq!(snapshot(&host.paths), Vec::<PathBuf>::new());
