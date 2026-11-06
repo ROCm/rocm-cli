@@ -151,7 +151,9 @@ writes are covered that way: the request to the child's stdin, and the forwardin
 of the child's stderr to this process's stderr (a line of progress, and the note
 recorded when reading it fails). The forwarding test writes into a real pipe whose
 reader is closed, because a mock sink that returns `BrokenPipe` itself never
-raises the signal.
+raises the signal. `FakeEngine` quotes the response and its scratch directory
+for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
+apostrophe, reaches the client intact.
 
 ### Advised commands must parse
 
