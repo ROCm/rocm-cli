@@ -333,6 +333,33 @@ ROCm backend directory under `bin/llamacpp/`, and run
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
 
+To check what a Lemonade install says about its size (no download needed for
+the refusal): in a fresh data folder on a drive with less than about 5 GiB free,
+or a debug build with `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1073741824` set, run
+`rocm engines install lemonade --yes`. Expected result:
+
+- Before anything else it prints `Installing Lemonade <version> and its
+  llama.cpp ROCm backend into <folder>` and a line giving the approximate
+  download (about 4.4 GiB), disk use (about 25 GiB) and the free space on that
+  drive.
+- It then fails with `not enough free disk space to install Lemonade ...
+  Nothing was downloaded.`, and `<folder>` has no `downloads` or `runtime`
+  subfolder.
+
+With room to spare, on Windows from an interactive console: install Lemonade
+with no runtime active, then `rocm install sdk`, then `rocm serve <gguf-model>`.
+Expected result:
+
+- The serve prints the install notice for the runtime's own
+  `engines\lemonade` folder, and says the data folder's copy is not reused.
+- Lemonade's own backend download progress (`[1/2] ...`, `Total: ...`) appears
+  in the console instead of a silent wait.
+- `rocm storage report` lists both copies under `Engine installs`, with the data
+  folder's one `not used` and the runtime's one `in use`.
+- `rocm runtimes uninstall <runtime-key>` says Lemonade's install was inside the
+  runtime and removed with it, and a following `rocm storage report` shows the
+  remaining copy as `not recorded as installed`.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a

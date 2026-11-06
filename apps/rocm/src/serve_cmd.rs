@@ -862,8 +862,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
     // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
     // not have.
+    //
+    // The scripted free-space override opens the same waiver: it exists to refuse a
+    // Lemonade install on a drive that cannot hold it, which `rocm serve` only
+    // reaches past this bail.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+        && [
+            "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
+            "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES",
+        ]
+        .iter()
+        .any(|variable| std::env::var_os(variable).is_some());
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()

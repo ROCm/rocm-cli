@@ -28,6 +28,7 @@ mod archive_props;
 mod backend_alignment;
 mod device_policy;
 mod direct_llama;
+mod footprint;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -41,6 +42,12 @@ mod test_support;
 // the crate root before the split, and `apps/rocm` depends on this crate's
 // lib target.
 pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+// The read-only view of Lemonade's install trees and record that `apps/rocm`
+// needs for `rocm storage` and `rocm runtimes uninstall`; see `footprint`.
+pub use footprint::{
+    InstallRecord, RecordCleanup, forget_install_record_inside, install_record, install_tree_dirs,
+    install_tree_root, recorded_runtime_dir, tree_has_install,
+};
 
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
@@ -371,14 +378,31 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             bail!("scripted Lemonade backend install failure")
         })?;
     }
-    eprintln!(
-        "Preparing Lemonade embeddable {}...",
-        rocm_deps::LEMONADE_VERSION
-    );
     let env_root = request
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
+    // Announced and space-checked before anything is downloaded: a fresh tree
+    // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
+    if let Some(preflight) = crate::footprint::plan_install_preflight(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::footprint::available_space_for_install,
+    ) {
+        for line in preflight.notice_lines() {
+            eprintln!("{line}");
+        }
+        match preflight.space_verdict() {
+            crate::footprint::SpaceVerdict::Fits => {}
+            crate::footprint::SpaceVerdict::Tight(warning) => eprintln!("{warning}"),
+            crate::footprint::SpaceVerdict::Refuse(message) => bail!(message),
+        }
+    }
+    eprintln!(
+        "Preparing Lemonade embeddable {}...",
+        rocm_deps::LEMONADE_VERSION
+    );
     let mut manifest =
         crate::install::prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
     eprintln!("Detecting best supported Lemonade llama.cpp backend...");
