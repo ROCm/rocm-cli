@@ -19,9 +19,12 @@
 //! This guard walks the whole tree, finds every file under a
 //! `proptest-regressions/` directory, and maps it back to the source file
 //! proptest would have derived it from. A seed file is an orphan when that
-//! source file does not exist, or exists but holds no `proptest!` block. The
-//! failure names the file, says which source file it expected, and says what
-//! to do about it.
+//! source file does not exist, or exists but holds no `proptest!` block. A
+//! block is the name, the `!` and an opening delimiter as separate tokens, so
+//! `proptest ! { .. }` and `proptest /* note */ ! { .. }` count; a mention in a
+//! comment or a string literal, a longer name (`my_proptest!`) and a bang that
+//! opens nothing (`proptest != x`) do not. The failure names the file, says
+//! which source file it expected, and says what to do about it.
 //!
 //! What it deliberately does not check: that the seed still reproduces
 //! anything (a fixed bug leaves a harmless, still-replayed seed), or which
@@ -42,8 +45,9 @@ mod tests {
     /// The directory name proptest's default persistence uses.
     const REGRESSIONS_DIR: &str = "proptest-regressions";
 
-    /// The text that marks a file as holding a property test.
-    const PROPTEST_MACRO: &str = "proptest!";
+    /// The name of the macro that marks a file as holding a property test,
+    /// which `proptest!` spells with a `!` and a delimiter after it.
+    const PROPTEST_MACRO: &str = "proptest";
 
     fn repo_root() -> PathBuf {
         // CARGO_MANIFEST_DIR is the xtask/ crate dir; its parent is the repo
@@ -134,11 +138,35 @@ mod tests {
     /// which blanks the contents of comments, string literals, raw strings and
     /// char literals, and only what is left is searched.
     ///
-    /// It still does not parse Rust: a `proptest!` that only appears as an
-    /// identifier suffix (`my_proptest!`) or inside another macro's arguments
-    /// counts. Nothing in this tree does either.
+    /// What is searched for is the name, the `!` and an opening delimiter as
+    /// separate tokens, not the text `proptest!`: Rust allows whitespace and
+    /// comments between them (`proptest ! { .. }`, `proptest /* note */ ! { .. }`),
+    /// and proptest reads the seed file of such a block all the same. The
+    /// stripper leaves whitespace alone and blanks a comment to spaces, so
+    /// skipping whitespace after the name, and again after the `!`, covers
+    /// both. The name must not be glued to a longer identifier (`my_proptest!`
+    /// is another macro), and a `!` that does not open a delimiter
+    /// (`proptest != x`, a variable compared with something) is not an
+    /// invocation.
+    ///
+    /// It still does not parse Rust: a `proptest!` inside another macro's
+    /// arguments counts, and so does one in a block that is compiled out by a
+    /// `cfg`. Nothing in this tree does either.
     fn has_proptest_block(source: &str) -> bool {
-        strip_literals_and_comments(source).contains(PROPTEST_MACRO)
+        let code = strip_literals_and_comments(source);
+        code.match_indices(PROPTEST_MACRO).any(|(at, name)| {
+            let glued_to_a_longer_name = code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_alphanumeric() || before == '_');
+            if glued_to_a_longer_name {
+                return false;
+            }
+            code[at + name.len()..]
+                .trim_start()
+                .strip_prefix('!')
+                .is_some_and(|after_bang| after_bang.trim_start().starts_with(['{', '(', '[']))
+        })
     }
 
     /// Why a seed file is not read by any test.
@@ -431,6 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn text_that_only_resembles_the_macro_does_not_keep_a_seed_alive() {
+        // The other side of reading `proptest`, `!` and a delimiter as separate
+        // tokens: the looser match must not accept what is not an invocation.
+        let expected = vec![Orphan::NoPropertyTest {
+            seed: "apps/rocm/proptest-regressions/main.txt".to_string(),
+            expected: "apps/rocm/src/main.rs".to_string(),
+        }];
+        let mut accepted = Vec::new();
+        for (what, source) in [
+            ("a longer macro name", "my_proptest! { }\n"),
+            ("a longer macro name, spaced", "my_proptest ! { }\n"),
+            ("a name that continues", "proptest_cases! { }\n"),
+            ("the name alone", "use proptest::prelude::*;\n"),
+            ("a function of that name", "fn proptest() {}\n"),
+            (
+                "a comparison",
+                "fn f(proptest: u8) -> bool { proptest != 3 }\n",
+            ),
+            ("a bang with no delimiter", "const X: u8 = proptest ! 3;\n"),
+            ("a sibling macro", "proptest::prop_compose! { }\n"),
+            ("a trailing name", "proptest\n"),
+        ] {
+            if orphans_when_main_holds(source) != expected {
+                accepted.push(what);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "the guard counted text that is not a proptest! invocation: {accepted:?}"
+        );
+    }
+
+    #[test]
     fn a_property_block_next_to_comments_and_literals_still_counts() {
         // The other direction: stripping must not hide a real block. Each is
         // a source the guard has to accept, so the stricter scan cannot turn a
@@ -460,6 +521,32 @@ mod tests {
                 "proptest! {\n    // a note\n    #[test] fn p() {}\n}\n",
             ),
             ("through its path", "::proptest::proptest! { }\n"),
+            ("with a space before the bang", "proptest ! { }\n"),
+            ("with a tab before the bang", "proptest\t! { }\n"),
+            ("with the bang on the next line", "proptest\n    ! {\n}\n"),
+            (
+                "with a block comment before the bang",
+                "proptest /* note */ ! { }\n",
+            ),
+            (
+                "with a nested block comment before the bang",
+                "proptest/* a /* b */ c */! { }\n",
+            ),
+            (
+                "with a line comment before the bang",
+                "proptest // note\n    ! { }\n",
+            ),
+            (
+                "with a space before the bang, through its path",
+                "::proptest::proptest ! { }\n",
+            ),
+            ("with spaces around the bang", "proptest  !  {\n}\n"),
+            ("with parentheses as its delimiter", "proptest! (\n);\n"),
+            ("with brackets as its delimiter", "proptest![];\n"),
+            (
+                "with a comment between the bang and its delimiter",
+                "proptest! /* note */ { }\n",
+            ),
         ] {
             if !orphans_when_main_holds(source).is_empty() {
                 hidden.push(what);

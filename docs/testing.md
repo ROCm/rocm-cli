@@ -305,7 +305,8 @@ This is enforced in part by a test, not by an `xtask` subcommand:
 `xtask` walks the tree and **fails the build** on a file under any
 `proptest-regressions/` directory whose `<crate>/src/<path>.rs` is missing or
 holds no `proptest!` block in code (a mention in a comment or a string literal
-does not count), naming the file and the source file it expected. It cannot see
+does not count; whitespace or a comment between `proptest` and the `!`, as in
+`proptest ! { .. }`, still does), naming the file and the source file it expected. It cannot see
 the opposite mistake, a split that `git mv`d the regression file away from tests
 that still need it: no file is orphaned then, one is just missing, so read the
 diff of a split for it. Run the check on its own with:
