@@ -13,7 +13,10 @@ use std::path::Path;
 
 use maud::{Markup, html};
 
-use super::{CellOutcome, Grid, LEGEND_ENTRIES, PlatformReport, PlatformReports, platform_cell};
+use super::{
+    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING, PlatformReport,
+    PlatformReports, platform_cell,
+};
 use crate::components::{feature_group, now_utc, page_shell, stats_bar};
 
 /// Run-level metadata shown in the report header so a downloaded report can be
@@ -273,11 +276,12 @@ fn legend() -> Markup {
                     " — no GPU. The CLI runs against a fake in-process model "
                     "server (a planted service record), validating CLI behaviour "
                     "and wiring without hardware. Runs on a GitHub-hosted runner "
-                    "and gates the PR."
+                    "and " (MOCK_GATES_PR) "."
                 }
                 li {
                     b { "Every other platform" }
-                    " — real self-hosted GPU hardware; non-blocking while proven out."
+                    " — real self-hosted GPU hardware; " (OTHER_LANES_NON_BLOCKING)
+                    " while proven out."
                 }
                 li {
                     b { "Status" }
@@ -322,6 +326,22 @@ mod tests {
     use super::*;
     use crate::consolidated::test_support::{feature_json, write_platform};
     use crate::consolidated::{load_platform_reports, load_reports};
+
+    #[test]
+    fn legend_mock_and_other_platform_items_are_unchanged() {
+        // Pins the two gating items byte for byte, so building them from shared
+        // fragments (see `MOCK_GATES_PR`) cannot change what the HTML
+        // report's legend says. Text only: that Mock is the required check and
+        // the rest are not is branch protection, outside this repository.
+        let html = legend().into_string();
+        let expected = "<li><b>Mock</b> — no GPU. The CLI runs against a fake in-process model \
+             server (a planted service record), validating CLI behaviour \
+             and wiring without hardware. Runs on a GitHub-hosted runner \
+             and gates the PR.</li>\
+             <li><b>Every other platform</b> — real self-hosted GPU hardware; \
+             non-blocking while proven out.</li>";
+        assert!(html.contains(expected), "legend text changed:\n{html}");
+    }
 
     #[test]
     fn generate_consolidated_renders_the_expectation_grid() {

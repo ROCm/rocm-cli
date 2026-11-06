@@ -396,6 +396,34 @@ Feature: Model serving
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+  # The `/dev/kfd` pre-flight (EAI-8457) is covered by `examine-31` in
+  # `examine.feature`, not here, and this note records why the scenario lives
+  # there rather than alongside the serve probes it also guards.
+  # The behaviour: on a Linux host where the KFD device cannot be opened,
+  # `rocm_core::amd_smi_json` declines the launch outright, so `serve`'s
+  # `gpu_vram_usage` and `detect_gpu_count` degrade to service state alone where
+  # they previously attempted the spawn. The same chokepoint serves `rocmd`'s
+  # bridge snapshot, and that surface is the one a scenario can observe
+  # directly: the snapshot reports `amd_smi_available` and a note that says why,
+  # as JSON, in one command. `serve`'s probes discard their error with `.ok()?`
+  # by design, so the declined branch is visible there only as the absence of a
+  # GPU-aware placement -- which a GPU-less lane cannot tell apart from having
+  # no GPU. One scenario on the observable surface beats a weaker one here.
+  # Reaching either branch needs the `e2e-test-hooks` seam
+  # `ROCM_E2E_KFD_DEVICE` (`rocm_core::preflight_kfd_device`), which moves the
+  # device the gate opens. `ROCM_CLI_TEST_HOST_ROOT` cannot substitute: the gate
+  # keeps the real node's veto on purpose, so a simulated root can make it
+  # decline but never allow -- see
+  # `the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto`.
+  # Also covered at unit level in `rocm-core`, each confirmed non-vacuous by
+  # mutation: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts the gate
+  # stops the *spawn* (a fake `amd-smi` leaves a marker file that must not
+  # appear), with the same fixture re-run against a readable device to prove the
+  # fake would otherwise have executed;
+  # `the_public_amd_smi_entry_point_gates_on_the_real_kfd_device` pins that the
+  # production wrapper gates on the real device; and
+  # `the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it` pins that the
+  # seam above relocates the probe instead of skipping it.
   # Regression test for the reuse exemption (ROCMAI-419 review). Under the
   # default `gpu_required` policy a host with no usable AMD GPU refuses `rocm
   # serve` outright, before any engine work. Re-issuing `serve` against a managed
@@ -671,6 +699,27 @@ Feature: Model serving
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
 
+  # ROCMAI-873: on WSL the GPU is reached through /dev/dxg and ROCDXG, and there
+  # is no /dev/kfd. The no-usable-GPU refusal used to tell every user to "confirm
+  # /dev/kfd is present", which a WSL user cannot do. It now names the status
+  # `rocm examine` reports for the path the probe actually asked about, and the
+  # last step runs that command on the same machine to show it exists and reports
+  # the condition (`wsl_rocdxg_missing`).
+  #
+  # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
+  # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
+  # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
+  # verdict) and the unit tests on the serve gate; there is no scenario for the
+  # launch that follows, because it would start preparing a real engine.
+  @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
+  Scenario: serve-42 - Serving on a WSL host whose ROCDXG library the loader cannot find is refused with WSL advice
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user serves a model under the GPU-required default on that machine
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the refusal points the user at the WSL driver status instead of /dev/kfd
+    And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
 
   # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
   # so it cannot be combined with the attached modes, which already stay on the
@@ -678,6 +727,6 @@ Feature: Model serving
   # exits first) is covered by `wait_past_readiness_budget_*` in
   # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
   @id:serve-wait-conflicts-with-attached-modes
-  Scenario: serve-42 - Waiting for readiness cannot be combined with attached mode
+  Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
     When the user serves a model with both --wait and --verbose
     Then the CLI refuses and names the conflicting flags

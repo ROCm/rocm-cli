@@ -1070,7 +1070,7 @@ rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 While a first-time model download is running, `rocm serve <model> --wait` keeps
 waiting past the usual 45 seconds until the server answers or its engine gives up
 (vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
-and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-42`); `--foreground` is refused
+and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
 by the argument parser, covered by a unit test. Run the log follow above from a
 second terminal to watch the download.
 
@@ -2670,10 +2670,167 @@ distinctly from both a malformed line and an unknown distribution:
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
 ```
 
+`examine-32` and `examine-33` plant a WSL machine under the same simulated root
+(`/dev/dxg`, DXCore and `librocdxg.so`) with a stand-in `ldconfig` on `PATH`
+whose cache does not list the library, and set `LD_LIBRARY_PATH` explicitly. With
+the library's directory on it, `driver_status` is `wsl_rocdxg_ready`; with the
+variable empty it is `wsl_rocdxg_missing`, which is the control that shows the
+first scenario turns on `LD_LIBRARY_PATH` and not on the planted files alone. Both
+run on every Linux lane, because the planted root, not the runner, decides what
+the probe finds.
+
+`examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
+library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
+own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+cache nor the variable involved, which is the layout of a TheRock tarball
+(ROCM-30386). Its control is `examine-33`, which plants the library alone and
+stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
+is what the verdict turns on.
+
+`serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[123] |serve-42 '
+```
+
 The install plans deliberately read the real file, so no scenario plants one
 for them, including for the fallback; their parsing is covered by the unit
 tests above, and the fallback itself by `hardware_root`'s own unit tests,
 since both now read through the same helper with an identity resolver.
+
+## amd-smi KFD pre-flight
+
+Every synchronous `amd-smi` launch goes through
+[`rocm_core::amd_smi_json`](../crates/rocm-core/src/amd_smi.rs), which first
+tries to open `/dev/kfd` for reading and declines the launch outright when it
+cannot. Against a device in the wrong kernel state `amd-smi` blocks in
+uninterruptible sleep, where no signal and therefore no caller timeout reaches
+it, so declining is the only outcome that bounds `rocmd`'s telemetry poll and
+`serve`'s GPU probes. The open is itself bounded (2s) and the number of probes
+that may be parked at once is capped (8), so the gate's own probe cannot inherit
+the stall it exists to refuse. The dashboard collector
+([amd_smi.rs](../crates/rocm-dash-collectors/src/amd_smi.rs)) gates its own
+launch on the same device through the same shared probe,
+`rocm_core::device_readable_bounded`.
+
+The gate declines on *any* unreachable device, including the fast errno cases
+(absent node, permission denied) that cannot hang anything. That is wider than
+the hazard and deliberate; `kfd_readable`'s doc comment says why, and names what
+`serve` still answers from on such a host.
+
+```bash
+cargo test -p rocm-core --lib amd_smi
+cargo test -p rocm-core --lib --features e2e-test-hooks -- the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it the_public_amd_smi_entry_point_gates_on_the_real_kfd_device
+```
+
+The unit tests cover the gate in isolation: that it stops the *spawn* rather
+than reporting a failure afterwards (a stub `amd-smi` leaves a marker file, and
+its absence is the evidence), that the probe declines rather than hangs against
+a device whose `open` blocks (a FIFO with no writer), that the in-flight budget
+declines rather than parking threads without bound, that the WSL and off-Linux
+wave-throughs hold, and that the public entry point gates on `/dev/kfd` itself
+rather than on some other path.
+
+**The `ROCM_E2E_KFD_DEVICE` seam.** `rocm_core::preflight_kfd_device` reads this
+variable and uses the path it names as the device the pre-flight opens. Only a
+build carrying the `e2e-test-hooks` feature honours it; a released artefact has
+no override compiled in and always gates on `/dev/kfd`. It moves the gate rather
+than removing it, so a scenario pointing it at an unopenable path gets the
+declining branch and one pointing it at an ordinary file gets the allowed
+branch, while with the variable unset the behaviour is production's on every
+build.
+
+`ROCM_CLI_TEST_HOST_ROOT` cannot stand in for it. The gate keeps the real
+`/dev/kfd`'s veto on purpose, so a simulated root can only ever make it decline,
+never allow — which is what stops a test hook starting a real `amd-smi` on a
+machine with no GPU, and also what makes the *allowed* branch unreachable under
+a simulated root on the GPU-less lane that runs per PR.
+
+`examine-31` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) covers the
+declining branch end to end. It plants a stub `amd-smi` that would answer the
+telemetry probe perfectly and records that it ran, points the seam at a path
+inside the scenario's isolated root that is never created, and checks that
+`rocmd`'s bridge snapshot still exits 0, reports `amd_smi_available: false`,
+carries a note saying the launch was *declined*, and names the device **this
+run** pointed the pre-flight at. Both of the last two are what make it
+non-vacuous: without the marker the scenario would pass against a gate that had
+been deleted and merely failed the spawn, and without the named device it would
+pass against a build that ignored the seam, since the GPU-less lane has no
+readable `/dev/kfd` of its own either. Linux-only, like its `examine-24` to
+`examine-26` telemetry siblings: the stub is a shell script, and the gate is a
+wave-through on every other platform.
+
+```bash
+cargo xtask e2e -- -n 'examine-31 '
+```
+
+No scenario drives the `rocm serve` / `rocm model` call sites through the gate.
+Those probes degrade to service-state-only GPU selection rather than failing,
+so there is no user-visible *output* for a scenario to assert on.
+
+Be precise about what does cover them, because the two halves have different
+guards. What the call sites do **with a missing count** is covered by
+`gpu_policy.rs`'s unit tests — `effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows`
+pins the `None` fall-through. That the call sites **route through the
+chokepoint at all** is *not* covered by any unit test: it is guarded by
+`xtask/src/amd_smi_launch_contract.rs`, a static text scan that fails the build
+when a file outside its allowlist calls `resolve_amd_smi_binary`. A rewrite that
+kept the count behaviour but spawned `amd-smi` directly would be caught by that
+scan and by nothing else. The decline
+itself is no longer discarded — `gpu_policy.rs`'s `amd_smi_probe_json` logs it
+at `info` with the full error chain, which is what makes "why did `--gpu auto`
+not rank my GPUs?" answerable without re-running. It is not `warn`, because on
+a GPU-less host it fires on every `serve`, where it is the expected answer and
+not a fault; and not `debug`, because the default filter is `warn,rocm=info`,
+so a `debug` line is invisible unless the user already suspected this — the
+wrong way round for the case that needs it, where the 2s open bound trips on a
+slow but healthy host and the decline is indistinguishable from "no GPU".
+
+### Keeping new launch sites inside the gate
+
+A chokepoint only holds while every launch site uses it, and nothing in a
+behavioural test suite fails when one stops: the regression is the *absence* of
+a call. [amd_smi_launch_contract.rs](../xtask/src/amd_smi_launch_contract.rs) is
+the structural guard for that. It scans every `.rs` file in the tree (comments
+stripped) for calls to `rocm_core::resolve_amd_smi_binary` — the only way to
+find the binary, since the managed SDK ships `amd-smi` inside the runtime
+wheel's bin directory rather than on `PATH` — and fails unless the calling file
+is one of two allowlisted, justified sites. Reverting either `gpu_policy.rs`
+probe to a raw `Command::new(resolve_amd_smi_binary())` now fails this test by
+name. It is bidirectional like the crate-edge allowlist: an entry whose file
+stops calling the resolver is stale and fails too.
+
+```bash
+cargo test -p xtask amd_smi_launch_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a resolver reached through
+a function pointer or a re-export under another name is outside what it can
+see. It closes the cheap, likely regression and claims nothing more.
+
+### What the gate is, and is not
+
+**It is a mitigation heuristic, not a proof.** The gate establishes exactly one
+thing: that `open("/dev/kfd")` returned within 2s. The D-state hang it exists to
+prevent is attributed to `amd-smi`'s *later* `ioctl`s against a wedged device,
+not to the open — so a device whose open succeeds and whose next ioctl wedges is
+not covered, and the 2s bound is a chosen number rather than a measured one. No
+run against a genuinely unhealthy driver was performed for this work: the GPU
+lane has no `amd-smi` at all, and the FIFO fixtures model a blocking `open`,
+which is the closest reachable analogue rather than the real failure. What the
+gate does buy is that the common precondition for the hazard — a device the
+kernel will not hand out — refuses the spawn instead of betting on a timeout
+that cannot reach a process in uninterruptible sleep.
+
+**The decline is broader than the hazard, and broader than the ticket.** Any
+unreachable `/dev/kfd` declines, including the fast errno cases that cannot hang
+anything: an absent node (EAI-8457 states the scenario does not apply with no
+`/dev/kfd`) and `EACCES` for a user outside the `render`/`video` groups.
+`gpu_vram_usage` still falls back to the DRM sysfs counters on such a host, but
+`detect_gpu_count` has **no** sysfs fallback and returns `None`, so `--gpu auto`
+there ranks from the sysfs VRAM rows alone. `kfd_readable`'s doc comment carries
+the same statement next to the code.
 
 ## Windows Runtime Preflight
 
