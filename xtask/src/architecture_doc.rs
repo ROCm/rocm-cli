@@ -83,7 +83,6 @@ const EXEMPT: &[&str] = &[
     "crates/rocm-dash-daemon/src/bench_ring.rs",
     "crates/rocm-dash-daemon/src/demo.rs",
     "crates/rocm-dash-daemon/src/persist.rs",
-    "crates/rocm-dash-daemon/src/registry.rs",
     "crates/rocm-dash-daemon/src/snapshot_ring.rs",
     "crates/rocm-dash-daemon/src/transport.rs",
     "crates/rocm-dash-tui/src/client.rs",
