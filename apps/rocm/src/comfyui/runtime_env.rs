@@ -1572,9 +1572,9 @@ mod tests {
             setup_entry_written: bool,
         }
 
-        let registered_keys = ["runtime-a", "runtime-b"];
         const SETUP_KEY: &str = "runtime-s";
         const MULTIPLE: &str = "Multiple ROCm runtimes are ready";
+        let registered_keys = ["runtime-a", "runtime-b"];
         let restore_failed = format!("failed to restore setup runtime `{SETUP_KEY}`");
         let mut rows_run = 0;
         let mut rows_skipped = 0;
@@ -1631,13 +1631,11 @@ mod tests {
                                 if ready == 0 {
                                     crate::test_support::make_runtime_registry_unwritable(&paths)?;
                                 } else {
-                                    match make_registry_read_only(&paths) {
-                                        Some(guard) => _read_only = guard,
-                                        None => {
-                                            rows_skipped += 1;
-                                            continue;
-                                        }
-                                    }
+                                    let Some(guard) = make_registry_read_only(&paths) else {
+                                        rows_skipped += 1;
+                                        continue;
+                                    };
+                                    _read_only = guard;
                                 }
                             }
                             rows_run += 1;
@@ -1741,7 +1739,7 @@ mod tests {
 
                             match (outcome, expected.selected) {
                                 (Ok(selected), Some(key)) => {
-                                    assert_eq!(selected.manifest.runtime_key, key, "{row}")
+                                    assert_eq!(selected.manifest.runtime_key, key, "{row}");
                                 }
                                 (Ok(selected), None) => panic!(
                                     "{row}: expected a refusal, picked {}",
