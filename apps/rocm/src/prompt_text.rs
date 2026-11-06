@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Text extraction from a natural-language request, shared by `chat.rs`'s
+//! Text extraction from a natural-language request, shared by `chat/intent.rs`'s
 //! prompt-intent heuristics (`fallback_rocm_tool_call_for_prompt`,
 //! `fallback_config_tool_call_for_prompt`, `install_sdk_chat_approval_for_prompt`
 //! and the `prompt_*` predicates) and the freeform planner: which of a list of

@@ -1445,9 +1445,9 @@ pub(crate) mod tests {
     }
 
     /// `build_driver_install_plan_read` is the one seam `install_driver` hands
-    /// its `real_os_release()` result to. Both are now one-line delegations
-    /// to `hardware_root::read_os_release`, so reverting either back to a raw
-    /// `/etc/os-release` read is a type error here, not a silent regression.
+    /// `hardware_root::real_os_release()`'s result to, so reverting that back to
+    /// a raw `/etc/os-release` read is a type error here, not a silent
+    /// regression.
     /// This still pins the behaviour at the seam itself: an `OsRelease` that
     /// says the fallback path was read plans exactly what a primary-path read
     /// with the same content would.
