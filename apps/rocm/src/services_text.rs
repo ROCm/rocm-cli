@@ -519,7 +519,7 @@ pub(crate) fn render_service_action_result_with_helper_note(
 ) -> String {
     let mut text = render_service_action_result(tool, value);
     if tool == "stop_server"
-        && let Some(note) = crate::service_launch::background_helper_note(paths)
+        && let Some(note) = crate::background_helper::background_helper_note(paths)
     {
         let _ = writeln!(text, "  note: {}", note.text);
     }

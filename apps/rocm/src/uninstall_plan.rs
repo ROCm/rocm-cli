@@ -137,7 +137,7 @@ pub(crate) fn build_uninstall_plan(
     // Only a helper that is running can be left behind. "Uninstall does not stop
     // it" is said only where that is the whole story: with a watcher enabled the
     // helper stays up; an idle one is already on its way out.
-    if let Some(note) = crate::service_launch::background_helper_note(paths)
+    if let Some(note) = crate::background_helper::background_helper_note(paths)
         && note.running
     {
         plan.warnings.push(if note.outlives {

@@ -10,6 +10,7 @@ mod advised_commands;
 #[path = "../../../crates/rocm-core/src/archive_props.rs"]
 mod archive_props;
 mod automations;
+mod background_helper;
 mod bootstrap;
 mod bridge_snapshot;
 mod chat;
