@@ -50,8 +50,11 @@ otherwise the job fails at once.
 
 Dispatch `nightly-queue.yml` with a run's `request_id` — the id its
 `queue-run.yml` job printed — to publish that run again, for instance when that
-job was cancelled while the run went on. It never starts a run, and there is
-no default: a run that did not happen cannot be published in its place. It
+job was cancelled while the run went on. Such a run was never finished, so if
+its lanes are done the queue side finishes it first. Do that within a day of
+its lanes finishing: the queue keeps them no longer. It never starts a run,
+and there is no default: a run that did not happen cannot be published in its
+place. It
 fails, rather than reporting green, when:
 
 - the named run has not finished, or never existed
@@ -201,8 +204,9 @@ checks the signature: a tampered runner would skip its own check.
 
 **Results move by a shared volume, not a network call.** The queue side writes
 each finished run's publishable files; the runner reads them read-only. No
-credential is needed between the two, and the only call the runner makes is
-the request for a run.
+credential is needed between the two, and the runner's only calls ask the
+queue side to start a run, how it is going, and to finish it; none carries a
+file.
 
 **A run is asked for, not submitted, from here.** `queue-run.yml` holds no
 credential and sends nothing to the queue: the runner, which sits next to the
