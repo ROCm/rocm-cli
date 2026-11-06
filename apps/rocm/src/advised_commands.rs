@@ -1159,7 +1159,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the non-interactive launcher report",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm tools: {}",
         "`rocm tools: enabled` status row",
     ),
@@ -1194,7 +1194,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "validation error naming the chat `rocm` tool",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm command",
         "fallback label for an unrenderable chat tool call",
     ),

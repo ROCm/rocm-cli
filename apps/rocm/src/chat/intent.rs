@@ -21,7 +21,7 @@
 //! edges out are `prompt_text.rs` (the phrase and install-detail extraction),
 //! `rocm_argv.rs`, `tool_policy.rs` (`ChatToolApprovalRequest`),
 //! `freeform_planner.rs` (`format_structured_tool_call`) and `providers` (the
-//! tool-call type). The turn loop in `chat.rs` reads this module's items
+//! tool-call type). The turn loop in `chat/turn.rs` reads this module's items
 //! through `super::intent`.
 
 use crate::freeform_planner::format_structured_tool_call;

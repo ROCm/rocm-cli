@@ -20,7 +20,7 @@
 //! `select_serve_engine`.
 //!
 //! The two renderers and `format_bytes` are `pub(crate)`; `main.rs` imports them
-//! and `chat.rs`, `storage.rs` and `automations.rs` reach them as
+//! and `chat/mcp_bridge.rs`, `storage.rs` and `automations.rs` reach them as
 //! `crate::<name>`. Every other item is private.
 
 use std::collections::BTreeMap;

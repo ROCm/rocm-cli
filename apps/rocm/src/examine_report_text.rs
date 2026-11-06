@@ -29,8 +29,8 @@
 //! `launch_default` calls `render_launch_summary`, re-imported there.
 //! `render_examine_text`, `render_examine_text_with_paths` and
 //! `render_engine_inventory_text_with_paths` are `pub(crate)`, read from
-//! [`chat.rs`](../apps/rocm/src/chat.rs)'s deterministic tool-output
-//! summaries; `render_engine_inventory_text_with_paths` is also read from
+//! [`chat/mcp_bridge.rs`](../apps/rocm/src/chat/mcp_bridge.rs)'s read-only
+//! command runner; `render_engine_inventory_text_with_paths` is also read from
 //! [`engines_cmd.rs`](../apps/rocm/src/engines_cmd.rs)'s
 //! `render_engine_inventory_text`. `append_examine_runtime_state` is also
 //! `pub(crate)`, read only from

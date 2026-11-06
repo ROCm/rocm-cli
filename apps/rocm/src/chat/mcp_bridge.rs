@@ -14,8 +14,9 @@
 //! A child of the `chat` module. It calls into `tool_policy.rs` (the validators
 //! and the approval split), `rocm_argv.rs`, `chat/summaries.rs`
 //! (`managed_service_running_state`) and the crate-root renderers; nothing here
-//! calls back into the turn loop in `chat.rs`, which reads this module's items
-//! through `super::mcp_bridge`. `run_internal_mcp_call` stays reachable as
+//! calls back into the turn loop in `chat/turn.rs` (only this module's tests
+//! read its `mcp_tool_result_text`), which reads this module's items through
+//! `super::mcp_bridge`. `run_internal_mcp_call` stays reachable as
 //! `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
 
 use super::summaries::managed_service_running_state;
@@ -841,8 +842,8 @@ fn run_chat_port_status_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::super::mcp_tool_result_text;
     use super::*;
+    use crate::chat::turn::mcp_tool_result_text;
     use crate::tests::test_paths;
     use std::fs;
     use std::net::TcpListener;

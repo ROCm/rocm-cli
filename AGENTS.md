@@ -318,7 +318,7 @@ Required consistency points:
 ### `skills/rocm-doctor/` — published from here, and a test fixture
 
 `skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
-(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+(`include_str!` in `apps/rocm/src/chat/turn.rs`). `skills/rocm-doctor/` is different
 on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the

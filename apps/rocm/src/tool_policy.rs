@@ -18,8 +18,8 @@
 //! `rocm_chat_tool_requested_command` turn a tool call into the argv and the
 //! one-line command it stands for.
 //!
-//! The module was relocated verbatim from `chat.rs`, which calls into it and
-//! re-exports the items other modules reach as `chat::<item>`. It calls
+//! The module was relocated verbatim from `chat.rs`, whose child modules call
+//! into it and which re-exports the items other modules reach as `chat::<item>`. It calls
 //! nothing in `chat.rs` and nothing in `freeform_planner.rs`, which is what
 //! lets the planner call into it without importing `chat`.
 
