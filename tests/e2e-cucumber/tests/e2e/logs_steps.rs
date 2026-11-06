@@ -353,3 +353,123 @@ fn ok_output(world: &E2eWorld) -> String {
     assert_eq!(rc, 0, "expected success, got rc={rc}:\n{}", combined(world));
     world.cli_output.clone().unwrap_or_default()
 }
+
+// ── --follow ───────────────────────────────────────────────────────
+
+const FOLLOW_SERVICE_ID: &str = "vllm-e2e-follow";
+
+#[given("a stopped local server whose log shows a download at 43 percent")]
+async fn plant_stopped_server_with_log(world: &mut E2eWorld) {
+    plant_server_with_log(world, "stopped");
+}
+
+#[given("a failed local server whose log shows a download at 43 percent")]
+async fn plant_failed_server_with_log(world: &mut E2eWorld) {
+    plant_server_with_log(world, "failed");
+}
+
+fn plant_server_with_log(world: &mut E2eWorld, status: &str) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let data = root.path().join("data");
+    let services = data.join("services");
+    let states = data.join("engines").join("vllm").join("state");
+    std::fs::create_dir_all(&services).expect("failed to create services dir");
+    std::fs::create_dir_all(&states).expect("failed to create engine state dir");
+    let log_path = services.join(format!("{FOLLOW_SERVICE_ID}.log"));
+    std::fs::write(&log_path, "Downloading model.safetensors: 43%\n").expect("failed to write log");
+    let record = serde_json::json!({
+        "service_id": FOLLOW_SERVICE_ID,
+        "engine": "vllm",
+        "model_ref": "qwen",
+        "canonical_model_id": "Qwen/Qwen3.5",
+        "host": "127.0.0.1",
+        "port": 9,
+        "endpoint_url": "http://127.0.0.1:9/v1",
+        "mode": "managed",
+        "status": status,
+        "supervisor_pid": 0,
+        "engine_pid": null,
+        "manifest_path": services.join(format!("{FOLLOW_SERVICE_ID}.json")),
+        "log_path": log_path,
+        "engine_state_path": states.join(format!("{FOLLOW_SERVICE_ID}.json")),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::write(
+        services.join(format!("{FOLLOW_SERVICE_ID}.json")),
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to write service record");
+}
+
+#[when("the user follows that server's logs")]
+async fn follow_stopped_server(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["logs", "--service", FOLLOW_SERVICE_ID, "--follow"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user follows that server's logs with rocm services logs -f")]
+async fn follow_stopped_server_through_services(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["services", "logs", FOLLOW_SERVICE_ID, "-f"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user asks to follow logs without naming a service")]
+async fn follow_without_service(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--follow"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI prints the download line, says it is not following, and exits")]
+async fn prints_and_exits(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let err = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        out.contains("Downloading model.safetensors: 43%"),
+        "expected the planted log line, got:\n{out}"
+    );
+    // Piped, stdout is log text only; the notice about the follow goes to stderr.
+    let note = format!("Service {FOLLOW_SERVICE_ID} is stopped; not following.");
+    assert!(!out.contains(&note), "notice leaked onto stdout:\n{out}");
+    assert!(
+        err.contains(&note),
+        "expected the not-following line, got:\n{err}"
+    );
+}
+
+#[then("the CLI prints the download line, says it is not following, and exits with an error")]
+async fn prints_and_fails(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let out = world.cli_output.clone().unwrap_or_default();
+    let err = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(
+        rc, 0,
+        "a failed server must not follow as success:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("Downloading model.safetensors: 43%"),
+        "expected the planted log line, got:\n{out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "Service {FOLLOW_SERVICE_ID} is failed; not following."
+        )),
+        "expected the not-following line, got:\n{err}"
+    );
+    assert!(
+        err.contains(&format!("service {FOLLOW_SERVICE_ID} failed")),
+        "expected the failure error, got:\n{err}"
+    );
+}
+
+#[then("the CLI refuses because --follow needs --service")]
+async fn refuses_follow(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    assert!(
+        combined(world).contains("--service"),
+        "expected the error to name --service, got:\n{}",
+        combined(world)
+    );
+}

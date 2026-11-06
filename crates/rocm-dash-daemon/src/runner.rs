@@ -90,10 +90,13 @@ pub struct RunnerOptions {
     /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
     /// that lets the amd-smi device pre-flight pass without a readable
     /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
-    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
-    /// deliberately don't depend on `rocm-core` to compute this themselves;
-    /// the caller (`apps/rocm`) does and passes the answer through. `false`
-    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    /// and `examine` already act on. This crate has no `rocm-core` dependency
+    /// to compute it with; `rocm-dash-collectors`, which does have one since
+    /// EAI-8457, still takes it threaded through rather than recomputing it, so
+    /// the dashboard cannot reach a different verdict about the same host than
+    /// `serve` and `examine` did. The caller (`apps/rocm`) computes it once and
+    /// passes the answer through both. `false` (the default) preserves the
+    /// bare-metal-only `/dev/kfd` check.
     pub amd_smi_gpu_reachable: bool,
     /// Where the caller's hardware probes put `/dev/kfd`.
     ///
@@ -402,6 +405,7 @@ pub async fn run_loop(
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
     let mut docker_warn: Option<String> = None;
+    let mut registry_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
 
     loop {
@@ -588,19 +592,47 @@ pub async fn run_loop(
         // the registry's authority; non-vLLM engines are tracked so the vLLM
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
+        //
+        // A pass that could not read the registry in full retires nothing, as
+        // with the Docker source above: what is known stays known (no `Gone`),
+        // and the instances keep the data they hold. Unlike Docker, whose listing
+        // is all or nothing, a registry can fail on one record while the rest
+        // read, so the readable records still add and refresh their services
+        // (announced once, as ever). Only a registry that was read in full, even
+        // an empty one, retires what it lacks.
         if let Some(services_dir) = opts.services_dir.as_ref()
             && discovery_due
         {
-            let records = crate::registry::load_service_records(services_dir);
-            let disc = crate::registry::discover_managed_services(&records);
-            discovery.managed_non_vllm = disc.non_vllm;
-            reconcile.reconcile_set(
-                DiscoverySource::Managed,
-                &disc.svcs,
-                &discovery.known_services,
-                &disc.seen,
-            );
-            discovery.known_services = disc.seen;
+            let read = crate::registry::read_service_records(services_dir);
+            let change = discovery.registry_health.observe(&read);
+            change.log();
+            match read {
+                Ok(read) => {
+                    let disc = crate::registry::discover_managed_services(&read.records);
+                    discovery.managed_non_vllm = disc.non_vllm;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                        &disc.seen,
+                    );
+                    discovery.known_services = disc.seen;
+                    registry_warn = None;
+                }
+                Err(e) => {
+                    // The records that did read still add and refresh their
+                    // services; nothing is retired, because the one that did
+                    // not read could be any of the known ones.
+                    let disc = crate::registry::discover_managed_services(&e.partial.records);
+                    reconcile.upsert_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                    );
+                    discovery.keep_through_partial_registry(disc);
+                    registry_warn = Some(registry_read_warning(&e));
+                }
+            }
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
@@ -614,14 +646,11 @@ pub async fn run_loop(
             && !runner.state.instances.is_empty()
             && tick_count.is_multiple_of(instance_ticks)
         {
-            let targets: Vec<(String, u16)> = runner
-                .state
-                .instances
-                .values()
-                .filter(|i| Some(i.container_id.as_str()) != discovery.lemonade_id.as_deref())
-                .filter(|i| !discovery.managed_non_vllm.contains(&i.container_id))
-                .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
-                .collect();
+            let targets = vllm_scrape_targets(
+                &runner.state.instances,
+                discovery.lemonade_id.as_deref(),
+                &discovery.managed_non_vllm,
+            );
             let prom = prom.clone();
             let results = parallel_scrape(targets, move |(id, port)| {
                 let prom = prom.clone();
@@ -862,6 +891,7 @@ pub async fn run_loop(
             }
         }
         warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(registry_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1020,6 +1050,102 @@ struct DiscoveryState {
     managed_non_vllm: HashSet<String>,
     /// The id of the currently-live Lemonade instance, if any.
     lemonade_id: Option<String>,
+    /// How the registry reads have been going, so a condition that lasts many
+    /// passes is logged once rather than every discovery tick.
+    registry_health: RegistryHealth,
+}
+
+impl DiscoveryState {
+    /// Record what a pass that read only part of the registry found. The services
+    /// it saw join the known set, so a later complete read can retire them, and
+    /// the known ones it did not see stay; the non-vLLM marks of the services it
+    /// saw are refreshed and the others kept, so a kept non-vLLM service is still
+    /// left out of the vLLM scrape.
+    fn keep_through_partial_registry(&mut self, disc: crate::registry::ManagedDiscovery) {
+        self.managed_non_vllm.retain(|id| !disc.seen.contains(id));
+        self.managed_non_vllm.extend(disc.non_vllm);
+        self.known_services.extend(disc.seen);
+    }
+}
+
+/// What the managed-service registry's reads have reported so far. A failure
+/// that lasts is logged on its first pass only, the recovery once, and a set of
+/// malformed records each time it changes; the dashboard's warning badge, which
+/// is cheap and does not scroll, carries the failure for as long as it lasts.
+#[derive(Default)]
+struct RegistryHealth {
+    /// The previous pass could not read the registry.
+    failing: bool,
+    /// The malformed records the last successful pass reported, so an unchanged
+    /// set is not reported again.
+    reported_malformed: Vec<PathBuf>,
+}
+
+/// What a discovery pass should say about the registry, apart from the services
+/// it found. Kept as data so [`RegistryHealth::observe`] can be tested without a
+/// log subscriber.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegistryChange {
+    /// The first failed pass of a streak, with the error.
+    failed: Option<String>,
+    /// The first successful pass after a streak of failures.
+    recovered: bool,
+    /// The malformed records, when the set differs from the one last reported
+    /// and is not empty.
+    malformed: Vec<PathBuf>,
+}
+
+impl RegistryHealth {
+    fn observe(
+        &mut self,
+        read: &Result<crate::registry::RegistryRead, crate::registry::RegistryReadError>,
+    ) -> RegistryChange {
+        let mut change = RegistryChange::default();
+        match read {
+            Err(e) => {
+                if !self.failing {
+                    self.failing = true;
+                    change.failed = Some(e.to_string());
+                }
+            }
+            Ok(read) => {
+                if self.failing {
+                    self.failing = false;
+                    change.recovered = true;
+                }
+                if read.malformed != self.reported_malformed {
+                    self.reported_malformed.clone_from(&read.malformed);
+                    change.malformed.clone_from(&read.malformed);
+                }
+            }
+        }
+        change
+    }
+}
+
+impl RegistryChange {
+    fn log(&self) {
+        if let Some(error) = &self.failed {
+            warn!(
+                error = %error,
+                "managed-service registry could not be read; keeping the known services until it can be"
+            );
+        }
+        if self.recovered {
+            info!("managed-service registry is readable again");
+        }
+        if !self.malformed.is_empty() {
+            warn!(
+                files = ?self.malformed,
+                "skipping managed-service records that are not valid JSON"
+            );
+        }
+    }
+}
+
+/// The header warning for a pass that could not read the registry.
+fn registry_read_warning(error: &crate::registry::RegistryReadError) -> String {
+    format!("managed registry: {error}; keeping the last known services")
 }
 
 /// Which discovery source a service came from. It only selects the log wording
@@ -1121,6 +1247,22 @@ impl Reconcile<'_> {
         known: &HashSet<String>,
         seen: &HashSet<String>,
     ) {
+        self.upsert_set(source, svcs, known);
+        for gone in known.difference(seen) {
+            self.retire(source, gone);
+        }
+    }
+
+    /// The half of [`Self::reconcile_set`] that adds and refreshes: upsert every
+    /// service in `svcs` and announce the ones `known` did not have. Retires
+    /// nothing, which is what a pass that could only see part of its source needs
+    /// (see [`DiscoveryState::keep_through_partial_registry`]).
+    fn upsert_set(
+        &mut self,
+        source: DiscoverySource,
+        svcs: &[DiscoveredService],
+        known: &HashSet<String>,
+    ) {
         for svc in svcs {
             let same_endpoint = self
                 .state
@@ -1136,18 +1278,17 @@ impl Reconcile<'_> {
                 self.announce(source, svc);
             }
         }
-        for gone in known.difference(seen) {
-            self.retire(source, gone);
-        }
     }
 
     /// Reconcile the probe-based Lemonade source, which has at most one service.
     ///
     /// Its `container_id` encodes the host and port, so a port or host change
-    /// yields a new id: the old id's telemetry is purged so a stale rate
-    /// baseline, TTFT and TPOT do not bleed across, and the new id is announced.
-    /// The old instance is not retired here. `None` means the endpoint did not
-    /// answer, which retires the current one.
+    /// yields a new id. The old id is retired first (its telemetry is purged, so
+    /// a stale rate baseline, TTFT and TPOT do not bleed across; it leaves the
+    /// state and is announced gone), then the new id is announced, so the state
+    /// and every snapshot carry one Lemonade instance and the vLLM scrape never
+    /// polls the old endpoint. `None` means the endpoint did not answer, which
+    /// retires the current one.
     fn reconcile_lemonade(
         &mut self,
         probed: Option<DiscoveredService>,
@@ -1156,8 +1297,8 @@ impl Reconcile<'_> {
         match probed {
             Some(svc) => {
                 let is_new_id = current.as_deref() != Some(svc.container_id.as_str());
-                if is_new_id && let Some(old_id) = current.as_deref() {
-                    self.telemetry.purge(old_id);
+                if is_new_id && let Some(old_id) = current.take() {
+                    self.retire(DiscoverySource::Lemonade, &old_id);
                 }
                 self.upsert(&svc, !is_new_id);
                 if is_new_id {
@@ -1172,6 +1313,22 @@ impl Reconcile<'_> {
             }
         }
     }
+}
+
+/// The `(id, port)` pairs the per-instance vLLM Prometheus scrape polls: every
+/// instance with a port except the live Lemonade instance (its own collector
+/// scrapes it) and the managed services whose engine is not vLLM.
+fn vllm_scrape_targets(
+    instances: &HashMap<String, Instance>,
+    lemonade_id: Option<&str>,
+    managed_non_vllm: &HashSet<String>,
+) -> Vec<(String, u16)> {
+    instances
+        .values()
+        .filter(|i| Some(i.container_id.as_str()) != lemonade_id)
+        .filter(|i| !managed_non_vllm.contains(&i.container_id))
+        .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
+        .collect()
 }
 
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process
@@ -1962,6 +2119,276 @@ mod tests {
         assert!(pass.telemetry.prev_ttft.contains_key("a"));
     }
 
+    // ── Lemonade state matrix ───────────────────────────────────────────────
+    //
+    // One Lemonade endpoint is probed per discovery pass. Its id encodes the host
+    // and port, so the states a probe can observe are: nothing ever answered; the
+    // first answer; the same endpoint again; the host or the port changed; the
+    // endpoint went quiet; it came back somewhere else; and the same answer
+    // arriving twice in one tick. Each row below checks the announcements, the
+    // instances a snapshot would carry, the telemetry kept per id, and the
+    // `(id, port)` pairs the vLLM scrape would poll, because a stale instance is
+    // visible on all four.
+
+    fn lemonade_svc(host: &str, port: u16) -> DiscoveredService {
+        DiscoveredService {
+            container_id: format!("lemonade-{host}-{port}"),
+            container_name: "lemonade".into(),
+            model_name: "model".into(),
+            port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    impl Pass {
+        /// The ids a snapshot carries. The loop builds a snapshot's instances from
+        /// `state.instances`, so this is the dashboard's view of the pass.
+        fn instance_ids(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self.state.instances.keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+
+        /// The ids the vLLM Prometheus scrape would poll while `current` is the
+        /// live Lemonade id.
+        fn scrape_targets(&self, current: Option<&str>) -> Vec<String> {
+            let mut ids: Vec<String> =
+                vllm_scrape_targets(&self.state.instances, current, &HashSet::new())
+                    .into_iter()
+                    .map(|(id, _port)| id)
+                    .collect();
+            ids.sort();
+            ids
+        }
+
+        /// A live KV reading, latency baselines and a rate tracker for `id`.
+        fn give_live_telemetry(&mut self, id: &str) {
+            self.scrape(id);
+            self.telemetry
+                .gen_trackers
+                .insert(id.into(), make_tracker(2));
+        }
+
+        fn has_telemetry(&self, id: &str) -> bool {
+            self.telemetry.gen_trackers.contains_key(id)
+                || self.telemetry.prev_ttft.contains_key(id)
+                || self.telemetry.prev_tpot.contains_key(id)
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Discover `old`, give it live telemetry, then probe `new`. Returns the pass,
+    /// the loop's current Lemonade id and what the second probe announced.
+    fn lemonade_identity_change(
+        old: &DiscoveredService,
+        new: &DiscoveredService,
+    ) -> (Pass, Option<String>, Vec<String>) {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(old.clone()), &mut current);
+        pass.give_live_telemetry(&old.container_id);
+        pass.announced();
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(new.clone()), &mut current);
+        let announced = pass.announced();
+        (pass, current, announced)
+    }
+
+    #[test]
+    fn lemonade_that_never_answers_leaves_no_trace() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+
+        assert!(pass.announced().is_empty());
+        assert_eq!(current, None);
+        assert!(pass.instance_ids().is_empty());
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_first_answer_is_announced_once_and_left_to_its_own_collector() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(lemonade_svc("127.0.0.1", 13305)), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
+        assert_eq!(current.as_deref(), Some("lemonade-127.0.0.1-13305"));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the live Lemonade instance is not a vLLM scrape target"
+        );
+    }
+
+    #[test]
+    fn lemonade_same_endpoint_again_keeps_its_instance_and_live_fields() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let id = svc.container_id.clone();
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(svc.clone()), &mut current);
+        pass.give_live_telemetry(&id);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+
+        assert!(pass.announced().is_empty());
+        assert_eq!(pass.instance_ids(), ids(&[&id]));
+        assert_eq!(pass.kv(&id), Some(25.0));
+        assert!(pass.has_telemetry(&id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_host_change_retires_the_old_instance_and_announces_the_new_one() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("10.0.0.7", 13305);
+        let (pass, current, announced) = lemonade_identity_change(&old, &new);
+
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-10.0.0.7-13305"
+            ]
+        );
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-10.0.0.7-13305"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
+        );
+    }
+
+    #[test]
+    fn lemonade_port_change_retires_the_old_instance_and_announces_the_new_one() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("127.0.0.1", 13306);
+        let (pass, current, announced) = lemonade_identity_change(&old, &new);
+
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
+        );
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13306"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
+        );
+    }
+
+    #[test]
+    fn lemonade_endpoint_going_quiet_is_announced_gone_and_leaves_no_trace() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let id = svc.container_id.clone();
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+        pass.give_live_telemetry(&id);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+
+        assert_eq!(pass.announced(), [format!("gone {id}")]);
+        assert_eq!(current, None);
+        assert!(pass.instance_ids().is_empty());
+        assert!(!pass.has_telemetry(&id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_coming_back_elsewhere_after_going_quiet_is_the_only_instance() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("127.0.0.1", 13306);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(old.clone()), &mut current);
+        pass.give_live_telemetry(&old.container_id);
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert_eq!(
+            pass.announced(),
+            [
+                "discovered lemonade-127.0.0.1-13305",
+                "gone lemonade-127.0.0.1-13305"
+            ]
+        );
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(new.clone()), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13306"]);
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(pass.instance_ids(), ids(&[&new.container_id]));
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_answer_repeated_within_one_tick_is_announced_once() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(svc.clone()), &mut current);
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_endpoint_moving_away_and_back_is_retired_each_time() {
+        let a = lemonade_svc("127.0.0.1", 13305);
+        let b = lemonade_svc("127.0.0.1", 13306);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(a.clone()), &mut current);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(Some(b), &mut current);
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
+        );
+        pass.reconcile()
+            .reconcile_lemonade(Some(a.clone()), &mut current);
+
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13306",
+                "discovered lemonade-127.0.0.1-13305"
+            ]
+        );
+        assert_eq!(current.as_deref(), Some(a.container_id.as_str()));
+        assert_eq!(pass.instance_ids(), ids(&[&a.container_id]));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
     #[test]
     fn reconcile_lemonade_follows_one_endpoint_through_its_lifecycle() {
         let mut pass = Pass::new();
@@ -1981,18 +2408,16 @@ mod tests {
         );
         assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
 
-        // A new id (the host or port changed) purges the old id's telemetry and
-        // announces the new one.
+        // A new id (the host or port changed) retires the old id, telemetry
+        // included, and announces the new one.
         pass.reconcile()
             .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
-        assert_eq!(pass.announced(), ["discovered l2"]);
+        assert_eq!(pass.announced(), ["gone l1", "discovered l2"]);
         assert_eq!(current.as_deref(), Some("l2"));
         assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
-        // Pins current behaviour, not a goal: the superseded instance stays in
-        // state (and so in every snapshot) because only its telemetry is purged.
-        // Retiring it later is a deliberate behaviour change, and this assertion
-        // is the one to update when that happens.
-        assert!(pass.state.instances.contains_key("l1"));
+        // The superseded instance leaves the state (and so every snapshot), not
+        // only its telemetry.
+        assert!(!pass.state.instances.contains_key("l1"));
 
         pass.reconcile().reconcile_lemonade(None, &mut current);
         assert_eq!(pass.announced(), ["gone l2"]);
@@ -2001,5 +2426,177 @@ mod tests {
 
         pass.reconcile().reconcile_lemonade(None, &mut current);
         assert!(pass.announced().is_empty(), "nothing left to retire");
+    }
+
+    // Registry read health: one test per row of the state matrix (first
+    // failure, repeated failure, recovery, empty, populated, malformed new,
+    // malformed unchanged, malformed cleared).
+
+    fn registry_read(
+        malformed: &[&str],
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Ok(crate::registry::RegistryRead {
+            records: Vec::new(),
+            malformed: malformed.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    fn registry_failure(
+        why: &str,
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Err(crate::registry::RegistryReadError {
+            path: PathBuf::from("services"),
+            source: std::io::Error::other(why),
+            partial: crate::registry::RegistryRead::default(),
+        })
+    }
+
+    /// State matrix for what a partially read registry does to the discovery
+    /// state, one assertion group per row: a service it saw joins the known set
+    /// and its non-vLLM mark follows the record; one it did not see stays known
+    /// and keeps its mark; nothing leaves either set.
+    #[test]
+    fn partial_registry_read_adds_what_it_saw_and_forgets_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["old-vllm", "old-lemonade", "flips"]),
+            managed_non_vllm: id_set(&["old-lemonade", "flips"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
+            seen: id_set(&["new-lemonade", "new-vllm", "flips"]),
+            non_vllm: id_set(&["new-lemonade"]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            state.known_services,
+            id_set(&[
+                "old-vllm",
+                "old-lemonade",
+                "flips",
+                "new-lemonade",
+                "new-vllm"
+            ]),
+            "the unseen services stay known and the new ones join them"
+        );
+        assert_eq!(
+            state.managed_non_vllm,
+            id_set(&["old-lemonade", "new-lemonade"]),
+            "an unseen non-vLLM service keeps its mark, a seen one follows its record"
+        );
+    }
+
+    #[test]
+    fn partial_registry_read_that_saw_nothing_changes_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["a", "b"]),
+            managed_non_vllm: id_set(&["b"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
+
+        assert_eq!(state.known_services, id_set(&["a", "b"]));
+        assert_eq!(state.managed_non_vllm, id_set(&["b"]));
+    }
+
+    #[test]
+    fn registry_health_reports_the_first_failure_of_a_streak_once() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_failure("disk gone"));
+        assert_eq!(
+            first.failed.as_deref(),
+            Some("cannot read services: disk gone"),
+            "the first failed pass names the error"
+        );
+        assert!(!first.recovered);
+
+        for pass in 2..=5 {
+            assert_eq!(
+                health.observe(&registry_failure("disk gone")),
+                RegistryChange::default(),
+                "failed pass {pass} of the same streak must stay quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_recovery_once_and_a_new_streak_again() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_failure("one"));
+        health.observe(&registry_failure("one"));
+
+        let recovered = health.observe(&registry_read(&[]));
+        assert!(recovered.recovered);
+        assert!(recovered.failed.is_none());
+        assert_eq!(
+            health.observe(&registry_read(&[])),
+            RegistryChange::default(),
+            "only the first good pass after a streak is a recovery"
+        );
+
+        let again = health.observe(&registry_failure("two"));
+        assert_eq!(again.failed.as_deref(), Some("cannot read services: two"));
+    }
+
+    #[test]
+    fn registry_health_is_quiet_for_an_empty_or_populated_registry() {
+        let mut health = RegistryHealth::default();
+        // A healthy read, empty or not, says nothing: there is no failure to
+        // report and no failure to have recovered from.
+        for _ in 0..3 {
+            assert_eq!(
+                health.observe(&registry_read(&[])),
+                RegistryChange::default()
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_a_malformed_set_when_it_changes() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(first.malformed, [PathBuf::from("a.json")]);
+        assert_eq!(
+            health.observe(&registry_read(&["a.json"])),
+            RegistryChange::default(),
+            "an unchanged malformed set is not reported again"
+        );
+
+        let grown = health.observe(&registry_read(&["a.json", "b.json"]));
+        assert_eq!(
+            grown.malformed,
+            [PathBuf::from("a.json"), PathBuf::from("b.json")],
+            "a newly malformed record reports the whole set"
+        );
+
+        let cleared = health.observe(&registry_read(&[]));
+        assert!(
+            cleared.malformed.is_empty(),
+            "clearing the set is not a warning"
+        );
+        let back = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(
+            back.malformed,
+            [PathBuf::from("a.json")],
+            "a record that goes bad again after being fixed is reported again"
+        );
+    }
+
+    #[test]
+    fn registry_health_keeps_the_malformed_set_across_a_read_failure() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_read(&["a.json"]));
+        health.observe(&registry_failure("blip"));
+
+        let after = health.observe(&registry_read(&["a.json"]));
+        assert!(after.recovered);
+        assert!(
+            after.malformed.is_empty(),
+            "the same corrupt record is not news just because a read failed in between"
+        );
     }
 }

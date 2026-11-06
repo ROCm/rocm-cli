@@ -39,7 +39,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServiceRecord};
 use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
@@ -323,12 +323,38 @@ pub(crate) enum ManagedReuseRefusal {
 /// pre-flight, and the spawn below when the reuse that waived that pre-flight
 /// turns out not to be available after all.
 pub(crate) fn no_usable_gpu_refusal(device_policy: &DevicePolicy) -> String {
+    // Keyed on the same `is_wsl_host()` the usable-GPU probe branches on, so the
+    // advice follows the platform whose answer produced the refusal.
+    no_usable_gpu_refusal_text(device_policy_name(device_policy), rocm_core::is_wsl_host())
+}
+
+/// The refusal text for `policy`, split on whether the probe that refused was
+/// the WSL one.
+///
+/// WSL reaches the GPU through `/dev/dxg` and ROCDXG, and has no `/dev/kfd`, so
+/// telling a WSL user to confirm that device is present names something that can
+/// never clear the condition. There the advice points at the status `rocm
+/// examine` reports for the path the probe actually asked about
+/// ([`rocm_core::WSL_ROCDXG_READY`]), and at `rocm diagnose`, which names what is
+/// missing.
+fn no_usable_gpu_refusal_text(policy: &str, on_wsl: bool) -> String {
+    let remedy = if on_wsl {
+        format!(
+            "WSL reaches the GPU through /dev/dxg and ROCDXG rather than /dev/kfd: run \
+             `rocm examine` and check that `driver_status` is `{ready}` (`rocm diagnose` \
+             names what is missing; a ROCDXG library the loader reaches only through \
+             LD_LIBRARY_PATH needs that variable exported in this shell, see docs/wsl.md), and ensure HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES \
+             are not masking every device.",
+            ready = rocm_core::WSL_ROCDXG_READY
+        )
+    } else {
+        "Check the driver with `rocm examine`, confirm /dev/kfd is present, and ensure \
+         HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES are not masking every device."
+            .to_owned()
+    };
     format!(
-        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
-         policy and does not fall back to CPU. Check the driver with `rocm examine`, \
-         confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
-         ROCR_VISIBLE_DEVICES are not masking every device.",
-        policy = device_policy_name(device_policy)
+        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} policy \
+         and does not fall back to CPU. {remedy}"
     )
 }
 
@@ -626,6 +652,148 @@ fn spawn_managed_engine_child(
     })
 }
 
+/// How long one readiness wait polls before `rocm serve` reports `starting`.
+const READINESS_WAIT: Duration = Duration::from_secs(45);
+
+/// `rocm serve --wait`: keep waiting past [`READINESS_WAIT`] (a first start
+/// downloads the model, which can take far longer) until the server answers or
+/// stops being live. A server that exited ends the wait with the last reading
+/// instead of blocking forever.
+fn wait_past_readiness_budget(
+    mut probe: impl FnMut() -> EndpointReadiness,
+    mut still_live: impl FnMut() -> bool,
+) -> EndpointReadiness {
+    loop {
+        let readiness = probe();
+        if readiness == EndpointReadiness::Serving || !still_live() {
+            return readiness;
+        }
+    }
+}
+
+/// Whether `pid` is a running process that is not a zombie. The serve
+/// supervisor is an unreaped child of this process, so after it dies
+/// `process_is_running` alone keeps reporting it alive.
+fn service_pid_is_alive(pid: u32) -> bool {
+    rocm_core::process_is_running(pid) && !process_is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` may contain spaces and parentheses; the state follows the last `)`.
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .and_then(|rest| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// Whether the record still describes a server that can finish starting: its
+/// status is a live one *and* a tracked process is alive. The status alone is
+/// not enough, since a killed engine never writes a terminal state.
+fn record_still_live(record: &ManagedServiceRecord, pid_alive: impl Fn(u32) -> bool) -> bool {
+    if !crate::managed_service_status::managed_service_is_live(record) {
+        return false;
+    }
+    let pids = crate::managed_service_status::recorded_service_pids(record);
+    pids.is_empty() || pids.into_iter().any(pid_alive)
+}
+
+/// [`record_still_live`] over the manifest on disk, so a `rocm services stop`
+/// from another terminal (which writes only the manifest) ends the wait too.
+fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32) -> bool) -> bool {
+    let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
+        return false;
+    };
+    let _ = latest.refresh_from_engine_state();
+    record_still_live(&latest, pid_alive)
+}
+
+/// Record a server that died mid-start as stopped, leaving a manifest that a
+/// `services stop` already settled untouched. A `failed` state the engine
+/// reported is persisted rather than overwritten, so the reason survives.
+fn settle_exited_service(paths: &AppPaths, service_id: &str) {
+    let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
+        return;
+    };
+    let on_disk = latest.status.clone();
+    let _ = latest.refresh_from_engine_state();
+    if crate::managed_service_status::managed_service_is_live(&latest) {
+        latest.status = "stopped".to_owned();
+    } else if latest.status == on_disk {
+        return;
+    }
+    let _ = latest.write();
+}
+
+/// The failure a `--wait` ends with when the server died before it became
+/// ready, after recording the death in the manifest. `None` while the wait did
+/// not apply, the endpoint is serving, or the server is still alive.
+fn died_during_wait(
+    paths: &AppPaths,
+    service_id: &str,
+    wait_until_ready: bool,
+    readiness: EndpointReadiness,
+    pid_alive: impl Fn(u32) -> bool,
+) -> Option<anyhow::Error> {
+    if !wait_until_ready
+        || readiness == EndpointReadiness::Serving
+        || service_still_live(paths, service_id, pid_alive)
+    {
+        return None;
+    }
+    settle_exited_service(paths, service_id);
+    let mut message = format!(
+        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
+    );
+    // A plain `serve` adds the memory guidance for a vLLM launch that ran out of
+    // VRAM; the wait's failure is the same launch, so it gets the same note.
+    // "starting" is the status the note keys on for "never became ready", which is
+    // what a `--wait` death is, whatever the settled record now says.
+    if let Ok(record) = ManagedServiceRecord::read_manifest(paths, service_id) {
+        for note in crate::serve_summary::append_oom_serve_note(
+            Vec::new(),
+            &record.engine,
+            false,
+            "starting",
+            Some(&record.log_path),
+        ) {
+            let _ = write!(message, "\n  note: {note}");
+        }
+    }
+    Some(anyhow!(message))
+}
+
+/// Record the outcome of a finished wait on the manifest as it is now, changing
+/// only what the wait learned. The copy read at spawn time can be long stale:
+/// `rocmd` may have recorded a restart or a new supervisor pid, and `rocm logs`
+/// refreshes the record, so writing it back whole would revert those.
+fn record_wait_outcome(
+    paths: &AppPaths,
+    held: &mut ManagedServiceRecord,
+    status: &str,
+    verified: bool,
+) -> Result<()> {
+    let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
+        .unwrap_or_else(|_| held.clone());
+    status.clone_into(&mut latest.status);
+    if verified {
+        // Latch the verification the wait just performed, so the readiness checks
+        // behind `services list` and chat read it instead of re-probing.
+        latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    }
+    latest.write()?;
+    *held = latest;
+    Ok(())
+}
+
 /// Test-only fault-injection switch, off (`const false`) in shipped binaries:
 /// the `e2e-oom-fault-injection` feature is enabled only by the `xtask e2e`
 /// mock-lane build, never by the release build. When enabled and
@@ -728,6 +896,82 @@ fn simulate_oom_managed_launch(
     })
 }
 
+/// Probe `record`'s endpoint until it answers: once within the readiness
+/// budget, or (with `wait_until_ready`) for as long as the server stays alive.
+fn wait_for_record_ready(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    wait_until_ready: bool,
+    endpoint_api_key: Option<&str>,
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> EndpointReadiness {
+    let probe = |on_tick: &mut dyn FnMut(Duration)| {
+        wait_for_service_http_ready_with_progress(
+            &record.engine,
+            &record.host,
+            record.port,
+            &|| {
+                let mut latest = record.clone();
+                let _ = latest.refresh_from_engine_state();
+                latest.served_model_name().to_owned()
+            },
+            endpoint_api_key,
+            READINESS_WAIT,
+            on_tick,
+        )
+    };
+    if wait_until_ready {
+        wait_past_readiness_budget(
+            || probe(&mut *on_wait_tick),
+            || service_still_live(paths, &record.service_id, service_pid_is_alive),
+        )
+    } else {
+        probe(on_wait_tick)
+    }
+}
+
+/// An equivalent service is already live. Without `--wait`, or once it is
+/// serving, report it as is; otherwise wait for it like a fresh launch would.
+fn wait_on_existing_service(
+    paths: &AppPaths,
+    mut report: ManagedLaunchReport,
+    wait_until_ready: bool,
+    on_wait_begin: &mut dyn FnMut(&str),
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> Result<ManagedLaunchReport> {
+    if !wait_until_ready || report.status == "ready" {
+        return Ok(report);
+    }
+    let Ok(mut record) = ManagedServiceRecord::read_manifest(paths, &report.service_id) else {
+        return Ok(report);
+    };
+    // The id of the server being waited on, which is not the caller's freshly
+    // generated one when it attached to an existing server.
+    on_wait_begin(&report.service_id);
+    // The key the caller generated belongs to a launch that did not happen; the
+    // existing service answers to its own.
+    let stored_key = endpoint_keys::endpoint_api_key(paths, &report.service_id);
+    let readiness =
+        wait_for_record_ready(paths, &record, true, stored_key.as_deref(), on_wait_tick);
+    if let Some(error) = died_during_wait(
+        paths,
+        &report.service_id,
+        true,
+        readiness,
+        service_pid_is_alive,
+    ) {
+        return Err(error);
+    }
+    report.status = status_for_readiness(readiness).to_owned();
+    record_wait_outcome(
+        paths,
+        &mut record,
+        &report.status,
+        readiness == EndpointReadiness::Serving,
+    )?;
+    Ok(report)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     engine: &str,
@@ -745,6 +989,8 @@ pub(crate) fn start_managed_service(
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
+    wait_until_ready: bool,
+    on_wait_begin: &mut dyn FnMut(&str),
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -780,7 +1026,18 @@ pub(crate) fn start_managed_service(
         require_api_key,
         gpu_refusal_waived_for_reuse,
     )? {
-        ManagedSpawn::AlreadyRunning(report) => return Ok(report),
+        ManagedSpawn::AlreadyRunning(report) => {
+            // `--wait` applies to a service that is still starting too: the
+            // natural retry after `rocm serve m` printed `starting`.
+            drop(launch_lock);
+            return wait_on_existing_service(
+                &paths,
+                report,
+                wait_until_ready,
+                on_wait_begin,
+                on_wait_tick,
+            );
+        }
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
     // The claiming service record is now persisted, so the selected GPU is
@@ -792,27 +1049,32 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    let readiness = wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &|| {
-            let mut latest = record.clone();
-            let _ = latest.refresh_from_engine_state();
-            latest.served_model_name().to_owned()
-        },
+    if wait_until_ready {
+        on_wait_begin(service_id);
+    }
+    let readiness = wait_for_record_ready(
+        &paths,
+        &record,
+        wait_until_ready,
         endpoint_api_key,
-        Duration::from_secs(45),
         on_wait_tick,
     );
-    let launch_status = status_for_readiness(readiness);
-    record.status = launch_status.to_owned();
-    if readiness == EndpointReadiness::Serving {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    if let Some(error) = died_during_wait(
+        &paths,
+        service_id,
+        wait_until_ready,
+        readiness,
+        service_pid_is_alive,
+    ) {
+        return Err(error);
     }
-    record.write()?;
+    let launch_status = status_for_readiness(readiness);
+    record_wait_outcome(
+        &paths,
+        &mut record,
+        launch_status,
+        readiness == EndpointReadiness::Serving,
+    )?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
     record_cli_audit_event(
         &paths,
@@ -878,6 +1140,23 @@ pub(crate) fn print_managed_launch_plain(
         println!("  manifest_path: {}", manifest_path.display());
     }
     println!("  readiness: {}", report.status);
+}
+
+/// The client configuration to show when a `--wait` begins, so a key generated for
+/// a public bind reaches the user even if the wait is interrupted or fails.
+/// `None` unless the wait is on the launch that key belongs to: an attach to an
+/// already-starting server (`waiting_on` differs from `service_id`) answers to
+/// its own key, which is not shown here.
+pub(crate) fn wait_begin_client_config(
+    waiting_on: &str,
+    service_id: &str,
+    host: &str,
+    port: u16,
+    api_key: Option<&str>,
+) -> Option<String> {
+    let key = api_key.filter(|_| waiting_on == service_id)?;
+    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
+    Some(render_endpoint_client_config(&endpoint_url, key))
 }
 
 /// Render the one-time secure client configuration for a public, authenticated
@@ -1562,8 +1841,341 @@ fn finish_attached_stop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_no_gpu_refusal_sends_a_bare_metal_user_to_dev_kfd() {
+        let text = super::no_usable_gpu_refusal_text("gpu_required", false);
+        assert!(text.contains("confirm /dev/kfd is present"), "{text}");
+        assert!(!text.contains("ROCDXG"), "{text}");
+    }
+
+    #[test]
+    fn the_no_gpu_refusal_does_not_send_a_wsl_user_to_dev_kfd() {
+        // WSL has no /dev/kfd, so advice to confirm it can never clear the
+        // condition. The text names the status `examine` reports for the path
+        // the probe asked about, taken from the constant the producer uses, so
+        // the two cannot drift. That the status really is the one a refused
+        // host shows is asserted end to end by serve-42.
+        let text = super::no_usable_gpu_refusal_text("gpu_required", true);
+        assert!(!text.contains("/dev/kfd is present"), "{text}");
+        assert!(text.contains("rocm examine"), "{text}");
+        assert!(text.contains("rocm diagnose"), "{text}");
+        // The advice is true only because `rocdxg_ready` counts a library on
+        // LD_LIBRARY_PATH; `a_rocdxg_only_on_the_loader_path_is_ready` in
+        // `rocm-core`'s host_gpu/wsl.rs proves that behavior.
+        assert!(text.contains("LD_LIBRARY_PATH"), "{text}");
+        assert!(
+            text.contains(&format!("`{}`", rocm_core::WSL_ROCDXG_READY)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_no_gpu_refusal_names_the_policy_on_both_platforms() {
+        for on_wsl in [false, true] {
+            let text = super::no_usable_gpu_refusal_text("gpu_required", on_wsl);
+            assert!(
+                text.starts_with("no usable AMD GPU detected; `rocm serve` requires a GPU under the gpu_required policy"),
+                "{text}"
+            );
+        }
+    }
     use super::*;
     use crate::tests::test_paths;
+
+    #[test]
+    fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {
+        let mut readings = vec![
+            EndpointReadiness::Unreachable,
+            EndpointReadiness::Unreachable,
+            EndpointReadiness::Serving,
+        ]
+        .into_iter();
+        let mut probes = 0;
+        let result = wait_past_readiness_budget(
+            || {
+                probes += 1;
+                readings.next().expect("no probe after Serving")
+            },
+            || true,
+        );
+        assert_eq!(result, EndpointReadiness::Serving);
+        assert_eq!(probes, 3, "must outlast the first (45s) budget");
+    }
+
+    #[test]
+    fn wait_past_readiness_budget_stops_when_the_server_exits() {
+        let mut probes = 0;
+        let result = wait_past_readiness_budget(
+            || {
+                probes += 1;
+                EndpointReadiness::Unreachable
+            },
+            || false,
+        );
+        assert_eq!(result, EndpointReadiness::Unreachable);
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn wait_past_readiness_budget_returns_at_once_when_already_serving() {
+        let result = wait_past_readiness_budget(
+            || EndpointReadiness::Serving,
+            || panic!("liveness is irrelevant once serving"),
+        );
+        assert_eq!(result, EndpointReadiness::Serving);
+    }
+
+    fn record_tracking_pid(paths: &AppPaths, pid: u32, status: &str) -> ManagedServiceRecord {
+        let mut record = reusable_record(paths);
+        record.supervisor_pid = pid;
+        record.status = status.to_owned();
+        record
+    }
+
+    #[cfg(unix)]
+    fn exited_child_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn record_still_live_ends_the_wait_for_a_dead_pid_with_a_live_status() {
+        // The engine was killed before writing any terminal state: the status
+        // still says `starting`, but nothing tracked is running.
+        let (root, paths) = test_paths("wait-dead-pid");
+        paths.ensure().expect("paths");
+        let dead = record_tracking_pid(&paths, exited_child_pid(), "starting");
+        assert!(!record_still_live(&dead, service_pid_is_alive));
+
+        let alive = record_tracking_pid(&paths, std::process::id(), "starting");
+        assert!(record_still_live(&alive, service_pid_is_alive));
+
+        // A settled status ends the wait even while the pid is still around.
+        let stopped = record_tracking_pid(&paths, std::process::id(), "stopped");
+        assert!(!record_still_live(&stopped, service_pid_is_alive));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn service_pid_is_alive_treats_an_unreaped_child_as_dead() {
+        // The serve supervisor is our own unreaped child; once it dies it is a
+        // zombie that `kill(pid, 0)` still reports as running.
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !process_is_zombie(pid) {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_running(pid),
+            "a zombie still answers kill(pid, 0)"
+        );
+        assert!(!service_pid_is_alive(pid));
+        child.wait().expect("reap");
+    }
+
+    #[test]
+    fn service_still_live_follows_the_manifest_on_disk() {
+        // `rocm services stop` from another terminal writes only the manifest.
+        let (root, paths) = test_paths("wait-manifest");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.write().expect("write");
+        assert!(service_still_live(&paths, &record.service_id, |_| true));
+
+        record.status = "stopped".to_owned();
+        record.write().expect("write");
+        assert!(!service_still_live(&paths, &record.service_id, |_| true));
+        assert!(!service_still_live(&paths, "no-such-service", |_| true));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settle_exited_service_demotes_a_live_manifest_and_spares_a_settled_one() {
+        let (root, paths) = test_paths("wait-settle");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.write().expect("write");
+        settle_exited_service(&paths, &record.service_id);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "stopped");
+
+        // A record that already failed keeps its reason: the guard, not the
+        // overwrite, is what spares it (a `stopped` -> `stopped` rewrite would
+        // be invisible).
+        record.status = "failed".to_owned();
+        record.write().expect("write");
+        settle_exited_service(&paths, &record.service_id);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_on_existing_service_only_waits_for_one_that_is_not_serving_yet() {
+        // The probing path itself blocks for the readiness budget, so only the
+        // cases that must return at once are driven here; a manifest planted
+        // as `starting` would hang a wrong guard for 45 seconds and fail it.
+        let (root, paths) = test_paths("wait-existing");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.write().expect("write");
+        let report = |status: &str| ManagedLaunchReport {
+            service_id: record.service_id.clone(),
+            endpoint_url: record.endpoint_url.clone(),
+            status: status.to_owned(),
+            already_running: true,
+            child_pid: None,
+            log_path: None,
+            manifest_path: None,
+        };
+        let mut no_tick = |_: Duration| panic!("must not probe");
+
+        let untouched = wait_on_existing_service(
+            &paths,
+            report("starting"),
+            false,
+            &mut |_| panic!("no --wait, no banner"),
+            &mut no_tick,
+        )
+        .expect("no --wait");
+        assert_eq!(untouched.status, "starting");
+        let ready = wait_on_existing_service(
+            &paths,
+            report("ready"),
+            true,
+            &mut |_| panic!("already ready, no banner"),
+            &mut no_tick,
+        )
+        .expect("already ready");
+        assert_eq!(ready.status, "ready");
+        record.status = "starting".to_owned();
+        assert_eq!(
+            ManagedServiceRecord::read_manifest(&paths, &record.service_id)
+                .unwrap()
+                .status,
+            "starting"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn died_during_wait_fails_with_a_logs_pointer_and_records_the_death() {
+        let (root, paths) = test_paths("wait-died");
+        paths.ensure().expect("paths");
+        let record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.write().expect("write");
+        let id = record.service_id;
+        let status = || {
+            ManagedServiceRecord::read_manifest(&paths, &id)
+                .unwrap()
+                .status
+        };
+
+        // Not waiting, already serving, or still alive: no failure, no change.
+        let pending = EndpointReadiness::Unreachable;
+        assert!(died_during_wait(&paths, &id, false, pending, |_| false).is_none());
+        assert!(
+            died_during_wait(&paths, &id, true, EndpointReadiness::Serving, |_| false).is_none()
+        );
+        assert!(died_during_wait(&paths, &id, true, pending, |_| true).is_none());
+        assert_eq!(status(), "starting");
+
+        // Dead server: the error names the logs command and the record is settled.
+        let error = died_during_wait(&paths, &id, true, pending, |_| false).expect("died");
+        let message = error.to_string();
+        assert!(
+            message.contains("exited before it became ready"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("rocm logs --service {id}")),
+            "{message}"
+        );
+        assert_eq!(status(), "stopped");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn died_during_wait_adds_the_oom_guidance_for_a_vllm_launch_only() {
+        let (root, paths) = test_paths("wait-died-oom");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.engine = "vllm".to_owned();
+        record.write().expect("write");
+        fs::write(
+            &record.log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("log");
+        let id = record.service_id;
+        let pending = EndpointReadiness::Unreachable;
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(message.contains("--gpu-memory-utilization"), "{message}");
+
+        // Same log, another engine: that engine has no such flag to suggest.
+        let mut record = ManagedServiceRecord::read_manifest(&paths, &id).unwrap();
+        record.engine = "lemonade".to_owned();
+        "starting".clone_into(&mut record.status);
+        record.write().expect("write");
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(!message.contains("--gpu-memory-utilization"), "{message}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_wait_outcome_keeps_what_changed_on_disk_during_the_wait() {
+        let (root, paths) = test_paths("wait-outcome");
+        paths.ensure().expect("paths");
+        let mut held = record_tracking_pid(&paths, 111, "starting");
+        held.write().expect("write");
+        // While the wait ran, `rocmd` recorded a restart and a new supervisor.
+        let mut elsewhere = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        elsewhere.restart_count = 3;
+        elsewhere.supervisor_pid = 222;
+        elsewhere.write().expect("write");
+
+        record_wait_outcome(&paths, &mut held, "ready", true).expect("outcome");
+        let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        assert_eq!(after.status, "ready");
+        assert!(after.inference_verified_at_unix_ms.is_some());
+        assert_eq!(after.restart_count, 3, "the restart count was reverted");
+        assert_eq!(after.supervisor_pid, 222, "the supervisor pid was reverted");
+
+        record_wait_outcome(&paths, &mut held, "starting", false).expect("outcome");
+        let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+        assert_eq!(after.status, "starting");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_begin_shows_the_key_only_for_the_launch_it_belongs_to() {
+        let own = wait_begin_client_config("svc-new", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
+            .expect("own launch shows its key");
+        // No `{own}` in the failure messages: the text carries the dummy key,
+        // and formatting it into an assert is what CodeQL flags as logging it.
+        assert!(own.contains("api key: k-secret"), "key line missing");
+        assert!(
+            own.contains("http://0.0.0.0:8000/v1/models"),
+            "models url missing"
+        );
+        // Attached to an already-starting server: its key is not this one.
+        assert!(
+            wait_begin_client_config("svc-old", "svc-new", "0.0.0.0", 8000, Some("k-secret"))
+                .is_none()
+        );
+        // Loopback binds have no key to show.
+        assert!(wait_begin_client_config("svc-new", "svc-new", "127.0.0.1", 8000, None).is_none());
+    }
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {
