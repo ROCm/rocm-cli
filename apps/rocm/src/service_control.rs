@@ -259,7 +259,8 @@ fn stop_internal_managed_service_confirmed_with(
         // The processes this stop confirmed gone are not the service's any more,
         // and their PIDs are stale the instant they exited. Left in the record,
         // a later stop would signal them again: a PID recorded without a
-        // start-time token (every one on Windows) cannot be refuted, so if the
+        // start-time token (every one a Windows record had before it recorded
+        // a creation time) cannot be refuted, so if the
         // OS had given it to another process the Windows tree kill would take
         // that process and its subtree. The same call, on the same confirmed
         // path, as `rocmd`'s stop.
@@ -1412,7 +1413,7 @@ mod tests {
         let rendered = format!("{:#}", outcome.expect_err("unconfirmed"));
         assert_no_retry_line(&rendered);
         assert!(
-            rendered.contains("check: `ps -p 888888888 -o pid,args`"),
+            rendered.contains(&format!("check: `{}`", process_check_command(888_888_888))),
             "{rendered}"
         );
         assert!(!rendered.contains("the record changed"), "{rendered}");

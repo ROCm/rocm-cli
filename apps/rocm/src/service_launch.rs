@@ -2678,7 +2678,13 @@ mod tests {
             finish("attached-unverified", Ok(stop_answer(false, "unverified")));
         let error = format!("{:#}", result.expect_err("an unverified stop fails"));
         assert!(error.contains("not signaled: process 4242"), "{error}");
-        assert!(error.contains("check: `ps -p 4242 -o pid,args`"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "check: `{}`",
+                crate::services_text::process_check_command(4242)
+            )),
+            "{error}"
+        );
         crate::services_text::tests::assert_no_retry_line(&error);
         assert!(out.is_empty(), "{out}");
         assert_eq!(signalled, None);
