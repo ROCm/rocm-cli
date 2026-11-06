@@ -186,7 +186,8 @@ const LEGEND_ENTRIES: &[(CellOutcome, &str)] = &[
 /// rest of the sentence for their own medium (the markdown one also spells out
 /// what a red Mock check means for the merge), so only the claim itself is
 /// shared: change who gates the PR here and both renderers change with it, and
-/// a test in `consolidated/mod.rs` fails if either stops using them.
+/// a test in `consolidated/mod.rs` fails if either renderer stops using them or
+/// spells either phrase out itself.
 const MOCK_GATES_PR: &str = "gates the PR";
 /// See [`MOCK_GATES_PR`].
 const OTHER_LANES_NON_BLOCKING: &str = "non-blocking";
@@ -1760,40 +1761,37 @@ mod tests {
     }
 
     #[test]
-    fn both_renderers_state_the_same_pr_gating_policy() {
-        // The markdown summary and the HTML legend each explain that Mock gates
-        // the PR and the other lanes do not. They word the rest differently, but
-        // the claim itself comes from `MOCK_GATES_PR` /
-        // `OTHER_LANES_NON_BLOCKING`; if either renderer is edited to say
-        // something else (or a third surface re-types the claim), this is where
-        // the two stop agreeing.
-        let report = write_report(&feature_json(&[(&[], &["passed"])]));
-        let inputs = vec![("e2e-report".to_string(), report.path().to_path_buf())];
-        let bundle = load_platform_reports(&inputs);
-
-        let md = consolidated_summary_markdown(&bundle);
-        assert!(
-            md.contains(&format!("It **{MOCK_GATES_PR}**")),
-            "markdown must say Mock {MOCK_GATES_PR}:\n{md}"
-        );
-        assert!(
-            md.contains(&format!("They are **{OTHER_LANES_NON_BLOCKING}**")),
-            "markdown must say the other lanes are {OTHER_LANES_NON_BLOCKING}:\n{md}"
-        );
-
-        let out = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated(&bundle, out.path(), &RunMeta::default()).expect("generate");
-        let html = std::fs::read_to_string(out.path()).expect("read");
-        assert!(
-            html.contains(&format!("runner and {MOCK_GATES_PR}.</li>")),
-            "HTML legend must say Mock {MOCK_GATES_PR}:\n{html}"
-        );
-        assert!(
-            html.contains(&format!(
-                "hardware; {OTHER_LANES_NON_BLOCKING} while proven out."
-            )),
-            "HTML legend must say the other lanes are {OTHER_LANES_NON_BLOCKING}:\n{html}"
-        );
+    fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
+        // What this proves, and what it does not. The rendered text is pinned
+        // verbatim by `summary_explanation_paragraphs_are_unchanged` (markdown)
+        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML); those
+        // catch any edit to the wording, but a renderer that re-typed the literal
+        // with identical words would still pass them and would silently stop
+        // following `MOCK_GATES_PR` / `OTHER_LANES_NON_BLOCKING`. This test
+        // closes that gap by reading each renderer's non-test source: it must
+        // name both constants and must not spell either phrase out itself.
+        for (name, source) in [
+            ("markdown.rs", include_str!("markdown.rs")),
+            ("html.rs", include_str!("html.rs")),
+        ] {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split always yields a first part");
+            for (constant, phrase) in [
+                ("MOCK_GATES_PR", MOCK_GATES_PR),
+                ("OTHER_LANES_NON_BLOCKING", OTHER_LANES_NON_BLOCKING),
+            ] {
+                assert!(
+                    production.contains(constant),
+                    "{name} must build its gating sentence from `{constant}`"
+                );
+                assert!(
+                    !production.contains(phrase),
+                    "{name} re-types {phrase:?} instead of using `{constant}`"
+                );
+            }
+        }
     }
 
     #[test]
