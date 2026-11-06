@@ -188,10 +188,7 @@ async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
     }
     let candidates = backend_candidates(runtime);
     if candidates.is_empty() {
-        let _ = writeln!(
-            report,
-            "no llama-server candidates under bin/llamacpp (backend download may not have completed)"
-        );
+        let _ = writeln!(report, "{}", empty_search_note(runtime));
     }
     let deadline = Instant::now() + budget;
     let mut servers = Vec::new();
@@ -243,31 +240,104 @@ async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
     Inventory { report, servers }
 }
 
-fn backend_candidates(runtime: &Path) -> Vec<PathBuf> {
-    let binary = if cfg!(windows) {
+/// The GPU backend directories under `bin/llamacpp` that are searched. The cpu
+/// backend is left out on purpose: a CPU build is never what a GPU serve should
+/// have launched, and listing it would read as one.
+const BACKEND_DIRS: [&str; 4] = ["rocm-stable", "rocm-nightly", "rocm", "vulkan"];
+/// How many directory levels below a backend directory are searched. Lemonade
+/// unpacks some llama.cpp builds into a build-numbered directory, and the layout
+/// is the router's to choose, so the search is not pinned to one level.
+const MAX_SEARCH_DEPTH: usize = 3;
+/// Directory entries read per directory, so a corrupt tree cannot make the
+/// search unbounded.
+const MAX_DIR_ENTRIES: usize = 256;
+/// Names listed when explaining an empty search.
+const MAX_LISTED_NAMES: usize = 16;
+
+fn server_binary() -> &'static str {
+    if cfg!(windows) {
         "llama-server.exe"
     } else {
         "llama-server"
-    };
+    }
+}
+
+fn backend_candidates(runtime: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    for backend in ["rocm-stable", "rocm-nightly", "rocm", "vulkan"] {
-        let dir = runtime.join("bin/llamacpp").join(backend);
-        let direct = dir.join(binary);
-        if direct.is_file() {
-            candidates.push(direct);
-        }
-        // Lemonade archives also unpack one level below the backend directory.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut nested: Vec<_> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().join(binary))
-                .filter(|path| path.is_file())
-                .collect();
-            nested.sort();
-            candidates.extend(nested);
-        }
+    for backend in BACKEND_DIRS {
+        collect_candidates(
+            &runtime.join("bin/llamacpp").join(backend),
+            0,
+            &mut candidates,
+        );
     }
     candidates
+}
+
+fn collect_candidates(dir: &Path, depth: usize, candidates: &mut Vec<PathBuf>) {
+    let direct = dir.join(server_binary());
+    if direct.is_file() {
+        candidates.push(direct);
+    }
+    if depth >= MAX_SEARCH_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .take(MAX_DIR_ENTRIES)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort();
+    for subdir in subdirs {
+        collect_candidates(&subdir, depth + 1, candidates);
+    }
+}
+
+/// Why a search found nothing, in terms of where it looked. An absent binary can
+/// mean a backend download that did not finish, a layout the search does not
+/// cover, or a build that was never installed, and the report cannot tell which,
+/// so it says what was searched and what `bin/llamacpp` actually holds.
+fn empty_search_note(runtime: &Path) -> String {
+    let llamacpp = runtime.join("bin/llamacpp");
+    let searched = BACKEND_DIRS
+        .iter()
+        .map(|backend| llamacpp.join(backend).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let present = match std::fs::read_dir(&llamacpp) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                format!("{} is empty", llamacpp.display())
+            } else {
+                let more = names.len().saturating_sub(MAX_LISTED_NAMES);
+                names.truncate(MAX_LISTED_NAMES);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} contains: {}{more}",
+                    llamacpp.display(),
+                    names.join(", ")
+                )
+            }
+        }
+        Err(error) => format!("{} cannot be read: {error}", llamacpp.display()),
+    };
+    format!(
+        "no llama-server candidates found; searched {searched}, down to {MAX_SEARCH_DEPTH} \
+         directory levels below each (the cpu backend is not searched); {present}"
+    )
 }
 
 fn fingerprint(server: &Path, deadline: Instant) -> std::io::Result<String> {
@@ -494,6 +564,61 @@ mod tests {
         std::fs::create_dir_all(cpu.parent().unwrap()).unwrap();
         std::fs::write(cpu, "").unwrap();
         assert_eq!(backend_candidates(root.path()), wanted);
+    }
+
+    #[test]
+    fn candidate_search_reaches_three_levels_below_a_backend_and_no_further() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = root.path().join("bin/llamacpp/rocm-nightly");
+        // Literal layouts, not derived from MAX_SEARCH_DEPTH: the depth is the
+        // behaviour under test, so changing the constant must turn this red.
+        let found_at_three = backend.join("a/b/llama-b9752").join(server_binary());
+        let found_at_two = backend.join("a/build").join(server_binary());
+        let beyond = backend.join("a/b/c/llama-b9752").join(server_binary());
+        for server in [&found_at_three, &found_at_two, &beyond] {
+            std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+            std::fs::write(server, "").unwrap();
+        }
+        assert_eq!(
+            backend_candidates(root.path()),
+            vec![found_at_two, found_at_three]
+        );
+    }
+
+    /// An empty search says where it looked and what `bin/llamacpp` holds, and does
+    /// not guess that a download was interrupted: the same report follows from a
+    /// layout the search does not cover or a build that was never installed.
+    #[tokio::test]
+    async fn empty_search_lists_the_searched_locations_and_blames_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let cpu = root.path().join("bin/llamacpp/cpu");
+        std::fs::create_dir_all(&cpu).unwrap();
+        std::fs::write(cpu.join(server_binary()), "").unwrap();
+        let report = evidence(&write_manifest(root.path())).await;
+        let llamacpp = root.path().join("bin/llamacpp");
+        for backend in BACKEND_DIRS {
+            assert!(
+                report.contains(&llamacpp.join(backend).display().to_string()),
+                "{report}"
+            );
+        }
+        assert!(
+            report.contains("no llama-server candidates found"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("{} contains: cpu", llamacpp.display())),
+            "{report}"
+        );
+        assert!(
+            !report.contains("download") && !report.contains("complete"),
+            "{report}"
+        );
+        assert!(!report.contains("candidate (not proof"), "{report}");
+
+        let bare = tempfile::tempdir().unwrap();
+        let report = evidence(&write_manifest(bare.path())).await;
+        assert!(report.contains("cannot be read"), "{report}");
     }
 
     #[tokio::test]

@@ -826,7 +826,13 @@ an engine, and counts as no engine named.
 Lemonade failures also include the installed runtime manifest's version/backend, configured
 `backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
 and `version.txt`,
-and each candidate's `--version` and `--help` output. At most eight candidates
+and each candidate's `--version` and `--help` output. Candidates are searched
+under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
+`bin/llamacpp`, down to three directory levels below each; the cpu backend is not
+searched. When nothing is found, the report lists those locations and what
+`bin/llamacpp` holds, and does not guess at the cause: an interrupted download, a
+layout outside the search and a build that was never installed look the same.
+At most eight candidates
 are hashed and probed, with two read-only probes per candidate. Each probe retains
 up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
 marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
