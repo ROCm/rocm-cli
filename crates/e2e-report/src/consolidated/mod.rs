@@ -1760,6 +1760,188 @@ mod tests {
         assert_eq!(grid.columns[0].label(), "MI300X Linux");
     }
 
+    /// Returns `src` with its comments and `use` statements removed, so what
+    /// is left is the code that actually runs (string literals included, since
+    /// a `{NAME}` interpolation lives inside one). Line, doc and block
+    /// comments are dropped; a `//` or `/*` inside a string literal is not a
+    /// comment. A `use` statement is dropped from the keyword through its
+    /// `;`, wherever it starts a statement, including a `use` nested in a
+    /// function body. Raw strings are not recognised: the renderers have none,
+    /// and one with an unbalanced `"` would confuse the scan.
+    fn strip_comments_and_uses(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        let mut in_string = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                out.push(c);
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 1;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            let next = chars.get(i + 1).copied();
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+            } else if c == '"' {
+                in_string = true;
+                out.push(c);
+                i += 1;
+            } else if c == '\'' && next == Some('"') && chars.get(i + 2) == Some(&'\'') {
+                // The `'"'` char literal: its quote does not open a string.
+                out.extend(&chars[i..i + 3]);
+                i += 3;
+            } else if c.is_alphabetic() || c == '_' {
+                let begin = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[begin..i].iter().collect();
+                let before = out.trim_end();
+                let starts_statement = before.is_empty()
+                    || before.ends_with([';', '{', '}', ']', ')'])
+                    || before.strip_suffix("pub").is_some_and(|rest| {
+                        !rest.ends_with(|ch: char| ch.is_alphanumeric() || ch == '_')
+                    });
+                if ident == "use" && starts_statement {
+                    while i < chars.len() && chars[i] != ';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else {
+                    out.push_str(&ident);
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether `code` (already stripped by [`strip_comments_and_uses`]) refers
+    /// to `constant` the way the renderers do: as a `{NAME}` interpolation in a
+    /// format string, or as a `(NAME)` splice in a `maud` block. A bare mention
+    /// that is neither (an import, a comment, a `let _ = NAME;`) is not use.
+    fn references_constant(code: &str, constant: &str) -> bool {
+        [
+            format!("{{{constant}}}"),
+            format!("{{{constant}:"),
+            format!("({constant})"),
+        ]
+        .iter()
+        .any(|shape| code.contains(shape.as_str()))
+    }
+
+    #[test]
+    fn strip_comments_and_uses_drops_imports_and_every_kind_of_comment() {
+        let src = "use super::{MOCK_GATES_PR, X};\n\
+                   pub(crate) use other::MOCK_GATES_PR;\n\
+                   // line: MOCK_GATES_PR\n\
+                   /// doc: [`MOCK_GATES_PR`]\n\
+                   //! inner doc: MOCK_GATES_PR\n\
+                   /* block: MOCK_GATES_PR /* nested */ MOCK_GATES_PR */\n\
+                   fn f() { use std::fmt::Write as _; let _ = 1; } // tail MOCK_GATES_PR\n";
+        let code = strip_comments_and_uses(src);
+        assert!(!code.contains("MOCK_GATES_PR"), "left behind: {code:?}");
+        assert!(
+            code.contains("fn f()") && code.contains("let _ = 1;"),
+            "{code:?}"
+        );
+    }
+
+    #[test]
+    fn strip_comments_and_uses_keeps_string_contents_and_prose_use() {
+        // `//` inside a string is not a comment, and the word `use` inside a
+        // string is not an import.
+        let src = "let a = \"see https://x.example then use {MOCK_GATES_PR}\";\n\
+                   let q = '\"'; let b = \"esc \\\" // {OTHER_LANES_NON_BLOCKING}\";\n";
+        let code = strip_comments_and_uses(src);
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+        assert!(
+            references_constant(&code, "OTHER_LANES_NON_BLOCKING"),
+            "{code:?}"
+        );
+    }
+
+    #[test]
+    fn references_constant_rejects_an_import_only_source() {
+        let code = strip_comments_and_uses("use super::{MOCK_GATES_PR, X};\nfn f() {}\n");
+        assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_rejects_a_comment_only_source() {
+        let code = strip_comments_and_uses("// built from MOCK_GATES_PR\nfn f() {}\n");
+        assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_rejects_a_doc_comment_only_source() {
+        let code = strip_comments_and_uses(
+            "/// Uses `{MOCK_GATES_PR}` and (MOCK_GATES_PR).\nfn f() {}\n//! {MOCK_GATES_PR}\n",
+        );
+        assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_rejects_import_plus_comment_with_a_retyped_phrase() {
+        // The shape the old check accepted: the constant named in an import and
+        // a comment, the sentence typed out by hand.
+        let code = strip_comments_and_uses(
+            "use super::MOCK_GATES_PR;\n// takes MOCK_GATES_PR\nfn f() { let s = \"It **gates the PR**\"; }\n",
+        );
+        assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_rejects_a_bare_non_interpolating_mention() {
+        let code = strip_comments_and_uses("fn f() { let _ = MOCK_GATES_PR; }\n");
+        assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_accepts_a_format_string_interpolation() {
+        let code = strip_comments_and_uses(
+            "use super::MOCK_GATES_PR;\nfn f() { write!(out, \"It **{MOCK_GATES_PR}**: runs\"); }\n",
+        );
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+        assert!(!references_constant(&code, "OTHER_LANES_NON_BLOCKING"));
+    }
+
+    #[test]
+    fn references_constant_accepts_a_macro_splice() {
+        let code = strip_comments_and_uses(
+            "use super::MOCK_GATES_PR;\nfn f() { html! { li { \"and \" (MOCK_GATES_PR) \".\" } } }\n",
+        );
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
     #[test]
     fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
         // What this proves, and what it does not. The rendered text is pinned
@@ -1768,8 +1950,16 @@ mod tests {
         // catch any edit to the wording, but a renderer that re-typed the literal
         // with identical words would still pass them and would silently stop
         // following `MOCK_GATES_PR` / `OTHER_LANES_NON_BLOCKING`. This test
-        // closes that gap by reading each renderer's non-test source: it must
-        // name both constants and must not spell either phrase out itself.
+        // closes that gap by reading each renderer's non-test source. It
+        // requires two things. First, each constant is in use: after dropping
+        // `use` statements and comments, the code must interpolate it as
+        // `{NAME}` in a format string or splice it as `(NAME)` into a `maud`
+        // block, so an import or a comment that merely names it does not count.
+        // Second, the source must not spell either phrase out itself (checked
+        // on the raw text, comments included). It does not prove that the
+        // interpolation sits in the sentence the reader sees, only that the
+        // renderer takes the words from the constant; the verbatim pins above
+        // prove the rendered words.
         for (name, source) in [
             ("markdown.rs", include_str!("markdown.rs")),
             ("html.rs", include_str!("html.rs")),
@@ -1778,13 +1968,16 @@ mod tests {
                 .split("#[cfg(test)]")
                 .next()
                 .expect("split always yields a first part");
+            let code = strip_comments_and_uses(production);
             for (constant, phrase) in [
                 ("MOCK_GATES_PR", MOCK_GATES_PR),
                 ("OTHER_LANES_NON_BLOCKING", OTHER_LANES_NON_BLOCKING),
             ] {
                 assert!(
-                    production.contains(constant),
-                    "{name} must build its gating sentence from `{constant}`"
+                    references_constant(&code, constant),
+                    "{name} must build its gating sentence from `{constant}`, \
+                     interpolated as `{{{constant}}}` or spliced as `({constant})`; \
+                     an import or a comment naming it is not use"
                 );
                 assert!(
                     !production.contains(phrase),
