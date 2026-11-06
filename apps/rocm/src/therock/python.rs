@@ -852,9 +852,20 @@ fn ensure_python_tag_matches(python_tag: &str, requirement: PythonRequirement) -
 /// `uv` is what reads `version` (it is passed through to `uv python install`),
 /// and this repo has no parser of its own to share, so this reads the spellings
 /// `uv` accepts for a CPython release that name a major and a minor: `3.13`,
-/// `3.13.1`, `3.13t` (free-threaded, which still reports `cp313`), and any of
-/// those after `cpython-` or `cpython@`. Anything else (another implementation,
-/// a range, a wildcard, a pre-release spelled on the minor) yields `None`.
+/// `3.13.1`, `3.13.*`, `3.13t` (free-threaded, which still reports `cp313`), and
+/// any of those after `cpython-` or `cpython@`. Whatever follows the minor is
+/// not validated, because only the major and minor decide the wheel tag.
+/// Anything that leaves the minor open or names something else (another
+/// implementation, a range, a wildcard such as `3.*`, a pre-release spelled on
+/// the minor) yields `None`.
+///
+/// This reader is a hand-rolled approximation of what `uv` accepts and can drift
+/// from it in either direction: a spelling `uv` takes may read as `None`, and one
+/// `uv` would reject may read as a tag. Both are benign. A `None` is announced
+/// as unchecked (the preview still prints a plan and says the tag cannot be
+/// checked until the Python is installed), never refused, and a tag read off a
+/// spelling `uv` then rejects is only a preview that predicted an install that
+/// fails at `uv python install`, with `uv`'s own error, as it always did.
 fn python_tag_for_version(version: &str) -> Option<String> {
     let version = version.trim();
     let version = ["cpython-", "cpython@"]
@@ -2019,6 +2030,8 @@ exit 1
             "",
             "3",
             "3.x",
+            "3.*",
+            "*",
             "latest",
             "pypy@3.10",
             "3.13rc1",
