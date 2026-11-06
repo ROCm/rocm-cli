@@ -706,7 +706,7 @@ fn validate_wheel_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Resul
 }
 
 fn validate_tarball_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Result<()> {
-    if runtime_install_root_has_payload(&manifest.install_root)? {
+    if rocm_core::install_root_has_payload(&manifest.install_root)? {
         Ok(())
     } else {
         bail!(
@@ -714,16 +714,6 @@ fn validate_tarball_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Res
             manifest.install_root.display()
         )
     }
-}
-
-fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -1276,5 +1266,58 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// Activation validation of a tarball runtime follows
+    /// `rocm_core::install_root_has_payload`: the root's own `.rocm-cli-runtime.json`
+    /// marker is a dot-entry and does not make a payload, so a root holding only
+    /// that is reported unusable (by the message the runtime listing prints), and
+    /// one more entry makes it ready. A root that is gone is reported by the
+    /// earlier "install root is missing" check, never reaching the payload rule.
+    #[test]
+    fn tarball_validation_follows_the_shared_payload_rule() {
+        let (root, _) = test_paths("tarball-shared-payload-rule");
+        let install_root = root.join("tarball-runtime");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join(".rocm-cli-runtime.json"), b"{}").unwrap();
+        let manifest = InstalledRuntimeManifest {
+            format: "tarball".to_owned(),
+            install_root: install_root.clone(),
+            ..test_runtime_manifest(
+                "release-tarball-gfx120X-all-7-13-0",
+                "therock-release:gfx120X-all",
+                1,
+            )
+        };
+
+        let error = validate_runtime_manifest_for_activation(&manifest)
+            .expect_err("a root with only the dot-marker has no payload")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "tarball runtime install root has no payload files: {}",
+                install_root.display()
+            )
+        );
+        assert_eq!(
+            runtime_usability_status(&manifest),
+            format!("unusable ({error})")
+        );
+
+        fs::write(install_root.join("rocm-install-file"), b"x").unwrap();
+        validate_runtime_manifest_for_activation(&manifest)
+            .expect("one entry beside the marker is a payload");
+        assert_eq!(runtime_usability_status(&manifest), "ready");
+
+        fs::remove_dir_all(&install_root).unwrap();
+        let error = validate_runtime_manifest_for_activation(&manifest)
+            .expect_err("a missing root is unusable")
+            .to_string();
+        assert_eq!(
+            error,
+            format!("install root is missing: {}", install_root.display())
+        );
+        fs::remove_dir_all(root).ok();
     }
 }

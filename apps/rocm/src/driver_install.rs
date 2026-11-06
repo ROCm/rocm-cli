@@ -37,7 +37,6 @@ use crate::driver_plan::{
     DriverCommandPhase, DriverInstallPlan, PrivilegeEscalation, build_driver_install_plan_read,
     render_driver_install_plan,
 };
-use crate::system_packages::real_os_release;
 
 /// Whether `rocm install driver` goes on to run the plan's commands. Pure so
 /// the gate that keeps native Windows from installing anything (its plan is
@@ -62,7 +61,7 @@ pub(crate) fn install_driver(
 ) -> std::result::Result<DriverInstallResult, DriverInstallError> {
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
-    let os_release = real_os_release();
+    let os_release = rocm_core::hardware_root::real_os_release();
     // The only place the real privilege level is read; every builder below takes
     // it as a parameter so both branches stay testable on any host.
     let plan =
