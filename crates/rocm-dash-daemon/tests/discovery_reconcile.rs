@@ -497,6 +497,12 @@ async fn assert_service_is_retired(rx: &mut broadcast::Receiver<Event>) {
 /// Replace the registry directory with a regular file of the same name, so
 /// listing it fails with something other than "not found". Portable: it needs no
 /// permission change, so it behaves the same for a privileged user and on Windows.
+///
+/// The directory is briefly absent between the two calls, which would read as a
+/// confirmed-empty registry. The runner is a task on this test's own
+/// current-thread runtime and reads the registry synchronously, so it cannot run
+/// between them: nothing here awaits. A test that moves to a multi-thread runtime
+/// must swap atomically instead.
 fn replace_registry_dir_with_a_file(services_dir: &std::path::Path) {
     std::fs::remove_dir_all(services_dir).unwrap();
     std::fs::write(services_dir, b"not a directory").unwrap();

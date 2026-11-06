@@ -2610,14 +2610,34 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         });
 }
 
-/// Replace the managed-service registry directory with a regular file of the
-/// same name, so listing it fails the way a broken mount or a permission change
-/// would, and wait for the failure to reach the screen. The header warnings
-/// badge growing is the evidence that a frame the daemon assembled after the
-/// failed pass is on display (the daemon adds a warning for as long as the
-/// registry cannot be read); the count is read before the swap because other
-/// warnings, such as no amd-smi on a GPU-less runner, are already present and
-/// constant.
+/// Create `path` as a symbolic link to itself, so opening it fails with a loop
+/// error. The scenario that uses it is `@requires-os:linux`.
+#[cfg(unix)]
+fn make_unreadable_record(path: &std::path::Path) {
+    std::os::unix::fs::symlink(path, path).expect("failed to plant the unreadable record");
+}
+
+#[cfg(not(unix))]
+fn make_unreadable_record(_path: &std::path::Path) {
+    panic!("the unreadable-registry scenario is Linux-only (@requires-os:linux)");
+}
+
+/// Make the managed-service registry unreadable and wait for the failure to
+/// reach the screen. The registry is made unreadable by adding one record file
+/// that cannot be opened: a symbolic link to itself, which fails with a loop
+/// error rather than "not found" (a dangling link would read as a record that
+/// was removed on purpose, and be skipped). That is a single atomic step that
+/// leaves the existing record and the directory in place, and it works for a
+/// privileged user, which a permission change does not. The dashboard process
+/// polls the registry on its own schedule, so the step must never expose a
+/// registry with the records gone: deleting the directory before putting
+/// something in its place would let a poll in between read an absent registry,
+/// which is a confirmed-empty one, and retire the model the scenario expects to
+/// survive. The header warnings badge growing is the evidence that a frame the
+/// daemon assembled after the failed pass is on display (the daemon adds a
+/// warning for as long as the registry cannot be read); the count is read before
+/// the change because other warnings, such as no amd-smi on a GPU-less runner,
+/// are already present and constant.
 #[when("the managed-service registry becomes unreadable")]
 async fn managed_registry_becomes_unreadable(world: &mut E2eWorld) {
     let before = warning_badge_count(&session(world).screen_text());
@@ -2628,9 +2648,8 @@ async fn managed_registry_becomes_unreadable(world: &mut E2eWorld) {
         .path()
         .join("data")
         .join("services");
-    std::fs::remove_dir_all(&services_dir).expect("failed to remove the registry directory");
-    std::fs::write(&services_dir, b"not a directory")
-        .expect("failed to put a file where the registry directory was");
+    let looping = services_dir.join("unreadable.json");
+    make_unreadable_record(&looping);
 
     session(world)
         .wait_for_screen_where(
