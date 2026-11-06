@@ -1169,22 +1169,22 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the model-readiness report, `<command>: <verdict>`, naming what was run",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm install folder",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed at",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm please",
         "natural-language phrase the planner matches in a request",
     ),
