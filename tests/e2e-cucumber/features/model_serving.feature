@@ -810,3 +810,32 @@ Feature: Model serving
     And a stopped managed service is recorded on the default serve port
     When the user restarts the stopped service
     Then the restart is refused naming the service that holds the port
+
+  # ROCMAI-597: a served model is also reachable from Anthropic-format clients.
+  # The serving process publishes an Anthropic-compatible `/v1/messages` endpoint
+  # beside the OpenAI one — the engine's own when it serves one, else a
+  # translation front on its own port — and `services list` shows it. Engine-
+  # agnostic like `serve-readiness-contract`: the served engine follows the host.
+  # Streaming and tool use are not translated yet, so they have no scenario.
+  @id:serve-anthropic-endpoint-advertised @requires-gpu
+  Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user lists running services
+    Then the service details include an Anthropic-compatible messages endpoint
+    And the service details still include the existing OpenAI-compatible endpoint
+
+  @id:serve-anthropic-messages-inference @requires-gpu
+  Scenario: serve-51 - A served model responds to an Anthropic Messages API request
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a request to the Anthropic messages endpoint
+    Then the response is a valid Anthropic Messages API response
+    And the Anthropic response identifies the correct model
+
+  @id:serve-anthropic-endpoint-readiness @requires-gpu
+  Scenario: serve-52 - Readiness covers the Anthropic-compatible endpoint
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the CLI reports the service as ready
+    Then both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy

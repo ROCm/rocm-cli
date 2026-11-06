@@ -103,6 +103,29 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so t
 serve_timeout_secs = 90
 flaky = true
 
+# The Anthropic-endpoint scenarios start from `a model is being served on GPU`
+# like the rows above, so they hit the same EAI-7423 shutdown on Linux lemonade.
+[["serve-anthropic-endpoint-advertised"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so no endpoint is left to advertise."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so the Anthropic request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-endpoint-readiness"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "Lemonade managed serve reaches ready then shuts down immediately, so readiness never covers the Anthropic endpoint."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7423: on a lemonade LINUX host the managed serve reaches ready then is
 # shut down immediately, so inference never happens (root-caused on the box
 # 2026-07-15; previously mis-attributed to the EAI-7052 Vulkan hang). os=linux:

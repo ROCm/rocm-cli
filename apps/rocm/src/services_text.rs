@@ -360,6 +360,31 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
     let _ = writeln!(output, "  Reclaim the space: rocm services prune");
 }
 
+/// The `anthropic endpoint:` row of a service listing.
+///
+/// Only a service that reports `ready` is probed: the endpoint is published when
+/// the engine first lists its model and is gone with the process, so for any
+/// other status the answer would say nothing the status does not. The probe is
+/// the same cheap `/v1/models` listing the OpenAI endpoint is judged by.
+fn anthropic_endpoint_line(paths: &AppPaths, record: &ManagedServiceRecord, url: &str) -> String {
+    let responding = record.status != "ready"
+        || rocm_core::anthropic_endpoint_ready(
+            url,
+            Some(record.served_model_name()),
+            crate::endpoint_keys::endpoint_api_key(paths, &record.service_id).as_deref(),
+            Duration::from_millis(750),
+        );
+    format_anthropic_endpoint_line(url, responding)
+}
+
+fn format_anthropic_endpoint_line(url: &str, responding: bool) -> String {
+    if responding {
+        format!("  anthropic endpoint: {url}")
+    } else {
+        format!("  anthropic endpoint: {url} (not responding)")
+    }
+}
+
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
     // Counts describe the WHOLE registry, not the rows this view keeps. The
     // default view hides records that are not live, and counting the filtered
@@ -416,6 +441,13 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if let Some(anthropic) = &record.anthropic_endpoint_url {
+            let _ = writeln!(
+                output,
+                "{}",
+                anthropic_endpoint_line(paths, &record, anthropic)
+            );
+        }
         let _ = writeln!(
             output,
             "  logs: rocm services logs {}",
@@ -2369,6 +2401,36 @@ pub(crate) mod tests {
         assert!(rendered.contains("entry-090"));
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_endpoint_row_says_when_the_endpoint_is_not_responding() {
+        assert_eq!(
+            format_anthropic_endpoint_line("http://127.0.0.1:41000", true),
+            "  anthropic endpoint: http://127.0.0.1:41000"
+        );
+        assert_eq!(
+            format_anthropic_endpoint_line("http://127.0.0.1:41000", false),
+            "  anthropic endpoint: http://127.0.0.1:41000 (not responding)"
+        );
+    }
+
+    #[test]
+    fn services_listing_shows_the_published_anthropic_endpoint_without_probing_a_stopped_service()
+    -> Result<()> {
+        let (_guard, paths) = test_paths("services-anthropic-row");
+        let mut record = crate::tests::plant_service_record(&paths, "svc-anthropic", "stopped", 0)?;
+        record.anthropic_endpoint_url = Some("http://127.0.0.1:1".to_owned());
+        record.anthropic_endpoint_mode = Some("proxy".to_owned());
+        record.write()?;
+
+        let rendered = render_services_text(&paths, true)?;
+
+        assert!(
+            rendered.contains("\n  anthropic endpoint: http://127.0.0.1:1\n"),
+            "{rendered}"
+        );
         Ok(())
     }
 

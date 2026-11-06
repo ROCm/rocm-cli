@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod amd_smi;
+pub mod anthropic_endpoint;
 #[cfg(all(test, unix))]
 mod archive_props;
 pub mod automation;
@@ -63,6 +64,11 @@ pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
+pub use anthropic_endpoint::{
+    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
+    anthropic_endpoint_ready, anthropic_messages_native_probe,
+    wait_for_published_anthropic_endpoint,
+};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
@@ -161,7 +167,7 @@ pub use model_catalog::{
 pub use net::{
     DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
     format_host_for_url, format_host_port, format_http_base_url, http_get_text,
-    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
+    http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
