@@ -440,7 +440,8 @@ pub(crate) fn rocm_mcp_tools() -> Vec<Value> {
                     "port": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 65535
+                        "maximum": 65535,
+                        "description": "Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)."
                     },
                     "allow_public_bind": {
                         "type": "boolean"

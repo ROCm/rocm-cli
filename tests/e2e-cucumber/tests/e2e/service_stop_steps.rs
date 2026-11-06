@@ -480,19 +480,18 @@ async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
         "the refusal must name exactly one `rocm serve <model>` command:\n{combined}"
     );
     assert!(
-        advised[0].contains("--host 0.0.0.0 --allow-public-bind"),
-        "the command must bring the server back on its public host: {}",
+        advised[0].contains("--host 0.0.0.0 --port <port> --allow-public-bind"),
+        "the command must bring the server back on its public host, with the explicit port a \
+         non-default host requires: {}",
         advised[0]
     );
     let mut args: Vec<String> = advised[0]
         .split_whitespace()
         .skip(1)
-        .map(|word| {
-            if word == "<model>" {
-                "Qwen/Qwen3-0.6B".to_owned()
-            } else {
-                word.to_owned()
-            }
+        .map(|word| match word {
+            "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
+            "<port>" => "8000".to_owned(),
+            word => word.to_owned(),
         })
         .collect();
     args.push("--help".to_owned());

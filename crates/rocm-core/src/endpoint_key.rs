@@ -148,8 +148,8 @@ pub fn ensure_public_service_has_endpoint_key(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
              so {would_open} without authentication. The key is dropped when a service stops and \
              cannot be recovered. Launch it again with `rocm serve <model> --host {host} \
-             --allow-public-bind` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose \
-             the key instead of generating one)."
+             --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
+             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
     Ok(())
@@ -257,7 +257,7 @@ mod tests {
                 // following it does not bring the service back on loopback.
                 assert!(
                     message.contains(&format!(
-                        "Launch it again with `rocm serve <model> --host {host} --allow-public-bind`"
+                        "Launch it again with `rocm serve <model> --host {host} --port <port> --allow-public-bind`"
                     )),
                     "{host} {start:?}: {message}"
                 );
@@ -325,7 +325,7 @@ mod tests {
             "managed service is bound to the public host `0.0.0.0` but has no endpoint API key, \
              so respawning it would reopen it without authentication. The key is dropped when a \
              service stops and cannot be recovered. Launch it again with `rocm serve <model> \
-             --host 0.0.0.0 --allow-public-bind` (add `--api-key <key>`, or set \
+             --host 0.0.0.0 --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }

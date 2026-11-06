@@ -227,7 +227,34 @@ fn handle_server_recover_event_with_record(
                     Some(record.service_id.clone()),
                 );
             }
-            restart_managed_service(paths, &mut *record)?;
+            // A contended launch lock or an occupied recorded port is a
+            // recoverable, per-service condition — report it and move on rather
+            // than letting one service take the whole 30s watcher tick (and the
+            // daemon) down.
+            if let Err(error) = restart_managed_service(paths, &mut *record) {
+                // `restart_managed_service` can fail before it ever writes the
+                // record (e.g. the recorded port is still occupied), so without
+                // this stamp the backoff guard above never sees a prior attempt
+                // and the next 30s tick retries immediately, forever. Best
+                // effort: a write failure here just means the next tick retries
+                // sooner, not a worse outcome than today.
+                let _ = crate::supervise::update_supervised_record(paths, record, |current| {
+                    current.last_restart_unix_ms = Some(now);
+                });
+                return crate::persistence::record_event(
+                    paths,
+                    state,
+                    "server-recover",
+                    "error",
+                    "restart_managed_service_failed",
+                    &format!(
+                        "failed to recover managed service {} on {}:{} after \
+                         {recovery_reason_display}: {error:#}",
+                        record.service_id, record.host, record.port
+                    ),
+                    Some(record.service_id.clone()),
+                );
+            }
             crate::persistence::record_event(
                 paths,
                 state,
@@ -289,6 +316,15 @@ pub(crate) fn find_recoverable_service(
     let now = unix_time_millis();
     for record in crate::persistence::load_managed_services(paths)? {
         if record.mode != "managed" || stop_requested(&record) {
+            continue;
+        }
+        // A candidate still inside its restart backoff would only be skipped by
+        // the caller; returning it here would starve every service after it
+        // while a refused recovery (e.g. its port was taken) keeps re-stamping.
+        if record
+            .last_restart_unix_ms
+            .is_some_and(|last| now.saturating_sub(last) < SERVER_RECOVER_BACKOFF_MS)
+        {
             continue;
         }
         if let Some(reason) = manifest_service_recovery_reason(&record, now) {
@@ -388,8 +424,12 @@ mod tests {
         UNCONFIRMED_STOP_PID, proposals_beyond_a_recent_window, seed_keyed_service,
         stop_with_outcome, temp_app_paths, test_runtime_state, test_watcher_snapshot,
     };
+    use crate::test_support::{free_loopback_port, identity_probe_record};
     use crate::watchers::policy::queue_proposal_with_arguments;
-    use rocm_core::{AutomationProposalRecord, WatcherRuntimeSnapshot, append_automation_proposal};
+    use rocm_core::{
+        AutomationEventRecord, AutomationProposalRecord, WatcherRuntimeSnapshot,
+        append_automation_proposal,
+    };
     use serde_json::Value;
     use std::fs;
 
@@ -757,6 +797,51 @@ mod tests {
         Ok(())
     }
 
+    /// The record `rocm serve` keeps when it abandons a launch whose child
+    /// already ran (`abandon_failed_managed_launch` in
+    /// `apps/rocm/src/service_launch.rs`) must not be respawned: the CLI has just
+    /// reported that launch as failed. The producing side is
+    /// `abandoned_launch_terminates_the_spawned_child` in that file; both go
+    /// through `ManagedServiceRecord::mark_launch_abandoned`.
+    #[test]
+    fn abandoned_launch_record_is_not_a_recovery_candidate() -> Result<()> {
+        let (root, paths) = temp_app_paths("recoverable-abandoned-launch");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-abandoned",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(UNCONFIRMED_STOP_PID);
+        record.status = "failed".to_owned();
+        record.write()?;
+        // Control: the same record as a plain `failed` one IS restarted, so the
+        // assertion below is about the abandoned status and not the fixture.
+        let control = find_recoverable_service(&paths)?;
+
+        record.status = "running".to_owned();
+        record.mark_launch_abandoned();
+        record.write()?;
+        let abandoned = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            control.map(|(record, _)| record.service_id).as_deref(),
+            Some("svc-abandoned")
+        );
+        assert!(abandoned.is_none(), "{abandoned:?}");
+        Ok(())
+    }
+
     #[test]
     fn find_recoverable_service_detects_stale_starting_manifest() -> Result<()> {
         let (root, paths) = temp_app_paths("recoverable-stale-starting");
@@ -989,6 +1074,112 @@ mod tests {
             "without a stop request the same record must still be recovered"
         );
         assert!(event_without_request);
+        Ok(())
+    }
+
+    #[test]
+    fn contained_recovery_survives_a_failed_restart_and_backs_off() -> Result<()> {
+        use std::net::TcpListener;
+
+        let (root, paths) = temp_app_paths("recovery-contained-port-collision");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let occupant = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = occupant.local_addr()?.port();
+
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-recover-2",
+            "lemonade",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            rocm_core::DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Contained,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "manifest_scan".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        // The watcher must not propagate a per-service failure: that would take
+        // the whole 30s tick (and every other watcher) down with it.
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Contained,
+            &mut state,
+            &event,
+            &mut record,
+        )
+        .expect("a failed restart must be caught and reported, not propagated");
+
+        let event_text = fs::read_to_string(paths.automation_events_path())?;
+        let logged = serde_json::from_str::<AutomationEventRecord>(event_text.trim())?;
+        let reloaded = load_service_record(&paths, "lemonade-recover-2")?;
+        fs::remove_dir_all(root).ok();
+        drop(occupant);
+
+        assert_eq!(logged.level, "error");
+        assert_eq!(logged.action, "restart_managed_service_failed");
+        assert!(
+            logged.message.contains("recorded port is in use"),
+            "{}",
+            logged.message
+        );
+        // Unchanged other than the backoff stamp: the occupied port must not
+        // have been reported as recovered.
+        assert_eq!(reloaded.status, "failed");
+        // Stamped despite `restart_managed_service` never writing the record on
+        // this failure path, so the next 30s tick's backoff guard sees a prior
+        // attempt instead of retrying immediately forever.
+        assert!(reloaded.last_restart_unix_ms.is_some());
+        Ok(())
+    }
+
+    /// A candidate still inside its restart backoff must not starve the ones
+    /// after it.
+    #[test]
+    fn find_recoverable_service_skips_a_candidate_inside_its_backoff() -> Result<()> {
+        let (root, paths) = temp_app_paths("recoverable-backoff-skip");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let b_created = unix_time_millis() - 10_000;
+        let mut a = identity_probe_record(&paths, "svc-backoff-a", free_loopback_port());
+        a.status = "failed".to_owned();
+        a.last_restart_unix_ms = Some(unix_time_millis());
+        // Records load newest first: A must come first, or the skip is not what
+        // gets B returned.
+        a.created_at_unix_ms = b_created + 1_000;
+        a.write()?;
+        let mut b = identity_probe_record(&paths, "svc-backoff-b", free_loopback_port());
+        b.status = "failed".to_owned();
+        b.created_at_unix_ms = b_created;
+        b.write()?;
+
+        let found = find_recoverable_service(&paths);
+        fs::remove_dir_all(root).ok();
+
+        let (record, _reason) = found?.expect("service B is recoverable");
+        assert_eq!(record.service_id, "svc-backoff-b");
         Ok(())
     }
 }

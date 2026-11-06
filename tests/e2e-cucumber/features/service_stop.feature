@@ -177,8 +177,8 @@ Feature: Stopping a managed service
   # restart of a publicly bound server whose key is gone would bring it back up
   # without authentication; it is refused instead. The refusal names a `rocm
   # serve` command to launch the server again, and the command is checked
-  # against the real parser with a model filled in for its `<model>`
-  # placeholder (`--help` ends the parse after every other word has been
+  # against the real parser with a model and a port filled in for its `<model>`
+  # and `<port>` placeholders (`--help` ends the parse after every other word has been
   # accepted, so nothing is started). That running it clears the condition is
   # covered by the unit tests, which follow it through `serve`'s own policy and
   # the key file it stores; here it is only shown to be a command `rocm` accepts.
