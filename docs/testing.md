@@ -329,10 +329,14 @@ check on its own with:
 cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
 ```
 
-The pull-request affected-crates selection reaches `xtask` only through the
-crates it depends on (`rocm-core`, `e2e-report`), so a move confined to
-`apps/rocm` meets this check in the merge queue, which runs the whole
-workspace; run the command above after moving a property test. To prove a moved seed is read,
+The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
+adds `xtask` when a changed file is under a `proptest-regressions` directory or
+when the diff of a changed Rust file adds or removes a line containing
+`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
+check on the pull request, whether or not its seed moved with it. The other
+source-scan contracts do not have this rule; they still meet a change confined to
+a crate that `xtask` does not depend on in the merge queue, which runs the whole
+workspace. To prove a moved seed is read,
 append a deliberately unparsable line to it, run the test with `--nocapture`
 (`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
 `unparsable line, ignoring` warning naming that path, and remove the line.
@@ -463,7 +467,10 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). On `main`
+`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
+the proptest seed guard and which no other crate depends on: a changed file under
+a `proptest-regressions` directory, and a changed Rust file whose diff adds or
+removes a line containing `proptest!` (found with `git diff -G`). On `main`
 and in the merge queue the full workspace always runs. For local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization.
 
