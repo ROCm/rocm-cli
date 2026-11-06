@@ -1632,7 +1632,7 @@ jobs:
   # fires, so this job is not a substitute for them.
   #
   # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
-  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # is not a published skill: apps/rocm/src/chat/turn.rs embeds it verbatim into the
   # chat assistant's system prompt with include_str!, so giving it the YAML
   # frontmatter this check requires would inject that frontmatter into a live
   # prompt.

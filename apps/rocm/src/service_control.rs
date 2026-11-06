@@ -22,7 +22,9 @@
 //! Only `run_internal_sandbox_tool` and `restart_internal_managed_service` are
 //! `pub(crate)`. `run_internal_sandbox_tool` is read from `main.rs`'s
 //! `dispatch()`, `services_cmd.rs`'s `run_approved_service_action` and
-//! `service_launch.rs`; `restart_internal_managed_service` from
+//! `serve_cmd.rs`, which hands it to `service_launch.rs`'s
+//! `run_attached_service` as the stop for a Ctrl-C;
+//! `restart_internal_managed_service` from
 //! `runtime_services.rs`. Every other item has no caller outside this module and
 //! stays private.
 //!
@@ -30,9 +32,9 @@
 //! (`load_managed_service`, `read_managed_service_manifest`) and shapes the
 //! `stop_server` answer with its `internal_stop_server_value`, which stays there
 //! next to `service_stop_unconfirmed` and the renderer that reads the same
-//! `stop_unconfirmed` status. `service_launch.rs` and this module import each
-//! other: this module takes the spawn helpers from it, and it takes
-//! `run_internal_sandbox_tool` from here.
+//! `stop_unconfirmed` status. This module takes the spawn helpers from
+//! `service_launch.rs`, which does not import this module back; the respawn
+//! guard it applies is `rocm_core::ensure_public_service_has_endpoint_key`.
 //!
 //! The regression tests for the stop and restart paths live in this module's own
 //! `mod tests`. They reach shared fixtures (`test_paths`, `ScopedTestEnv`,

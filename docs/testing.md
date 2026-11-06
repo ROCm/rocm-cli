@@ -500,14 +500,61 @@ Known limits, unchanged by the narrowing: the steps check the working tree rathe
 commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
 builds can resolve Cargo features differently from `--workspace` ones.
 
-Preview what a push would check without compiling:
+### Pass stamps
+
+A step that already passed on this exact content is skipped. After a step's cargo command exits 0,
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs) records a stamp, and the next run of the same step
+looks for it first. The stamp stands for:
+
+- the step and its exact cargo arguments, so a pass recorded for `-p xtask` never lets a later run
+  over `--workspace` skip (the selection is part of the key, not a separate check);
+- the git *tree* hash of `HEAD`, not the commit hash, so an amend that only rewords the message, or
+  the same content pushed to a second remote, still hits;
+- the compiler and cargo identity (`rustc -vV`, `cargo -vV`) and a digest of the `CARGO_*` and
+  `RUST*` environment (never the values), minus a short list of per-run variables such as
+  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable
+  whose value is not valid Unicode never stops the hook: an unrelated one is ignored and a
+  relevant one is hashed as the bytes it is.
+
+The working tree has to be clean for a stamp to be used or written, because cargo checks the working
+tree, not the pushed commit: with uncommitted changes the step runs and says why, and an untracked
+file counts because it can hide a missing `git add`. The tree is probed again after the step, and
+nothing is recorded if cargo changed it (a rewritten `Cargo.lock`, for example). A pass is only
+written after cargo succeeded, per step, so a failed `test` does not erase the `clippy` pass that
+the retry then skips.
+
+Stamps live in `rocm-cli-prepush-passes` under the git common directory, so every worktree of a
+clone shares them, nothing lands in the work tree and `cargo clean` does not erase them. Each write
+drops stamps older than seven days and keeps at most 64. A write goes through a scratch file and a
+rename, and removes the scratch file itself when the rename fails; a process killed mid-write
+leaves its scratch file behind until a later write prunes it, once it is more than an hour old (a
+younger one may belong to a concurrent writer). Any error locating, reading or verifying a
+stamp means the step runs (git is run for an explicit directory with `GIT_DIR` and the other
+repository-selecting variables removed, which git and prek export to a hook run from a linked
+worktree); a stamp that does not match its key exactly, is dated in the future or is
+unreadable is ignored (the step names it); a failed write is reported and never fails the hook.
+
+The skip message says what a stamp does not cover: user-level cargo configuration, installed
+tools, files git ignores (the one thing a clean `git status` cannot see) and flaky tests. Force
+a run with `--rerun` or `ROCM_PRE_PUSH_RERUN=1` (the hook has no flags, so use the variable
+there), or delete the directory the message names. `SKIP=<hook id>` still skips a hook outright,
+and `verify-commits` is a separate hook that checks commit signatures on every push. A skip
+proves that this tree passed these checks earlier, not that they ran during this push; for a
+fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it
+drops this step's earlier pass before running, so if the rerun fails the next ordinary run runs
+the step instead of skipping on the pass it was meant to double-check, and a successful rerun
+records a fresh one. Other steps' and other selections' passes are left alone, and `--dry-run`
+never touches a stamp.
+
+Preview what a push would check without compiling (a dry run also says when a real run would skip):
 
 ```bash
 cargo xtask pre-push-check test --dry-run --base origin/main
 ```
 
 `--base` replaces the range's base; `clippy` and `clippy-e2e` take the same flags. The selection
-logic is unit-tested in [prepush.rs](../xtask/src/prepush.rs); as dev tooling, with no change to
+logic and the stamps are unit-tested in [prepush.rs](../xtask/src/prepush.rs) and
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs); as dev tooling, with no change to
 what the `rocm` binary does, it has no Gherkin scenario.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
@@ -1300,10 +1347,28 @@ provider-assisted plan before dispatching it, so it never runs the plan's
 command and shows only the plan text; for that surface the reuse of the
 rendered plan is covered by the unit tests below.
 
+A `serve` the provider proposes must also pass the four serve safety rules the
+chat assistant's `rocm_command` is held to (no CPU device, no public bind, a
+loopback host, managed serving), which one shared check in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) applies to both. Four more
+mock-lane scenarios in the same feature file run `rocm "serve a model"` against
+a provider whose plan breaks one rule each: `chat-13`
+(`chat-planning-assistant-cpu-serve-refused`), `chat-14`
+(`chat-planning-assistant-public-bind-serve-refused`), `chat-15`
+(`chat-planning-assistant-non-local-host-serve-refused`) and `chat-16`
+(`chat-planning-assistant-unmanaged-serve-refused`). Each asks the provider
+exactly once, prints the CLI's own plan rather than the provider's, runs
+nothing, and says why the provider's plan was not used. The two unit suites
+that run one shared table of refused and accepted `serve` argvs are
+`chat_refuses_each_unsafe_serve_and_proposes_nothing` and
+`planner_refuses_each_unsafe_serve_and_plans_nothing`; deleting a rule from the
+shared check fails both.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
+cargo test -p rocm --bin rocm unsafe_serve
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
 cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
 cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
