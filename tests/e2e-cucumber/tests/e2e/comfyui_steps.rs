@@ -751,8 +751,6 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
     {
         write_fixture(&source.join(relative), contents);
     }
-    // Every command these scenarios run goes through
-    // `run_keeping_scenario_env`, so this reaches all of them.
     disable_startup_update_check(world);
 }
 
@@ -766,8 +764,15 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
 /// cucumber polls every other scenario from (#661). A scenario that waits for
 /// the install's own output under a deadline (`comfyui-04`'s download spinner)
 /// would spend that deadline inside the check instead. Nothing here is about
-/// updates. Reaches the commands run through `run_keeping_scenario_env` and the
-/// PTY spawns, both of which apply `command_env`.
+/// updates.
+///
+/// This is `command_env`, so it reaches the two ways these scenarios run `rocm`
+/// that apply it: `run_keeping_scenario_env` (through
+/// `run_rocm_with_scenario_env` in `tests/e2e.rs`, which reads `command_env`;
+/// the wrapper restores it afterwards) and `TuiSession::spawn` in
+/// `tests/e2e/tui_driver.rs` (through `spawn_binary_with_env`, which overlays
+/// `command_env` onto the child and leaves it in place). It does not reach
+/// plain `run_rocm` or `run_rocm_ok`, which ignore `command_env`.
 fn disable_startup_update_check(world: &mut E2eWorld) {
     world
         .command_env
