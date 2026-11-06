@@ -578,3 +578,26 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the refusal asks for the environment folder with --root
     And no runtime is registered
+
+  # A preview of a ROCm 10 or newer wheel has `uv pip compile` choose the torch
+  # and torchvision versions: nothing else does, and the plan's package specs, its
+  # runtime key and its command are made of them. When a `uv` is already there the
+  # preview must still run it, so the plan is the one a real install would print.
+  # This pins that half of the contract next to runtime-28, where no `uv` is there,
+  # so that skipping the step on a clean host cannot become skipping it everywhere.
+  #
+  # The recording `uv` is the one named by `ROCM_CLI_UV_BINARY`, so it counts as
+  # present, and it answers `uv pip compile` with the fixture's four pinned
+  # versions. Its log is the evidence the compile ran, once, and the plan
+  # carries the versions it printed.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23 (the Python the
+  # preview would prepare is not what this scenario is about).
+  @id:runtime-install-preview-of-rocm-10-uses-the-uv-that-is-present @requires-os:linux
+  Scenario: runtime-27 - Previewing a ROCm 10 SDK install with a uv already present resolves the package versions with it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no usable Python and a recording uv
+    And the recording uv answers uv pip compile with the ROCm 10 fixture's versions
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview requests the gfx1200 device extras
+    And the preview resolved the versions with the uv that was present

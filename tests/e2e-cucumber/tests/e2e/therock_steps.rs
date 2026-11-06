@@ -269,6 +269,24 @@ const SCRATCH_CACHE_DIR: &str = "scratch-cache";
 /// for a reason it does not name, so they are refused up front.
 #[given("a host with no usable Python and a recording uv")]
 async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
+    let scenario_root = host_without_python(world);
+    let uv = scenario_root
+        .join("recording-uv-bin")
+        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
+    crate::install_fixture_binary("fake-uv", &uv);
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world.command_env.push((
+        "FAKE_UV_LOG",
+        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
+    ));
+}
+
+/// What the hosts these steps build share: `PATH` is one empty folder, so no Python is found
+/// and none has been saved, and the CLI has a cache folder of its own. Returns
+/// the scenario root.
+fn host_without_python(world: &mut E2eWorld) -> std::path::PathBuf {
     for var in [
         "ROCM_CLI_PYTHON",
         "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
@@ -282,10 +300,6 @@ async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
     let scenario_root = root(world).to_path_buf();
     let empty_path = scenario_root.join("no-python-on-path");
     std::fs::create_dir_all(&empty_path).expect("failed to create the empty PATH folder");
-    let uv = scenario_root
-        .join("recording-uv-bin")
-        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
-    crate::install_fixture_binary("fake-uv", &uv);
     world
         .command_env
         .push(("PATH", empty_path.into_os_string()));
@@ -298,13 +312,7 @@ async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_CACHE_DIR", scratch_cache.into_os_string()));
-    world
-        .command_env
-        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
-    world.command_env.push((
-        "FAKE_UV_LOG",
-        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
-    ));
+    scenario_root
 }
 
 #[given("a canonical release pip index fixture and a ROCm 10 pip index fixture")]
@@ -1298,6 +1306,50 @@ async fn preview_refused_for_python_version(world: &mut E2eWorld) {
         );
     }
     assert_no_python_prepared(world);
+}
+
+/// The four pins `uv pip compile` would print for the ROCm 10 fixture, one
+/// `name==version` per line, which the CLI reads back as the chosen stack.
+#[given("the recording uv answers uv pip compile with the ROCm 10 fixture's versions")]
+async fn recording_uv_answers_compile(world: &mut E2eWorld) {
+    let pins = [
+        ("rocm", NEXT_ROCM_VERSION),
+        ("torch", NEXT_TORCH_VERSION),
+        ("torchvision", NEXT_TORCHVISION_VERSION),
+        ("torchaudio", NEXT_TORCHAUDIO_VERSION),
+    ]
+    .map(|(name, version)| format!("{name}=={version}"))
+    .join("\n");
+    world.command_env.push(("FAKE_UV_STDOUT", pins.into()));
+    // The CLI pipes the requirements into `uv pip compile -`; see the stand-in.
+    world.command_env.push(("FAKE_UV_DRAIN_STDIN", "1".into()));
+}
+
+/// A `uv` that is present is still used: it ran `uv pip compile`, once and for
+/// nothing else, and the preview did not report the step as skipped. The log is
+/// the evidence, since the plan's versions alone could not tell a compile from a
+/// guess.
+#[then("the preview resolved the versions with the uv that was present")]
+async fn preview_resolved_with_present_uv(world: &mut E2eWorld) {
+    let log_path = root(world).join(UV_INVOCATION_LOG);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!(
+            "the recording uv has no log at {}, so the preview never ran it: {error}",
+            log_path.display()
+        )
+    });
+    let runs: Vec<&str> = log.lines().collect();
+    assert!(
+        matches!(runs.as_slice(), [run] if run.starts_with("pip compile ")),
+        "the preview should run uv once, for `uv pip compile`, and for nothing else:\n{log}"
+    );
+    let out = stdout(world);
+    for unresolved in ["resolution_note:", "not resolved by this preview"] {
+        assert!(
+            !out.contains(unresolved),
+            "the preview ran uv but reported the step as skipped ({unresolved:?}):\n{out}"
+        );
+    }
 }
 
 #[then("the preview resolves the canonical release pip index")]
