@@ -254,7 +254,7 @@ const CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS: [&str; 1] = ["rocm_command"];
 ///
 /// Scope note, so the guarantee is not overread: this covers model-supplied
 /// *arguments*, not model-supplied prose. An assistant's reply text is still
-/// printed as it comes; `strip_ansi_sequences` in `comfyui.rs` is the tool for
+/// printed as it comes; `rocm_core::strip_ansi_sequences` is the tool for
 /// that surface, and is already used on ComfyUI log output.
 ///
 /// Walks the whole arguments object rather than naming fields, so a new

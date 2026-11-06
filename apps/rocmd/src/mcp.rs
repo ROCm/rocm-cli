@@ -18,8 +18,6 @@ use rocm_core::{
 };
 use serde_json::Value;
 use serde_json::json;
-use std::collections::VecDeque;
-use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
@@ -844,17 +842,12 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
     })
 }
 
+/// The last `limit` lines of a service log joined with newlines, read through
+/// the shared bounded tail routine.
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut lines = VecDeque::with_capacity(limit);
-    for line in content.lines() {
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line.to_owned());
-    }
-    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
+    let lines = rocm_core::tail_lines(path, limit, rocm_core::LOG_VIEW_MAX_TAIL_READ)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -947,6 +940,151 @@ mod tests {
         let tail = read_tail_lines(&path, 2)?;
         fs::remove_file(&path)?;
         assert_eq!(tail, "line3\nline4");
+        Ok(())
+    }
+
+    fn tail_fixture(label: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-{label}-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not read whole into one string.
+        let path = tail_fixture("large", &large_log_with_head_marker())?;
+
+        let tail = read_tail_lines(&path, 10_000)?;
+        fs::remove_file(&path)?;
+
+        assert!(!tail.lines().any(|line| line == "HEAD-MARKER"));
+        assert!(tail.ends_with("\nTAIL-MARKER"));
+        assert!(tail.lines().count() < 5122);
+        assert!(tail.lines().count() > 3500, "the window holds about 4 MiB");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_shows_a_sixteen_bit_log_as_lossy_text_instead_of_failing() -> Result<()> {
+        // The tool reads the child's own bytes as UTF-8; a UTF-16 log is not
+        // detected here (only the ComfyUI log view does that), but it no
+        // longer fails the whole tool call.
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "[INFO] one\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let path = tail_fixture("utf16", &bytes)?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert!(
+            tail.starts_with("\u{FFFD}\u{FFFD}["),
+            "the byte order mark is replaced, the rest kept: {tail:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_ansi_colour_codes() -> Result<()> {
+        let path = tail_fixture("ansi", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "\u{1b}[32mgreen\u{1b}[0m done");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
+        let path = tail_fixture("invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "ok\nbad\u{FFFD}byte\nlast");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_labelled_read_error() {
+        let path = unique_test_path(&format!(
+            "rocmd-tail-missing-{}.log",
+            crate::test_support::unique_suffix()
+        ));
+
+        let error = read_tail_lines(&path, 5).expect_err("a missing log must not read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to read {}", path.display())
+        );
+        assert!(
+            format!("{error:#}").contains(&format!("failed to open {}", path.display())),
+            "the cause names the failing step: {error:#}"
+        );
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing() -> Result<()> {
+        // With limit 0 the old reader never evicted and returned the whole
+        // file. The tool handler clamps the limit to 1..=500, so only a
+        // direct call could see it.
+        let path = tail_fixture("zero", b"a\nb\nc\n")?;
+
+        let tail = read_tail_lines(&path, 0)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let path = tail_fixture("few", b"a\nb\n")?;
+
+        let tail = read_tail_lines(&path, 50)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let path = tail_fixture("no-newline", b"a\nb\nc")?;
+
+        let tail = read_tail_lines(&path, 2)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "b\nc");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let path = tail_fixture("crlf", b"a\r\nb\r\n")?;
+
+        let tail = read_tail_lines(&path, 5)?;
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail, "a\nb");
         Ok(())
     }
 

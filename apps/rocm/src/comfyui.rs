@@ -354,13 +354,20 @@ fn render_logs_with_options(
         if show_file_locations {
             writeln!(output, "  saved file: {}", path.display())?;
         }
-        let lines = read_tail_lines(path, limit)
+        let tail = read_log_tail(path, limit)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        if lines.is_empty() {
+        if tail.newest_line_exceeds_the_read_bound() {
+            // The file has content; saying it is empty would be false.
+            writeln!(
+                output,
+                "  No output shown: {}.",
+                crate::services_text::newest_line_exceeds_bound_notice()
+            )?;
+        } else if tail.lines.is_empty() {
             writeln!(output, "  The saved log is empty.")?;
         } else {
             writeln!(output, "  latest output:")?;
-            for line in lines {
+            for line in tail.lines {
                 writeln!(output, "    {line}")?;
             }
         }
@@ -503,66 +510,17 @@ fn comfyui_log_title(path: &Path) -> &'static str {
     }
 }
 
-fn read_tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    let bytes = fs::read(path)?;
-    let text = strip_ansi_sequences(&decode_log_bytes(&bytes));
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(limit)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    lines.reverse();
-    Ok(lines)
-}
-
-fn decode_log_bytes(bytes: &[u8]) -> String {
-    if bytes.starts_with(&[0xff, 0xfe]) || looks_like_utf16_le(bytes) {
-        let start = if bytes.starts_with(&[0xff, 0xfe]) {
-            2
-        } else {
-            0
-        };
-        let units = bytes[start..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        return String::from_utf16_lossy(&units);
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn looks_like_utf16_le(bytes: &[u8]) -> bool {
-    if bytes.len() < 8 {
-        return false;
-    }
-    let sample_len = bytes.len().min(512);
-    let zero_odd_bytes = bytes[..sample_len]
-        .iter()
-        .enumerate()
-        .filter(|(index, byte)| index % 2 == 1 && **byte == 0)
-        .count();
-    zero_odd_bytes * 4 >= sample_len
-}
-
-fn strip_ansi_sequences(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            cleaned.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            let _ = chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    cleaned
+/// The last `limit` lines of a saved log, read through the shared bounded tail
+/// routine. A ComfyUI log may have been redirected by a Windows shell as
+/// UTF-16 and carries the colour codes of the Python process, so it is
+/// decoded the console way: UTF-16 detected, ANSI sequences stripped.
+fn read_log_tail(path: &Path, limit: usize) -> Result<rocm_core::LogTail> {
+    rocm_core::tail_log_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::CONSOLE,
+    )
 }
 
 fn load_manifest(paths: &AppPaths) -> Result<Option<ComfyUiManifest>> {
@@ -994,6 +952,222 @@ mod tests {
         let lines = read_tail_lines(&log, 5)?;
 
         assert_eq!(lines, vec!["[INFO] Device: AMD Radeon RX 9070 XT"]);
+        Ok(())
+    }
+
+    /// The lines of [`read_log_tail`], for the tests that compare lines.
+    fn read_tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+        Ok(read_log_tail(path, limit)?.lines)
+    }
+
+    fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let paths = test_paths(name);
+        let dir = app_root(&paths).join("logs");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("start-fixture.log");
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    fn utf16_le(text: &str, bom: bool) -> Vec<u8> {
+        let mut bytes = if bom { vec![0xff, 0xfe] } else { Vec::new() };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// 5 MiB: a marked first line, 5120 lines of 1 KiB, a marked last line.
+    fn large_log_with_head_marker() -> Vec<u8> {
+        let mut bytes = b"HEAD-MARKER\n".to_vec();
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..5120 {
+            bytes.extend_from_slice(filler.as_bytes());
+        }
+        bytes.extend_from_slice(b"TAIL-MARKER\n");
+        bytes
+    }
+
+    /// What `render_logs` prints for a lone saved log with these bytes, and
+    /// the log's size on disk, so a message is asserted with the state it
+    /// describes.
+    fn render_lone_log(name: &str, bytes: &[u8]) -> Result<(String, u64)> {
+        let paths = test_paths(name);
+        let logs = app_root(&paths).join("logs");
+        fs::create_dir_all(&logs)?;
+        let log = logs.join("start-fixture.log");
+        fs::write(&log, bytes)?;
+        let size = fs::metadata(&log)?.len();
+        Ok((render_logs(&paths, 5)?, size))
+    }
+
+    #[test]
+    fn logs_say_a_log_is_empty_only_when_it_is_and_name_the_bound_when_it_is_not() -> Result<()> {
+        let bound = rocm_core::LOG_VIEW_MAX_TAIL_READ;
+        assert_eq!(
+            bound,
+            4 * 1024 * 1024,
+            "the notice below names this many MiB"
+        );
+        let notice = "No output shown: the newest line is longer than the 4 MiB a log view reads.";
+        let over_the_bound = usize::try_from(bound)? + 1024;
+
+        // An empty file: the log really is empty, and says so.
+        let (rendered, size) = render_lone_log("comfyui-logs-empty", b"")?;
+        assert_eq!(size, 0);
+        assert!(rendered.contains("The saved log is empty."), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
+
+        // One line longer than the bound, with and without a final newline,
+        // and as sixteen-bit text: the file has content, so it is not empty,
+        // and the notice names the bound.
+        let one_line = "x".repeat(over_the_bound).into_bytes();
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        let wide = utf16_le(&"y".repeat(over_the_bound / 2 + 1), true);
+        for (name, bytes) in [
+            ("comfyui-logs-long-line", one_line),
+            ("comfyui-logs-long-line-newline", with_newline),
+            ("comfyui-logs-long-line-wide", wide),
+        ] {
+            let (rendered, size) = render_lone_log(name, &bytes)?;
+            assert!(size > bound, "{name}: the log is bigger than the bound");
+            assert!(rendered.contains(notice), "{name}: {rendered}");
+            assert!(!rendered.contains("is empty"), "{name}: {rendered}");
+            assert!(!rendered.contains("latest output:"), "{name}: {rendered}");
+        }
+
+        // A big log whose newest lines are short is shown, not described.
+        let (rendered, size) = render_lone_log("comfyui-logs-big", &large_log_with_head_marker())?;
+        assert!(size > bound);
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_file_is_read_through_a_bounded_window() -> Result<()> {
+        // A line far outside the tail window is not returned however large the
+        // limit: the log is not read whole.
+        let log = tail_fixture("comfyui-tail-large", &large_log_with_head_marker())?;
+
+        let lines = read_tail_lines(&log, 10_000)?;
+        fs::remove_file(&log)?;
+
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        assert!(lines.len() < 5122, "got {} lines", lines.len());
+        assert!(lines.len() > 3500, "the window holds about 4 MiB of lines");
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_a_large_sixteen_bit_log_is_read_through_a_bounded_window() -> Result<()> {
+        // The window of a UTF-16 log must start on a character boundary or
+        // every following character decodes as garbage.
+        let mut text = String::from("HEAD-MARKER\r\n");
+        let filler = format!("\u{1b}[33m{}\u{1b}[0m\r\n", "y".repeat(1000));
+        for _ in 0..3000 {
+            text.push_str(&filler);
+        }
+        text.push_str("TAIL-MARKER\r\n");
+        let log = tail_fixture("comfyui-tail-large-utf16", &utf16_le(&text, true))?;
+        assert!(fs::metadata(&log)?.len() > 6_000_000);
+
+        let lines = read_tail_lines(&log, 10_000)?;
+        fs::remove_file(&log)?;
+
+        assert!(!lines.iter().any(|line| line == "HEAD-MARKER"));
+        assert_eq!(lines.last().map(String::as_str), Some("TAIL-MARKER"));
+        let whole = "y".repeat(1000);
+        for line in &lines[..lines.len() - 1] {
+            assert_eq!(line, &whole, "a partial leading fragment was kept");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_a_bomless_utf16_log_and_strips_ansi() -> Result<()> {
+        let text = "\u{1b}[32m[INFO]\u{1b}[0m one\r\n\u{1b}[1;31mtwo\u{1b}[0m\r\n";
+        let log = tail_fixture("comfyui-tail-utf16-nobom", &utf16_le(text, false))?;
+
+        let lines = read_tail_lines(&log, 5)?;
+
+        assert_eq!(lines, vec!["[INFO] one", "two"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_ansi_from_an_eight_bit_log() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-ansi-utf8", b"\x1b[32mgreen\x1b[0m done\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5)?, vec!["green done"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_decodes_invalid_eight_bit_text_lossily() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-invalid", b"ok\nbad\xffbyte\nlast\n")?;
+
+        assert_eq!(
+            read_tail_lines(&log, 5)?,
+            vec!["ok", "bad\u{FFFD}byte", "last"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_missing_file_is_a_not_found_error_naming_the_path() {
+        let paths = test_paths("comfyui-tail-missing");
+        let missing = app_root(&paths).join("logs").join("absent.log");
+
+        let error = read_tail_lines(&missing, 5).expect_err("a missing log must not read");
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open {}", missing.display())
+        );
+        let io_error = error
+            .downcast_ref::<io::Error>()
+            .expect("the io error is kept as the cause");
+        assert_eq!(io_error.kind(), io::ErrorKind::NotFound);
+        // A limit of 0 returns before the file is looked at.
+        assert!(
+            read_tail_lines(&missing, 0)
+                .expect("limit 0 never opens the file")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_tail_lines_limit_zero_returns_nothing_for_an_existing_log() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-zero", b"a\nb\n")?;
+
+        assert!(read_tail_lines(&log, 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_returns_every_line_when_fewer_than_the_limit() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-few", b"a\nb\n")?;
+
+        assert_eq!(read_tail_lines(&log, 50)?, vec!["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_keeps_a_final_line_without_a_trailing_newline() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-no-newline", b"a\nb\nc")?;
+
+        assert_eq!(read_tail_lines(&log, 2)?, vec!["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_tail_lines_strips_crlf_line_endings() -> Result<()> {
+        let log = tail_fixture("comfyui-tail-crlf", b"a\r\nb\r\n")?;
+
+        assert_eq!(read_tail_lines(&log, 5)?, vec!["a", "b"]);
         Ok(())
     }
 
