@@ -1932,17 +1932,19 @@ fn run_installer_pty(
 /// The frames the installer painted: the stretches between the carriage
 /// returns that separate one redraw from the next.
 ///
-/// Keyed on the carriage returns rather than on what the text looks like. A
-/// downloader redraws in place and nothing else here does, so this picks out
-/// progress output without having to guess at its shape, and without counting
-/// ordinary lines that happen to contain a bar-ish character (the installer's
-/// own get-started block prints `rocm install sdk  # ...`).
+/// Both signals are needed, and neither is sufficient alone. A downloader
+/// redraws in place and nothing else here does, but the line it redraws on can
+/// also carry the preceding `download: <url>` notice, which is not a frame and
+/// is longer than a terminal when the URL is a real release asset. Bar
+/// characters alone are no better: the get-started block prints
+/// `rocm install sdk  # ...`, which never redraws. Requiring a carriage return
+/// and a bar character keeps each one out.
 fn progress_frames(terminal_output: &str) -> Vec<&str> {
     terminal_output
         .lines()
         .filter(|line| line.contains('\r'))
         .flat_map(|line| line.split('\r'))
-        .filter(|frame| !frame.trim().is_empty())
+        .filter(|frame| frame.contains('#') || frame.contains('%'))
         .collect()
 }
 
