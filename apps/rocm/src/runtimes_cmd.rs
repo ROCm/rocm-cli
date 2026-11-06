@@ -2613,6 +2613,77 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Rewrite a manifest file as an older rocm-cli wrote it: without the keys
+    /// that hold no value, which a newer binary reads back as their defaults and
+    /// writes out as explicit `null`s. Returns the bytes now on disk.
+    fn rewrite_as_legacy_shaped(path: &Path) -> Result<Vec<u8>> {
+        let mut document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let object = document
+            .as_object_mut()
+            .context("a manifest is a JSON object")?;
+        let empty: Vec<String> = object
+            .iter()
+            .filter(|(_, value)| value.is_null())
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert!(
+            !empty.is_empty(),
+            "the fixture must hold a null-valued key for this to mean anything"
+        );
+        for key in empty {
+            object.remove(&key);
+        }
+        let legacy = serde_json::to_vec_pretty(&document)?;
+        fs::write(path, &legacy)?;
+        Ok(legacy)
+    }
+
+    /// Recovering the setup runtime from a manifest an older binary wrote, in a
+    /// folder the user cannot write to: the file decodes to the very manifest the
+    /// recovery would write, so it is already current and is left alone. Judging
+    /// it by bytes would read the missing keys as a change, write the registry
+    /// entry, and then fail on the read-only file. The registry entry and the
+    /// file's bytes are asserted together. (Where the file stays writable
+    /// regardless, as for an administrator, the unchanged bytes still prove the
+    /// file was not rewritten.)
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn setup_recovery_leaves_a_read_only_legacy_shaped_install_root_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-recovery-legacy");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let local = manifest.install_root.join(".rocm-cli-runtime.json");
+        fs::remove_file(&entry)?;
+        let legacy = rewrite_as_legacy_shaped(&local)?;
+        let mut permissions = fs::metadata(&local)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&local, permissions.clone())?;
+
+        let recovered = recover_setup_runtime_registration(&paths, &config);
+
+        permissions.set_readonly(false);
+        fs::set_permissions(&local, permissions)?;
+        let recovered = recovered
+            .context("a usable manifest in a folder that cannot be written is recovered")?;
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert!(entry.is_file(), "the registry entry is restored");
+        assert_eq!(
+            fs::read(&local)?,
+            legacy,
+            "the install root manifest is already current and must not be rewritten"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     /// The writer gives a runtime a manifest in its folder exactly when
     /// uninstall, which prune asks the same question of, may delete that folder.
     /// The two are written in different modules; this is what ties them.

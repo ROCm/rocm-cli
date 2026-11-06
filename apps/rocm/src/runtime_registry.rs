@@ -381,8 +381,12 @@ impl ManifestOverwrite {
 /// gets none: a root the user may not be able to write to must not make
 /// registering it fail, and an import's source manifest may be that very file
 /// in another install.
-/// The file is not rewritten when it already holds exactly what would be
-/// written, so recovering a runtime from its own manifest leaves it alone.
+/// The file is not rewritten when it already holds what would be written, so
+/// recovering a runtime from its own manifest leaves it alone. "Holds" is judged
+/// on the decoded manifest, not the bytes ([`install_root_manifest_is_current`]):
+/// a file an older binary wrote omits keys that now read back as defaults and
+/// are written out explicitly, and a root the user cannot write to must not turn
+/// that into a failure.
 ///
 /// Neither file is written atomically; that is a separate piece of work shared
 /// with the other writers in the workspace.
@@ -411,14 +415,30 @@ pub(crate) fn write_runtime_manifest(
 
     if manifest.owns_install_root() {
         let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
-        let already_current =
-            fs::read(&local_manifest_path).is_ok_and(|existing| existing == encoded);
+        let already_current = fs::read(&local_manifest_path)
+            .is_ok_and(|existing| install_root_manifest_is_current(&existing, &encoded));
         if !already_current {
             fs::write(&local_manifest_path, &encoded)
                 .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
         }
     }
     Ok(())
+}
+
+/// Whether an install root manifest already holds the manifest that `encoded`
+/// is the storage form of. Equal bytes qualify, and so does a file that decodes
+/// to the same manifest once normalised for storage: a manifest written before
+/// a field existed has no key for it, reads back as the field's default, and
+/// serializes with an explicit value, so a byte comparison reads it as changed.
+/// A file that does not decode is not current.
+fn install_root_manifest_is_current(existing: &[u8], encoded: &[u8]) -> bool {
+    if existing == encoded {
+        return true;
+    }
+    serde_json::from_slice::<InstalledRuntimeManifest>(existing)
+        .ok()
+        .and_then(|decoded| serde_json::to_vec_pretty(&decoded.normalize_storage_paths()).ok())
+        .is_some_and(|normalised| normalised == encoded)
 }
 
 pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
@@ -1036,6 +1056,54 @@ mod tests {
                 "a different manifest is written, which the read-only file refuses"
             );
         }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The state matrix for "is the install root manifest already current":
+    /// the same bytes, the same manifest in an older shape (keys that hold no
+    /// value omitted, so a byte comparison reads it as changed), a different
+    /// manifest in that shape, and a file that is not a manifest at all. Pure, so
+    /// it runs on every platform, unlike the read-only-file tests that show the
+    /// effect on the filesystem.
+    #[test]
+    fn install_root_manifest_is_current_compares_the_decoded_manifest() -> Result<()> {
+        let (root, _paths) = test_paths("manifest-current-decoded");
+        let manifest = manifest_in(&root, "release-wheel-gfx120X-all-7.13.0", false, None)?;
+        let stored = manifest.clone().normalize_storage_paths();
+        let encoded = serde_json::to_vec_pretty(&stored)?;
+        let legacy_shaped = |manifest: &InstalledRuntimeManifest| -> Result<Vec<u8>> {
+            let mut document = serde_json::to_value(manifest.clone().normalize_storage_paths())?;
+            let object = document.as_object_mut().context("a JSON object")?;
+            let empty: Vec<String> = object
+                .iter()
+                .filter(|(_, value)| value.is_null())
+                .map(|(key, _)| key.clone())
+                .collect();
+            assert!(!empty.is_empty(), "the fixture needs a null-valued key");
+            for key in empty {
+                object.remove(&key);
+            }
+            Ok(serde_json::to_vec_pretty(&document)?)
+        };
+
+        assert!(install_root_manifest_is_current(&encoded, &encoded));
+        let legacy = legacy_shaped(&manifest)?;
+        assert_ne!(legacy, encoded, "the legacy shape must differ in bytes");
+        assert!(
+            install_root_manifest_is_current(&legacy, &encoded),
+            "a legacy-shaped file that decodes to the same manifest is current"
+        );
+        let newer = InstalledRuntimeManifest {
+            version: "7.14.0".to_owned(),
+            ..manifest
+        };
+        assert!(
+            !install_root_manifest_is_current(&legacy_shaped(&newer)?, &encoded),
+            "a legacy-shaped file that decodes to a different manifest is not current"
+        );
+        assert!(!install_root_manifest_is_current(b"not json", &encoded));
+        assert!(!install_root_manifest_is_current(b"", &encoded));
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
