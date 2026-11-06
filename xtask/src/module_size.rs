@@ -349,18 +349,36 @@ fn is_excluded(relative: &str) -> bool {
 /// The file a `mod name;` declaration refers to.
 fn resolve_child(parent: &Path, parent_mod_rs_like: bool, child: &Child) -> Result<PathBuf> {
     let dir = parent.parent().unwrap_or_else(|| Path::new(""));
-    let mut base = if parent_mod_rs_like {
-        dir.to_path_buf()
+    // The directory the children are looked up in, built the way rustc builds it:
+    // a non-`mod.rs` file owes a directory named after it, but it is only added
+    // when an ordinary inline block (or the declaration itself) goes below it. A
+    // `#[path]` on an inline block starts again from the file's own directory.
+    let mut base = dir.to_path_buf();
+    let mut owed_stem = if parent_mod_rs_like {
+        None
     } else {
-        dir.join(parent.file_stem().unwrap_or_default())
+        Some(parent.file_stem().unwrap_or_default().to_owned())
     };
-    for name in &child.inline {
-        base.push(name);
+    for block in &child.inline {
+        match block {
+            InlineDir::Named(name) => {
+                if let Some(stem) = owed_stem.take() {
+                    base.push(stem);
+                }
+                base.push(name);
+            }
+            InlineDir::Path(path) => {
+                base.push(path);
+                owed_stem = None;
+            }
+        }
     }
 
     if let Some(attr) = &child.path_attr {
-        let at = if child.inline.is_empty() { dir } else { &base };
-        return Ok(normalize(&at.join(attr)));
+        return Ok(normalize(&base.join(attr)));
+    }
+    if let Some(stem) = owed_stem {
+        base.push(stem);
     }
 
     let flat = base.join(format!("{}.rs", child.name));
@@ -435,10 +453,20 @@ struct Analysis {
 struct Child {
     name: String,
     path_attr: Option<String>,
-    /// Directory names of the inline `mod a { .. }` blocks the declaration sits
-    /// in: the block's name, or its `#[path]` value when it has one.
-    inline: Vec<String>,
+    /// The inline `mod a { .. }` blocks the declaration sits in, outermost first.
+    inline: Vec<InlineDir>,
     gated: bool,
+}
+
+/// How an inline module block contributes to the directory its children live in.
+#[derive(Clone)]
+enum InlineDir {
+    /// An ordinary block: the directory is named after the module.
+    Named(String),
+    /// A block with `#[path = ".."]`: the attribute value names the directory, and
+    /// it starts from the directory of the source file, not from a directory named
+    /// after a non-`mod.rs` file.
+    Path(String),
 }
 
 fn analyze(source: &str) -> Result<Analysis> {
@@ -458,7 +486,7 @@ fn analyze(source: &str) -> Result<Analysis> {
 /// that its file is known to be reached.
 fn walk_items(
     items: &[Item],
-    inline: &mut Vec<String>,
+    inline: &mut Vec<InlineDir>,
     gated: bool,
     analysis: &mut Analysis,
 ) -> Result<()> {
@@ -470,9 +498,10 @@ fn walk_items(
         match item {
             Item::Mod(module) => match &module.content {
                 Some((_, inner)) => {
-                    let directory = path_attribute(&module.attrs)?
-                        .unwrap_or_else(|| module.ident.unraw().to_string());
-                    inline.push(directory);
+                    inline.push(match path_attribute(&module.attrs)? {
+                        Some(path) => InlineDir::Path(path),
+                        None => InlineDir::Named(module.ident.unraw().to_string()),
+                    });
                     walk_items(inner, inline, item_gated, analysis)?;
                     inline.pop();
                 }
@@ -1020,6 +1049,50 @@ trait T {
             .map(|(path, _)| path)
             .collect();
         assert_eq!(names, ["src/custom/child.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn inline_blocks_below_a_non_mod_rs_file_resolve_the_way_rustc_does() {
+        // Each layout was checked against rustc: the child is found at exactly the
+        // file listed, and nowhere else.
+        let layouts: [(&str, &str); 4] = [
+            // `#[path]` on the block starts from the file's own directory, not
+            // from a directory named after the file.
+            (
+                "#[path = \"custom\"]\nmod api {\n    mod child;\n}\n",
+                "src/custom/child.rs",
+            ),
+            // An ordinary block first owes the file's directory, then the path.
+            (
+                "mod a {\n    #[path = \"custom\"]\n    mod api {\n        mod child;\n    }\n}\n",
+                "src/outer/a/custom/child.rs",
+            ),
+            // A `#[path]` block, then an ordinary one below it.
+            (
+                "#[path = \"custom\"]\nmod api {\n    mod inner {\n        mod child;\n    }\n}\n",
+                "src/custom/inner/child.rs",
+            ),
+            // A `#[path]` child inside a `#[path]` block starts from that block.
+            (
+                "#[path = \"custom\"]\nmod api {\n    #[path = \"x.rs\"]\n    mod child;\n}\n",
+                "src/custom/x.rs",
+            ),
+        ];
+        for (outer, child_file) in layouts {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "src/lib.rs", "mod outer;\n");
+            write(dir.path(), "src/outer.rs", outer);
+            write(dir.path(), child_file, "fn c() {}\n");
+            let names: Vec<String> = counted(dir.path())
+                .unwrap_or_else(|e| panic!("{outer:?}: {e:#}"))
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+            assert!(
+                names.contains(&child_file.to_string()),
+                "{outer:?}: {names:?}"
+            );
+        }
     }
 
     #[test]
