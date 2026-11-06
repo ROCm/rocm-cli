@@ -1862,7 +1862,10 @@ mod tests {
         out
     }
 
-    /// Whether `src` contains a raw string literal (`r"`, `r#"`, `br"`, ...).
+    /// Whether `src` contains a raw string literal (`r"`, `r#"`, `br"`, `cr"`,
+    /// ...). The plain byte and C strings `b"..."` and `c"..."` are not raw:
+    /// they follow the ordinary `"` and `\` rules, so the scanner reads them as
+    /// an identifier followed by a plain string.
     /// Deliberately over-eager: it does not skip comments or strings, because a
     /// false alarm only makes the caller's assertion fail loudly, while a miss
     /// would let [`strip_comments_and_uses`] mis-scan text it cannot read.
@@ -1873,8 +1876,9 @@ mod tests {
             if chars[i] != 'r' {
                 return false;
             }
-            // `r` (or the `r` of `br`) must start a token, not end an identifier.
-            let start = if i > 0 && chars[i - 1] == 'b' {
+            // `r` (or the `r` of `br` / `cr`) must start a token, not end an
+            // identifier.
+            let start = if i > 0 && matches!(chars[i - 1], 'b' | 'c') {
                 i - 1
             } else {
                 i
@@ -2087,19 +2091,42 @@ mod tests {
     }
 
     #[test]
+    fn strip_comments_and_uses_reads_plain_byte_and_c_strings_like_any_string() {
+        // The prefix is an identifier to the scanner and the quote that follows
+        // opens an ordinary string, so `//` inside it is not a comment.
+        let code = strip_comments_and_uses(
+            "let a = c\"see // <MOCK_GATES_PR}\"; let b = b\"x // y\"; // gone\n"
+                .replace('<', "{")
+                .as_str(),
+        );
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+        assert!(!code.contains("gone"), "{code:?}");
+    }
+
+    #[test]
     fn contains_raw_string_flags_every_raw_form_and_nothing_else() {
         for raw in [
             "let s = r\"x\";",
             "let s = r#\"x\"#;",
             "let s = r##\"x\"##;",
             "let s = br\"x\";",
+            "let s = br#\"x\"#;",
+            "let s = cr\"x\";",
+            "let s = cr#\"x\"#;",
+            "let s = cr##\"x\"##;",
+            "let _ = cr#\"\" (MOCK_GATES_PR) \"\"#;",
             "f(r\"x\")",
+            "f(cr\"x\")",
         ] {
             assert!(contains_raw_string(raw), "missed: {raw}");
         }
         for plain in [
             "let r = \"x\";",
             "let s = bar\"x\";",
+            "let s = incr\"x\";",
+            "let s = b\"x\";",
+            "let s = c\"x\";",
+            "let s = c\"x\" + b\"y\";",
             "let s = \"x\"; // r and #",
             "write!(out, \"{x}\")",
         ] {
