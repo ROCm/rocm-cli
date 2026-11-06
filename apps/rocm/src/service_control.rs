@@ -249,6 +249,14 @@ fn stop_internal_managed_service_confirmed_with(
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
+        // The processes this stop confirmed gone are not the service's any more,
+        // and their PIDs are stale the instant they exited. Left in the record,
+        // a later stop would signal them again: a PID recorded without a
+        // start-time token (every one on Windows) cannot be refuted, so if the
+        // OS had given it to another process the Windows tree kill would take
+        // that process and its subtree. The same call, on the same confirmed
+        // path, as `rocmd`'s stop.
+        record.clear_recorded_processes();
     } else {
         // The marker records that a stop was *asked for* even though it could
         // not be confirmed. `refresh_managed_service_runtime_liveness` needs it
@@ -1388,6 +1396,110 @@ mod tests {
         assert_eq!(on_disk.status, "stopped");
         assert_eq!(on_disk.stop_requested_unix_ms, None);
         assert_eq!(key, None, "a confirmed stop drops the key");
+    }
+
+    /// A confirmed stop must not leave the processes it stopped named in the
+    /// record. Their PIDs are stale the moment they exit, and a recorded PID
+    /// with no start-time token is signalled on trust alone once the OS has
+    /// handed it to another process; on Windows the tree kill then takes that
+    /// process and everything under it. `rocmd`'s stop clears them for the same
+    /// reason (`stop_managed_service_clears_recorded_pids_once_the_processes_are_gone`).
+    #[test]
+    fn a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing() {
+        use rocm_core::TerminationOutcome::Graceful;
+        let (root, paths) = test_paths("services-stop-clears-pids");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-clears-pids";
+        let mut record = stop_test_record(&paths, service_id);
+        // The dangerous shape: a supervisor recorded without a start-time token,
+        // and an engine with one.
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = None;
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+        record.write().unwrap();
+
+        // The termination of each recorded PID, observed: the real routine runs
+        // (which PIDs it visits, in which order), only the signalling is replaced.
+        let signalled = std::cell::RefCell::new(Vec::new());
+        let stop = |record: &ManagedServiceRecord| {
+            rocm_core::terminate_recorded_service_pids(record, |identity| {
+                signalled.borrow_mut().push(*identity);
+                Graceful
+            })
+        };
+
+        let first = stop_internal_managed_service_with(&paths, service_id, stop).unwrap();
+        let after_first = raw_manifest(&paths, service_id);
+        let signalled_by_first = signalled.borrow().clone();
+
+        let second = stop_internal_managed_service_with(&paths, service_id, stop).unwrap();
+        let after_second = raw_manifest(&paths, service_id);
+        let signalled_in_all = signalled.borrow().clone();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(first["stopped"], true, "{first}");
+        assert_eq!(
+            signalled_by_first,
+            vec![
+                rocm_core::ProcessIdentity::new(4242, None),
+                rocm_core::ProcessIdentity::new(4243, Some(77)),
+            ]
+        );
+        // The persisted state after the confirmed stop names no process.
+        assert_eq!(after_first.status, "stopped");
+        assert_eq!(after_first.stop_requested_unix_ms, None);
+        assert_eq!(after_first.supervisor_pid, 0);
+        assert_eq!(after_first.supervisor_start_ticks, None);
+        assert_eq!(after_first.engine_pid, None);
+        assert_eq!(after_first.engine_start_ticks, None);
+        // So a stop of the same record signals nothing, and still reads stopped.
+        assert_eq!(
+            signalled_in_all, signalled_by_first,
+            "the second stop reached a PID the first one had already stopped"
+        );
+        assert_eq!(second["stopped"], true, "{second}");
+        assert_eq!(second["signaled_pids"], serde_json::json!([]), "{second}");
+        assert_eq!(second["pid_outcomes"], serde_json::json!([]), "{second}");
+        assert_eq!(after_second.status, "stopped");
+        assert_eq!(after_second.supervisor_pid, 0);
+        assert_eq!(after_second.engine_pid, None);
+    }
+
+    #[test]
+    fn an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop() {
+        use rocm_core::TerminationOutcome::TimedOut;
+        let (root, paths) = test_paths("services-stop-keeps-pids");
+        paths.ensure().unwrap();
+        let service_id = "svc-services-stop-keeps-pids";
+        let mut record = stop_test_record(&paths, service_id);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+        record.write().unwrap();
+
+        let signalled = std::cell::Cell::new(0_usize);
+        let stop = |record: &ManagedServiceRecord| {
+            rocm_core::terminate_recorded_service_pids(record, |_| {
+                signalled.set(signalled.get() + 1);
+                TimedOut
+            })
+        };
+        let first = stop_internal_managed_service_with(&paths, service_id, stop).unwrap();
+        let after_first = raw_manifest(&paths, service_id);
+        let _ = stop_internal_managed_service_with(&paths, service_id, stop).unwrap();
+        let signalled_in_all = signalled.get();
+        let _ = fs::remove_dir_all(root);
+
+        // Nothing was confirmed gone, so the record still names what survived:
+        // that is the only thing a later stop can find them by.
+        assert_eq!(first["stopped"], false, "{first}");
+        assert_eq!(after_first.supervisor_pid, 4242);
+        assert_eq!(after_first.supervisor_start_ticks, Some(5));
+        assert_eq!(after_first.engine_pid, Some(4243));
+        assert_eq!(after_first.engine_start_ticks, Some(77));
+        assert_eq!(signalled_in_all, 4, "each stop tried both processes");
     }
 
     #[test]

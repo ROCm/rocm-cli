@@ -127,11 +127,9 @@ pub(crate) fn stop_managed_service_via(
         record.stop_requested_unix_ms = None;
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
-        // leave one behind for the next stop to find.
-        record.supervisor_pid = 0;
-        record.supervisor_start_ticks = None;
-        record.engine_pid = None;
-        record.engine_start_ticks = None;
+        // leave one behind for the next stop to find. The same call
+        // `rocm services stop` makes on its confirmed path.
+        record.clear_recorded_processes();
     } else {
         // The recorded PIDs stay: an unconfirmed survivor is still the
         // service's, and the record is what names it.

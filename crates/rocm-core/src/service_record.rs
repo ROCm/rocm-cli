@@ -321,6 +321,25 @@ impl ManagedServiceRecord {
         self.engine_start_ticks = crate::process_start_ticks(pid);
     }
 
+    /// Forget the processes this record names: the supervisor and the engine,
+    /// each with its start-time token.
+    ///
+    /// For a stop that has confirmed every one of them gone, and for nothing
+    /// else. A recorded PID goes stale the instant its process exits, and a
+    /// later stop of the same record would signal whatever the OS has since
+    /// handed that number to; a PID recorded without a token cannot be
+    /// refuted, and on Windows none can, so the tree kill would take that
+    /// process and everything under it. `rocm services stop` and `rocmd`'s stop
+    /// both call this on the confirmed path, so the two leave the same record
+    /// behind. An unconfirmed stop keeps the PIDs: the record is the only thing
+    /// that names a survivor.
+    pub const fn clear_recorded_processes(&mut self) {
+        self.supervisor_pid = 0;
+        self.supervisor_start_ticks = None;
+        self.engine_pid = None;
+        self.engine_start_ticks = None;
+    }
+
     pub fn normalize_paths_for_host(&mut self) {
         self.manifest_path = normalize_runtime_path_for_host(&self.manifest_path);
         self.log_path = normalize_runtime_path_for_host(&self.log_path);
@@ -680,6 +699,35 @@ mod tests {
         assert_eq!(record.supervisor_start_ticks, expected);
         assert_eq!(record.engine_pid, Some(pid));
         assert_eq!(record.engine_start_ticks, expected);
+    }
+
+    /// What a stop that confirmed its processes gone leaves behind: no PID and
+    /// no token for either role, and nothing else touched.
+    #[test]
+    fn clearing_the_recorded_processes_clears_each_pid_and_its_token_and_nothing_else() {
+        let mut record = probe_test_record(11437);
+        record.supervisor_pid = 4242;
+        record.supervisor_start_ticks = Some(5);
+        record.engine_pid = Some(4243);
+        record.engine_start_ticks = Some(77);
+        record.status = "ready".to_owned();
+        record.restart_count = 3;
+        let before = record.clone();
+
+        record.clear_recorded_processes();
+
+        assert_eq!(record.supervisor_pid, 0);
+        assert_eq!(record.supervisor_start_ticks, None);
+        assert_eq!(record.engine_pid, None);
+        assert_eq!(record.engine_start_ticks, None);
+        assert_eq!(record.service_id, before.service_id);
+        assert_eq!(record.status, "ready");
+        assert_eq!(record.restart_count, 3);
+        assert_eq!(record.port, before.port);
+        // A cleared record no longer names what it named, so a stop that read it
+        // before and finds this after does not claim the same processes.
+        assert!(!before.names_same_processes(&record));
+        assert!(record.names_same_processes(&record.clone()));
     }
 
     #[test]
