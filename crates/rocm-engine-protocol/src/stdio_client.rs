@@ -22,7 +22,7 @@
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -154,13 +154,11 @@ where
     let stderr_reader = child.stderr.take().map(|stderr| {
         thread::spawn(move || collect_stderr(stderr, forward_stderr.then(io::stderr)))
     });
-    let mut stdout = Vec::new();
-    child
+    let stdout_pipe = child
         .stdout
         .take()
-        .context("engine stdio child did not expose stdout")?
-        .read_to_end(&mut stdout)
-        .context("failed to read engine stdio response")?;
+        .context("engine stdio child did not expose stdout")?;
+    let stdout = read_response(&mut child, stdout_pipe)?;
     let status = child
         .wait()
         .context("failed waiting for engine stdio response")?;
@@ -183,6 +181,24 @@ where
             format!("failed to parse engine response envelope; stderr: {stderr}")
         }
     })
+}
+
+/// Read the child's whole answer from `stdout`.
+///
+/// A failed read would leave the child running with nobody waiting on it, and
+/// this client lives in the long-lived daemon, so the child is killed and
+/// reaped before the error is returned, as it is when the request cannot be
+/// written. The stderr collector is not joined on that path: a grandchild that
+/// inherited the pipe could hold it open, and the thread ends by itself once
+/// the pipe closes.
+fn read_response(child: &mut Child, mut stdout: impl Read) -> Result<Vec<u8>> {
+    let mut response = Vec::new();
+    if let Err(error) = stdout.read_to_end(&mut response) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow::Error::new(error).context("failed to read engine stdio response"));
+    }
+    Ok(response)
 }
 
 /// Read `stderr` to the end line by line, optionally writing each line to
@@ -588,6 +604,63 @@ mod tests {
                 error.to_string(),
                 "failed to parse engine response envelope"
             );
+        }
+
+        /// An answer whose read fails kills the child and reaps it, so a daemon
+        /// that hits this repeatedly collects neither a running engine nor a
+        /// zombie per failure. A zombie keeps its `/proc` entry until it is
+        /// waited on, so the entry being gone shows the reap and not only the
+        /// kill (hence Linux only).
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_failed_read_of_the_answer_kills_and_reaps_the_child() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let proc_entry = format!("/proc/{pid}");
+            assert!(Path::new(&proc_entry).exists(), "the child is running");
+
+            let error = read_response(&mut child, Fails).unwrap_err();
+
+            assert_eq!(error.to_string(), "failed to read engine stdio response");
+            assert_eq!(
+                format!("{error:#}"),
+                "failed to read engine stdio response: pipe went away"
+            );
+            assert!(
+                !Path::new(&proc_entry).exists(),
+                "the child must be killed and reaped, not left running or as a zombie"
+            );
+            // The status was collected by the reap, so it is still reported.
+            assert_eq!(
+                child.try_wait().unwrap().and_then(|status| status.signal()),
+                Some(libc::SIGKILL)
+            );
+        }
+
+        /// The success path of the same helper hands the bytes back and leaves
+        /// the child alone.
+        #[test]
+        fn a_successful_read_of_the_answer_leaves_the_child_to_the_caller() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let bytes = read_response(&mut child, &b"{\"ok\":true}"[..]).unwrap();
+
+            assert_eq!(bytes, b"{\"ok\":true}");
+            assert!(child.try_wait().unwrap().is_none(), "still running");
+            child.kill().unwrap();
+            child.wait().unwrap();
         }
 
         #[test]
