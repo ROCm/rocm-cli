@@ -138,7 +138,8 @@ use host_gpu::{
 };
 pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::{
-    LOG_VIEW_MAX_TAIL_READ, LogDecode, strip_ansi_sequences, tail_lines, tail_lines_decoded,
+    LOG_VIEW_MAX_TAIL_READ, LogDecode, LogTail, strip_ansi_sequences, tail_lines,
+    tail_lines_decoded, tail_log_decoded,
 };
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,

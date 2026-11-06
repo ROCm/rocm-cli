@@ -54,6 +54,31 @@ impl LogDecode {
     };
 }
 
+/// The lines a bounded tail read returned, and what the bound left unread.
+///
+/// A caller that only wants the lines uses [`tail_lines_decoded`]; one that
+/// tells a person what it found uses [`tail_log_decoded`], so that "the log
+/// has no lines" and "the log's newest line does not fit in the read bound"
+/// are not the same empty list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogTail {
+    /// The last lines of the log, oldest first.
+    pub lines: Vec<String>,
+    /// How many bytes at the start of the file the read did not look at
+    /// because of the byte budget; zero when the whole file was read.
+    pub skipped_bytes: u64,
+}
+
+impl LogTail {
+    /// True when the read found no complete line even though the log has
+    /// content: its newest line begins before the byte budget's window, so the
+    /// window held only a fragment of it, which is dropped. An empty log, or a
+    /// limit of zero, is not this.
+    pub const fn newest_line_exceeds_the_read_bound(&self) -> bool {
+        self.lines.is_empty() && self.skipped_bytes > 0
+    }
+}
+
 /// Reads the last `limit` lines from a file as UTF-8, seeking near the end
 /// instead of reading the whole file for files larger than `max_tail_read`.
 ///
@@ -82,8 +107,19 @@ pub fn tail_lines_decoded(
     max_tail_read: u64,
     decode: LogDecode,
 ) -> Result<Vec<String>> {
+    Ok(tail_log_decoded(path, limit, max_tail_read, decode)?.lines)
+}
+
+/// [`tail_lines_decoded`], also reporting how much of the start of the file
+/// the byte budget left unread (see [`LogTail`]). The lines are the same.
+pub fn tail_log_decoded(
+    path: &Path,
+    limit: usize,
+    max_tail_read: u64,
+    decode: LogDecode,
+) -> Result<LogTail> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(LogTail::default());
     }
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -103,7 +139,7 @@ fn tail_lines_from<R: Read + Seek>(
     limit: usize,
     max_tail_read: u64,
     decode: LogDecode,
-) -> Result<Vec<String>> {
+) -> Result<LogTail> {
     let utf16_bom = if decode.utf16_le {
         sniff_utf16_le(&mut source, size, path)?
     } else {
@@ -121,7 +157,10 @@ fn tail_lines_from<R: Read + Seek>(
             seek_pos += 1;
         }
         if seek_pos >= size {
-            return Ok(Vec::new());
+            return Ok(LogTail {
+                lines: Vec::new(),
+                skipped_bytes: size,
+            });
         }
         // Probe the unit preceding `seek_pos` to classify the first line, then
         // leave the cursor at `seek_pos` for the read below.
@@ -234,7 +273,7 @@ fn tail_lines_from<R: Read + Seek>(
         }
     }
 
-    Ok(lines
+    let lines = lines
         .into_iter()
         .map(|line| {
             if decode.strip_ansi {
@@ -243,7 +282,17 @@ fn tail_lines_from<R: Read + Seek>(
                 line
             }
         })
-        .collect())
+        .collect();
+    Ok(LogTail {
+        lines,
+        // Not `window_start`: a byte order mark skipped at the start of a
+        // whole-file read is not something the budget left unread.
+        skipped_bytes: if size > max_tail_read {
+            window_start
+        } else {
+            0
+        },
+    })
 }
 
 /// `Some(has_byte_order_mark)` when the start of the source reads as UTF-16
@@ -554,7 +603,8 @@ mod tests {
             limit,
             max_tail_read,
             decode,
-        )?;
+        )?
+        .lines;
         Ok((lines, bytes_read.get()))
     }
 
@@ -834,7 +884,8 @@ mod tests {
                 usize::MAX,
                 budget,
                 LogDecode::PLAIN,
-            )?;
+            )?
+            .lines;
 
             assert!(
                 lines.iter().all(|line| line == "settled-line-xx"),
@@ -865,7 +916,8 @@ mod tests {
             usize::MAX,
             size / 4,
             LogDecode::CONSOLE,
-        )?;
+        )?
+        .lines;
 
         assert!(!lines.is_empty());
         assert!(lines.iter().all(|line| line == "settled-line-xx"));
@@ -979,6 +1031,103 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    // --- an empty tail: no lines, or no line that fits the bound --------
+
+    fn read_log_bytes(
+        name: &str,
+        bytes: &[u8],
+        limit: usize,
+        max_tail_read: u64,
+        decode: LogDecode,
+    ) -> Result<LogTail> {
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-{name}-{}.log", unique_suffix()));
+        fs::write(&path, bytes)?;
+        let tail = tail_log_decoded(&path, limit, max_tail_read, decode);
+        fs::remove_file(&path).ok();
+        tail
+    }
+
+    #[test]
+    fn an_empty_tail_says_whether_the_log_is_empty_or_its_newest_line_is_too_long() -> Result<()> {
+        // The state matrix of an empty `lines`: (content, limit, whether the
+        // newest line exceeds the bound, bytes the budget left unread).
+        let long_line = "x".repeat(300);
+        let long_with_newline = format!("{long_line}\n");
+        let long_utf16 = utf16_le_bytes(&long_line, true);
+        let cases: Vec<(&str, Vec<u8>, usize, bool, u64)> = vec![
+            ("empty file", Vec::new(), 5, false, 0),
+            (
+                "limit zero on a long line",
+                long_line.clone().into_bytes(),
+                0,
+                false,
+                0,
+            ),
+            (
+                "long line without a newline",
+                long_line.into_bytes(),
+                5,
+                true,
+                300 - 64,
+            ),
+            (
+                "long line with a newline",
+                long_with_newline.clone().into_bytes(),
+                5,
+                true,
+                301 - 64,
+            ),
+            ("long sixteen-bit line", long_utf16, 5, true, 602 - 64),
+            (
+                "long line that ends a larger log",
+                format!("first\n{long_with_newline}").into_bytes(),
+                5,
+                true,
+                6 + 301 - 64,
+            ),
+            ("short log", b"a\nb\n".to_vec(), 5, false, 0),
+        ];
+        for (label, content, limit, exceeds, skipped) in cases {
+            let tail = read_log_bytes("empty-tail", &content, limit, 64, LogDecode::CONSOLE)?;
+            assert_eq!(
+                tail.newest_line_exceeds_the_read_bound(),
+                exceeds,
+                "{label}: {tail:?}"
+            );
+            assert_eq!(tail.skipped_bytes, skipped, "{label}: {tail:?}");
+            // The flag is only ever set for an empty list, and the empty list
+            // only ever comes from the cases that name it.
+            if exceeds || content.is_empty() || limit == 0 {
+                assert!(tail.lines.is_empty(), "{label}: {tail:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_tail_that_found_lines_never_reports_an_exceeded_bound() -> Result<()> {
+        let content = "line\n".repeat(100).into_bytes();
+
+        let tail = read_log_bytes("found", &content, 5, 64, LogDecode::PLAIN)?;
+
+        assert_eq!(tail.lines.len(), 5);
+        assert!(tail.skipped_bytes > 0, "the budget did leave bytes unread");
+        assert!(!tail.newest_line_exceeds_the_read_bound());
+        Ok(())
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_counted_as_bytes_the_budget_skipped() -> Result<()> {
+        let content = utf16_le_bytes("a\nb\n", true);
+
+        let tail = read_log_bytes("bom-skipped", &content, 5, 1024, LogDecode::CONSOLE)?;
+
+        assert_eq!(tail.lines, vec!["a", "b"]);
+        assert_eq!(tail.skipped_bytes, 0);
         Ok(())
     }
 }

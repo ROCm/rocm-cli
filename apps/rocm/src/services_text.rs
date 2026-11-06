@@ -77,7 +77,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, ManagedServiceRecord};
+use rocm_core::{AppPaths, LogTail, ManagedServiceRecord};
 use rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
 
 use crate::managed_service_status::{
@@ -470,8 +470,7 @@ fn render_service_logs_text_with_options(
     show_file_locations: bool,
 ) -> Result<String> {
     let record = load_managed_service(paths, service_id)?;
-    let recent_lines =
-        read_optional_tail_lines(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
+    let recent = read_optional_log_tail(&record.log_path, DEFAULT_LOG_TAIL_LINES, "service log");
 
     let mut output = String::new();
     let _ = writeln!(output, "Service Log");
@@ -497,11 +496,17 @@ fn render_service_logs_text_with_options(
         let _ = writeln!(output, "  Choose Show file locations to see exact paths.");
     }
     let _ = writeln!(output);
-    if recent_lines.is_empty() {
+    if recent.newest_line_exceeds_the_read_bound() {
+        let _ = writeln!(
+            output,
+            "Recent output: none shown; {}",
+            newest_line_exceeds_bound_notice()
+        );
+    } else if recent.lines.is_empty() {
         let _ = writeln!(output, "Recent output: no output yet");
     } else {
-        let _ = writeln!(output, "Recent output: last {} line(s)", recent_lines.len());
-        for line in recent_lines {
+        let _ = writeln!(output, "Recent output: last {} line(s)", recent.lines.len());
+        for line in recent.lines {
             let _ = writeln!(output, "  {line}");
         }
     }
@@ -804,13 +809,34 @@ fn list_log_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
 }
 
 pub(crate) fn read_optional_tail_lines(path: &Path, limit: usize, label: &str) -> Vec<String> {
+    read_optional_log_tail(path, limit, label).lines
+}
+
+/// [`read_optional_tail_lines`], keeping what the byte budget left unread so
+/// a caller that describes an empty result can tell an empty log from one
+/// whose newest line is too long to show.
+pub(crate) fn read_optional_log_tail(path: &Path, limit: usize, label: &str) -> LogTail {
     if !path.is_file() {
-        return Vec::new();
+        return LogTail::default();
     }
-    match read_tail_lines(path, limit, label) {
-        Ok(lines) => lines,
-        Err(error) => vec![format!("<failed to read {label}: {error}>")],
+    match read_log_tail(path, limit, label) {
+        Ok(tail) => tail,
+        Err(error) => LogTail {
+            lines: vec![format!("<failed to read {label}: {error}>")],
+            skipped_bytes: 0,
+        },
     }
+}
+
+/// The clause a log view prints when a log has content but none of it is
+/// shown because its newest line does not fit the read budget
+/// ([`LogTail::newest_line_exceeds_the_read_bound`]). Derived from the budget
+/// the views read with, so the number cannot drift from it.
+pub(crate) fn newest_line_exceeds_bound_notice() -> String {
+    format!(
+        "the newest line is longer than the {} MiB a log view reads",
+        rocm_core::LOG_VIEW_MAX_TAIL_READ / (1024 * 1024)
+    )
 }
 
 fn format_cli_lifecycle_tail_line(line: &str) -> String {
@@ -879,8 +905,18 @@ fn lifecycle_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// routine; `label` names the log in the error ("service log", "CLI action
 /// log").
 pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
-    rocm_core::tail_lines(path, limit, rocm_core::LOG_VIEW_MAX_TAIL_READ)
-        .with_context(|| format!("failed to read {label} {}", path.display()))
+    Ok(read_log_tail(path, limit, label)?.lines)
+}
+
+/// [`read_tail_lines`], with what the byte budget left unread.
+fn read_log_tail(path: &Path, limit: usize, label: &str) -> Result<LogTail> {
+    rocm_core::tail_log_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::PLAIN,
+    )
+    .with_context(|| format!("failed to read {label} {}", path.display()))
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1279,6 +1315,91 @@ pub(crate) mod tests {
         assert!(rendered.contains("entry-090"));
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// What `rocm services logs` prints for a service whose log holds `bytes`
+    /// (or has no file when `None`), with the log's size on disk, so a message
+    /// is asserted together with the state it describes.
+    fn render_service_log_with(name: &str, bytes: Option<&[u8]>) -> Result<(String, Option<u64>)> {
+        let (root, paths) = test_paths(name);
+        paths.ensure()?;
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc_tail_notice",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_preferred".to_owned()),
+        );
+        record.write()?;
+        let size = match bytes {
+            Some(bytes) => {
+                fs::write(&record.log_path, bytes)?;
+                Some(fs::metadata(&record.log_path)?.len())
+            }
+            None => None,
+        };
+        let rendered = render_service_logs_text(&paths, "svc_tail_notice")?;
+        let _ = fs::remove_dir_all(root);
+        Ok((rendered, size))
+    }
+
+    #[test]
+    fn service_logs_say_no_output_only_for_an_empty_log_and_name_the_bound_otherwise() -> Result<()>
+    {
+        let bound = rocm_core::LOG_VIEW_MAX_TAIL_READ;
+        assert_eq!(
+            bound,
+            4 * 1024 * 1024,
+            "the notice below names this many MiB"
+        );
+        let notice =
+            "Recent output: none shown; the newest line is longer than the 4 MiB a log view reads";
+        let over_the_bound = usize::try_from(bound)? + 1024;
+
+        // No log file and an empty one: nothing was written, and it says so.
+        let (rendered, size) = render_service_log_with("service-logs-none", None)?;
+        assert_eq!(size, None);
+        assert!(
+            rendered.contains("Recent output: no output yet"),
+            "{rendered}"
+        );
+        let (rendered, size) = render_service_log_with("service-logs-empty", Some(b""))?;
+        assert_eq!(size, Some(0));
+        assert!(
+            rendered.contains("Recent output: no output yet"),
+            "{rendered}"
+        );
+
+        // One line longer than the bound, with and without a final newline:
+        // the file has content, so "no output yet" would be false.
+        let one_line = "x".repeat(over_the_bound).into_bytes();
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        for (name, bytes) in [
+            ("service-logs-long-line", one_line),
+            ("service-logs-long-line-newline", with_newline),
+        ] {
+            let (rendered, size) = render_service_log_with(name, Some(&bytes))?;
+            assert!(size.is_some_and(|size| size > bound), "{name}: {size:?}");
+            assert!(rendered.contains(notice), "{name}: {rendered}");
+            assert!(!rendered.contains("no output yet"), "{name}: {rendered}");
+            assert!(!rendered.contains("last 0 line(s)"), "{name}: {rendered}");
+        }
+
+        // A big log whose newest lines are short is shown, not described.
+        let (rendered, size) =
+            render_service_log_with("service-logs-big", Some(&large_log_with_head_marker()))?;
+        assert!(size.is_some_and(|size| size > bound));
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
         Ok(())
     }
 

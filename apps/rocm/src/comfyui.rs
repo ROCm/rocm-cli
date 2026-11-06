@@ -354,13 +354,20 @@ fn render_logs_with_options(
         if show_file_locations {
             writeln!(output, "  saved file: {}", path.display())?;
         }
-        let lines = read_tail_lines(path, limit)
+        let tail = read_log_tail(path, limit)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        if lines.is_empty() {
+        if tail.newest_line_exceeds_the_read_bound() {
+            // The file has content; saying it is empty would be false.
+            writeln!(
+                output,
+                "  No output shown: {}.",
+                crate::services_text::newest_line_exceeds_bound_notice()
+            )?;
+        } else if tail.lines.is_empty() {
             writeln!(output, "  The saved log is empty.")?;
         } else {
             writeln!(output, "  latest output:")?;
-            for line in lines {
+            for line in tail.lines {
                 writeln!(output, "    {line}")?;
             }
         }
@@ -507,8 +514,8 @@ fn comfyui_log_title(path: &Path) -> &'static str {
 /// routine. A ComfyUI log may have been redirected by a Windows shell as
 /// UTF-16 and carries the colour codes of the Python process, so it is
 /// decoded the console way: UTF-16 detected, ANSI sequences stripped.
-fn read_tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    rocm_core::tail_lines_decoded(
+fn read_log_tail(path: &Path, limit: usize) -> Result<rocm_core::LogTail> {
+    rocm_core::tail_log_decoded(
         path,
         limit,
         rocm_core::LOG_VIEW_MAX_TAIL_READ,
@@ -948,6 +955,11 @@ mod tests {
         Ok(())
     }
 
+    /// The lines of [`read_log_tail`], for the tests that compare lines.
+    fn read_tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+        Ok(read_log_tail(path, limit)?.lines)
+    }
+
     fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
         let paths = test_paths(name);
         let dir = app_root(&paths).join("logs");
@@ -974,6 +986,63 @@ mod tests {
         }
         bytes.extend_from_slice(b"TAIL-MARKER\n");
         bytes
+    }
+
+    /// What `render_logs` prints for a lone saved log with these bytes, and
+    /// the log's size on disk, so a message is asserted with the state it
+    /// describes.
+    fn render_lone_log(name: &str, bytes: &[u8]) -> Result<(String, u64)> {
+        let paths = test_paths(name);
+        let logs = app_root(&paths).join("logs");
+        fs::create_dir_all(&logs)?;
+        let log = logs.join("start-fixture.log");
+        fs::write(&log, bytes)?;
+        let size = fs::metadata(&log)?.len();
+        Ok((render_logs(&paths, 5)?, size))
+    }
+
+    #[test]
+    fn logs_say_a_log_is_empty_only_when_it_is_and_name_the_bound_when_it_is_not() -> Result<()> {
+        let bound = rocm_core::LOG_VIEW_MAX_TAIL_READ;
+        assert_eq!(
+            bound,
+            4 * 1024 * 1024,
+            "the notice below names this many MiB"
+        );
+        let notice = "No output shown: the newest line is longer than the 4 MiB a log view reads.";
+        let over_the_bound = usize::try_from(bound)? + 1024;
+
+        // An empty file: the log really is empty, and says so.
+        let (rendered, size) = render_lone_log("comfyui-logs-empty", b"")?;
+        assert_eq!(size, 0);
+        assert!(rendered.contains("The saved log is empty."), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
+
+        // One line longer than the bound, with and without a final newline,
+        // and as sixteen-bit text: the file has content, so it is not empty,
+        // and the notice names the bound.
+        let one_line = "x".repeat(over_the_bound).into_bytes();
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        let wide = utf16_le(&"y".repeat(over_the_bound / 2 + 1), true);
+        for (name, bytes) in [
+            ("comfyui-logs-long-line", one_line),
+            ("comfyui-logs-long-line-newline", with_newline),
+            ("comfyui-logs-long-line-wide", wide),
+        ] {
+            let (rendered, size) = render_lone_log(name, &bytes)?;
+            assert!(size > bound, "{name}: the log is bigger than the bound");
+            assert!(rendered.contains(notice), "{name}: {rendered}");
+            assert!(!rendered.contains("is empty"), "{name}: {rendered}");
+            assert!(!rendered.contains("latest output:"), "{name}: {rendered}");
+        }
+
+        // A big log whose newest lines are short is shown, not described.
+        let (rendered, size) = render_lone_log("comfyui-logs-big", &large_log_with_head_marker())?;
+        assert!(size > bound);
+        assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
+        assert!(!rendered.contains(notice), "{rendered}");
+        Ok(())
     }
 
     #[test]
