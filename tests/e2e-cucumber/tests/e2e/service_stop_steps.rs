@@ -177,6 +177,50 @@ fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key:
     plant_server_record(world, host, with_key, process, Some(ticks));
 }
 
+/// A ready, publicly bound server whose recorded PID is a live process that is
+/// not the server: what a recycled PID looks like. The record's start-time token
+/// is not the process's own, so the stop has to refuse the PID rather than signal
+/// it. The token is the process's real one offset by one on Linux, and `1` (a
+/// `FILETIME` in 1601, which no live process has) on Windows.
+#[given("a managed server whose recorded process id now belongs to a different process")]
+async fn managed_server_with_a_recycled_pid(world: &mut E2eWorld) {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("ping", &["-n", "300", "127.0.0.1"])
+    } else {
+        ("sleep", &["300"])
+    };
+    let bystander = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process that holds the recorded PID");
+    let stale_ticks = if cfg!(windows) {
+        1
+    } else {
+        start_ticks(bystander.id()).wrapping_add(1)
+    };
+    plant_server_record(world, "0.0.0.0", true, bystander, Some(stale_ticks));
+}
+
+/// The stop's promise about the process that holds the recorded PID, checked on
+/// the process: it was not signalled, so it is still running.
+#[then("the process now holding the recorded process id is still running")]
+async fn process_holding_the_pid_still_runs(world: &mut E2eWorld) {
+    let process = world
+        .recorded_process
+        .as_mut()
+        .expect("scenario recorded no process");
+    assert!(
+        process
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "the stop signalled a process that is not the recorded server"
+    );
+}
+
 /// Where the parent the Windows scenario records writes the PID of the process
 /// it started, for the scenario to read.
 fn descendant_pid_path(world: &E2eWorld) -> PathBuf {

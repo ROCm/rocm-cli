@@ -1461,6 +1461,25 @@ work: with the `taskkill /T` step removed the stop ends only the recorded
 process and the scenario fails on the surviving child. `service-stop-01` plants
 PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
 injected unit tests above cover its ordering and verdicts on every host.
+
+The tree kill is behind the same identity gate as the rest of the stop. On
+Windows `process_start_ticks` is the process creation time (`GetProcessTimes`, a
+`FILETIME`), so a record written by this version refutes a PID that an unrelated
+process has taken, and the stop reports `identity_mismatch` without running
+`taskkill` on it; only a record written before Windows recorded a token has
+nothing to refute. `a_filetime_is_its_high_word_above_its_low_word` runs the
+conversion on every host. `terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+runs the real stop against this test's own PID with a wrong token on Linux and
+Windows (a stop that went ahead would end the test process), and
+`terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+repeats it against a bystander on Windows only and then stops that bystander
+with its true token. `service-stop-09` is the live version on every OS: it
+records a running process under a token no live process has, stops the server,
+and asserts that the process is still running and the record names no process.
+Neither Windows-only test nor the Windows half of `service-stop-09` ran where
+this was written; the Windows CI jobs are what exercise them. A stop that cannot
+verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
+eq <pid>"` on Windows (`process_check_command`).
 `service-stop-06` (Linux) is the same stop of a real recorded process through
 `rocm services stop`, checking the persisted state: the process exited and the
 record names none. Run the Windows scenario on a Windows host with

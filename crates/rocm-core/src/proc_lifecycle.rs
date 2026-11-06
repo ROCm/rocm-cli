@@ -32,8 +32,10 @@ pub enum KillScope {
 /// A spawned process identified in a way that is robust to PID recycling.
 ///
 /// `start_ticks` is the kernel start-time of the process (clock ticks since
-/// boot). It is `None` on platforms without `/proc`, where identity cannot be
-/// verified and callers fall back to best-effort behaviour.
+/// boot) on Linux, and its creation time as a `FILETIME` on Windows. It is
+/// `None` on other platforms, and for a record written before Windows recorded
+/// one, where identity cannot be verified and callers fall back to best-effort
+/// behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -431,13 +433,16 @@ pub fn terminate_recorded_service_pids(
 /// launches it through an `__engine-serve-http` process: a root-only kill would
 /// leave the engine running and still holding the device.
 ///
-/// Identity verification does not reach that far on Windows.
-/// [`process_start_ticks`] has no `/proc` to read there and returns `None`, so
-/// no recorded identity can be refuted and the [`IdentityState::Matches`] gate
-/// only ever turns away a PID that is not running at all. A recorded PID that
-/// has been recycled by an unrelated process still passes it, and `taskkill /T
-/// /F` then takes that process and its whole subtree. Closing that needs a
-/// Windows process creation time in [`process_start_ticks`].
+/// The tree kill runs only for a PID that passes the same identity gate as the
+/// rest of the stop. A record written with a start-time token carries the
+/// process's creation time on Windows ([`process_start_ticks`]), so a PID that
+/// an unrelated process has since taken reads back [`IdentityState::Recycled`]
+/// and neither it nor its subtree is touched. A record written before Windows
+/// recorded a token has none to refute, and for it the gate only turns away a
+/// PID that is not running at all: that old record can still name a recycled
+/// PID, and `taskkill /T /F` then takes that process and its subtree. A stop
+/// that confirms clears the record's PIDs, so that exposure shrinks to the
+/// records written before the token existed and not yet stopped.
 pub fn terminate_recorded_pid(identity: &ProcessIdentity) -> TerminationOutcome {
     terminate_recorded_pid_with(identity, platform_tree_kill(), identity_state, |identity| {
         terminate_verified(identity, KillScope::Tree, MANAGED_STOP_GRACE, true)
@@ -539,8 +544,9 @@ fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
 
 /// Read the kernel start-time (field 22 of `/proc/<pid>/stat`) for `pid`.
 ///
-/// Returns `None` when the value cannot be read, including on non-Linux
-/// platforms, where identity verification degrades to best-effort.
+/// Returns `None` when the value cannot be read, including on platforms with
+/// neither `/proc` nor a creation time to read (neither Linux nor Windows),
+/// where identity verification degrades to best-effort.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn process_start_ticks(pid: u32) -> Option<u64> {
@@ -548,7 +554,56 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
     parse_start_ticks(&stat)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Read the creation time of `pid` (`GetProcessTimes`) as the token that tells
+/// the process from a later one that reuses its PID.
+///
+/// The value is the creation time as a Windows `FILETIME` (100 ns intervals
+/// since 1601), not clock ticks since boot: only equality with a value read
+/// earlier from the same PID means anything. `None` when the process cannot be
+/// opened for querying (it is gone, or belongs to a more privileged account).
+#[cfg(windows)]
+#[must_use]
+#[allow(unsafe_code)] // Win32 FFI
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: plain Win32 calls. The handle is checked before use and closed on
+    // every path, and the four out-parameters are valid for the one call.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let read = GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        );
+        CloseHandle(handle);
+        (read != 0).then(|| filetime_ticks(creation.dwLowDateTime, creation.dwHighDateTime))
+    }
+}
+
+/// The 64-bit value of a Windows `FILETIME`, which a Win32 call returns as two
+/// 32-bit halves. Kept apart from the FFI so a test can run it on every host.
+#[cfg(any(windows, test))]
+fn filetime_ticks(low: u32, high: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 #[must_use]
 // Platform stub. The `cfg` sibling calls non-const code, so making only this
 // arm `const` would give the two platforms different signatures and push
@@ -684,7 +739,7 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn identity_matches_our_own_process() {
         let pid = std::process::id();
@@ -693,7 +748,7 @@ mod tests {
         assert_eq!(identity_state(&id), IdentityState::Matches);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn identity_mismatch_when_start_ticks_differ() {
         // Same live PID (ours), but a different recorded start-time: a recycled
@@ -713,7 +768,7 @@ mod tests {
         assert_eq!(identity_state(&id), IdentityState::Gone);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn refuses_to_signal_on_identity_mismatch() {
         // Our own PID with a wrong start-time. A forced stop must NOT kill us:
@@ -1177,5 +1232,81 @@ mod tests {
         ));
         reap(child);
         assert!(!crate::process_is_running(id.pid));
+    }
+
+    #[test]
+    fn a_filetime_is_its_high_word_above_its_low_word() {
+        // The Windows creation time arrives as two 32-bit halves; swapping them
+        // or dropping the shift would make every process read as a different one.
+        assert_eq!(
+            filetime_ticks(0x89AB_CDEF, 0x0123_4567),
+            0x0123_4567_89AB_CDEF
+        );
+        assert_eq!(filetime_ticks(1, 0), 1);
+        assert_eq!(filetime_ticks(0, 1), 1 << 32);
+        assert_eq!(filetime_ticks(u32::MAX, u32::MAX), u64::MAX);
+    }
+
+    /// The managed stop's own entry point refuses a PID whose recorded identity no
+    /// longer matches, and reaches neither it nor its tree. Our own PID with a
+    /// wrong start-time is what a recycled PID looks like; if the stop went
+    /// ahead, `taskkill /T /F` on Windows (a plain forced kill elsewhere) would
+    /// end this test process instead of asserting. On Windows this runs the real
+    /// tree-kill gate: the verdict has to come from the identity check, before
+    /// any `taskkill`.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches() {
+        let pid = std::process::id();
+        let real = process_start_ticks(pid).expect("own start-time");
+        let stale = ProcessIdentity::new(pid, Some(real.wrapping_add(1)));
+
+        let outcome = terminate_recorded_pid(&stale);
+
+        assert_eq!(outcome, TerminationOutcome::IdentityMismatch);
+        assert!(crate::process_is_running(pid), "nothing was signalled");
+    }
+
+    /// The same refusal against a bystander that is a different process holding
+    /// the recorded PID (the recycled case), then the stop of that process when
+    /// its identity does match. Windows only: that is where a tree kill by PID
+    /// follows the identity gate, and where a creation-time token is read.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+        let real = process_start_ticks(pid).expect("a live process has a creation time");
+        assert_eq!(
+            process_start_ticks(pid),
+            Some(real),
+            "the creation time of one process does not change"
+        );
+        assert_ne!(
+            Some(real),
+            process_start_ticks(std::process::id()),
+            "two processes do not share one"
+        );
+
+        let outcome =
+            terminate_recorded_pid(&ProcessIdentity::new(pid, Some(real.wrapping_add(1))));
+        assert_eq!(outcome, TerminationOutcome::IdentityMismatch);
+        assert!(
+            child.try_wait().expect("check the bystander").is_none(),
+            "a PID whose recorded creation time differs is a stranger and must keep running"
+        );
+
+        let outcome = terminate_recorded_pid(&ProcessIdentity::capture(pid));
+        assert!(outcome.stopped(), "{outcome:?}");
+        let _ = child.wait();
+        assert!(!crate::process_is_running(pid));
     }
 }

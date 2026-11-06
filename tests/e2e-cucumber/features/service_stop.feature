@@ -156,8 +156,10 @@ Feature: Stopping a managed service
   # checks that BOTH are gone together with the report and the record. Without
   # the tree-kill step the stop ends only the recorded process, the child keeps
   # running, and the scenario fails on it. No GPU, no engine, no network. The
-  # record carries no start-time token, because Windows has none: the case the
-  # tree kill and the cleared record exist for.
+  # record carries no start-time token, like a Windows record written before the
+  # token was recorded: the case where the PID cannot be refuted, which the tree
+  # kill and the cleared record exist for. service-stop-09 below is the same stop
+  # with a token that does not match.
 
   @id:service-stop-takes-down-the-whole-process-tree-on-windows
   @requires-os:windows
@@ -195,3 +197,22 @@ Feature: Stopping a managed service
     Then the CLI refuses the restart because it would reopen the public server without authentication
     And the refusal names a serve command that rocm accepts
     And the server is left running, with no stop recorded and no key file
+
+  # A recorded PID is not proof that the recorded process still holds it: the
+  # server can exit by itself and the OS hand its PID to an unrelated program.
+  # The record pairs the PID with the process's start-time token (Linux's
+  # `/proc` start time, Windows' creation time), and a stop whose token no longer
+  # matches treats the recorded process as already gone: it reports the stop,
+  # clears the record and leaves the process that now holds the PID running,
+  # instead of signalling a stranger (on Windows, with `taskkill /T /F`, its
+  # whole subtree). The stranger here is a real process, so "left alone" is
+  # checked on the process itself. Runs on every OS: the planted token is one
+  # no live process has.
+  @id:service-stop-leaves-a-process-that-reused-the-recorded-pid-alone
+  Scenario: service-stop-09 - Stopping a managed server whose recorded PID now belongs to another process leaves that process running
+    Given a managed server whose recorded process id now belongs to a different process
+    When the user stops it with --yes
+    Then the CLI reports the service as stopped
+    And the process now holding the recorded process id is still running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone

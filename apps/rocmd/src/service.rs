@@ -327,10 +327,11 @@ mod tests {
     /// a different process: the recorded service already exited and its PID was
     /// recycled. The stop must refuse it rather than signal a stranger.
     ///
-    /// Linux-only: a refutable identity needs a readable start-time, and
-    /// `rocm_core::process_start_ticks` reads it from `/proc`. On Windows it is
-    /// always `None`, so no identity can be refuted there and the state this
-    /// asserts on cannot be constructed.
+    /// Linux-only: it stages the bystander with `sleep` and offsets its token
+    /// read from `/proc`. The same refusal on Windows, where the token is the
+    /// process creation time, is asserted in `rocm-core`'s `proc_lifecycle`
+    /// tests (`terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+    /// and its Windows-only neighbour) and by scenario `service-stop-09`.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_managed_service_refuses_a_pid_whose_recorded_identity_no_longer_matches() -> Result<()>
