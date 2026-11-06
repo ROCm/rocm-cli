@@ -779,6 +779,14 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
+Before Lemonade writes a new install, whether from `rocm engines install
+lemonade` or the first `rocm serve` that needs it, it prints the folder it is
+installing into, the approximate download (about 4.4 GiB) and disk use (about
+25 GiB), and any existing Lemonade copy it is not reusing. It stops before
+downloading when the drive cannot hold the download, and warns when it may not
+hold the finished install. On Windows the backend download's own progress
+appears in the console.
+
 `--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
 libnuma), including a `sudo` password prompt. `engines install` never asks for
 confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
