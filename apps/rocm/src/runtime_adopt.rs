@@ -19,7 +19,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, managed_pip_cache_dir, runtime_python_executable_in_env};
+use rocm_core::{
+    AppPaths, RocmCliConfig, managed_pip_cache_dir, runtime_python_env_root_for_executable,
+    runtime_python_executable_in_env,
+};
 
 use crate::runtime_registry::{
     ManifestOverwrite, paths_equivalent, runtime_manifest_path, runtime_registry_dir,
@@ -234,22 +237,15 @@ fn resolve_adopt_python_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>)
         return Ok((python, Some(env_root)));
     }
     if absolute.is_file() {
-        let inferred_root = infer_python_env_root(&absolute);
+        // `None` for an interpreter outside a `bin`/`Scripts` folder: the
+        // request then asks for `--root` rather than adopting a guessed folder.
+        let inferred_root = runtime_python_env_root_for_executable(&absolute);
         return Ok((absolute, inferred_root));
     }
     bail!(
         "Python executable or folder is missing: {}",
         absolute.display()
     );
-}
-
-fn infer_python_env_root(python_executable: &Path) -> Option<PathBuf> {
-    let bin_dir = python_executable.parent()?;
-    let bin_name = bin_dir.file_name()?.to_string_lossy();
-    if bin_name.eq_ignore_ascii_case("Scripts") || bin_name == "bin" {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    bin_dir.parent().map(Path::to_path_buf)
 }
 
 pub(crate) fn adopt_runtime_from_probe(
@@ -799,5 +795,69 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// `rocm runtimes adopt --python <file>` without `--root` takes the
+    /// environment folder from the shared rule (see
+    /// `rocm_core::runtime_python_env_root_for_executable`): only an
+    /// interpreter in a `bin` or `Scripts` folder, in any case, names one. An
+    /// interpreter in an unrelated folder yields no root, and the request is
+    /// then refused with `--root` guidance rather than adopting a guessed
+    /// folder.
+    #[test]
+    fn adopt_python_file_infers_a_root_only_from_a_bin_or_scripts_folder() -> Result<()> {
+        let (root, _) = test_paths("runtime-adopt-infer-root");
+        for (folder, expected_root) in [
+            ("bin", true),
+            ("Scripts", true),
+            ("SCRIPTS", true),
+            ("tools", false),
+        ] {
+            let env_root = root.join(format!("env-{folder}"));
+            let python = env_root.join(folder).join("python");
+            fs::create_dir_all(python.parent().unwrap())?;
+            fs::write(&python, "python")?;
+
+            let (resolved, inferred) = resolve_adopt_python_input(&python)?;
+
+            assert_eq!(resolved, python, "{folder}");
+            assert_eq!(
+                inferred.as_deref(),
+                expected_root.then_some(env_root.as_path()),
+                "{folder}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// What no inferred root costs the user: the request is refused and asks
+    /// for `--root`, and an explicit `--root` still adopts the same
+    /// interpreter.
+    #[test]
+    fn adopt_request_without_an_inferred_root_asks_for_root() {
+        let python = PathBuf::from("python");
+        let request = |install_root: Option<PathBuf>| {
+            infer_adopt_runtime_request(
+                python.clone(),
+                install_root,
+                None,
+                None,
+                None,
+                false,
+                &therock::RocmSdkPythonProbe {
+                    rocm_sdk_version: Some("7.13.0".to_owned()),
+                    resolved_target_family: Some("gfx120X-all".to_owned()),
+                    ..therock::RocmSdkPythonProbe::default()
+                },
+            )
+        };
+
+        let error = request(None).unwrap_err().to_string();
+        assert!(error.contains("pass --root"), "{error}");
+
+        let explicit = request(Some(PathBuf::from("/opt/rocm-env"))).unwrap();
+        assert_eq!(explicit.install_root, PathBuf::from("/opt/rocm-env"));
     }
 }

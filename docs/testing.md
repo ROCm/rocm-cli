@@ -922,6 +922,10 @@ entry from the manifest already in the setup folder) needs a setup, so neither
 has a scenario; the unit tests below assert each path's file set instead, and
 `write_runtime_manifest` is the one routine all four paths write through.
 
+`--root` may be left out when `--python` sits directly in the environment's `bin`
+(or `Scripts`) folder; an interpreter anywhere else is refused until `--root` is
+given (scenario `runtime-23`).
+
 Focused unit coverage:
 
 ```bash

@@ -22,7 +22,7 @@ use crate::therock;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, RocmCliConfig, runtime_is_linux, runtime_is_windows, runtime_path_list_join,
-    runtime_path_list_split, runtime_paths_equivalent,
+    runtime_path_list_split, runtime_paths_equivalent, runtime_python_env_root_for_executable,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -237,7 +237,7 @@ pub(super) fn runtime_environment_for_manifest(
     }
 
     let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(&manifest.python_executable),
+        venv_root: runtime_python_env_root_for_executable(&manifest.python_executable),
         rocm_root: Some(manifest.runtime_root.clone()),
         path_entries: Vec::new(),
         library_entries: Vec::new(),
@@ -254,7 +254,7 @@ pub(super) fn runtime_environment_from_runtime(
     python: &Path,
 ) -> ComfyUiRuntimeEnvironment {
     let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(python),
+        venv_root: runtime_python_env_root_for_executable(python),
         rocm_root: manifest
             .rocm_sdk
             .as_ref()
@@ -305,15 +305,6 @@ fn collect_rocm_runtime_paths(root: &Path, env: &mut ComfyUiRuntimeEnvironment) 
         }
         push_existing_path(&mut env.library_entries, path);
     }
-}
-
-fn infer_python_env_root(python: &Path) -> Option<PathBuf> {
-    let bin_dir = python.parent()?;
-    let name = bin_dir.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if matches!(name.as_str(), "scripts" | "bin") {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    None
 }
 
 pub(super) fn apply_runtime_environment(
@@ -963,5 +954,65 @@ mod tests {
             .get_envs()
             .find(|(name, _)| name.to_string_lossy() == key)
             .and_then(|(_, value)| value.map(OsString::from))
+    }
+
+    /// The environment folder ComfyUI exports as `VIRTUAL_ENV`, by the folder
+    /// the interpreter sits in. Today only a `bin` or `Scripts` folder
+    /// (any case) identifies a venv; anything else leaves `VIRTUAL_ENV` unset
+    /// rather than pointing it at a guessed folder.
+    #[test]
+    fn runtime_environment_exports_virtual_env_only_for_a_bin_or_scripts_folder() -> Result<()> {
+        let cases: [(&str, Option<&str>); 7] = [
+            ("/opt/venv/bin/python", Some("/opt/venv")),
+            ("/opt/venv/Scripts/python.exe", Some("/opt/venv")),
+            ("/opt/venv/SCRIPTS/python.exe", Some("/opt/venv")),
+            ("/opt/venv/BIN/python", Some("/opt/venv")),
+            ("/opt/venv/tools/python", None),
+            ("python", None),
+            ("/python", None),
+        ];
+        for (python, expected) in cases {
+            let python = PathBuf::from(python);
+            let manifest = minimal_runtime_manifest(&python);
+
+            let env = runtime_environment_from_runtime(&manifest, &python);
+            let mut command = Command::new(&python);
+            apply_runtime_environment(&mut command, &env)?;
+
+            assert_eq!(
+                command_env_value(&command, "VIRTUAL_ENV").as_deref(),
+                expected.map(std::ffi::OsStr::new),
+                "{}",
+                python.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn minimal_runtime_manifest(python: &Path) -> therock::InstalledRuntimeManifest {
+        therock::InstalledRuntimeManifest {
+            runtime_key: "therock-release-gfx120x-all".to_owned(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            channel: "release".to_owned(),
+            format: "wheel".to_owned(),
+            family: "gfx120X-all".to_owned(),
+            family_source: "test".to_owned(),
+            version: "7.13.0a20260511".to_owned(),
+            install_root: PathBuf::from("/nonexistent/runtime"),
+            selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            source_layout_generation: None,
+            index_url: None,
+            tarball_file_name: None,
+            python_launcher: None,
+            python_executable: Some(python.display().to_string()),
+            pip_cache_dir: None,
+            rocm_sdk: None,
+            sdk_torch: None,
+            wheel_composition: None,
+            read_only: false,
+            imported_from: None,
+            devel: true,
+            installed_at_unix_ms: 100,
+        }
     }
 }

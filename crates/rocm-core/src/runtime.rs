@@ -119,6 +119,31 @@ pub fn runtime_python_executable_in_env(env_root: &Path) -> PathBuf {
     runtime_python_env_bin_dir(env_root).join(runtime_python_executable_name())
 }
 
+/// The environment folder an interpreter belongs to, found from the
+/// interpreter's own path: the inverse of [`runtime_python_executable_in_env`]
+/// for a caller that holds only the interpreter.
+///
+/// An interpreter belongs to an environment only when it sits directly in that
+/// environment's `bin` or `Scripts` folder, and the answer is that folder's
+/// parent. Both layouts are accepted, in any letter case, whatever the host: a
+/// recorded interpreter path is not always from this host's layout, and a
+/// Windows file system does not tell `Scripts` from `SCRIPTS`.
+///
+/// Anything else gives `None`: an interpreter in some other folder, a bare file
+/// name, or one at the file system root. A guess would name a folder that is
+/// not an environment, and the caller would then export it as `VIRTUAL_ENV`,
+/// look for `lib/python3.*` under it, or register it as a runtime. `None` lets
+/// each caller refuse in its own words instead.
+pub fn runtime_python_env_root_for_executable(python: &Path) -> Option<PathBuf> {
+    let bin_dir = python.parent()?;
+    let name = bin_dir.file_name()?.to_str()?;
+    if name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("Scripts") {
+        bin_dir.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
 pub fn runtime_python_activation_script(env_root: &Path) -> PathBuf {
     let script = if runtime_is_windows() {
         "activate.bat"
@@ -1025,6 +1050,57 @@ pub fn platform_binary_name(binary_name: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The one rule every caller shares. Paths are built with `join`, not
+    /// written with a separator, so the table means the same on every host.
+    #[test]
+    fn env_root_for_executable_needs_a_bin_or_scripts_folder() {
+        let venv = Path::new("opt").join("venv");
+        for (folder, python) in [
+            ("bin", "python"),
+            ("BIN", "python"),
+            ("Scripts", "python.exe"),
+            ("SCRIPTS", "python.exe"),
+            ("scripts", "python.exe"),
+        ] {
+            assert_eq!(
+                runtime_python_env_root_for_executable(&venv.join(folder).join(python)),
+                Some(venv.clone()),
+                "{folder}"
+            );
+        }
+        for folder in ["tools", "bin2", "my-bin", "venv"] {
+            assert_eq!(
+                runtime_python_env_root_for_executable(&venv.join(folder).join("python")),
+                None,
+                "{folder}"
+            );
+        }
+        // A bare file name has an empty parent, and a root-level file's parent
+        // is the file system root: neither is inside a `bin` or `Scripts`.
+        assert_eq!(
+            runtime_python_env_root_for_executable(Path::new("python")),
+            None
+        );
+        assert_eq!(
+            runtime_python_env_root_for_executable(
+                &Path::new(std::path::MAIN_SEPARATOR_STR).join("python")
+            ),
+            None
+        );
+    }
+
+    /// The inverse really is the inverse: the interpreter this host's layout
+    /// puts in an environment leads back to that environment.
+    #[test]
+    fn env_root_for_executable_inverts_the_hosts_layout() {
+        let env_root = Path::new("opt").join("venv");
+        let python = runtime_python_executable_in_env(&env_root);
+        assert_eq!(
+            runtime_python_env_root_for_executable(&python).as_deref(),
+            Some(normalize_runtime_path_for_host(&env_root).as_path())
+        );
+    }
 
     fn scratch_dir(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
