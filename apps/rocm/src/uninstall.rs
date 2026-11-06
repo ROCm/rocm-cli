@@ -63,6 +63,20 @@ impl PathEdit {
     }
 }
 
+/// `rocm uninstall` has no `--force`; the flag is declared (hidden) only so this
+/// can answer it. Left undeclared, clap's nearest-name guess for `--force` is
+/// `--force-dev-binaries`, which removes development binaries, and a near miss
+/// such as `--forc` gets that same suggestion. Declared, those guesses land here
+/// instead, before anything is planned or removed.
+pub(crate) fn reject_force(force: bool) -> Result<()> {
+    if force {
+        bail!(
+            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     let paths = AppPaths::discover()?;
     let plan = build_uninstall_plan(&paths, &options)?;

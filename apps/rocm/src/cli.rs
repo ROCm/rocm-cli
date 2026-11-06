@@ -1414,7 +1414,7 @@ impl PermissionsModeArg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli_command, device_policy_name, engine_inventory, reject_uninstall_force};
+    use crate::{cli_command, device_policy_name, engine_inventory, uninstall::reject_force};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
 
@@ -2193,20 +2193,18 @@ mod tests {
             panic!("not an uninstall command");
         };
         assert!(force.is_some() && !force_dev_binaries);
-        let refusal = reject_uninstall_force(force.is_some())
-            .unwrap_err()
-            .to_string();
+        let refusal = reject_force(force.is_some()).unwrap_err().to_string();
         assert!(refusal.contains("`--force` is not an option"), "{refusal}");
         assert!(refusal.contains("--yes"), "{refusal}");
         assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
-        assert!(reject_uninstall_force(false).is_ok());
+        assert!(reject_force(false).is_ok());
         // `--force=x` is the same mistake, and gets the same answer rather than
         // a usage line that lists every flag.
         let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
         let Some(Command::Uninstall { force, .. }) = cli.command else {
             panic!("not an uninstall command");
         };
-        assert!(reject_uninstall_force(force.is_some()).is_err());
+        assert!(reject_force(force.is_some()).is_err());
 
         // Near misses and the forms clap suggests from elsewhere in the command
         // line never offer the destructive flag.

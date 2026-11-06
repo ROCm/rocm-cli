@@ -946,7 +946,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force_dev_binaries,
             force,
         }) => {
-            reject_uninstall_force(force.is_some())?;
+            uninstall::reject_force(force.is_some())?;
             uninstall(UninstallOptions {
                 yes,
                 dry_run,
@@ -964,20 +964,6 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         None => launch_default(),
     }
-}
-
-/// `rocm uninstall` has no `--force`; the flag is declared (hidden) only so this
-/// can answer it. Left undeclared, clap's nearest-name guess for `--force` is
-/// `--force-dev-binaries`, which removes development binaries, and a near miss
-/// such as `--forc` gets that same suggestion. Declared, those guesses land here
-/// instead, before anything is planned or removed.
-fn reject_uninstall_force(force: bool) -> Result<()> {
-    if force {
-        bail!(
-            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation"
-        );
-    }
-    Ok(())
 }
 
 /// Build the command tree handed to `clap_complete` for shell completions.
