@@ -2736,8 +2736,17 @@ cargo xtask e2e -- -n 'examine-31 '
 
 No scenario drives the `rocm serve` / `rocm model` call sites through the gate.
 Those probes degrade to service-state-only GPU selection rather than failing,
-so there is no user-visible *output* for a scenario to assert on; what they do
-with a missing count is covered by `gpu_policy.rs`'s unit tests. The decline
+so there is no user-visible *output* for a scenario to assert on.
+
+Be precise about what does cover them, because the two halves have different
+guards. What the call sites do **with a missing count** is covered by
+`gpu_policy.rs`'s unit tests — `effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows`
+pins the `None` fall-through. That the call sites **route through the
+chokepoint at all** is *not* covered by any unit test: it is guarded by
+`xtask/src/amd_smi_launch_contract.rs`, a static text scan that fails the build
+when a file outside its allowlist calls `resolve_amd_smi_binary`. A rewrite that
+kept the count behaviour but spawned `amd-smi` directly would be caught by that
+scan and by nothing else. The decline
 itself is no longer discarded — `gpu_policy.rs`'s `amd_smi_probe_json` logs it
 at `info` with the full error chain, which is what makes "why did `--gpu auto`
 not rank my GPUs?" answerable without re-running. It is not `warn`, because on

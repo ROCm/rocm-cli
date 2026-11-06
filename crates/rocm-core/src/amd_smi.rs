@@ -200,9 +200,10 @@ fn preflight_kfd_device() -> PathBuf {
 /// `/sys/class/kfd` and AMD DRM cards under `/sys/class/drm` — both
 /// world-readable, neither needing the device node open — and
 /// `validate_pinned_gpu_index` prefers that set outright. What is lost is the
-/// secondary count `--gpu auto` ranks with, so on a *multi*-GPU host in that
-/// state auto-selection returns no selection and the engine's own device probe
-/// picks. `rocm diagnose` already names the host, as `fix-4-render-group`.
+/// `amd-smi` device count `--gpu auto` would rank with; `effective_gpu_count`
+/// (`apps/rocm/src/gpu_policy.rs`) falls through to the DRM sysfs VRAM rows, so
+/// auto-selection still ranks, over those rows alone rather than over nothing.
+/// `rocm diagnose` already names the host, as `fix-4-render-group`.
 ///
 /// # Platforms with no KFD
 ///

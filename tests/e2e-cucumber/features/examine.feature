@@ -498,7 +498,12 @@ Feature: GPU detection and system inspection
   # examine-24/25/26 unable to reach amd-smi on a GPU-less runner at all.
   # Linux-only, like its three siblings: the stub is a shell script, and the
   # gate is a wave-through on every other platform.
-  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux
+  # `@requires-bare-metal`, not just `@requires-os:linux`: WSL2 reports an
+  # os_family of `linux`, so the Linux tag matches there — but on a WSL host
+  # with a usable GPU `kfd_readable`'s wave-through short-circuits the device
+  # open entirely, and the decline this scenario asserts never happens. The
+  # premise is a host where the `/dev/kfd` open is what decides.
+  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux @requires-bare-metal
   Scenario: examine-31 - An unopenable KFD device stops amd-smi being launched at all
     Given the KFD device cannot be opened
     When the daemon gathers a bridge snapshot
