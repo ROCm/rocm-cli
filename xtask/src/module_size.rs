@@ -17,8 +17,9 @@
 //! library, binary, proc-macro or build-script target of a workspace package
 //! (the roots come from `cargo metadata`), except:
 //!
-//! * a file with a `tests`, `benches` or `examples` directory anywhere in its
-//!   path (this includes the end-to-end harness crate under `tests/`);
+//! * a file with a `tests`, `benches` or `examples` directory in its path above
+//!   the package's `src/` (this includes the end-to-end harness crate under
+//!   `tests/`); a module directory of that name inside `src/` is not excluded;
 //! * a file reached only through a `mod` declaration gated on a test-only cfg
 //!   (`#[cfg(test)] mod x;`, `#[cfg(all(test, unix))] mod x;`, with or without a
 //!   `#[path]`), or whose own first line is `#![cfg(test)]`. Proptest and
@@ -158,9 +159,18 @@ fn evaluate() -> Result<Outcome> {
         serde_json::from_slice(&stdout).context("failed to parse `cargo metadata` output")?;
     let packages: Vec<Package> = metadata.packages.iter().map(Package::from).collect();
     let files = collect(&metadata.workspace_root, &packages)?;
+    outcome_of(&files, MAX_PRODUCTION_LINES)
+}
+
+/// Checking no files at all means the walk is broken, not that the tree is
+/// clean, so it must not read as a pass.
+fn outcome_of(files: &[(String, usize)], limit: usize) -> Result<Outcome> {
+    if files.is_empty() {
+        bail!("found no source files to measure; the module walk is broken, not the tree");
+    }
     Ok(Outcome {
         checked: files.len(),
-        offenders: offenders(&files, MAX_PRODUCTION_LINES),
+        offenders: offenders(files, limit),
     })
 }
 
@@ -227,7 +237,8 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
     let mut walk = Walk {
         root: normalize(root),
         counted: Vec::new(),
-        reached: BTreeSet::new(),
+        seen_ungated: BTreeSet::new(),
+        seen_gated: BTreeSet::new(),
     };
     for package in packages {
         for target_root in &package.roots {
@@ -239,8 +250,9 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
     for package in packages {
         for file in rust_files_under(&package.src_dir)? {
             let file = normalize(&file);
-            if !walk.reached.contains(&file) && !is_excluded(&walk.relative(&file)) {
-                stray.push(walk.relative(&file));
+            let shown = walk.relative(&file)?;
+            if !walk.reached(&file) && !is_excluded(&shown) {
+                stray.push(shown);
             }
         }
     }
@@ -260,13 +272,30 @@ fn collect(root: &Path, packages: &[Package]) -> Result<Vec<(String, usize)>> {
 struct Walk {
     root: PathBuf,
     counted: Vec<(String, usize)>,
-    reached: BTreeSet<PathBuf>,
+    /// Files already visited as production code, and files already visited only
+    /// through a test-gated declaration. They are separate because a file declared
+    /// twice, once behind a test gate and once not, must still be counted.
+    seen_ungated: BTreeSet<PathBuf>,
+    seen_gated: BTreeSet<PathBuf>,
 }
 
 impl Walk {
-    fn relative(&self, file: &Path) -> String {
-        let relative = file.strip_prefix(&self.root).unwrap_or(file);
-        relative.to_string_lossy().replace('\\', "/")
+    /// `file` relative to the workspace root, with `/` separators. A file outside
+    /// the root is an error, never a path that is tested as it stands, because
+    /// the test-only directory rule reads these components.
+    fn relative(&self, file: &Path) -> Result<String> {
+        let relative = file.strip_prefix(&self.root).with_context(|| {
+            format!(
+                "{} is outside the workspace root {}",
+                file.display(),
+                self.root.display()
+            )
+        })?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn reached(&self, file: &Path) -> bool {
+        self.seen_ungated.contains(file) || self.seen_gated.contains(file)
     }
 
     /// Visit `file`: count it unless it is test-only, then follow its external
@@ -275,10 +304,14 @@ impl Walk {
     /// a directory named after it. Everything below a gated file is gated.
     fn visit(&mut self, file: &Path, mod_rs_like: bool, gated: bool) -> Result<()> {
         let file = normalize(file);
-        if !self.reached.insert(file.clone()) {
+        if gated {
+            if self.seen_ungated.contains(&file) || !self.seen_gated.insert(file.clone()) {
+                return Ok(());
+            }
+        } else if !self.seen_ungated.insert(file.clone()) {
             return Ok(());
         }
-        let shown = self.relative(&file);
+        let shown = self.relative(&file)?;
         let source =
             fs::read_to_string(&file).with_context(|| format!("failed to read {shown}"))?;
         let analysis = analyze(&source).with_context(|| format!("failed to parse {shown}"))?;
@@ -301,10 +334,13 @@ impl Walk {
     }
 }
 
-/// Whether a root-relative `/` path is under a test-only directory.
+/// Whether a root-relative `/` path is under a test-only directory. Only the
+/// directories above a package's `src/` count: a module directory inside `src/`
+/// that happens to be called `examples` is production code unless it is gated.
 fn is_excluded(relative: &str) -> bool {
     relative
         .split('/')
+        .take_while(|component| *component != "src")
         .any(|component| EXCLUDED_DIRS.contains(&component))
 }
 
@@ -924,6 +960,122 @@ trait T {
             roots: vec![dir.path().join("tests/harness/src/lib.rs")],
         }];
         assert!(collect(dir.path(), &packages).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_path_attribute_inside_an_inline_module_resolves_against_the_module_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "mod a {\n    #[path = \"x.rs\"]\n    mod y;\n}\n",
+        );
+        write(dir.path(), "src/a/x.rs", "fn x() {}\n");
+        let names: Vec<String> = counted(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(names, ["src/a/x.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn children_of_a_file_loaded_by_path_sit_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "#[path = \"other/imp.rs\"]\nmod imp;\n",
+        );
+        write(dir.path(), "src/other/imp.rs", "mod below;\n");
+        write(dir.path(), "src/other/below.rs", "fn b() {}\n");
+        let names: Vec<String> = counted(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            names,
+            ["src/lib.rs", "src/other/below.rs", "src/other/imp.rs"]
+        );
+    }
+
+    #[test]
+    fn a_file_declared_both_behind_a_test_gate_and_not_is_counted_in_either_order() {
+        for lib in [
+            "#[cfg(test)]\n#[path = \"foo.rs\"]\nmod foo_t;\nmod foo;\n",
+            "mod foo;\n#[cfg(test)]\n#[path = \"foo.rs\"]\nmod foo_t;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "src/lib.rs", lib);
+            write(dir.path(), "src/foo.rs", &filler(2000));
+            let files = counted(dir.path()).unwrap();
+            assert!(
+                files.contains(&("src/foo.rs".to_string(), 2000)),
+                "{lib:?}: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_directory_named_like_a_test_directory_inside_src_is_still_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs", "mod examples;\n");
+        write(dir.path(), "src/examples/mod.rs", &filler(1600));
+        let files = counted(dir.path()).unwrap();
+        assert!(
+            files.contains(&("src/examples/mod.rs".to_string(), 1600)),
+            "{files:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_workspace_root_is_an_error_not_a_path_to_test_as_it_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs", "fn a() {}\n");
+        let elsewhere = dir.path().join("elsewhere");
+        let error = collect(&elsewhere, &lib_package(dir.path())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside the workspace root"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn measuring_no_files_is_an_error_not_a_pass() {
+        assert!(outcome_of(&[], MAX_PRODUCTION_LINES).is_err());
+        assert!(outcome_of(&[("a.rs".to_string(), 1)], MAX_PRODUCTION_LINES).is_ok());
+    }
+
+    #[test]
+    fn only_library_binary_proc_macro_and_build_script_targets_start_a_module_tree() {
+        let target = |kind: &str, path: &str| MetaTarget {
+            kind: vec![kind.to_string()],
+            src_path: PathBuf::from(path),
+        };
+        let package = MetaPackage {
+            manifest_path: PathBuf::from("/ws/pkg/Cargo.toml"),
+            targets: vec![
+                target("lib", "/ws/pkg/src/lib.rs"),
+                target("bin", "/ws/pkg/src/main.rs"),
+                target("proc-macro", "/ws/pkg/src/derive.rs"),
+                target("custom-build", "/ws/pkg/build.rs"),
+                target("test", "/ws/pkg/tests/it.rs"),
+                target("bench", "/ws/pkg/benches/b.rs"),
+                target("example", "/ws/pkg/examples/e.rs"),
+            ],
+        };
+        let package = Package::from(&package);
+        assert_eq!(package.src_dir, PathBuf::from("/ws/pkg/src"));
+        assert_eq!(
+            package.roots,
+            [
+                PathBuf::from("/ws/pkg/src/lib.rs"),
+                PathBuf::from("/ws/pkg/src/main.rs"),
+                PathBuf::from("/ws/pkg/src/derive.rs"),
+                PathBuf::from("/ws/pkg/build.rs"),
+            ]
+        );
     }
 
     #[test]

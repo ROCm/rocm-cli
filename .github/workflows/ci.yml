@@ -1441,7 +1441,7 @@ jobs:
             cat "$report"
           else
             cat "$report"
-            echo "::warning title=Module size (advisory)::$(tr '\n' ' ' < "$report")"
+            echo "::warning title=Module size (advisory)::$(sed 's/%/%25/g' "$report" | tr '\n' ' ')"
             {
               echo '### Source files over the module-size limit (advisory)'
               echo
