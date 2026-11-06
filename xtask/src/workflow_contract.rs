@@ -1320,10 +1320,21 @@ jobs:
         );
         assert_eq!(run, expected_run, "{context}: wrong `run=`");
         match notice_for {
-            Some(result) => assert!(
-                stdout.contains("::notice") && stdout.contains(&format!("result: {result}")),
-                "{context}: must print a notice naming clippy's result, got {stdout:?}"
-            ),
+            Some(result) => {
+                assert!(
+                    stdout.contains("::notice") && stdout.contains(&format!("result: {result}")),
+                    "{context}: must print a notice naming clippy's result, got {stdout:?}"
+                );
+                // The notice is printed for every non-success result, including
+                // `cancelled`, where nothing is red and nothing is blocked. So it
+                // may tell the reader what to re-run but must not claim the merge
+                // is blocked; `run=false` above is what makes "no scenario ran" true.
+                assert!(
+                    stdout.contains("re-run clippy") && !stdout.contains("blocks the merge"),
+                    "{context}: the notice must say to re-run clippy and must not assert a \
+                     merge block that a `cancelled` clippy does not cause, got {stdout:?}"
+                );
+            }
             None => assert!(
                 !stdout.contains("::notice"),
                 "{context}: must not print the clippy skip notice, got {stdout:?}"
@@ -1373,7 +1384,9 @@ jobs:
     /// `::notice::` the gate prints is what keeps that from being silent. The
     /// notice's claim that no scenario ran is the `run=false` asserted next to
     /// it, and `ci_e2e_steps_after_the_gate_follow_its_decision` is what makes
-    /// every later step honour that decision.
+    /// every later step honour that decision. A `cancelled` clippy reaches the
+    /// same branch with nothing red, so the notice must hold for it too: it says
+    /// to re-run, and does not say the merge is blocked.
     #[cfg(unix)]
     #[test]
     fn e2e_gate_skips_scenarios_unless_clippy_passed() {

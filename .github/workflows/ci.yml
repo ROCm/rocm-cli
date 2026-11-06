@@ -1858,8 +1858,10 @@ jobs:
       # first), so anything but `success` here is red or cancelled. The skip
       # makes this required check report green without having run a scenario,
       # the same shape as the build-and-test case above, which is harmless only
-      # while `clippy` is itself required; the notice says so on the run page
-      # rather than leaving a silent pass.
+      # while `clippy` is itself required. The notice says on the run page that no
+      # scenario ran and what to re-run, rather than leaving a silent pass. It does
+      # not say the merge is blocked: a `cancelled` clippy is not red, so only a
+      # `failure` blocks anything, and the notice has to be true for both.
       - name: Decide whether to run
         id: gate
         run: |
@@ -1868,7 +1870,7 @@ jobs:
           elif [ "${{ needs.changes.outputs.heavy }}" = "true" ] \
             && [ "${{ needs.clippy.result }}" != "success" ]; then
             # Deliberately stricter than pr-linux-binaries' `success || skipped`: clippy is skipped only on a dispatch, which the first branch already handled.
-            echo "::notice title=E2E scenarios not run::clippy did not pass (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. The required clippy check blocks the merge."
+            echo "::notice title=E2E scenarios not run::clippy did not succeed (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. Fix or re-run clippy, then re-run this job to run the scenarios."
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif { [ "${{ needs.build-and-test.result }}" = "success" ] \
               || [ "${{ needs.build-and-test.result }}" = "failure" ]; } \
