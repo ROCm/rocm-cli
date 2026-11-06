@@ -31,6 +31,8 @@ mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
 mod rocm_releases;
+#[cfg(test)]
+mod rust_source;
 mod signing;
 mod tpn;
 mod verify_commits;
