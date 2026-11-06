@@ -222,9 +222,10 @@ pub use service_record::{
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
-    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, find_uv_binary,
+    split_local_version, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
+    uv_pip_check_args, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject,
+    violations_requiring,
 };
 pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
