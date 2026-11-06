@@ -1105,6 +1105,16 @@ rocm logs --service <service-id>
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
 
+The `service_logs` tool (what the assistant and MCP clients call to read a
+server's log) answers through `rocm_core::service_log_tool_summary`, so an empty
+log (`has no log output yet`) and a log whose newest line is longer than the
+4 MiB a log view reads (`none is shown: the newest line is longer than ...`, with
+`newest_line_exceeds_read_bound` set in the structured reply) are not both
+reported as zero lines read. The CLI's copy of the tool is run by scenarios
+`logs-09` and `logs-10` through `rocm mcp-call service_logs`; the daemon's copy
+is covered by `cargo test -p rocmd --lib service_logs`, because the harness
+drives only the `rocm` binary.
+
 TUI log pagination focused tests:
 
 ```bash

@@ -137,6 +137,20 @@ async fn read_server_log(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("a tool-using client reads that server's log through the service_logs tool")]
+async fn read_server_log_through_the_tool(world: &mut E2eWorld) {
+    // The tool is read-only, so no `--allow-mutation`. The exit code is checked
+    // by the `Then` steps that parse the reply.
+    let arguments =
+        serde_json::json!({ "service_id": crate::e2e::service_cleanup_steps::SERVICE_ID })
+            .to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["mcp-call", "service_logs", "--arguments-json", &arguments],
+    );
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user reads the ComfyUI logs")]
 async fn read_comfyui_logs(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "logs"]);
@@ -239,6 +253,60 @@ async fn says_no_output_yet(world: &mut E2eWorld) {
     let out = ok_output(world);
     assert!(out.contains("Recent output: no output yet"), "{out}");
     assert!(!out.contains("longer than"), "{out}");
+    let on_disk = std::fs::read(server_log_path(world)).expect("the server log is still there");
+    assert!(on_disk.is_empty(), "the log on disk should be empty");
+}
+
+/// The reply `rocm mcp-call service_logs` printed, parsed. Asserts the call
+/// succeeded and reported no error first, so a failure reads as the CLI's own.
+fn service_logs_tool_reply(world: &E2eWorld) -> serde_json::Value {
+    let out = ok_output(world);
+    let reply: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|error| panic!("rocm mcp-call did not print JSON ({error}):\n{out}"));
+    assert_eq!(
+        reply["isError"],
+        serde_json::json!(false),
+        "the tool reported an error:\n{out}"
+    );
+    reply
+}
+
+#[then(
+    "the tool says the newest line is too long to show and flags it instead of returning an empty tail unexplained"
+)]
+async fn tool_says_the_line_is_too_long(world: &mut E2eWorld) {
+    let reply = service_logs_tool_reply(world);
+    let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("none is shown: the newest line is longer than the 4 MiB a log view reads"),
+        "expected the too-long notice, got:\n{reply}"
+    );
+    assert!(
+        !text.contains("no log output yet") && !text.contains("Read the last"),
+        "a log with content must not be described as empty or as read:\n{reply}"
+    );
+    let content = &reply["structuredContent"];
+    assert_eq!(content["tail"], "", "{reply}");
+    assert_eq!(content["newest_line_exceeds_read_bound"], true, "{reply}");
+    // The claim and the state it describes: the log on disk holds exactly one
+    // line, longer than the bound the notice names.
+    let on_disk = std::fs::read(server_log_path(world)).expect("the server log is still there");
+    assert!(
+        on_disk.len() > LOG_VIEW_BOUND_BYTES && !on_disk.contains(&b'\n'),
+        "the log on disk should be one line past the bound, is {} bytes",
+        on_disk.len()
+    );
+}
+
+#[then("the tool says the server has no log output yet and does not flag an over-long line")]
+async fn tool_says_no_output_yet(world: &mut E2eWorld) {
+    let reply = service_logs_tool_reply(world);
+    let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("has no log output yet"), "{reply}");
+    assert!(!text.contains("longer than"), "{reply}");
+    let content = &reply["structuredContent"];
+    assert_eq!(content["tail"], "", "{reply}");
+    assert_eq!(content["newest_line_exceeds_read_bound"], false, "{reply}");
     let on_disk = std::fs::read(server_log_path(world)).expect("the server log is still there");
     assert!(on_disk.is_empty(), "the log on disk should be empty");
 }
