@@ -150,14 +150,14 @@ pub fn build_messages(turns: &[ChatTurn]) -> Vec<rig::completion::Message> {
         .collect()
 }
 
-/// Append a "via: tool, tool" annotation so the operator can see which Skills
+/// Append a "via: tool, tool" annotation so the operator can see which tools
 /// fired. Deduplicates, preserving first-seen order. Pure.
-pub fn annotate_reply(reply: String, skills: &[String]) -> String {
-    if skills.is_empty() {
+pub fn annotate_reply(reply: String, fired: &[String]) -> String {
+    if fired.is_empty() {
         return reply;
     }
     let mut seen: Vec<String> = Vec::new();
-    for s in skills {
+    for s in fired {
         if !seen.contains(s) {
             seen.push(s.clone());
         }
@@ -166,7 +166,7 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 }
 
 /// Drive a built rig prompt request to completion under the shared
-/// [`REQUEST_TIMEOUT`], then annotate the reply with the Skills that fired.
+/// [`REQUEST_TIMEOUT`], then annotate the reply with the tools that fired.
 ///
 /// The shared `complete()` tail, called from [`run_agent_request`] — the one
 /// call site all three backends (RigAgentClient, ChatGptAgentClient,
@@ -174,7 +174,7 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 /// typestate), so this is generic over `IntoFuture<Output = Result<String, E>>`
 /// with a `Display` error. A timeout maps to [`AgentError::Timeout`]; a backend
 /// error maps to [`AgentError::Request`]; success is annotated with the fired
-/// Skills. ONE definition of the tail.
+/// tools. ONE definition of the tail.
 ///
 /// `backend` tags the lifecycle trace events (request-start / completion /
 /// error / timeout) so a hung or failing chat is traceable to a specific
@@ -214,20 +214,20 @@ where
         }
         Ok(Ok(reply)) => reply,
     };
-    let skills = fired.lock().map(|g| g.clone()).unwrap_or_default();
+    let fired_tools = fired.lock().map(|g| g.clone()).unwrap_or_default();
     info!(
         backend,
         elapsed_ms = started.elapsed().as_millis() as u64,
         reply_len = reply.len(),
-        skills_fired = skills.len(),
+        skills_fired = fired_tools.len(),
         "chat request complete"
     );
-    Ok(annotate_reply(reply, &skills))
+    Ok(annotate_reply(reply, &fired_tools))
 }
 
 /// Drive one `complete()` call from a preamble'd `AgentBuilder` through to a
 /// reply string: apply the sampling knobs, register the SAME three tool sets
-/// (telemetry/skill, ROCm read, ROCm mutating) in the SAME order, build the
+/// (telemetry, ROCm read, ROCm mutating) in the SAME order, build the
 /// prompt request with the shared history/turn-limit, and hand off to
 /// [`finish_agent_request`].
 ///
@@ -263,7 +263,7 @@ where
     let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
     let agent = apply_inference_params(agent, params);
-    // Telemetry + skill registry tools (shared registration site).
+    // Telemetry tools (shared registration site).
     let agent = register_telemetry_tools(agent, &snap, &fired);
     // Read-only ROCm machine-inspection tools (forward across the seam).
     let agent = register_rocm_read_tools(agent, executor, &fired);
@@ -715,7 +715,7 @@ where
 
         // Tool registration is delegated to run_agent_request, the single
         // shared site all three backends (RigAgentClient, ChatGptAgentClient,
-        // AnthropicAgentClient) now call: the SAME telemetry/skill tools +
+        // AnthropicAgentClient) now call: the SAME telemetry tools +
         // every ROCm read + mutating tool, so capability and approval
         // behavior are uniform across backends.
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
@@ -745,7 +745,7 @@ struct MockApprovalTrigger {
 }
 
 /// Deterministic in-memory client for tests and the offline demo. Never touches
-/// the network. Can emit a canned tool-calling-style answer (cites a Skill).
+/// the network. Can emit a canned tool-calling-style answer (cites a tool).
 pub struct MockAgentClient {
     reply: String,
     fail: bool,
@@ -849,7 +849,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::agent::{
-        ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, SKILL_NAMES, fixture_snapshot,
+        ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, TELEMETRY_TOOL_NAMES, fixture_snapshot,
     };
 
     /// A throwaway, never-pre-existing directory for
@@ -956,16 +956,16 @@ mod tests {
     }
 
     #[test]
-    fn annotate_reply_appends_deduped_skills() {
+    fn annotate_reply_appends_deduped_tools() {
         let r = annotate_reply("hi".into(), &["gpu_status".into(), "gpu_status".into()]);
         assert!(r.contains("hi"));
         assert!(r.contains("via: gpu_status"));
-        // No skills → unchanged.
+        // No fired tools → unchanged.
         assert_eq!(annotate_reply("hi".into(), &[]), "hi");
     }
 
     #[tokio::test]
-    async fn mock_tool_calling_answer_cites_skill() {
+    async fn mock_tool_calling_answer_cites_tool() {
         // The offline "what's GPU-2 doing?" demo path — no live LLM.
         let agent =
             MockAgentClient::with_tool_call("GPU-2 is at 87% util, 71°C, 250 W.", "gpu_status");
@@ -977,7 +977,7 @@ mod tests {
         assert!(reply.contains("87% util"));
         assert!(
             reply.contains("gpu_status"),
-            "reply cites the Skill that fired"
+            "reply cites the tool that fired"
         );
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
     #[test]
     fn all_backends_register_same_rocm_tools() {
         // Contract: every backend's complete() registers the SAME three tool
-        // sets — telemetry/skill (register_telemetry_tools), read ROCm
+        // sets — telemetry (register_telemetry_tools), read ROCm
         // (register_rocm_read_tools), and mutating ROCm
         // (register_rocm_mutating_tools) — so capability + approval parity holds
         // across local/openai/anthropic. This enumerates the canonical sets that
@@ -1703,13 +1703,17 @@ mod tests {
         // `run_agent_request_registers_tool_sets_and_enforces_turn_limit` below
         // asserts those tools are actually sent on the wire from that one site.
         //
-        // Telemetry/skill set: register_telemetry_tools registers exactly the
-        // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
-        // TokensPerWatt, ListSkills, SkillPlan). Pinning the size here means the
-        // telemetry registration can't silently diverge from the canonical set.
-        assert_eq!(SKILL_NAMES.len(), 6, "canonical telemetry/skill set size");
-        for n in SKILL_NAMES {
-            assert!(!n.is_empty(), "empty telemetry/skill tool name");
+        // Telemetry set: register_telemetry_tools registers exactly the
+        // tools in TELEMETRY_TOOL_NAMES (GpuStatus, ListInstances, BenchSummary,
+        // TokensPerWatt). Pinning the size here means the telemetry
+        // registration can't silently diverge from the canonical set.
+        assert_eq!(
+            TELEMETRY_TOOL_NAMES.len(),
+            4,
+            "canonical telemetry set size"
+        );
+        for n in TELEMETRY_TOOL_NAMES {
+            assert!(!n.is_empty(), "empty telemetry tool name");
             // Telemetry tools are disjoint from both ROCm sets.
             assert!(
                 !ROCM_READ_TOOL_NAMES.contains(&n),
@@ -1803,16 +1807,20 @@ mod tests {
             .iter()
             .map(|t| t.name.as_str())
             .collect();
-        for expected in SKILL_NAMES
+        // Exactly the canonical registry reaches the model: nothing registered
+        // outside the three name tables (the retired `list_skills` and
+        // `skill_plan` included), and nothing in them left unregistered. A new
+        // tool is added to its table in the same change, which keeps this true.
+        let expected_tool_names: std::collections::BTreeSet<&str> = TELEMETRY_TOOL_NAMES
             .iter()
             .chain(ROCM_READ_TOOL_NAMES.iter())
             .chain(ROCM_MUTATING_TOOL_NAMES.iter())
-        {
-            assert!(
-                sent_tool_names.contains(expected),
-                "registered tool {expected} missing from the wire request"
-            );
-        }
+            .copied()
+            .collect();
+        assert_eq!(
+            sent_tool_names, expected_tool_names,
+            "the tool names sent on the wire must equal the canonical registry"
+        );
 
         // Sanity bound on the request count: enough to have tried every
         // scripted turn up to the limit, not an early bail-out or a runaway
@@ -1880,7 +1888,7 @@ mod tests {
 
         assert!(
             reply.contains("⚙ via: gpu_status"),
-            "reply should carry the fired-skill annotation: {reply}"
+            "reply should carry the fired-tool annotation: {reply}"
         );
 
         let requests = recorded.requests();
@@ -1917,7 +1925,7 @@ mod tests {
         ));
 
         // The snapshot `run_agent_request` hands to `register_telemetry_tools`
-        // reaches `gpu_status`'s own output, not just the fired-skill log: the
+        // reaches `gpu_status`'s own output, not just the fired-tool log: the
         // second request (after the tool call) must carry the tool result
         // derived from `fixture_snapshot()`'s GPUs, not an empty/default one.
         let second = requests

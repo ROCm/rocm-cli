@@ -769,9 +769,9 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // <id> --dry-run`. Assert the shape (present once per cause, ending in
     // the always-on auto/manual marker) rather than a specific fix-id's exact
     // flags: the top match is environment-dependent, and a shared vocabulary
-    // doesn't guarantee diagnose and the fix.rs catalog agree on the
-    // underlying values for a given fix-id -- unit tests in diagnose.rs call
-    // fix.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
+    // doesn't guarantee diagnose and the fix/catalog.rs catalog agree on the
+    // underlying values for a given fix-id -- unit tests in diagnose/linux.rs call
+    // fix/catalog.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
     let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
@@ -2238,7 +2238,7 @@ async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
     );
 }
 
-fn workspace_root() -> std::path::PathBuf {
+pub(crate) fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -2246,7 +2246,7 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-fn xtask_command() -> std::process::Command {
+pub(crate) fn xtask_command() -> std::process::Command {
     if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
         std::process::Command::new(binary)
     } else {

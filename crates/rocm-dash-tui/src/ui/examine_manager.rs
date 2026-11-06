@@ -1151,7 +1151,7 @@ mod tests {
     }
 
     /// The outcome sentences the CLI prints for a refusal, copied from
-    /// `show_prepared_report` in `apps/rocm/src/main.rs`.
+    /// `show_prepared_report` in `apps/rocm/src/diagnose_cmd.rs`.
     const REFUSAL_TEXTS: [&str; 3] = [
         "This machine holds hardware that is not on AMD's published ROCm \
          compatibility matrix, so no report was prepared. A report describes only \

@@ -53,11 +53,11 @@
 //!
 //! * **Clap `--help` text** comes from `///` doc comments, which are comments
 //!   and so are skipped here. `every_help_text_in_the_command_tree_is_ascii`
-//!   (`apps/rocm/src/main.rs`) walks the whole clap command tree and asserts
+//!   (`apps/rocm/src/cli.rs`) walks the whole clap command tree and asserts
 //!   the *rendered* help is ASCII, which also covers `#[arg(help = ...)]`.
 //! * **Text assembled at runtime** from non-literal sources.
 //!   `every_message_the_diagnose_catalog_can_emit_is_ascii`
-//!   (`crates/rocm-core/src/diagnose.rs`) walks the `CHECKERS` catalog and
+//!   (`crates/rocm-core/src/diagnose/catalog.rs`) walks the `CHECKERS` catalog and
 //!   asserts the rendered report and the `--json` payload are ASCII.
 //!
 //! Source scan and rendered-output walk catch different mistakes; keep both.
@@ -173,18 +173,13 @@ mod tests {
     /// covering.
     const EXEMPT_LITERALS: &[(&str, &str, &str)] = &[
         (
-            "apps/rocm/src/comfyui.rs",
+            "apps/rocm/src/comfyui/install.rs",
             "Resolving and installing packages with uv…",
             SPINNER_LABEL,
         ),
         (
-            "apps/rocm/src/comfyui.rs",
+            "apps/rocm/src/comfyui/install.rs",
             "Fetching ComfyUI source archive…",
-            SPINNER_LABEL,
-        ),
-        (
-            "apps/rocm/src/main.rs",
-            "Waiting for a launch already under way…",
             SPINNER_LABEL,
         ),
         (
@@ -195,6 +190,11 @@ mod tests {
         (
             "apps/rocm/src/serve_cmd.rs",
             "Running smoke test…",
+            SPINNER_LABEL,
+        ),
+        (
+            "apps/rocm/src/service_records.rs",
+            "Waiting for a launch already under way…",
             SPINNER_LABEL,
         ),
         ("apps/rocm/src/therock.rs", "Downloading {}…", SPINNER_LABEL),
@@ -967,10 +967,10 @@ mod tests {
     /// decided by the *including file's path*, not by whether the
     /// `include_str!` sits in a `#[cfg(test)]` block. So a production file
     /// that embeds a fixture from inside its own test module is still walked
-    /// -- `crates/rocm-dash-tui/src/skills.rs:451` does exactly that, from
-    /// inside the `#[cfg(test)] mod tests` beginning at `:415`, and passes
-    /// only because that fixture is pure ASCII. A fixture carrying a real
-    /// non-ASCII character would be a false positive here.
+    /// -- `apps/rocm/src/remote/doctor.rs` does exactly that, embedding
+    /// `tests/remote-ssh/examination.json` from inside its `#[cfg(test)] mod
+    /// tests`, and passes only because that fixture is pure ASCII. A fixture
+    /// carrying a real non-ASCII character would be a false positive here.
     ///
     /// That is deliberate, not an oversight. Scoping by call site would mean
     /// asking the hand-rolled test-span tracker in [`non_ascii_literals`]

@@ -11,6 +11,7 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod amd_smi_launch_contract;
 mod ascii_output_contract;
 mod catalog;
 mod coverage;
@@ -26,6 +27,7 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
 mod rocm_releases;
@@ -281,18 +283,53 @@ pub(crate) enum Command {
     /// Reads `.eml` files (one message each) and raw `.json` report bodies,
     /// and prints how many reports describe each problem, at every level of
     /// the group key, with refused and unreadable reports counted apart.
-    /// Sends and files nothing. Counts are reports, not people.
-    ReportRollup {
-        /// `.eml` or `.json` files, or directories holding them (read one
-        /// level deep).
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Print the rollup as JSON.
+    ///
+    /// Also prints the weekly trend, by the week each mail was sent in (only
+    /// the week is kept from its `Date`), and names any week in which a known
+    /// problem rose sharply against its recent average. The first and the
+    /// latest week of the export may be partial: the first is never part of a
+    /// baseline, and a rise in the latest is a lower bound. Sends and files
+    /// nothing. Counts are reports, not people.
+    ReportRollup(report_rollup::Args),
+    /// Compute a mechanical GO/NO-GO release-readiness verdict and status
+    /// table from the nightly build/E2E results and commits since the last
+    /// release tag, plus the categorized facts an LLM narrative step drafts
+    /// prose from (the verdict and table never depend on that step).
+    ReleaseReadiness {
+        /// Baseline tag for `git log <tag>..HEAD` (e.g. the last published
+        /// release tag, resolved by the caller via `git describe --tags
+        /// --abbrev=0 --match 'v*' --exclude 'v*-*'`).
         #[arg(long)]
-        json: bool,
-        /// Also list each message skipped as not a report, by file and subject.
+        since_tag: String,
+        /// Path to the consolidated E2E `support-matrix.md` produced by
+        /// `cargo xtask e2e-report` (reused as-is, not regenerated).
         #[arg(long)]
-        verbose: bool,
+        e2e_report: PathBuf,
+        /// The calling workflow's own nightly Linux build job result
+        /// (`needs.nightly.result`).
+        #[arg(long)]
+        nightly_result: String,
+        /// The calling workflow's own nightly Windows build job result
+        /// (`needs.windows-nightly.result`).
+        #[arg(long)]
+        windows_result: String,
+        /// The calling workflow's `e2e-report-nightly` job result (`needs.e2e-report-nightly.result`).
+        /// That job already fails if any E2E lane that ran didn't upload its
+        /// `report.json` (preflight failure, timeout, runner loss), which would
+        /// otherwise just vanish from the consolidated E2E report's totals,
+        /// reading as zero failures. Gating on this job's result (rather than
+        /// each lane job's own `continue-on-error`-masked result, which is
+        /// always `success`) covers every lane, present and future, for free.
+        /// Caveat: a re-run can pass on an earlier attempt's artifact, so this
+        /// can miss a lane.
+        #[arg(long)]
+        e2e_report_job_result: String,
+        /// Path to write the structured facts JSON (input to the narrative step).
+        #[arg(long)]
+        out: PathBuf,
+        /// Path to write the mechanical verdict + status table markdown.
+        #[arg(long)]
+        table_out: PathBuf,
     },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
@@ -384,11 +421,24 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
-        Command::ReportRollup {
-            paths,
-            json,
-            verbose,
-        } => report_rollup::run(&paths, json, verbose)?,
+        Command::ReportRollup(args) => report_rollup::run(&args)?,
+        Command::ReleaseReadiness {
+            since_tag,
+            e2e_report,
+            nightly_result,
+            windows_result,
+            e2e_report_job_result,
+            out,
+            table_out,
+        } => release_readiness::run(
+            &since_tag,
+            &e2e_report,
+            &nightly_result,
+            &windows_result,
+            &e2e_report_job_result,
+            &out,
+            &table_out,
+        )?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

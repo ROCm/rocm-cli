@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Property tests for the local provider's SSE transport readers.
+//! Property tests for the local provider's SSE transport readers, declared
+//! from `local_http.rs` so they sit with the readers they test.
 //!
 //! Each property re-frames one of the SSE bodies the unit tests in
 //! `providers.rs` already use (plus the same shape with CRLF line endings and
@@ -10,11 +11,12 @@
 //! interrupts its reads. None of them generates SSE text from scratch.
 
 use super::*;
+use crate::test_support::{proptest_cases, split_at_offsets};
 use proptest::prelude::*;
 use std::io::{BufReader, Cursor, ErrorKind, Read};
 
 const OPENAI_FIXTURES: &[&str] = &[
-    // providers.rs `parses_openai_sse_chat_events`.
+    // providers/wire.rs `parses_openai_sse_chat_events`.
     "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n",
     // Same body, CRLF line endings.
     "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",
@@ -45,21 +47,6 @@ fn events_for_whole_body(body: &[u8]) -> Vec<ProviderStreamEvent> {
         Ok(())
     })
     .expect("fixture stream finishes")
-}
-
-/// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
-fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
-    let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    for cut in cuts {
-        pieces.push(&bytes[start..cut]);
-        start = cut;
-    }
-    pieces.push(&bytes[start..]);
-    pieces
 }
 
 /// Encode `body` with HTTP/1.1 chunked transfer coding, cutting chunks at
@@ -185,7 +172,7 @@ fn close_delimited_events<R: Read>(reader: &mut R) -> Result<Vec<ProviderStreamE
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(256)))]
 
     /// Chunked transfer coding is transparent: any chunk layout yields the same
     /// events as the plain body.

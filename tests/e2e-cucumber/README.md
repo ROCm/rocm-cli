@@ -145,6 +145,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
+| `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM refusal scenarios serve-33/34/35. |
@@ -311,7 +312,7 @@ sentence fails the scenario. `skill_reference.rs` reads the print-only count.
 
 Two rules follow:
 
-- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+- The catalog is authoritative in [fix/catalog.rs](../../crates/rocm-core/src/fix/catalog.rs). When one of
   these scenarios fails, the CLI is right and the docs are what change.
 - A skill-only edit must still run this job, so `skills/**` is in the `heavy`
   paths filter that gates the `e2e` job.
@@ -324,6 +325,7 @@ on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
 assertion either way would encode one runner's state.
 
 Claims about *whether* a cause was established therefore live in
-`crates/rocm-core/src/diagnose.rs`, where the `Examination` is constructed rather
-than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+[diagnose.rs](../../crates/rocm-core/src/diagnose.rs) and the modules it
+declares, such as [catalog.rs](../../crates/rocm-core/src/diagnose/catalog.rs),
+where the `Examination` is constructed rather than probed. What this feature asserts holds on any host, so it is clean on WSL2,
 the no-GPU lane, and the GPU lanes alike.

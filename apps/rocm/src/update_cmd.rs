@@ -2,22 +2,24 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm update`'s own rendering and activation logic: the read-only status
-//! report (`render_update_text`, `append_update_surfaces`), the predicate
-//! deciding whether `update` should route into the mutating path instead of
-//! that report (`update_should_preview_or_apply`), applying a runtime update
+//! `rocm update`'s own handler (`update`) and its rendering and activation
+//! logic: the read-only status report (`render_update_text`,
+//! `append_update_surfaces`), the predicate deciding whether `update` should
+//! route into the mutating path instead of that report
+//! (`update_should_preview_or_apply`), applying a runtime update
 //! (`apply_runtime_update`, `append_update_activate_summary`), and the
 //! update-source/installed-runtime pickers behind it
 //! (`select_runtime_update_source`, `select_installed_update_runtime`).
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
 //! (ROCMAI-210) of the `main.rs` modularization (see `docs/architecture.md`).
-//! `dispatch()` calls directly into this module at three points in the
-//! `update` command arm — `update_should_preview_or_apply(apply, dry_run)`,
-//! `apply_runtime_update(...)`, and `render_update_text(&paths)` — all
-//! re-imported via `use crate::update_cmd::{...};`; `dispatch()`'s own body
-//! is otherwise unaffected. `chat.rs`'s deterministic `rocm update` tool
-//! summary also calls `render_update_text` the same way, outside `dispatch()`.
+//! The `update` command arm of `dispatch()` calls `update`, the handler whose
+//! body was that arm's own and which was relocated here verbatim, re-imported
+//! via `use crate::update_cmd::update;`; `update` in turn calls
+//! `update_should_preview_or_apply(apply, dry_run)`,
+//! `apply_runtime_update(...)`, and `render_update_text(&paths)`. `chat.rs`'s
+//! deterministic `rocm update` tool summary also calls `render_update_text`,
+//! outside `dispatch()`.
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const ROLLBACK_RECOVERY_HINT` sits between
@@ -28,9 +30,11 @@
 //! `use crate::{...}` — so it stays a shared crate-root constant, reached
 //! from here the same way via `use crate::ROLLBACK_RECOVERY_HINT;`.
 //!
-//! `render_update_text`, `apply_runtime_update`, and
-//! `update_should_preview_or_apply` are `pub(crate)` for `dispatch()`'s own
-//! calls above. `select_runtime_update_source` is also `pub(crate)`: it is
+//! `update` is `pub(crate)` for `dispatch()` and `render_update_text` for
+//! `chat.rs`; `apply_runtime_update` and `update_should_preview_or_apply` keep
+//! the `pub(crate)` they had when `dispatch()` called them directly, though
+//! only `update` calls them now. `select_runtime_update_source` is also
+//! `pub(crate)`: it is
 //! reached from `therock_version_proptests.rs`'s property tests via
 //! `crate::update_cmd::select_runtime_update_source`. `append_update_surfaces`,
 //! `append_update_activate_summary`, and `select_installed_update_runtime`
@@ -47,12 +51,129 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ModelRecipeRegistrySource, RocmCliConfig, load_model_recipe_registry};
 
+use crate::cli_audit::record_cli_audit_event;
 use crate::runtimes_cmd::{
     RuntimeActivationResult, activate_runtime, current_runtime_manifest, select_runtime_manifest,
 };
 use crate::{
     ROLLBACK_RECOVERY_HINT, engine_inventory, runtime_services, sanitize_log_value, therock,
 };
+
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn update(
+    apply: bool,
+    runtime: Option<String>,
+    activate: bool,
+    dry_run: bool,
+    json: bool,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    if !apply && !dry_run && (runtime.is_some() || activate) {
+        bail!(
+            "--runtime and --activate require --apply or --dry-run; \
+             run `rocm update --dry-run` to preview or add --apply to update"
+        );
+    }
+    if update_should_preview_or_apply(apply, dry_run) {
+        let mut config = RocmCliConfig::load(&paths)?;
+        match apply_runtime_update(&paths, &mut config, runtime.as_deref(), activate, dry_run) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "runtime",
+                    if dry_run {
+                        "runtime_update_dry_run"
+                    } else {
+                        "runtime_update_apply"
+                    },
+                    "info",
+                    format!(
+                        "runtime update completed runtime={} activate={} dry_run={}",
+                        runtime.as_deref().unwrap_or("<selected>"),
+                        activate,
+                        dry_run
+                    ),
+                    None,
+                );
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "runtime",
+                    if dry_run {
+                        "runtime_update_dry_run"
+                    } else {
+                        "runtime_update_apply"
+                    },
+                    "error",
+                    format!(
+                        "runtime update failed runtime={} activate={} dry_run={}: {error}",
+                        runtime.as_deref().unwrap_or("<selected>"),
+                        activate,
+                        dry_run
+                    ),
+                    None,
+                );
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+    if json {
+        match therock::render_update_json(&paths, timeout_secs) {
+            Ok(document) => {
+                println!("{}", serde_json::to_string(&document)?);
+                record_cli_audit_event(
+                    &paths,
+                    "update",
+                    "update_check",
+                    "info",
+                    "rendered update report (json)",
+                    None,
+                );
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "update",
+                    "update_check",
+                    "error",
+                    format!("update report failed: {error}"),
+                    None,
+                );
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+    match render_update_text(&paths) {
+        Ok(text) => {
+            print!("{text}");
+            record_cli_audit_event(
+                &paths,
+                "update",
+                "update_check",
+                "info",
+                "rendered update report",
+                None,
+            );
+        }
+        Err(error) => {
+            record_cli_audit_event(
+                &paths,
+                "update",
+                "update_check",
+                "error",
+                format!("update report failed: {error}"),
+                None,
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn render_update_text(paths: &AppPaths) -> Result<String> {
     let mut output = therock::render_update_report(paths)?;

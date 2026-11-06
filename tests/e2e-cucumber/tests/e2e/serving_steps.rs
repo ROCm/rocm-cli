@@ -15,6 +15,7 @@ use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
+use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
 /// Model id of the live managed service the reuse scenarios plant.
 ///
@@ -45,6 +46,10 @@ const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
 /// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
 /// repeating the literal.
 const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
+/// Model id for the OOM-launch scenario, kept distinct from every other e2e
+/// serve model so its service records can never collide with another
+/// scenario's.
+const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -173,14 +178,21 @@ fn serve_failure_evidence(
 /// dropped before the panic, which is why #260 could not be root-caused from a
 /// CI artifact. A non-zero exit is reported the same way rather than through
 /// `run_rocm_ok`, since the engine log explains those launches too.
-async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_substr: &str) {
+///
+/// Returns the serve command's stdout, for a scenario that checks what it printed.
+async fn serve_and_wait(
+    world: &mut E2eWorld,
+    args: &[&str],
+    model: &str,
+    ready_substr: &str,
+) -> String {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
     let (stdout, stderr, rc) = crate::run_rocm(world, args);
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
-        return;
+        return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
     let headline = if rc == 0 {
@@ -643,6 +655,62 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     .await;
 }
 
+/// ROCMAI-827: serve the same small GGUF model as `setup_lemonade_model`, from
+/// the scenario's fresh config (every automation watcher off), keeping what the
+/// serve printed so the Then can check it against the helper's runtime state.
+#[when("the user serves a GGUF model on lemonade with no automation enabled")]
+async fn serve_lemonade_without_automations(world: &mut E2eWorld) {
+    let stdout = serve_and_wait(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+        "Qwen3-0.6B-GGUF",
+        "Qwen3-0.6B",
+    )
+    .await;
+    world.cli_output = Some(stdout);
+}
+
+#[then("serving started no background helper")]
+async fn serving_started_no_background_helper(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        !out.contains("background automation daemon"),
+        "with no watcher enabled, serve must not start (or try to start) the helper, got:
+{out}"
+    );
+    // The printed line is checked together with the state: the helper never
+    // published a runtime state, and its status reports it not running.
+    // A helper spawned a moment ago may not have published its runtime state
+    // yet, so the state alone can pass vacuously. The spawn records its
+    // autostart claim synchronously, before the CLI returns, so a claim file is
+    // proof a helper was started.
+    let claim = world.app_paths().automation_autostart_claim_path();
+    assert!(
+        !claim.exists(),
+        "serve spawned a background helper (autostart claim {} exists: {:?})",
+        claim.display(),
+        std::fs::read_to_string(&claim)
+    );
+    let state = rocm_core::AutomationRuntimeState::load(&world.app_paths())
+        .expect("failed to read the helper's runtime state");
+    assert!(
+        state.as_ref().is_none_or(|state| !state.running),
+        "serve left a background helper recorded running: {state:?}"
+    );
+    let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+    assert!(
+        status.contains("Status: not running"),
+        "expected `rocm daemon --status` to report no helper, got:
+{status}"
+    );
+}
+
 #[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]
 async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     // Forces the `owner/repo:variant` direct-serve path (`serve_hf_checkpoint`,
@@ -830,18 +898,32 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
-    world.cli_output = Some(stdout);
+    let engine = "vllm";
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+    // stderr and the exit code ride along so a run that stopped on a refusal reads
+    // as one in the Then step, instead of as "the name was not expanded".
+    world.serve_runs = Some(vec![ServeRun {
+        engine: engine.to_owned(),
+        stdout,
+        stderr,
+        rc,
+    }]);
 }
 
 #[when("the user serves the same short name with different engines")]
 async fn user_serves_multiple_engines(world: &mut E2eWorld) {
-    let mut outputs = Vec::new();
+    let mut runs = Vec::new();
     for engine in ["lemonade", "vllm"] {
-        let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
-        outputs.push(stdout);
+        let (stdout, stderr, rc) =
+            crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+        runs.push(ServeRun {
+            engine: engine.to_owned(),
+            stdout,
+            stderr,
+            rc,
+        });
     }
-    world.cli_outputs = Some(outputs);
+    world.serve_runs = Some(runs);
 }
 
 #[when("the user lists running services")]
@@ -1092,6 +1174,123 @@ async fn user_serves_negative_temperature(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// A gated AIM catalog entry (`requires_hf_token`), with a profile for a Radeon
+/// PRO W7900 (`gfx110X-all`). The token check runs before GPU detection and
+/// Docker, so no engine or GPU is needed to reach it.
+const GATED_AIM_MODEL: &str = "meta-llama/Llama-3.1-8B-Instruct";
+
+/// An AIM image with profiles for Radeon (`gfx110X-all`, `gfx120X-all`) only.
+const RADEON_AIM_MODEL: &str = "Qwen/Qwen3.5-9B";
+
+/// An AIM image that needs 8 GPUs on an Instinct MI300X.
+const EIGHT_GPU_AIM_MODEL: &str = "deepseek-ai/DeepSeek-R1";
+
+/// Put a `docker` that always fails first on `PATH` and have it log every call to
+/// a file in the scenario root, so a refused serve can be shown never to have
+/// reached Docker (not even `docker info`).
+#[given("Docker is watched for any call")]
+async fn docker_is_watched(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+    let bin_dir = root.join("watched-docker-bin");
+    crate::install_fixture_binary(
+        "fake-docker",
+        &bin_dir.join(e2e_cucumber::fixture_binary::fixture_target_name("docker")),
+    );
+    let mut path = std::ffi::OsString::from(&bin_dir);
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("FAKE_DOCKER_LOG", docker_call_log(world).into_os_string()));
+}
+
+fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("docker-calls.log")
+}
+
+/// Plant one GPU in the simulated kernel topology (`ROCM_CLI_TEST_HOST_ROOT`, honoured
+/// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
+/// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
+fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root");
+    let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+/// gfx942, TheRock family `gfx94X-dcgpu`.
+#[given("a host whose only GPU is an AMD Instinct MI300X")]
+async fn host_with_an_mi300x(world: &mut E2eWorld) {
+    plant_single_gpu(world, 90402);
+}
+
+/// gfx1100, TheRock family `gfx110X-all`.
+#[given("a host whose only GPU is an AMD Radeon PRO W7900")]
+async fn host_with_a_w7900(world: &mut E2eWorld) {
+    plant_single_gpu(world, 110_000);
+}
+
+fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {
+    let mut full = vec!["serve"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--engine", "aim"]);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &full);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a gated AIM model without passing a Hugging Face token")]
+async fn user_serves_gated_aim_without_token(world: &mut E2eWorld) {
+    run_serve_aim(world, &[GATED_AIM_MODEL]);
+}
+
+#[when(
+    "the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked"
+)]
+async fn user_serves_gated_aim_with_token(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("HF_TOKEN", "hf_e2e_placeholder".into()));
+    // An empty mask hides every device, so a GPU host presents as having none usable.
+    world.command_env.push(("HIP_VISIBLE_DEVICES", "".into()));
+    run_serve_aim(world, &[GATED_AIM_MODEL, "--engine-env", "HF_TOKEN"]);
+}
+
+#[when("the user serves a Radeon-only AIM image")]
+async fn user_serves_radeon_only_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[RADEON_AIM_MODEL]);
+}
+
+#[when("the user serves an AIM image that needs eight GPUs")]
+async fn user_serves_eight_gpu_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[EIGHT_GPU_AIM_MODEL]);
 }
 
 /// Serve with every GPU hidden from the CLI and engine via an empty
@@ -1858,6 +2057,71 @@ async fn assert_no_engine_preparation(world: &mut E2eWorld) {
     );
 }
 
+#[then("the CLI explains that the model needs a Hugging Face token")]
+async fn assert_hf_token_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs a Hugging Face token") && output.contains("--engine-env HF_TOKEN"),
+        "expected the gated-model refusal naming the remedy, got:\n{output}"
+    );
+}
+
+#[then("no service was started")]
+async fn assert_no_service_started(world: &mut E2eWorld) {
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records = std::fs::read_dir(&services_dir).map_or(0, Iterator::count);
+    assert_eq!(records, 0, "a refused serve left service records behind");
+}
+
+#[then("the refusal is that no usable GPU is visible")]
+async fn assert_refusal_is_no_usable_gpu(world: &mut E2eWorld) {
+    // The token gate and the GPU-family gate were both passed: the serve got as
+    // far as the GPU-required pre-flight, which the empty mask fails.
+    let output = serve_output(world);
+    assert!(
+        output.contains("no usable AMD GPU") && !output.contains("needs a Hugging Face token"),
+        "expected the exported token to clear its gate and the serve to stop at the \
+         GPU pre-flight, got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image has no profile for this GPU and names the GPUs it supports")]
+async fn assert_no_profile_for_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("has no profile for this GPU (gfx94X-dcgpu)")
+            && output.contains("it supports: gfx110X-all, gfx120X-all"),
+        "expected the unsupported-GPU refusal naming the detected and supported families, \
+         got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image needs eight GPUs and multi-GPU serving is not supported")]
+async fn assert_needs_eight_gpus(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs 8 GPUs") && output.contains("does not support multi-GPU serving"),
+        "expected the multi-GPU refusal, got:\n{output}"
+    );
+}
+
+#[then("Docker was never called")]
+async fn assert_docker_never_called(world: &mut E2eWorld) {
+    let log = docker_call_log(world);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "a refused serve reached Docker ({}):\n{calls}",
+        log.display()
+    );
+}
+
 #[then("the CLI explains that temperature cannot be negative")]
 async fn assert_negative_temperature_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1883,6 +2147,8 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
     //   - CLI, a mask is active on the runner — refused against the visible set.
     //   - CLI, no visible set could be enumerated — falls back to the raw detected
     //     count.
+    //   On native Windows the CLI's set is the AMD adapters Windows lists
+    //   (ROCMAI-824), so the first two shapes are what that lane prints.
     //   - ENGINE, on a host where neither the visible set nor the count could be
     //     probed: `--gpu` validation takes its permissive fallback and the engine's
     //     own probe makes the late rejection. Accepted deliberately, unlike in the
@@ -1902,6 +2168,57 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
     );
 }
 
+#[given("a managed vLLM launch will run out of GPU memory")]
+async fn plant_oom_launch(world: &mut E2eWorld) {
+    // Nothing to plant on disk: unlike the reuse case, this scenario drives a
+    // real `rocm serve` launch. The launch's failed-with-OOM state (an owned log
+    // carrying a real allocator signature, status "starting", nothing reused) is
+    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook.
+    //
+    // Arming that hook is what this `Given` does, via the World's `command_env`
+    // fixture channel — the premise belongs to the premise step, and the `When`
+    // below stays a plain user action with no mechanism in it. It previously sat
+    // in the `When`, which left this step a no-op whose deletion changed nothing.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // through `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails loudly
+    // rather than silently skipping: the fault injection would not arm, the real
+    // GPU pre-flight would bail, and the `Then` steps would fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1".into()));
+}
+
+#[when("the user opens the interactive serve summary for that launch")]
+async fn open_oom_launch_summary(world: &mut E2eWorld) {
+    // A plain user action. The fault injection the premise arms (see the `Given`
+    // above) rides along on the World's `command_env`, which `TuiSession::spawn`
+    // applies per-child. With it armed, the GPU-required pre-flight is bypassed
+    // for the simulated launch, so no GPU is touched; the launch resolves the
+    // model, "spawns", writes an OOM log it owns, and reports `starting` —
+    // exactly the state the memory-guidance note keys on.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom-launch",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
 #[then("the summary reflects the reused already-running service")]
 async fn assert_reused_running_service(world: &mut E2eWorld) {
     let screen = world
@@ -1915,6 +2232,77 @@ async fn assert_reused_running_service(world: &mut E2eWorld) {
     assert!(
         screen_without_whitespace(&screen).contains("alreadyrunning"),
         "expected the summary to reflect the reused live service:\n{screen}"
+    );
+}
+
+#[then("the deployment summary blames this launch for GPU memory")]
+async fn assert_oom_launch_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The note is a long line the 80-column PTY wraps across grid rows, so match
+    // whitespace-insensitively — otherwise a soft wrap between "GPU" and "memory"
+    // would break a literal `contains` and mask a rendered note.
+    assert!(
+        screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
+        "a managed launch that OOM'd must be blamed for GPU memory in its own \
+         deployment summary:\n{screen}"
+    );
+}
+
+#[then("the deployment summary names the GPU memory knobs")]
+async fn assert_oom_launch_names_knobs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The actionable fix: lower the reservation or move to a less-busy device.
+    // Assert on the flag names (whitespace-insensitive, since an 80-column wrap
+    // can split a token across rows) so a reworded preamble does not mask a
+    // dropped remediation. Both knobs the step promises are checked — the step
+    // passed while only `--gpu-memory-utilization` was asserted, so dropping
+    // `--gpu <index>` from the guidance would not have failed anything.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("--gpu-memory-utilization"),
+        "the OOM summary must name the memory knob `--gpu-memory-utilization`:\n{screen}"
+    );
+    assert!(
+        flattened.contains("--gpu<index>"),
+        "the OOM summary must also name the other knob it advertises, `--gpu <index>`:\n{screen}"
+    );
+}
+
+#[then("the deployment summary quotes the engine's own failing line")]
+async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The only assertion in this scenario that can fail on the symptom
+    // *selection*. The other two Then steps match text `oom_memory_note` emits
+    // unconditionally, so deleting the `is_rocm_authored_log_line` filter — or
+    // dropping the `rocm diagnose` sentence altogether — left serve-41 green
+    // while the note silently fell back to the canonical symptom. That is the
+    // bug the fixture's engine-error block was added to expose, and nothing
+    // asserted it.
+    //
+    // `Tried to allocate 7.21 GiB.` is what discriminates: the fixture's real
+    // line carries it and `VLLM_OOM_CANONICAL_SYMPTOM` does not, so a fallback
+    // fails here rather than passing as a near-match. Whitespace-collapsed for
+    // the same reason as its siblings — the command is long and the 80-column
+    // PTY wraps it across grid rows.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains(
+            "--symptom'vllm:torch.OutOfMemoryError:HIPoutofmemory.Triedtoallocate7.21GiB.'"
+        ),
+        "the summary must print `rocm diagnose --symptom` quoting the engine's own failing \
+         line, not rocm-cli's own hint and not the canonical fallback:\n{screen}"
     );
 }
 
@@ -1951,12 +2339,15 @@ async fn assert_masked_index_message(world: &mut E2eWorld) {
 
 #[then("the output shows the full model name")]
 async fn assert_full_model_name(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no CLI output");
-    let resolved = resolved_model(output)
-        .unwrap_or_else(|| panic!("no 'resolved model' in output:\n{output}"));
+    let runs = world.serve_runs.as_ref().expect("no serve run");
+    let run = runs.first().expect("no serve run");
+    let resolved = run
+        .resolved_model()
+        .unwrap_or_else(|| panic!("{}", run.missing_plan_message()));
     assert!(
         resolved.contains('/'),
-        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{}",
+        run.stdout
     );
 }
 
@@ -1976,19 +2367,16 @@ async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
 
 #[then("all engines expand to the same full model name")]
 async fn assert_consistent_expansion(world: &mut E2eWorld) {
-    let outputs = world.cli_outputs.as_ref().expect("no CLI outputs");
-    assert!(
-        outputs.len() >= 2,
-        "need at least 2 serve outputs to compare"
-    );
+    let runs = world.serve_runs.as_ref().expect("no serve runs");
+    assert!(runs.len() >= 2, "need at least 2 serve outputs to compare");
     let mut resolved: Vec<String> = Vec::new();
-    for (i, output) in outputs.iter().enumerate() {
+    for (i, run) in runs.iter().enumerate() {
         // A missing `resolved model:` line means the engine never got far enough
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = resolved_model(output).map(str::to_string) else {
-            panic!("engine #{i} produced no 'resolved model' line:\n{output}");
+        let Some(model) = run.resolved_model().map(str::to_string) else {
+            panic!("engine #{i}: {}", run.missing_plan_message());
         };
         resolved.push(model);
     }
@@ -2073,17 +2461,6 @@ fn selected_engine(output: &str) -> &str {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
-}
-
-/// The model a serve plan actually resolved to (`resolved model: <id>`), which
-/// can differ from the requested id — `rocm serve <model>` with no `--engine`
-/// picks the recipe's preferred model+engine. `None` if the plan has no such line
-/// (e.g. the serve errored before resolving).
-fn resolved_model(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("resolved model:"))
-        .map(str::trim)
 }
 
 /// A distinctive substring of a model id that appears in the served endpoint's
@@ -2352,5 +2729,51 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         record.get("status").and_then(serde_json::Value::as_str),
         Some("stopped"),
         "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+/// The discriminating assertion for the fabricated-launch daemon suppression.
+///
+/// `simulate_oom_managed_launch` writes a `starting` record for a process that
+/// never existed, so `ensure_background_helper_running_quiet` would leave a
+/// `rocm daemon` supervising a pid that will never appear — and nothing in this
+/// scenario's teardown stops it. Observed in the wild as daemons outliving their
+/// e2e checkout by days.
+///
+/// Without this step the suppression was untested: deleting the
+/// `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs` left serve-41 green,
+/// because every other assertion here is about the summary text. Both artefacts
+/// the autostart path can leave are checked, since the daemon publishes its
+/// runtime-state only after it is up — a spawn caught in the window before that
+/// shows up as a claim and nothing else.
+#[then("no background automation daemon was left behind")]
+async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("automations");
+
+    let state_path = root.join("runtime-state.json");
+    if let Ok(text) = std::fs::read_to_string(&state_path) {
+        let state: serde_json::Value =
+            serde_json::from_str(&text).expect("automation runtime-state is not valid JSON");
+        assert_ne!(
+            state.get("running").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a fabricated OOM launch must not start the automation daemon, but \
+             {} says one is running:\n{text}",
+            state_path.display()
+        );
+    }
+
+    let claim_path = root.join("autostart.claim");
+    assert!(
+        !claim_path.is_file(),
+        "a fabricated OOM launch must not even claim a daemon autostart, but {} exists: {:?}",
+        claim_path.display(),
+        std::fs::read_to_string(&claim_path).ok()
     );
 }

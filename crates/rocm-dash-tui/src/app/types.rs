@@ -172,6 +172,24 @@ pub enum ConnState {
     },
 }
 
+impl ConnState {
+    const IN_PROCESS_PREFIX: &'static str = "in-process/";
+
+    /// The `daemon_version` the Windows in-process collector reports; the one
+    /// producer of the tag [`Self::is_in_process`] looks for.
+    pub fn in_process_version(version: &str) -> String {
+        format!("{}{version}", Self::IN_PROCESS_PREFIX)
+    }
+
+    /// True for the Windows in-process collector (see
+    /// `client::connect_and_run`'s `#[cfg(windows)]` arm), which tags its
+    /// `daemon_version` this way since there's no real `rocmdashd` behind
+    /// it — and so no instance registry it could ever populate.
+    pub fn is_in_process(&self) -> bool {
+        matches!(self, Self::Connected { version, .. } if version.starts_with(Self::IN_PROCESS_PREFIX))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActiveTab {
     // 5-tab IA. Home is the default; ROCm and Serving are the two domain tabs
@@ -557,8 +575,37 @@ impl ScrollTarget {
     ];
 }
 
-/// Esc-menu rows: Options / Help / Quit.
-pub const MENU_ITEMS: usize = 3;
+/// One selectable row of the Esc main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Options,
+    Help,
+    Quit,
+}
+
+impl MenuItem {
+    /// The text the menu draws for this row.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Options => "Options",
+            Self::Help => "Help",
+            Self::Quit => "Quit",
+        }
+    }
+}
+
+/// Esc-menu rows, top to bottom.
+///
+/// The one list the menu is built from: the wrap bound of
+/// `KeyAction::MenuMove` and the row an activation runs (`app/actions.rs`),
+/// and the rows, labels and reserved height `draw_menu` paints
+/// (`ui/menu.rs`), all read it. A new row is added here and gets an
+/// arm in the `KeyAction::MenuActivate` match, which the compiler requires
+/// for every `MenuItem`. A `MenuItem` left out of this list is not caught by
+/// the compiler (stable Rust cannot check that without a derive macro this
+/// crate doesn't depend on), the same limit as `ScrollTarget::ALL` above.
+pub const MENU_ITEMS: &[MenuItem] = &[MenuItem::Options, MenuItem::Help, MenuItem::Quit];
 
 /// Command-palette destinations (label, tab).
 pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
@@ -576,6 +623,20 @@ pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
 mod tests {
     use super::*;
     use crate::app::test_support::args_with_anthropic_key;
+
+    #[test]
+    fn in_process_version_is_recognised_by_is_in_process() {
+        let in_process = ConnState::Connected {
+            host: "localhost".into(),
+            version: ConnState::in_process_version("1.2.3"),
+        };
+        assert!(in_process.is_in_process());
+        let daemon = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.2.3".into(),
+        };
+        assert!(!daemon.is_in_process());
+    }
 
     #[test]
     fn from_digit_maps_five_to_chat() {

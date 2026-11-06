@@ -11,7 +11,7 @@
 //! in `app/quit_confirm.rs`.
 
 use crate::app::AppState;
-use crate::ui::{approval, format};
+use crate::ui::{approval, exec, format};
 
 /// Build the quit-confirm prompt's request (title + body) once, so the
 /// dashboard's own render arm above and the pre-dashboard launcher's
@@ -89,9 +89,10 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
-/// (mirroring the Serving tab's "Running now" listing in
+/// (mirroring the serving rows of the Serving tab's "Running now" listing in
 /// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans), and how to stop each one that this host's own registry
+/// styled spans; that listing also shows starting services, which this gate
+/// deliberately does not count), and how to stop each one that this host's own registry
 /// manages (a live read, passed in as `snapshot` so the caller controls how
 /// many times the registry is actually read — see `quit_confirm_request`) —
 /// not a blanket command, since a Docker- or Lemonade-discovered instance
@@ -173,7 +174,12 @@ pub(super) fn quit_confirm_body_with(
         ids.sort();
         for id in ids.iter().take(5) {
             body.push(format!("• {id} — stop it first:"));
-            body.push(format!("  rocm services stop {id} --yes"));
+            // Quoted so the line is the argv it names even for an id that is
+            // not one inert word; an ordinary id is printed unchanged.
+            body.push(format!(
+                "  rocm services stop {} --yes",
+                exec::quote_display_arg(id)
+            ));
         }
         if let Some(line) = format::overflow_line(managed_ids.len(), 5) {
             body.push(line);
@@ -215,7 +221,10 @@ pub(super) fn quit_confirm_body_with(
                 // reassemble a remediation command broken across the model
                 // name's line, at least.
                 body.push(format!("• {} — stop it first:", i.model_name));
-                body.push(format!("  rocm services stop {} --yes", i.container_id));
+                body.push(format!(
+                    "  rocm services stop {} --yes",
+                    exec::quote_display_arg(&i.container_id)
+                ));
             } else {
                 body.push(format!("• {}", i.model_name));
             }
@@ -239,9 +248,11 @@ mod tests {
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose dashboard-embedded daemon client never connects at
-        // all (Windows — `has_received_snapshot` never flips for the whole
-        // session), `instances` never fills, so without this the quit prompt
+        // On a host whose daemon client never sends an instance snapshot
+        // (Windows — it connects and streams live GPU/CPU/memory every tick,
+        // but has no `rocmdashd` socket to source an instance list from, so
+        // `has_received_snapshot` never flips for the whole session),
+        // `instances` never fills, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry
@@ -680,6 +691,63 @@ mod tests {
                  rendered frame even if its line wraps — not vacuously \
                  satisfied by a model name that happens to embed it: {painted:?}"
             );
+        }
+    }
+
+    /// Both stop lines -- the registry-only startup fallback and the one beside
+    /// a known instance -- are commands a user is told to paste, so each must
+    /// split back to exactly `rocm services stop <id> --yes` whatever the id
+    /// holds. Mutation: printing either id bare fails this for every id below
+    /// except the inert one.
+    #[test]
+    fn quit_confirm_stop_lines_denote_the_argv_they_name_for_a_hostile_id() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for id in [
+            "svc-managed",
+            "svc with space",
+            "it's",
+            "a;b|c&&d",
+            "$(id)",
+            "`id`",
+            "\\back\\slash",
+            "\"quoted\"",
+        ] {
+            let expected = Some(vec![
+                "rocm".to_owned(),
+                "services".to_owned(),
+                "stop".to_owned(),
+                id.to_owned(),
+                "--yes".to_owned(),
+            ]);
+            let stop_lines = |body: &[String]| -> Vec<String> {
+                body.iter()
+                    .filter_map(|line| line.strip_prefix("  rocm services stop "))
+                    .map(|rest| format!("rocm services stop {rest}"))
+                    .collect()
+            };
+
+            // Registry-only fallback: no daemon snapshot, no instances.
+            let mut fallback = AppState::new("t".into(), "default-dark".into());
+            with_registry_probe(&mut fallback, true, &[id]);
+            let lines = stop_lines(&quit_confirm_body(&fallback));
+            assert_eq!(lines.len(), 1, "fallback for {id:?}: {lines:?}");
+            assert_eq!(shlex::split(&lines[0]), expected, "fallback: {}", lines[0]);
+
+            // Known instance managed by this host's registry.
+            let mut known = AppState::new("t".into(), "default-dark".into());
+            known.instances.insert(
+                id.to_string(),
+                Instance {
+                    container_id: id.to_string(),
+                    model_name: "Qwen2.5-7B".to_string(),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+            with_registry_probe(&mut known, true, &[id]);
+            let lines = stop_lines(&quit_confirm_body(&known));
+            assert_eq!(lines.len(), 1, "instance for {id:?}: {lines:?}");
+            assert_eq!(shlex::split(&lines[0]), expected, "instance: {}", lines[0]);
         }
     }
 }

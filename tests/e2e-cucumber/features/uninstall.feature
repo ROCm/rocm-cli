@@ -10,10 +10,10 @@ Feature: Uninstall
   # and points HOME, the uv cache and the Hugging Face cache at the scenario's
   # own folder, so an uninstall can never reach the runner's shared caches.
   #
-  # Linux-only, and the behaviour they pin is only claimed for Linux: on
-  # Windows a directory symlink or junction needs `remove_dir` rather than
-  # `remove_file`, which `rocm uninstall` does not do yet and nothing here
-  # verifies.
+  # The link scenarios are Linux-only, and the behaviour they pin is only
+  # claimed for Linux: on Windows a directory symlink or junction needs
+  # `remove_dir` rather than `remove_file`, which `rocm uninstall` does not do
+  # yet and nothing here verifies.
 
   @id:uninstall-trailing-slash-link-unlinks-only @requires-os:linux
   Scenario: uninstall-01 - A linked cache folder written with a trailing slash is unlinked, not emptied
@@ -50,3 +50,19 @@ Feature: Uninstall
     When the user uninstalls the config without confirming
     Then the uninstall is refused and the user is told to confirm explicitly
     And the config folder still holds the user's files
+
+  # An install isolated by ROCM_CLI_CONFIG_DIR and ROCM_CLI_DATA_DIR alone,
+  # with no ROCM_CLI_CACHE_DIR, keeps its cache inside its data folder. It once
+  # fell back to the default `~/.rocm/cache`, so `rocm storage` reported the
+  # default install's cache and `rocm uninstall` deleted it.
+  @id:uninstall-moved-data-folder-keeps-its-own-cache
+  Scenario: uninstall-05 - With only the config and data folders set, the cache folder is the data folder's own
+    Given a default install's cache folder in the user's home holds the user's files
+    And the data folder's own cache folder holds a cache file
+    When the user asks what ROCm CLI keeps on disk with only the config and data folders set
+    Then the storage report names the cache folder inside the data folder
+    When the user uninstalls with only the config and data folders set
+    Then the uninstall succeeds
+    And the uninstall does not name the default install's cache folder
+    And the data folder's own cache folder is gone
+    And the default install's cache folder still holds the user's files

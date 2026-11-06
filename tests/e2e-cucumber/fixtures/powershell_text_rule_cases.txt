@@ -2,7 +2,7 @@
 # Windows: what it must refuse (`flag`) and what it must let through (`pass`).
 #
 # The rule exists twice. `fails_in_windows_powershell` in
-# crates/rocm-core/src/fix.rs checks the catalog and the diagnosis fixes; the
+# crates/rocm-core/src/fix/catalog.rs checks the catalog and the diagnosis fixes; the
 # diagnose-43..45 steps use `powershell_text_rule::refusal` in this crate, which
 # does not depend on rocm-core. Both read this file and must agree on every
 # line, so a change to one rule that the other does not follow fails a test on

@@ -91,6 +91,11 @@ Every local (relative-path) Markdown link and `#anchor` fragment in the reposito
 
 Since only links are checked, cite a specific repository file as a link relative to the citing file, `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/`, rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, links leaving a `skills/` folder, and `docs/rocm-docs/` along with the files it includes, which are this file and README.md), is in AGENTS.md section 5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
 
+### Updating the AIM catalog
+
+AIM model entries are hand-maintained in `crates/rocm-core/src/model_catalog.json`;
+see `docs/aim-catalog.md` for the refresh process and staleness warning.
+
 ### Test commands
 
 | Component | Command |

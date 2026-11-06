@@ -310,6 +310,20 @@ fn collect_process_tree(root: u32) -> Vec<u32> {
         }
     }
 
+    walk_process_tree(root, &children)
+}
+
+/// Walk `root` plus its transitive descendants over an already-built
+/// parent→children table.
+///
+/// `root` comes first, every other PID comes after its parent, and no PID is
+/// listed twice, so a cycle in the table ends the walk instead of looping it.
+///
+/// Split out of [`collect_process_tree`] so the traversal — the part that
+/// decides which PIDs get signalled — can be exercised against a synthetic
+/// table (cycles, self-parents, shared parents) without touching `/proc`.
+#[cfg(not(windows))]
+fn walk_process_tree(root: u32, children: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
@@ -391,7 +405,7 @@ pub fn process_is_running(pid: u32) -> bool {
 /// serialize check-then-act sequences over shared on-disk state — e.g. the
 /// daemon autostart decision, the managed-serve GPU select-then-claim, a
 /// `uv` install, and each JSONL store's append-or-repair and read-modify-write
-/// (see `jsonl_lock_path` in `automation.rs`) — so two concurrent invocations
+/// (see `jsonl_lock_path` in `jsonl_store.rs`) — so two concurrent invocations
 /// cannot both pass the same check, or interleave a write with another's.
 ///
 /// The lock is released when the guard is dropped, and by the OS if the process
@@ -409,7 +423,27 @@ impl FileLock {
     /// The lock file itself carries no data; it is a rendezvous point, so an
     /// existing file is reused (never truncated) and its contents are ignored.
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let (file, path) = Self::open(path.into())?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// As [`acquire`](Self::acquire), but never blocks: `Ok(None)` means another
+    /// holder has the lock right now. For callers that must not park a thread
+    /// (an async loop) and retry on their own schedule.
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Option<Self>> {
+        let (file, path) = Self::open(path.into())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to try-acquire lock {}", path.display()))
+            }
+        }
+    }
+
+    fn open(path: PathBuf) -> Result<(fs::File, PathBuf)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -421,9 +455,7 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
+        Ok((file, path))
     }
 
     /// The lock file backing this guard.
@@ -630,23 +662,25 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// only as an opaque error, so this is the only place that can still tell which
 /// of its characters came from the child. All four callers inherit it.
 ///
-/// It bounds this message and nothing else. A caller that quotes the `Output`
-/// handed back to it is quoting raw child output of its own, unbounded and
-/// persisted the same way -- `capture_amd_smi_json`'s non-zero-exit `bail!` and
-/// the daemon's `parse_sandbox_child_output` both do. Both predate this
-/// constant and are outside its scope; of the two, #623 tracks the
-/// `capture_amd_smi_json` quote.
+/// It bounds this message by itself. A caller that quotes the `Output` handed
+/// back to it is quoting raw child output of its own, persisted the same way,
+/// so it has to apply a bound too -- which is why this is `pub(crate)` rather
+/// than private: [`crate::amd_smi::amd_smi_json`] bounds its non-zero-exit
+/// quote (the one #623 tracked) with *this* constant instead of declaring a
+/// second one free to drift from it. The daemon's
+/// `parse_sandbox_child_output` still predates both and is outside this scope.
 ///
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
 /// GPU-metrics watcher copies that note into the automation-event and audit
 /// JSONL files once a minute — stores that are never rotated or capped.
 /// Unbounded, a child that prints a megabyte and then stalls past its
-/// timeout grows both logs by that much per minute, forever.
+/// timeout grows both logs by that much per minute, forever. A 151K-character
+/// JSONL line was reproduced from exactly that poller.
 ///
 /// Sized to still hold a real stderr backtrace: the point is to stop a
 /// payload-sized quote, not to shorten diagnostics.
-const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
+pub(crate) const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 
 /// One captured stream: the bytes so far, whether its reader saw EOF, and the
 /// read error that stopped it, if one did.
@@ -1014,6 +1048,12 @@ fn assemble_output(
 
     Ok(output)
 }
+
+/// Property tests for [`walk_process_tree`]; a child module so it can reach
+/// the walk while it stays private.
+#[cfg(all(test, not(windows)))]
+#[path = "process_tree_properties.rs"]
+mod tree_properties;
 
 #[cfg(test)]
 mod tests {

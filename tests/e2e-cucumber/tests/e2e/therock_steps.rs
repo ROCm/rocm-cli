@@ -87,6 +87,16 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 /// The non-release sibling the live catalog publishes beside the real archive.
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
+/// The ROCm version `CURRENT_TARBALL` carries, as the preview reports it.
+const CURRENT_TARBALL_VERSION: &str = "7.10.0";
+
+/// A host ROCm newer than `CURRENT_TARBALL_VERSION`, reported with a packaging
+/// build number the way a system install's `.info/version` reports one.
+const HOST_ROCM_NEWER_WITH_BUILD_NUMBER: &str = "7.20.1-33";
+/// The same host version with a suffix that is neither a build number nor a
+/// PEP 440 stage. Dropping the whole suffix would read it as `7.20.1`, newer
+/// than `CURRENT_TARBALL_VERSION`; it must be read as "can't tell" instead.
+const HOST_ROCM_WITH_UNREADABLE_SUFFIX: &str = "7.20.1-33rc1";
 
 /// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
 /// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
@@ -968,6 +978,56 @@ async fn preview_pinned_tarball_install_with_group_family(world: &mut E2eWorld) 
     );
 }
 
+/// The install folder therock-next-15 asks for: inside the scenario's root, with
+/// a lone `'` in its name — the shape the old dry-run quoter left bare.
+const QUOTED_FOLDER_NAME: &str = "it's-here";
+
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
+)]
+async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = root(world)
+        .join(QUOTED_FOLDER_NAME)
+        .to_string_lossy()
+        .into_owned();
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--prefix",
+            &prefix,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the dry-run command line names that folder as a single argument")]
+async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    let output = stdout(world);
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("command: "))
+        .unwrap_or_else(|| panic!("no `command:` line in the dry-run preview:\n{output}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the dry-run `command:` line does not parse: `{line}`"));
+    // By file name rather than the full path: the CLI resolves the prefix
+    // through symlinks, so the folder's parent may be spelled differently from
+    // the one this step built. What must hold is that one whole word names it.
+    assert!(
+        words.iter().any(|word| {
+            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
+        }),
+        "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
+    );
+}
+
 fn stdout(world: &E2eWorld) -> &str {
     world.cli_output.as_deref().unwrap_or_default()
 }
@@ -1494,5 +1554,93 @@ async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
     assert!(
         install_output.contains("vLLM ROCm 10.x discovery pinned:"),
         "vLLM install against a live ROCm 10.x runtime did not report discovery pins:\n{install_output}"
+    );
+}
+
+#[given("a release tarball catalog whose newest ROCm is older than the host's")]
+async fn release_tarball_catalog_only(world: &mut E2eWorld) {
+    let served = root(world).join("therock-release-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    allow_base_overrides(world);
+    let base = server_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+}
+
+#[given("a machine whose own ROCm install reports a newer version with a packaging build number")]
+async fn host_rocm_newer_with_build_number(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_NEWER_WITH_BUILD_NUMBER);
+}
+
+#[given("a machine whose own ROCm install reports a version with an unreadable build suffix")]
+async fn host_rocm_with_unreadable_suffix(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_WITH_UNREADABLE_SUFFIX);
+}
+
+#[when("the user previews a tarball SDK install")]
+async fn preview_unpinned_tarball_install(world: &mut E2eWorld) {
+    // No `--version`: an unpinned release install reaches the canonical
+    // catalog, which the given-step populated with `CURRENT_TARBALL` alone.
+    // `--family` keeps the preview off host GPU detection.
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            GROUP_FAMILY,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the preview selects the newest SDK in the catalog")]
+async fn preview_selects_catalog_newest(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("tarball: {CURRENT_TARBALL}"),
+        "selected artifact",
+    );
+    assert_contains(
+        world,
+        &format!("latest_version: {CURRENT_TARBALL_VERSION}"),
+        "selected artifact version",
+    );
+}
+
+#[then("the preview explains that the host's newer ROCm is passed over for the selected SDK")]
+async fn preview_explains_host_newer(world: &mut E2eWorld) {
+    // The note claims the catalog's version "is selected", so assert the
+    // selection beside it: the claim and the state it describes, together.
+    preview_selects_catalog_newest(world).await;
+    assert_contains(
+        world,
+        &format!(
+            "version_note: this host reports ROCm {HOST_ROCM_NEWER_WITH_BUILD_NUMBER}, but \
+             {CURRENT_TARBALL_VERSION} is the newest TheRock ROCm tarball for this GPU family, \
+             so it is selected"
+        ),
+        "host-newer version note",
+    );
+}
+
+#[then("the preview does not claim the host's ROCm is newer")]
+async fn preview_does_not_claim_host_newer(world: &mut E2eWorld) {
+    // Absence is only evidence because the sibling scenario shows the same
+    // preview printing the note when the host version is readable and newer.
+    let preview = stdout(world);
+    assert!(
+        !preview.contains("version_note:") && !preview.contains("this host reports ROCm"),
+        "the preview claimed an unreadable host ROCm version is newer:\n{preview}"
     );
 }
