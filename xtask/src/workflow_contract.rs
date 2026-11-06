@@ -1228,8 +1228,8 @@ jobs:
             .find_map(|(name, step)| (name == "Decide whether to run").then_some(step))
             .expect("ci.yml's `e2e` job has a \"Decide whether to run\" step");
         let mut script = dedent(&run_block(&step).expect(
-            "the E2E gate step has no `run: |` block; `run_block` reads only that \
-             literal form, not `run: |-`, `run: >` or a one-line `run:`",
+            "the E2E gate step has no block-scalar `run:`; `run_block` reads `run: |`, \
+             `run: |-`, `run: >` and the like, but not a one-line `run:`",
         ))
         .expect("the gate step's script is not empty");
         let values = [
@@ -2229,7 +2229,7 @@ jobs:
     /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let (run_at, run_indent, _) = run_block_header(&lines)?;
+        let (run_at, run_indent, _, _) = run_block_header(&lines)?;
         let mut body: Vec<&str> = lines[run_at + 1..]
             .iter()
             .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
@@ -2242,15 +2242,21 @@ jobs:
     }
 
     /// Where a step's block-scalar `run:` opens: the index of its `run:` line
-    /// in `lines`, the column of the `run` key, and whether the block is
-    /// folded (`>`) rather than literal (`|`). The key may be the step's
-    /// first (`- run: |`), two columns in from the dash.
+    /// in `lines`, the column of the `run` key, whether the block is folded
+    /// (`>`) rather than literal (`|`), and its indentation indicator, if it
+    /// has one. The key may be the step's first (`- run: |`), two columns in
+    /// from the dash.
     ///
     /// Any block-scalar header counts — `|` or `>`, with or without a
     /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
     /// without a trailing comment — since every one of them hands the step a
     /// multi-line script.
-    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool)> {
+    ///
+    /// The first `run:` key at any depth is taken, so a `run:` nested under
+    /// some other key (an action's `with:` input) would be read as the
+    /// step's script. No workflow here has one; a step that does would need
+    /// this to match only at the step's own key column.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool, Option<usize>)> {
         lines.iter().enumerate().find_map(|(at, line)| {
             let code = strip_comment(line).trim();
             let (key, key_column) = match code.strip_prefix("- ") {
@@ -2263,10 +2269,18 @@ jobs:
                 '>' => true,
                 _ => return None,
             };
-            indicator[1..]
+            let modifiers = &indicator[1..];
+            if !modifiers
                 .chars()
                 .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
-                .then_some((at, key_column, folded))
+            {
+                return None;
+            }
+            let indent = modifiers
+                .chars()
+                .find_map(|c| c.to_digit(10))
+                .map(|digit| digit as usize);
+            Some((at, key_column, folded, indent))
         })
     }
 
@@ -2277,17 +2291,25 @@ jobs:
     /// indent becomes a space, so two such lines are ONE line of script; a
     /// blank line ends the line, and a more-indented line keeps the breaks
     /// around it. A literal `|` block is the script as written.
+    ///
+    /// The block's indent is the `run` key's column plus its indentation
+    /// indicator (`>2`) when it has one, as YAML reads it; otherwise the
+    /// indent of its first non-blank line.
     fn run_script(step: &str) -> Option<Vec<String>> {
         let lines: Vec<&str> = step.lines().collect();
-        let (_, _, folded) = run_block_header(&lines)?;
+        let (_, run_indent, folded, indicator) = run_block_header(&lines)?;
         let body = run_block(step)?;
         if !folded {
             return Some(body.iter().map(|line| (*line).to_owned()).collect());
         }
-        let indent = body
-            .iter()
-            .find(|line| !line.trim().is_empty())
-            .map_or(0, |line| indent_of(line));
+        let indent = indicator.map_or_else(
+            || {
+                body.iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or(0, |line| indent_of(line))
+            },
+            |digit| run_indent + digit,
+        );
         let mut script: Vec<String> = Vec::new();
         let mut folds_onto_last = false;
         for line in body {
@@ -2309,7 +2331,7 @@ jobs:
         Some(script)
     }
 
-    /// The non-comment lines of a step's `run: |` block, joined.
+    /// The non-comment lines of a step's block-scalar `run:`, joined.
     ///
     /// A preflight step's body is the only place a lane can still spell its own
     /// floor (the WSL `${…:-8}` default, the PowerShell `else { 8 }`), and a
@@ -2924,8 +2946,8 @@ jobs:
                 .and_then(|block| dedent(&block))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{workflow}'s clock-settling step has no `run: |` body (only the literal \
-                         `run: |` form is read; `run: |-`, `run: >` and one-line `run:` are not)"
+                        "{workflow}'s clock-settling step has no block-scalar `run:` body \
+                         (`run: |`, `run: >` and the like are read; a one-line `run:` is not)"
                     )
                 });
             bodies.push((workflow, body));
@@ -7624,7 +7646,7 @@ permissions:
             && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
     }
 
-    /// The statements of a pwsh `run: |` body, in order.
+    /// The statements of a pwsh `run:` script, in order.
     ///
     /// A line is split at its top-level `;`s (see
     /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
@@ -7812,8 +7834,9 @@ permissions:
     /// Whether a pwsh statement can neither run a program nor touch
     /// `$LASTEXITCODE`, so a native command's status survives it.
     ///
-    /// Deliberately narrow, and erring towards "might": outside single
-    /// quotes, which are literal, the statement has no `(` (a subexpression
+    /// Deliberately narrow, and erring towards "might": every quote in the
+    /// statement closes, and outside single quotes, which are literal, it
+    /// has no `(` (a subexpression
     /// `$(…)` or a `(…)` argument runs a command, even inside double quotes),
     /// no `{` (a script block), no `&` (the call operator, `&&`) and no
     /// expanding `@"` here-string. What is left is a pipeline whose first
@@ -7822,7 +7845,9 @@ permissions:
     /// later element is one of those cmdlets. Anything else, a keyword
     /// (`exit`, a loop's closing `}`) or a function call included, is not.
     fn leaves_last_exit_code_alone(statement: &str) -> bool {
-        let code = without_single_quoted_text(statement);
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
         if code.contains(['(', '{', '&']) || code.contains("@\"") {
             return false;
         }
@@ -7869,7 +7894,11 @@ permissions:
     /// that text is literal, so nothing in it can run. Double-quoted strings
     /// are kept whole, since `$(…)` inside one does run, and a `'` inside one
     /// is just a character.
-    fn without_single_quoted_text(statement: &str) -> String {
+    ///
+    /// `None` when a quote is still open at the end: what it hides cannot be
+    /// told from literal text, so the caller must assume the worst. A stray
+    /// `'@ | git …` would otherwise reduce to a lone `'`, a plain value.
+    fn without_single_quoted_text(statement: &str) -> Option<String> {
         let mut kept = String::new();
         let mut quote: Option<char> = None;
         let mut chars = statement.chars();
@@ -7893,14 +7922,24 @@ permissions:
                 _ => kept.push(c),
             }
         }
-        kept
+        quote.is_none().then_some(kept)
     }
 
     /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
     /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
     /// the same variable and count just the same.
+    ///
+    /// Only a mention outside single quotes counts (`'$LASTEXITCODE'` is
+    /// literal text), and only of the whole name (`$LASTEXITCODEX` is another
+    /// variable). A statement with a quote left open reads nothing.
     fn reads_last_exit_code(statement: &str) -> bool {
-        statement.to_ascii_lowercase().contains("$lastexitcode")
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        let code = code.to_ascii_lowercase();
+        code.match_indices("$lastexitcode").any(|(at, name)| {
+            !code[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
     }
 
     /// [`unchecked_native_commands`] over a pwsh step's script: its
@@ -8371,6 +8410,37 @@ permissions:
         assert!(unchecked_native_commands_in_step(step).is_empty());
     }
 
+    /// A folded block with an indentation indicator (`>2`) sets its own
+    /// indent: the run key's column plus the digit, not the indent of its
+    /// first line. Here the first line is more indented than that, so it
+    /// keeps its own line, and the two lines at the block's indent fold into
+    /// one. PyYAML reads both fixtures this way.
+    #[test]
+    fn a_folded_run_block_honours_its_indentation_indicator() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >2\n            \
+                    python a.py --self-test\n          python b.py --self-test\n          \
+                    python c.py\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "            python a.py --self-test",
+                "          python b.py --self-test python c.py",
+            ]
+        );
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["python a.py --self-test"]
+        );
+        // `run:` as the step's first key: the key, not the dash, sets the
+        // column the digit counts from.
+        let step =
+            "      - run: >2\n            a1\n          b\n          c\n        shell: pwsh\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            ["            a1", "          b c"]
+        );
+    }
+
     /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
     /// the step is pwsh, and its script checked, just the same. Matched only
     /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
@@ -8471,6 +8541,15 @@ permissions:
             // A loop's closing brace: the check reads the last pass only.
             &["}"],
             &["Write-Output 'fine'", "git rev-parse HEAD"],
+            // An unclosed `'` hides the rest of the statement, so the
+            // statement is not known to be inert: here a stray closing
+            // marker would leave just `'`, which reads as a plain value.
+            &["'@ | git hash-object --stdin"],
+            &["Write-Output 'open | git hash-object --stdin"],
+            // `$LASTEXITCODE` inside single quotes is literal text, and
+            // `$LASTEXITCODEX` is another variable: neither reads the status.
+            &["git log --grep '$LASTEXITCODE'"],
+            &["Invoke-Thing $LASTEXITCODEX"],
         ] {
             let body: Vec<&str> = std::iter::once("cargo build")
                 .chain(between.iter().copied())
