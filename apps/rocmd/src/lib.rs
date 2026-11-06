@@ -7,6 +7,7 @@
 mod cli;
 mod common;
 mod daemon;
+mod daemon_host;
 mod engine_ipc;
 mod host_snapshot;
 mod mcp;

@@ -391,8 +391,19 @@ pub(crate) fn restart_managed_service(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> Result<()> {
-    let rocmd_binary =
-        std::env::current_exe().context("failed to resolve current rocmd executable path")?;
+    restart_managed_service_on(paths, record, &crate::daemon_host::DaemonHost::detect()?)
+}
+
+/// [`restart_managed_service`] on a given host, so a test can be `rocm`.
+///
+/// The binary that runs `supervise` is chosen before anything is written: a
+/// restart that cannot find it leaves the record as it was.
+fn restart_managed_service_on(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    host: &crate::daemon_host::DaemonHost,
+) -> Result<()> {
+    let rocmd_binary = host.rocmd_binary()?;
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -543,6 +554,7 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon_host::DaemonHost;
     use crate::persistence::load_service_record;
     #[cfg(target_os = "linux")]
     use crate::test_support::UNCONFIRMED_STOP_PID;
@@ -1249,6 +1261,126 @@ mod tests {
             Some(1),
             "the restart's failure write must not withdraw a stop issued meanwhile"
         );
+        Ok(())
+    }
+
+    /// Tests that run a script they just wrote take this lock. Writing an
+    /// executable while another thread forks can leave the new file "text file
+    /// busy" at its first exec, and the retry below covers forks the lock cannot
+    /// see.
+    static SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The restart, when the daemon is embedded in `rocm`, launches `supervise`
+    /// on the `rocmd` it is given. Before the choice was made, it re-executed
+    /// `rocm` itself and the new supervisor died on an unrecognised subcommand.
+    ///
+    /// The stand-in is a script that records its arguments, so what the restart
+    /// actually ran can be read back. It needs only `/bin/sh` and `/bin/sleep`,
+    /// and fails by name when they are missing; `setsid` is what the restart
+    /// itself runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_runs_supervise_on_the_rocmd_it_is_given() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = SCRIPT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tool in ["/bin/sh", "/bin/sleep"] {
+            assert!(
+                Path::new(tool).exists(),
+                "this test needs {tool} to stand in for rocmd"
+            );
+        }
+        let (root, paths) = temp_app_paths("restart-runs-given-rocmd");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let seen = root.join("rocmd-args.txt");
+        // The daemon is `rocm`, which does not exist here; the `rocmd` beside it
+        // is the stand-in.
+        let host = DaemonHost::new(root.join("rocm"), true);
+        let stand_in = root.join("rocmd");
+        {
+            // Every writer is closed before the first exec.
+            let mut file = fs::File::create(&stand_in)?;
+            write!(
+                file,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 3\n",
+                seen.display()
+            )?;
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+            file.sync_all()?;
+        }
+
+        let service_id = "svc-restart-given-rocmd";
+        let mut record = identity_probe_record(&paths, service_id, 11470);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        // The first exec of a new file can still lose a race with an unrelated
+        // fork (ETXTBSY): setsid then exits at once and nothing is recorded.
+        let mut outcome = Err(anyhow::anyhow!("not attempted"));
+        for _ in 0..10 {
+            outcome = restart_managed_service_on(&paths, &mut record, &host);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !seen.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if seen.exists() {
+                break;
+            }
+        }
+        let args = fs::read_to_string(&seen).unwrap_or_default();
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(&root).ok();
+
+        outcome?;
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args.get(..2),
+            Some(&["supervise", service_id][..]),
+            "the rocmd it is given must be started as `rocmd supervise <service>`: {args:?}"
+        );
+        let persisted = persisted?;
+        assert_eq!(persisted.status, "recovering");
+        assert_ne!(
+            persisted.supervisor_pid, 0,
+            "the spawned supervisor's PID is recorded"
+        );
+        Ok(())
+    }
+
+    /// With no `rocmd` to run, the restart reports it, and the record is exactly
+    /// as the restart found it: it is not marked `recovering` for a supervisor
+    /// that was never started.
+    #[test]
+    fn restart_without_a_rocmd_to_run_changes_nothing() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-no-rocmd");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-no-rocmd";
+        let mut record = identity_probe_record(&paths, service_id, 11471);
+        record.status = "failed".to_owned();
+        record.write()?;
+        let before = load_service_record(&paths, service_id)?;
+
+        let host = DaemonHost::new(root.join("rocm"), true);
+        let outcome = restart_managed_service_on(&paths, &mut record, &host);
+        let after = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let error = format!(
+            "{:#}",
+            outcome.expect_err("no rocmd to run: the restart must fail")
+        );
+        assert!(error.contains("no `supervise` command"), "{error}");
+        assert!(error.contains("unable to locate sibling binary"), "{error}");
+        let after = after?;
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.supervisor_pid, before.supervisor_pid);
+        assert_eq!(after.restart_count, before.restart_count);
         Ok(())
     }
 
