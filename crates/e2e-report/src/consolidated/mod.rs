@@ -1766,8 +1766,17 @@ mod tests {
     /// comments are dropped; a `//` or `/*` inside a string literal is not a
     /// comment. A `use` statement is dropped from the keyword through its
     /// `;`, wherever it starts a statement, including a `use` nested in a
-    /// function body. Raw strings are not recognised: the renderers have none,
-    /// and one with an unbalanced `"` would confuse the scan.
+    /// function body.
+    ///
+    /// This is a hand-rolled scanner, not a Rust lexer, and its gaps are
+    /// deliberate. It knows plain `"..."` strings (with `\` escapes) and the
+    /// one-character char literals `'x'` and `'\x'`; it does NOT know raw
+    /// strings (`r"..."`, `r#"..."#`, `br"..."`), whose contents it would scan
+    /// as code, so a raw string holding a quote, `//` or `use` would change the
+    /// result silently. It does not know byte-string or other literal forms
+    /// either. [`contains_raw_string`] exists so the test using this helper
+    /// fails loudly if a renderer ever grows a raw string, instead of trusting
+    /// this scan on text it cannot read.
     fn strip_comments_and_uses(src: &str) -> String {
         let chars: Vec<char> = src.chars().collect();
         let mut out = String::new();
@@ -1812,10 +1821,19 @@ mod tests {
                 in_string = true;
                 out.push(c);
                 i += 1;
-            } else if c == '\'' && next == Some('"') && chars.get(i + 2) == Some(&'\'') {
-                // The `'"'` char literal: its quote does not open a string.
+            } else if c == '\''
+                && next.is_some_and(|n| n != '\\' && n != '\'')
+                && chars.get(i + 2) == Some(&'\'')
+            {
+                // A one-character literal such as `'"'` or `'/'`: its content
+                // does not open a string or a comment. (A lifetime never has a
+                // closing quote two characters on.)
                 out.extend(&chars[i..i + 3]);
                 i += 3;
+            } else if c == '\'' && next == Some('\\') && chars.get(i + 3) == Some(&'\'') {
+                // An escaped one-character literal such as `'\"'` or `'\''`.
+                out.extend(&chars[i..i + 4]);
+                i += 4;
             } else if c.is_alphabetic() || c == '_' {
                 let begin = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -1844,18 +1862,100 @@ mod tests {
         out
     }
 
+    /// Whether `src` contains a raw string literal (`r"`, `r#"`, `br"`, ...).
+    /// Deliberately over-eager: it does not skip comments or strings, because a
+    /// false alarm only makes the caller's assertion fail loudly, while a miss
+    /// would let [`strip_comments_and_uses`] mis-scan text it cannot read.
+    fn contains_raw_string(src: &str) -> bool {
+        let chars: Vec<char> = src.chars().collect();
+        let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+        (0..chars.len()).any(|i| {
+            if chars[i] != 'r' {
+                return false;
+            }
+            // `r` (or the `r` of `br`) must start a token, not end an identifier.
+            let start = if i > 0 && chars[i - 1] == 'b' {
+                i - 1
+            } else {
+                i
+            };
+            if start > 0 && is_ident(chars[start - 1]) {
+                return false;
+            }
+            let mut j = i + 1;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            chars.get(j) == Some(&'"')
+        })
+    }
+
+    /// Splits stripped code into what lies outside string literals (each
+    /// literal collapsed to `""`) and the contents of each string literal.
+    /// Same literal rules, and same gaps, as [`strip_comments_and_uses`].
+    fn split_string_literals(code: &str) -> (String, Vec<String>) {
+        let chars: Vec<char> = code.chars().collect();
+        let (mut outside, mut strings) = (String::new(), Vec::new());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '"' {
+                let mut body = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        body.push(chars[i]);
+                        i += 1;
+                    }
+                    body.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                outside.push_str("\"\"");
+                strings.push(body);
+            } else if c == '\''
+                && next.is_some_and(|n| n != '\\' && n != '\'')
+                && chars.get(i + 2) == Some(&'\'')
+            {
+                outside.extend(&chars[i..i + 3]);
+                i += 3;
+            } else if c == '\'' && next == Some('\\') && chars.get(i + 3) == Some(&'\'') {
+                outside.extend(&chars[i..i + 4]);
+                i += 4;
+            } else {
+                outside.push(c);
+                i += 1;
+            }
+        }
+        (outside, strings)
+    }
+
     /// Whether `code` (already stripped by [`strip_comments_and_uses`]) refers
-    /// to `constant` the way the renderers do: as a `{NAME}` interpolation in a
-    /// format string, or as a `(NAME)` splice in a `maud` block. A bare mention
-    /// that is neither (an import, a comment, a `let _ = NAME;`) is not use.
+    /// to `constant` the way the renderers do: as a `{NAME}` (or `{NAME:..}`)
+    /// interpolation inside a string literal, or as a `(NAME)` splice outside
+    /// any string that is not a call argument (`foo(NAME)` and `.m(NAME)` are
+    /// refused: the `(` must not directly follow an identifier). A bare mention
+    /// that is none of these (an import, a comment, a `let _ = NAME;`) is not
+    /// use.
+    ///
+    /// What this still cannot tell: whether the interpolation is in the
+    /// gating sentence rather than in some other string, or the splice in the
+    /// right `maud` block. Placement is carried by the verbatim pins
+    /// `summary_explanation_paragraphs_are_unchanged` and
+    /// `legend_mock_and_other_platform_items_are_unchanged`, not by this check.
     fn references_constant(code: &str, constant: &str) -> bool {
-        [
-            format!("{{{constant}}}"),
-            format!("{{{constant}:"),
-            format!("({constant})"),
-        ]
-        .iter()
-        .any(|shape| code.contains(shape.as_str()))
+        let (outside, strings) = split_string_literals(code);
+        let interpolated = strings.iter().any(|s| {
+            s.contains(&format!("{{{constant}}}")) || s.contains(&format!("{{{constant}:"))
+        });
+        let splice = format!("({constant})");
+        let spliced = outside.match_indices(&splice).any(|(at, _)| {
+            !outside[..at]
+                .trim_end()
+                .ends_with(|ch: char| ch.is_alphanumeric() || ch == '_')
+        });
+        interpolated || spliced
     }
 
     #[test]
@@ -1935,6 +2035,79 @@ mod tests {
     }
 
     #[test]
+    fn references_constant_refuses_a_call_argument() {
+        for src in [
+            "fn f() { foo(MOCK_GATES_PR); }\n",
+            "fn f() { out.push_str(MOCK_GATES_PR); }\n",
+            "fn f() { foo (MOCK_GATES_PR); }\n",
+        ] {
+            let code = strip_comments_and_uses(src);
+            assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn references_constant_wants_each_shape_on_its_own_side_of_a_string() {
+        // A splice written inside a string is text, not a splice; an
+        // interpolation written outside a string is a block, not a format arg.
+        for src in [
+            "fn f() { let s = \"see: (MOCK_GATES_PR)\"; }\n",
+            "fn f() { let s = { MOCK_GATES_PR }; let t = {MOCK_GATES_PR}; }\n",
+        ] {
+            let code = strip_comments_and_uses(src);
+            assert!(!references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn references_constant_still_accepts_a_format_spec_and_a_splice_after_a_block() {
+        // `<` stands in for the opening brace so clippy does not take the
+        // fixture for a malformed format string.
+        let with_spec = "fn f() { write!(o, \"<MOCK_GATES_PR:>4}\"); }\n".replace('<', "{");
+        let code = strip_comments_and_uses(&with_spec);
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+
+        let after_block = "fn f() { html! { b { \"x\" } (MOCK_GATES_PR) } }\n";
+        let code = strip_comments_and_uses(after_block);
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn strip_comments_and_uses_reads_one_character_literals() {
+        // None of these quotes or slashes may open a string or a comment.
+        let code = strip_comments_and_uses(
+            "let a = '\"'; let b = '\\\"'; let c = '/'; let d = '\\''; // gone MOCK_GATES_PR\n\
+             let e = \"{OTHER_LANES_NON_BLOCKING}\"; fn g<'a>(x: &'a str) {}\n",
+        );
+        assert!(!code.contains("MOCK_GATES_PR"), "{code:?}");
+        assert!(
+            references_constant(&code, "OTHER_LANES_NON_BLOCKING"),
+            "{code:?}"
+        );
+    }
+
+    #[test]
+    fn contains_raw_string_flags_every_raw_form_and_nothing_else() {
+        for raw in [
+            "let s = r\"x\";",
+            "let s = r#\"x\"#;",
+            "let s = r##\"x\"##;",
+            "let s = br\"x\";",
+            "f(r\"x\")",
+        ] {
+            assert!(contains_raw_string(raw), "missed: {raw}");
+        }
+        for plain in [
+            "let r = \"x\";",
+            "let s = bar\"x\";",
+            "let s = \"x\"; // r and #",
+            "write!(out, \"{x}\")",
+        ] {
+            assert!(!contains_raw_string(plain), "false alarm: {plain}");
+        }
+    }
+
+    #[test]
     fn references_constant_accepts_a_macro_splice() {
         let code = strip_comments_and_uses(
             "use super::MOCK_GATES_PR;\nfn f() { html! { li { \"and \" (MOCK_GATES_PR) \".\" } } }\n",
@@ -1951,15 +2124,21 @@ mod tests {
         // with identical words would still pass them and would silently stop
         // following `MOCK_GATES_PR` / `OTHER_LANES_NON_BLOCKING`. This test
         // closes that gap by reading each renderer's non-test source. It
-        // requires two things. First, each constant is in use: after dropping
-        // `use` statements and comments, the code must interpolate it as
-        // `{NAME}` in a format string or splice it as `(NAME)` into a `maud`
-        // block, so an import or a comment that merely names it does not count.
-        // Second, the source must not spell either phrase out itself (checked
-        // on the raw text, comments included). It does not prove that the
-        // interpolation sits in the sentence the reader sees, only that the
-        // renderer takes the words from the constant; the verbatim pins above
-        // prove the rendered words.
+        // requires three things. First, the production source has no raw
+        // string literal, which the hand-rolled scanner below cannot read (the
+        // test fails loudly rather than trusting a scan it cannot do). Second,
+        // each constant is in use: after dropping `use` statements and
+        // comments, the code must interpolate it as `{NAME}` inside a string
+        // literal or splice it as `(NAME)` outside one (not as a call
+        // argument), so an import, a comment or a bare mention does not count.
+        // Third, the source must not spell either phrase out itself (checked on
+        // the raw text, comments included).
+        //
+        // What it does NOT prove is placement: an interpolation in some other
+        // string, or a splice in the wrong block, would still satisfy it. That
+        // guarantee is carried by the verbatim pins above, which fix the
+        // rendered words; this test only guards that the words keep coming from
+        // the constants rather than from a re-typed copy or an unused import.
         for (name, source) in [
             ("markdown.rs", include_str!("markdown.rs")),
             ("html.rs", include_str!("html.rs")),
@@ -1968,6 +2147,11 @@ mod tests {
                 .split("#[cfg(test)]")
                 .next()
                 .expect("split always yields a first part");
+            assert!(
+                !contains_raw_string(production),
+                "{name} now has a raw string literal, which `strip_comments_and_uses` \
+                 cannot scan; teach the helper raw strings before relying on this test"
+            );
             let code = strip_comments_and_uses(production);
             for (constant, phrase) in [
                 ("MOCK_GATES_PR", MOCK_GATES_PR),
@@ -1976,8 +2160,9 @@ mod tests {
                 assert!(
                     references_constant(&code, constant),
                     "{name} must build its gating sentence from `{constant}`, \
-                     interpolated as `{{{constant}}}` or spliced as `({constant})`; \
-                     an import or a comment naming it is not use"
+                     interpolated as `{{{constant}}}` inside a string literal or spliced \
+                     as `({constant})` outside one (not as a call argument); \
+                     an import, a comment or a bare mention is not use"
                 );
                 assert!(
                     !production.contains(phrase),
