@@ -63,7 +63,85 @@ fn plant_logs(world: &E2eWorld, invalid_byte: bool) {
     std::fs::write(cli_logs.join("e2e-probe.log"), body).expect("failed to write log file");
 }
 
+/// How far past the 4 MiB a log view reads (`LOG_VIEW_MAX_TAIL_READ` in
+/// `rocm-core`) the planted line reaches.
+const LOG_VIEW_BOUND_BYTES: usize = 4 * 1024 * 1024;
+const OVERSIZE_LINE_BYTES: usize = LOG_VIEW_BOUND_BYTES + 1024;
+
+/// Plant the record of a stopped local server (the same planting the record
+/// cleanup scenarios use) and replace its log with `bytes`.
+fn plant_server_record_with_log(world: &E2eWorld, bytes: &[u8]) {
+    crate::e2e::service_cleanup_steps::plant_record(world, "failed");
+    std::fs::write(server_log_path(world), bytes).expect("failed to write the server log");
+}
+
+fn server_log_path(world: &E2eWorld) -> std::path::PathBuf {
+    crate::e2e::service_cleanup_steps::services_dir(world).join(format!(
+        "{}.log",
+        crate::e2e::service_cleanup_steps::SERVICE_ID
+    ))
+}
+
+/// The one saved ComfyUI log the ComfyUI log scenarios plant.
+fn comfyui_log_path(world: &E2eWorld) -> std::path::PathBuf {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    root.path()
+        .join("data")
+        .join("apps")
+        .join("comfyui")
+        .join("logs")
+        .join("start-e2e.log")
+}
+
+fn plant_comfyui_log(world: &E2eWorld, bytes: &[u8]) {
+    let log = comfyui_log_path(world);
+    std::fs::create_dir_all(log.parent().expect("log has a parent"))
+        .expect("failed to create the ComfyUI logs dir");
+    std::fs::write(&log, bytes).expect("failed to write the ComfyUI log");
+}
+
+#[given("a ComfyUI log holding one line longer than the log view reads")]
+async fn comfyui_with_an_oversize_line(world: &mut E2eWorld) {
+    plant_comfyui_log(world, &vec![b'x'; OVERSIZE_LINE_BYTES]);
+}
+
+#[given("a ComfyUI log file that is empty")]
+async fn comfyui_with_an_empty_log(world: &mut E2eWorld) {
+    plant_comfyui_log(world, b"");
+}
+
+#[given("a local server record whose log holds one line longer than the log view reads")]
+async fn server_with_an_oversize_line(world: &mut E2eWorld) {
+    // No final newline: a server mid-line when it died, or one that logs
+    // without line breaks.
+    plant_server_record_with_log(world, &vec![b'x'; OVERSIZE_LINE_BYTES]);
+}
+
+#[given("a local server record whose log file is empty")]
+async fn server_with_an_empty_log(world: &mut E2eWorld) {
+    plant_server_record_with_log(world, b"");
+}
+
 // ── When ───────────────────────────────────────────────────────────
+
+#[when("the user reads that server's log")]
+async fn read_server_log(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "services",
+            "logs",
+            crate::e2e::service_cleanup_steps::SERVICE_ID,
+        ],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user reads the ComfyUI logs")]
+async fn read_comfyui_logs(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "logs"]);
+    record(world, stdout, stderr, rc);
+}
 
 #[when("the user searches the logs for that topic")]
 async fn search_topic(world: &mut E2eWorld) {
@@ -101,6 +179,68 @@ async fn reports_matches(world: &mut E2eWorld) {
         out.contains(&format!("Showing: 1-{MATCH_COUNT} of {MATCH_COUNT}")),
         "expected the {MATCH_COUNT} matches to be listed, got:\n{out}"
     );
+}
+
+#[then("the CLI says the newest line is too long to show instead of saying there is no output")]
+async fn says_the_line_is_too_long(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(
+            "Recent output: none shown; the newest line is longer than the 4 MiB a log view reads"
+        ),
+        "expected the too-long notice, got:\n{out}"
+    );
+    assert!(
+        !out.contains("no output yet"),
+        "a log with content must not be reported as having no output:\n{out}"
+    );
+    // The claim and the state it describes: the log on disk holds exactly one
+    // line, longer than the bound the notice names.
+    let on_disk = std::fs::read(server_log_path(world)).expect("the server log is still there");
+    assert!(
+        on_disk.len() > LOG_VIEW_BOUND_BYTES && !on_disk.contains(&b'\n'),
+        "the log on disk should be one line past the bound, is {} bytes",
+        on_disk.len()
+    );
+}
+
+#[then(
+    "the CLI says the ComfyUI log's newest line is too long to show instead of saying it is empty"
+)]
+async fn comfyui_says_the_line_is_too_long(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("No output shown: the newest line is longer than the 4 MiB a log view reads."),
+        "expected the too-long notice, got:\n{out}"
+    );
+    assert!(
+        !out.contains("is empty"),
+        "a log with content must not be reported as empty:\n{out}"
+    );
+    let on_disk = std::fs::read(comfyui_log_path(world)).expect("the ComfyUI log is still there");
+    assert!(
+        on_disk.len() > LOG_VIEW_BOUND_BYTES && !on_disk.contains(&b'\n'),
+        "the log on disk should be one line past the bound, is {} bytes",
+        on_disk.len()
+    );
+}
+
+#[then("the CLI says the ComfyUI log is empty")]
+async fn comfyui_says_empty(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(out.contains("The saved log is empty."), "{out}");
+    assert!(!out.contains("longer than"), "{out}");
+    let on_disk = std::fs::read(comfyui_log_path(world)).expect("the ComfyUI log is still there");
+    assert!(on_disk.is_empty(), "the log on disk should be empty");
+}
+
+#[then("the CLI says there is no output yet")]
+async fn says_no_output_yet(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(out.contains("Recent output: no output yet"), "{out}");
+    assert!(!out.contains("longer than"), "{out}");
+    let on_disk = std::fs::read(server_log_path(world)).expect("the server log is still there");
+    assert!(on_disk.is_empty(), "the log on disk should be empty");
 }
 
 #[then("the CLI reports no matching lines")]
