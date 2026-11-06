@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use rocm_core::AppPaths;
+use rocm_core::{AppPaths, AutomationRuntimeState};
 
 use crate::runtimes_cmd::{runtime_manifest_path, runtime_registry_dir};
 use crate::therock;
@@ -359,6 +359,33 @@ pub(crate) const SERVE_SAFETY_ACCEPTED: &[&[&str]] = &[
 /// `args` as the owned argv both surfaces take.
 pub(crate) fn owned_argv(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_owned()).collect()
+}
+
+/// Build an `AutomationRuntimeState` for the background-helper tests (the
+/// no-double-spawn guard in `background_helper.rs` and the autostart tests in
+/// `service_launch.rs`).
+pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
+    AutomationRuntimeState {
+        running,
+        automations_enabled: true,
+        daemon_pid,
+        started_at_unix_ms: 1,
+        last_tick_unix_ms: 1,
+        local_webhook_endpoint: None,
+        active_watchers: Vec::new(),
+    }
+}
+
+/// Put the on-disk facts in one of the four combinations: whether a watcher
+/// is enabled, and whether the helper is running (this process stands in for
+/// a live daemon).
+pub(crate) fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
+    let mut config = rocm_core::RocmCliConfig::default();
+    config.watcher_config_mut("server-recover").enabled = watcher_enabled;
+    config.save(paths).expect("save config");
+    runtime_state(helper_running, std::process::id())
+        .write(paths)
+        .expect("write runtime state");
 }
 
 mod tests {

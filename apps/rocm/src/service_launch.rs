@@ -1546,7 +1546,7 @@ fn finish_attached_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::background_helper::tests::{runtime_state, set_helper_facts};
+    use crate::test_support::{runtime_state, set_helper_facts};
     use crate::tests::test_paths;
 
     #[test]

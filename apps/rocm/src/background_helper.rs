@@ -85,24 +85,12 @@ pub(crate) fn background_helper_note(paths: &AppPaths) -> Option<HelperNote> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::fs;
 
     use super::*;
+    use crate::test_support::{runtime_state, set_helper_facts};
     use crate::tests::test_paths;
-
-    /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
-    pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
-        AutomationRuntimeState {
-            running,
-            automations_enabled: true,
-            daemon_pid,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 1,
-            local_webhook_endpoint: None,
-            active_watchers: Vec::new(),
-        }
-    }
 
     #[test]
     fn background_helper_already_running_true_for_live_pid() {
@@ -147,18 +135,6 @@ pub(crate) mod tests {
             "running=false ⇒ not running even with a live pid"
         );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Put the on-disk facts in one of the four combinations: whether a watcher
-    /// is enabled, and whether the helper is running (this process stands in for
-    /// a live daemon).
-    pub(crate) fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
-        let mut config = rocm_core::RocmCliConfig::default();
-        config.watcher_config_mut("server-recover").enabled = watcher_enabled;
-        config.save(paths).expect("save config");
-        runtime_state(helper_running, std::process::id())
-            .write(paths)
-            .expect("write runtime state");
     }
 
     /// ROCMAI-827: the helper note is derived from both facts, so it cannot
