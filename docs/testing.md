@@ -516,16 +516,16 @@ the note against the state it left: a recording `uv` standing in for the downloa
 was never run (that log is the evidence; no network is involved), and there is no
 managed-tools folder and no saved config. It also looks for a tool archive in its
 own cache folder, but only as a backstop: the stand-in `uv` is returned before a
-download could start. The printed `command:` line then shows `uv venv --python 3.12 ...` (a version,
-because no interpreter path exists yet), so it is not copy-pasteable verbatim:
-`uv` resolves `3.12` itself, and on a host with a different Python 3.12 it can
-choose that one rather than the managed one a real install prepares.
-That scenario is a canonical-layout preview. A preview of a
-ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still need `uv`:
-it resolves the published package versions with `uv pip compile`, so on a clean
-host it can download the managed `uv` and create the data folder's `tools`
-folder, although it still prepares no Python. The "no `uv`, no `tools` folder"
-guarantee is therefore the canonical layout's only.
+download could start. The printed `command:` line then shows
+`uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
+so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
+with a different Python 3.12 it can choose that one rather than the managed one
+a real install prepares. That scenario is a canonical-layout preview. A preview
+of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still
+need `uv`: it resolves the published package versions with `uv pip compile`, so
+on a clean host it can download the managed `uv` and create the data folder's
+`tools` folder, although it still prepares no Python. The "no `uv`, no `tools`
+folder" guarantee is therefore the canonical layout's only.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
