@@ -13,8 +13,8 @@ use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ENGINE_UNKNOWN_EVIDENCE, ServeAttempt, archive_service_log, engine_from_serve_args,
-    reported_engine, serve_attempt_report, service_log_tail,
+    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
+    serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -137,6 +137,9 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 /// rather than three calls at each site: the log must be read and copied out
 /// while the service still owns it, because stopping the service both changes
 /// what the log's last lines say and is the step most likely to fail outright.
+/// For Lemonade the backend inventory is read before the stop too, and the
+/// `llama-server` probes, which execute a backend binary, run only after it so
+/// they cannot contend with the still-running router.
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
@@ -157,17 +160,15 @@ async fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
-    let backend_evidence = match engine {
-        Some("lemonade") => Some(
-            e2e_cucumber::lemonade_diagnostics::backend_evidence(
-                &world.app_paths().engine_runtime_manifest_path("lemonade"),
-            )
-            .await,
-        ),
-        Some(_) => None,
-        None => Some(ENGINE_UNKNOWN_EVIDENCE.to_owned()),
-    };
-    let stop_status = stop_scenario_services(world);
+    // The stop sits inside this call because its position relative to the
+    // backend probes is the point: see `backend_evidence_around_stop`.
+    let (stop_status, backend_evidence) =
+        e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
+            || world.app_paths().engine_runtime_manifest_path("lemonade"),
+            engine,
+            || stop_scenario_services(world),
+        )
+        .await;
     serve_attempt_report(&ServeAttempt {
         headline,
         device_state,

@@ -66,8 +66,8 @@ reason = "A vLLM serve of a short name does not resolve to lemonade's full model
 # Retain flaky=true because historical runs also passed intermittently; do not
 # infer a fix from a single XPASS. The flag is per-row and is NOT derived from
 # `bug`, so a new #897 row needs `flaky = true` added explicitly. Failed serves
-# now capture candidate executable --version/--help and configured pins
-# separately, before stopping the service.
+# now capture configured pins, candidate executable paths and fingerprints
+# before stopping the service, and each candidate's --version/--help after it.
 #
 # os=linux: native Windows passed (29338475133 Strix-Windows).
 [["serve-default-engine-working-endpoint"]]

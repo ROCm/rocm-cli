@@ -831,8 +831,9 @@ are hashed and probed, with two read-only probes per candidate. Each probe retai
 up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
 marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
 output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
-Each probe has a five-second timeout. Hashing and probes share a 20-second budget
-after inventory discovery; hashing runs off the async executor, rejects files
+Each probe has a five-second timeout. The inventory, including hashing, has a
+20-second budget and the probes have their own 20-second budget, which starts
+when the service stop returns; hashing runs off the async executor, rejects files
 over 32 MiB, and checks its deadline between 64 KiB reads. A candidate over the
 size cap gets no fingerprint, and its entry says so with `sha256 unavailable:
 executable exceeds 32 MiB hash limit`; it is still listed and probed. Filesystem
@@ -842,13 +843,20 @@ A candidate or configured build pin is **not proof** of which binary the router
 launched; a failed probe is retained as evidence, not treated as an identity.
 Probes inherit the harness environment rather than reconstructing the engine's
 managed library paths, so a probe loader error alone does not establish why the
-serve failed. The probes run once the serve has exited non-zero or its readiness
-wait has timed out, and after the log has been read and archived, but before the
-service is stopped, so the router may still be running while they execute. Whether
-a `llama-server --version` or `--help` run initialises a GPU backend, and so could
-contend with that router on a shared-memory device, has not been checked; the
-probes are bounded and sequential, and the attempt's failing outcome is already
-decided when they start.
+serve failed. The report reads files first and executes a backend second. The
+manifest, pins, candidate paths, fingerprints and `version.txt` are read once the serve has exited
+non-zero or its readiness wait has timed out and the log has been read and
+archived, but before the service is stopped, so they describe the state being
+diagnosed. The `--version` and `--help` probes run after the stop returns, in the
+report's "probes, run after the service stop was attempted" section: llama.cpp
+builds commonly initialise a GPU backend even for `--version`, and doing that next
+to a still-running router on a shared-memory device could change the state being
+diagnosed. A stop that fails or finds no record can leave the router running; the
+report's `stop` section says so, and the probes still run. No lane has shown
+whether a probe initialises a GPU backend, which is why they are kept off the
+router's side of the stop. The order is fixed in one function,
+`backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
+to show the fingerprint was read before it and the probes came after it.
 
 Use the evidence to distinguish backend startup, download, and router readiness
 failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the

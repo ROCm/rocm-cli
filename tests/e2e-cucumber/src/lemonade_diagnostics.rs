@@ -2,7 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Read-only backend evidence for a failed Lemonade serve, before teardown.
+//! Read-only backend evidence for a failed Lemonade serve.
+//!
+//! The evidence is taken in two steps with the service stop between them (see
+//! [`backend_evidence_around_stop`]): what is only read from disk (manifest,
+//! pins, candidate paths, fingerprints) is collected while the failed service is
+//! still in the state being diagnosed, and the `llama-server` probes, which
+//! execute a backend binary, run after it has been stopped.
 
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -12,31 +18,147 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::serve_log::read_clamped;
+use crate::serve_log::{ENGINE_UNKNOWN_EVIDENCE, read_clamped};
 
 const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CANDIDATES: usize = 8;
-const TOTAL_EVIDENCE_BUDGET: Duration = Duration::from_secs(20);
+/// Time for the read-only inventory (pins, candidate paths, fingerprints),
+/// taken before the service is stopped.
+const INVENTORY_BUDGET: Duration = Duration::from_secs(20);
+/// Time for the probes, started after the stop returns so a slow stop does not
+/// use it up.
+const PROBE_BUDGET: Duration = Duration::from_secs(20);
 const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct Budgets {
+    inventory: Duration,
+    probes: Duration,
+}
+
+const DEFAULT_BUDGETS: Budgets = Budgets {
+    inventory: INVENTORY_BUDGET,
+    probes: PROBE_BUDGET,
+};
+
+/// Runs one `llama-server` flag and renders what came back. A trait so the order
+/// of probes against the service stop is testable without executing a binary.
+trait Probe {
+    async fn run(&self, server: &Path, flag: &str, timeout: Duration) -> String;
+}
+
+struct RealProbe;
+
+impl Probe for RealProbe {
+    async fn run(&self, server: &Path, flag: &str, timeout: Duration) -> String {
+        probe(server, flag, timeout).await
+    }
+}
+
+/// Collect the backend evidence for a failed serve of `engine` around the call
+/// that stops the service, and return the stop's own status with it.
+///
+/// `stop` always runs exactly once, whatever the engine, so a caller cannot
+/// forget it or run it twice. For Lemonade the order is fixed: the read-only
+/// inventory first, then `stop`, then the probes. A probe executes a backend
+/// binary, and llama.cpp builds commonly initialise a GPU backend even for
+/// `--version`, so running one next to a still-live router on a shared-memory
+/// device could change the very state being diagnosed. Reading files cannot.
+/// `manifest_path` is only called for Lemonade.
+///
+/// The report says `engine unknown` when no engine was determined, so a skipped
+/// inventory stays visible, and returns no evidence for another engine.
+pub async fn backend_evidence_around_stop(
+    manifest_path: impl FnOnce() -> PathBuf,
+    engine: Option<&str>,
+    stop: impl FnOnce() -> String,
+) -> (String, Option<String>) {
+    match engine {
+        Some("lemonade") => {
+            let (stop_status, evidence) =
+                evidence_around_stop(&manifest_path(), DEFAULT_BUDGETS, &RealProbe, stop).await;
+            (stop_status, Some(evidence))
+        }
+        Some(_) => (stop(), None),
+        None => (stop(), Some(ENGINE_UNKNOWN_EVIDENCE.to_owned())),
+    }
+}
+
+async fn evidence_around_stop(
+    manifest_path: &Path,
+    budgets: Budgets,
+    probe: &impl Probe,
+    stop: impl FnOnce() -> String,
+) -> (String, String) {
+    let inventory = take_inventory(manifest_path, budgets.inventory).await;
+    let stop_status = stop();
+    let probes = inventory.probe_all(probe, budgets.probes).await;
+    (stop_status, format!("{}{probes}", inventory.report))
+}
+
+/// What was read from disk before the stop: the report so far, and the
+/// candidates the probes will run against once the service is stopped.
+struct Inventory {
+    report: String,
+    servers: Vec<PathBuf>,
+}
+
+impl Inventory {
+    fn without_probes(report: String) -> Self {
+        Self {
+            report,
+            servers: Vec::new(),
+        }
+    }
+
+    async fn probe_all(&self, probe: &impl Probe, budget: Duration) -> String {
+        if self.servers.is_empty() {
+            return String::new();
+        }
+        let mut report = String::new();
+        let _ = writeln!(
+            report,
+            "probes, run after the service stop was attempted; they inherit the harness \
+             environment, not the engine's managed library environment, so a probe loader \
+             failure does not establish a serving failure:"
+        );
+        let deadline = Instant::now() + budget;
+        for server in &self.servers {
+            let _ = writeln!(report, "probe target: {}", server.display());
+            for flag in ["--version", "--help"] {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = writeln!(
+                        report,
+                        "remaining evidence skipped: evidence budget exhausted"
+                    );
+                    return report;
+                }
+                let output = probe.run(server, flag, remaining.min(PROBE_TIMEOUT)).await;
+                let _ = writeln!(report, "{flag}:\n{output}");
+            }
+        }
+        report
+    }
+}
 
 /// Record the installed version and pins separately from executable build output:
 /// a pin describes what should be installed, not what a runner actually cached.
 ///
 /// Every candidate is labelled as such; finding a binary does not prove that the
-/// router launched it. No install, download, model load, or cache repair is done.
-pub async fn backend_evidence(manifest_path: &Path) -> String {
-    backend_evidence_with_budget(manifest_path, TOTAL_EVIDENCE_BUDGET).await
-}
-
-async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) -> String {
+/// router launched it. Nothing here executes anything. No install, download,
+/// model load, or cache repair is done.
+async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
     let mut report = String::new();
     let _ = writeln!(report, "manifest: {}", manifest_path.display());
     let manifest = match read_clamped(manifest_path, MAX_EVIDENCE_BYTES).and_then(|(bytes, _)| {
         serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
     }) {
         Ok(manifest) => manifest,
-        Err(error) => return format!("{report}unavailable: {error}"),
+        Err(error) => {
+            return Inventory::without_probes(format!("{report}unavailable: {error}"));
+        }
     };
     for key in ["version", "backend_recipe", "backend_name", "runtime_dir"] {
         let _ = writeln!(
@@ -49,7 +171,9 @@ async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) ->
         .get("runtime_dir")
         .and_then(serde_json::Value::as_str)
     else {
-        return format!("{report}backend inventory unavailable: no runtime_dir");
+        return Inventory::without_probes(format!(
+            "{report}backend inventory unavailable: no runtime_dir"
+        ));
     };
     let runtime = Path::new(runtime);
     let pins = runtime.join("resources/backend_versions.json");
@@ -63,11 +187,6 @@ async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) ->
         }
     }
     let candidates = backend_candidates(runtime);
-    let _ = writeln!(
-        report,
-        "probes inherit the harness environment, not the engine's managed library environment; \
-         a probe loader failure does not establish a serving failure"
-    );
     if candidates.is_empty() {
         let _ = writeln!(
             report,
@@ -75,19 +194,21 @@ async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) ->
         );
     }
     let deadline = Instant::now() + budget;
+    let mut servers = Vec::new();
     for server in candidates.iter().take(MAX_CANDIDATES) {
         if Instant::now() >= deadline {
             let _ = writeln!(
                 report,
                 "remaining evidence skipped: evidence budget exhausted"
             );
-            return report;
+            return Inventory { report, servers };
         }
         let _ = writeln!(
             report,
             "candidate (not proof of selection): {}",
             server.display()
         );
+        servers.push(server.clone());
         let path = server.clone();
         match tokio::task::spawn_blocking(move || fingerprint(&path, deadline))
             .await
@@ -112,18 +233,6 @@ async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) ->
                 );
             }
         }
-        for flag in ["--version", "--help"] {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let _ = writeln!(
-                    report,
-                    "remaining evidence skipped: evidence budget exhausted"
-                );
-                return report;
-            }
-            let output = probe(server, flag, remaining.min(PROBE_TIMEOUT)).await;
-            let _ = writeln!(report, "{flag}:\n{output}");
-        }
     }
     if candidates.len() > MAX_CANDIDATES {
         let _ = writeln!(
@@ -131,7 +240,7 @@ async fn backend_evidence_with_budget(manifest_path: &Path, budget: Duration) ->
             "backend inventory truncated after {MAX_CANDIDATES} candidates"
         );
     }
-    report
+    Inventory { report, servers }
 }
 
 fn backend_candidates(runtime: &Path) -> Vec<PathBuf> {
@@ -287,6 +396,16 @@ async fn drain_output(
 mod tests {
     use super::*;
 
+    async fn evidence(manifest: &Path) -> String {
+        evidence_with(manifest, DEFAULT_BUDGETS).await
+    }
+
+    async fn evidence_with(manifest: &Path, budgets: Budgets) -> String {
+        evidence_around_stop(manifest, budgets, &RealProbe, String::new)
+            .await
+            .1
+    }
+
     fn write_manifest(runtime: &Path) -> PathBuf {
         let manifest = runtime.join("runtime.json");
         std::fs::write(
@@ -319,7 +438,7 @@ mod tests {
         let server = root.path().join("not-executable");
         std::fs::write(&server, b"abc").unwrap();
         assert_eq!(
-            fingerprint(&server, Instant::now() + TOTAL_EVIDENCE_BUDGET).unwrap(),
+            fingerprint(&server, Instant::now() + INVENTORY_BUDGET).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -331,14 +450,14 @@ mod tests {
         let file = std::fs::File::create(&server).unwrap();
         file.set_len(MAX_HASH_BYTES).unwrap();
         assert_eq!(
-            fingerprint(&server, Instant::now() + TOTAL_EVIDENCE_BUDGET)
+            fingerprint(&server, Instant::now() + INVENTORY_BUDGET)
                 .unwrap()
                 .len(),
             64
         );
         file.set_len(MAX_HASH_BYTES + 1).unwrap();
         assert_eq!(
-            fingerprint(&server, Instant::now() + TOTAL_EVIDENCE_BUDGET)
+            fingerprint(&server, Instant::now() + INVENTORY_BUDGET)
                 .unwrap_err()
                 .to_string(),
             "executable exceeds 32 MiB hash limit"
@@ -392,7 +511,7 @@ mod tests {
             std::fs::create_dir_all(server.parent().unwrap()).unwrap();
             std::fs::write(server, "").unwrap();
         }
-        let report = backend_evidence(&write_manifest(root.path())).await;
+        let report = evidence(&write_manifest(root.path())).await;
         assert_eq!(
             report
                 .matches("candidate (not proof of selection):")
@@ -434,7 +553,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_HASH_BYTES + 1)
             .unwrap();
-        let report = backend_evidence(&write_manifest(root.path())).await;
+        let report = evidence(&write_manifest(root.path())).await;
         assert!(
             report.contains("sha256 unavailable: executable exceeds 32 MiB hash limit"),
             "{report}"
@@ -455,12 +574,144 @@ mod tests {
         let server = root.path().join("bin/llamacpp/rocm-stable").join(binary);
         std::fs::create_dir_all(server.parent().unwrap()).unwrap();
         std::fs::write(server, "").unwrap();
-        let report =
-            backend_evidence_with_budget(&write_manifest(root.path()), Duration::ZERO).await;
+        let report = evidence_with(
+            &write_manifest(root.path()),
+            Budgets {
+                inventory: Duration::ZERO,
+                probes: PROBE_BUDGET,
+            },
+        )
+        .await;
         assert!(report.contains("remaining evidence skipped: evidence budget exhausted"));
         for skipped in ["sha256", "--version:", "--help:", "candidate ("] {
             assert!(!report.contains(skipped), "{report}");
         }
+    }
+
+    struct RecordingProbe<'a> {
+        events: &'a std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Probe for RecordingProbe<'_> {
+        async fn run(&self, _server: &Path, flag: &str, _timeout: Duration) -> String {
+            self.events.borrow_mut().push(format!("probe {flag}"));
+            "recorded, not executed".to_owned()
+        }
+    }
+
+    /// A lemonade data dir whose manifest sits where the engine writes it, with one
+    /// small candidate whose SHA-256 is a known value.
+    fn lemonade_data_dir_with_candidate() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = rocm_core::AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let runtime = root.path().join("runtime");
+        let binary = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        let server = runtime.join("bin/llamacpp/rocm-stable").join(binary);
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, b"abc").unwrap();
+        let manifest = paths.engine_runtime_manifest_path("lemonade");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"runtime_dir": runtime}).to_string(),
+        )
+        .unwrap();
+        (root, manifest, server)
+    }
+
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    /// The inventory is read while the failed service is still in place and the
+    /// probes, which execute a backend binary, run only after the stop.
+    ///
+    /// The stop deletes the candidate. A fingerprint in the report therefore proves
+    /// the file was read before the stop, and the recorded events prove the probes
+    /// came after it; running either step on the wrong side turns this red.
+    #[tokio::test]
+    async fn inventory_precedes_the_stop_and_probes_follow_it() {
+        let (_root, manifest, server) = lemonade_data_dir_with_candidate();
+        let events = std::cell::RefCell::new(Vec::new());
+        let (stop_status, report) = evidence_around_stop(
+            &manifest,
+            DEFAULT_BUDGETS,
+            &RecordingProbe { events: &events },
+            || {
+                events.borrow_mut().push("stop".to_owned());
+                std::fs::remove_file(&server).unwrap();
+                "stopped".to_owned()
+            },
+        )
+        .await;
+        assert_eq!(stop_status, "stopped");
+        assert_eq!(
+            *events.borrow(),
+            ["stop", "probe --version", "probe --help"],
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("sha256: {ABC_SHA256}")),
+            "{report}"
+        );
+        assert!(!report.contains("sha256 unavailable"), "{report}");
+        let inventory = report.find("candidate (not proof of selection):").unwrap();
+        let probes = report.find("probe target:").unwrap();
+        assert!(inventory < probes, "{report}");
+        assert!(report.contains("recorded, not executed"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn stop_runs_once_for_every_engine_and_an_unknown_engine_stays_visible() {
+        let stops = std::cell::Cell::new(0);
+        let stop = || {
+            stops.set(stops.get() + 1);
+            "stopped".to_owned()
+        };
+        let no_manifest = || -> PathBuf { panic!("the manifest is only read for lemonade") };
+
+        assert_eq!(
+            backend_evidence_around_stop(no_manifest, Some("vllm"), stop).await,
+            ("stopped".to_owned(), None)
+        );
+        assert_eq!(
+            backend_evidence_around_stop(no_manifest, None, stop).await,
+            (
+                "stopped".to_owned(),
+                Some(ENGINE_UNKNOWN_EVIDENCE.to_owned())
+            )
+        );
+        assert_eq!(stops.get(), 2);
+
+        let (_root, manifest, _server) = lemonade_data_dir_with_candidate();
+        let (status, evidence) =
+            backend_evidence_around_stop(|| manifest, Some("lemonade"), stop).await;
+        assert_eq!(status, "stopped");
+        assert!(evidence.unwrap().contains("manifest: "));
+        assert_eq!(stops.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_manifest_is_reported_and_the_service_is_still_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let (stop_status, report) = evidence_around_stop(
+            &root.path().join("missing.json"),
+            DEFAULT_BUDGETS,
+            &RecordingProbe { events: &events },
+            || "stopped".to_owned(),
+        )
+        .await;
+        assert_eq!(stop_status, "stopped");
+        assert!(report.contains("unavailable:"), "{report}");
+        assert!(events.borrow().is_empty(), "no candidate, no probe");
+        assert!(!report.contains("probe target:"), "{report}");
     }
 
     #[cfg(unix)]
@@ -474,9 +725,14 @@ mod tests {
             "#!/bin/sh\nexec /bin/sleep 30\n",
         )
         .unwrap();
-        let report =
-            backend_evidence_with_budget(&write_manifest(root.path()), Duration::from_secs(1))
-                .await;
+        let report = evidence_with(
+            &write_manifest(root.path()),
+            Budgets {
+                inventory: INVENTORY_BUDGET,
+                probes: Duration::from_secs(1),
+            },
+        )
+        .await;
         assert!(report.contains("--version:\nprobe timed out"), "{report}");
         assert!(report.contains("remaining evidence skipped: evidence budget exhausted"));
         assert!(!report.contains("--help:"), "{report}");
@@ -527,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn missing_manifest_is_reported_without_panicking() {
         let root = tempfile::tempdir().unwrap();
-        let report = backend_evidence(&root.path().join("missing.json")).await;
+        let report = evidence(&root.path().join("missing.json")).await;
         assert!(report.contains("unavailable:"), "{report}");
     }
 
@@ -552,7 +808,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let report = backend_evidence(&manifest).await;
+        let report = evidence(&manifest).await;
         assert!(
             report.contains("configured pins (not executable identity):"),
             "{report}"
@@ -600,7 +856,7 @@ esac
             .to_string(),
         )
         .unwrap();
-        let report = backend_evidence(&manifest).await;
+        let report = evidence(&manifest).await;
         assert!(report.contains(&server.display().to_string()), "{report}");
         assert!(report.contains("version: 9752 (fixture-build)"), "{report}");
         assert!(report.contains("version.txt: cached-build"), "{report}");
