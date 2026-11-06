@@ -419,8 +419,17 @@ impl CapturedOutput {
 
 async fn probe(server: &Path, flag: &str, timeout: Duration) -> String {
     let mut command = tokio::process::Command::new(server);
+    command.arg(flag);
+    run_probe(command, timeout).await
+}
+
+/// Run `command` with bounded time and output, and render what came back.
+///
+/// Split from [`probe`] so the timeout, kill and reap path can be driven with any
+/// child, not only a `llama-server` stand-in: shell-script stand-ins exist on unix
+/// only, and this path is what must also hold on Windows.
+async fn run_probe(mut command: tokio::process::Command, timeout: Duration) -> String {
     command
-        .arg(flag)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1054,6 +1063,81 @@ esac
             server.is_file(),
             "diagnostics must not repair or remove the cache"
         );
+    }
+
+    /// Selects what [`probe_child`] does when a probe test re-runs this test binary
+    /// as its child process.
+    const PROBE_CHILD_ENV: &str = "ROCM_E2E_PROBE_CHILD";
+
+    /// Not a test: the child process the probe tests below start.
+    ///
+    /// The probe's timeout, kill and reap path has to hold on Windows too, and a
+    /// shell-script stand-in does not exist there. This test binary does, on every
+    /// platform, so the tests re-run it with `--ignored --exact` and this function
+    /// plays the stand-in. It is `#[ignore]`d so a normal run skips it, and does
+    /// nothing unless [`PROBE_CHILD_ENV`] selects a behaviour.
+    #[test]
+    #[ignore = "child process of the probe tests, not a test of its own"]
+    fn probe_child() {
+        match std::env::var(PROBE_CHILD_ENV).as_deref() {
+            Ok("sleep") => {
+                println!("pid:{}", std::process::id());
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Ok("exit") => println!("child-ran"),
+            _ => {}
+        }
+    }
+
+    fn probe_child_command(behaviour: &str) -> tokio::process::Command {
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!("{module}::probe_child"),
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(PROBE_CHILD_ENV, behaviour);
+        command
+    }
+
+    /// The timeout path on every platform: the child is still running when the
+    /// timeout fires, so the report must say so, return promptly, and leave no
+    /// process behind. `process_is_running` is false only once the child has been
+    /// killed and reaped, so a probe that merely abandoned it turns this red.
+    #[tokio::test]
+    async fn a_probe_that_outlives_its_timeout_is_killed_and_reaped() {
+        let start = Instant::now();
+        let report = run_probe(probe_child_command("sleep"), Duration::from_secs(5)).await;
+        assert!(report.starts_with("probe timed out after 5s"), "{report}");
+        assert!(!report.contains("kill/reap failed"), "{report}");
+        assert!(start.elapsed() < Duration::from_secs(20), "{report}");
+        let pid = report
+            .lines()
+            .find_map(|line| line.strip_prefix("pid:"))
+            .unwrap_or_else(|| {
+                panic!("the child did not report its pid before the timeout: {report}")
+            })
+            .parse::<u32>()
+            .unwrap();
+        assert!(!rocm_core::process_is_running(pid), "{report}");
+    }
+
+    /// The normal path on every platform: status and output come back, and the
+    /// timeout branch is not taken.
+    #[tokio::test]
+    async fn a_probe_that_exits_reports_its_status_and_output() {
+        let report = run_probe(probe_child_command("exit"), Duration::from_secs(60)).await;
+        let status = if cfg!(windows) {
+            "exit code: 0\n"
+        } else {
+            "exit status: 0\n"
+        };
+        assert!(report.starts_with(status), "{report}");
+        assert!(report.contains("child-ran"), "{report}");
+        assert!(!report.contains("timed out"), "{report}");
     }
 
     #[cfg(unix)]

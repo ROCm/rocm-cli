@@ -870,6 +870,14 @@ router's side of the stop. The order is fixed in one function,
 `backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
 to show the fingerprint was read before it and the probes came after it.
 
+The probe's timeout, kill and reap path is tested on every platform, Windows
+included: the unit tests re-run the test binary itself as the child (an ignored
+helper test selected by an environment variable), let the probe time out, and
+require that the child is gone afterwards. The shell-script `llama-server`
+stand-ins used by the other probe tests exist on unix only. Not covered anywhere
+is the `kill/reap failed` branch, which needs an operating system that refuses to
+kill a child it just started.
+
 Use the evidence to distinguish backend startup, download, and router readiness
 failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the
 Strix Halo Ubuntu investigation. A backend's ready line does not establish that
