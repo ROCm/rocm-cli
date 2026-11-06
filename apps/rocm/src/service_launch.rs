@@ -1924,7 +1924,7 @@ pub(crate) fn run_attached_service(
         }
         AttachOutcome::Stop => {
             println!("stopping server...");
-            let stop = stop_service(&paths, &service_id);
+            let stop = stop_service(paths, &service_id);
             finish_attached_stop(
                 paths,
                 &service_id,
