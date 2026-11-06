@@ -151,7 +151,15 @@ fn tail_lines_from<R: Read + Seek>(
     // capacity upfront. Real callers ask for small limits (tens to a few
     // hundred lines), so capping still gives them a single allocation.
     let mut lines: VecDeque<String> = VecDeque::with_capacity(limit.min(4096));
-    let mut keep = |text: String| {
+    let mut keep = |text: String, terminated: bool| {
+        // The unterminated tail of a console log can be only the escape
+        // sequence a program writes after its last newline (a colour reset).
+        // It is not a line: counting it would push the last real line out
+        // when the limit is small. A terminated line that strips to nothing
+        // is a blank line the program wrote, and stays.
+        if decode.strip_ansi && !terminated && strip_ansi_sequences(&text).is_empty() {
+            return;
+        }
         if lines.len() == limit {
             lines.pop_front();
         }
@@ -189,10 +197,13 @@ fn tail_lines_from<R: Read + Seek>(
                 first_line_is_partial = false;
                 continue;
             }
-            keep(String::from_utf16_lossy(line));
+            keep(String::from_utf16_lossy(line), terminated);
         }
     } else {
-        let mut reader = BufReader::new(source);
+        // Capped at the snapshot like the sixteen-bit window above: a log
+        // whose writer is still appending must not pull the read past the
+        // budget by however much it grew since `size` was taken.
+        let mut reader = BufReader::new(source.take(size - window_start));
         // Read raw bytes rather than `BufRead::lines()`: when the seek above
         // lands inside a multi-byte UTF-8 character, the leading fragment is
         // invalid UTF-8 on its own. `lines()` would surface that as an `Err`
@@ -208,7 +219,8 @@ fn tail_lines_from<R: Read + Seek>(
             if bytes_read == 0 {
                 break;
             }
-            if raw_line.last() == Some(&b'\n') {
+            let terminated = raw_line.last() == Some(&b'\n');
+            if terminated {
                 raw_line.pop();
                 if raw_line.last() == Some(&b'\r') {
                     raw_line.pop();
@@ -218,7 +230,7 @@ fn tail_lines_from<R: Read + Seek>(
                 first_line_is_partial = false;
                 continue;
             }
-            keep(String::from_utf8_lossy(&raw_line).into_owned());
+            keep(String::from_utf8_lossy(&raw_line).into_owned(), terminated);
         }
     }
 
@@ -756,6 +768,217 @@ mod tests {
     fn a_sixteen_bit_limit_zero_returns_empty_without_opening_the_file() -> Result<()> {
         let path = Path::new("/does/not/exist/rocm-core-tail-limit-zero-wide.log");
         assert!(tail_lines_decoded(path, 0, TEST_MAX_TAIL_READ, LogDecode::CONSOLE)?.is_empty());
+        Ok(())
+    }
+
+    // --- a source that grows after its size was read -------------------
+
+    /// A source whose underlying data grows by `appended` on the first read
+    /// after the size was taken, as a log does when its writer is still busy
+    /// between the `stat` and the read.
+    struct GrowsOnFirstRead {
+        cursor: std::io::Cursor<Vec<u8>>,
+        appended: Option<Vec<u8>>,
+        bytes_read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl GrowsOnFirstRead {
+        fn new(content: Vec<u8>, appended: Vec<u8>) -> (Self, std::rc::Rc<std::cell::Cell<u64>>) {
+            let bytes_read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let source = Self {
+                cursor: std::io::Cursor::new(content),
+                appended: Some(appended),
+                bytes_read: bytes_read.clone(),
+            };
+            (source, bytes_read)
+        }
+    }
+
+    impl Read for GrowsOnFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(appended) = self.appended.take() {
+                self.cursor.get_mut().extend_from_slice(&appended);
+            }
+            let read = self.cursor.read(buf)?;
+            self.bytes_read.set(self.bytes_read.get() + read as u64);
+            Ok(read)
+        }
+    }
+
+    impl Seek for GrowsOnFirstRead {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
+
+    #[test]
+    fn a_source_that_grows_after_its_size_was_read_is_not_read_past_that_size() -> Result<()> {
+        // 64 KiB of 16-byte lines, then 64 KiB more appended after the size
+        // snapshot. With a budget of a quarter of the snapshot the window
+        // starts mid-file; with a budget above the snapshot there is no seek.
+        // Either way the tail must end where the snapshot ended and the read
+        // must touch no more than the window (plus the one probe byte).
+        let settled = "settled-line-xx\n".repeat(4096).into_bytes();
+        let appended = "APPENDED-LINE-x\n".repeat(4096).into_bytes();
+        let size = settled.len() as u64;
+        for (label, budget) in [
+            ("window inside the file", size / 4),
+            ("whole file", size + 1),
+        ] {
+            let (source, bytes_read) = GrowsOnFirstRead::new(settled.clone(), appended.clone());
+
+            let lines = tail_lines_from(
+                source,
+                size,
+                Path::new("growing-source"),
+                usize::MAX,
+                budget,
+                LogDecode::PLAIN,
+            )?;
+
+            assert!(
+                lines.iter().all(|line| line == "settled-line-xx"),
+                "{label}: read past the size snapshot into {:?}",
+                lines.iter().find(|line| line.starts_with("APPENDED"))
+            );
+            assert_eq!(lines.last().map(String::as_str), Some("settled-line-xx"));
+            assert!(
+                bytes_read.get() <= budget.min(size) + 1,
+                "{label}: read {} bytes against a budget of {budget}",
+                bytes_read.get()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_growing_sixteen_bit_source_is_not_read_past_its_size_either() -> Result<()> {
+        let settled = utf16_le_bytes(&"settled-line-xx\n".repeat(1024), true);
+        let appended = utf16_le_bytes(&"APPENDED-LINE-x\n".repeat(1024), false);
+        let size = settled.len() as u64;
+        let (source, _) = GrowsOnFirstRead::new(settled, appended);
+
+        let lines = tail_lines_from(
+            source,
+            size,
+            Path::new("growing-source"),
+            usize::MAX,
+            size / 4,
+            LogDecode::CONSOLE,
+        )?;
+
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| line == "settled-line-xx"));
+        Ok(())
+    }
+
+    // --- a final escape-only fragment ----------------------------------
+
+    /// What the ComfyUI log view returned before the tail routine replaced its
+    /// private reader: decode the whole file, strip ANSI sequences from the
+    /// whole text, then take the last `limit` of `str::lines`.
+    fn comfyui_reader_before_the_shared_routine(bytes: &[u8], limit: usize) -> Vec<String> {
+        let looks_utf16 = bytes.len() >= 8 && {
+            let sample = &bytes[..bytes.len().min(512)];
+            let zero_odd = sample
+                .iter()
+                .enumerate()
+                .filter(|(index, byte)| index % 2 == 1 && **byte == 0)
+                .count();
+            zero_odd * 4 >= sample.len()
+        };
+        let text = if bytes.starts_with(&[0xff, 0xfe]) || looks_utf16 {
+            let start = if bytes.starts_with(&[0xff, 0xfe]) {
+                2
+            } else {
+                0
+            };
+            let units: Vec<u16> = bytes[start..]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        let text = strip_ansi_sequences(&text);
+        let mut lines: Vec<String> = text.lines().rev().take(limit).map(str::to_owned).collect();
+        lines.reverse();
+        lines
+    }
+
+    /// The same text as UTF-8 and as UTF-16 with and without a byte order mark.
+    fn console_encodings(text: &str) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("utf-8", text.as_bytes().to_vec()),
+            ("utf-16 with bom", utf16_le_bytes(text, true)),
+            ("utf-16 without bom", utf16_le_bytes(text, false)),
+        ]
+    }
+
+    #[test]
+    fn a_colour_reset_after_the_final_newline_does_not_displace_the_last_line() -> Result<()> {
+        for (label, bytes) in console_encodings("\u{1b}[31mfailed\n\u{1b}[0m") {
+            let lines = read_bytes("reset", &bytes, 1, LogDecode::CONSOLE)?;
+            assert_eq!(lines, vec!["failed"], "{label}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_final_escape_only_fragment_is_not_a_line_but_blank_lines_are() -> Result<()> {
+        // (text, limit, expected): the unterminated escape-only tail never
+        // counts; a terminated blank line, even one made only of an escape
+        // sequence, is a real line and keeps its place.
+        let cases: [(&str, usize, &[&str]); 5] = [
+            ("one\ntwo\n\u{1b}[0m", 2, &["one", "two"]),
+            ("one\ntwo\n\u{1b}[1;3", 2, &["one", "two"]),
+            ("one\ntwo\n\n", 2, &["two", ""]),
+            ("one\ntwo\n\u{1b}[0m\n", 2, &["two", ""]),
+            ("one\ntwo\n\u{1b}[0mtext", 2, &["two", "text"]),
+        ];
+        for (text, limit, expected) in cases {
+            for (label, bytes) in console_encodings(text) {
+                let lines = read_bytes("fragment", &bytes, limit, LogDecode::CONSOLE)?;
+                assert_eq!(lines, expected, "{label}: {text:?} limit {limit}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plain_decode_keeps_a_final_escape_fragment_because_it_strips_nothing() -> Result<()> {
+        let lines = read_bytes("plain-reset", b"a\n\x1b[0m", 2, LogDecode::PLAIN)?;
+
+        assert_eq!(lines, vec!["a", "\u{1b}[0m"]);
+        Ok(())
+    }
+
+    #[test]
+    fn console_decode_matches_the_comfyui_reader_it_replaced_on_small_logs() -> Result<()> {
+        // Inputs on which the old reader and the per-line strip agree: no
+        // escape sequence runs across a newline. The old reader is the
+        // oracle, so a difference here is a change in what a user sees.
+        let texts = [
+            "plain\nlines\n",
+            "\u{1b}[31mfailed\n\u{1b}[0m",
+            "\u{1b}[31mfailed\u{1b}[0m\n\u{1b}[0m",
+            "a\n\u{1b}[0m\n\u{1b}[0m",
+            "a\r\nb\r\n\u{1b}[0m",
+            "a\n\n\n",
+            "a\n\u{1b}[2K",
+            "\u{1b}[0m",
+            "",
+        ];
+        for text in texts {
+            for (label, bytes) in console_encodings(text) {
+                for limit in 1..=4 {
+                    let expected = comfyui_reader_before_the_shared_routine(&bytes, limit);
+                    let actual = read_bytes("oracle", &bytes, limit, LogDecode::CONSOLE)?;
+                    assert_eq!(actual, expected, "{label}: {text:?} limit {limit}");
+                }
+            }
+        }
         Ok(())
     }
 }
