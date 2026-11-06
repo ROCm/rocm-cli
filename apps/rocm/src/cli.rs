@@ -2226,6 +2226,28 @@ mod tests {
             assert_eq!(error.exit_code(), 2, "{args:?}");
         }
 
+        // The guard depends on clap offering the hidden `--force` as the
+        // suggestion for a near miss: its candidates are every declared long
+        // name, hidden or not. If a clap upgrade stopped suggesting hidden
+        // arguments, `--forc` would be answered with `--force-dev-binaries`
+        // again, so the near misses must name `--force` and not the
+        // destructive flag. The two checks together are independent of
+        // clap's wording around the suggestion.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+        ] {
+            let rendered = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err()
+                .render()
+                .to_string();
+            assert!(
+                rendered.contains("--force") && !rendered.contains("force-dev-binaries"),
+                "{args:?} must be steered to the declared `--force`, not the destructive flag:\n{rendered}"
+            );
+        }
+
         // The whole flag misspelled is still met with the flag it was meant to be.
         let error = cli_command()
             .try_get_matches_from(["rocm", "uninstall", "--force-dev-binary"])
