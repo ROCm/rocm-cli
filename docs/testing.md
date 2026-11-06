@@ -1063,7 +1063,10 @@ sorted order, so a search that finishes inside its limits is deterministic.
 Symlinks are never followed: only real directories are entered and only a regular
 file named `llama-server` counts, so a link cycle ends and a link out of the
 backend directory is not read; the report says how many symlinked entries it
-declined to follow. When a limit or the clock ends the search early the report
+declined to follow. The same rule covers every file the report reads: the
+manifest, the pins file, `version.txt` and a candidate's fingerprint target are
+refused when the last path component is a symlink, and the report says `symlink
+not followed` in place of the content. When a limit or the clock ends the search early the report
 says which, and does not claim an empty result. When nothing is found, the report
 lists the searched locations and what `bin/llamacpp` holds (the first 16 names
 out of at most 64 entries read, with a count of those omitted), and does not

@@ -157,6 +157,24 @@ impl Inventory {
     }
 }
 
+/// What the report says about a file it did not read because it is a symlink.
+const SYMLINK_NOT_FOLLOWED: &str = "symlink not followed";
+
+/// Whether the last component of `path` is itself a symlink (not followed).
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// [`read_clamped`], except that a path which is a symlink is refused rather than
+/// followed, the same rule the directory walk applies: a link inside the backend
+/// tree that points outside it must not put the outside file into the report.
+fn read_regular_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+    if is_symlink(path) {
+        return Err(std::io::Error::other(SYMLINK_NOT_FOLLOWED));
+    }
+    read_clamped(path, max)
+}
+
 /// Answers "has the inventory's time run out?". Injected so a test can drive the
 /// traversal's deadline without sleeping; the real one compares against an
 /// [`Instant`]. `Arc` because the scan runs on a blocking thread.
@@ -203,12 +221,13 @@ enum Scan {
 fn scan_runtime(manifest_path: &Path, limits: SearchLimits, expired: &dyn Fn() -> bool) -> Scan {
     let mut report = String::new();
     let _ = writeln!(report, "manifest: {}", manifest_path.display());
-    let manifest = match read_clamped(manifest_path, MAX_EVIDENCE_BYTES).and_then(|(bytes, _)| {
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
-    }) {
-        Ok(manifest) => manifest,
-        Err(error) => return Scan::Unavailable(format!("{report}unavailable: {error}")),
-    };
+    let manifest =
+        match read_regular_clamped(manifest_path, MAX_EVIDENCE_BYTES).and_then(|(bytes, _)| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+        }) {
+            Ok(manifest) => manifest,
+            Err(error) => return Scan::Unavailable(format!("{report}unavailable: {error}")),
+        };
     for key in ["version", "backend_recipe", "backend_name", "runtime_dir"] {
         let _ = writeln!(
             report,
@@ -227,7 +246,7 @@ fn scan_runtime(manifest_path: &Path, limits: SearchLimits, expired: &dyn Fn() -
     let runtime = Path::new(runtime);
     let pins = runtime.join("resources/backend_versions.json");
     let _ = writeln!(report, "configured pins (not executable identity):");
-    match read_clamped(&pins, MAX_EVIDENCE_BYTES) {
+    match read_regular_clamped(&pins, MAX_EVIDENCE_BYTES) {
         Ok((bytes, note)) => {
             let _ = writeln!(report, "{}{note}", String::from_utf8_lossy(&bytes));
         }
@@ -262,7 +281,9 @@ fn inspect_candidate(server: &Path, deadline: Instant) -> String {
     }
     if let Some(parent) = server.parent() {
         let version = parent.join("version.txt");
-        if let Ok((bytes, note)) = read_clamped(&version, MAX_EVIDENCE_BYTES) {
+        if is_symlink(&version) {
+            let _ = writeln!(report, "{}: {SYMLINK_NOT_FOLLOWED}", version.display());
+        } else if let Ok((bytes, note)) = read_clamped(&version, MAX_EVIDENCE_BYTES) {
             let _ = writeln!(
                 report,
                 "{}: {}{note}",
@@ -594,6 +615,9 @@ fn fingerprint_with_limit(server: &Path, deadline: Instant, limit: u64) -> std::
             describe_hash_limit(limit)
         ))
     };
+    if is_symlink(server) {
+        return Err(std::io::Error::other(SYMLINK_NOT_FOLLOWED));
+    }
     let mut file = std::fs::File::open(server)?;
     // Do not hash an arbitrarily large corrupt cache entry while reporting a
     // failure. Never label a partial hash as SHA256.
@@ -1131,12 +1155,121 @@ mod tests {
         )
         .unwrap();
         symlink(outside.path(), backends.join("rocm-nightly")).unwrap();
+        // A version marker beside the real server that links out of the tree.
+        std::fs::write(outside.path().join("version.txt"), "OUTSIDE-VERSION").unwrap();
+        symlink(
+            outside.path().join("version.txt"),
+            backends.join("rocm-stable/real/version.txt"),
+        )
+        .unwrap();
 
         let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
         assert_eq!(found.candidates, vec![real], "{found:?}");
         assert_eq!(found.stop, None, "{found:?}");
-        assert_eq!(found.symlinks_skipped, 4, "{found:?}");
+        assert_eq!(found.symlinks_skipped, 5, "{found:?}");
         assert_eq!(found.dirs_visited, 2, "{found:?}");
+    }
+
+    /// Every file the report reads from the backend tree is refused when it is a
+    /// symlink, and the report says so, the way the walk reports a link it did not
+    /// enter. A real `llama-server` sits beside a `version.txt` that links to a file
+    /// outside the tree, the pins file is a link out too, and so is a manifest: none
+    /// of the outside content may appear, and each refusal is named. A fingerprint
+    /// of a path that has become a link is refused as well.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_files_are_refused_and_named_not_embedded() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for (name, text) in [
+            ("version.txt", "OUTSIDE-VERSION"),
+            ("pins.json", "OUTSIDE-PINS"),
+            ("manifest.json", r#"{"version": "OUTSIDE-MANIFEST"}"#),
+            ("binary", "OUTSIDE-BINARY"),
+        ] {
+            std::fs::write(outside.path().join(name), text).unwrap();
+        }
+        let server = touch_server(&root.path().join("bin/llamacpp/rocm-stable"));
+        std::fs::write(&server, "abc").unwrap();
+        symlink(
+            outside.path().join("version.txt"),
+            server.parent().unwrap().join("version.txt"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("resources")).unwrap();
+        symlink(
+            outside.path().join("pins.json"),
+            root.path().join("resources/backend_versions.json"),
+        )
+        .unwrap();
+
+        let inventory = take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now() + INVENTORY_BUDGET,
+            SEARCH_LIMITS,
+            std::sync::Arc::new(|| false),
+        )
+        .await;
+        let report = &inventory.report;
+        assert!(!report.contains("OUTSIDE"), "{report}");
+        assert!(
+            report.contains(&format!(
+                "{}: {SYMLINK_NOT_FOLLOWED}",
+                server.parent().unwrap().join("version.txt").display()
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "{}: {SYMLINK_NOT_FOLLOWED}",
+                root.path()
+                    .join("resources/backend_versions.json")
+                    .display()
+            )),
+            "{report}"
+        );
+        // The real server beside the links is still fingerprinted, and the walk
+        // counts the one link it saw among the entries.
+        assert!(
+            report.contains(&format!("sha256: {ABC_SHA256}")),
+            "{report}"
+        );
+        assert!(
+            report.contains("1 symlinked entries under the backend directories were not followed"),
+            "{report}"
+        );
+
+        let linked_manifest = root.path().join("linked-manifest.json");
+        symlink(outside.path().join("manifest.json"), &linked_manifest).unwrap();
+        let inventory = take_inventory_with(
+            &linked_manifest,
+            Instant::now() + INVENTORY_BUDGET,
+            SEARCH_LIMITS,
+            std::sync::Arc::new(|| false),
+        )
+        .await;
+        assert!(
+            !inventory.report.contains("OUTSIDE"),
+            "{}",
+            inventory.report
+        );
+        assert!(
+            inventory
+                .report
+                .contains(&format!("unavailable: {SYMLINK_NOT_FOLLOWED}")),
+            "{}",
+            inventory.report
+        );
+
+        let linked_binary = root.path().join("linked-binary");
+        symlink(outside.path().join("binary"), &linked_binary).unwrap();
+        assert_eq!(
+            fingerprint(&linked_binary, Instant::now() + INVENTORY_BUDGET)
+                .unwrap_err()
+                .to_string(),
+            SYMLINK_NOT_FOLLOWED
+        );
     }
 
     #[tokio::test]
