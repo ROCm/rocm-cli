@@ -543,6 +543,14 @@ a family of GPUs, or none), or you want to target a different GPU, also pass
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
 ```
 
+The `--dry-run` preview downloads no `uv` and creates no `tools` folder. For ROCm
+10 and newer, `uv pip compile` is what chooses the `torch` and `torchvision`
+versions, so the preview runs a `uv` that is already installed and gives the
+complete plan. With none installed it can't, and it says so in a
+`resolution_note:` line: the package specs, runtime key, install folder, manifest
+and `command:` (everything made from those versions) read `not resolved by this
+preview`, and a real install fetches `uv` and resolves them.
+
 A family label such as `--family gfx120X-all` is rejected for those versions
 instead of being resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
