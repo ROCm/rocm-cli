@@ -5,9 +5,13 @@
 //! Registering a runtime that was not installed by `rocm install sdk`:
 //! importing a manifest written elsewhere, adopting an existing Python
 //! environment by probing it, and recovering the registration of the runtime
-//! `rocm setup` created.
+//! `rocm setup` created. It also holds the one rule for picking "the one ready
+//! runtime" when nothing else says which to use
+//! ([`select_single_ready_runtime`]), which sits here because it recovers the
+//! setup registration first; `rocm comfyui install` and the engine paths both
+//! ask it and each words the zero and several cases itself.
 //!
-//! Relocated from `runtimes_cmd.rs` with no behavior change. `runtimes_cmd.rs`
+//! The rest was relocated from `runtimes_cmd.rs` with no behavior change. `runtimes_cmd.rs`
 //! calls into this module for `rocm runtimes import` and `rocm runtimes adopt`,
 //! and re-exports `newest_installed_runtime_manifest`,
 //! `recover_setup_runtime_registration` and `setup_runtime_paths` for the
@@ -19,11 +23,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, managed_pip_cache_dir, runtime_python_executable_in_env};
+use rocm_core::{
+    AppPaths, RocmCliConfig, managed_pip_cache_dir, runtime_python_env_root_for_executable,
+    runtime_python_executable_in_env,
+};
 
 use crate::runtime_registry::{
-    paths_equivalent, runtime_manifest_path, runtime_registry_dir,
-    validate_runtime_manifest_for_activation,
+    ManifestOverwrite, paths_equivalent, runtime_manifest_path, runtime_registry_dir,
+    sort_manifests_newest_install_first, validate_runtime_manifest_for_activation,
+    write_runtime_manifest,
 };
 use crate::therock;
 
@@ -58,7 +66,11 @@ pub(crate) fn import_runtime_manifest(
     validate_runtime_manifest_for_activation(&manifest)
         .with_context(|| format!("imported runtime `{}` is not usable", manifest.runtime_key))?;
 
-    write_runtime_registry_manifest(paths, &manifest, replace)?;
+    write_runtime_manifest(
+        paths,
+        &manifest,
+        ManifestOverwrite::for_replace_flag(replace),
+    )?;
 
     Ok(manifest)
 }
@@ -230,22 +242,15 @@ fn resolve_adopt_python_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>)
         return Ok((python, Some(env_root)));
     }
     if absolute.is_file() {
-        let inferred_root = infer_python_env_root(&absolute);
+        // `None` for an interpreter outside a `bin`/`Scripts` folder: the
+        // request then asks for `--root` rather than adopting a guessed folder.
+        let inferred_root = runtime_python_env_root_for_executable(&absolute);
         return Ok((absolute, inferred_root));
     }
     bail!(
         "Python executable or folder is missing: {}",
         absolute.display()
     );
-}
-
-fn infer_python_env_root(python_executable: &Path) -> Option<PathBuf> {
-    let bin_dir = python_executable.parent()?;
-    let bin_name = bin_dir.file_name()?.to_string_lossy();
-    if bin_name.eq_ignore_ascii_case("Scripts") || bin_name == "bin" {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    bin_dir.parent().map(Path::to_path_buf)
 }
 
 pub(crate) fn adopt_runtime_from_probe(
@@ -314,7 +319,11 @@ pub(crate) fn adopt_runtime_from_probe(
     };
     validate_runtime_manifest_for_activation(&manifest)
         .with_context(|| format!("adopted runtime `{}` is not usable", manifest.runtime_key))?;
-    write_runtime_registry_manifest(paths, &manifest, request.replace)?;
+    write_runtime_manifest(
+        paths,
+        &manifest,
+        ManifestOverwrite::for_replace_flag(request.replace),
+    )?;
     Ok(manifest)
 }
 
@@ -350,37 +359,17 @@ fn parse_therock_runtime_id(runtime_id: &str) -> Result<(String, String)> {
     Ok((channel.to_owned(), family.to_owned()))
 }
 
-fn write_runtime_registry_manifest(
-    paths: &AppPaths,
-    manifest: &therock::InstalledRuntimeManifest,
-    replace: bool,
-) -> Result<()> {
-    let manifest = manifest.clone().normalize_storage_paths();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    if registry_path.exists() && !replace {
-        bail!(
-            "runtime registry entry already exists: {}; pass --replace to overwrite it",
-            registry_path.display()
-        );
-    }
-    fs::create_dir_all(
-        registry_path
-            .parent()
-            .context("runtime registry path has no parent directory")?,
-    )?;
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&manifest)
-            .context("failed to serialize runtime registry manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", registry_path.display()))?;
-    Ok(())
+/// The runtime `rocm setup` created, as the manifest in its install tree
+/// describes it, and whether the runtime registry already holds its entry.
+struct SetupRuntime {
+    manifest: therock::InstalledRuntimeManifest,
+    registered: bool,
 }
 
-pub(crate) fn recover_setup_runtime_registration(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<Option<String>> {
+/// Find the runtime `rocm setup` created and check that it is usable, without
+/// changing anything. `None` when setup named no folder or the folder holds no
+/// manifest; an error when it does and the runtime cannot be used.
+fn find_setup_runtime(paths: &AppPaths, config: &RocmCliConfig) -> Result<Option<SetupRuntime>> {
     let Some(setup_root) = config
         .setup
         .therock_venv
@@ -424,16 +413,190 @@ pub(crate) fn recover_setup_runtime_registration(
         )
     })?;
 
-    if !runtime_manifest_path(paths, &manifest.runtime_key).is_file() {
-        write_runtime_registry_manifest(paths, &manifest, false).with_context(|| {
-            format!(
-                "failed to restore setup runtime `{}` into {}",
-                manifest.runtime_key,
-                runtime_registry_dir(paths).display()
-            )
-        })?;
+    let registered = runtime_manifest_path(paths, &manifest.runtime_key).is_file();
+    Ok(Some(SetupRuntime {
+        manifest,
+        registered,
+    }))
+}
+
+/// Write the registry entry of a setup runtime that the registry has lost, and
+/// nothing when it is there. The one place that write and its error message live.
+fn restore_setup_registration(paths: &AppPaths, setup: &SetupRuntime) -> Result<()> {
+    if !setup.registered {
+        write_runtime_manifest(paths, &setup.manifest, ManifestOverwrite::Refuse).with_context(
+            || {
+                format!(
+                    "failed to restore setup runtime `{}` into {}",
+                    setup.manifest.runtime_key,
+                    runtime_registry_dir(paths).display()
+                )
+            },
+        )?;
     }
-    Ok(Some(manifest.runtime_key))
+    Ok(())
+}
+
+pub(crate) fn recover_setup_runtime_registration(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    let Some(setup) = find_setup_runtime(paths, config)? else {
+        return Ok(None);
+    };
+    restore_setup_registration(paths, &setup)?;
+    Ok(Some(setup.manifest.runtime_key))
+}
+
+/// Whether finding the runtime `rocm setup` created may write its lost registry
+/// entry back while a runtime is being picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupRecovery {
+    /// Write the entry back, as `rocm serve` and `rocm engines install` do.
+    Persist,
+    /// Count the setup runtime as if its entry were there, and write nothing:
+    /// a `--dry-run` preview must name the runtime the real run will use
+    /// without changing any file.
+    PreviewOnly,
+}
+
+impl SetupRecovery {
+    /// The recovery a command with a `--dry-run` flag uses.
+    pub(crate) const fn for_dry_run(dry_run: bool) -> Self {
+        if dry_run {
+            Self::PreviewOnly
+        } else {
+            Self::Persist
+        }
+    }
+}
+
+/// What picking "the one ready runtime" found. The caller decides how to report
+/// the two cases that are not a pick, because the advice differs by command
+/// (`rocm comfyui install` and `rocm serve` name different remedies).
+#[derive(Debug)]
+pub(crate) enum SingleReadyRuntime {
+    /// Exactly one registered runtime is ready.
+    One(Box<therock::InstalledRuntimeManifest>),
+    /// No registered runtime is ready. `registered` is everything the registry
+    /// holds, unusable entries included and possibly none, so a caller can say
+    /// why each one does not count.
+    Zero {
+        registered: Vec<therock::InstalledRuntimeManifest>,
+    },
+    /// More than one is ready, so there is nothing to pick without a choice.
+    Many {
+        ready: Vec<therock::InstalledRuntimeManifest>,
+    },
+}
+
+/// Pick the one ready runtime when nothing else says which to use: no
+/// `--runtime-id`, no active runtime, no configured default. This is the only
+/// place that rule lives; `rocm comfyui install` and the engine paths
+/// (`rocm serve`, `rocm engines install`) both call it.
+///
+/// Ready means `validate_runtime_manifest_for_activation` accepts the runtime,
+/// the same check `rocm runtimes activate` applies. Setup is recovered first
+/// (`recover_setup_runtime_registration`), so the runtime `rocm setup` created
+/// counts even if its registry entry was lost. With [`SetupRecovery::Persist`]
+/// that writes the entry back; with [`SetupRecovery::PreviewOnly`] nothing is
+/// written, and the setup runtime is counted from its own manifest as the
+/// registry would hold it once restored, so the answer is the one `Persist`
+/// gives.
+///
+/// A setup runtime that cannot be used (its manifest is unreadable or points
+/// elsewhere, or it fails the readiness check) is not a ready runtime and
+/// cannot change the count, so it does not stop a registered ready runtime from
+/// being picked, or from being refused as ambiguous with another. That is the
+/// answer a choice that names a runtime gets from the registry too. When the
+/// registry holds no ready runtime the setup runtime was the only candidate and
+/// its error is the answer. A setup runtime that can be used but whose registry
+/// entry cannot be written is different: it is one of the runtimes being
+/// counted, so the failed write is reported as it is.
+pub(crate) fn select_single_ready_runtime(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    recovery: SetupRecovery,
+) -> Result<SingleReadyRuntime> {
+    let setup = match find_setup_runtime(paths, config) {
+        Ok(setup) => setup,
+        Err(unusable) => {
+            return match classify_single_ready_runtime(therock::load_runtime_manifests(paths)?) {
+                SingleReadyRuntime::Zero { .. } => Err(unusable),
+                answer => Ok(answer),
+            };
+        }
+    };
+    Ok(classify_single_ready_runtime(registered_runtimes_with(
+        paths, setup, recovery,
+    )?))
+}
+
+/// Every runtime the registry holds, with the one `rocm setup` created counted
+/// even if its registry entry was lost. With [`SetupRecovery::Persist`] the
+/// entry is written back first (`recover_setup_runtime_registration`); with
+/// [`SetupRecovery::PreviewOnly`] nothing is written, and the setup runtime is
+/// added from its own manifest as the registry would hold it once restored, so
+/// both return the same list. An error when the setup runtime exists but
+/// cannot be used.
+pub(crate) fn registered_runtimes_with_setup(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    recovery: SetupRecovery,
+) -> Result<Vec<therock::InstalledRuntimeManifest>> {
+    registered_runtimes_with(paths, find_setup_runtime(paths, config)?, recovery)
+}
+
+/// [`registered_runtimes_with_setup`] for a setup runtime already found.
+fn registered_runtimes_with(
+    paths: &AppPaths,
+    setup: Option<SetupRuntime>,
+    recovery: SetupRecovery,
+) -> Result<Vec<therock::InstalledRuntimeManifest>> {
+    match recovery {
+        SetupRecovery::Persist => {
+            if let Some(setup) = &setup {
+                restore_setup_registration(paths, setup)?;
+            }
+            therock::load_runtime_manifests(paths)
+        }
+        SetupRecovery::PreviewOnly => {
+            let mut registered = therock::load_runtime_manifests(paths)?;
+            if let Some(setup) = setup
+                && !setup.registered
+            {
+                // What `load_runtime_manifests` would return for the entry that
+                // `Persist` would have written.
+                registered.push(
+                    setup
+                        .manifest
+                        .normalize_storage_paths()
+                        .normalize_host_paths(),
+                );
+                sort_manifests_newest_install_first(&mut registered);
+            }
+            Ok(registered)
+        }
+    }
+}
+
+/// The pure half of [`select_single_ready_runtime`]: which of `registered` are
+/// ready, and whether that is none, one or several.
+pub(crate) fn classify_single_ready_runtime(
+    registered: Vec<therock::InstalledRuntimeManifest>,
+) -> SingleReadyRuntime {
+    let ready: Vec<_> = registered
+        .iter()
+        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
+        .cloned()
+        .collect();
+    if ready.is_empty() {
+        return SingleReadyRuntime::Zero { registered };
+    }
+    match <[therock::InstalledRuntimeManifest; 1]>::try_from(ready) {
+        Ok([manifest]) => SingleReadyRuntime::One(Box::new(manifest)),
+        Err(ready) => SingleReadyRuntime::Many { ready },
+    }
 }
 
 /// The folder setup was configured for and its pip cache — the pair both
@@ -818,5 +981,388 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// `rocm runtimes adopt --python <file>` without `--root` takes the
+    /// environment folder from the shared rule (see
+    /// `rocm_core::runtime_python_env_root_for_executable`): only an
+    /// interpreter in a `bin` or `Scripts` folder, in any case, names one. An
+    /// interpreter in an unrelated folder yields no root, and the request is
+    /// then refused with `--root` guidance rather than adopting a guessed
+    /// folder.
+    #[test]
+    fn adopt_python_file_infers_a_root_only_from_a_bin_or_scripts_folder() -> Result<()> {
+        let (root, _) = test_paths("runtime-adopt-infer-root");
+        for (folder, expected_root) in [
+            ("bin", true),
+            ("Scripts", true),
+            ("SCRIPTS", true),
+            ("tools", false),
+        ] {
+            let env_root = root.join(format!("env-{folder}"));
+            let python = env_root.join(folder).join("python");
+            fs::create_dir_all(python.parent().unwrap())?;
+            fs::write(&python, "python")?;
+
+            let (resolved, inferred) = resolve_adopt_python_input(&python)?;
+
+            assert_eq!(resolved, python, "{folder}");
+            assert_eq!(
+                inferred.as_deref(),
+                expected_root.then_some(env_root.as_path()),
+                "{folder}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn pip_runtime(paths: &AppPaths, key: &str) -> Result<therock::InstalledRuntimeManifest> {
+        write_test_pip_runtime(paths, key, "therock-release:gfx120X-all", "7.14.0", 20)
+    }
+
+    /// Readiness is the activation check and nothing looser: a runtime whose
+    /// interpreter is gone is registered but does not count, and neither is it
+    /// "the only one".
+    #[test]
+    fn single_ready_runtime_counts_only_what_activation_accepts() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-classify");
+        let ready = pip_runtime(&paths, "runtime-a")?;
+        let broken = pip_runtime(&paths, "runtime-b")?;
+        fs::remove_file(
+            broken
+                .python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        )?;
+        assert!(validate_runtime_manifest_for_activation(&ready).is_ok());
+        assert!(validate_runtime_manifest_for_activation(&broken).is_err());
+
+        match classify_single_ready_runtime(vec![ready.clone(), broken.clone()]) {
+            SingleReadyRuntime::One(manifest) => assert_eq!(manifest.runtime_key, "runtime-a"),
+            other => panic!("expected the one ready runtime, got {other:?}"),
+        }
+        match classify_single_ready_runtime(vec![broken.clone()]) {
+            SingleReadyRuntime::Zero { registered } => {
+                assert_eq!(registered.len(), 1, "unusable entries stay listed");
+            }
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        match classify_single_ready_runtime(Vec::new()) {
+            SingleReadyRuntime::Zero { registered } => assert!(registered.is_empty()),
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        let second = pip_runtime(&paths, "runtime-c")?;
+        match classify_single_ready_runtime(vec![ready, broken, second]) {
+            SingleReadyRuntime::Many { ready } => {
+                let keys: Vec<_> = ready.iter().map(|m| m.runtime_key.as_str()).collect();
+                assert_eq!(keys, ["runtime-a", "runtime-c"], "only ready ones listed");
+            }
+            other => panic!("expected several ready runtimes, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// What no inferred root costs the user: the request is refused and asks
+    /// for `--root`, and an explicit `--root` still adopts the same
+    /// interpreter.
+    #[test]
+    fn adopt_request_without_an_inferred_root_asks_for_root() {
+        let python = PathBuf::from("python");
+        let request = |install_root: Option<PathBuf>| {
+            infer_adopt_runtime_request(
+                python.clone(),
+                install_root,
+                None,
+                None,
+                None,
+                false,
+                &therock::RocmSdkPythonProbe {
+                    rocm_sdk_version: Some("7.13.0".to_owned()),
+                    resolved_target_family: Some("gfx120X-all".to_owned()),
+                    ..therock::RocmSdkPythonProbe::default()
+                },
+            )
+        };
+
+        let error = request(None).unwrap_err().to_string();
+        assert!(error.contains("pass --root"), "{error}");
+
+        let explicit = request(Some(PathBuf::from("/opt/rocm-env"))).unwrap();
+        assert_eq!(explicit.install_root, PathBuf::from("/opt/rocm-env"));
+    }
+
+    /// The selection recovers the setup runtime first, so a runtime the registry
+    /// lost is the one found, and finding it is what writes its entry back.
+    #[test]
+    fn select_single_ready_runtime_recovers_setup_before_counting() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-recovers-setup");
+        let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "runtime-s",
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        assert!(crate::test_support::runtime_registry_entry_names(&paths).is_empty());
+
+        match select_single_ready_runtime(&paths, &config, SetupRecovery::Persist)? {
+            SingleReadyRuntime::One(manifest) => assert_eq!(manifest.runtime_key, "runtime-s"),
+            other => panic!("expected the recovered setup runtime, got {other:?}"),
+        }
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", lost.runtime_key)]
+        );
+
+        // Without setup naming a folder there is nothing to recover and the
+        // registry is not touched.
+        let (other_root, other_paths) = test_paths("single-ready-no-setup");
+        match select_single_ready_runtime(
+            &other_paths,
+            &RocmCliConfig::default(),
+            SetupRecovery::Persist,
+        )? {
+            SingleReadyRuntime::Zero { registered } => assert!(registered.is_empty()),
+            other => panic!("expected no ready runtime, got {other:?}"),
+        }
+        assert!(crate::test_support::runtime_registry_entry_names(&other_paths).is_empty());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(other_root);
+        Ok(())
+    }
+
+    /// The keys `select_single_ready_runtime` found ready, in the order it lists
+    /// them, or the message of its refusal to recover.
+    fn single_ready_outcome(
+        paths: &AppPaths,
+        config: &RocmCliConfig,
+        recovery: SetupRecovery,
+    ) -> Result<Vec<String>, String> {
+        match select_single_ready_runtime(paths, config, recovery) {
+            Ok(SingleReadyRuntime::One(manifest)) => Ok(vec![manifest.runtime_key]),
+            Ok(SingleReadyRuntime::Many { ready }) => {
+                Ok(ready.into_iter().map(|m| m.runtime_key).collect())
+            }
+            Ok(SingleReadyRuntime::Zero { registered }) => {
+                Err(format!("none ready of {}", registered.len()))
+            }
+            Err(error) => Err(format!("{error:#}")),
+        }
+    }
+
+    /// A preview counts the runtime setup created from its own manifest and
+    /// writes nothing; the real run then finds the same runtime and writes the
+    /// entry. Both orders of install time are covered: the ready runtimes are
+    /// listed newest first, and a preview must list them the way the registry
+    /// will once the entry is back.
+    #[test]
+    fn preview_counts_the_setup_runtime_without_writing_and_agrees_with_persist() -> Result<()> {
+        for (label, other_installed_at) in [("other-newer", 30), ("other-older", 10)] {
+            let (root, paths) = test_paths(&format!("single-ready-preview-{label}"));
+            let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                &paths,
+                "runtime-setup",
+            )?;
+            write_test_pip_runtime(
+                &paths,
+                "runtime-other",
+                "therock-release:gfx120X-all",
+                "7.14.0",
+                other_installed_at,
+            )?;
+            let config = RocmCliConfig::load(&paths)?;
+            let registry_before = crate::test_support::runtime_registry_entry_names(&paths);
+            assert_eq!(registry_before, ["runtime-other.json"], "{label}");
+
+            let preview = single_ready_outcome(&paths, &config, SetupRecovery::PreviewOnly)
+                .expect("the setup runtime and the other one are both ready");
+
+            assert_eq!(preview.len(), 2, "{label}: {preview:?}");
+            assert!(preview.contains(&lost.runtime_key), "{label}: {preview:?}");
+            assert_eq!(
+                crate::test_support::runtime_registry_entry_names(&paths),
+                registry_before,
+                "{label}: a preview must not write the lost entry"
+            );
+            let persisted = single_ready_outcome(&paths, &config, SetupRecovery::Persist)
+                .expect("recovery finds the same two");
+            assert_eq!(preview, persisted, "{label}: preview and real run disagree");
+            assert_eq!(
+                crate::test_support::runtime_registry_entry_names(&paths),
+                [
+                    "runtime-other.json".to_owned(),
+                    "runtime-setup.json".to_owned()
+                ],
+                "{label}: the real run writes the entry back"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+        Ok(())
+    }
+
+    /// The setup runtime alone is "the one ready runtime" in a preview, and a
+    /// registry that already holds it is left as it is.
+    #[test]
+    fn preview_picks_a_lost_setup_runtime_and_ignores_a_registered_one() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-preview-one");
+        crate::test_support::write_test_setup_runtime_missing_from_registry(&paths, "runtime-s")?;
+        let config = RocmCliConfig::load(&paths)?;
+
+        assert_eq!(
+            single_ready_outcome(&paths, &config, SetupRecovery::PreviewOnly),
+            Ok(vec!["runtime-s".to_owned()])
+        );
+        assert!(crate::test_support::runtime_registry_entry_names(&paths).is_empty());
+
+        // Once the entry exists a preview and a real run see one runtime, and
+        // neither adds a second copy of it.
+        assert_eq!(
+            single_ready_outcome(&paths, &config, SetupRecovery::Persist),
+            Ok(vec!["runtime-s".to_owned()])
+        );
+        assert_eq!(
+            single_ready_outcome(&paths, &config, SetupRecovery::PreviewOnly),
+            Ok(vec!["runtime-s".to_owned()])
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A setup runtime that is no longer usable is reported by a preview as the
+    /// real run reports it, and neither writes anything.
+    #[test]
+    fn preview_reports_an_unusable_setup_runtime_as_persist_does() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-preview-unusable");
+        let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "runtime-s",
+        )?;
+        fs::remove_file(
+            lost.python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+
+        let preview = single_ready_outcome(&paths, &config, SetupRecovery::PreviewOnly)
+            .expect_err("an unusable setup runtime is an error");
+        let persist = single_ready_outcome(&paths, &config, SetupRecovery::Persist)
+            .expect_err("an unusable setup runtime is an error");
+
+        assert!(preview.contains("is not usable"), "{preview}");
+        assert_eq!(preview, persist);
+        assert!(crate::test_support::runtime_registry_entry_names(&paths).is_empty());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Recovering the setup runtime restores the registry entry and writes no
+    /// install-root file, whatever shape that file has: the manifest it restores
+    /// is the one read from that very file, so it is always what would be
+    /// written. A hand-edited file (compact, an extra key, no final newline) is
+    /// therefore left byte for byte as it was, and recovery cannot fail on a
+    /// setup folder that is read-only. Asserted on the bytes, so it holds when
+    /// the process can write anyway. The restored entry is what the file says.
+    #[test]
+    fn setup_recovery_restores_the_entry_and_leaves_a_hand_edited_install_root_file_alone()
+    -> Result<()> {
+        let (root, paths) = test_paths("setup-recovery-hand-edited-file");
+        let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "runtime-s",
+        )?;
+        let file = lost.install_root.join(".rocm-cli-runtime.json");
+        let mut document = serde_json::to_value(&lost)?;
+        document["a_key_a_future_release_adds"] = serde_json::json!(true);
+        let hand_edited = serde_json::to_vec(&document)?;
+        fs::write(&file, &hand_edited)?;
+        let config = RocmCliConfig::load(&paths)?;
+
+        let recovered = recover_setup_runtime_registration(&paths, &config)?;
+
+        assert_eq!(recovered.as_deref(), Some("runtime-s"));
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec!["runtime-s.json".to_owned()]
+        );
+        assert_eq!(
+            fs::read(&file)?,
+            hand_edited,
+            "recovery must not rewrite the install-root file it restored from"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A setup runtime that is no longer usable is not a ready runtime, so it
+    /// does not change what the registry alone answers: one registered ready
+    /// runtime is picked, two are refused as ambiguous with exactly those two
+    /// named, and the registry is not written. Only when the registry holds no
+    /// ready runtime is the setup runtime's own error the answer. Both recoveries
+    /// agree, and the answer and the registry are asserted together.
+    #[test]
+    fn an_unusable_setup_runtime_does_not_hide_the_registrys_ready_runtimes() -> Result<()> {
+        for recovery in [SetupRecovery::Persist, SetupRecovery::PreviewOnly] {
+            for (registered, expected) in [
+                (vec![], Err("is not usable")),
+                (vec!["runtime-a"], Ok(vec!["runtime-a"])),
+                (
+                    vec!["runtime-a", "runtime-b"],
+                    Ok(vec!["runtime-b", "runtime-a"]),
+                ),
+            ] {
+                let (root, paths) = test_paths("single-ready-unusable-setup");
+                for (index, key) in registered.iter().enumerate() {
+                    write_test_pip_runtime(
+                        &paths,
+                        key,
+                        "therock-release:gfx120X-all",
+                        "7.14.0",
+                        10 + index as u128,
+                    )?;
+                }
+                let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                    &paths,
+                    "runtime-s",
+                )?;
+                fs::remove_file(
+                    lost.python_executable
+                        .as_deref()
+                        .context("the fixture records an interpreter")?,
+                )?;
+                let config = RocmCliConfig::load(&paths)?;
+                let entries = crate::test_support::runtime_registry_entry_names(&paths);
+                assert_eq!(entries.len(), registered.len());
+
+                let outcome = single_ready_outcome(&paths, &config, recovery);
+
+                let label = format!("{recovery:?}, {} registered", registered.len());
+                match expected {
+                    Ok(keys) => assert_eq!(
+                        outcome,
+                        Ok(keys.into_iter().map(str::to_owned).collect()),
+                        "{label}"
+                    ),
+                    Err(text) => {
+                        let message = outcome.expect_err("nothing else is ready");
+                        assert!(message.contains(text), "{label}: {message}");
+                    }
+                }
+                assert_eq!(
+                    crate::test_support::runtime_registry_entry_names(&paths),
+                    entries,
+                    "{label}: the unusable setup runtime is not registered"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dry_run_previews_and_a_real_run_persists() {
+        assert_eq!(SetupRecovery::for_dry_run(true), SetupRecovery::PreviewOnly);
+        assert_eq!(SetupRecovery::for_dry_run(false), SetupRecovery::Persist);
     }
 }

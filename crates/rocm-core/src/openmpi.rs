@@ -707,17 +707,6 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
     }
 }
 
-/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
-/// when the former is absent (per `os-release(5)`).
-///
-/// Not routed through [`crate::host_path`]: the hints name package-manager
-/// commands for the real machine, so a simulated host root must not choose
-/// their distribution.
-#[cfg(target_os = "linux")]
-fn real_os_release() -> crate::hardware_root::OsRelease {
-    crate::hardware_root::read_os_release(crate::hardware_root::identity_path_for_str)
-}
-
 const OPENMPI_MANUAL_HINT: &str = "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)";
 const LIBATOMIC_MANUAL_HINT: &str =
     "install your distribution's libatomic runtime package (providing libatomic.so.1)";
@@ -738,7 +727,7 @@ pub fn install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
         install_hint_for_read(
-            &real_os_release(),
+            &crate::hardware_root::real_os_release(),
             build_openmpi_install_plan,
             OPENMPI_MANUAL_HINT,
         )
@@ -765,7 +754,7 @@ pub fn libatomic_install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
         install_hint_for_read(
-            &real_os_release(),
+            &crate::hardware_root::real_os_release(),
             build_libatomic_install_plan,
             LIBATOMIC_MANUAL_HINT,
         )
@@ -792,7 +781,7 @@ pub fn libnuma_install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
         install_hint_for_read(
-            &real_os_release(),
+            &crate::hardware_root::real_os_release(),
             build_libnuma_install_plan,
             LIBNUMA_MANUAL_HINT,
         )
@@ -1012,10 +1001,9 @@ mod tests {
     }
 
     /// `install_hint_for_read`/`plan_for_os_release_read` are the one seam
-    /// `openmpi::real_os_release()` and `system_packages::real_os_release()`
-    /// hand their result to — both now one-line delegations to
-    /// `hardware_root::read_os_release`, so reverting either back to a raw
-    /// `/etc/os-release` read is a type error here, not a silent regression.
+    /// `hardware_root::real_os_release()` hands its result to, from here and
+    /// from every caller in the `rocm` binary, so reverting any of them back to
+    /// a raw `/etc/os-release` read is a type error, not a silent regression.
     /// This still pins the behaviour at the seam itself: an `OsRelease` that
     /// says the fallback path was read produces the same plan and hint a
     /// primary-path read with the same content would.

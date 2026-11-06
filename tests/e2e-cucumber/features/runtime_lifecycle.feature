@@ -48,10 +48,12 @@ Feature: Runtime lifecycle state machine
     Given a runtime manifest to import
     When the user imports the runtime
     Then the runtime is registered as read-only
+    And the registry records the import and its folder gains no manifest file
     When the user imports the same runtime again
     Then the CLI refuses because it already exists
     When the user imports it again allowing replacement
     Then the import succeeds
+    And the registry records the import and its folder gains no manifest file
 
   # `rocm runtimes list` prefixes each row with `*`/`-`/a blank to mark active,
   # rollback-target, and neither, with nothing else on the page explaining what

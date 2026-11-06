@@ -41,10 +41,9 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     // breaks the arm-selection logic pass by construction. The hosted
     // `ubuntu-latest` E2E image (26.04 once GitHub's migration completes) and the self-hosted GPU
     // lane (24.04) both take the apt arm, with their own release codename.
-    let os_release_text =
-        rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
-            .text()
-            .to_owned();
+    let os_release_text = rocm_core::hardware_root::real_os_release()
+        .text()
+        .to_owned();
     let Ok(os_release) = rocm_core::os_release::parse(&os_release_text) else {
         panic!("host's /etc/os-release is unreadable:\n{output}");
     };
