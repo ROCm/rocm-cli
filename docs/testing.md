@@ -1787,7 +1787,17 @@ and its neighbours), not by killing a real tree. The callers' own tests check
 that each reaches the routine and reports what it returns
 (`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
 `cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
-that no private copy of the routine or its constant has come back. No scenario
+that no private copy of the routine or its constant has come back. A confirmed
+stop also clears the PIDs and start-time tokens it stopped from the record
+(`ManagedServiceRecord::clear_recorded_processes`, one call from both
+binaries), and an unconfirmed one keeps them; a PID recorded without a token is
+signalled on trust alone once the OS has recycled it, so a stale one must not
+survive for a second stop to find.
+`a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing`
+runs the real routine with the per-PID signal injected, and asserts the
+persisted record after the first stop and that a second stop signals nothing;
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
+other direction. No scenario
 kills a real process tree on Windows: `service-stop-01` plants PID 0 and
 `service-stop-02` is Linux-only, so the Windows tree kill has no live coverage
 beyond compiling there and the injected unit tests, which the `windows-debug`
