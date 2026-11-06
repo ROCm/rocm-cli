@@ -50,6 +50,9 @@ Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
 Run `rocm <command> --help` for details and examples on any command."
 )]
+// No global flags, no subcommand aliases and no abbreviations: the logger gate in
+// `logging::is_enabled_for` reads the subcommand as `argv[1]` and relies on that
+// (guarded by `uninstall_stays_the_first_argument_the_logger_gate_reads`).
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -443,9 +446,16 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
-        /// TCP port to bind.
-        #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
-        port: u16,
+        /// TCP port to bind. Omit it to choose an available port automatically,
+        /// starting at 11435, on the default 127.0.0.1 host. Any other --host
+        /// requires an explicit --port: proactive collision detection is claimed
+        /// only for local 127.0.0.1 serving.
+        // `allow_hyphen_values` so a negative value such as `-1` reaches
+        // `parse_serve_port` and gets the domain error naming the valid range,
+        // instead of clap rejecting it as an unknown flag. Mirrors the same
+        // choice made for `--gpu-memory-utilization` below.
+        #[arg(long, value_parser = crate::serve_port::parse_serve_port, allow_hyphen_values = true)]
+        port: Option<u16>,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
         /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
@@ -453,6 +463,15 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Keep waiting until the server answers requests or its engine gives up
+        /// (vLLM and AIM after 5 minutes by default, raised with
+        /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
+        /// instead of returning `starting` after 45 seconds.
+        /// Also waits on a matching server that is already starting. Fails with a
+        /// pointer to the logs if the server exits first. Cannot be
+        /// combined with --foreground or --verbose, which already stay attached.
+        #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
+        wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
@@ -552,11 +571,16 @@ rocm serve qwen --verbose --device gpu_required")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm logs\n  \
 rocm logs --service <service-id>\n  \
+rocm logs --service <service-id> --follow\n  \
 rocm logs --search error timeout")]
     Logs {
         /// Show logs for a managed service id.
         #[arg(long)]
         service: Option<String>,
+        /// Keep printing new output for --service until the server stops (Ctrl-C ends the
+        /// follow and leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f', requires = "service")]
+        follow: bool,
         /// Search recent logs for one or more words.
         #[arg(long, num_args = 1.., value_name = "QUERY")]
         search: Vec<String>,
@@ -1040,6 +1064,10 @@ pub(crate) enum ServicesCommand {
     Logs {
         /// Service id from `rocm services list`.
         service_id: String,
+        /// Keep printing new output until the server stops (Ctrl-C ends the follow and
+        /// leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Stop a local model server.
     ///
@@ -1747,6 +1775,21 @@ mod tests {
             .collect()
     }
 
+    fn serve_arg_help(arg_id: &str) -> String {
+        let mut cli = Cli::command();
+        let serve = cli
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand exists");
+        let arg = serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"));
+        arg.get_long_help()
+            .map(ToString::to_string)
+            .or_else(|| arg.get_help().map(ToString::to_string))
+            .unwrap_or_default()
+    }
+
     // Both `--engine` and `--device` restrict their input to a fixed set via a
     // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
     // error (exit code 2) with the accepted choices listed. Values are advertised
@@ -1910,6 +1953,22 @@ mod tests {
     }
 
     #[test]
+    fn serve_wait_parses_and_conflicts_with_attached_modes() {
+        let cli = parse_serve(&["--wait"]).expect("--wait parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: true, .. })
+        ));
+        let cli = parse_serve(&[]).expect("default parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: false, .. })
+        ));
+        assert!(parse_serve(&["--wait", "--verbose"]).is_err());
+        assert!(parse_serve(&["--wait", "--foreground"]).is_err());
+    }
+
+    #[test]
     fn serve_parses_verbose_and_no_smoke_test_flags() {
         let cli = parse_serve(&["--verbose", "--no-smoke-test"]).expect("flags parse");
         match cli.command {
@@ -1927,6 +1986,77 @@ mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_without_port_flag_requests_automatic_selection() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve { port, host, .. }) => {
+                assert_eq!(port, None, "omitted --port must stay unresolved");
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+                assert!(crate::serve_port::PortRequest::from_flag(port).is_auto());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_with_explicit_port_keeps_it_concrete() {
+        let cli = parse_serve(&["--port", "8000"]).expect("explicit port parses");
+        match cli.command {
+            Some(Command::Serve { port, .. }) => {
+                assert_eq!(port, Some(8000));
+                assert_eq!(
+                    crate::serve_port::PortRequest::from_flag(port),
+                    crate::serve_port::PortRequest::Explicit(8000)
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_or_out_of_range_port() {
+        for bad in ["0", "65536", "-1", "auto"] {
+            let error = parse_serve(&["--port", bad]).expect_err("must be rejected");
+            assert!(
+                error.to_string().contains("between 1 and 65535"),
+                "unexpected error for --port {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_engine_serve_command_keeps_a_concrete_default_port() {
+        // Only the user-facing verb gained automatic selection; the direct engine
+        // entry point still requires (and defaults to) a concrete port.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "__engine-serve-http",
+            "lemonade",
+            "svc-1",
+            "qwen",
+            "--state-path",
+            "state.json",
+        ])
+        .expect("hidden engine command parses");
+        match cli.command {
+            Some(Command::EngineServeHttp { port, host, .. }) => {
+                assert_eq!(port, rocm_core::DEFAULT_LOCAL_PORT);
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+            }
+            other => panic!("expected EngineServeHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_port_help_documents_omission_and_the_custom_host_rule() {
+        let help = serve_arg_help("port");
+        assert!(help.contains("11435"), "{help}");
+        assert!(help.contains("automatically"), "{help}");
+        assert!(help.contains("127.0.0.1"), "{help}");
+        assert!(help.contains("explicit --port"), "{help}");
     }
 
     #[test]
@@ -2091,6 +2221,42 @@ mod tests {
         let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
             .expect_err("zero max-tokens is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `logging::is_enabled_for` decides that `rocm uninstall` skips the client
+    /// log by looking at the first raw argument. That is only right while the
+    /// subcommand is always `argv[1]`: a global flag in front of it, an alias
+    /// for `uninstall`, or an abbreviated name would start the logger again and
+    /// a dry run would list a `logs` folder it had just made. The e2e scenario
+    /// `uninstall-06` proves the behaviour; this fails earlier, naming the cause.
+    #[test]
+    fn uninstall_stays_the_first_argument_the_logger_gate_reads() {
+        let command = Cli::command();
+        let global_args: Vec<_> = command
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .filter(|id| !matches!(*id, "help" | "version"))
+            .collect();
+        assert!(
+            global_args.is_empty(),
+            "a top-level argument {global_args:?} can come before the subcommand, so \
+             logging::is_enabled_for no longer sees `uninstall` as the first argument"
+        );
+        let aliased: Vec<_> = command
+            .get_subcommands()
+            .filter(|sub| sub.get_all_aliases().any(|alias| alias == "uninstall"))
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(
+            aliased.is_empty(),
+            "{aliased:?} answers to `uninstall`, which logging::is_enabled_for does not check"
+        );
+        let uninstall = command
+            .find_subcommand("uninstall")
+            .expect("uninstall subcommand exists");
+        assert_eq!(uninstall.get_all_aliases().count(), 0);
+        Cli::try_parse_from(["rocm", "uninstal"])
+            .expect_err("an abbreviated subcommand name must not reach uninstall");
     }
 
     #[test]

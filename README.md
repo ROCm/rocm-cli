@@ -842,7 +842,7 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
-                   [--verbose] [--foreground | --managed]
+                   [--verbose] [--foreground | --managed] [--wait]
                    [--no-smoke-test]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
@@ -862,6 +862,32 @@ after a crash (with the `server-recover` automation enabled) inherits the
 daemon's environment, not yours, so a forwarded secret must also be set
 there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
 for a cold-start model download.
+
+`--port` is optional on the default loopback host (`127.0.0.1`): omit it and
+`rocm serve` picks the first free port in `11435`-`11535`, checking both
+rocm-cli's own records and the OS. The non-interactive plan output (piped
+output, or the Dash approval card) shows `Port: automatic; endpoint shown
+after launch` while the launch is in flight and prints the concrete endpoint
+once the port is actually leased; the interactive deployment summary table
+only ever shows the final resolved endpoint. Pass `--port` explicitly to pin
+one; on `127.0.0.1`, an explicit loopback port already reserved by another
+managed service is rejected up front, naming that service and how to free it
+(`rocm services stop <service-id> --yes`). A port held by an untracked process
+is rejected too, but without naming the holder. `--host` to anything other
+than the default
+loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
+requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
+cannot promise a free port anywhere else. An explicit `--port` on such a host
+is refused when a live managed service already holds that port on the same
+address (`localhost` counts as both loopback addresses) or on a wildcard
+listener that covers it (`0.0.0.0` for IPv4 addresses, `::` for any); the OS is not probed on such a
+host, so any other clash is reported by the engine when it starts.
+
+`rocm services restart` and `rocmd`'s automatic recovery are deliberately
+stricter about hosts than that launch check: they refuse to bring a service
+back on a port that any other live managed service has recorded, whatever host
+that service is bound to, because a `0.0.0.0` listener also covers the loopback
+address.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -891,6 +917,10 @@ different settings. If you previously started a service with `--temperature`
 flags, or with different ones, stop the existing service first (`rocm
 services stop <service-id> --yes`) or match the original flags.
 
+Likewise, an explicit `--port` that differs from the port the running service
+is already on is refused rather than silently ignored; omit `--port` to reuse
+the running service, or stop it first to serve on the new port.
+
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
@@ -912,6 +942,17 @@ can:
   directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
+`--wait` keeps `rocm serve` waiting until the server answers requests or its
+engine gives up (vLLM and AIM after 5 minutes by default; raise it with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
+of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`rocm services stop`), it fails with an error that points at the server's logs
+instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+in the background; a generated API key (public bind) is printed when the wait
+begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
+when the model is already being served and still starting, it waits on that
+server instead (an already-serving one is reported at once). Watch the download with
+`rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
@@ -1082,7 +1123,7 @@ Manage background servers started with `--managed`:
 
 ```
 rocm services list [--all] [--json]
-rocm services logs <service-id>
+rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
@@ -1102,6 +1143,14 @@ second stop can report the server stopped while that process still runs.
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
 nothing, and leaves the stop request recorded.
+
+After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
+and re-checks the port before it respawns: if another live managed service is
+now recorded on that port, or (on the default `127.0.0.1` host only) the port is
+bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
+bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
+`restart` fails saying the server was stopped but not restarted and names
+`rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
@@ -1383,19 +1432,31 @@ provider settings are left untouched.
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
+rocm logs [--service <service-id> [--follow]] [--search TERM ...] [QUERY ...]
+rocm services logs <service-id> [--follow]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
                [--force-dev-binaries]
 ```
 
+`--follow` (`-f`) keeps printing a server's new log output, such as a model
+download's progress, until the server stops (a server that ends `failed` makes the command exit
+non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
+ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
+line stays on the row under the newest output. Piped or redirected output keeps
+stdout to the log text alone: the hint (once), `is ready.` and `stopped following.`
+lines go to stderr. A server that is already `failed` when the follow starts exits
+non-zero too, after printing its log.
+
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
 do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. Outside an interactive terminal, when there
-is something to remove, it refuses with exit code 1 and removes nothing unless
-you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
+and `--yes` to skip the confirmation. It does not create the folders it reports
+on: with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there
+is nothing to remove. Outside an interactive terminal, when there is something
+to remove, it refuses with exit code 1 and removes nothing unless you pass
+`--yes`. Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.

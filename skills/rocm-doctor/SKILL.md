@@ -40,9 +40,17 @@ If it is **not** — an **NVIDIA / Intel / Apple** GPU — then **stop and decli
 - Do **not** run `rocm examine` / `rocm diagnose` / `rocm fix`.
 
 Being helpful here means being honest about the boundary — confidently-wrong
-advice for a stack this skill does not cover is worse than no advice. Only
-continue past this gate when the GPU is AMD. See
-[Out of scope](#out-of-scope).
+advice for a stack this skill does not cover is worse than no advice.
+
+A fresh install on a clean machine is out of scope too: that is a setup task,
+not a diagnosis. Exit cleanly and say so.
+
+If the user names no GPU vendor, treat ROCm / HIP wording as AMD and continue.
+Should `rocm examine` then report `no-amd-gpu`, the CLI found no AMD GPU: say so,
+ask which GPU the machine has, and propose no fix until that is settled. That
+status alone does not prove the GPU is not AMD.
+
+Only continue past this gate when the GPU is AMD.
 
 **WSL2 is in scope** and does not stop this gate. It is a platform family of its
 own, with its own catalog entries covering `/dev/dxg`, the DXCore handoff,
@@ -58,9 +66,7 @@ offered there.
   CLI is older than the catalog contract this skill requires. Nothing else here is
   assumed — the CLI does the probing.
 - **Platform:** native Linux (in-tree `amdgpu` module + `/dev/kfd`), Windows
-  (HIP SDK), or WSL2 (`/dev/dxg` + the Windows host driver). NVIDIA/Intel/Apple
-  GPUs and clean-machine installs are out of scope (see
-  [Out of scope](#out-of-scope)).
+  (HIP SDK), or WSL2 (`/dev/dxg` + the Windows host driver).
 - **No fixed ROCm version, GPU arch (`gfx…`), or container image is assumed** —
   `rocm examine`/`diagnose` detect the installed ROCm, the GPU's `gfx` target, and
   container context, and match fixes to what they find. Never hand-set
@@ -70,7 +76,7 @@ offered there.
 ## Workflow
 
 Only start here once the [Scope gate](#scope-gate--check-before-anything-else)
-passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
+passes — the GPU is AMD.
 
 0. **Ensure the `rocm` CLI is present.** Everything below shells out to it, so
    check first and install it if missing:
@@ -138,6 +144,10 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    rocm diagnose --symptom "<paste the exact error>" --json
    ```
 
+   If the user pasted no error text, run `rocm diagnose --json` without
+   `--symptom`: the CLI probes the host on its own, and a symptom you write
+   yourself is matched as though the user had said it.
+
    Read the JSON:
    - `has_match` — **the gate.** True means a cause cleared the threshold and
      you may propose a fix; false means nothing was established, so route
@@ -179,42 +189,46 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
      named only in the symptom, route it yourself per
      [Framework routing](#framework-routing).
 
-2. **Propose the fix.** Show the top match's `title`, `evidence`, plan, and
-   `verify` command. Only propose applying it when the user is on board.
+2. **Decide what the diagnosis supports.** Take the first case that fits:
 
-   If the top match's `fix.class` is `diagnose-only`, there is no fix to
-   propose: relay its `title` and `evidence` as an explanation of the host and
-   **stop there** — *provided the user pasted no symptom, or the evidence
-   plausibly accounts for the one they did.* A `diagnose-only` cause like
-   `info-20-gpu-no-rocm-support` scores from host state alone (the GPU
-   architecture), not from the symptom, so it can be the top match even when
-   the pasted text describes something the evidence never mentions — a crash
-   in the engine actually running on this host, say, rather than anything
-   about ROCm/HIP support. Relaying host-state evidence that does not address
-   what the user pasted and stopping there would silently drop their actual
-   complaint. If a symptom was pasted and this cause's evidence does not
-   plausibly explain it, treat this cause as not having answered the
-   question: say what it does establish about the host, then route upstream
-   per `route_when_no_match` for the pasted symptom itself, exactly as you
-   would if `has_match` were false. You may mention a lower cause only if it
-   *also* clears `min_score_for_match` — below that threshold nothing was
-   established, which is the same bar the `has_match` paragraph above sets,
-   and a `diagnose-only` top match does not lower it. The one exception is the
-   advice-only `fix-22-display-driver-old` entry described under `has_match`
-   above: relay it as advice, never as a cause.
+   - **`has_match` is false.** Nothing was established. Say so and route
+     upstream per `route_when_no_match` (or per
+     [Framework routing](#framework-routing) for an app named in the symptom).
+     Propose no fix.
+   - **The top match is `diagnose-only` and the user pasted a symptom its
+     `evidence` does not plausibly explain.** A `diagnose-only` cause like
+     `info-20-gpu-no-rocm-support` scores from host state alone (the GPU
+     architecture), not from the symptom, so it can be the top match even when
+     the pasted text describes something the evidence never mentions — a crash
+     in the engine actually running on this host, say. Relaying the evidence
+     and stopping would silently drop the user's actual complaint. Say what the
+     cause does establish about the host, then route upstream for the pasted
+     symptom itself, exactly as if `has_match` were false.
+   - **The top match is `diagnose-only` and no symptom was pasted, or its
+     `evidence` plausibly accounts for the one that was.** There is no fix to
+     propose: relay its `title` and `evidence` as an explanation of the host and
+     stop there.
+   - **Otherwise.** Show the top match's `title`, `evidence`, plan, and `verify`
+     command. Only propose applying it when the user is on board.
 
-3. **Apply with consent.** For an auto-applicable fix:
+   Mention a lower cause only if it *also* clears `min_score_for_match`: below
+   that threshold nothing was established, which is the bar the `has_match`
+   bullet sets, and a `diagnose-only` top match does not lower it. The advice-only
+   `fix-22-display-driver-old` entry described under `has_match` is the one
+   exception: relay it as advice, never as a cause.
+
+3. **Apply with consent.** For a fix that has a runner:
 
    ```
-   rocm fix <fix-id>            # auto fixes: prompt before changing anything
+   rocm fix <fix-id>            # prompts before changing anything
    rocm fix <fix-id> --dry-run  # show the exact change, touch nothing
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only the four auto-applicable fixes are ones the CLI runs itself. The other 24
-   are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
-   fix <id>` just prints the plan for the user to run themselves — no prompt, and
-   the CLI never performs those.
+   Only four fixes have a runner the CLI executes itself. The other 24 are
+   **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm fix
+   <id>` just prints the plan for the user to run themselves — no prompt, and the
+   CLI never performs those.
 
    One entry is in neither group. `info-20-gpu-no-rocm-support` is
    **diagnose-only**: `rocm fix` takes the id, names the problem, says there is
@@ -287,22 +301,12 @@ start of the reply, before relaying a multi-step plan.
 
 `rocm diagnose --model <ref>` answers whether a model fits before a download.
 
-## Out of scope
-
-- **NVIDIA / Intel / Apple Silicon GPUs**, and **fresh installs on a clean
-  machine** (a setup task, not a diagnosis). Exit cleanly and say so.
-
-WSL2 is **not** in this list. It is a supported platform family with its own
-catalog entries — see [reference.md](reference.md).
-
 ## Rules
 
-- Never run the workflow — or offer *any* troubleshooting, generic GPU fixes
-  included — for a non-AMD GPU. State it is out of scope and stop. This does
-  not apply to WSL2, which is in scope and runs the normal workflow.
 - Never invent a fix. If `rocm diagnose` returns no match, route upstream.
 - Never run a mutating fix without the user's explicit OK; prefer `--dry-run`
   first. New failure modes are added to the CLI catalog, not improvised here.
 
-See [reference.md](reference.md) for the full closed catalog and the CLI
-command/exit-code reference.
+Read [reference.md](reference.md) when `rocm fix` exits non-zero (its exit codes
+are listed there), and before telling the user which platforms a fix id applies
+to.

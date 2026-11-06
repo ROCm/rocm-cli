@@ -126,11 +126,12 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
-    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
-    detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
+    DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
+    WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
+    detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
+    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
+    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -171,7 +172,10 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
+    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{

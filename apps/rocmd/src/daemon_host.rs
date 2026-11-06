@@ -38,30 +38,44 @@ fn is_embedded_in_rocm() -> bool {
 pub(crate) struct DaemonHost {
     current_exe: PathBuf,
     embedded_in_rocm: bool,
+    /// Unit tests only: the test binary has every command, so a spawn runs it
+    /// and no sibling is ever looked for.
+    #[cfg(test)]
+    test_binary_has_every_command: bool,
 }
 
 impl DaemonHost {
     /// The host this process is running in.
     ///
-    /// A unit test never gets this one: it passes the code under test a host of
-    /// its own, so that nothing outside the test's stand-in binaries can run,
-    /// not even a `rocm` that happens to sit in the build directory.
+    /// Under test, the process is the test binary, which stands in for both
+    /// `rocm` and `rocmd` and looks for neither: code that reaches this runs
+    /// the test binary and nothing else, not even a `rocm` that happens to sit
+    /// in the build directory. A test that needs another binary passes the code
+    /// it exercises a host of its own.
     pub(crate) fn detect() -> Result<Self> {
-        if cfg!(test) {
-            anyhow::bail!(
-                "a unit test reached `DaemonHost::detect`; pass it a host so that no binary \
-                 outside its stand-ins can run"
+        #[cfg(test)]
+        {
+            let mut host = Self::new(
+                std::env::current_exe().context("the test binary has a path")?,
+                false,
             );
+            host.test_binary_has_every_command = true;
+            Ok(host)
         }
-        let current_exe = rocm_core::current_executable_path()
-            .context("failed to resolve the current executable path")?;
-        Ok(Self::new(current_exe, is_embedded_in_rocm()))
+        #[cfg(not(test))]
+        {
+            let current_exe = rocm_core::current_executable_path()
+                .context("failed to resolve the current executable path")?;
+            Ok(Self::new(current_exe, is_embedded_in_rocm()))
+        }
     }
 
     pub(crate) const fn new(current_exe: PathBuf, embedded_in_rocm: bool) -> Self {
         Self {
             current_exe,
             embedded_in_rocm,
+            #[cfg(test)]
+            test_binary_has_every_command: false,
         }
     }
 
@@ -77,6 +91,12 @@ impl DaemonHost {
         &self,
         sibling: impl FnOnce(&Path, &str) -> Result<PathBuf>,
     ) -> Result<PathBuf> {
+        #[cfg(test)]
+        {
+            if self.test_binary_has_every_command {
+                return Ok(self.current_exe.clone());
+            }
+        }
         if !self.embedded_in_rocm {
             return Ok(self.current_exe.clone());
         }
@@ -97,6 +117,12 @@ impl DaemonHost {
         &self,
         sibling: impl FnOnce(&Path, &str) -> Result<PathBuf>,
     ) -> Result<PathBuf> {
+        #[cfg(test)]
+        {
+            if self.test_binary_has_every_command {
+                return Ok(self.current_exe.clone());
+            }
+        }
         if self.embedded_in_rocm {
             return Ok(self.current_exe.clone());
         }
@@ -260,13 +286,14 @@ mod tests {
         assert!(!is_embedded_in_rocm());
     }
 
-    /// The real host is not reachable from a unit test, whatever sits beside it.
+    /// The real host is not reachable from a unit test: under test, `detect` is
+    /// the test binary for both commands, and nothing beside it is looked for.
     #[test]
-    fn a_unit_test_cannot_reach_the_real_host() {
-        let error = DaemonHost::detect()
-            .err()
-            .expect("detect is refused in tests");
-        assert!(format!("{error:#}").contains("pass it a host"), "{error:#}");
+    fn under_test_detect_is_the_test_binary_and_looks_for_no_sibling() {
+        let host = DaemonHost::detect().unwrap();
+        let this = std::env::current_exe().unwrap();
+        assert_eq!(host.rocmd_binary().unwrap(), this);
+        assert_eq!(host.rocm_binary().unwrap(), this);
     }
 
     /// `rocm daemon` enters through `run_from_args`, and that is what marks

@@ -165,6 +165,10 @@ jobs:
               # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
               - 'tests/e2e-cucumber/README.md'
+              # `cargo xtask check-architecture-doc` (clippy job) compares this
+              # module map with the source tree; deleting or rewording an entry
+              # can break it though no *.rs file moved.
+              - 'docs/architecture.md'
               # license_headers_hook_has_no_file_type_filter (xtask) reads this
               # file's license-headers hook config; an edit here that reopens the
               # file-type-filter gap must still run that test on the PR.
@@ -344,8 +348,9 @@ jobs:
     # waiting for it delayed the whole run behind a check that rarely fails. The
     # two run in parallel instead. That is acceptable because `clippy` stays a required
     # check, so a lint failure still blocks the merge; what a clippy-red run loses
-    # is only the early skip of this job and of E2E, which now spend their runner
-    # time before the failure is known.
+    # is only the early skip of this job, which spends its runner time before the
+    # failure is known. The E2E job does wait for `clippy` and skips its scenarios
+    # when lint is red (see its gate step), so that cost stops here.
     needs: [changes, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
     # tolerate a skipped build-and-test in their own `if:` guards.
@@ -1419,6 +1424,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask check-crate-edges
 
+      - name: Every production source file has an entry in docs/architecture.md
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask check-architecture-doc
+
       - name: Published Doctor catalog is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask catalog --check
@@ -1426,6 +1435,34 @@ jobs:
       - name: Recorded rocm output the skill evals replay is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask eval-fixtures --check
+
+      # Advisory for now. `cargo xtask check-module-size` is strict on its own;
+      # only this step is non-blocking. `continue-on-error` keeps the job green
+      # while the warning annotation and the job summary list the offenders. When
+      # files are over the limit the step itself shows as failed (red) in the
+      # job's step list, because it ends in `exit 1`, while the job and the check
+      # stay green: that is the advisory phase, not a failure to chase.
+      # Making the limit blocking means deleting `continue-on-error` and the
+      # capture below, leaving the bare command.
+      - name: Source files are within the module-size limit (advisory)
+        if: needs.changes.outputs.rust == 'true'
+        continue-on-error: true
+        run: |
+          report="$RUNNER_TEMP/module-size.txt"
+          if cargo xtask check-module-size > "$report" 2>&1; then
+            cat "$report"
+          else
+            cat "$report"
+            echo "::warning title=Module size (advisory)::$(sed 's/%/%25/g' "$report" | tr '\n' ' ')"
+            {
+              echo '### Source files over the module-size limit (advisory)'
+              echo
+              echo '```'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
@@ -1825,7 +1862,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-26.04]
     runs-on: ${{ matrix.os }}
-    needs: [changes, build-and-test]
+    needs: [changes, clippy, build-and-test]
     # This is a REQUIRED check, so — like every sibling required job — the job
     # itself must always run (except on a manual dispatch that didn't select the
     # mock platform), and the actual work is gated at the STEP level. Gating
@@ -1841,19 +1878,38 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Whether the real work runs this time. On push/PR/merge_group: only when
-      # build-and-test ran to a verdict and the change is heavy. On
-      # workflow_dispatch: build-and-test is skipped, so tolerate that and rely
-      # on the job-level platform gate above.
+      # `clippy` passed, build-and-test ran to a verdict, and the change is
+      # heavy. On workflow_dispatch: clippy and build-and-test are skipped, so
+      # tolerate that and rely on the job-level platform gate above.
       #
       # "Ran to a verdict", not "succeeded": build-and-test is a matrix over
       # both images and its result is the aggregate, so a failure on one image
       # would otherwise skip this job's work on the other too — and the required
       # 24.04 leg would report green without having run a scenario.
+      #
+      # `clippy` is different: it must have succeeded. It is a required check
+      # of its own, so a red one blocks the merge whatever E2E says, and running
+      # the scenarios first would only spend runner time on a change that
+      # cannot merge. `clippy` runs on every event but a dispatch (handled
+      # first), so anything but `success` here is red or cancelled. The skip
+      # makes this required check report green without having run a scenario,
+      # the same shape as the build-and-test case above, which is harmless only
+      # while `clippy` is itself required. The notice says on the run page that no
+      # scenario ran and what to re-run, rather than leaving a silent pass. It does
+      # not say the merge is blocked: a `cancelled` clippy is not red, so only a
+      # `failure` blocks anything, and the notice has to be true for both.
       - name: Decide whether to run
         id: gate
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.changes.outputs.heavy }}" = "true" ] \
+            && [ "${{ needs.clippy.result }}" != "success" ]; then
+            # Deliberately stricter than pr-linux-binaries' `success || skipped`:
+            # clippy is skipped only on a dispatch, which the first branch
+            # already handled.
+            echo "::notice title=E2E scenarios not run::clippy did not succeed (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. Fix clippy if it is red, then re-run the workflow so that clippy and this job run again."
+            echo "run=false" >> "$GITHUB_OUTPUT"
           elif { [ "${{ needs.build-and-test.result }}" = "success" ] \
               || [ "${{ needs.build-and-test.result }}" = "failure" ]; } \
             && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then

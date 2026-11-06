@@ -27,6 +27,46 @@ Run clippy with warnings as errors:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Source file size
+
+No source file may exceed 1,500 production lines. Production lines leave out test-gated
+items (inline `#[cfg(test)]` modules and the like) and test-only files, so adding the
+tests a fix needs never counts against a file. Check it with:
+
+```bash
+cargo xtask check-module-size
+```
+
+It exits non-zero and names each offending file with its count. There is one limit for
+every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
+CI job and in the `cargo-module-size` pre-commit hook, which run
+`cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
+offenders without failing (in CI the step shows red in the job's step list while the job
+stays green); the second is the same check that exits successfully even
+when the check itself cannot run. That holds once xtask has built: a commit that leaves
+xtask or `rocm-core` not compiling still fails the hook.
+The counting rules are unit-tested in `xtask/src/module_size.rs`:
+
+```bash
+cargo test -p xtask module_size
+```
+
+### Module map check
+
+Every production source file must have an entry in [architecture.md](architecture.md). The
+check runs in the `clippy` CI job and in the `architecture-doc` prek hook, and you can run it
+on its own:
+
+```bash
+cargo xtask check-architecture-doc
+```
+
+It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
+does not link, and on a stale entry in the `EXEMPT` list in
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+`lychee` check is complementary, not redundant: it confirms that links already in the doc
+resolve, and says nothing about a file the doc never mentions.
+
 ### Tests that touch the environment
 
 `std::env::set_var` / `remove_var` change state shared by every thread in the
@@ -373,8 +413,66 @@ change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
 `tests/e2e-cucumber/README.md`). On `main`
-and in the merge queue the full workspace always runs. For local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization.
+and in the merge queue the full workspace always runs. For a full local verification, keep using
+`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
+narrows the local pre-push hooks (next section).
+
+### Pre-push hook scope
+
+The pre-push hooks `cargo-clippy`, `cargo-clippy-e2e` and `cargo-test` in
+[.pre-commit-config.yaml](../.pre-commit-config.yaml) run through `cargo xtask pre-push-check`
+([prepush.rs](../xtask/src/prepush.rs)), which applies the same selection to the range being
+pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does not have yet;
+`origin/main...HEAD` when run by hand). Each step prints the scope it chose:
+
+- `clippy` runs `cargo clippy -p <crate> … --all-targets -- -D warnings` for the affected crates,
+  or `--workspace` when the selection is the whole workspace.
+- `clippy-e2e` lints the e2e harness target only when `e2e-cucumber` is among the affected crates.
+- `test` runs `cargo test -p <crate> … --all-targets` for the affected crates, never including
+  `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
+  `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
+
+The directory-based selection cannot see a crate's tests reading a file from outside the crate,
+so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
+file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
+test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
+selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+[prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
+`include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
+covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
+whose path is written out (an `include_str!` literal, or a `CARGO_MANIFEST_DIR` chain ending in
+literal `.join("...")` segments) is checked file by file, but a test that derives the repo root in
+one place and joins the rest elsewhere (xtask's `repo_root()` helper) is only recorded as reading
+through the root. For that case the test checks that the crate is a declared reader, not which files
+it reads, so a test that starts reading a new kind of file of another crate needs its
+`CROSS_CRATE_READS` entry added by hand.
+
+A step that has nothing to check says so and exits successfully. A step whose affected crates
+cannot be determined (the pushed range's base is not available locally, the range lists no
+changed files at all, or `cargo metadata` fails) runs over the whole workspace and prints why, so
+narrowing never replaces a check with silence. An empty list counts as undeterminable because the
+hook only fires for a push that contains a Rust file, so an empty list means the range is wrong. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
+filter, as before, including a lockfile-only push.
+
+The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
+job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
+`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
+every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
+`--workspace`.
+
+Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed
+commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
+builds can resolve Cargo features differently from `--workspace` ones.
+
+Preview what a push would check without compiling:
+
+```bash
+cargo xtask pre-push-check test --dry-run --base origin/main
+```
+
+`--base` replaces the range's base; `clippy` and `clippy-e2e` take the same flags. The selection
+logic is unit-tested in [prepush.rs](../xtask/src/prepush.rs); as dev tooling, with no change to
+what the `rocm` binary does, it has no Gherkin scenario.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does
@@ -507,6 +605,59 @@ rocm install sdk --channel release --format wheel < /dev/null   # expect the ref
 The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
 never prompts and never refuses, whatever the active default is.
+
+The preview also prepares no Python. On a host with no usable Python, a real
+install downloads a managed `uv`, has it install Python, and saves that Python's
+path in the config; `--dry-run` instead prints a `python_note:` line saying so
+and does not prepare Python or save a Python path. Scenario `runtime-23` checks
+the note against the state it left: a recording `uv` standing in for the download
+was never run (that log is the evidence; no network is involved), and there is no
+managed-tools folder and no saved config. It also looks for a tool archive in its
+own cache folder, but only as a backstop: the stand-in `uv` is returned before a
+download could start. The printed `command:` line then shows
+`uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
+so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
+with a different Python 3.12 it can choose that one rather than the managed one
+a real install prepares. That scenario is a canonical-layout preview. A preview
+of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still
+need `uv`: it resolves the published package versions with `uv pip compile`, so
+on a clean host it can download the managed `uv` and create the data folder's
+`tools` folder, although it still prepares no Python. The "no `uv`, no `tools`
+folder" guarantee is therefore the canonical layout's only.
+
+The preview does not announce a Python the install would refuse either, and it
+prints nothing that predicts what a real install would do on a path that ends in
+a refusal. With `ROCM_CLI_MANAGED_PYTHON_VERSION` naming a version that reads as
+a wheel tag other than the layout's (`3.13`, `3.13t`, `cpython-3.13` or
+`cpython@3.13` for the canonical cp312 layout), and with managed Python disabled
+by `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`, the preview fails with the
+install's own message after stating only what it found (for example that the
+`PATH` Python is not usable); the single line saying a real install would
+prepare a managed Python appears only for a decision that passed both checks.
+Scenarios `runtime-24` (the `3.13` refusal) and `runtime-25` (policy refusal with
+an unusable `PATH` Python) check this on the whole output. A version whose tag
+cannot be read off its name (`pypy@3.10`, a range) is announced as unchecked: the
+note and the progress line say its tag cannot be checked until it is installed.
+The scenarios run on Linux. The preview's decision (what a host with no usable
+Python is told, which managed version is announced or refused, what the
+bootstrap policy does) is unit-tested on every platform, including the Windows
+CI job, by `a_dry_run_decides_from_an_injected_environment_on_every_platform`:
+it hands `python_for_install` a resolver environment that carries the policy and
+finds nothing, so it needs no interpreter. What stays Unix-only is the search
+order and the interpreter probes, whose stand-ins are shell scripts as in the
+other resolver tests, and no end-to-end run covers the Windows preview, so the
+Windows search order (`python`, `python3`, `py` with `PATHEXT`) is not covered
+by any test.
+`a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
+[python.rs](../apps/rocm/src/therock/python.rs) is the state matrix: every
+combination of `PATH` Python (usable, unusable, absent), saved Python (usable,
+unusable, absent), bootstrap policy (enabled, disabled) and version override
+(default, accepted, unreadable, refused tag), each asserting the complete
+progress output and that `uv` was not run and no file was written. Beside it are
+`a_dry_run_with_no_usable_python_prepares_nothing`,
+`a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
+`a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
+preview does still write its package-index cache under the cache folder.
 
 Then it verifies:
 
@@ -953,7 +1104,10 @@ symlinks.
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
-anything is removed:
+anything is removed, and a dry run on a machine ROCm CLI never touched
+(`uninstall-06`) reporting nothing to remove and creating no folder. The
+`uninstall` command does not start the file logger, which would otherwise create
+the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"
@@ -1064,7 +1218,15 @@ Log browser smoke:
 rocm logs
 rocm logs --search server
 rocm logs --service <service-id>
+rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
+
+While a first-time model download is running, `rocm serve <model> --wait` keeps
+waiting past the usual 45 seconds until the server answers or its engine gives up
+(vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
+and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
+by the argument parser, covered by a unit test. Run the log follow above from a
+second terminal to watch the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
@@ -1129,8 +1291,25 @@ cargo test -p rocmd recovery_respawn_fails_closed
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
+Collision-safe port selection, focused tests:
+
+```bash
+cargo test -p rocm --bin rocm -- serve_port::
+cargo test -p rocm --bin rocm automatic_selects_against_real_loopback_listeners
+cargo test -p rocm --bin rocm concurrent_auto_transactions_publish_distinct_ports
+cargo test -p rocm --bin rocm concurrent_equivalent_transactions_converge_on_one_record
+cargo test -p rocmd recovery_waits_for_the_allocation_lock_and_refuses_an_occupied_port
+```
+
+Omitting `--port` on the default loopback host scans `11435..=11535` for a
+candidate neither reserved by a live managed-service record nor occupied on the
+OS ([`serve_port.rs`](../apps/rocm/src/serve_port.rs)), under the same `services/launch.lock` that serializes
+every other managed launch and `rocmd` recovery attempt. An explicit `--port`
+on a non-default `--host` is still required: automatic selection only probes
+`127.0.0.1` and refuses to guess elsewhere.
+
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
-credential-free. A public bind (`--host 0.0.0.0 --allow-public-bind`) requires an
+credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
 variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
@@ -2684,6 +2863,29 @@ distinctly from both a malformed line and an unknown distribution:
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
+```
+
+`examine-32` and `examine-33` plant a WSL machine under the same simulated root
+(`/dev/dxg`, DXCore and `librocdxg.so`) with a stand-in `ldconfig` on `PATH`
+whose cache does not list the library, and set `LD_LIBRARY_PATH` explicitly. With
+the library's directory on it, `driver_status` is `wsl_rocdxg_ready`; with the
+variable empty it is `wsl_rocdxg_missing`, which is the control that shows the
+first scenario turns on `LD_LIBRARY_PATH` and not on the planted files alone. Both
+run on every Linux lane, because the planted root, not the runner, decides what
+the probe finds.
+
+`examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
+library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
+own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+cache nor the variable involved, which is the layout of a TheRock tarball
+(ROCM-30386). Its control is `examine-33`, which plants the library alone and
+stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
+is what the verdict turns on.
+
+`serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[123] |serve-42 '
 ```
 
 The install plans deliberately read the real file, so no scenario plants one
