@@ -224,7 +224,12 @@ grew its own private copy of the conversation would fail those tests.
 The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
 its default action, which is how `rocm` runs, because the test harness leaves it
 ignored and changing it process-wide would race sibling tests. A write that is
-not guarded kills that process, and the parent test reports the signal.
+not guarded kills that process, and the parent test reports the signal. Two
+writes are covered that way: the request to the child's stdin, and the forwarding
+of the child's stderr to this process's stderr (a line of progress, and the note
+recorded when reading it fails). The forwarding test writes into a real pipe whose
+reader is closed, because a mock sink that returns `BrokenPipe` itself never
+raises the signal.
 
 ### Advised commands must parse
 

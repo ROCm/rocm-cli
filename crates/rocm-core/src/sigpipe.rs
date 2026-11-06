@@ -19,17 +19,55 @@
 /// (Rust's startup default) this changes nothing. The disposition is
 /// process-wide, so keep `f` to the write itself. Windows has no SIGPIPE and
 /// runs `f` as is.
+///
+/// Guarded regions may overlap, on one thread or on several (the stderr
+/// forwarder of one engine request runs while another request writes to its
+/// child). The disposition in force before the first region is remembered once
+/// and put back when the last region ends, so an overlap can neither restore
+/// "ignored" over a default action nor leave "ignored" behind.
+#[cfg(unix)]
+pub fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = unix::IgnoreGuard::enter();
+    f()
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // libc FFI
-pub fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: reading/installing a signal disposition is always safe.
-    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let result = f();
-    // SAFETY: restoring the disposition captured above is always safe.
-    unsafe {
-        libc::signal(libc::SIGPIPE, previous);
+mod unix {
+    use std::sync::{Mutex, PoisonError};
+
+    /// How many guarded regions are open, and the disposition that was in force
+    /// before the first of them.
+    static OPEN: Mutex<(usize, libc::sighandler_t)> = Mutex::new((0, libc::SIG_DFL));
+
+    /// Holds SIGPIPE ignored from [`IgnoreGuard::enter`] until it is dropped, so
+    /// a panic inside the guarded region still restores the disposition.
+    pub(super) struct IgnoreGuard;
+
+    impl IgnoreGuard {
+        pub(super) fn enter() -> Self {
+            let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            if open.0 == 0 {
+                // SAFETY: reading/installing a signal disposition is always safe.
+                open.1 = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            }
+            open.0 += 1;
+            Self
+        }
     }
-    result
+
+    impl Drop for IgnoreGuard {
+        fn drop(&mut self) {
+            let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            open.0 -= 1;
+            if open.0 == 0 {
+                // SAFETY: restoring the disposition captured by the first guard.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, open.1);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -43,6 +81,84 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Command, ExitStatus, Stdio};
+
+    /// The disposition SIGPIPE has now (read by installing the same one back).
+    #[allow(unsafe_code)] // libc::signal
+    fn current_disposition() -> libc::sighandler_t {
+        // SAFETY: reading/installing a signal disposition is always safe.
+        let current = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        // SAFETY: putting back what was just read.
+        unsafe {
+            libc::signal(libc::SIGPIPE, current);
+        }
+        current
+    }
+
+    /// Guarded regions that overlap, nested on one thread or interleaved across
+    /// two, leave SIGPIPE ignored for as long as any of them is open and put the
+    /// original default action back only when the last one closes. With a guard
+    /// that saved and restored per call, the region that ended first would
+    /// restore "ignored" over the second's `SIG_DFL` capture, or restore the
+    /// default under the region still open. Runs in a re-executed child, since
+    /// the disposition is process-wide and the harness leaves it ignored.
+    #[test]
+    #[allow(unsafe_code)] // libc::signal, to install the default action in the child
+    fn overlapping_guards_restore_the_original_disposition_once() {
+        if std::env::var_os("ROCM_TEST_SIGPIPE_OVERLAP_ARM").is_some() {
+            use std::sync::Barrier;
+            // SAFETY: installing a signal disposition is always safe.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+
+            // Nested on one thread.
+            with_sigpipe_ignored(|| {
+                with_sigpipe_ignored(|| {});
+                assert_eq!(
+                    current_disposition(),
+                    libc::SIG_IGN,
+                    "the inner region ended while the outer one was open"
+                );
+            });
+            assert_eq!(current_disposition(), libc::SIG_DFL, "nested");
+
+            // Two threads whose regions overlap, the first to enter leaving first.
+            let entered = Barrier::new(2);
+            let first_left = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    with_sigpipe_ignored(|| {
+                        entered.wait();
+                    });
+                    first_left.wait();
+                });
+                scope.spawn(|| {
+                    with_sigpipe_ignored(|| {
+                        entered.wait();
+                        first_left.wait();
+                        assert_eq!(
+                            current_disposition(),
+                            libc::SIG_IGN,
+                            "the first region ended while this one was open"
+                        );
+                    });
+                });
+            });
+            assert_eq!(current_disposition(), libc::SIG_DFL, "interleaved");
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "sigpipe::tests::overlapping_guards_restore_the_original_disposition_once",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ROCM_TEST_SIGPIPE_OVERLAP_ARM", "1")
+            .status()
+            .expect("re-exec the test arm in a child process");
+        assert!(status.success(), "{status:?}");
+    }
 
     /// A write to a dead child's stdin under the default SIGPIPE action is
     /// fatal, and the same write inside [`with_sigpipe_ignored`] returns an
