@@ -43,7 +43,7 @@ mod workflow_contract;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -411,12 +411,7 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
-        Command::PrePushCheck {
-            check,
-            base,
-            dry_run,
-            rerun,
-        } => prepush::run(check, base, dry_run, rerun)?,
+        command @ Command::PrePushCheck { .. } => run_pre_push_check(command, prepush::run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckModuleSize => module_size::run()?,
         Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
@@ -497,6 +492,25 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// The `pre-push-check` arm of [`run`]: hand each argument to `run` as parsed.
+/// `run` is a parameter so a test sees exactly what arrives, in particular that
+/// `--rerun` is not dropped on the way to the stamp logic.
+fn run_pre_push_check(
+    command: Command,
+    run: impl FnOnce(prepush::Check, Option<String>, bool, bool) -> Result<()>,
+) -> Result<()> {
+    let Command::PrePushCheck {
+        check,
+        base,
+        dry_run,
+        rerun,
+    } = command
+    else {
+        bail!("not a pre-push-check command");
+    };
+    run(check, base, dry_run, rerun)
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -519,6 +533,49 @@ mod tests {
             panic!("expected pre-push-check");
         };
         rerun
+    }
+
+    /// What the dispatch hands to `prepush::run` for these arguments: the real
+    /// clap parse, then the `pre-push-check` arm, with `run` recording its input.
+    fn handed_to_run(args: &[&str]) -> (String, Option<String>, bool, bool) {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let mut seen = None;
+        super::run_pre_push_check(cli.command, |check, base, dry_run, rerun| {
+            seen = Some((format!("{check:?}"), base, dry_run, rerun));
+            Ok(())
+        })
+        .expect("the dispatch succeeds");
+        seen.expect("the arm calls run")
+    }
+
+    #[test]
+    fn the_dispatch_hands_every_flag_to_run_unchanged() {
+        assert_eq!(
+            handed_to_run(&["xtask", "pre-push-check", "test"]),
+            ("Test".to_string(), None, false, false)
+        );
+        assert_eq!(
+            handed_to_run(&[
+                "xtask",
+                "pre-push-check",
+                "clippy",
+                "--base",
+                "origin/main",
+                "--dry-run",
+                "--rerun",
+            ]),
+            (
+                "Clippy".to_string(),
+                Some("origin/main".to_string()),
+                true,
+                true
+            )
+        );
+        // `--rerun` alone, and `--dry-run` alone, are not mixed up with each other.
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).3);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).2);
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).2);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).3);
     }
 
     #[test]

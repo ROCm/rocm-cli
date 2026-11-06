@@ -476,6 +476,23 @@ fn process_env(name: &str) -> Option<String> {
     std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
 }
 
+/// What the `pre-push-check` command line asked for.
+pub struct Flags {
+    pub base: Option<String>,
+    pub dry_run: bool,
+    pub rerun: bool,
+}
+
+/// The world one invocation runs against: where passes are kept, how the tree
+/// and toolchain are probed, the clock, and how a process variable is read.
+pub struct World<'a> {
+    pub probe: &'a dyn prepush_stamp::Probe,
+    pub store: &'a dyn prepush_stamp::Store,
+    /// Seconds since the epoch.
+    pub now: u64,
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+}
+
 /// Entry point for the `pre-push-check` subcommand.
 pub fn run(check: Check, base: Option<String>, dry_run: bool, rerun: bool) -> Result<()> {
     let store: Box<dyn prepush_stamp::Store> = match prepush_stamp::FsStore::in_git_common_dir(None)
@@ -484,26 +501,59 @@ pub fn run(check: Check, base: Option<String>, dry_run: bool, rerun: bool) -> Re
         Err(error) => Box::new(prepush_stamp::UnavailableStore(format!("{error:#}"))),
     };
     let probe = prepush_stamp::SystemProbe::default();
-    let stamps = Stamps::new(
-        &probe,
-        store.as_ref(),
-        prepush_stamp::now_secs(),
+    run_in(
+        check,
+        Flags {
+            base,
+            dry_run,
+            rerun,
+        },
+        &World {
+            probe: &probe,
+            store: store.as_ref(),
+            now: prepush_stamp::now_secs(),
+            env: &process_env,
+        },
+        affected::load_graph,
+        affected::changed_files_between,
+        spawn_cargo,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`run`] with the world injected: this is where `--rerun` and
+/// `ROCM_PRE_PUSH_RERUN` reach the stamp logic, so a test drives it with a fake
+/// store and sees whether a recorded pass is honored.
+pub fn run_in(
+    check: Check,
+    flags: Flags,
+    world: &World<'_>,
+    load_graph: impl FnOnce() -> Result<Graph>,
+    changed_files: impl FnOnce(&str, &str) -> Result<Vec<String>>,
+    run_cargo: impl FnMut(&[String]) -> Result<()>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Flags {
+        base,
+        dry_run,
         rerun,
-        process_env,
-    );
+    } = flags;
+    let stamps = Stamps::new(world.probe, world.store, world.now, rerun, |name| {
+        (world.env)(name)
+    });
     let request = Request {
         base,
         dry_run,
-        env: Env::from_lookup(process_env),
+        env: Env::from_lookup(|name| (world.env)(name)),
     };
     execute(
         check,
         request,
         &stamps,
-        affected::load_graph,
-        affected::changed_files_between,
-        spawn_cargo,
-        &mut std::io::stdout().lock(),
+        load_graph,
+        changed_files,
+        run_cargo,
+        out,
     )
 }
 
@@ -1929,6 +1979,85 @@ mod tests {
         .expect("the first run");
         assert_eq!(store.files.borrow().len(), 1);
         (probe, store)
+    }
+
+    // ---- run_in: the flag and the variable reach the stamp logic ----
+
+    /// Drive the real wiring below `main`: `run_in` builds the stamps from the
+    /// flag and the environment, here over a fake store. With `recorded_pass`
+    /// a first plain run records a pass for the tree; the run that follows is
+    /// the one measured, and the result says whether it ran cargo.
+    fn measured_run_ran_cargo(rerun: bool, rerun_var: Option<&str>, recorded_pass: bool) -> bool {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let env = |name: &str| {
+            if name == prepush_stamp::RERUN_VAR {
+                rerun_var.map(String::from)
+            } else {
+                None
+            }
+        };
+        let ran = std::cell::Cell::new(false);
+        let run_once = |now: u64, rerun: bool| {
+            ran.set(false);
+            run_in(
+                Check::Test,
+                Flags {
+                    base: None,
+                    dry_run: false,
+                    rerun,
+                },
+                &World {
+                    probe: &probe,
+                    store: &store,
+                    now,
+                    env: &env,
+                },
+                || Ok(graph()),
+                |_, _| Ok(vec!["xtask/src/main.rs".to_string()]),
+                |_| {
+                    ran.set(true);
+                    Ok(())
+                },
+                &mut Vec::new(),
+            )
+            .expect("the step");
+            ran.get()
+        };
+        if recorded_pass {
+            // Nothing is on record yet, so this run runs cargo and records a pass.
+            assert!(run_once(NOW, false), "the first run runs the step");
+            assert_eq!(store.files.borrow().len(), 1, "and records a pass");
+        }
+        run_once(NOW + 60, rerun)
+    }
+
+    #[test]
+    fn without_the_flag_or_the_variable_a_recorded_pass_skips_the_step() {
+        assert!(!measured_run_ran_cargo(false, None, true));
+        assert!(
+            !measured_run_ran_cargo(false, Some("0"), true),
+            "0 means off"
+        );
+        assert!(
+            !measured_run_ran_cargo(false, Some(""), true),
+            "empty means off"
+        );
+    }
+
+    #[test]
+    fn the_flag_reaches_the_stamp_logic_and_reruns_despite_a_recorded_pass() {
+        assert!(measured_run_ran_cargo(true, None, true));
+    }
+
+    #[test]
+    fn the_variable_reaches_the_stamp_logic_and_reruns_despite_a_recorded_pass() {
+        assert!(measured_run_ran_cargo(false, Some("1"), true));
+    }
+
+    #[test]
+    fn with_no_recorded_pass_the_step_runs_either_way() {
+        assert!(measured_run_ran_cargo(false, None, false));
+        assert!(measured_run_ran_cargo(true, None, false));
     }
 
     #[test]
