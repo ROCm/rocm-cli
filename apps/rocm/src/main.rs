@@ -947,15 +947,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             keep_data,
             keep_cache,
             force_dev_binaries,
-        }) => uninstall(UninstallOptions {
-            yes,
-            dry_run,
-            keep_binaries,
-            keep_config,
-            keep_data,
-            keep_cache,
-            force_dev_binaries,
-        }),
+            force,
+        }) => {
+            uninstall::reject_force(force.is_some())?;
+            uninstall(UninstallOptions {
+                yes,
+                dry_run,
+                keep_binaries,
+                keep_config,
+                keep_data,
+                keep_cache,
+                force_dev_binaries,
+            })
+        }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();
             clap_complete::generate(shell, &mut cmd, "rocm", &mut std::io::stdout());
