@@ -9,15 +9,16 @@
 //! may ask for (`run_rocm_read_only_in_process`), the helpers that wrap a
 //! command's output as an MCP tool result, and the `path_exists` and
 //! `port_status` tools. `render_services_tool_result_text`, the text of the
-//! `services` tool, lives here too.
+//! `services` tool, lives here too, as does `mcp_tool_result_text`, which reads
+//! the text back out of an MCP tool result for the turn loop.
 //!
 //! A child of the `chat` module. It calls into `tool_policy.rs` (the validators
 //! and the approval split), `rocm_argv.rs`, `chat/summaries.rs`
 //! (`managed_service_running_state`) and the crate-root renderers; nothing here
-//! calls back into the turn loop in `chat/turn.rs` (only this module's tests
-//! read its `mcp_tool_result_text`), which reads this module's items through
-//! `super::mcp_bridge`. `run_internal_mcp_call` stays reachable as
-//! `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
+//! calls back into the turn loop in `chat/turn.rs`, tests included; the turn
+//! loop reads this module's items through `super::mcp_bridge`.
+//! `run_internal_mcp_call` stays reachable as `chat::run_internal_mcp_call` for
+//! `main.rs` and `dash_seam.rs`.
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
@@ -434,6 +435,25 @@ fn internal_mcp_tool_result_from_command(
     })
 }
 
+pub(super) fn mcp_tool_result_text(value: &serde_json::Value) -> String {
+    value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                        .then(|| item.get("text").and_then(serde_json::Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| value.to_string())
+}
+
 fn run_rocm_capture_for_paths(
     paths: &AppPaths,
     args: &[&str],
@@ -843,10 +863,27 @@ fn run_chat_port_status_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::turn::mcp_tool_result_text;
     use crate::tests::test_paths;
     use std::fs;
     use std::net::TcpListener;
+
+    #[test]
+    fn mcp_tool_result_text_joins_text_content_items() {
+        let value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "line one"},
+                {"type": "image", "text": "ignored"},
+                {"type": "text", "text": "line two"},
+            ]
+        });
+        assert_eq!(mcp_tool_result_text(&value), "line one\nline two");
+    }
+
+    #[test]
+    fn mcp_tool_result_text_falls_back_to_raw_value_without_text_content() {
+        let value = serde_json::json!({"content": []});
+        assert_eq!(mcp_tool_result_text(&value), value.to_string());
+    }
 
     #[test]
     fn loopback_tcp_port_is_reachable_detects_listening_and_closed_ports() {

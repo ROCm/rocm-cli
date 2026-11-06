@@ -25,7 +25,7 @@ use super::intent::{
     latest_user_chat_message, prompt_asks_engine_install_state, prompt_asks_running_or_status,
     prompt_can_use_read_only_without_local_assistant, prompt_mentions_serving_engine_or_service,
 };
-use super::mcp_bridge::{loopback_host_key, run_chat_read_only_tool};
+use super::mcp_bridge::{loopback_host_key, mcp_tool_result_text, run_chat_read_only_tool};
 use super::summaries::{deterministic_chat_tool_summary, deterministic_summary_can_stand_alone};
 use crate::engine_runtime_select::service_model_names_match;
 use crate::freeform_planner::format_structured_tool_call;
@@ -39,25 +39,6 @@ use crate::{ChatInferenceParams, chat_host_facts, providers};
 use anyhow::Result;
 use rocm_core::{AppPaths, DEFAULT_LOCAL_HOST};
 use std::fmt::Write as _;
-
-pub(super) fn mcp_tool_result_text(value: &serde_json::Value) -> String {
-    value
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                        .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| value.to_string())
-}
 
 fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
     value
@@ -902,24 +883,6 @@ mod tests {
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({ "args": args }),
         }
-    }
-
-    #[test]
-    fn mcp_tool_result_text_joins_text_content_items() {
-        let value = serde_json::json!({
-            "content": [
-                {"type": "text", "text": "line one"},
-                {"type": "image", "text": "ignored"},
-                {"type": "text", "text": "line two"},
-            ]
-        });
-        assert_eq!(mcp_tool_result_text(&value), "line one\nline two");
-    }
-
-    #[test]
-    fn mcp_tool_result_text_falls_back_to_raw_value_without_text_content() {
-        let value = serde_json::json!({"content": []});
-        assert_eq!(mcp_tool_result_text(&value), value.to_string());
     }
 
     #[test]

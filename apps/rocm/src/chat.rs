@@ -298,8 +298,7 @@ mod tests {
 /// mostly metacharacters.
 #[cfg(test)]
 mod command_preview_properties {
-    use super::mcp_bridge::run_chat_path_exists_tool;
-    use super::turn::mcp_tool_result_text;
+    use super::mcp_bridge::{mcp_tool_result_text, run_chat_path_exists_tool};
     use super::*;
     use crate::freeform_planner::{
         ProviderPlannerToolCall, format_structured_tool_call, planner_failure_note,
