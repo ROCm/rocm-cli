@@ -242,6 +242,10 @@ async fn managed_server_whose_process_started_another(world: &mut E2eWorld) {
     // The premise, so the Then step cannot pass for the wrong reason: the
     // descendant exists and is running, and so is the parent.
     let descendant = wait_for_descendant_pid(&pid_file);
+    // Kept first, with its creation time where the host reads one, so teardown
+    // can end the child on its own even when the stop (or a step) fails and the
+    // parent is gone: a later stop cannot recover a child from a dead parent.
+    world.recorded_descendant = Some(rocm_core::ProcessIdentity::capture(descendant));
     assert_ne!(descendant, pid, "the child must be a different process");
     assert!(
         windows_process_is_running(descendant),
