@@ -43,10 +43,35 @@ pub(super) struct WheelCompatibility {
     pub(super) platform_tags: Vec<String>,
 }
 
+/// Where an interpreter came from. `as_str` is what the install plan prints on
+/// its `python_source:` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PythonSource {
+    /// `ROCM_CLI_PYTHON`.
+    Env,
+    /// Found on `PATH`.
+    Path,
+    /// The managed Python ROCm CLI prepares.
+    Managed,
+    /// The interpreter an installed runtime's manifest recorded.
+    Manifest,
+}
+
+impl PythonSource {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Path => "path",
+            Self::Managed => "managed",
+            Self::Manifest => "manifest",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PythonLauncher {
     pub(super) executable: PathBuf,
-    pub(super) source: &'static str,
+    pub(super) source: PythonSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,7 +308,7 @@ fn ensure_managed_python(
         let _ = record_managed_python_config(paths, &manifest.executable);
         return Ok(PythonLauncher {
             executable: manifest.executable,
-            source: "managed",
+            source: PythonSource::Managed,
         });
     }
 
@@ -357,7 +382,7 @@ fn ensure_managed_python(
     ));
     Ok(PythonLauncher {
         executable,
-        source: "managed",
+        source: PythonSource::Managed,
     })
 }
 
@@ -560,10 +585,10 @@ impl PlannedPython {
     }
 
     /// The `python_source:` line's value.
-    pub(super) const fn source(&self) -> &'static str {
+    pub(super) const fn source(&self) -> PythonSource {
         match self {
             Self::Ready(launcher) => launcher.source,
-            Self::WouldPrepareManaged { .. } => "managed",
+            Self::WouldPrepareManaged { .. } => PythonSource::Managed,
         }
     }
 
@@ -604,16 +629,20 @@ impl PlannedPython {
     pub(super) fn progress_text(&self) -> String {
         match self {
             Self::Ready(launcher) => match launcher.source {
-                "path" => format!("Using Python from PATH: {}.", launcher.executable.display()),
-                "env" => format!(
+                PythonSource::Path => {
+                    format!("Using Python from PATH: {}.", launcher.executable.display())
+                }
+                PythonSource::Env => format!(
                     "Using Python from ROCM_CLI_PYTHON: {}.",
                     launcher.executable.display()
                 ),
-                "managed" => format!(
+                PythonSource::Managed => format!(
                     "Using ROCm CLI's portable Python: {}.",
                     launcher.executable.display()
                 ),
-                _ => format!("Using Python from {}.", launcher.executable.display()),
+                PythonSource::Manifest => {
+                    format!("Using Python from {}.", launcher.executable.display())
+                }
             },
             Self::WouldPrepareManaged {
                 version,
@@ -711,7 +740,7 @@ fn find_python_launcher_in(
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLookup::Found(PythonLauncher {
             executable: PathBuf::from(value),
-            source: "env",
+            source: PythonSource::Env,
         }));
     }
 
@@ -721,7 +750,7 @@ fn find_python_launcher_in(
             Ok(()) => {
                 return Ok(PythonLookup::Found(PythonLauncher {
                     executable: candidate,
-                    source: "path",
+                    source: PythonSource::Path,
                 }));
             }
             Err(_) => {
@@ -753,7 +782,7 @@ fn find_python_launcher_in(
         if python_launcher_install_ready(&manifest.executable, requirement).is_ok() {
             return Ok(PythonLookup::Found(PythonLauncher {
                 executable: manifest.executable,
-                source: "managed",
+                source: PythonSource::Managed,
             }));
         }
         progress_line(match purpose {
@@ -1098,7 +1127,7 @@ exit 1
             },
             python_requirement(SourceLayout::Canonical),
         )?;
-        assert_eq!(launcher.source, "path");
+        assert_eq!(launcher.source, PythonSource::Path);
         assert!(
             launcher.executable.is_absolute(),
             "PATH launcher should resolve to an absolute executable: {}",
@@ -1201,7 +1230,7 @@ exit 1
             python_requirement(SourceLayout::Canonical),
         )?;
 
-        assert_eq!(launcher.source, "path");
+        assert_eq!(launcher.source, PythonSource::Path);
         assert!(path_python.exists());
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -1268,7 +1297,8 @@ exit 1
         };
 
         assert_eq!(
-            launcher.source, "path",
+            launcher.source,
+            PythonSource::Path,
             "resolve_python_launcher must consult the test override, not the real environment"
         );
         assert!(launcher.executable.starts_with(&bin_dir));
@@ -1569,7 +1599,7 @@ exit 1
         let PlannedPython::Ready(launcher) = planned else {
             panic!("a usable PATH Python must be reported as ready, got {planned:?}");
         };
-        assert_eq!(launcher.source, "path");
+        assert_eq!(launcher.source, PythonSource::Path);
         assert_eq!(launcher.executable, python);
         assert!(!host.uv_was_run());
         assert_eq!(snapshot(&host.paths), Vec::<PathBuf>::new());
@@ -1595,7 +1625,7 @@ exit 1
         let PlannedPython::Ready(launcher) = planned else {
             panic!("a usable saved Python must be reported as ready, got {planned:?}");
         };
-        assert_eq!(launcher.source, "managed");
+        assert_eq!(launcher.source, PythonSource::Managed);
         assert_eq!(launcher.executable, managed);
         assert!(!host.uv_was_run());
         assert!(
@@ -2073,7 +2103,8 @@ exit 1
             let compatibility = planned.wheel_compatibility()?;
             assert_eq!(compatibility.python_tag, tag);
             assert!(compatibility.platform_tags.contains(&"any".to_owned()));
-            assert_eq!(planned.source(), "managed");
+            assert_eq!(planned.source(), PythonSource::Managed);
+            assert_eq!(planned.source().as_str(), "managed");
             assert_eq!(planned.launcher_display(), "not prepared by this preview");
             assert_eq!(planned.venv_python_arg(), PathBuf::from(version));
             assert!(
@@ -2096,10 +2127,10 @@ exit 1
     fn a_ready_python_prints_its_path_and_source() {
         let planned = PlannedPython::Ready(PythonLauncher {
             executable: PathBuf::from("/usr/bin/python3"),
-            source: "path",
+            source: PythonSource::Path,
         });
         assert_eq!(planned.launcher_display(), "/usr/bin/python3");
-        assert_eq!(planned.source(), "path");
+        assert_eq!(planned.source().as_str(), "path");
         assert_eq!(planned.venv_python_arg(), PathBuf::from("/usr/bin/python3"));
         assert!(planned.note().is_none());
         assert_eq!(

@@ -472,7 +472,7 @@ fn install_wheel_runtime(
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
     let _ = writeln!(output, "  python_launcher: {}", python.launcher_display());
-    let _ = writeln!(output, "  python_source: {}", python.source());
+    let _ = writeln!(output, "  python_source: {}", python.source().as_str());
     if let Some(note) = python.note() {
         let _ = writeln!(output, "  python_note: {note}");
     }
