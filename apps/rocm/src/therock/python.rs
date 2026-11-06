@@ -1386,10 +1386,8 @@ exit 1
 
     /// Process environment variables set for one test and restored on drop.
     /// Every caller holds `PROCESS_ENV_TEST_LOCK` for as long as it holds this.
-    #[cfg(unix)]
     struct RestoredEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
-    #[cfg(unix)]
     impl RestoredEnv {
         #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
         fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
@@ -1409,7 +1407,6 @@ exit 1
         }
     }
 
-    #[cfg(unix)]
     impl Drop for RestoredEnv {
         #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
         fn drop(&mut self) {
@@ -1441,7 +1438,6 @@ exit 1
     /// Every path under the three folders a command may write to, sorted. Empty
     /// when none of them exists, so "nothing was created" and "something empty
     /// was created" are different answers.
-    #[cfg(unix)]
     fn snapshot(paths: &AppPaths) -> Vec<PathBuf> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = fs::read_dir(dir) else {
@@ -1608,6 +1604,144 @@ exit 1
             host.uv_was_run(),
             "the stand-in uv is not reachable, so the checks above prove nothing"
         );
+        Ok(())
+    }
+
+    /// The preview's decision, made from an injected environment, on every
+    /// platform.
+    ///
+    /// The tests around it drive the decision with shell-script interpreters and
+    /// run on Unix only. The decision itself (what a host with no usable Python
+    /// is told, which managed version is announced or refused, what the bootstrap
+    /// policy does) needs no interpreter: a [`PythonResolverEnv`] with nothing to
+    /// find and the policy written into it exercises `python_for_install`
+    /// end to end, so this one runs on the Windows CI job as well. The search
+    /// order and the interpreter probes stay Unix-only, as the PR text says.
+    ///
+    /// Each row asserts the whole progress output and the state left behind
+    /// together. The control at the end is the install on the same host: it
+    /// reaches the managed `uv` (a file that cannot be launched, so nothing is
+    /// downloaded or run), which shows the preview's silence about `uv` means it
+    /// stayed out of it, not that the stand-in was never wired up.
+    #[test]
+    fn a_dry_run_decides_from_an_injected_environment_on_every_platform() -> Result<()> {
+        use super::super::process::PROGRESS_LINE_SINK;
+
+        let _lock = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = test_paths("python-dry-run-injected");
+        let tools = root.join("tools");
+        fs::create_dir_all(&tools)?;
+        // Present but not executable, on every platform: `ensure_uv_binary`
+        // returns it as the override, and launching it fails.
+        let uv = tools.join("uv");
+        fs::write(&uv, "not an executable")?;
+        let _uv = RestoredEnv::set(&[("ROCM_CLI_UV_BINARY", Some(&uv))]);
+        assert!(snapshot(&paths).is_empty());
+
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let run = |version: Option<&str>, disabled: bool, dry_run: bool| {
+            let _resolver = OverridePythonResolverEnv::new(PythonResolverEnv {
+                python_override: None,
+                search_dirs: Vec::new(),
+                managed_python_version: version.map(str::to_owned),
+                managed_bootstrap_disabled: disabled,
+            });
+            PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+            let result = python_for_install(&paths, requirement, dry_run);
+            let lines = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+            (result, lines)
+        };
+        let promise = |version: &str, caveat: &str| {
+            format!(
+                "No usable Python found; a real install would prepare Python {version}{caveat}. This preview does not."
+            )
+        };
+
+        // Announced: the default, a patch release of the required minor, a
+        // blank override (read as unset) and a version whose tag cannot be read.
+        for (version, announced, checked) in [
+            (None, "3.12", true),
+            (Some("3.12.4"), "3.12.4", true),
+            (Some("cpython@3.12"), "cpython@3.12", true),
+            (Some("  "), "3.12", true),
+            (Some("pypy@3.10"), "pypy@3.10", false),
+        ] {
+            let (result, lines) = run(version, false, true);
+            let planned = result.unwrap_or_else(|error| panic!("{version:?}: {error:#}"));
+            let PlannedPython::WouldPrepareManaged {
+                version: planned_version,
+                tag_checked,
+                ..
+            } = &planned
+            else {
+                panic!(
+                    "{version:?}: a host with no Python must be planned as needing one, got {planned:?}"
+                );
+            };
+            assert_eq!(planned_version, announced, "{version:?}");
+            assert_eq!(*tag_checked, checked, "{version:?}");
+            let caveat = if checked {
+                ""
+            } else {
+                " (its wheel tag cannot be checked until it is installed; cp312 is required)"
+            };
+            assert_eq!(lines, vec![promise(announced, caveat)], "{version:?}");
+            assert!(
+                planned.note().is_some_and(|note| note.contains(&format!(
+                    "install managed Python {announced}{caveat} and save"
+                ))),
+                "{version:?}: {planned:?}"
+            );
+        }
+
+        // Refused: a version whose wheel tag is not the layout's, in every
+        // spelling that reads as one, and a host where the bootstrap is
+        // disabled. Nothing is promised, so no line predicts the install.
+        for version in ["3.13", "3.13t", "cpython-3.13", "cpython@3.13"] {
+            let (result, lines) = run(Some(version), false, true);
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(&format!("would prepare managed Python {version}"))
+                    && error.contains("Python wheel tag cp313 is not supported")
+                    && error.contains("cp312 is required"),
+                "{version}: {error}"
+            );
+            assert_eq!(lines, Vec::<String>::new(), "{version}");
+        }
+        let (preview, lines) = run(None, true, true);
+        let preview = preview.unwrap_err().to_string();
+        let (install, _) = run(None, true, false);
+        assert!(
+            preview.contains("managed Python bootstrap is disabled"),
+            "{preview}"
+        );
+        assert_eq!(preview, install.unwrap_err().to_string());
+        assert_eq!(lines, Vec::<String>::new());
+
+        // State: every preview above left the config, data and cache folders as
+        // they were, which for this host is absent.
+        assert!(!paths.config_path().exists());
+        assert!(!managed_python_manifest_path(&paths).exists());
+        assert_eq!(snapshot(&paths), Vec::<PathBuf>::new());
+
+        // Control: the real install on the same host goes on to prepare Python,
+        // which reaches the managed `uv`.
+        let (install, lines) = run(None, false, false);
+        let error = format!("{:#}", install.unwrap_err());
+        assert!(
+            error.contains("failed to launch uv python install"),
+            "the install did not reach uv, so the previews above prove nothing: {error}"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Preparing Python 3.12...".to_owned(),
+                "Installing Python 3.12 via uv...".to_owned()
+            ]
+        );
+        fs::remove_dir_all(&root).ok();
         Ok(())
     }
 
