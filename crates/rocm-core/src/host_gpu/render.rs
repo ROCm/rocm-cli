@@ -69,6 +69,14 @@ impl ExamineSummary {
                     detected.unwrap_or("<unknown>")
                 ),
             },
+            // The command names `rocm services list` rather than the serve
+            // summary on purpose. The summary reads the device once, right
+            // after `ready`, and lemonade answers `unknown` until its own
+            // inference probe returns — so the row it prints is legitimately
+            // absent for a short window. Pointing at the surface that shows it
+            // *once known* keeps the advice able to clear the condition it is
+            // printed for, which naming the summary would not.
+            //
             // Not folded in with `VulkanOnly`: a detection gap is not a
             // confirmed absence of ROCm support, and saying "Vulkan" here would
             // be the same false claim in the other direction. What the user can
@@ -77,8 +85,9 @@ impl ExamineSummary {
             // thing on this host that can actually settle the question.
             GpuSupportLevel::Unknown => format!(
                 "  rocm_support: unknown - {}, so this build can confirm neither \
-                 ROCm support nor its absence; `rocm serve <model> --engine \
-                 lemonade` reports the backend it picked on its `device:` row\n",
+                 ROCm support nor its absence; serve a model with `rocm serve \
+                 <model> --engine lemonade` and read the backend it picked from \
+                 the `device:` row of `rocm services list`\n",
                 match detected {
                     Some(gfx) => format!("GPU target {gfx} is not in this build's catalog"),
                     None => "no AMD GPU was detected".to_owned(),
