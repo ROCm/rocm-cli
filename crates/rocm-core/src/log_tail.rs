@@ -79,8 +79,9 @@ impl LogTail {
     }
 }
 
-/// The clause a log view prints when a log has content but none of it is
-/// shown because its newest line does not fit the read budget
+/// The clause a log view prints when none of a log's content is shown.
+///
+/// That is the case when the newest line does not fit the read budget
 /// ([`LogTail::newest_line_exceeds_the_read_bound`]). Derived from
 /// [`LOG_VIEW_MAX_TAIL_READ`], the budget the views read with, so the number
 /// cannot drift from it.
@@ -91,9 +92,10 @@ pub fn newest_line_exceeds_bound_notice() -> String {
     )
 }
 
-/// What the `service_logs` tool says about a service's log tail, so that an
-/// empty log and a log whose newest line does not fit the read bound are not
-/// both reported as "Read the last 0 line(s)". Shared by the daemon's MCP
+/// What the `service_logs` tool says about a service's log tail.
+///
+/// An empty log and a log whose newest line does not fit the read bound are
+/// not both reported as "Read the last 0 line(s)". Shared by the daemon's MCP
 /// server and the CLI's own tool bridge, which answer the same tool.
 ///
 /// The count is the number of lines returned, not the number asked for.
