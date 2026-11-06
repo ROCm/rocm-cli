@@ -841,10 +841,63 @@ mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        audit_line, audit_messages, audit_record, seed_audit_store, temp_app_paths,
-    };
-    use crate::{AppPaths, AuditEventRecord, append_audit_event, load_recent_audit_events};
+    use crate::test_support::temp_app_paths;
+    use serde::Deserialize;
+
+    /// The record these tests store. The engine is generic over its record
+    /// type, so its tests carry their own rather than borrow one of its users':
+    /// `automation.rs` covers the stores it builds on this engine.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Entry {
+        tag: String,
+        /// Padding, so a line is about as long as a real store's. The
+        /// rotation tests size their byte caps, and the torn-tail tests cut
+        /// their debris, against that length.
+        detail: String,
+    }
+
+    fn entry(tag: &str) -> Entry {
+        Entry {
+            tag: tag.to_owned(),
+            detail: "d".repeat(110),
+        }
+    }
+
+    /// One serialized record, without its newline.
+    fn entry_line(tag: &str) -> String {
+        serde_json::to_string(&entry(tag)).expect("serialize entry")
+    }
+
+    fn entry_tags(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.tag.as_str()).collect()
+    }
+
+    /// A throwaway root, and the path of a store inside it, whose directory
+    /// exists.
+    fn temp_store(name: &str) -> Result<(PathBuf, PathBuf)> {
+        let (root, _paths) = temp_app_paths(name);
+        let path = root.join("store").join("events.jsonl");
+        fs::create_dir_all(path.parent().context("a store has a directory")?)?;
+        Ok((root, path))
+    }
+
+    /// Write `contents` as the store, as an out-of-band edit or a killed
+    /// writer would have left it.
+    fn seed_store(path: &Path, contents: &str) -> Result<()> {
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    /// Append the record tagged `tag` to `path`, with no rotation.
+    fn append_entry(path: &Path, tag: &str) -> Result<()> {
+        append_jsonl_record(path, &entry(tag), None, "entry record")
+    }
+
+    /// The most recent `limit` records of the store at `path`, reading up to
+    /// the generations a real store keeps.
+    fn load_recent_entries(path: &Path, limit: usize) -> Result<Vec<Entry>> {
+        load_recent_jsonl_records(path, 4, limit, "entry")
+    }
 
     #[test]
     fn a_rotation_failure_is_reported_once_per_store() {
@@ -919,18 +972,16 @@ mod tests {
     // it — sees the file end early; that is not an error.
     #[test]
     fn a_scan_that_finds_the_file_shorter_than_it_was_still_succeeds() -> Result<()> {
-        let (root, paths) = temp_app_paths("scan-shrunk");
-        seed_audit_store(
-            &paths,
-            &format!("{}\n{}\n", audit_line("a"), audit_line("b")),
+        let (root, path) = temp_store("scan-shrunk")?;
+        seed_store(
+            &path,
+            &format!("{}\n{}\n", entry_line("a"), entry_line("b")),
         )?;
-        let path = paths.audit_events_path();
         let file = fs::File::open(&path)?;
         let stale_len = file.metadata()?.len() + 40;
-        let recent =
-            scan_recent_jsonl_records::<AuditEventRecord>(&path, &file, stale_len, 5, "audit");
+        let recent = scan_recent_jsonl_records::<Entry>(&path, &file, stale_len, 5, "entry");
         fs::remove_dir_all(root).ok();
-        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        assert_eq!(entry_tags(&recent?), ["a", "b"]);
         Ok(())
     }
 
@@ -946,11 +997,10 @@ mod tests {
     // `automation.rs`, just complete JSON rather than torn).
     #[test]
     fn load_recent_retries_past_a_shrink_mid_scan_and_succeeds() -> Result<()> {
-        let (root, paths) = temp_app_paths("scan-retry-after-shrink");
-        let seed = format!("{}\n", audit_line("seed"));
-        let giant = audit_line(&"x".repeat(200_000));
-        seed_audit_store(&paths, &format!("{seed}{giant}"))?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("scan-retry-after-shrink")?;
+        let seed = format!("{}\n", entry_line("seed"));
+        let giant = entry_line(&"x".repeat(200_000));
+        seed_store(&path, &format!("{seed}{giant}"))?;
         let seed_len = seed.len() as u64;
         let hook_path = path.clone();
         test_hooks::set_before_scan_read(
@@ -964,10 +1014,10 @@ mod tests {
                     .expect("truncate mid-scan");
             }),
         );
-        let recent = load_recent_audit_events(&paths, 5);
+        let recent = load_recent_entries(&path, 5);
         fs::remove_dir_all(root).ok();
         assert_eq!(
-            audit_messages(&recent?),
+            entry_tags(&recent?),
             ["seed"],
             "a shrink strictly between two chunked reads must be retried, not failed"
         );
@@ -1044,21 +1094,20 @@ mod tests {
         ))
     }
 
-    /// Run the torn-tail repair on the seeded audit store with the replace and
-    /// truncate steps supplied by the test, appending the record `b`.
-    fn repair_audit_store_with(
-        paths: &AppPaths,
+    /// Run the torn-tail repair on the seeded store at `path` with the replace
+    /// and truncate steps supplied by the test, appending the record `b`.
+    fn repair_store_with(
+        path: &Path,
         replace: impl FnOnce(&Path, &[u8]) -> Result<()>,
         truncate: impl FnOnce(&Path, u64) -> Result<()>,
     ) -> Result<()> {
-        let path = paths.audit_events_path();
-        let file = open_jsonl_for_append(&path)?;
-        let TailState::Torn(tail_start) = inspect_tail(&path, &file)? else {
+        let file = open_jsonl_for_append(path)?;
+        let TailState::Torn(tail_start) = inspect_tail(path, &file)? else {
             bail!("the seeded store has no torn tail");
         };
-        let mut line = audit_line("b").into_bytes();
+        let mut line = entry_line("b").into_bytes();
         line.push(b'\n');
-        repair_torn_tail_and_append(&path, file, tail_start, &line, replace, truncate)
+        repair_torn_tail_and_append(path, file, tail_start, &line, replace, truncate)
     }
 
     // The fallback the whole-store rewrite lacked: when it cannot complete
@@ -1069,15 +1118,14 @@ mod tests {
     // in `automation.rs` pins.
     #[test]
     fn a_torn_tail_is_cut_in_place_when_replacing_the_store_fails() -> Result<()> {
-        let (root, paths) = temp_app_paths("torn-tail-fallback-truncates");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("torn-tail-fallback-truncates")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
         let before = file_identity(&path)?;
         let mut attempted = Vec::new();
 
-        repair_audit_store_with(
-            &paths,
+        repair_store_with(
+            &path,
             |_, content| {
                 attempted = content.to_vec();
                 bail!("no space left on device")
@@ -1087,9 +1135,9 @@ mod tests {
 
         let after = file_identity(&path)?;
         let text = fs::read_to_string(&path);
-        let recent = load_recent_audit_events(&paths, 5);
+        let recent = load_recent_entries(&path, 5);
         fs::remove_dir_all(root).ok();
-        let expected = format!("{}\n{}\n", audit_line("a"), audit_line("b"));
+        let expected = format!("{}\n{}\n", entry_line("a"), entry_line("b"));
         assert_eq!(
             String::from_utf8(attempted)?,
             expected,
@@ -1097,7 +1145,7 @@ mod tests {
         );
         assert_eq!(text?, expected);
         assert_eq!(before, after, "the fallback must cut the debris in place");
-        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        assert_eq!(entry_tags(&recent?), ["a", "b"]);
         Ok(())
     }
 
@@ -1106,14 +1154,13 @@ mod tests {
     // every repair.
     #[test]
     fn a_torn_tail_is_not_truncated_when_replacing_the_store_works() -> Result<()> {
-        let (root, paths) = temp_app_paths("torn-tail-fallback-unused");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("torn-tail-fallback-unused")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
         let before = file_identity(&path)?;
 
-        repair_audit_store_with(
-            &paths,
+        repair_store_with(
+            &path,
             |path, content| crate::write_atomic(path, content, "jsonl"),
             |_, _| bail!("truncate must not run when the replace succeeded"),
         )?;
@@ -1121,24 +1168,23 @@ mod tests {
         let after = file_identity(&path)?;
         let text = fs::read_to_string(&path);
         fs::remove_dir_all(root).ok();
-        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(text?, format!("{}\n{}\n", entry_line("a"), entry_line("b")));
         assert_ne!(before, after, "a working replace publishes a new file");
         Ok(())
     }
 
     #[test]
     fn a_torn_tail_that_can_be_neither_replaced_nor_cut_reports_both_causes() -> Result<()> {
-        let (root, paths) = temp_app_paths("torn-tail-fallback-both-fail");
-        let torn = &audit_line("torn")[..20];
-        let seeded = format!("{}\n{torn}", audit_line("a"));
-        seed_audit_store(&paths, &seeded)?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("torn-tail-fallback-both-fail")?;
+        let torn = &entry_line("torn")[..20];
+        let seeded = format!("{}\n{torn}", entry_line("a"));
+        seed_store(&path, &seeded)?;
 
         // Layered like the real steps (`write_atomic` and
         // `truncate_jsonl_in_place` both wrap the OS error in a context), so
         // the assertion fails if either cause is formatted without its chain.
-        let result = repair_audit_store_with(
-            &paths,
+        let result = repair_store_with(
+            &path,
             |_, _| {
                 Err(anyhow::anyhow!("no space left on device"))
                     .context("failed to replace the store")
@@ -1149,7 +1195,7 @@ mod tests {
         );
 
         let text = fs::read_to_string(&path);
-        let recent = load_recent_audit_events(&paths, 5);
+        let recent = load_recent_entries(&path, 5);
         fs::remove_dir_all(root).ok();
         assert_eq!(
             format!("{:#}", result.expect_err("both steps failed")),
@@ -1164,7 +1210,7 @@ mod tests {
             text?, seeded,
             "a failed repair must leave the store as it was"
         );
-        assert_eq!(audit_messages(&recent?), ["a"]);
+        assert_eq!(entry_tags(&recent?), ["a"]);
         Ok(())
     }
 
@@ -1173,13 +1219,12 @@ mod tests {
     // stub swaps the store for a directory, which makes reopening it fail.
     #[test]
     fn a_failed_append_after_the_cut_still_reports_why_the_replace_failed() -> Result<()> {
-        let (root, paths) = temp_app_paths("torn-tail-fallback-append-fails");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("torn-tail-fallback-append-fails")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
 
-        let result = repair_audit_store_with(
-            &paths,
+        let result = repair_store_with(
+            &path,
             |_, _| {
                 Err(anyhow::anyhow!("no space left on device"))
                     .context("failed to replace the store")
@@ -1208,18 +1253,17 @@ mod tests {
     // one-line append: no second repair, no new file.
     #[test]
     fn appends_after_a_fallback_repair_are_plain_appends() -> Result<()> {
-        let (root, paths) = temp_app_paths("torn-tail-fallback-then-append");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
-        repair_audit_store_with(
-            &paths,
+        let (root, path) = temp_store("torn-tail-fallback-then-append")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
+        repair_store_with(
+            &path,
             |_, _| bail!("no space left on device"),
             truncate_jsonl_in_place,
         )?;
         let repaired = file_identity(&path)?;
 
-        append_audit_event(&paths, &audit_record("c"))?;
+        append_entry(&path, "c")?;
 
         let after = file_identity(&path)?;
         let text = fs::read_to_string(&path);
@@ -1228,9 +1272,9 @@ mod tests {
             text?,
             format!(
                 "{}\n{}\n{}\n",
-                audit_line("a"),
-                audit_line("b"),
-                audit_line("c")
+                entry_line("a"),
+                entry_line("b"),
+                entry_line("c")
             )
         );
         assert_eq!(repaired, after);
@@ -1250,11 +1294,10 @@ mod tests {
     fn append_repairs_a_torn_tail_in_a_directory_that_takes_no_new_files() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let (root, paths) = temp_app_paths("torn-tail-read-only-dir");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
-        let dir = path.parent().context("the audit store has a directory")?;
+        let (root, path) = temp_store("torn-tail-read-only-dir")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
+        let dir = path.parent().context("the store has a directory")?;
         // Create the lock file now: the append reuses an existing one, but
         // could not create it inside the read-only directory.
         drop(FileLock::acquire(jsonl_lock_path(&path))?);
@@ -1262,7 +1305,7 @@ mod tests {
 
         fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
         let read_only_holds = fs::File::create(dir.join("probe")).is_err();
-        let result = read_only_holds.then(|| append_audit_event(&paths, &audit_record("b")));
+        let result = read_only_holds.then(|| append_entry(&path, "b"));
         fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
 
         let after = file_identity(&path)?;
@@ -1274,7 +1317,7 @@ mod tests {
             return Ok(());
         };
         result?;
-        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(text?, format!("{}\n{}\n", entry_line("a"), entry_line("b")));
         assert_eq!(before, after);
         Ok(())
     }
@@ -1288,24 +1331,23 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
 
         const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
-        let (root, paths) = temp_app_paths("torn-tail-share-violation");
-        let torn = &audit_line("torn")[..20];
-        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("torn-tail-share-violation")?;
+        let torn = &entry_line("torn")[..20];
+        seed_store(&path, &format!("{}\n{torn}", entry_line("a")))?;
         let before = file_identity(&path)?;
         let blocker = fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ_WRITE)
             .open(&path)?;
 
-        let result = append_audit_event(&paths, &audit_record("b"));
+        let result = append_entry(&path, "b");
 
         drop(blocker);
         let after = file_identity(&path)?;
         let text = fs::read_to_string(&path);
         fs::remove_dir_all(root).ok();
         result?;
-        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(text?, format!("{}\n{}\n", entry_line("a"), entry_line("b")));
         assert_eq!(before, after);
         Ok(())
     }
@@ -1343,47 +1385,41 @@ mod tests {
 
     #[test]
     fn the_store_lock_is_a_sibling_of_the_store() {
-        let paths = AppPaths {
-            config_dir: PathBuf::from("c"),
-            data_dir: PathBuf::from("d"),
-            cache_dir: PathBuf::from("k"),
-        };
+        let events = PathBuf::from("d").join("first").join("events.jsonl");
+        let proposals = PathBuf::from("d").join("second").join("proposals.jsonl");
         assert_eq!(
-            jsonl_lock_path(&paths.audit_events_path()),
-            paths.audit_dir().join("events.jsonl.lock")
+            jsonl_lock_path(&events),
+            PathBuf::from("d").join("first").join("events.jsonl.lock")
         );
         assert_eq!(
-            jsonl_lock_path(&paths.automation_proposals_path()),
-            paths.automations_dir().join("proposals.jsonl.lock")
+            jsonl_lock_path(&proposals),
+            PathBuf::from("d")
+                .join("second")
+                .join("proposals.jsonl.lock")
         );
     }
 
     #[test]
     fn rotated_generations_are_numbered_siblings_of_the_store() {
-        let path = PathBuf::from("d").join("audit").join("events.jsonl");
+        let path = PathBuf::from("d").join("store").join("events.jsonl");
         assert_eq!(jsonl_generation_path(&path, 0), path);
         assert_eq!(
             jsonl_generation_path(&path, 1),
-            PathBuf::from("d").join("audit").join("events.jsonl.1")
+            PathBuf::from("d").join("store").join("events.jsonl.1")
         );
         assert_eq!(
             jsonl_generation_path(&path, 4),
-            PathBuf::from("d").join("audit").join("events.jsonl.4")
+            PathBuf::from("d").join("store").join("events.jsonl.4")
         );
     }
 
-    /// Append an audit record tagged `tag` to `path` under `rotation`.
+    /// Append the record tagged `tag` to `path` under `rotation`.
     fn append_rotating(path: &Path, tag: &str, rotation: JsonlRotation) -> Result<()> {
-        append_jsonl_record(
-            path,
-            &audit_record(tag),
-            Some(rotation),
-            "audit event record",
-        )
+        append_jsonl_record(path, &entry(tag), Some(rotation), "entry record")
     }
 
-    /// The tags in every generation of the audit-shaped store at `path`,
-    /// oldest first, read straight from the files.
+    /// The tags in every generation of the store at `path`, oldest first, read
+    /// straight from the files.
     fn tags_in_every_generation(path: &Path, generations: usize) -> Result<Vec<String>> {
         let mut tags = Vec::new();
         for generation in (0..=generations).rev() {
@@ -1392,7 +1428,7 @@ mod tests {
                 continue;
             }
             for line in fs::read_to_string(&generation_path)?.lines() {
-                tags.push(serde_json::from_str::<AuditEventRecord>(line)?.message);
+                tags.push(serde_json::from_str::<Entry>(line)?.tag);
             }
         }
         Ok(tags)
@@ -1400,18 +1436,16 @@ mod tests {
 
     fn recent_tags(path: &Path, generations: usize, limit: usize) -> Result<Vec<String>> {
         Ok(
-            load_recent_jsonl_records::<AuditEventRecord>(path, generations, limit, "audit")?
+            load_recent_jsonl_records::<Entry>(path, generations, limit, "entry")?
                 .into_iter()
-                .map(|record| record.message)
+                .map(|record| record.tag)
                 .collect(),
         )
     }
 
     #[test]
     fn rotation_keeps_the_live_file_and_the_configured_generations() -> Result<()> {
-        let (root, paths) = temp_app_paths("rotation-generations");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-generations")?;
         // One record per file: every append after the first rotates.
         let rotation = JsonlRotation {
             max_bytes: 1,
@@ -1439,10 +1473,8 @@ mod tests {
     // asks for; the rest must come from the rotated generations, in order.
     #[test]
     fn load_recent_spans_a_rollover() -> Result<()> {
-        let (root, paths) = temp_app_paths("rotation-spans");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
-        let line_len = audit_line("00").len() as u64 + 1;
+        let (root, path) = temp_store("rotation-spans")?;
+        let line_len = entry_line("00").len() as u64 + 1;
         // Rotate once a file holds five records.
         let rotation = JsonlRotation {
             max_bytes: 5 * line_len,
@@ -1473,11 +1505,9 @@ mod tests {
     // where `.1` was shifted to `.2` but the live file not yet renamed.
     #[test]
     fn load_recent_reads_a_store_caught_mid_rotation_in_order() -> Result<()> {
-        let (root, paths) = temp_app_paths("rotation-mid");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-mid")?;
         let write = |generation: usize, tags: &[&str]| -> Result<()> {
-            let text: String = tags.iter().map(|tag| audit_line(tag) + "\n").collect();
+            let text: String = tags.iter().map(|tag| entry_line(tag) + "\n").collect();
             fs::write(jsonl_generation_path(&path, generation), text)?;
             Ok(())
         };
@@ -1499,11 +1529,9 @@ mod tests {
     // nor rename the live file over a `.1` that was never shifted away.
     #[test]
     fn a_rotation_that_fails_still_appends_the_record() -> Result<()> {
-        let (root, paths) = temp_app_paths("rotation-fails");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
-        fs::write(&path, audit_line("a") + "\n")?;
-        fs::write(jsonl_generation_path(&path, 1), audit_line("old") + "\n")?;
+        let (root, path) = temp_store("rotation-fails")?;
+        fs::write(&path, entry_line("a") + "\n")?;
+        fs::write(jsonl_generation_path(&path, 1), entry_line("old") + "\n")?;
         // `.1` cannot be renamed over a non-empty directory.
         let blocker = jsonl_generation_path(&path, 2);
         fs::create_dir_all(&blocker)?;
@@ -1518,8 +1546,8 @@ mod tests {
         let recent = recent_tags(&path, 2, 10);
         fs::remove_dir_all(root).ok();
         appended?;
-        assert_eq!(live?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
-        assert_eq!(first?, audit_line("old") + "\n");
+        assert_eq!(live?, format!("{}\n{}\n", entry_line("a"), entry_line("b")));
+        assert_eq!(first?, entry_line("old") + "\n");
         assert_eq!(recent?, ["old", "a", "b"]);
         Ok(())
     }
@@ -1542,11 +1570,9 @@ mod tests {
             return Ok(());
         }
 
-        let (root, paths) = temp_app_paths("rotation-warning");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
-        fs::write(&path, audit_line("a") + "\n")?;
-        fs::write(jsonl_generation_path(&path, 1), audit_line("old") + "\n")?;
+        let (root, path) = temp_store("rotation-warning")?;
+        fs::write(&path, entry_line("a") + "\n")?;
+        fs::write(jsonl_generation_path(&path, 1), entry_line("old") + "\n")?;
         // `.1` cannot be renamed over a non-empty directory.
         let blocker = jsonl_generation_path(&path, 2);
         fs::create_dir_all(&blocker)?;
@@ -1589,13 +1615,11 @@ mod tests {
     // live file open without delete sharing).
     #[test]
     fn a_rotation_after_one_left_part_way_drops_no_generation() -> Result<()> {
-        let (root, paths) = temp_app_paths("rotation-part-way");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-part-way")?;
         let write = |generation: usize, tag: &str| -> Result<()> {
             fs::write(
                 jsonl_generation_path(&path, generation),
-                audit_line(tag) + "\n",
+                entry_line(tag) + "\n",
             )?;
             Ok(())
         };
@@ -1656,9 +1680,7 @@ mod tests {
     fn rotation_under_concurrent_threads_loses_no_records() -> Result<()> {
         const WRITERS: usize = 8;
         const APPENDS_PER_WRITER: usize = 25;
-        let (root, paths) = temp_app_paths("rotation-threads");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-threads")?;
         let barrier = std::sync::Barrier::new(WRITERS);
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..WRITERS)
@@ -1708,9 +1730,7 @@ mod tests {
             return Ok(());
         }
 
-        let (root, paths) = temp_app_paths("rotation-processes");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-processes")?;
         let exe = std::env::current_exe().context("current test executable")?;
         let children = (0..WRITERS)
             .map(|writer| {
@@ -1757,9 +1777,7 @@ mod tests {
             max_bytes: 2048,
             generations: 3,
         };
-        let (root, paths) = temp_app_paths("rotation-read-race");
-        paths.ensure()?;
-        let path = paths.audit_events_path();
+        let (root, path) = temp_store("rotation-read-race")?;
         let done = std::sync::atomic::AtomicBool::new(false);
         let outcome = std::thread::scope(|scope| {
             let reader = scope.spawn(|| -> Result<usize> {
