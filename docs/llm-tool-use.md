@@ -30,6 +30,14 @@ rocm-cli local assistants use structured tools, not shell commands.
   note carrying such a character is left out and counted.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready.
+- A `rocm serve` the model proposes through `rocm_command`, or the
+  provider-assisted planner proposes in its tool call, is refused unless it
+  asks for no public bind (`--allow-public-bind`), no CPU device, a loopback
+  `--host` if it names one, and managed serving (`--managed`, never
+  `--foreground`). One shared check applies those four rules to both, in that
+  order, and a refused call is neither proposed for approval nor planned; the
+  two refusals read alike and differ only in naming the local assistant or the
+  provider planner.
 - The built-in local assistant is fixed to `qwen`
   (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, Lemonade and AIM (a
   Docker-based engine) are the general serving engines; the assistant may inspect or manage them for model

@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::cli::ComfyuiCommand;
+use crate::cli_audit::record_cli_audit_event;
 use crate::therock;
 use anyhow::{Context, Result, bail};
 use process::{comfyui_run_state_cli_label, endpoint_is_reachable, evaluate_running_state};
@@ -58,6 +60,169 @@ pub(crate) struct ComfyUiStartOptions {
     pub host: String,
     pub port: u16,
     pub no_open_browser: bool,
+}
+
+pub(crate) fn run(command: Option<ComfyuiCommand>) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    match command.unwrap_or(ComfyuiCommand::Status) {
+        ComfyuiCommand::Status => {
+            print!("{}", render_status(&paths, &config)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_status",
+                "info",
+                "rendered ComfyUI status",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::ModelsPath => {
+            print!("{}", render_models_path(&paths)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_models_path",
+                "info",
+                "rendered ComfyUI models path",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::Logs { lines } => {
+            print!("{}", render_logs(&paths, lines)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_logs",
+                "info",
+                "rendered ComfyUI logs",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::Install {
+            runtime_id,
+            reinstall,
+            dry_run,
+            yes: _,
+        } => {
+            match install(
+                &paths,
+                &config,
+                ComfyUiInstallOptions {
+                    runtime_id: runtime_id.clone(),
+                    reinstall,
+                    dry_run,
+                },
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    record_cli_audit_event(
+                        &paths,
+                        "app",
+                        if dry_run {
+                            "comfyui_install_dry_run"
+                        } else {
+                            "comfyui_install"
+                        },
+                        "info",
+                        format!(
+                            "ComfyUI install completed runtime={} reinstall={} dry_run={}",
+                            runtime_id.as_deref().unwrap_or("<selected>"),
+                            reinstall,
+                            dry_run
+                        ),
+                        None,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    record_cli_audit_event(
+                        &paths,
+                        "app",
+                        if dry_run {
+                            "comfyui_install_dry_run"
+                        } else {
+                            "comfyui_install"
+                        },
+                        "error",
+                        format!(
+                            "ComfyUI install failed runtime={} reinstall={} dry_run={}: {error}",
+                            runtime_id.as_deref().unwrap_or("<selected>"),
+                            reinstall,
+                            dry_run
+                        ),
+                        None,
+                    );
+                    Err(error)
+                }
+            }
+        }
+        ComfyuiCommand::Start {
+            host,
+            port,
+            no_open_browser,
+            yes: _,
+        } => match start(
+            &paths,
+            ComfyUiStartOptions {
+                host,
+                port,
+                no_open_browser,
+            },
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_start",
+                    "info",
+                    "ComfyUI start requested",
+                    None,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_start",
+                    "error",
+                    format!("ComfyUI start failed: {error}"),
+                    None,
+                );
+                Err(error)
+            }
+        },
+        ComfyuiCommand::Stop { yes: _ } => match stop(&paths) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "info",
+                    "ComfyUI stop requested",
+                    None,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "error",
+                    format!("ComfyUI stop failed: {error}"),
+                    None,
+                );
+                Err(error)
+            }
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

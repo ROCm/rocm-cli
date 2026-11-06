@@ -17,8 +17,8 @@
 //! body was that arm's own and which was relocated here verbatim, re-imported
 //! via `use crate::update_cmd::update;`; `update` in turn calls
 //! `update_should_preview_or_apply(apply, dry_run)`,
-//! `apply_runtime_update(...)`, and `render_update_text(&paths)`. `chat.rs`'s
-//! deterministic `rocm update` tool summary also calls `render_update_text`,
+//! `apply_runtime_update(...)`, and `render_update_text(&paths)`. `chat/mcp_bridge.rs`'s
+//! read-only `rocm update` handling also calls `render_update_text`,
 //! outside `dispatch()`.
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
@@ -31,7 +31,7 @@
 //! from here the same way via `use crate::ROLLBACK_RECOVERY_HINT;`.
 //!
 //! `update` is `pub(crate)` for `dispatch()` and `render_update_text` for
-//! `chat.rs`; `apply_runtime_update` and `update_should_preview_or_apply` keep
+//! `chat/mcp_bridge.rs`; `apply_runtime_update` and `update_should_preview_or_apply` keep
 //! the `pub(crate)` they had when `dispatch()` called them directly, though
 //! only `update` calls them now. `select_runtime_update_source` is also
 //! `pub(crate)`: it is
