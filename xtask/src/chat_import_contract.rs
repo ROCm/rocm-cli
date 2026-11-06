@@ -30,7 +30,13 @@
 //! test item appears to end. The gate covers one thing, which is not always an
 //! item: it can sit on a struct field, an enum variant, a parameter, a
 //! struct-literal field, a match arm or a statement, and then it ends with that
-//! element (see `gated_end`), not with the next function in the file.
+//! element (see `gated_end`), not with the next function in the file. Whether
+//! the gate sits on a list element or on an item is decided by the bracket
+//! around it: anything inside `(..)` or `[..]` is an element (so the
+//! function-pointer fields of `struct S(#[cfg(test)] unsafe fn(), T);` end at
+//! the comma and `T` stays scanned), and inside `{..}` by the first word of
+//! what is gated (`fn`, `use`, `let` begin an item or statement, a field's
+//! name does not).
 //!
 //! Known limits, stated rather than hidden:
 //!
@@ -50,6 +56,13 @@
 //!   gate sits on a list element, so a comparison at the top level of a gated
 //!   element can extend the exemption to the closing bracket of its list; that
 //!   hides at most the elements after it in the same braces.
+//! * An item gated inside a macro invocation written with `(..)` or `[..]`
+//!   (`lazy_static!( #[cfg(test)] fn f<A, B>() where A: X, B: Y {..} )`) is
+//!   read as a list element, so a comma in its generics or `where` clause ends
+//!   the exemption early; what follows is then scanned as production, which
+//!   can only make the scan stricter. A match arm in `{..}` whose pattern
+//!   starts with an item keyword (an inline `const { .. }` pattern) is read as
+//!   an item and ends at its block or `;` instead of at its comma.
 
 #[cfg(test)]
 mod tests {
@@ -256,8 +269,45 @@ mod tests {
         }
     }
 
-    /// The index just past what the `#[cfg(test)]` gate covers, where `start`
-    /// is the first token after the gate.
+    /// The bracket that most closely encloses the token at `index`: the `(`,
+    /// `[` or `{` whose closer has not yet been read there, or `None` at the
+    /// top level of the file.
+    fn enclosing_opener(tokens: &[Token], index: usize) -> Option<char> {
+        let mut closers = 0usize;
+        for token in tokens[..index.min(tokens.len())].iter().rev() {
+            match token.tok {
+                Tok::Punct(')' | ']' | '}') => closers += 1,
+                Tok::Punct(open @ ('(' | '[' | '{')) => {
+                    if closers == 0 {
+                        return Some(open);
+                    }
+                    closers -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether the gate at `gate`, covering what starts at `start`, sits on one
+    /// element of a comma-separated list rather than on an item or statement.
+    ///
+    /// Inside `(..)` or `[..]` that is always so: a tuple struct's or variant's
+    /// fields, a parameter list, call arguments and array elements are lists,
+    /// and none holds an item or a statement. That matters because such an
+    /// element can start with the same word as an item, and only the
+    /// enclosing bracket tells them apart: the field type `fn()`, `unsafe fn()`
+    /// or `extern "C" fn()` is not a function item. In a `{..}` the first word
+    /// decides (see [`begins_item_or_statement`]), since a braced struct's
+    /// field starts with its name and no list element there starts with a
+    /// keyword that begins an item.
+    fn gate_is_on_a_list_element(tokens: &[Token], gate: usize, start: usize) -> bool {
+        matches!(enclosing_opener(tokens, gate), Some('(' | '['))
+            || !begins_item_or_statement(tokens, first_token_gated(tokens, start))
+    }
+
+    /// The index just past what the `#[cfg(test)]` gate covers, where `gate` is
+    /// the index of the gate's `#` and `start` is the first token after it.
     ///
     /// The gate covers one item, statement or list element, so the exemption
     /// ends at the first of:
@@ -289,8 +339,8 @@ mod tests {
     /// its top level in practice, and a miscount in this direction only ever
     /// extends the exemption to the enclosing closer, so a gated element with
     /// an odd `<` hides at most the elements after it in the same braces.
-    fn gated_end(tokens: &[Token], start: usize) -> usize {
-        let element = !begins_item_or_statement(tokens, first_token_gated(tokens, start));
+    fn gated_end(tokens: &[Token], gate: usize, start: usize) -> usize {
+        let element = gate_is_on_a_list_element(tokens, gate, start);
         let mut nesting = 0usize;
         let mut generics = 0usize;
         let mut i = start;
@@ -338,7 +388,7 @@ mod tests {
         let mut i = 0;
         while i < tokens.len() {
             if let Some(len) = cfg_test_attribute_len(tokens, i) {
-                i = gated_end(tokens, i + len);
+                i = gated_end(tokens, i, i + len);
                 continue;
             }
             kept.push(tokens[i].clone());
@@ -687,6 +737,79 @@ mod tests {
             (
                 "fn f(x: u8) {\n    match x {\n        #[cfg(test)]\n        0 => crate::chat::f(),\n        _ => crate::chat::g(),\n    }\n}\n",
                 &[5],
+            ),
+        ];
+        // Every case is checked before failing, so one run shows them all.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(source, expected)| lines_of(source) != *expected)
+            .map(|(source, expected)| {
+                format!(
+                    "{source:?}: expected {expected:?}, got {:?}",
+                    lines_of(source)
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_test_gate_inside_parentheses_or_brackets_covers_one_list_element() {
+        // Inside `(..)` or `[..]` there are no items or statements, only list
+        // elements, so a function-pointer type that starts with `fn`, `unsafe`
+        // or `extern` is a field to end at its comma, not an item to end at a
+        // `;` or a block. Each case keeps the production field after it
+        // visible. Cases that already held (a `{` block as the element, a
+        // field that starts with a name) pin the boundary of the rule.
+        let cases: [(&str, &[usize]); 12] = [
+            // The shape Copilot reported, and its `unsafe` twin.
+            ("struct State(#[cfg(test)] fn(), crate::chat::T);\n", &[1]),
+            (
+                "struct State(#[cfg(test)] unsafe fn(), crate::chat::T);\n",
+                &[1],
+            ),
+            (
+                "struct State(#[cfg(test)] extern \"C\" fn(u8), crate::chat::T);\n",
+                &[1],
+            ),
+            (
+                "struct State(#[cfg(test)] unsafe extern \"C\" fn(u8, u8) -> u8, crate::chat::T);\n",
+                &[1],
+            ),
+            (
+                "struct State(#[cfg(test)] pub unsafe fn(), crate::chat::T);\n",
+                &[1],
+            ),
+            (
+                "struct State(#[cfg(test)] for<'a> fn(&'a u8), crate::chat::T);\n",
+                &[1],
+            ),
+            // The same fields in an enum variant, over several lines.
+            (
+                "enum E {\n    V(\n        #[cfg(test)]\n        unsafe fn(),\n        crate::chat::T,\n    ),\n}\n",
+                &[5],
+            ),
+            // A gated function-pointer field is exempt, and so is the chat
+            // path inside it: only what follows the comma is production.
+            ("struct State(#[cfg(test)] fn(crate::chat::T), u8);\n", &[]),
+            // A gated last field with no comma ends at the closing `)`.
+            (
+                "struct State(u8, #[cfg(test)] unsafe fn());\nfn production() { crate::chat::f(); }\n",
+                &[2],
+            ),
+            // Braced fields start with a name, and an array element or a call
+            // argument that is a block ends with the block: both already held.
+            (
+                "struct S {\n    #[cfg(test)]\n    f: unsafe fn(),\n    x: crate::chat::T,\n}\n",
+                &[4],
+            ),
+            (
+                "fn f() { g([#[cfg(test)] unsafe { 1 }, crate::chat::A]); }\n",
+                &[1],
+            ),
+            (
+                "fn f() { g(#[cfg(test)] unsafe { h() }, crate::chat::A); }\n",
+                &[1],
             ),
         ];
         // Every case is checked before failing, so one run shows them all.
