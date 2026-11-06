@@ -1869,8 +1869,10 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           elif [ "${{ needs.changes.outputs.heavy }}" = "true" ] \
             && [ "${{ needs.clippy.result }}" != "success" ]; then
-            # Deliberately stricter than pr-linux-binaries' `success || skipped`: clippy is skipped only on a dispatch, which the first branch already handled.
-            echo "::notice title=E2E scenarios not run::clippy did not succeed (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. Fix or re-run clippy, then re-run this job to run the scenarios."
+            # Deliberately stricter than pr-linux-binaries' `success || skipped`:
+            # clippy is skipped only on a dispatch, which the first branch
+            # already handled.
+            echo "::notice title=E2E scenarios not run::clippy did not succeed (result: ${{ needs.clippy.result }}), so no scenario ran and this check reports success without one. Fix clippy if it is red, then re-run the workflow so that clippy and this job run again."
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif { [ "${{ needs.build-and-test.result }}" = "success" ] \
               || [ "${{ needs.build-and-test.result }}" = "failure" ]; } \

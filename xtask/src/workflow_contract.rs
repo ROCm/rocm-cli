@@ -1329,10 +1329,16 @@ jobs:
                 // `cancelled`, where nothing is red and nothing is blocked. So it
                 // may tell the reader what to re-run but must not claim the merge
                 // is blocked; `run=false` above is what makes "no scenario ran" true.
+                // Re-running only this job would reuse the clippy result recorded
+                // by the earlier attempt, so the advice is to re-run the workflow,
+                // which runs clippy again and then this job.
                 assert!(
-                    stdout.contains("re-run clippy") && !stdout.contains("blocks the merge"),
-                    "{context}: the notice must say to re-run clippy and must not assert a \
-                     merge block that a `cancelled` clippy does not cause, got {stdout:?}"
+                    stdout.contains("re-run the workflow")
+                        && !stdout.contains("re-run this job")
+                        && !stdout.contains("blocks the merge"),
+                    "{context}: the notice must say to re-run the workflow, must not say to \
+                     re-run only this job (it would reuse the old clippy result) and must not \
+                     assert a merge block that a `cancelled` clippy does not cause, got {stdout:?}"
                 );
             }
             None => assert!(
@@ -1386,7 +1392,8 @@ jobs:
     /// it, and `ci_e2e_steps_after_the_gate_follow_its_decision` is what makes
     /// every later step honour that decision. A `cancelled` clippy reaches the
     /// same branch with nothing red, so the notice must hold for it too: it says
-    /// to re-run, and does not say the merge is blocked.
+    /// to re-run the workflow (not just this job, which would reuse the old
+    /// clippy result), and does not say the merge is blocked.
     #[cfg(unix)]
     #[test]
     fn e2e_gate_skips_scenarios_unless_clippy_passed() {
