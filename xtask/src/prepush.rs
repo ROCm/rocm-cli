@@ -444,10 +444,10 @@ pub fn execute(
     // `--rerun` replaces the recorded pass: drop it first, so a run that fails
     // leaves nothing for the next ordinary run to skip on, and write a fresh one
     // only once cargo succeeded.
-    if stamps.rerun {
-        if let Some(note) = key.as_ref().and_then(|key| stamps.invalidate(key)) {
-            writeln!(out, "pre-push-check {label}: {note}")?;
-        }
+    if stamps.rerun
+        && let Some(note) = key.as_ref().and_then(|key| stamps.invalidate(key))
+    {
+        writeln!(out, "pre-push-check {label}: {note}")?;
     }
     run_cargo(&args)?;
     if let Some(note) = key.and_then(|key| stamps.record(&key)) {
