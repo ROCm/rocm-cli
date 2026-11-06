@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,8 +33,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use e2e_cucumber::paced_download::is_intermediate_download_progress_frame;
 use e2e_cucumber::panic_capture::panic_message;
+use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
+use e2e_cucumber::terminal_size::non_zero_dimensions;
 
 use crate::E2eWorld;
 
@@ -60,6 +63,18 @@ const OVERFLOW_COLS: u16 = 90;
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
 
+/// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
+/// stay `u16` because `PtySize` takes that. A zero here fails the build.
+const VT_ROWS: NonZeroU16 = NonZeroU16::new(ROWS).expect("ROWS must be non-zero");
+const VT_COLS: NonZeroU16 = NonZeroU16::new(COLS).expect("COLS must be non-zero");
+
+/// `(rows, cols)` of `screen` as plain `u16`s. Read the size through this, not
+/// `Screen::size`, which returns `NonZeroU16`s.
+fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get())
+}
+
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
 /// returns the instant its condition holds.
@@ -72,12 +87,20 @@ const KEY_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Default wall-clock budget for a single wait. Generous enough for a cold dash
-/// start plus the embedded-daemon connect, while still turning a genuine hang
-/// into a prompt, diagnosable failure rather than a CI-timeout.
+/// Default budget for a single wait. Generous enough for a cold dash start
+/// plus the embedded-daemon connect, while still turning a genuine hang into a
+/// prompt, diagnosable failure rather than a CI-timeout.
+///
+/// Most waits spend it in wall-clock time. [`TuiSession::send_until`] and
+/// [`TuiSession::quit_and_wait`] act on what they read, so they spend it in
+/// time they were polled: time the harness leaves them unpolled is added to
+/// their deadline, up to a wall-clock cap of
+/// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+/// times the budget.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// Wall-clock budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`.
+/// Budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`; see
+/// [`DEFAULT_TIMEOUT_SECS`] for which waits spend it in wall-clock time.
 ///
 /// Mirrors `E2E_SERVE_TIMEOUT_SECS` in `serving_steps.rs`: the assertion is
 /// right, the budget is what varies by host. The self-hosted Strix lanes share
@@ -176,11 +199,22 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
-    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
-    /// scenario's isolation environment — for a step whose `Given` planted
-    /// scenario-owned state (e.g. a shell rc file) that only the piped
-    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
-    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
+    ///
+    /// A step needs this when a `Given` has planted scenario-owned state that
+    /// only the piped `run_rocm_with_env` path would otherwise pick up, since
+    /// [`pty_env`]'s `HOME`/lack of `SHELL` are the PTY's own isolation rather
+    /// than that state. The sole caller today is the `fix`-prompt step in
+    /// `diagnose_steps.rs`, which overrides `HOME`/`SHELL` so the fix resolves
+    /// to the shell rc file its `Given` wrote.
+    ///
+    /// Not the route a test-only CLI switch takes: `ROCM_E2E_SIMULATE_OOM_LAUNCH`
+    /// and friends go onto `world.command_env`, which plain [`spawn`](Self::spawn)
+    /// already applies, so they need no overlay here.
+    ///
+    /// The vars are applied per-child on the `CommandBuilder`, never via the
+    /// shared process environment, so concurrent scenarios on the no-GPU lane
+    /// cannot observe each other's overrides.
     pub fn spawn_with_env(
         world: &E2eWorld,
         args: &[&str],
@@ -221,6 +255,9 @@ impl TuiSession {
         Self::spawn_binary_with_env(world, binary, args, &[], None)
     }
 
+    /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
+    /// `binary <args>` under a PTY with the isolated environment, then overlay
+    /// `extra_env` on the child.
     fn spawn_binary_with_env(
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
@@ -267,7 +304,10 @@ impl TuiSession {
             cmd.env(key, value);
         }
         // Caller-supplied overrides win over the scenario's own isolation
-        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself), but
+        // deliberately stay *above* the provider-credential strip below, so no
+        // `extra_env` entry can reinstate a credential and select a cloud
+        // backend for a journey that is meant to be deterministic local chat.
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -313,7 +353,7 @@ impl TuiSession {
             .take_writer()
             .map_err(|e| reap_orphan(format!("failed to take pty writer: {e}")))?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(VT_ROWS, VT_COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
         let reader = spawn_reader(
@@ -388,6 +428,38 @@ impl TuiSession {
         cell.bgcolor() == WASH
     }
 
+    /// The foreground color of `needle` on every screen row that contains both
+    /// `anchor` and `needle`, in row order; empty if there is no such row. A row
+    /// that carries the anchor but not the needle is never read, so the result
+    /// does not depend on which panel draws the anchor first. Matches cell by
+    /// cell, so a wide glyph earlier in the row cannot shift the column.
+    /// Style-aware, unlike `screen_text`.
+    pub fn foregrounds_in_rows_with(&self, anchor: &str, needle: &str) -> Vec<vt100::Color> {
+        let wanted: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = p.screen();
+        let (_, cols) = screen_size(screen);
+        screen
+            .rows(0, cols)
+            .enumerate()
+            .filter(|(_, text)| text.contains(anchor) && text.contains(needle))
+            .filter_map(|(row, _)| {
+                let row = row as u16;
+                (0..cols).find_map(|col| {
+                    let matches = wanted.iter().enumerate().all(|(i, ch)| {
+                        screen
+                            .cell(row, col + i as u16)
+                            .is_some_and(|cell| cell.contents() == *ch)
+                    });
+                    matches.then(|| screen.cell(row, col).map(vt100::Cell::fgcolor))?
+                })
+            })
+            .collect()
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while
@@ -399,12 +471,150 @@ impl TuiSession {
             .parser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (p.screen().contents(), p.screen().size())
+        (p.screen().contents(), screen_size(p.screen()))
     }
 
     fn framed_screen(&self) -> String {
         let (screen, (rows, cols)) = self.screen_snapshot();
         format!("--- last screen ({cols}x{rows}) ---\n{screen}\n--- end screen ---")
+    }
+
+    /// Reconstructs a popup's own body text as one word-wrap-undone string,
+    /// immune to the host's incidental terminal width budget — unlike
+    /// `screen_text()`, which hands back the raw grid with `Wrap`-induced row
+    /// breaks still in it and sibling panels' text still occupying the same
+    /// physical rows the popup's own content wrapped onto (PR #707 review,
+    /// 2026-10-16: a long enough host temp path wrapped a quoted argument
+    /// across rows and a single-row substring match on the raw grid timed
+    /// out even though the popup rendered it correctly).
+    ///
+    /// Stays black-box like the rest of this driver (see the module doc):
+    /// it finds the popup's own left/right content columns from the
+    /// rendered title row itself, not from replicating `centered_rect`'s
+    /// layout math, so it tracks the real geometry regardless of future
+    /// layout changes.
+    ///
+    /// `title_bar` is the exact title text passed to `draw_popup_frame`
+    /// (e.g. `"Review: <req.title>"` for an approval popup) — not the
+    /// popup's whole border row, just the text inside it. The title row is
+    /// rendered `╭─╮<title_bar>╭───...───╮` (`panel::popup`'s "rounded +
+    /// notch" framing: a short decorative notch directly left of the title,
+    /// then the rest of the border running to the box's own right corner).
+    /// The left column is found by a fixed 3-column offset from the title
+    /// text, not a walk (see the inline comment on `left` — it is an exact
+    /// invariant of how the notch is stamped); the right column has no such
+    /// invariant and is found by walking forward through border characters
+    /// to the box's own closing corner. Body
+    /// rows run from just below the title row to just above the row
+    /// carrying the literal `"Approve ("` button label; each is sliced to
+    /// that same column span, discarding whatever sibling panels draw
+    /// outside it on those same physical rows.
+    ///
+    /// Rejoining those slices is not a uniform single space per break:
+    /// `Wrap` only breaks at a word boundary when the *next* word doesn't
+    /// fit, which leaves that row's own trailing cells blank — so a row
+    /// with no trailing blank was a hard mid-word split instead (a single
+    /// token wider than the whole popup, e.g. a long host path with no
+    /// spaces in it), and concatenating two such slices with an inserted
+    /// space would corrupt the very thing being reconstructed. So: a row
+    /// that ends with trailing blank gets a join space before the next
+    /// row's content; a row that fills every column of its own slice does
+    /// not. (A word-boundary wrap landing exactly flush with zero leftover
+    /// width is the one case this can't tell apart from a hard split, and
+    /// reads as the latter — rare enough, and low-stakes enough for a test
+    /// assertion, not to be worth a more elaborate signal.) The whole
+    /// result is whitespace-normalized afterward regardless, so this makes
+    /// no claim about the exact rendered spacing beyond reconstructing the
+    /// one real space a word-boundary wrap consumed — which is all
+    /// `wait_for_popup_body_where`'s callers need.
+    fn popup_body_text(&self, title_bar: &str) -> Result<String, String> {
+        const BORDER: [char; 3] = ['─', '╭', '╮'];
+
+        let (screen, _) = self.screen_snapshot();
+        let rows: Vec<&str> = screen.split('\n').collect();
+        let title_row_idx = rows
+            .iter()
+            .position(|r| r.contains(title_bar))
+            .ok_or_else(|| format!("no row contains the popup title {title_bar:?}"))?;
+        let title_row: Vec<char> = rows[title_row_idx].chars().collect();
+        let title_start_bytes = rows[title_row_idx]
+            .find(title_bar)
+            .expect("just matched via contains");
+        // Byte offset from `find` -> char offset: box-drawing glyphs are
+        // multi-byte UTF-8 but exactly one terminal column each, so the two
+        // only agree on plain ASCII.
+        let title_start = rows[title_row_idx][..title_start_bytes].chars().count();
+
+        // Exact, not a walk: `panel::stamp_title` always stamps its left
+        // bracket at `area.x + 2` regardless of title length (`lb = area.x +
+        // 2` in `crates/rocm-dash-tui/src/ui/panel.rs`), with the true box
+        // corner at `area.x` and exactly one dash between them — so the true
+        // left corner is always exactly 3 columns before the title text,
+        // never more, regardless of what sits further left on this row (an
+        // outer box's own border could in principle be flush against this
+        // one with no gap; the fixed offset is immune to that, where an
+        // open-ended border-character walk would not be). Fail loudly if a
+        // future rendering change breaks this invariant rather than
+        // silently trusting whatever a walk happened to find.
+        if title_start < 3 {
+            return Err(format!(
+                "popup title {title_bar:?} starts at column {title_start}, too close to the row start for the expected 3-column left notch"
+            ));
+        }
+        let left = title_start - 3;
+        if title_row[left..title_start] != ['╭', '─', '╮'] {
+            return Err(format!(
+                "expected the popup's own left notch '╭─╮' immediately before {title_bar:?}, found {:?} at columns {left}..{title_start}",
+                title_row[left..title_start].iter().collect::<String>()
+            ));
+        }
+
+        let title_end = title_start + title_bar.chars().count();
+        // The right-hand side has no equivalent fixed offset (unlike the
+        // left notch, it depends on the box's own width, which this
+        // black-box driver does not know) — stamp_title's right bracket sits
+        // at `lb + 1 + label_w`, then dashes run to the box's own true right
+        // corner, however far that is. So this walks through border
+        // characters the way the left side used to, with no corresponding
+        // exact-offset check to close the same over-walk gap: if an outer
+        // box's border ever sat flush against this one's right edge with no
+        // gap, this would walk into it undetected. Not currently reachable
+        // (every nested popup in this app leaves a gap), so left as a weaker
+        // check until that stops holding.
+        let mut right = title_end;
+        while right < title_row.len() && BORDER.contains(&title_row[right]) {
+            right += 1;
+        }
+        right = right.saturating_sub(1);
+        if right < title_end || title_row.get(right) != Some(&'╮') {
+            return Err(format!(
+                "expected the popup's own right corner '╮' immediately (through border characters only) after {title_bar:?}, found {:?} at column {right}",
+                title_row.get(right)
+            ));
+        }
+
+        let mut reconstructed = String::new();
+        let mut pending_join_space = false;
+        for row in rows.iter().skip(title_row_idx + 1) {
+            if row.contains("Approve (") {
+                break;
+            }
+            let chars: Vec<char> = row.chars().collect();
+            if left + 1 >= right || right > chars.len() {
+                continue;
+            }
+            let slice: String = chars[left + 1..right].iter().collect();
+            let trimmed = slice.trim_end();
+            if pending_join_space && !reconstructed.is_empty() {
+                reconstructed.push(' ');
+            }
+            reconstructed.push_str(trimmed);
+            pending_join_space = trimmed.len() < slice.len();
+        }
+        Ok(reconstructed
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "))
     }
 
     /// Take the reader thread's recorded panic message, if any, clearing it so
@@ -436,6 +646,9 @@ impl TuiSession {
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        // Validate before resizing the PTY so a zero dimension fails cleanly
+        // instead of leaving the PTY and the emulated screen at different sizes.
+        let (vt_rows, vt_cols) = non_zero_dimensions(rows, cols)?;
         let size = PtySize {
             rows,
             cols,
@@ -452,7 +665,7 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
-            .set_size(rows, cols);
+            .set_size(vt_rows, vt_cols);
         Ok(())
     }
 
@@ -531,6 +744,11 @@ impl TuiSession {
     /// the application having acted on the key rather than on it having been
     /// ready when the key was written.
     ///
+    /// Like [`quit_and_wait`](Self::quit_and_wait), `timeout` is time this step
+    /// was polled, up to a wall-clock cap of
+    /// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+    /// times `timeout`.
+    ///
     /// Only safe for idempotent keys (a tab jump, not a toggle): the key is
     /// always sent at least once, and further copies may still be queued in the
     /// terminal when the marker appears, so the application may act on it again
@@ -548,6 +766,7 @@ impl TuiSession {
             RetryTiming {
                 timeout,
                 resend_interval: KEY_RESEND_INTERVAL,
+                poll_interval: POLL_INTERVAL,
             },
             Self::send,
             |session, marker, attempt| Box::pin(session.wait_for_screen(marker, attempt)),
@@ -689,6 +908,60 @@ impl TuiSession {
         }
     }
 
+    /// Like [`wait_for_screen_where`](Self::wait_for_screen_where), but
+    /// `is_ready` sees [`popup_body_text`](Self::popup_body_text)'s
+    /// word-wrap-undone reconstruction of the popup titled `title_bar`
+    /// instead of the raw screen grid — for a popup whose content can wrap
+    /// across rows depending on the host's own, uncontrollable path
+    /// lengths. A popup not yet open (or not yet matching) is "not ready"
+    /// the same way an absent string is for `wait_for_screen_where`, not a
+    /// hard error — [`popup_body_text`](Self::popup_body_text)'s `Err` only
+    /// means try again next tick, same as the plain substring check above.
+    pub async fn wait_for_popup_body_where(
+        &mut self,
+        describe: &str,
+        title_bar: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if matches!(self.popup_body_text(title_bar), Ok(body) if is_ready(&body)) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // Re-derive the failure right at the timeout, rather than
+                // threading it through the loop: a popup not yet open is
+                // expected early on and not worth surfacing, but if this
+                // specific call fails, that's the real cause of the timeout
+                // and the plain screen dump alone doesn't say so.
+                let extra = match self.popup_body_text(title_bar) {
+                    Err(e) => format!("\nlast popup_body_text error: {e}"),
+                    Ok(_) => String::new(),
+                };
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.{extra}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).
@@ -697,13 +970,20 @@ impl TuiSession {
     /// the app has finished acting on whatever came just before it (e.g. right
     /// after an unsynchronized `send` like the Escape key), it can be consumed
     /// by that transient state and never reach the quit handler — the process
-    /// then never exits and this hangs until `timeout`. Re-sending on a short
-    /// cadence closes that gap the same way [`send_until`] does for screen
-    /// markers: if the first attempt landed (the common case), the process
-    /// has already exited by the first check and the loop below never reaches
-    /// a second send. What's resent each pass isn't always the same literal
-    /// `gesture` either — see the quit-confirm handling below, which switches
-    /// to `"y"` once the prompt is on screen.
+    /// then never exits and this hangs until `timeout`. Re-sending closes that
+    /// gap the same way [`send_until`] does for screen markers: if the first
+    /// attempt landed (the common case), the process has already exited by the
+    /// first check and the loop never reaches a second send. What's resent
+    /// each pass isn't always the same literal `gesture` either — see the
+    /// quit-confirm handling below, which switches to `"y"` once the prompt is
+    /// on screen — and the wait between sends doubles each pass. `timeout`
+    /// is time this step was polled: time the harness leaves it unpolled is
+    /// added to the deadline, up to a wall-clock cap of
+    /// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+    /// times `timeout`.
+    /// [`e2e_cucumber::quit_and_wait::quit_and_wait`] explains why the gesture
+    /// is resent, why the wait doubles, and why the deadline counts only
+    /// polled time.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`
@@ -719,38 +999,45 @@ impl TuiSession {
         // for `/quit\r` — type "uit" into chat as a message once the leading
         // `q` cancels the prompt. Either way it never exits.
         let gesture = if self.is_chat { "/quit\r" } else { "q" };
-        let deadline = Instant::now() + timeout;
-        loop {
-            let confirming = self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
-            self.send(if confirming { "y" } else { gesture })?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let attempt = KEY_RESEND_INTERVAL.min(remaining);
-            match self.wait_for_exit_code_within(attempt).await {
-                Some(code) => {
-                    return if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully (code {code}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
-                }
-                None => {
-                    if let Some(panic_message) = self.take_reader_panic() {
-                        return Err(format!(
-                            "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
-                            self.framed_screen()
-                        ));
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+        let result = retry_quit_and_wait(
+            self,
+            gesture,
+            RetryTiming {
+                timeout,
+                resend_interval: KEY_RESEND_INTERVAL,
+                poll_interval: POLL_INTERVAL,
+            },
+            |session| session.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER),
+            Self::send,
+            |session, attempt| Box::pin(session.exit_poll_within(attempt)),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(QuitError::Failed(error)) => Err(error),
+            Err(QuitError::TimedOut(expiry)) => Err(format!(
+                "timed out after {expiry} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// One bounded wait of [`quit_and_wait`](Self::quit_and_wait): whether the
+    /// child exited within `budget` (and how), or the reader thread failed.
+    async fn exit_poll_within(&mut self, budget: Duration) -> ExitPoll {
+        match self.wait_for_exit_code_within(budget).await {
+            Some(0) => ExitPoll::Finished(Ok(())),
+            Some(code) => ExitPoll::Finished(Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            ))),
+            None => match self.take_reader_panic() {
+                Some(panic_message) => ExitPoll::Finished(Err(format!(
+                    "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
                     self.framed_screen()
-                ));
-            }
+                ))),
+                None => ExitPoll::Running,
+            },
         }
     }
 

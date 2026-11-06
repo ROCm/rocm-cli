@@ -1,0 +1,255 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
+//! The shared `[y/N]` confirmation prompt.
+//!
+//! Before this module existed, `fix.rs`, `apps/rocm/src/uninstall_plan.rs` and
+//! `apps/rocm/src/therock/consent.rs` each hand-rolled the same print-prompt /
+//! flush stdout / read a line / normalize / match `"y"`/`"yes"` sequence. This
+//! is that sequence, split into the two fallible steps callers compose.
+//!
+//! [`print_prompt`] and [`read_answer`] stay two calls rather than one bundled
+//! "ask and read" function because `fix/consent.rs`'s `confirm()` attempts the read
+//! even when the prompt couldn't be written — its behavior before this module
+//! existed — while `uninstall_plan.rs` and `therock/consent.rs` treat a failed
+//! write as fatal, each with their own phase-specific message. A single
+//! `Result`-returning function can't express "ignore this step's error and
+//! keep going"; only a caller holding a separate `Result` per step can.
+//!
+//! Both take the stream to use (`&mut impl Write` / `&mut impl BufRead`)
+//! rather than reaching for `stdin()`/`stdout()` themselves, so the sequence
+//! — including a write failure and an EOF read — is unit-testable here
+//! without a controlled terminal. Real callers pass `std::io::stdout()` and
+//! `std::io::stdin().lock()`.
+//!
+//! [`interactive_terminal`] answers the question callers ask before prompting at
+//! all: whether this process has a terminal on both streams.
+//! [`require_yes_or_interactive`] is the guard built on it for a mutating
+//! command that confirms with a `[y/N]` prompt: `--yes` approves, a terminal
+//! gets asked, and anything else is refused with one shared message.
+
+use anyhow::{Result, bail};
+use std::io::{BufRead, IsTerminal, Write, stdin, stdout};
+
+/// Parse a user's typed response to a `[y/N]` prompt.
+pub fn is_affirmative_answer(line: &str) -> bool {
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Write `prompt` to `out` and flush it, so it's visible before a blocking
+/// read. `prompt` is expected to already include the trailing `[y/N]: `.
+///
+/// Uses a fallible write rather than `print!`, which panics on a write
+/// failure instead of returning it. In practice a short prompt like these
+/// only reaches an unbuffered write (and so can only fail) at `flush`, since
+/// it fits in stdout's line buffer; a fallible write only matters once a
+/// prompt is long enough to overflow that buffer, but costs nothing to have
+/// either way.
+pub fn print_prompt(out: &mut impl Write, prompt: &str) -> std::io::Result<()> {
+    write!(out, "{prompt}")?;
+    out.flush()
+}
+
+/// Read one line from `input` and parse it as yes/no. Only errors if the
+/// line can't be read; a declined answer — including an empty read at EOF —
+/// is `Ok(false)`, not an error.
+pub fn read_answer(input: &mut impl BufRead) -> std::io::Result<bool> {
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(is_affirmative_answer(&line))
+}
+
+/// Whether this process can hold an interactive exchange with a user.
+///
+/// Both streams must be a terminal: stdin so an answer can be read, stdout so
+/// the question is seen. Anything that captures either — a pipe, a CI step, the
+/// dashboard spawning `rocm` as a child — makes this false, and callers then
+/// skip the prompt rather than block on input nobody can supply.
+///
+/// A property of the invocation, not of the host. `rocm examine` reports it so a
+/// pasted report explains why prompts were skipped.
+pub fn interactive_terminal() -> bool {
+    stdin().is_terminal() && stdout().is_terminal()
+}
+
+/// Guard a mutating command that confirms with a `[y/N]` prompt.
+///
+/// Returns `Ok(true)` when `yes` (the command's `--yes`) already approves it, so
+/// the caller proceeds without prompting. Returns `Ok(false)` when there is no
+/// `--yes` but [`interactive_terminal`] holds, so the caller still has to ask.
+/// Otherwise nobody can answer a prompt and the command is refused with
+/// `"{action} requires --yes outside an interactive terminal"`; `action` is the
+/// command as the user typed it (`"uninstall"`, `"runtimes uninstall"`).
+///
+/// `--yes` is checked first, so it never touches the terminal probe. Commands
+/// whose refusal deliberately differs (a different exit code, or two consents
+/// that are not interchangeable) do not use this.
+pub fn require_yes_or_interactive(yes: bool, action: &str) -> Result<bool> {
+    require_yes_or_interactive_with(yes, action, interactive_terminal)
+}
+
+/// [`require_yes_or_interactive`] with the terminal probe injected, so the
+/// refusal is testable without depending on how the test runner's streams are
+/// wired. The probe is only called when `yes` is false.
+fn require_yes_or_interactive_with(
+    yes: bool,
+    action: &str,
+    interactive: impl FnOnce() -> bool,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive() {
+        bail!("{action} requires --yes outside an interactive terminal");
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, Result};
+
+    #[test]
+    fn is_affirmative_answer_accepts_only_y_and_yes() {
+        for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
+            assert!(
+                is_affirmative_answer(accepted),
+                "expected {accepted:?} to be treated as a yes"
+            );
+        }
+    }
+
+    #[test]
+    fn is_affirmative_answer_rejects_everything_else() {
+        for declined in ["n", "no", "", "\n", "yep", "ye"] {
+            assert!(
+                !is_affirmative_answer(declined),
+                "expected {declined:?} to be treated as a decline"
+            );
+        }
+    }
+
+    /// A writer that always fails, standing in for a full or closed stdout
+    /// without depending on `/dev/full` or any other platform-specific setup.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> Result<usize> {
+            Err(Error::other("write failed"))
+        }
+        fn flush(&mut self) -> Result<()> {
+            Err(Error::other("flush failed"))
+        }
+    }
+
+    #[test]
+    fn print_prompt_writes_and_flushes_the_whole_prompt() {
+        let mut out = Vec::new();
+        print_prompt(&mut out, "Proceed? [y/N]: ").expect("write to a Vec cannot fail");
+        assert_eq!(out, b"Proceed? [y/N]: ");
+    }
+
+    #[test]
+    fn print_prompt_surfaces_a_write_failure_as_an_error_not_a_panic() {
+        let mut out = FailingWriter;
+        print_prompt(&mut out, "Proceed? [y/N]: ")
+            .expect_err("a failing writer must return Err, not panic");
+    }
+
+    /// A writer whose `write` succeeds but whose `flush` always fails, so a
+    /// flush-specific failure is exercised separately from a write failure:
+    /// `FailingWriter` above fails at `write` and so never reaches `flush` at
+    /// all, which would let a dropped `out.flush()?` pass every test here.
+    struct FlushFailingWriter {
+        written: Vec<u8>,
+    }
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<()> {
+            Err(Error::other("flush failed"))
+        }
+    }
+
+    #[test]
+    fn print_prompt_surfaces_a_flush_failure_as_an_error_not_a_panic() {
+        let mut out = FlushFailingWriter {
+            written: Vec::new(),
+        };
+        print_prompt(&mut out, "Proceed? [y/N]: ")
+            .expect_err("a writer whose flush fails must return Err, not panic");
+        assert_eq!(
+            out.written, b"Proceed? [y/N]: ",
+            "the write itself must still have gone through before flush ran"
+        );
+    }
+
+    #[test]
+    fn read_answer_parses_a_typed_line() {
+        let mut input: &[u8] = b"yes\n";
+        assert!(read_answer(&mut input).expect("read from a byte slice cannot fail"));
+
+        let mut input: &[u8] = b"n\n";
+        assert!(!read_answer(&mut input).expect("read from a byte slice cannot fail"));
+    }
+
+    #[test]
+    fn read_answer_at_eof_declines_without_erroring() {
+        let mut input: &[u8] = b"";
+        assert!(!read_answer(&mut input).expect("EOF is Ok(false), not an error"));
+    }
+
+    /// A reader whose `read_line` always fails, so a real I/O failure on the
+    /// input side (as opposed to EOF, which is not an error) is exercised too.
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(Error::other("read failed"))
+        }
+    }
+
+    impl BufRead for FailingReader {
+        fn fill_buf(&mut self) -> Result<&[u8]> {
+            Err(Error::other("read failed"))
+        }
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    #[test]
+    fn read_answer_surfaces_a_read_failure_as_an_error() {
+        let mut input = FailingReader;
+        read_answer(&mut input).expect_err("a failing reader must return Err");
+    }
+
+    #[test]
+    fn guard_approves_on_yes_without_probing_the_terminal() {
+        let approved = require_yes_or_interactive_with(true, "uninstall", || {
+            panic!("--yes must short-circuit before the terminal probe")
+        })
+        .expect("--yes approves");
+        assert!(approved);
+    }
+
+    #[test]
+    fn guard_asks_for_a_prompt_when_a_terminal_is_present_and_yes_is_absent() {
+        let approved = require_yes_or_interactive_with(false, "uninstall", || true)
+            .expect("an interactive terminal is allowed to prompt");
+        assert!(!approved, "the caller still has to ask");
+    }
+
+    #[test]
+    fn guard_refuses_without_yes_outside_a_terminal_naming_the_action() {
+        let error = require_yes_or_interactive_with(false, "runtimes uninstall", || false)
+            .expect_err("no --yes and no terminal must refuse");
+        assert_eq!(
+            error.to_string(),
+            "runtimes uninstall requires --yes outside an interactive terminal"
+        );
+    }
+}

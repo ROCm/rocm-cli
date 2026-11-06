@@ -40,6 +40,18 @@ const STUB_MARKET_NAME: &str = "stub-accelerator";
 /// otherwise, per `command_failure_detail` — not stdout unconditionally.
 const STUB_FIRST_GPU_MARKET_NAME: &str = "stub-accelerator-gpu0";
 
+/// The `e2e-test-hooks` seam that names the device node `rocm_core`'s `amd-smi`
+/// pre-flight opens (EAI-8457).
+///
+/// Spelled out rather than imported: `rocm_core` exports it only to its own
+/// crate, because a `pub` constant would read as an invitation for production
+/// code to consult it. The harness has to agree with that string by hand, and
+/// the scenario that points it at an absent path is what notices if it drifts:
+/// it asserts the decline names *that* path, so a build that ignored the
+/// variable would decline naming `/dev/kfd` and fail, rather than passing on a
+/// gate that declined for the host's own reasons.
+const KFD_DEVICE_SEAM: &str = "ROCM_E2E_KFD_DEVICE";
+
 /// Where the `amd-smi` stub and its payload live inside the isolated root.
 ///
 /// Derived rather than carried on the World so the Given and the When agree on
@@ -201,11 +213,16 @@ async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
         !repo_version.contains("${"),
         "repo_version still shows an unresolved shell placeholder: {repo_version:?}\n{output}"
     );
+    // The default, unoverridden value is the literal "latest" (ROCM_CLI_AMDGPU_DRIVER_VERSION
+    // is unset on a normal test host) -- not a numeric ROCm version -- so only
+    // non-empty and metacharacter-safe are asserted here, matching the same
+    // filter build_driver_install_plan_at applies before this value ever reaches
+    // a single-quoted shell command.
+    assert!(!repo_version.is_empty(), "repo_version is empty:\n{output}");
     assert!(
         repo_version
             .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_digit()),
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
         "repo_version is not a concrete version string: {repo_version:?}\n{output}"
     );
 }
@@ -281,7 +298,7 @@ async fn assert_host_default_engine_reported(world: &mut E2eWorld) {
 #[then("all supported engines are listed")]
 async fn assert_all_engines_listed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
-    for engine in ["lemonade", "vllm"] {
+    for engine in ["lemonade", "vllm", "aim"] {
         assert!(
             output.contains(engine),
             "engine '{engine}' not found in:\n{output}"
@@ -430,6 +447,34 @@ fn parsed_json(world: &E2eWorld) -> serde_json::Value {
     let output = world.cli_output.as_ref().expect("no command was run");
     serde_json::from_str(output)
         .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{output}"))
+}
+
+#[then("the inspection reports a current install-method name")]
+async fn assert_install_method_is_current(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let method = json
+        .get("rocm_install_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // `probe_rocm_install` used to name these "amdgpu-install" and
+    // "tarball-or-other"; a whitelist (rather than pinning one value) is what
+    // keeps this hermetic across hosts -- which branch actually fires here
+    // depends on this machine's real /etc/apt (etc.) ROCm repo markers, not
+    // just on the CLI-managed install this scenario plants, so a host that
+    // happens to have a real ROCm repo configured (this includes some
+    // developer machines and self-hosted GPU runners, not just a clean mock
+    // lane) legitimately resolves to "repo-native" instead of
+    // "runfile-or-tarball". Either current name passing and either retired
+    // name failing is exactly the coverage a revert of the rename needs.
+    // "zypper" is excluded: `probe_rocm_install` reports SUSE via its `rpm -q`
+    // branch, so it always yields "dnf", never "zypper". "none" is excluded
+    // too: this scenario plants an install, so "none" would mean the planted
+    // install went undetected, which is the regression this scenario exists
+    // to catch, not a value it should tolerate.
+    assert!(
+        matches!(method, "apt" | "dnf" | "repo-native" | "runfile-or-tarball"),
+        "expected a current rocm_install_method name, got {method:?}: {json}"
+    );
 }
 
 #[when("the user inspects the system both for reading and for scripting")]
@@ -1126,7 +1171,7 @@ async fn assert_hip_copies_reported(world: &mut E2eWorld) {
 }
 
 // Sources the loader itself actually consults, mirrored from
-// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
+// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine/library_copies.rs`: a `rocm-install` or
 // `managed-runtime` hit is evidence a copy exists, not evidence anything
 // would load it. Shared by the HIP and comgr selection assertions below so
 // the two cannot drift apart.
@@ -1229,7 +1274,7 @@ async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
         // the probe ran and found nothing or never ran at all -- exactly the
         // state of every lane where this scenario is the only coverage. The
         // "no libamd_comgr found" note is pushed only by the probe actually
-        // running and coming up empty (see `probe_comgr` in examine.rs), so
+        // running and coming up empty (see `probe_comgr` in examine/library_copies.rs), so
         // requiring it here is what makes this assertion prove the probe ran.
         let notes = value["notes"].as_array().expect("notes must be a list");
         assert!(
@@ -1508,6 +1553,12 @@ async fn assert_reported_distribution(
     assert_eq!(inspection_str(&json, "/summary/distro"), name, "{json:#}");
 }
 
+#[then(expr = "the inspection reports the distribution family {string}")]
+async fn assert_reported_distribution_family(world: &mut E2eWorld, like: String) {
+    let json = parsed_json(world);
+    assert_eq!(inspection_str(&json, "/distro_id_like"), like, "{json:#}");
+}
+
 #[then("the inspection reports no trouble reading the release file")]
 async fn assert_os_release_read_cleanly(world: &mut E2eWorld) {
     let json = parsed_json(world);
@@ -1712,6 +1763,44 @@ async fn stub_amd_smi_that_stalls_only_on_monitor(world: &mut E2eWorld) {
     );
 }
 
+/// Where the stub records that it ran, so the decline can be asserted as "never
+/// spawned" rather than merely "reported unavailable".
+fn stub_ran_marker(world: &E2eWorld) -> PathBuf {
+    stub_bin_dir(world).join("amd-smi-ran")
+}
+
+#[given("the KFD device cannot be opened")]
+async fn kfd_device_cannot_be_opened(world: &mut E2eWorld) {
+    // A stub that *would* answer perfectly well, and a marker that records it
+    // running. The point of the gate is that neither ever happens: a scenario
+    // whose stub could not have answered anyway would pass against a gate that
+    // had been deleted.
+    let payload = write_stub_payload(world);
+    let marker = stub_ran_marker(world);
+    write_amd_smi_stub(
+        world,
+        &format!(
+            "touch {marker}\nexec cat {payload}",
+            marker = marker.display(),
+            payload = payload.display()
+        ),
+    );
+
+    // Inside the isolated root and never created. The decline must name this
+    // path, which is what proves the daemon read the seam rather than falling
+    // back to `/dev/kfd` -- a host-dependent answer that would make the
+    // scenario pass for the wrong reason on a lane with no GPU.
+    let absent = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("absent-kfd-device");
+    world
+        .command_env
+        .push((KFD_DEVICE_SEAM, absent.into_os_string()));
+}
+
 #[when("the daemon gathers a bridge snapshot")]
 async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     let rocmd = crate::rocmd_binary();
@@ -1749,6 +1838,28 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     )
     .expect("failed to build the stub PATH");
     command.env("PATH", path);
+
+    // The `/dev/kfd` pre-flight in `rocm_core::amd_smi_json` (EAI-8457) refuses
+    // to spawn `amd-smi` at all when the device cannot be opened, and the lane
+    // that runs these scenarios per PR has no `/dev/kfd`. Without a seam the
+    // stub would never be reached and all three scenarios would assert against
+    // a decline instead of the pipe-drain behaviour they are about.
+    //
+    // `ROCM_CLI_TEST_HOST_ROOT` cannot do this job: the gate deliberately keeps
+    // the real node's veto, so a simulated root can only ever make it decline.
+    // The `e2e-test-hooks` path seam can, and it moves the gate rather than
+    // disabling it -- the daemon still opens the file named here before it
+    // spawns anything, which is why a plain readable file is enough to stand in
+    // for a healthy device. The companion scenario points the same variable at
+    // an absent path to exercise the other branch.
+    let kfd_stand_in = isolated_home.join("kfd-stand-in");
+    std::fs::write(&kfd_stand_in, b"").expect("failed to plant the stand-in KFD node");
+    command.env(KFD_DEVICE_SEAM, &kfd_stand_in);
+    // Applied after the default above so a scenario that pushed its own value
+    // -- the declined branch does -- wins over it.
+    for (key, value) in &world.command_env {
+        command.env(key, value);
+    }
 
     let output = command
         .output()
@@ -1868,6 +1979,60 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
     );
 }
 
+#[then("the snapshot says amd-smi was never launched and names the device")]
+async fn assert_snapshot_declined_the_launch(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    // A declined probe degrades the GPU section the same way a timed-out one
+    // does; it must not fail the command.
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(false),
+        "a launch that was refused cannot have reported a GPU: {gpu}"
+    );
+    let note = gpu["note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a degraded snapshot must explain itself: {gpu}"));
+    assert!(
+        note.contains("declined to launch"),
+        "the note must say the launch was refused, not blame the binary or a timeout: {note:?}"
+    );
+
+    // The device this run was pointed at, not `/dev/kfd`. On a lane with no GPU
+    // the gate declines either way, so without this the scenario would pass
+    // against a build that ignored the seam entirely -- and would then be
+    // asserting the runner's own missing device rather than the gate.
+    let expected = world
+        .command_env
+        .iter()
+        .find(|(key, _)| *key == KFD_DEVICE_SEAM)
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+        .expect("the scenario must have pointed the pre-flight at an absent device");
+    assert!(
+        note.contains(&expected),
+        "the note must name the device the pre-flight actually probed ({expected}): {note:?}"
+    );
+
+    // The load-bearing half: the gate's claim is that nothing is spawned, which
+    // a note alone does not establish. The stub would have answered this probe
+    // perfectly, so the marker's absence is the only evidence that the refusal
+    // happened before the launch rather than after a failed one.
+    let marker = stub_ran_marker(world);
+    assert!(
+        !marker.exists(),
+        "the pre-flight must refuse before the spawn, but the stub amd-smi ran and left \
+         {}",
+        marker.display()
+    );
+}
+
 #[then(
     "the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout"
 )]
@@ -1935,5 +2100,333 @@ async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eW
         length <= MAX_NOTE_CHARS,
         "this note travels to the same automation and audit logs as examine-25's, so it needs \
          the same bound, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
+    );
+}
+
+// ── Windows display driver ─────────────────────────────────────────
+
+/// The first day not counted as older: the release of the first HIP SDK for
+/// Windows, `FIRST_HIP_SDK_FOR_WINDOWS` in `rocm_core::windows_driver`.
+///
+/// Repeated here on purpose. The step judges the CLI's verdict against the day
+/// the documentation names, so a verdict computed from a drifted constant would
+/// not agree with it. Dates are `yyyy-MM-dd`, which order as text.
+const FIRST_HIP_SDK_FOR_WINDOWS_DAY: &str = "2023-07-27";
+
+/// The driver record the machine-readable form carries, if it carries one.
+pub(crate) fn windows_driver_record(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.pointer("/summary/driver/windows")
+}
+
+/// What the machine-readable form says about the driver's age, worked out from
+/// its date and not from the verdict it carries, so the verdict can be held
+/// against it.
+fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
+    match record.get("date").and_then(serde_json::Value::as_str) {
+        None => "unknown",
+        Some(date) if date < FIRST_HIP_SDK_FOR_WINDOWS_DAY => "predates_first_hip_sdk",
+        Some(_) => "not_older",
+    }
+}
+
+#[then(
+    "the inspection reports the display driver's version and date as the machine-readable form does"
+)]
+async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json).unwrap_or_else(|| {
+        panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
+    });
+    let version = record
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(!version.is_empty(), "{record:#}");
+    assert_eq!(field_value(text, "driver_version"), Some(version), "{text}");
+    // A version with no date would map to "unknown", and the age steps of this
+    // scenario, `diagnose-41` and `driver-install-04` would all stay green on
+    // it. The probe reads the date from the same device record as the
+    // version, so on the lane it must be there.
+    let date = record
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        date.len() == 10 && date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-',
+        "a driver version was read but no yyyy-MM-dd date came with it: {record:#}"
+    );
+    assert_eq!(field_value(text, "driver_date"), Some(date), "{text}");
+}
+
+#[then("the inspection calls the driver old only when its date is before 27 July 2023")]
+async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json)
+        .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
+    let expected = age_expected_from_date(record);
+    assert_eq!(
+        record.get("age").and_then(serde_json::Value::as_str),
+        Some(expected),
+        "the machine-readable verdict does not follow the driver date:\n{record:#}"
+    );
+    let age = field_value(text, "driver_age").unwrap_or_else(|| panic!("no driver_age:\n{text}"));
+    let expected_start = match expected {
+        "predates_first_hip_sdk" => "older than the first HIP SDK for Windows",
+        "not_older" => "not older than the first HIP SDK for Windows",
+        _ => "unknown",
+    };
+    assert!(
+        age.starts_with(expected_start),
+        "driver_age should start with {expected_start:?} for {record:#}, got: {age}"
+    );
+    // Whatever the verdict, the text says the minimum is not established. It
+    // must never present the date as a compatibility requirement.
+    assert!(
+        expected == "unknown" || age.contains("not established"),
+        "{age}"
+    );
+}
+
+// ── ROCDXG reachable through LD_LIBRARY_PATH ───────────────────────
+
+/// Plant a WSL machine under the simulated host root: `/dev/dxg`, DXCore, and
+/// `librocdxg.so` under `/opt/rocm`, plus a stand-in `ldconfig` first on PATH
+/// whose cache does not list the library. `LD_LIBRARY_PATH` is set explicitly
+/// (to `loader_path`, possibly empty) so the runner's own value, which may name
+/// a real `/opt/rocm/lib`, cannot decide the scenario.
+fn plant_wsl_machine_with_unregistered_rocdxg(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/dxg"), "").expect("failed to plant /dev/dxg");
+    std::fs::create_dir_all(host.join("usr/lib/wsl/lib"))
+        .expect("failed to create planted WSL lib");
+    std::fs::write(host.join("usr/lib/wsl/lib/libdxcore.so"), "")
+        .expect("failed to plant libdxcore.so");
+    std::fs::create_dir_all(host.join("opt/rocm/lib")).expect("failed to create planted ROCm lib");
+    std::fs::write(host.join("opt/rocm/lib/librocdxg.so"), "")
+        .expect("failed to plant librocdxg.so");
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    // A readable cache that simply lacks the library: `None` (ldconfig could not
+    // run) would be a different case, and one the verdict must not read as "no".
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("ldconfig"),
+        "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6'\n",
+    )
+    .expect("failed to write the fake ldconfig");
+    push_planted_wsl_machine_env(world, loader_path);
+}
+
+/// Hand the planted WSL machine to the next `rocm` invocation. Separate from the
+/// planting so a scenario that runs a second command on the same machine can give
+/// it the same environment: the scenario env is consumed by each run.
+fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let path = std::env::join_paths(std::iter::once(root.join("fake-bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("LD_LIBRARY_PATH", loader_path.into()));
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
+}
+
+#[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
+async fn wsl_machine_with_rocdxg_on_the_loader_path(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+}
+
+#[given("a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH")]
+async fn wsl_machine_with_rocdxg_nowhere_the_loader_looks(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+}
+
+#[given(
+    "a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn wsl_machine_with_rocdxg_beside_the_runtime(world: &mut E2eWorld) {
+    // The same machine as the control above, plus the runtime that opens the
+    // library: the only difference between the two scenarios, so the verdict can
+    // only turn on it.
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let lib = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/opt/rocm/lib");
+    std::fs::write(lib.join("libhsa-runtime64.so.1"), "")
+        .expect("failed to plant libhsa-runtime64.so.1");
+}
+
+#[then(expr = "the inspection reports the ROCDXG driver status {string}")]
+async fn assert_rocdxg_driver_status(world: &mut E2eWorld, status: String) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        status,
+        "{json:#}"
+    );
+}
+
+fn assert_rocdxg_sources(
+    world: &E2eWorld,
+    in_cache: bool,
+    on_loader_path: bool,
+    beside_runtime: bool,
+) {
+    let json = parsed_json(world);
+    let flag = |pointer: &str| {
+        json.pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
+    };
+    // The library itself is on disk in every scenario, so the verdict turns on
+    // the loader sources alone.
+    assert!(flag("/summary/wsl/librocdxg"), "{json:#}");
+    assert_eq!(
+        flag("/summary/wsl/ldconfig_librocdxg"),
+        in_cache,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_on_ld_library_path"),
+        on_loader_path,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_beside_runtime"),
+        beside_runtime,
+        "{json:#}"
+    );
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache"
+)]
+async fn assert_rocdxg_only_on_the_loader_path(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, true, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_in_neither_source(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_only_beside_the_runtime(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, true);
+}
+
+/// The `driver_detail` line is the CLI's own advice about what is wrong. It is
+/// asserted beside the status so that a message naming a registration the
+/// workload does not need cannot ride along with a verdict that says ready.
+fn rocdxg_driver_detail(world: &E2eWorld) -> String {
+    let json = parsed_json(world);
+    inspection_str(&json, "/summary/driver/detail").to_owned()
+}
+
+#[then(
+    "the inspection's driver detail does not send the user to register the library with ldconfig"
+)]
+async fn assert_rocdxg_detail_asks_for_no_registration(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        !detail.contains("ldconfig"),
+        "the library loads through LD_LIBRARY_PATH, so the detail must not name the cache: {detail}"
+    );
+}
+
+#[then("the inspection's driver detail says the library is missing from the linker cache")]
+async fn assert_rocdxg_detail_names_the_cache(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        detail.contains("ldconfig:librocdxg.so"),
+        "nothing lets the loader find the library, so the detail must say so: {detail}"
+    );
+}
+
+// ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
+
+#[when("the user serves a model under the GPU-required default on that machine")]
+async fn user_serves_on_the_planted_wsl_machine(world: &mut E2eWorld) {
+    // The pre-flight refuses before any engine is prepared, so the model and
+    // engine named here are never fetched.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+            "--engine",
+            "lemonade",
+            "--gpu",
+            "auto",
+            "--no-smoke-test",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal points the user at the WSL driver status instead of /dev/kfd")]
+async fn assert_wsl_refusal_advice(world: &mut E2eWorld) {
+    let output = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        !output.contains("/dev/kfd is present"),
+        "WSL has no /dev/kfd, so advice to confirm it cannot clear the condition:\n{output}"
+    );
+    assert!(
+        output.contains("`driver_status` is `wsl_rocdxg_ready`"),
+        "the refusal must name the status `rocm examine` reports as ready:\n{output}"
+    );
+}
+
+#[then(
+    "inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check"
+)]
+async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
+    // The refusal says to run `rocm examine` and compare `driver_status` with the
+    // ready value. Run it on the same planted machine: it must exist, accept
+    // those arguments, and show the condition the refusal is about.
+    push_planted_wsl_machine_env(world, "");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        "wsl_rocdxg_missing",
+        "{json:#}"
     );
 }

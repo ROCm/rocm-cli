@@ -5,13 +5,17 @@
 //! The TheRock managed-runtime-environment surface.
 //!
 //! `ManagedRuntimeEnvironment`/`FrameworkInterpreter`, `active_managed_therock_*`,
-//! `prepend_runtime_paths`, and the registry-manifest probing behind them.
-//! amd-smi binary resolution (`resolve_amd_smi_binary*`) still reads those
-//! same registry records from `lib.rs` — a distinct, not-yet-scoped concern.
+//! `prepend_runtime_paths`, and the registry-manifest probing behind them,
+//! including the managed-SDK probe candidates (`managed_therock_sdk_probe_candidates`,
+//! `TheRockSdkProbeCandidate`) and the library directories a managed runtime keeps.
+//! amd-smi binary resolution (`resolve_amd_smi_binary*`) reads those same
+//! registry records from [`crate::amd_smi`] — a distinct concern that lives
+//! in its own module.
 
+use crate::gfx_target::normalize_therock_family;
 use crate::{
-    AppPaths, RocmCliConfig, normalize_runtime_path_for_host, normalize_therock_family,
-    runtime_is_linux, runtime_is_windows, runtime_python_executable_in_env,
+    AppPaths, RocmCliConfig, normalize_runtime_path_for_host, runtime_is_linux, runtime_is_windows,
+    runtime_python_executable_in_env,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -195,8 +199,37 @@ fn select_active_managed_therock_record(
         return Some(record.clone());
     }
 
-    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    sort_records_newest_install_first(&mut records);
     records.into_iter().next().map(|(_, record)| record)
+}
+
+/// Order registry records newest install first, breaking ties on the runtime
+/// key and then on the record's path.
+///
+/// Without a tiebreak the order of records that share an
+/// `installed_at_unix_ms` is whatever `read_dir` returned, so "the most recently
+/// installed runtime" would be chosen by the filesystem. Ties are ordinary: a
+/// `--devel` install and its plain sibling land in the same millisecond, and a
+/// record written before the field existed reads as `0`. `rocm`'s own registry
+/// load breaks the same tie on the runtime key, ascending, so this uses the
+/// same tiebreak among the records this crate considers. The two sides do not
+/// consider the same records, though: these fallbacks only see records
+/// [`managed_therock_environment_records`] accepts (a TheRock runtime whose
+/// `rocm_sdk` probe imported), while the CLI's startup update check takes the
+/// first of every parsed manifest. So the rule is shared, not the pick: with
+/// no active key, a tarball runtime installed after a wheel one is what the
+/// CLI reports on, while this falls back to the wheel. Shared by all three
+/// registry fallbacks: the active-runtime fallback, the `amd-smi` binary
+/// resolver, and the SDK probe candidate list.
+pub(crate) fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
+    records.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 
 pub fn prepend_runtime_paths(
@@ -381,8 +414,6 @@ pub(crate) struct TheRockSdkProbeManifest {
     #[serde(default)]
     pub(crate) import_ok: bool,
     #[serde(default)]
-    pub(crate) site_packages: Option<PathBuf>,
-    #[serde(default)]
     pub(crate) root_path: Option<PathBuf>,
     #[serde(default)]
     pub(crate) bin_path: Option<PathBuf>,
@@ -394,11 +425,81 @@ pub(crate) struct TheRockSdkProbeManifest {
     pub(crate) library_paths: Vec<PathBuf>,
 }
 
+pub(crate) fn managed_therock_sdk_probe_candidates(
+    registry_dir: &Path,
+) -> Vec<TheRockSdkProbeCandidate> {
+    let Ok(entries) = fs::read_dir(registry_dir) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(record) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TheRockFamilyManifest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !record.looks_like_therock() {
+            continue;
+        }
+        let sdk_ready = record
+            .rocm_sdk
+            .as_ref()
+            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some() && sdk.bin_path.is_some());
+        if !sdk_ready {
+            continue;
+        }
+        records.push((path, record));
+    }
+    sort_records_newest_install_first(&mut records);
+    records
+        .into_iter()
+        .filter_map(|(_, record)| {
+            let sdk = record.rocm_sdk?;
+            Some(TheRockSdkProbeCandidate {
+                root_path: sdk.root_path?,
+                library_paths: sdk.library_paths,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+    for path in [
+        root.join("bin"),
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ] {
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TheRockSdkProbeCandidate {
+    pub(crate) root_path: PathBuf,
+    /// The SDK's own recorded library directories -- every package root the
+    /// probe script actually imported and asked Python for (see
+    /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
+    /// `root_path` after the fact. This is what
+    /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
+    /// a caller that needs to find a managed runtime's actual libraries (comgr
+    /// included) should prefer this over re-deriving the layout.
+    pub(crate) library_paths: Vec<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_python_executable_name;
     use crate::test_support::temp_app_paths;
+    use crate::unix_time_millis;
 
     #[test]
     fn managed_therock_family_uses_runtime_manifest_not_host_mapping() -> Result<()> {
@@ -510,6 +611,168 @@ mod tests {
         let config = RocmCliConfig::default();
         assert_eq!(active_managed_therock_channel(&paths, &config)?, None);
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn registry_records_tie_on_install_time_is_broken_on_the_runtime_key() {
+        // The file name mirrors the key's letters (`aaa` -> `zzz.json`), so
+        // path order is the reverse of key order: a sort that fell through to
+        // the path tiebreak without consulting the key would fail here.
+        let record = |key: &str, installed_at: u128| {
+            let mirrored: String = key
+                .bytes()
+                .map(|byte| char::from(b'a' + b'z' - byte))
+                .collect();
+            (
+                PathBuf::from(format!("{mirrored}.json")),
+                serde_json::from_value::<TheRockFamilyManifest>(serde_json::json!({
+                    "runtime_key": key,
+                    "installed_at_unix_ms": installed_at,
+                }))
+                .expect("record"),
+            )
+        };
+        let keys = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(_, record)| record.runtime_key.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        // Same millisecond, both read orders: the smaller key comes first, as
+        // in `rocm`'s registry load, so the fallback cannot depend on `read_dir`.
+        for mut records in [
+            vec![
+                record("bbb", 2_000),
+                record("aaa", 2_000),
+                record("old", 1_000),
+            ],
+            vec![
+                record("aaa", 2_000),
+                record("bbb", 2_000),
+                record("old", 1_000),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(keys(&records), ["aaa", "bbb", "old"]);
+        }
+
+        // The install time still decides first.
+        let mut records = vec![record("aaa", 1_000), record("zzz", 2_000)];
+        sort_records_newest_install_first(&mut records);
+        assert_eq!(keys(&records), ["zzz", "aaa"]);
+    }
+
+    #[test]
+    fn registry_records_without_a_key_or_a_time_still_sort_deterministically() {
+        let record = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockFamilyManifest>(fields).expect("record"),
+            )
+        };
+        let paths = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless records in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut records in [
+            vec![
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["a.json", "b.json"]);
+        }
+
+        // A record written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut records in [
+            vec![
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["timed.json", "untimed.json", "zero.json"]);
+        }
+    }
+
+    #[test]
+    fn active_managed_therock_fallback_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Two runtimes installed in the same millisecond, written under both
+        // pairings of file name and runtime key. Whichever file `read_dir`
+        // returns first holds `bbb` in one of the two pairings, so a fallback
+        // that kept the read order picks the wrong runtime in that one.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = temp_app_paths("active-therock-tie");
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-release:gfx120X-all",
+                        "family": "gfx120X-all",
+                        "channel": "release",
+                        "version": format!("version-of-{key}"),
+                        "installed_at_unix_ms": 2_000,
+                        "rocm_sdk": { "import_ok": true }
+                    }))?,
+                )?;
+            }
+
+            let config = RocmCliConfig::default();
+            assert_eq!(
+                active_managed_therock_version(&paths, &config)?,
+                Some("version-of-aaa".to_owned()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
         Ok(())
     }
 
@@ -825,6 +1088,105 @@ mod tests {
                 "rocm_sdk": { "import_ok": true }
             }))?,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_therock_sdk_probe_candidates_break_install_time_ties_on_the_runtime_key()
+    -> Result<()> {
+        // Same shape as the amd-smi and active-runtime fallback tie tests: both
+        // pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-sdk-probe-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let root = temp_root.join(key);
+                let bin = root.join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": {
+                            "import_ok": true,
+                            "root_path": root,
+                            "bin_path": bin,
+                        },
+                    }))?,
+                )?;
+            }
+
+            let candidates = managed_therock_sdk_probe_candidates(&registry_dir);
+            let expected_root_path = temp_root.join("aaa");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                candidates
+                    .first()
+                    .map(|candidate| candidate.root_path.clone()),
+                Some(expected_root_path),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `managed_therock_sdk_probe_candidates` surfaces the SDK's own recorded
+    /// `library_paths` rather than dropping them.
+    ///
+    /// Those are what `examine`'s comgr/HIP search now reads to find a managed
+    /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
+    /// `examine/library_copies.rs`), in place of re-deriving the layout from
+    /// `root_path` after the fact -- a guess that does not hold for every
+    /// real install shape, which is what left a managed runtime's own code
+    /// object manager library unseen on a real host
+    /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
+    /// candidate whose `library_paths` came back empty would defeat that fix
+    /// silently, so this pins the field surviving the read.
+    #[test]
+    fn managed_sdk_probe_candidate_carries_recorded_library_paths() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-library-paths");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        let comgr_dir = site_packages.join("_rocm_sdk_core").join("lib");
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&comgr_dir)?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin,
+                    "library_paths": [comgr_dir]
+                }
+            }))?,
+        )?;
+
+        let candidates = managed_therock_sdk_probe_candidates(&registry);
+        assert_eq!(candidates.len(), 1, "expected exactly one candidate");
+        assert_eq!(
+            candidates[0].library_paths,
+            vec![comgr_dir],
+            "the recorded library_paths must survive into the candidate, or the \
+             comgr/HIP search has nowhere else reliable to find them"
+        );
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 }

@@ -11,19 +11,40 @@
 //! on-disk format at runtime, through its own `ServiceRecord` mirror struct
 //! in `registry.rs` rather than this type, and the serde test guards that
 //! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
-//! a doc comment — `rocm-dash-core` and `rocm-dash-collectors` do not depend
-//! on `rocm-core` at all.
+//! a doc comment. `rocm-dash-core` does not depend on `rocm-core` at all;
+//! `rocm-dash-collectors` does since EAI-8457, but only for the shared bounded
+//! `/dev/kfd` probe, and it never reads this on-disk format either.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::AppPaths;
-use crate::INFERENCE_VERIFIED_STATE_KEY;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// Engine state-file key recording the last inference probe attempt.
+pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
+
+/// Minimum gap between inference probes against a service that is still loading.
+///
+/// Only a *successful* probe latches, so without this a warming model would be
+/// re-probed by every readiness poll — and each attempt costs up to
+/// [`crate::INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// supervisor ticks every few seconds and `services list` sits in front of a
+/// user, so the unthrottled cost lands exactly where it is most visible. The
+/// price of throttling is that readiness can be noticed up to this late.
+pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ManagedServiceRecord {
@@ -31,6 +52,12 @@ pub struct ManagedServiceRecord {
     pub engine: String,
     pub model_ref: String,
     pub canonical_model_id: String,
+    /// The name the running server lists in `/v1/models`, when it differs from
+    /// `canonical_model_id` (a container engine's `canonical_model_id` is the
+    /// image to pull). Adopted from the engine state file; see
+    /// [`Self::served_model_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_id: Option<String>,
     pub host: String,
     pub port: u16,
     pub endpoint_url: String,
@@ -106,7 +133,71 @@ pub struct ManagedServiceRecord {
     pub created_at_unix_ms: u128,
 }
 
+/// Whether the engine `Stop` verdict decides that a stop is confirmed.
+///
+/// True for engines whose service is a container rather than a recorded
+/// process: the engine `Stop` is the only thing that stops one, so its verdict,
+/// not the PID signalling, decides. For a PID-supervised
+/// engine the PIDs are authoritative and the engine `Stop` is reported only.
+/// Shared by `rocm` and `rocmd` so the two stop paths cannot disagree.
+#[must_use]
+pub fn engine_stop_decides_confirmation(engine: &str) -> bool {
+    engine == "aim"
+}
+
+/// No record exists for the requested service id.
+///
+/// [`ManagedServiceRecord::read_manifest`] returns this, as the root of its
+/// error, only when the manifest file is absent. Its message is the whole
+/// story for the user, so it carries no OS cause; a manifest that exists but
+/// cannot be read or parsed surfaces its cause instead. Callers can tell the
+/// two apart with `err.downcast_ref::<ManagedServiceNotFound>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedServiceNotFound {
+    pub service_id: String,
+}
+
+impl std::fmt::Display for ManagedServiceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No local server named `{}`. See `rocm services list --all`.",
+            self.service_id
+        )
+    }
+}
+
+impl std::error::Error for ManagedServiceNotFound {}
+
 impl ManagedServiceRecord {
+    /// Read and parse the record for `service_id` exactly as it is on disk.
+    ///
+    /// The single loader behind every command that takes a service id, in both
+    /// `rocm` and `rocmd`. A missing manifest is [`ManagedServiceNotFound`];
+    /// any other read failure (permission denied, a directory in its place) and
+    /// a manifest that does not parse keep their underlying cause. The caller
+    /// validates the id first; this only joins it onto the services directory.
+    pub fn read_manifest(paths: &AppPaths, service_id: &str) -> Result<Self> {
+        let manifest_path = paths.service_manifest_path(service_id);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ManagedServiceNotFound {
+                    service_id: service_id.to_owned(),
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to read the record for local server `{service_id}` at {}",
+                    manifest_path.display()
+                )));
+            }
+        };
+        serde_json::from_slice::<Self>(&bytes)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         paths: &AppPaths,
@@ -134,6 +225,7 @@ impl ManagedServiceRecord {
             engine,
             model_ref: model_ref.into(),
             canonical_model_id: canonical_model_id.into(),
+            served_model_id: None,
             host,
             port,
             mode: mode.into(),
@@ -161,6 +253,21 @@ impl ManagedServiceRecord {
             engine_state_path,
             created_at_unix_ms: unix_time_millis(),
         }
+    }
+
+    /// The model name to look for in the endpoint's `/v1/models` and to send in
+    /// requests: the served name when the engine reported one, else the
+    /// canonical id, else the model ref.
+    #[must_use]
+    pub fn served_model_name(&self) -> &str {
+        [
+            self.served_model_id.as_deref().unwrap_or_default(),
+            self.canonical_model_id.as_str(),
+            self.model_ref.as_str(),
+        ]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or_default()
     }
 
     /// Drop the per-run state that a restart invalidates, and count the restart.
@@ -277,6 +384,13 @@ impl ManagedServiceRecord {
         {
             self.env_id = Some(env_id.to_owned());
         }
+        if let Some(served) = state
+            .get("served_model_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.served_model_id = Some(served.to_owned());
+        }
         // Adopt the engine server PID together with ITS OWN start-time token so
         // a later stop verifies the server process, not the launcher. The ticks
         // key must match the PID key: `server_pid`↔`server_start_ticks`,
@@ -322,6 +436,52 @@ impl ManagedServiceRecord {
         Ok(self.status != previous)
     }
 
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
+    /// Mark a launch the CLI has just abandoned — its child terminated, the
+    /// error already reported to the user — as over, while keeping the record
+    /// and log for `rocm services`/`rocm logs` to show.
+    ///
+    /// The status is `stopped`, not `failed`, on purpose: `rocmd`'s recovery
+    /// scan restarts a managed `failed` record that carries no stop marker, so
+    /// a `failed` record here could be respawned after the CLI reported the
+    /// launch as failed. A stop marker would not hold either, because the
+    /// liveness refresh clears it as soon as the recorded PIDs are gone.
+    /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    pub fn mark_launch_abandoned(&mut self) {
+        self.status = "stopped".to_owned();
+    }
+
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
+    }
+
     fn with_storage_paths(&self) -> Self {
         let mut record = self.clone();
         record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);
@@ -356,6 +516,75 @@ mod tests {
     use super::*;
     use crate::test_support::{probe_test_record, temp_app_paths};
 
+    /// An unknown id reads as one plain sentence pointing at the listing
+    /// command, with no OS error chained under it.
+    #[test]
+    fn read_manifest_reports_a_missing_record_as_not_found_without_an_os_cause() {
+        let (root, paths) = temp_app_paths("read-manifest-missing");
+        let error =
+            ManagedServiceRecord::read_manifest(&paths, "nope").expect_err("no record was written");
+        assert_eq!(
+            error.downcast_ref::<ManagedServiceNotFound>(),
+            Some(&ManagedServiceNotFound {
+                service_id: "nope".to_owned()
+            })
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "No local server named `nope`. See `rocm services list --all`."
+        );
+        assert_eq!(error.chain().count(), 1, "{error:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A manifest path that exists but cannot be read is not "not found": the
+    /// OS error stays in the chain so the user can act on it.
+    #[test]
+    fn read_manifest_keeps_the_cause_of_an_unreadable_record() {
+        let (root, paths) = temp_app_paths("read-manifest-unreadable");
+        fs::create_dir_all(paths.service_manifest_path("svc-dir")).expect("dir in place");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-dir")
+            .expect_err("a directory is not a readable record");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("svc-dir"),
+            "names the record: {error:#}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A corrupt manifest exists, so it is a parse failure with its cause, not
+    /// "not found".
+    #[test]
+    fn read_manifest_keeps_the_cause_of_a_corrupt_record() {
+        let (root, paths) = temp_app_paths("read-manifest-corrupt");
+        let manifest = paths.service_manifest_path("svc-corrupt");
+        fs::create_dir_all(manifest.parent().expect("parent")).expect("services dir");
+        fs::write(&manifest, b"{ not json").expect("write corrupt");
+        let error = ManagedServiceRecord::read_manifest(&paths, "svc-corrupt")
+            .expect_err("corrupt json must not parse");
+        assert!(error.downcast_ref::<ManagedServiceNotFound>().is_none());
+        assert!(
+            error.to_string().starts_with("failed to parse "),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<serde_json::Error>()
+                .is_some(),
+            "{error:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn restarting_drops_the_previous_runs_inference_verification() {
         // The restarted child is a different server with an unloaded model. If the
@@ -379,6 +608,22 @@ mod tests {
         assert!(record.last_restart_unix_ms.is_some());
     }
 
+    #[test]
+    fn blocks_port_needs_a_live_record_on_that_exact_port() {
+        let mut record = probe_test_record(11435);
+        record.status = "running".to_owned();
+        assert!(record.blocks_port(11435));
+        assert!(
+            !record.blocks_port(11436),
+            "a different port is not blocked"
+        );
+        record.status = "stopped".to_owned();
+        assert!(
+            !record.blocks_port(11435),
+            "a stopped record blocks nothing"
+        );
+    }
+
     /// Writes `state` as the record's engine state file and runs the refresh.
     fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
         let dir = std::env::temp_dir().join(format!(
@@ -398,6 +643,29 @@ mod tests {
         record.refresh_from_engine_state().expect("refresh");
         let _ = fs::remove_dir_all(dir);
         record
+    }
+
+    /// A container engine serves under a different name than the image it pulls;
+    /// the record adopts that name from the engine state, and every readiness
+    /// probe asks for it rather than for the image reference.
+    #[test]
+    fn engine_refresh_adopts_the_served_model_name_for_readiness_probes() {
+        let mut record = probe_test_record(11438);
+        record.canonical_model_id = "org/aim-image:1".to_owned();
+        assert_eq!(record.served_model_name(), "org/aim-image:1");
+
+        let record = refresh_from_state(
+            "served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "Org/Served-Model" }),
+        );
+        assert_eq!(record.served_model_id.as_deref(), Some("Org/Served-Model"));
+        assert_eq!(record.served_model_name(), "Org/Served-Model");
+
+        let record = refresh_from_state(
+            "blank-served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "  " }),
+        );
+        assert_eq!(record.served_model_id, None);
     }
 
     /// vLLM records one process as both `pid` and `server_pid` with only

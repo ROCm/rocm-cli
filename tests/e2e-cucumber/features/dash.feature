@@ -5,12 +5,20 @@ Feature: Interactive dashboard
   # only for now: portable-pty compiles on Windows via ConPTY, but that path is
   # not yet promoted to a blocking contract (tracked as a follow-up).
 
+  # #534: the ROCm view's `Runs:` line is a command a user can copy into a
+  # shell, and it named `rocm doctor`, a subcommand that does not exist. The
+  # unit test beside the action list checks each label against what its screen
+  # runs; the diagnose steps here check the line the user actually sees. They
+  # extend this journey rather than open another dashboard session, which would
+  # add load to the no-GPU lane's timing-sensitive dash scenarios.
   @id:dash-opens-and-navigates @requires-os:linux
   Scenario: dash-01 - A user opens the dashboard and navigates to ROCm setup
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user opens the ROCm view
     Then ROCm setup actions are displayed
+    When the user selects the ROCm diagnose action
+    Then the diagnose action says it runs rocm examine
     When the user quits the dashboard
     Then the dashboard exits successfully
 
@@ -130,7 +138,7 @@ Feature: Interactive dashboard
   # this PR generalized, so a revert of that change would not turn this red.
   # The discriminating regression test for that change is the unit test
   # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
-  # app/mod.rs, which does fail on revert.
+  # app/overlays.rs, which does fail on revert.
   @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
   Scenario: dash-11 - Escape closes a manager overlay on any tab
     When the user opens the dashboard with demo data
@@ -568,5 +576,294 @@ Feature: Interactive dashboard
     And the user opens the Observe view
     And the user grows the terminal until the GPU section shows compact rows
     Then the GPU section reports VRAM in binary units
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #693: dash-25 proves `spawn_in` threads a scenario-owned folder into the
+  # real browser, but its whitespace case lives in a CHILD entry under that
+  # folder (`ADOPT_SCENARIO_CHILD`), not in the `spawn_in` cwd itself — so it
+  # never drives #500's `quote_display_arg` fix through the real
+  # approval-preview render a user actually sees. Here the scenario's own
+  # root IS the whitespace path: `spawn_in`'s cwd has a space in its own
+  # name, onboarding's Adopt flow resolves its browser start from that exact
+  # cwd (`std::env::current_dir()` in `activate_choice`), and choosing
+  # "[ use this folder ]" stages an approval whose `--root` argument is that
+  # same whitespace path. #500 already has widget-level `TestBackend`
+  # snapshot coverage of the quoting in isolation
+  # (`approval_snapshot_quotes_args_containing_spaces` in
+  # `crates/rocm-dash-tui/tests/wave0_job_bridge.rs`); this is the missing
+  # black-box proof that the real wizard renders it quoted too.
+  @id:dash-onboarding-adopt-whitespace-cwd-quotes-approval-preview @requires-os:linux
+  Scenario: dash-36 - Adopting a folder whose own path contains a space quotes it in the approval preview
+    When the user opens the dashboard in a scenario folder whose own name has a space
+    And the user opens the Observe view
+    And the user opens onboarding setup
+    Then the onboarding welcome screen is displayed
+    When the user continues past the onboarding welcome screen
+    Then the onboarding setup choices are displayed
+    When the user chooses to adopt an existing folder
+    Then the existing-folder browser is displayed
+    When the user chooses the current folder
+    Then the approval preview quotes the whitespace-containing root path
+    When the user denies the adopt approval and closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # Exercises the hero's "no GPU telemetry" rendering (see
+  # `gpu_data_unavailable`/`node_throughput_title` in
+  # `crates/rocm-dash-tui/src/ui/tabs/home.rs`) with a *real* embedded daemon,
+  # not `--demo` (whose fixture always has 8 GPUs and can never reach this
+  # state). The runner's own hardware must not decide the outcome (a WSL host
+  # with a usable GPU skips the `/dev/kfd` pre-flight, and any host whose user
+  # can read `/dev/kfd` passes it), so the scenario runs on a simulated GPU-less
+  # host (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by the `e2e-test-hooks`
+  # build): the daemon's pre-flight and WSL reachability probe follow that
+  # empty root, `detect_with_binary` returns `None`, and every snapshot reports
+  # zero GPUs. The other half of that state machine, the transient "pending"
+  # placeholder shown before the first snapshot arrives at all, is not covered
+  # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
+  # pins it): it closes in well under a second and there's no hook to freeze the daemon
+  # mid-handshake, so asserting on it would be asserting on a race.
+  @id:dash-reports-no-gpu-telemetry @requires-os:linux
+  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard home view is displayed
+    And the hero reports no GPU telemetry available
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Diagnose screen offers the same Doctor report the CLI prepares, and the
+  # review comes first. Whether a report can be prepared is a property of the
+  # machine, not of the dashboard: hardware that is not on AMD's published list,
+  # an architecture that cannot be read, and a WSL host all get a refusal, and
+  # only an approved architecture gets a report. So this scenario does not pin
+  # which outcome this machine produces. It reads whether the CLI refused from
+  # the preview, then checks the card against that: a report is offered for
+  # sending exactly when the CLI printed one, and a refusal shows the CLI's own
+  # explanation. The card puts that outcome first. This scenario runs at the
+  # detail size that "the user opens the Observe view" selects (120x40); the
+  # cramped 80x24 case is covered by the unit test in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  #
+  # The scenario opens the send review with `s` and then declines it. It never
+  # approves, so no mail client is ever opened from a test. What the review must
+  # say before anyone can approve is checked here: the mail goes from the user's
+  # own account and carries their address, stated above the report so it is on
+  # screen with Approve. On a lane where the CLI refused, `s` opens nothing, and
+  # that is checked instead. The approve path, and the promise that no send
+  # starts before an approve, are asserted where the key sequence can be driven
+  # directly: the unit tests in `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
+  Scenario: dash-38 - A user reviews a Doctor report in the dashboard before anything is sent
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the Diagnose screen
+    And the user prepares a Doctor report
+    Then the report is displayed for review
+    When the user leaves the report review
+    Then the dashboard offers to send a report only if the CLI prepared one
+    When the user asks to review the report for sending
+    Then the review says the mail carries the user's own address before showing the report
+    When the user declines the send
+    And the user closes the Diagnose screen
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #286: the header's warning badge counted warnings but gave no way to read
+  # them, and while a GPU is reported the text is drawn nowhere else in the
+  # dashboard. A recording supplies one warning next to a working GPU so the
+  # scenario needs no daemon and no particular host hardware; the user reads
+  # the text from the badge with `!`. The click on the badge, and its refusal
+  # over an open modal, a manager overlay or focused chat input, are asserted by
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/header.rs`, where a
+  # mouse event can be sent directly. The key needs no such gate: it is only
+  # reached when nothing else owns the keyboard, which is the event loop's
+  # existing arm order and is not re-tested here.
+  @id:dash-warning-badge-opens-the-warning @requires-os:linux
+  Scenario: dash-39 - A user reads the warning behind the header badge
+    When the user opens the dashboard replaying a recording that reports a warning
+    Then the header shows that one warning is reported
+    When the user opens the warnings
+    Then the warning text is displayed
+    And the backdrop behind the popup is dimmed
+    When the user presses Escape
+    Then the warning text is no longer displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #771: the Services manager painted every row's status in the "ok" color, so
+  # a stopped or failed service looked as healthy as a running one. A recording
+  # supplies one service per lifecycle state, so the scenario needs no daemon
+  # and no GPU. The scenario compares the colors the user sees rather than
+  # naming a theme's RGB values: running, starting and stopped must all differ,
+  # and stopped and failed, which are both errors, must match. A status cell
+  # is read only from a row that also carries its model name, and every such
+  # row must agree, because the Instances tab behind the overlay can show the
+  # same words; so no layout order can hide a wrong color. The mapping from
+  # every status to its tone is covered by the unit tests in
+  # `crates/rocm-dash-tui/src/ui/theme.rs`.
+  @id:dash-services-status-colored-by-state @requires-os:linux
+  Scenario: dash-40 - The Services manager colors each service's status by its state
+    When the user opens the dashboard replaying a recording with running, starting, stopped and failed services
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    And each service's status is colored by its state
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Home "Running" tile counts a service that is still coming up and shows
+  # its stage, so a fresh serve is visible before the readiness probe passes.
+  # The seeded record is the one dash-03 uses (`starting` / `loading`).
+  @id:dash-home-lists-starting-service @requires-os:linux
+  Scenario: dash-41 - Home counts a still-loading model as running and shows its stage
+    Given a managed model is still loading
+    When the user opens the dashboard
+    Then the Home view counts the managed model as running and shows it as loading
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # ROCMAI-196: the instance detail modal's "recent throughput" panel is
+  # fed from the dashboard's snapshot history. The scripted-metrics managed
+  # model gives real scraped ticks, so this scenario asserts only a populated
+  # row. The idle and no-data placeholders and the short-terminal collapse
+  # are pinned by render tests in `ui/instance_detail.rs`.
+  @id:dash-instance-detail-recent-throughput @requires-os:linux
+  Scenario: dash-42 - Instance detail lists recent throughput samples for a serving model
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the user opens instance detail
+    Then instance details are displayed
+    And the instance detail lists recent throughput samples
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The dashboard follows the managed-service registry on a timer. A pass that
+  # cannot read the registry says nothing about the services in it, so it must
+  # not retire the model that is on screen: the header warns that the registry
+  # is not being read, and the model stays. The registry is made unreadable by
+  # adding one record that cannot be opened (a link to itself), in a single step
+  # that leaves the model's own record in place, so no poll of the registry can
+  # see it empty or absent, and no permission setup of the runner (running as
+  # root) can make it readable. A registry that reads but is empty does retire
+  # a service; that contrast, the recovery path and the once-per-streak log
+  # line are asserted by the daemon's own tests in
+  # `crates/rocm-dash-daemon/tests/`, where the loop runs without a terminal.
+  @id:dash-managed-model-survives-unreadable-registry @requires-os:linux
+  Scenario: dash-43 - A managed model stays on screen while its registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    Then the header warns that the registry is not being read
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The same registry failure, from the other side: a service whose record can be
+  # read is still added while some other record cannot be opened. The dashboard
+  # reads what it can and retires nothing, so a model that is started beside a
+  # stale unreadable record appears on screen (and the first model stays). The
+  # daemon's own tests in `crates/rocm-dash-daemon/tests/` assert the rest of the
+  # matrix: a record removed during the failure is not retired until the registry
+  # reads in full, and a record that becomes unreadable is not announced again
+  # when it reads again.
+  @id:dash-new-model-appears-beside-unreadable-record @requires-os:linux
+  Scenario: dash-44 - A newly served model appears while another record in the registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    And another managed model is served
+    Then the other managed model is displayed
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+
+  @id:dash-serve-wizard-opens-collapsed @requires-os:linux
+  Scenario: dash-45 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    Then the serve wizard shows only the model, Advanced settings, and Launch
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
+  Scenario: dash-46 - Escape cancels an in-progress host edit without closing the serve wizard
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user expands the serve wizard's Advanced settings
+    And the user starts editing the serve wizard's Host field
+    And the user types "nope" into the serve wizard
+    And the user presses Escape
+    Then the serve wizard is still open with the host unchanged
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
+  Scenario: dash-47 - An automatic serve form stages a bare serve command with an automatic port
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 2 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard asks to approve "serve demo-model" with an automatic port
+    When the user presses Escape
+    Then the serve wizard approval closes and the wizard stays open
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
+  Scenario: dash-48 - A custom host with an automatic port is refused in the form
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "localhost" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "set Port to Custom"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-public-host @requires-os:linux
+  Scenario: dash-49 - A public host is refused in the form with the CLI pointer
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "0.0.0.0" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "Dash serves on loopback only"
+    When the user presses Escape
+    Then the serve wizard is closed
     When the user quits the dashboard
     Then the dashboard exits successfully

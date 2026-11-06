@@ -14,6 +14,7 @@
 //! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
 
 use ratatui::style::{Color, Modifier, Style};
+use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::state::JobStatus;
 
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +257,28 @@ impl Theme {
     /// `dock::logs_dock` and `log_body_tone`'s doc comment.
     pub const fn job_status_color(&self, status: &JobStatus) -> Color {
         self.tone_color(job_status_tone(status))
+    }
+
+    /// Color for an [`InstanceStatus`], via [`Self::tone_color`]. The single
+    /// source of truth for instance/service-status color shared by the
+    /// Instances tab, the instance detail card and the Services manager — a
+    /// stopped or failed service must not read the same as a running one.
+    pub const fn instance_status_color(&self, status: InstanceStatus) -> Color {
+        self.tone_color(instance_status_tone(status))
+    }
+}
+
+/// Tone for an [`InstanceStatus`], behind [`Theme::instance_status_color`].
+/// `Starting` is the warning tone because it is a background in-progress state
+/// the user is not necessarily watching (see `docs/ux-guidelines.md`), unlike a
+/// foreground running job, which is accent. Exhaustive, so a new variant forces
+/// a decision here instead of silently defaulting to a color.
+pub(crate) const fn instance_status_tone(status: InstanceStatus) -> StatusTone {
+    match status {
+        InstanceStatus::Ready | InstanceStatus::Running => StatusTone::Success,
+        InstanceStatus::Starting { .. } => StatusTone::Warning,
+        InstanceStatus::Stopped | InstanceStatus::Error => StatusTone::Error,
+        InstanceStatus::Unknown => StatusTone::Muted,
     }
 }
 
@@ -771,5 +794,42 @@ mod tests {
         }
         assert_eq!(log_body_tone(&JobStatus::Running), StatusTone::Neutral);
         assert_ne!(job_status_tone(&JobStatus::Running), StatusTone::Neutral);
+    }
+
+    #[test]
+    fn instance_status_tone_covers_all_variants() {
+        use rocm_dash_core::metrics::StartupPhase;
+        let cases = [
+            (InstanceStatus::Ready, StatusTone::Success),
+            (InstanceStatus::Running, StatusTone::Success),
+            (
+                InstanceStatus::Starting { phase: None },
+                StatusTone::Warning,
+            ),
+            (
+                InstanceStatus::Starting {
+                    phase: Some(StartupPhase::Loading),
+                },
+                StatusTone::Warning,
+            ),
+            (InstanceStatus::Stopped, StatusTone::Error),
+            (InstanceStatus::Error, StatusTone::Error),
+            (InstanceStatus::Unknown, StatusTone::Muted),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(instance_status_tone(status), expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn instance_status_color_distinguishes_healthy_from_failed() {
+        let t = Theme::default_dark();
+        assert_eq!(t.instance_status_color(InstanceStatus::Running), t.ok);
+        assert_eq!(t.instance_status_color(InstanceStatus::Stopped), t.err);
+        assert_ne!(
+            t.instance_status_color(InstanceStatus::Stopped),
+            t.instance_status_color(InstanceStatus::Running),
+            "a stopped service must not render in the running color"
+        );
     }
 }

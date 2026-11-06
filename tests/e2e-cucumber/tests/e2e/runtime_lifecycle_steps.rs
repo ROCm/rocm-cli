@@ -273,9 +273,19 @@ fn active_runtime_key(world: &E2eWorld) -> String {
 
 /// Path to an importable manifest file (not yet in the registry) for the import
 /// scenario, with its install_root created so the import validates.
+/// The folder the manifest to import points at: a runtime somebody else owns.
+fn import_install_root(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("runtime-import")
+}
+
 fn write_import_manifest(world: &E2eWorld) -> PathBuf {
     let root = world.isolated_root.as_ref().expect("no isolated root");
-    let install_root = root.path().join("runtime-import");
+    let install_root = import_install_root(world);
     std::fs::create_dir_all(&install_root).expect("failed to create import install root");
     std::fs::write(install_root.join("payload.txt"), "payload")
         .expect("failed to write import payload");
@@ -740,6 +750,27 @@ async fn imported_readonly(world: &mut E2eWorld) {
     );
 }
 
+/// What an import creates on disk: the registry entry, and nothing in the
+/// folder it points at. The manifest ROCm CLI keeps in an install root is its
+/// proof that it owns the folder, and an imported runtime is somebody else's.
+/// Unit tests cover the same file set for adopt and setup recovery, which no
+/// scenario reaches without a Python environment to probe.
+#[then("the registry records the import and its folder gains no manifest file")]
+async fn import_writes_registry_entry_only(world: &mut E2eWorld) {
+    let entry = registry_dir(world).join(format!("{IMPORT_KEY}.json"));
+    assert!(
+        entry.is_file(),
+        "expected a registry entry at {}",
+        entry.display()
+    );
+    let sidecar = import_install_root(world).join(".rocm-cli-runtime.json");
+    assert!(
+        !sidecar.exists(),
+        "an import must not write into the folder it registers: {}",
+        sidecar.display()
+    );
+}
+
 #[then("the CLI refuses because it already exists")]
 async fn import_duplicate_refused(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
@@ -844,7 +875,13 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
 #[then("the CLI refuses and requires --yes")]
 async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
-    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    // `rocm runtimes uninstall --help` promises exit 1 for this refusal.
+    assert_eq!(
+        rc,
+        1,
+        "expected a refusal with exit 1:\n{}",
+        combined(world)
+    );
     assert!(
         combined(world).contains("requires --yes"),
         "expected a --yes-required error, got:\n{}",

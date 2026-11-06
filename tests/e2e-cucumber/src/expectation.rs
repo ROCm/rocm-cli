@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::capability::HostCapability;
+use crate::capability::{HostCapability, docker_available};
 
 /// Tag prefixes in their normalized bare form. cucumber-rs currently supplies
 /// scenario tags with a leading `@`; [`ScenarioDecl::from_tags`] accepts either
@@ -31,7 +31,9 @@ const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_OOM_FAULT_INJECTION_TAG: &str = "requires-oom-fault-injection";
 const REQUIRES_CASE_SENSITIVE_FS_TAG: &str = "requires-case-sensitive-fs";
+const REQUIRES_DIR_PERMISSIONS_TAG: &str = "requires-dir-permissions";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -59,24 +61,6 @@ pub enum Expectation {
     },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
-}
-
-/// Whether a container runtime is usable here.
-///
-/// Probed rather than assumed: a developer machine may have the client without
-/// a running daemon.
-///
-/// Necessary but not sufficient — see the `requires_docker` gate, which also
-/// wants an explicit opt-in. A daemon answering does not mean the fixture image
-/// can be built: a self-hosted runner behind a restricted network has both a
-/// working daemon and no route to the package mirror the image installs from.
-fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Facts extracted from a scenario's tags.
@@ -130,6 +114,16 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
+    /// `@requires-oom-fault-injection`: the scenario drives the test-only
+    /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+    /// to fabricate a GPU-less OOM launch, so it can only run against a binary
+    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
+    /// test a prebuilt shipping release binary that has the hook compiled out —
+    /// there the real GPU-required serve pre-flight would run instead. Skipped
+    /// when [`HostCapability::oom_fault_injection`] is false so those lanes do
+    /// not report the missing hook as a regression.
+    pub requires_oom_fault_injection: bool,
     /// `@requires-case-sensitive-fs`: the scenario's premise is two files whose
     /// names differ only in letter case (e.g. two runtime registry entries), so
     /// it is skipped where the scenarios' temp root folds case and the second
@@ -140,6 +134,15 @@ pub struct ScenarioDecl {
     /// directory or a mounted Windows drive. The answer comes from the capability
     /// probe's `case_sensitive_fs`, measured on that same temp root.
     pub requires_case_sensitive_fs: bool,
+    /// `@requires-dir-permissions`: the scenario's premise is a directory that
+    /// refuses new files once its write bits are cleared, so it is skipped for a
+    /// user those bits do not bind — root, which is what the self-hosted WSL2
+    /// guest runs the suite as.
+    ///
+    /// `@requires-os:linux` cannot express this: root on Linux is still
+    /// `linux`. The answer comes from the capability probe's
+    /// `dir_permissions_bind`, measured under the same temp root.
+    pub requires_dir_permissions: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -187,7 +190,9 @@ impl ScenarioDecl {
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
+        let mut requires_oom_fault_injection = false;
         let mut requires_case_sensitive_fs = false;
+        let mut requires_dir_permissions = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -221,8 +226,12 @@ impl ScenarioDecl {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_OOM_FAULT_INJECTION_TAG {
+                requires_oom_fault_injection = true;
             } else if tag == REQUIRES_CASE_SENSITIVE_FS_TAG {
                 requires_case_sensitive_fs = true;
+            } else if tag == REQUIRES_DIR_PERMISSIONS_TAG {
+                requires_dir_permissions = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -239,7 +248,9 @@ impl ScenarioDecl {
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
+            requires_oom_fault_injection,
             requires_case_sensitive_fs,
+            requires_dir_permissions,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -362,6 +373,18 @@ impl Expectations {
             .filter(|e| e.when.matches(cap, effective_engine))
             .filter_map(|e| e.serve_timeout_secs)
             .min()
+    }
+
+    /// The serve-readiness window a scenario runs with on this host, as the
+    /// harness's `before` hook hands it to the serve steps
+    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): a
+    /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
+    /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
+    /// no `@id:` tag or with neither, which keeps the step default.
+    pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
+        let id = decl.id.as_deref()?;
+        decl.serve_timeout_secs
+            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
     }
 
     /// Whether any declared condition for this scenario matches this host — the
@@ -579,6 +602,13 @@ pub fn resolve(
             reason: "requires WSL; this host is not running under WSL".to_owned(),
         };
     }
+    if decl.requires_oom_fault_injection && !cap.oom_fault_injection {
+        return Expectation::Skip {
+            reason: "requires the e2e-oom-fault-injection build; this binary has \
+                     the hook compiled out"
+                .to_owned(),
+        };
+    }
     // Checked before the filesystem premise: on native Windows both fail, and
     // the OS is the coarser, more useful reason to report.
     if let Some(os) = &decl.requires_os
@@ -592,6 +622,13 @@ pub fn resolve(
         return Expectation::Skip {
             reason: "requires a case-sensitive filesystem; the temp root ($TMPDIR) here folds \
                      letter case"
+                .to_owned(),
+        };
+    }
+    if decl.requires_dir_permissions && !cap.dir_permissions_bind {
+        return Expectation::Skip {
+            reason: "requires directory permissions that bind the user running the suite; a \
+                     read-only directory still takes new files here (root?)"
                 .to_owned(),
         };
     }
@@ -623,6 +660,34 @@ pub fn resolve(
 
     // (3) default.
     Expectation::ExpectPass
+}
+
+/// Whether a scenario runs in an `E2E_ONLY_LIFECYCLE=1` lane.
+///
+/// True for a scenario that is itself `@lifecycle`, or whose `@id` is one of
+/// `extra_ids` — scenarios a caller has explicitly opted into this lane
+/// without tagging them `@lifecycle` (which would also pull them out of
+/// `nightly.yml` and `e2e-selfhosted.yml`, neither of which restricts to the
+/// lifecycle set).
+pub fn lifecycle_lane_includes(decl: &ScenarioDecl, extra_ids: &[String]) -> bool {
+    decl.lifecycle
+        || decl
+            .id
+            .as_deref()
+            .is_some_and(|id| extra_ids.iter().any(|e| e == id))
+}
+
+/// `extra_ids` entries that match no scenario's `@id` in `known_ids`.
+///
+/// `lifecycle_lane_includes` folds an unmatched id in silently — a renamed or
+/// typo'd `@id:` tag would otherwise drop a scenario out of the lane with CI
+/// staying green. The caller should treat a non-empty result as fatal.
+pub fn unmatched_also_run_ids<'a>(extra_ids: &'a [String], known_ids: &[String]) -> Vec<&'a str> {
+    extra_ids
+        .iter()
+        .filter(|id| !known_ids.contains(*id))
+        .map(String::as_str)
+        .collect()
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -674,7 +739,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -685,7 +752,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -696,7 +765,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: false,
+                dir_permissions_bind: true,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -716,7 +787,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -730,7 +803,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -743,7 +818,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -754,7 +831,9 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
+                oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
         }
     }
@@ -945,6 +1024,138 @@ serve_timeout_secs = 90
             ),
             Expectation::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_lifecycle_scenarios_regardless_of_extra_ids() {
+        let d = decl(&["id:lifecycle-linux-install", "lifecycle"]);
+        assert!(lifecycle_lane_includes(&d, &[]));
+        assert!(lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_a_non_lifecycle_scenario_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!d.lifecycle);
+        assert!(lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_non_lifecycle_scenario_not_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
+        assert!(!lifecycle_lane_includes(&d, &[]));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_scenario_with_no_id_even_with_extra_ids_set() {
+        let d = decl(&[]);
+        assert!(d.id.is_none());
+        assert!(!lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_every_extra_id_matches_a_known_id() {
+        let known = vec!["comfyui-01".to_owned(), "comfyui-02".to_owned()];
+        let extra = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&extra, &known).is_empty());
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_names_an_extra_id_no_scenario_carries() {
+        let known = vec!["comfyui-01".to_owned()];
+        let extra = vec!["comfyui-01".to_owned(), "comfyui-02-renamed".to_owned()];
+        assert_eq!(
+            unmatched_also_run_ids(&extra, &known),
+            vec!["comfyui-02-renamed"]
+        );
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_extra_ids_is_empty() {
+        let known = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&[], &known).is_empty());
+    }
+
+    /// The tag line directly above `Scenario: <prefix>` in `model_serving.feature`.
+    fn model_serving_tags(prefix: &str) -> Vec<String> {
+        let feature = include_str!("../features/model_serving.feature");
+        let lines: Vec<&str> = feature.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&format!("Scenario: {prefix}")))
+            .unwrap_or_else(|| panic!("no `Scenario: {prefix}` in model_serving.feature"));
+        lines[at - 1]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
+        // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
+        // may each wait out a 1200s readiness cap. Run per-PR on the Strix Ubuntu
+        // pool they pushed the job (~25 min otherwise) into its 45 min cap on every
+        // run. They must resolve to Skip unless the nightly opt-in is set, and must
+        // still be reachable (not Skip for the nightly reason) when it is.
+        let m = Expectations::default();
+        for prefix in ["serve-26 -", "serve-27 -"] {
+            let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
+            assert_eq!(d.requires_engine.as_deref(), Some("aim"), "{prefix}");
+            assert!(d.nightly, "{prefix} must be @nightly");
+            match resolve(&d, &cap("strix-ubuntu"), &m, Included::default()) {
+                Expectation::Skip { reason } => {
+                    assert!(reason.contains("E2E_INCLUDE_NIGHTLY"), "{prefix}: {reason}");
+                }
+                other => panic!("{prefix} must skip per-PR, got {other:?}"),
+            }
+            // Opted in: the nightly gate must not fire. What remains is the engine
+            // requirement, which `engine_available("aim")` decides from the host's
+            // engine list, its GFX family and whether Docker answers. Pin both
+            // sides of it: a host that lists aim runs the scenario exactly when
+            // Docker is reachable, and one that does not list aim skips on the
+            // engine, never on the nightly opt-in.
+            let opted_in = Included {
+                nightly: true,
+                ..Included::default()
+            };
+            let mut with_aim = cap("strix-ubuntu");
+            with_aim.available_engines.push("aim".to_owned());
+            match resolve(&d, &with_aim, &m, opted_in) {
+                Expectation::ExpectPass => assert!(
+                    docker_available(),
+                    "{prefix} ran although Docker is unreachable"
+                ),
+                Expectation::Skip { reason } => {
+                    assert!(
+                        !docker_available(),
+                        "{prefix} skipped with the opt-in set, aim listed and Docker                          reachable: {reason}"
+                    );
+                    assert!(
+                        reason.contains("engine 'aim' cannot start"),
+                        "{prefix}: wrong skip reason with the opt-in set: {reason}"
+                    );
+                }
+                other @ Expectation::ExpectXfail { .. } => {
+                    panic!("{prefix}: unexpected outcome when opted in: {other:?}")
+                }
+            }
+            match resolve(&d, &cap("strix-ubuntu"), &m, opted_in) {
+                Expectation::Skip { reason } => assert!(
+                    reason.contains("engine 'aim' cannot start"),
+                    "{prefix}: {reason}"
+                ),
+                other => {
+                    panic!("{prefix}: host without aim must skip on the engine, got {other:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -1434,6 +1645,56 @@ serve_timeout_secs = 90
         }
     }
 
+    /// The fault-injection gate keys on the *binary's* build, not the host, so
+    /// the same mock lane runs it or skips it depending only on whether the hook
+    /// was compiled in. Proving both directions keeps a feature-less prebuilt
+    /// binary (the self-hosted lanes) from reporting the missing hook as a bug.
+    #[test]
+    fn requires_oom_fault_injection_runs_only_when_the_hook_is_built_in() {
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:serve-oom-launch-memory-guidance",
+            "requires-oom-fault-injection",
+        ]);
+        assert!(d.requires_oom_fault_injection);
+
+        // Binary built without the feature (default fixtures) — skip.
+        let without_hook = cap("mock");
+        assert!(!without_hook.oom_fault_injection);
+        assert!(matches!(
+            resolve(
+                &d,
+                &without_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
+            Expectation::Skip { .. }
+        ));
+
+        // Same host, but the binary carries the hook — run.
+        let mut with_hook = cap("mock");
+        with_hook.oom_fault_injection = true;
+        assert_eq!(
+            resolve(
+                &d,
+                &with_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
+            Expectation::ExpectPass
+        );
+    }
+
     #[test]
     fn case_sensitive_fs_tag_parses_in_both_shapes() {
         assert!(decl(&["id:x", "requires-case-sensitive-fs"]).requires_case_sensitive_fs);
@@ -1462,6 +1723,7 @@ serve_timeout_secs = 90
         // so `@requires-os:linux` alone would have let the scenario run.
         let folded = HostCapability {
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
             ..cap("wsl2")
         };
         let both = decl(&[
@@ -1487,6 +1749,50 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn dir_permissions_tag_parses_in_both_shapes() {
+        assert!(decl(&["id:x", "requires-dir-permissions"]).requires_dir_permissions);
+        assert!(decl(&["@id:x", "@requires-dir-permissions"]).requires_dir_permissions);
+        // Absent by default, so no existing scenario changes meaning.
+        assert!(!decl(&["id:x", "requires-os:linux"]).requires_dir_permissions);
+    }
+
+    #[test]
+    fn requires_dir_permissions_skips_for_a_user_the_permission_bits_do_not_bind() {
+        let m = Expectations::default();
+        let none = Included::default();
+        let d = decl(&[
+            "id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced",
+            "requires-os:linux",
+            "requires-dir-permissions",
+        ]);
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, none),
+            Expectation::ExpectPass,
+            "an ordinary user's read-only directory refuses new files, so the scenario runs"
+        );
+        // The case the gate exists for: the WSL2 guest runs the suite as root,
+        // so `os_family` is `linux` and `@requires-os:linux` alone would let the
+        // scenario run and pass without testing anything.
+        let as_root = HostCapability {
+            dir_permissions_bind: false,
+            ..cap("wsl2")
+        };
+        match resolve(&d, &as_root, &m, none) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("directory permissions"),
+                "the skip must name the missing premise: {reason}"
+            ),
+            other => panic!("a user the permission bits do not bind must skip, got {other:?}"),
+        }
+        // Without the tag the same host still runs it: the probe answer only
+        // matters to scenarios that declare the premise.
+        assert_eq!(
+            resolve(&decl(&["id:x", "requires-os:linux"]), &as_root, &m, none),
+            Expectation::ExpectPass
+        );
+    }
+
+    #[test]
     fn os_reason_wins_over_case_folding_reason_on_a_non_matching_os() {
         // Native Windows fails both premises of the case-twin scenario; the grid
         // must report the OS, the coarser reason, rather than the filesystem.
@@ -1498,6 +1804,38 @@ serve_timeout_secs = 90
         ]);
         let host = cap("strix-windows");
         assert!(!host.case_sensitive_fs, "fixture must fail both premises");
+        match resolve(&d, &host, &m, Included::default()) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("requires os 'linux'"),
+                "the OS reason must win: {reason}"
+            ),
+            other => panic!("native Windows must skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn os_reason_wins_over_dir_permissions_reason_on_a_non_matching_os() {
+        // The same ordering as the case-folding twin above, for the tag the
+        // torn-audit-tail scenario carries next to `@requires-os:linux`.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced",
+            "requires-os:linux",
+            "requires-dir-permissions",
+        ]);
+        assert!(
+            d.requires_dir_permissions && d.requires_os.is_some(),
+            "both premise tags must parse, or the ordering below proves nothing"
+        );
+        let host = HostCapability {
+            dir_permissions_bind: false,
+            ..cap("strix-windows")
+        };
+        assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
+        assert!(
+            !host.dir_permissions_bind,
+            "fixture must fail both premises"
+        );
         match resolve(&d, &host, &m, Included::default()) {
             Expectation::Skip { reason } => assert!(
                 reason.contains("requires os 'linux'"),
@@ -1526,6 +1864,7 @@ reason = "unrelated open bug"
         ]);
         let folded = HostCapability {
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
             ..cap("strix-ubuntu")
         };
         assert!(matches!(
@@ -1884,15 +2223,21 @@ flaky = true
         ));
     }
 
+    /// EAI-7998's row (`examine --json` reporting `has_amd_gpu: false` on a WSL2
+    /// host whose own summary names a gfx target) is resolved by taking the
+    /// field from that same target on WSL, not by this test, which only guards
+    /// against a silent regression. A WSL host with a reported target and one
+    /// without both go through the scenario now, so re-adding the row has to be
+    /// a deliberate decision.
     #[test]
-    fn gpu_report_disagreement_xfail_requires_a_reported_gfx_target() {
+    fn gpu_report_agreement_has_no_xfail_on_wsl() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        assert!(m.is_xfail(
-            "examine-both-forms-agree-on-gpu",
-            &cap("wsl-no-passthrough"),
-            "lemonade"
-        ));
-        assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
+        for host in ["wsl-no-passthrough", "wsl"] {
+            assert!(
+                !m.is_xfail("examine-both-forms-agree-on-gpu", &cap(host), "lemonade"),
+                "examine-08 must run, not xfail, on the {host} host"
+            );
+        }
     }
 
     /// EAI-8031's row (Windows lane cold-downloading its HF checkpoint every
@@ -1910,6 +2255,71 @@ flaky = true
             &cap("strix-windows"),
             "lemonade"
         ));
+    }
+
+    /// serve-40 serves through the same lemonade managed serve as the other
+    /// lemonade serve rows, so its row is scoped the same way: xfail on a
+    /// lemonade Linux host, with a 90s serve wait, and not an expected failure
+    /// on native Windows. The row must stay `flaky` (a fixed #897 would
+    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name #897.
+    #[test]
+    fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let id = "serve-stop-leaves-no-background-helper";
+        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
+        assert_eq!(
+            m.serve_timeout_for(id, &cap("strix-ubuntu"), "lemonade"),
+            Some(90)
+        );
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
+        let entries = m.entries_for(id);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].flaky);
+        assert_eq!(entries[0].bug, "#897");
+    }
+
+    /// The row's 90s only matters if the harness hands it to the serve steps:
+    /// the `before` hook stores `serve_timeout_override(decl, cap)` on the world
+    /// and `serve_and_wait` waits that long instead of the 300s/600s default.
+    /// Resolve it from serve-40's REAL tag line, so dropping the `@id:` or the
+    /// `@requires-engine:lemonade` pin from the feature file fails here rather
+    /// than silently restoring the full wait. The pin also decides the engine on
+    /// a host whose default is another engine (MI300X serves vLLM by default).
+    #[test]
+    fn serve_40_gets_the_shortened_serve_window_from_its_own_tags() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let tags = feature_tags(
+            include_str!("../features/model_serving.feature"),
+            "serve-stop-leaves-no-background-helper",
+        );
+        let decl = ScenarioDecl::from_tags(&tags);
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
+            Some(90)
+        );
+        assert_eq!(m.serve_timeout_override(&decl, &cap("mi300x")), Some(90));
+        assert_eq!(m.serve_timeout_override(&decl, &cap("strix-windows")), None);
+    }
+
+    #[test]
+    fn serve_timeout_override_prefers_the_tag_and_needs_an_id() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        // The row says 90s on this host; a `@serve-timeout` tag lengthens it.
+        let tagged = decl(&[
+            "id:serve-stop-leaves-no-background-helper",
+            "requires-engine:lemonade",
+            "serve-timeout:2400",
+        ]);
+        assert_eq!(
+            m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            Some(2400)
+        );
+        // No `@id:` tag, nothing to look up: the step default stays.
+        let anonymous = decl(&["requires-engine:lemonade"]);
+        assert_eq!(
+            m.serve_timeout_override(&anonymous, &cap("strix-ubuntu")),
+            None
+        );
     }
 
     #[test]

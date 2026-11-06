@@ -30,7 +30,7 @@ pub const VERBS: &[Verb] = &[
             "Pick an install folder (prefix)",
             "Dry-run to preview, then apply",
         ],
-        cmd: "rocm install --channel … --format …",
+        cmd: "rocm install sdk --channel … --format …",
         read_only: false,
         badge: None,
     },
@@ -44,7 +44,7 @@ pub const VERBS: &[Verb] = &[
             "Preview the update (dry-run)",
             "Apply the update and activate it",
         ],
-        cmd: "rocm update --check",
+        cmd: "rocm update",
         read_only: false,
         badge: None,
     },
@@ -52,14 +52,16 @@ pub const VERBS: &[Verb] = &[
         icon: "⚕",
         label: "Diagnose & fix  (doctor)",
         action: KeyAction::OpenExamine,
-        summary: "Read-only environment check that flags what needs fixing.",
+        summary: "Checks the environment and can prepare a Doctor report.",
         steps: &[
-            "Run `rocm doctor` (one job, no approval)",
+            "Run the check (no approval)",
             "Review runtime / driver / permission checks",
             "Re-run after fixes with r",
+            "Prepare a Doctor report (p): shown first, sent only on approval",
         ],
-        cmd: "rocm doctor",
-        read_only: true,
+        cmd: "rocm examine",
+        // The report can be sent, behind an approval, so this verb is not read-only.
+        read_only: false,
         badge: None,
     },
     Verb {
@@ -187,6 +189,63 @@ mod tests {
         );
     }
 
+    fn runs_label(action: KeyAction) -> &'static str {
+        VERBS
+            .iter()
+            .find(|verb| verb.action == action)
+            .unwrap_or_else(|| panic!("no ROCm verb opens {action:?}"))
+            .cmd
+    }
+
+    /// The detail pane prints `Runs: <cmd>`. A label that parses is not a
+    /// label that is true: each must name the subcommand its manager
+    /// actually spawns, and its value flags. Values the user picks in a form
+    /// show as `…`, and mode switches such as `--dry-run` are left out, so
+    /// the Install label is not a command to copy as written.
+    #[test]
+    fn rocm_runs_labels_name_what_each_manager_spawns() {
+        use crate::ui::examine_manager::EXAMINE_ARGS;
+        use crate::ui::install_manager::InstallManagerState;
+        use crate::ui::update_manager::UpdateAction;
+
+        assert_eq!(
+            runs_label(KeyAction::OpenUpdate),
+            format!("rocm {}", UpdateAction::Check.args().join(" ")),
+            "the Update row's label must be the command its first action runs"
+        );
+        assert_eq!(
+            runs_label(KeyAction::OpenExamine),
+            format!("rocm {}", EXAMINE_ARGS.join(" ")),
+            "the doctor row's label must be the command the examine screen runs"
+        );
+
+        // Install takes user-chosen values, so its label shows `…` for them.
+        // Derive the label from the default form's argv: the subcommand, then
+        // each value flag with its value elided. Mode switches (`--dry-run`,
+        // or the approval flag a real install adds) depend on what the user
+        // picks in the form, so the label leaves them out.
+        let install = runs_label(KeyAction::OpenInstall);
+        let args = InstallManagerState::default()
+            .build_args()
+            .expect("the default install form builds an argv");
+        let mut expected = vec!["rocm".to_owned()];
+        let mut words = args.iter().peekable();
+        while let Some(word) = words.next() {
+            if !word.starts_with("--") {
+                expected.push(word.clone());
+            } else if words.peek().is_some_and(|next| !next.starts_with("--")) {
+                words.next();
+                expected.push(word.clone());
+                expected.push("…".to_owned());
+            }
+        }
+        assert_eq!(
+            install,
+            expected.join(" "),
+            "the Install row's label must name what the form runs, values elided"
+        );
+    }
+
     #[test]
     fn rocm_verb_action_maps_selection_to_seam() {
         assert_eq!(verb_action(0), KeyAction::OpenInstall);
@@ -195,6 +254,30 @@ mod tests {
         assert_eq!(verb_action(5), KeyAction::Nothing);
         // Out-of-range is a safe no-op.
         assert_eq!(verb_action(99), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn the_diagnose_verb_is_not_read_only_because_it_can_send_a_report() {
+        let diagnose = VERBS
+            .iter()
+            .find(|v| v.action == KeyAction::OpenExamine)
+            .expect("the Diagnose verb");
+        assert!(!diagnose.read_only, "the Doctor report can be sent");
+        assert!(
+            !diagnose.summary.starts_with("Read-only"),
+            "the summary must agree with the flag: {}",
+            diagnose.summary
+        );
+        // The pane prints its footer from the flag, so check what is drawn too.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.rocm_sel = 2;
+        let out = render(&s, 120, 40);
+        assert!(
+            out.contains("Mutating actions ask before they run"),
+            "{out}"
+        );
+        assert!(!out.contains("Read-only — nothing is changed"), "{out}");
     }
 
     #[test]

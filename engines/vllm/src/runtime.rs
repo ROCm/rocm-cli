@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::discover_builds::vllm_rocm_discover_build;
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
@@ -23,9 +24,34 @@ pub(crate) struct VllmRuntime {
     pub(crate) sdk_bin_paths: Vec<PathBuf>,
     pub(crate) sdk_library_paths: Vec<PathBuf>,
     /// ROCm SDK version recorded in the runtime manifest, if known. Drives
-    /// [`crate::install::vllm_install_route`] and
+    /// [`crate::wheel_builds::vllm_install_route`] and
     /// [`crate::process::apply_therock_env`]'s ROCm 10.x discovery dispatch.
     pub(crate) rocm_sdk_version: Option<String>,
+}
+
+#[cfg(test)]
+impl VllmRuntime {
+    /// The one place tests outside this struct's own definition get a runtime
+    /// from: a managed TheRock runtime with every optional part empty. A test
+    /// overrides only the fields it is about, with struct-update syntax
+    /// (`VllmRuntime { sdk_root: Some(root), ..VllmRuntime::for_test() }`), so a
+    /// field added to the struct is defaulted here once instead of breaking
+    /// every test module that builds one.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -95,57 +121,20 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
-/// The ROCm SDK 10.0 release line, as it appears in both
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
-pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
-/// The ROCm SDK 10.1 release line, as it appears in both
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
-pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
-
-/// ROCm SDK versions keyed by a row in `install.rs`'s discover-build table
-/// (see [`crate::install::vllm_rocm_discover_build`] for the recipe each one
-/// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
-/// here, in the lower layer, as the single source for which versions count —
-/// `install.rs`'s table literally uses these constants for its
-/// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
-/// matches against the same two strings. This list and that table are still
-/// two separate pieces of data, kept in agreement only by
-/// `install.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
-/// test, not by construction — a new table row needs a matching entry here,
-/// and that test is what catches it if one is missed.
-pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
-
-/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
-/// ignoring patch and any dev/pre-release suffix. See
-/// [`crate::install::vllm_rocm_discover_build`] for why the line, not the
-/// exact release, is what a discover row covers. Lives here, not in
-/// `install.rs`, alongside [`ROCM_DISCOVER_BUILD_VERSIONS`] so
-/// [`runtime_has_discover_build`] can match without calling into `install`.
-pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
-    fn series(version: &str) -> Option<(u64, u64)> {
-        let mut parts = version.trim().split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor: String = parts
-            .next()?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        Some((major, minor.parse().ok()?))
-    }
-    series(recorded).is_some_and(|version| Some(version) == series(table_key))
-}
-
 /// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
-/// recipe. Exposed as runtime metadata, matched directly against
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `install` — the vLLM
-/// launch path in `process.rs`, specifically — don't need to reach into
-/// `install`'s build-selection table for a plain yes/no check.
+/// recipe: the same row lookup install routing uses
+/// ([`vllm_rocm_discover_build`], over the one discover-build table in
+/// `discover_builds.rs`), so a version is a discover build for launch-time
+/// environment setup exactly when it is one for install routing. There is no
+/// separate list of versions to keep in step with that table. Exposed as
+/// runtime metadata so callers outside `wheel_builds` — the vLLM launch path
+/// in `process.rs`, specifically — don't need to reach into its
+/// build-selection code for a plain yes/no check.
 pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
-    runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
-        ROCM_DISCOVER_BUILD_VERSIONS
-            .iter()
-            .any(|key| rocm_sdk_series_matches(version, key))
-    })
+    runtime
+        .rocm_sdk_version
+        .as_deref()
+        .is_some_and(|version| vllm_rocm_discover_build(version).is_some())
 }
 
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
@@ -313,12 +302,21 @@ struct ManagedRuntimeCandidate {
 fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntimeManifest>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
+    load_runtime_manifests_in(&registry, runtime_id)
+}
+
+/// The registry manifests in `registry` matching `runtime_id`, in
+/// [`sort_manifests_newest_install_first`]'s order.
+fn load_runtime_manifests_in(
+    registry: &Path,
+    runtime_id: Option<&str>,
+) -> Result<Vec<TheRockRuntimeManifest>> {
     if !registry.is_dir() {
         return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
-        fs::read_dir(&registry).with_context(|| format!("failed to read {}", registry.display()))?
+        fs::read_dir(registry).with_context(|| format!("failed to read {}", registry.display()))?
     {
         let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -332,13 +330,31 @@ fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntime
         if !runtime_matches(&manifest, runtime_id) {
             continue;
         }
-        manifests.push((manifest.installed_at_unix_ms.unwrap_or(0), manifest));
+        manifests.push((path, manifest));
     }
-    manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
+    sort_manifests_newest_install_first(&mut manifests);
     Ok(manifests
         .into_iter()
         .map(|(_, manifest)| manifest)
         .collect())
+}
+
+/// Order newest install first, breaking ties on the runtime key and then on the
+/// manifest's own file path, so the result is a function of registry contents
+/// only rather than of whatever order `read_dir` happened to return — a
+/// `--devel` install and its plain sibling land in the same millisecond. A
+/// manifest without `installed_at_unix_ms` (written before the field existed)
+/// reads as installed at 0. This matches the tiebreak the CLI's own registry
+/// order uses.
+fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntimeManifest)]) {
+    manifests.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -830,21 +846,14 @@ mod tests {
     #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let mut runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from(if cfg!(windows) {
                 r"C:\venv\Scripts\vllm.exe"
             } else {
                 "/home/user/.venv/bin/vllm"
             }),
-            python_executable: None,
             version: Some("test".to_owned()),
             source: "managed_runtime_manifest:vllm-source-pip-gfx120x-all".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         assert!(runtime_is_managed(&runtime));
@@ -870,18 +879,13 @@ mod tests {
         // assessed environment or it fixes an interpreter nobody found broken.
         let assessed = VllmRuntime {
             runtime_id: "nightly-wheel-gfx94x-dcgpu-7-14-0a20260611".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
             python_executable: Some(PathBuf::from(
                 "/rocm/runtimes/wheel/nightly-gfx94x/bin/python",
             )),
             version: Some("0.26.0".to_owned()),
             source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         let target = assessed_python_for_repair(&assessed).expect("a managed runtime has a python");
@@ -968,16 +972,10 @@ mod tests {
     fn runtime_with_sdk_version(version: Option<&str>) -> VllmRuntime {
         VllmRuntime {
             runtime_id: "nightly-wheel-gfx94x-dcgpu".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
             command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
-            python_executable: None,
-            version: None,
             source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
             rocm_sdk_version: version.map(ToOwned::to_owned),
+            ..VllmRuntime::for_test()
         }
     }
     #[test]
@@ -1009,17 +1007,11 @@ mod tests {
         // for the step that does).
         let root = PathBuf::from("/tmp/rocm-sdk");
         let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(root.clone()),
             sdk_bin: Some(root.join("bin")),
             sdk_bin_paths: vec![root.join("runtime").join("bin")],
             sdk_library_paths: vec![root.join("runtime").join("lib")],
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
         let entries = therock_library_path_entries(&runtime);
         assert!(entries.contains(&root.join("runtime").join("lib")));
@@ -1047,17 +1039,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn runtime_with_compat_dir(env_root: &Path) -> VllmRuntime {
         VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env_root.join("bin").join("python")),
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
             sdk_root: Some(env_root.join("sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         }
     }
 
@@ -1155,15 +1139,9 @@ mod tests {
         let runtime = VllmRuntime {
             runtime_id: "external-vllm-python".to_owned(),
             env_id: "external-vllm-python".to_owned(),
-            command: PathBuf::from("vllm"),
             python_executable: Some(env.path().join("bin").join("python")),
-            version: None,
             source: "environment python".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
+            ..VllmRuntime::for_test()
         };
 
         let shim = ensure_therock_compat_shims(&runtime, rocm_core::openmpi::ensure_mpi_cxx_compat);
@@ -1177,6 +1155,142 @@ mod tests {
             assert!(
                 !env.path().join("rocm-cli-lib-compat").exists(),
                 "must not write into the venv root's compat dir when sdk_root is absent"
+            );
+        }
+    }
+
+    #[test]
+    fn load_runtime_manifests_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Both pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them. A third, older manifest proves the tie only applies to
+        // manifests that actually share `installed_at_unix_ms`.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let registry = std::env::temp_dir().join(format!(
+                "rocm-engine-vllm-runtime-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&registry)?;
+
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                    }))?,
+                )?;
+            }
+            fs::write(
+                registry.join("older.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "runtime_key": "older",
+                    "runtime_id": "therock-stable:gfx94X-dcgpu",
+                    "installed_at_unix_ms": 1_000_u128,
+                }))?,
+            )?;
+
+            let manifests =
+                load_runtime_manifests_in(&registry, Some("therock-stable:gfx94X-dcgpu"));
+            let _ = fs::remove_dir_all(&registry);
+            let manifests = manifests?;
+
+            let keys: Vec<Option<String>> = manifests
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    Some("aaa".to_owned()),
+                    Some("bbb".to_owned()),
+                    Some("older".to_owned())
+                ],
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifests_without_a_key_or_a_time_still_sort_deterministically() {
+        let manifest = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockRuntimeManifest>(fields).expect("manifest"),
+            )
+        };
+        let paths = |manifests: &[(PathBuf, TheRockRuntimeManifest)]| {
+            manifests
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless manifests in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut manifests in [
+            vec![
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(paths(&manifests), ["a.json", "b.json"]);
+        }
+
+        // A manifest written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut manifests in [
+            vec![
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(
+                paths(&manifests),
+                ["timed.json", "untimed.json", "zero.json"]
             );
         }
     }

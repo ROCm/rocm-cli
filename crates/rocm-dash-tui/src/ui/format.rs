@@ -100,14 +100,6 @@ pub fn pct(value: f32) -> String {
     }
 }
 
-/// `Option<f32>` percentage → `-` when None.
-pub fn pct_opt(value: Option<f32>) -> String {
-    match value {
-        Some(v) => pct(v),
-        None => "-".to_string(),
-    }
-}
-
 /// SI-suffixed number: 1234 → "1.23 k", 1_234_567 → "1.23 M".
 /// Below 1000 returns the raw integer with no suffix.
 pub fn si(value: f64) -> String {
@@ -147,6 +139,13 @@ pub fn tps_opt(value: Option<f64>) -> String {
         Some(v) => format!("{v:.1} tok/s"),
         None => "-".to_string(),
     }
+}
+
+/// Latency in milliseconds (TTFT/TPOT). `123ms`. `—` when None or non-finite.
+pub fn ms_opt(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map_or_else(|| "—".to_string(), |v| format!("{v:.0}ms"))
 }
 
 /// Energy efficiency: generation throughput per watt. `0.42 tok/W`. `-` when
@@ -198,15 +197,6 @@ pub fn duration(seconds: f64) -> String {
         format!("{m}m {s}s")
     } else {
         format!("{s}s")
-    }
-}
-
-/// Request counter rendered with SI suffix for big numbers and `-` for None.
-pub fn reqs_opt(value: Option<u32>) -> String {
-    match value {
-        Some(v) if v >= 1_000 => si(f64::from(v)),
-        Some(v) => v.to_string(),
-        None => "-".to_string(),
     }
 }
 
@@ -262,7 +252,26 @@ pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> Stri
     }
 }
 
-/// Full-unit gen_tps for cards, pane rows, and services views.
+/// Latency (TTFT/TPOT) for narrow table cells.
+///
+/// - `None` / non-finite → `"—"`
+/// - `Some(v)`, Held → `"{v:.0}ms*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.0}ms"`
+pub fn latency_cell(ms: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match ms.filter(|v| v.is_finite()) {
+        None => "—".to_string(),
+        Some(v) => {
+            let base = format!("{v:.0}ms");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Full-unit gen_tps for pane rows and services views.
 /// Mirrors [`tps_opt`] format and appends [`HELD_MARKER`] when metadata is Held.
 ///
 /// - `None` → `"-"`
@@ -337,11 +346,38 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
     }
 }
 
+/// Instances that belong in a "running" listing: serving or still starting.
+///
+/// Serving ones come first, with a stable order within each group (model name,
+/// then container id) so rows do not reshuffle with `HashMap` iteration order.
+#[must_use]
+pub fn running_instances(state: &crate::app::AppState) -> Vec<&rocm_dash_core::metrics::Instance> {
+    let mut running: Vec<_> = state
+        .instances
+        .values()
+        .filter(|i| i.status.counts_as_running())
+        .collect();
+    running.sort_by(|a, b| {
+        (!a.status.is_serving(), &a.model_name, &a.container_id).cmp(&(
+            !b.status.is_serving(),
+            &b.model_name,
+            &b.container_id,
+        ))
+    });
+    running
+}
+
+/// Lowercase stage text for a starting instance (`loading`, `starting`, ...).
+#[must_use]
+pub fn stage_text(status: rocm_dash_core::metrics::InstanceStatus) -> String {
+    status.label().to_lowercase()
+}
+
 /// The "…and N more" summary line for a list capped to its first `cap`
 /// items, or `None` when `len` doesn't exceed `cap`.
 ///
 /// Shared by every capped list (`tabs::pane::live_lines`'s
-/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm_body_with`) so
+/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm::quit_confirm_body_with`) so
 /// the overflow wording and arithmetic stay identical across them. Each call
 /// site still passes its own `cap` literal alongside its own separate
 /// `.take(N)` — this does not keep the two in sync if one changes without
@@ -515,12 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn pct_opt_handles_none() {
-        assert_eq!(pct_opt(None), "-");
-        assert_eq!(pct_opt(Some(75.0)), "75.0%");
-    }
-
-    #[test]
     fn si_scales_into_k_m_b() {
         assert_eq!(si(0.0), "0");
         assert_eq!(si(123.0), "123");
@@ -587,13 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn reqs_opt_collapses_big_counts() {
-        assert_eq!(reqs_opt(None), "-");
-        assert_eq!(reqs_opt(Some(5)), "5");
-        assert_eq!(reqs_opt(Some(12_000)), "12.00 k");
-    }
-
-    #[test]
     fn watts_and_celsius_and_mhz() {
         assert_eq!(watts(123.4), "123.4 W");
         assert_eq!(celsius(67.0), "67.0°C");
@@ -610,6 +633,16 @@ mod tests {
             observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             freshness: ObservationFreshness::Fresh,
         }
+    }
+
+    #[test]
+    fn latency_cell_marks_held_and_never_prints_non_finite() {
+        assert_eq!(latency_cell(None, None), "—");
+        assert_eq!(latency_cell(Some(f64::NAN), Some(&held_obs())), "—");
+        assert_eq!(latency_cell(Some(150.4), Some(&held_obs())), "150ms*");
+        assert_eq!(latency_cell(Some(150.4), Some(&fresh_obs())), "150ms");
+        // Unknown freshness (legacy snapshot) is never shown as held.
+        assert_eq!(latency_cell(Some(150.4), None), "150ms");
     }
 
     fn held_obs() -> ObservationMetadata {

@@ -48,6 +48,36 @@ const NEXT_TORCH_VERSION: &str = "2.10.0+rocm10.0.0";
 const NEXT_TORCHVISION_VERSION: &str = "0.25.0+rocm10.0.0";
 const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 
+/// A newer ROCm 10 build published beside `NEXT_ROCM_VERSION`, for the scenario
+/// that pins the older one.
+const NEWER_NEXT_ROCM_VERSION: &str = "10.1.0";
+const NEWER_NEXT_TORCH_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0";
+/// The newer build's torchaudio, shaped like the live `whl-next` index's
+/// `+rocm10.1.0` builds: an original release (CPU-only on the live index), the
+/// hardware-verified rebuild, and a newer rebuild sharing the same label. The
+/// verified one is the release `rocm_engine_vllm::verified_torchaudio_release`
+/// records for ROCm 10.1 (the vLLM ROCm 10.x discover-build table's exact
+/// torchaudio pin); this fixture has to change with it.
+const NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION: &str = "2.11.0.2+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION: &str = "2.11.0.3+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERSIONS: [&str; 3] = [
+    NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION,
+    NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+    NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION,
+];
+/// A rebuild of `NEXT_TORCHAUDIO_VERSION`, published the way the live index
+/// publishes torchaudio rebuilds: as a fourth release segment.
+const NEXT_TORCHAUDIO_REBUILD_VERSION: &str = "2.9.1.2+rocm10.0.0";
+/// A still newer rebuild of the same build, published only as a wheel no host
+/// running this suite can install (another CPython and OS).
+const NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION: &str = "2.9.1.3+rocm10.0.0";
+
+/// The tag every fixture wheel carries unless a scenario says otherwise.
+const ANY_WHEEL_TAG: &str = "py3-none-any";
+const FOREIGN_WHEEL_TAG: &str = "cp39-cp39-macosx_11_0_arm64";
+
 const CURRENT_ROCM_VERSION: &str = "7.10.0";
 const CURRENT_TORCH_VERSION: &str = "2.9.0+rocm7.10.0";
 const CURRENT_TORCHVISION_VERSION: &str = "0.24.0+rocm7.10.0";
@@ -57,6 +87,16 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 /// The non-release sibling the live catalog publishes beside the real archive.
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
+/// The ROCm version `CURRENT_TARBALL` carries, as the preview reports it.
+const CURRENT_TARBALL_VERSION: &str = "7.10.0";
+
+/// A host ROCm newer than `CURRENT_TARBALL_VERSION`, reported with a packaging
+/// build number the way a system install's `.info/version` reports one.
+const HOST_ROCM_NEWER_WITH_BUILD_NUMBER: &str = "7.20.1-33";
+/// The same host version with a suffix that is neither a build number nor a
+/// PEP 440 stage. Dropping the whole suffix would read it as `7.20.1`, newer
+/// than `CURRENT_TARBALL_VERSION`; it must be read as "can't tell" instead.
+const HOST_ROCM_WITH_UNREADABLE_SUFFIX: &str = "7.20.1-33rc1";
 
 /// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
 /// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
@@ -127,21 +167,37 @@ fn aggregate_root_html() -> String {
 /// One PEP 503 package page with PEP 658 metadata. The metadata lets uv resolve
 /// the published dependency contract without downloading a wheel.
 fn write_wheel_index(served: &Path, package: &str, version: &str, requires: &[String]) {
-    let file_name = format!("{package}-{version}-py3-none-any.whl");
-    let html =
-        format!("<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>\n");
+    write_wheel_index_builds(
+        served,
+        package,
+        &[(version, ANY_WHEEL_TAG, requires.to_vec())],
+    );
+}
+
+/// [`write_wheel_index`] for a page that lists several published builds, each
+/// as `(version, wheel tag, requirements)`.
+fn write_wheel_index_builds(served: &Path, package: &str, builds: &[(&str, &str, Vec<String>)]) {
+    let mut html = String::new();
+    for (version, wheel_tag, requires) in builds {
+        let file_name = format!("{package}-{version}-{wheel_tag}.whl");
+        writeln!(
+            html,
+            "<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>"
+        )
+        .expect("write fixture HTML");
+        let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
+        if matches!(package, "rocm" | "torch" | "torchvision") {
+            metadata.push_str("Provides-Extra: device-gfx1200\n");
+        }
+        if package == "rocm" {
+            metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
+        }
+        for requirement in requires {
+            writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
+        }
+        write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
+    }
     write_fixture(&served.join("index.html"), &html);
-    let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
-    if matches!(package, "rocm" | "torch" | "torchvision") {
-        metadata.push_str("Provides-Extra: device-gfx1200\n");
-    }
-    if package == "rocm" {
-        metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
-    }
-    for requirement in requires {
-        writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
-    }
-    write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
 }
 
 fn write_pip_index(served: &Path, versions: [(&str, &str); 4]) {
@@ -177,6 +233,80 @@ fn allow_base_overrides(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
 }
 
+/// Only the canonical release index, for a scenario that never pins ROCm 10 and
+/// so never reaches the next layout.
+#[given("a canonical release pip index fixture")]
+async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("current"),
+        [
+            ("rocm", CURRENT_ROCM_VERSION),
+            ("torch", CURRENT_TORCH_VERSION),
+            ("torchvision", CURRENT_TORCHVISION_VERSION),
+            ("torchaudio", CURRENT_TORCHAUDIO_VERSION),
+        ],
+    );
+    serve_pip_fixtures(world);
+}
+
+/// File the recording `uv` appends to, one line per invocation.
+const UV_INVOCATION_LOG: &str = "uv-invocations.log";
+
+/// The per-scenario cache folder, under the scenario root.
+const SCRATCH_CACHE_DIR: &str = "scratch-cache";
+
+/// A host where the CLI can find no Python: `PATH` is one empty folder, so the
+/// search comes up empty and no managed Python has been saved. `uv` is a
+/// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
+/// to prepare a managed Python reaches it, instead of downloading the real one,
+/// and leaves a line behind.
+///
+/// Relies on the ambient environment not naming a Python: a set
+/// `ROCM_CLI_PYTHON` would answer the search before it looks at `PATH`, and a
+/// set `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP` would turn the case this
+/// scenario is about into an error. Either would make the scenario pass or fail
+/// for a reason it does not name, so they are refused up front.
+#[given("a host with no usable Python and a recording uv")]
+async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
+    for var in [
+        "ROCM_CLI_PYTHON",
+        "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
+    ] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set in the environment running the suite, which would change what this \
+             scenario exercises; unset it"
+        );
+    }
+    let scenario_root = root(world).to_path_buf();
+    let empty_path = scenario_root.join("no-python-on-path");
+    std::fs::create_dir_all(&empty_path).expect("failed to create the empty PATH folder");
+    let uv = scenario_root
+        .join("recording-uv-bin")
+        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
+    crate::install_fixture_binary("fake-uv", &uv);
+    world
+        .command_env
+        .push(("PATH", empty_path.into_os_string()));
+    // A cache folder of this scenario's own. The harness otherwise points the
+    // CLI at a cache shared across scenarios and, on CI, across runs, where a
+    // tool archive an earlier run left would trip the backstop check for one in
+    // the cache. Overrides the shared one for this scenario only.
+    let scratch_cache = scenario_root.join(SCRATCH_CACHE_DIR);
+    std::fs::create_dir_all(&scratch_cache).expect("failed to create the scratch cache folder");
+    world
+        .command_env
+        .push(("ROCM_CLI_CACHE_DIR", scratch_cache.into_os_string()));
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world.command_env.push((
+        "FAKE_UV_LOG",
+        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
+    ));
+}
+
 #[given("a canonical release pip index fixture and a ROCm 10 pip index fixture")]
 async fn pip_index_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
@@ -198,6 +328,13 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
             ("torchaudio", NEXT_TORCHAUDIO_VERSION),
         ],
     );
+    serve_pip_fixtures(world);
+}
+
+/// Serves `therock-pip-fixtures/` and points both the canonical release and
+/// the ROCm 10 pip bases at it, through the explicit trust gate.
+fn serve_pip_fixtures(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
     world.artifact_server = Some(LoopbackServer::start(&served));
     allow_base_overrides(world);
     let current = current_pip_base(world);
@@ -208,6 +345,83 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
+}
+
+/// Two ROCm 10 builds on one ROCm 10 index, with each package's dependency
+/// contract shaped like the live preview index's: torch requires its exact
+/// `rocm` build and torchvision its exact torch, so pinning `rocm` carries both
+/// — but torchaudio requires neither, so nothing in its metadata ties it to a
+/// build. `torchaudio` lists the torchaudio builds the index publishes, each
+/// with its wheel tag.
+fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+    let served = root(world).join("therock-pip-fixtures").join("next");
+    write_fixture(&served.join("index.html"), &aggregate_root_html());
+    let builds = [
+        (
+            NEXT_ROCM_VERSION,
+            NEXT_TORCH_VERSION,
+            NEXT_TORCHVISION_VERSION,
+        ),
+        (
+            NEWER_NEXT_ROCM_VERSION,
+            NEWER_NEXT_TORCH_VERSION,
+            NEWER_NEXT_TORCHVISION_VERSION,
+        ),
+    ];
+    let rocm = builds.map(|(rocm, ..)| (rocm, ANY_WHEEL_TAG, Vec::new()));
+    let torch =
+        builds.map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]));
+    let torchvision = builds.map(|(_, torch, torchvision)| {
+        (torchvision, ANY_WHEEL_TAG, vec![format!("torch=={torch}")])
+    });
+    let torchaudio = torchaudio
+        .iter()
+        .map(|(version, wheel_tag)| (*version, *wheel_tag, Vec::new()))
+        .collect::<Vec<_>>();
+    write_wheel_index_builds(&served.join("rocm"), "rocm", &rocm);
+    write_wheel_index_builds(&served.join("torch"), "torch", &torch);
+    write_wheel_index_builds(&served.join("torchvision"), "torchvision", &torchvision);
+    write_wheel_index_builds(&served.join("torchaudio"), "torchaudio", &torchaudio);
+    serve_pip_fixtures(world);
+}
+
+/// The older build also carries a torchaudio rebuild, as the live index does,
+/// and a newer rebuild still that this host cannot install. The newer build
+/// carries a hardware-verified torchaudio with a newer rebuild beside it.
+fn serve_two_next_builds_with_torchaudio_rebuilds(world: &mut E2eWorld) {
+    let mut torchaudio = vec![
+        (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+    ];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
+}
+
+#[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
+async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// The same index as the newer-build fixture, named for what the
+/// verified-torchaudio scenario needs from it: ROCm 10.1.0's original
+/// torchaudio release, its hardware-verified rebuild and a newer rebuild all
+/// share the `+rocm10.1.0` label.
+#[given("a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label")]
+async fn pip_index_fixture_with_torchaudio_rebuilds_sharing_a_label(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// The pinned build's only torchaudio is a wheel this host cannot install, so
+/// for this Python and platform it publishes none; the newer build publishes
+/// installable ones.
+#[given(
+    "a ROCm 10 pip index fixture whose ROCm 10.0.0 torchaudio is only a wheel this host cannot install"
+)]
+async fn pip_index_fixture_without_pinned_torchaudio(world: &mut E2eWorld) {
+    let mut torchaudio = vec![(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG)];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
 }
 
 /// Registry key for the planted manifest below. Filename-safe (no `:`), same
@@ -262,6 +476,92 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
         manifest,
     )
     .expect("failed to write runtime manifest");
+}
+
+/// Makes the planted ROCm 10 runtime the active default, so a real install
+/// without consent reaches the non-interactive refusal: past every point where
+/// the plan is chosen and announced, but before `uv`, any download or any
+/// change on disk.
+#[given("that runtime is the active default")]
+async fn planted_runtime_is_the_active_default(world: &mut E2eWorld) {
+    // Black-box: plain JSON matching the CLI's on-disk config schema, as
+    // `examine_steps.rs` plants it. Every field defaults.
+    let config_dir = root(world).join("config");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config = serde_json::json!({ "active_runtime_key": NEXT_GROUPED_FAMILY_RUNTIME_KEY });
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming")]
+async fn install_pinned_wheel_without_confirming(world: &mut E2eWorld) {
+    // No `--dry-run`: the install-log note is printed only past the preview.
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+        ],
+    );
+}
+
+#[then("the install is refused without replacing the active default runtime")]
+async fn install_refused_before_replacing_active_default(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no recorded exit code");
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        rc != 0 && reported.contains("--approve-replacing-active-default"),
+        "expected the non-interactive refusal (rc {rc}):\n{reported}"
+    );
+    // The refusal comes before `uv` creates an environment: nothing installed.
+    assert!(
+        !reported.contains("Creating Python environment"),
+        "the install went past the refusal:\n{reported}"
+    );
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    let registered = std::fs::read_dir(&registry)
+        .expect("failed to read the runtime registry")
+        .map(|entry| entry.expect("bad registry entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registered,
+        [std::ffi::OsString::from(format!(
+            "{NEXT_GROUPED_FAMILY_RUNTIME_KEY}.json"
+        ))],
+        "the refused install registered a runtime"
+    );
+}
+
+#[then(
+    "the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn install_log_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // The same build therock-next-11's preview pins on this fixture, so the
+    // note names the build the install would have taken, not another one.
+    assert_contains(
+        world,
+        &format!(
+            "Note: torchaudio {NEXT_TORCHAUDIO_REBUILD_VERSION}, the newest build published for \
+             ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, because no torchaudio release \
+             is recorded as verified for this ROCm line"
+        ),
+        "unverified torchaudio install-log note",
+    );
 }
 
 #[when("the user previews applying the pending update to that runtime")]
@@ -672,6 +972,46 @@ async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0")]
+async fn preview_newer_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEWER_NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
+async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn preview_pinned_tarball_install(world: &mut E2eWorld) {
     preview_ok(
@@ -712,6 +1052,56 @@ async fn preview_pinned_tarball_install_with_group_family(world: &mut E2eWorld) 
     );
 }
 
+/// The install folder therock-next-15 asks for: inside the scenario's root, with
+/// a lone `'` in its name — the shape the old dry-run quoter left bare.
+const QUOTED_FOLDER_NAME: &str = "it's-here";
+
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
+)]
+async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = root(world)
+        .join(QUOTED_FOLDER_NAME)
+        .to_string_lossy()
+        .into_owned();
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--prefix",
+            &prefix,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the dry-run command line names that folder as a single argument")]
+async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    let output = stdout(world);
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("command: "))
+        .unwrap_or_else(|| panic!("no `command:` line in the dry-run preview:\n{output}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the dry-run `command:` line does not parse: `{line}`"));
+    // By file name rather than the full path: the CLI resolves the prefix
+    // through symlinks, so the folder's parent may be spelled differently from
+    // the one this step built. What must hold is that one whole word names it.
+    assert!(
+        words.iter().any(|word| {
+            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
+        }),
+        "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
+    );
+}
+
 fn stdout(world: &E2eWorld) -> &str {
     world.cli_output.as_deref().unwrap_or_default()
 }
@@ -722,6 +1112,192 @@ fn assert_contains(world: &E2eWorld, needle: &str, what: &str) {
         "{what}: expected {needle:?} in the preview:\n{}",
         stdout(world)
     );
+}
+
+/// The managed interpreter the canonical layout needs. Keep in step with
+/// `DEFAULT_MANAGED_PYTHON_VERSION` in `apps/rocm/src/therock/python.rs`.
+const CANONICAL_MANAGED_PYTHON: &str = "3.12";
+
+#[then("the preview says a real install would prepare a managed Python")]
+async fn preview_says_managed_python_would_be_prepared(world: &mut E2eWorld) {
+    assert_contains(world, "python_source: managed", "python source");
+    assert_contains(
+        world,
+        "python_launcher: not prepared by this preview",
+        "python launcher",
+    );
+    assert_contains(
+        world,
+        &format!("would use uv to install managed Python {CANONICAL_MANAGED_PYTHON}"),
+        "python note",
+    );
+}
+
+/// The preview says it prepared no Python, and the state it left agrees. The
+/// claim and the filesystem are checked together: the note alone would pass
+/// with the bug present, and so would the empty folders alone if the preview
+/// had simply stopped before it got to the Python.
+#[then("the preview prepared no Python, as it says")]
+async fn preview_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "a real install would prepare Python {CANONICAL_MANAGED_PYTHON}. This preview does not."
+        ),
+        "the progress line about what the preview skipped",
+    );
+    assert_no_python_prepared(world);
+}
+
+/// The state half of the claim: the recording `uv` was never run (the evidence
+/// that nothing was prepared), no managed tools folder, no saved configuration,
+/// and, as a backstop only, no tool archive in the scenario's cache. Every
+/// scenario that calls this previews the canonical layout (no ROCm 10 pin), the
+/// only layout whose preview needs no `uv`; a ROCm 10 preview can legitimately
+/// create the managed tools folder to resolve package versions.
+fn assert_no_python_prepared(world: &E2eWorld) {
+    let paths = world.app_paths();
+    let scenario_root = root(world).to_path_buf();
+    let uv_log = scenario_root.join(UV_INVOCATION_LOG);
+    assert!(
+        !uv_log.exists(),
+        "the preview ran uv, which it says it did not:\n{}",
+        std::fs::read_to_string(&uv_log).unwrap_or_default()
+    );
+    let tools = rocm_core::managed_tools_dir(&paths.data_dir);
+    assert!(
+        !tools.exists(),
+        "the preview created the managed tools folder {}, which would hold a managed uv and Python",
+        tools.display()
+    );
+    // A backstop, not the detector. `ROCM_CLI_UV_BINARY` makes `ensure_uv_binary`
+    // return the recording `uv` before any download could begin, so this folder
+    // stays empty even if the preview did go on to prepare a Python; the `uv`
+    // log above is what shows that. It is the scenario's own cache folder (see
+    // the Given), not `paths.cache_dir`, which is the shared one where a run's
+    // leftovers would already be.
+    let cache_tools = scenario_root.join(SCRATCH_CACHE_DIR).join("tools");
+    assert!(
+        !cache_tools.exists(),
+        "the preview downloaded a tool archive into {}",
+        cache_tools.display()
+    );
+    let config = paths.config_path();
+    assert!(
+        !config.exists(),
+        "the preview saved a configuration at {}, which would record a managed Python: {}",
+        config.display(),
+        std::fs::read_to_string(&config).unwrap_or_default()
+    );
+}
+
+/// Plants an interpreter on the empty `PATH` folder that cannot serve the
+/// install: `fake-python` answers the wheel-tag probe with `{}`, which is not
+/// the tag the layout needs, so the search finds a Python and rejects it.
+#[given("the only Python on the host's path is not usable")]
+async fn only_unusable_python_on_path(world: &mut E2eWorld) {
+    let python = root(world).join("no-python-on-path").join("python3");
+    crate::install_fixture_binary("fake-python", &python);
+}
+
+#[given("managed Python bootstrap is disabled")]
+async fn managed_python_bootstrap_disabled(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1".into()));
+}
+
+/// The refusal is the whole story: the output states the finding about the
+/// `PATH` Python and the policy refusal, and no line says what a real install
+/// would go on to do, since it would do nothing.
+#[then("the preview is refused because managed Python is disabled, without a promise")]
+async fn preview_refused_for_disabled_bootstrap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("managed Python bootstrap is disabled"),
+        "expected the policy refusal:\n{stderr}"
+    );
+    let out = stdout(world);
+    assert!(
+        out.contains("Python from PATH is not usable for this ROCm install (cp312 is required).\n"),
+        "expected the finding about the PATH Python:\n{out}"
+    );
+    for promise in [
+        "a real install would",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
+}
+
+#[given("the managed Python version is overridden to 3.13")]
+async fn managed_python_version_overridden(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_MANAGED_PYTHON_VERSION", "3.13".into()));
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 with no version pin")]
+async fn try_preview_unpinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+/// The refusal names the version and the tag rule, as a real install would
+/// meet it, and the state agrees that nothing was prepared on the way to it.
+#[then("the preview is refused because the install would refuse that Python")]
+async fn preview_refused_for_python_version(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    for needle in [
+        "would prepare managed Python 3.13",
+        "Python wheel tag cp313 is not supported",
+        "cp312 is required",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle:?} in the refusal:\n{stderr}"
+        );
+    }
+    // The progress lines must not promise what the refusal then takes back: the
+    // output holds no "would prepare Python 3.13" and no plan.
+    let out = stdout(world);
+    assert!(
+        out.contains("Checking Python for the ROCm install.\n"),
+        "expected the neutral Python check line:\n{out}"
+    );
+    for promise in [
+        "would prepare Python 3.13",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
 }
 
 #[then("the preview resolves the canonical release pip index")]
@@ -846,9 +1422,81 @@ fn assert_version_resolution_extras(world: &mut E2eWorld, include_devel: bool) {
     };
     let expected = format!(
         "version_resolution_specs: rocm[{extras},device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
-         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] torchaudio"
+         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] \
+         torchaudio=={NEXT_TORCHAUDIO_VERSION}"
     );
     assert_contains(world, &expected, "version resolution extras");
+}
+
+#[then("every package in the preview is built for ROCm 10.0.0")]
+async fn preview_installs_one_rocm_build(world: &mut E2eWorld) {
+    // The whole line: one package from the newer build is the regression, and
+    // which package drifts depends on whose metadata fails to name its build.
+    // torchaudio is the build's newest rebuild, not its original release.
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEXT_TORCHAUDIO_REBUILD_VERSION}"
+    );
+    assert_contains(world, &expected, "single ROCm build");
+}
+
+/// The `torchaudio_selection:` line, which must name the very torchaudio the
+/// `package_specs:` line installs: the two are asserted together so a note that
+/// describes one build while the plan installs another fails here.
+fn assert_torchaudio_selection(world: &E2eWorld, torchaudio: &str, description: &str) {
+    assert_contains(
+        world,
+        &format!("torchaudio=={torchaudio}"),
+        "torchaudio in the install plan",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio_selection: torchaudio {torchaudio}, {description}"),
+        "torchaudio selection note",
+    );
+}
+
+#[then(
+    "the preview says its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn preview_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // ROCm 10.0 has no verified torchaudio recorded, so the newest build is
+    // pinned and the plan says that is all it is.
+    assert_torchaudio_selection(
+        world,
+        NEXT_TORCHAUDIO_REBUILD_VERSION,
+        &format!(
+            "the newest build published for ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, \
+             because no torchaudio release is recorded as verified for this ROCm line"
+        ),
+    );
+}
+
+#[then(
+    "the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild"
+)]
+async fn preview_installs_verified_torchaudio(world: &mut E2eWorld) {
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEWER_NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEWER_NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEWER_NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION}"
+    );
+    assert_contains(world, &expected, "verified torchaudio plan");
+    assert_torchaudio_selection(
+        world,
+        NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+        &format!("the build verified on hardware for ROCm {NEWER_NEXT_ROCM_VERSION}"),
+    );
+    // Recency picked the newer rebuild before; it must appear nowhere now.
+    assert!(
+        !stdout(world).contains(NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION)
+            && !stdout(world).contains("not hardware-verified"),
+        "the preview still names the newer rebuild or an unverified note:\n{}",
+        stdout(world)
+    );
 }
 
 #[then("the preview resolves the ROCm 10 tarball catalog")]
@@ -899,6 +1547,43 @@ async fn install_fails(world: &mut E2eWorld) {
     );
 }
 
+#[then(
+    "the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another"
+)]
+async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    // This sentence is only produced where the torchaudio pin is chosen, before
+    // `uv` runs, so it places the failure there rather than at any later check.
+    assert!(
+        reported.contains(&format!(
+            "no torchaudio built for ROCm {NEXT_ROCM_VERSION} is published for this Python and platform"
+        )),
+        "the refusal did not name the missing torchaudio build:\n{reported}"
+    );
+    // The sentence above is what tells the pin refused; these are a second,
+    // cheaper guard. The refusal names no version, so neither fallback build —
+    // the pinned ROCm build's wheel for another platform, or the newer ROCm
+    // build's — can appear unless the pin error was swallowed and resolution
+    // carried on with one of them.
+    for fallback in
+        std::iter::once(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION).chain(NEWER_NEXT_TORCHAUDIO_VERSIONS)
+    {
+        assert!(
+            !reported.contains(fallback),
+            "resolution continued with torchaudio {fallback}:\n{reported}"
+        );
+    }
+    // Likewise for a swallowed error: no install plan was printed.
+    assert!(
+        !reported.contains("package_specs:"),
+        "the refusal still printed an install plan:\n{reported}"
+    );
+}
+
 #[then("the failure asks for an exact GPU arch and names --family gfx1200")]
 async fn failure_names_the_exact_arch_flag(world: &mut E2eWorld) {
     // Both streams: what matters is that the user is told how to fix it, not
@@ -919,7 +1604,7 @@ async fn failure_names_the_exact_arch_flag(world: &mut E2eWorld) {
 }
 
 /// The default (un-overridden) ROCm 10 preview pip index base. Matches
-/// `THEROCK_NEXT_RELEASE_PIP_INDEX_BASE` in `apps/rocm/src/therock.rs`.
+/// `THEROCK_NEXT_PIP_INDEX_BASE` in `apps/rocm/src/therock/source.rs`.
 const DEFAULT_NEXT_RELEASE_PIP_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
 
 /// The newest `rocm` version the live ROCm 10 preview source actually
@@ -1129,5 +1814,93 @@ async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
     assert!(
         install_output.contains("vLLM ROCm 10.x discovery pinned:"),
         "vLLM install against a live ROCm 10.x runtime did not report discovery pins:\n{install_output}"
+    );
+}
+
+#[given("a release tarball catalog whose newest ROCm is older than the host's")]
+async fn release_tarball_catalog_only(world: &mut E2eWorld) {
+    let served = root(world).join("therock-release-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    allow_base_overrides(world);
+    let base = server_base(world);
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+}
+
+#[given("a machine whose own ROCm install reports a newer version with a packaging build number")]
+async fn host_rocm_newer_with_build_number(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_NEWER_WITH_BUILD_NUMBER);
+}
+
+#[given("a machine whose own ROCm install reports a version with an unreadable build suffix")]
+async fn host_rocm_with_unreadable_suffix(world: &mut E2eWorld) {
+    world.plant_unmanaged_rocm_reporting(HOST_ROCM_WITH_UNREADABLE_SUFFIX);
+}
+
+#[when("the user previews a tarball SDK install")]
+async fn preview_unpinned_tarball_install(world: &mut E2eWorld) {
+    // No `--version`: an unpinned release install reaches the canonical
+    // catalog, which the given-step populated with `CURRENT_TARBALL` alone.
+    // `--family` keeps the preview off host GPU detection.
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            GROUP_FAMILY,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the preview selects the newest SDK in the catalog")]
+async fn preview_selects_catalog_newest(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("tarball: {CURRENT_TARBALL}"),
+        "selected artifact",
+    );
+    assert_contains(
+        world,
+        &format!("latest_version: {CURRENT_TARBALL_VERSION}"),
+        "selected artifact version",
+    );
+}
+
+#[then("the preview explains that the host's newer ROCm is passed over for the selected SDK")]
+async fn preview_explains_host_newer(world: &mut E2eWorld) {
+    // The note claims the catalog's version "is selected", so assert the
+    // selection beside it: the claim and the state it describes, together.
+    preview_selects_catalog_newest(world).await;
+    assert_contains(
+        world,
+        &format!(
+            "version_note: this host reports ROCm {HOST_ROCM_NEWER_WITH_BUILD_NUMBER}, but \
+             {CURRENT_TARBALL_VERSION} is the newest TheRock ROCm tarball for this GPU family, \
+             so it is selected"
+        ),
+        "host-newer version note",
+    );
+}
+
+#[then("the preview does not claim the host's ROCm is newer")]
+async fn preview_does_not_claim_host_newer(world: &mut E2eWorld) {
+    // Absence is only evidence because the sibling scenario shows the same
+    // preview printing the note when the host version is readable and newer.
+    let preview = stdout(world);
+    assert!(
+        !preview.contains("version_note:") && !preview.contains("this host reports ROCm"),
+        "the preview claimed an unreadable host ROCm version is newer:\n{preview}"
     );
 }

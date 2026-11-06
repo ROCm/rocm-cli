@@ -219,6 +219,81 @@ pub struct Report {
 /// What a report says when the catalog recognised nothing.
 pub const UNRECOGNISED: &str = "unrecognised";
 
+/// The name of each level of [`Report::group_key`], in the same order.
+///
+/// Ordered most general first, the way a rollup reads: the cause, then the
+/// hardware, then the releases around it. A reader of the rollup learns which
+/// of these separates a group by watching where the counts split.
+pub const GROUP_AXES: [&str; 5] = ["entry", "architecture", "rocm", "os", "engine"];
+
+impl Report {
+    /// The description a grouper matches on: every published field except the
+    /// ones that describe this build rather than this machine.
+    ///
+    /// Two reports describe the same problem exactly when their keys are
+    /// equal. This is the one definition of "same problem"; a counter that
+    /// built its own would drift from the field set the report builder is
+    /// tested against.
+    ///
+    /// Left out on purpose: `schema`, `architecture_matrix`, `cli_version` and
+    /// `fix_offered` describe the CLI that wrote the report, and `os_family`
+    /// is implied by `distro`. The distribution travels with its major
+    /// version, because Ubuntu 22 and RHEL 22 would otherwise be one group.
+    /// So does the engine, except where there is none to name: an absent or
+    /// unknown engine has an absent or unknown version, so the version would
+    /// only repeat the word.
+    #[must_use]
+    pub fn group_key(&self) -> [String; 5] {
+        let engine = if self.engine == NONE || self.engine == UNKNOWN {
+            self.engine.clone()
+        } else {
+            format!("{}-{}", self.engine, self.engine_version)
+        };
+        [
+            self.entry.clone(),
+            self.architecture.clone(),
+            self.rocm.clone(),
+            format!("{}-{}", self.distro, self.os_major),
+            engine,
+        ]
+    }
+
+    /// Whether every value [`Report::group_key`] reads is one this CLI writes.
+    ///
+    /// Each check is the writer's own rule run backwards: the catalog for the
+    /// entry, the compatibility matrix for the architecture, the approved lists
+    /// and their fallback words, and the normal form `major_minor` and
+    /// `leading_digits` produce for versions. A report that fails is one no
+    /// version of this CLI that speaks this schema wrote. A reader built from an
+    /// older checkout may also fail a newer report whose catalog entry or
+    /// architecture it does not know yet, which is why rollups are run from the
+    /// current main.
+    pub(crate) fn is_in_vocabulary(&self) -> bool {
+        let release = |value: &str| {
+            value == NONE || value == UNKNOWN || (!value.is_empty() && major_minor(value) == value)
+        };
+        let entry = self.entry == UNRECOGNISED || crate::fix::is_catalog_id(&self.entry);
+        let distro = APPROVED_DISTROS.contains(&self.distro.as_str())
+            || [DISTRO_OTHER, UNKNOWN, "windows", ""].contains(&self.distro.as_str());
+        let os_major = leading_digits(&self.os_major) == self.os_major;
+        // The pair the writer decides together, so it is checked together.
+        let engine = match self.engine.as_str() {
+            NONE | UNKNOWN => self.engine_version == self.engine,
+            name => {
+                APPROVED_ENGINES.contains(&name)
+                    && self.engine_version != NONE
+                    && release(&self.engine_version)
+            }
+        };
+        entry
+            && is_rocm_supported(&self.architecture)
+            && release(&self.rocm)
+            && distro
+            && os_major
+            && engine
+    }
+}
+
 /// What a reader made of a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -344,7 +419,7 @@ fn os_major(examination: &Examination) -> String {
     match examination.os_family.as_str() {
         "linux" => {
             // `distro_version` is `VERSION_ID` from `/etc/os-release`
-            // (`examine.rs::probe_os`), e.g. "22.04" -- the actual distro
+            // (`examine/host_env.rs::probe_os`), e.g. "22.04" -- the actual distro
             // release. `os_version` on Linux is `uname -v`'s kernel *build*
             // banner (e.g. "#1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC
             // 2026"): a timestamp, not a release, and reading it here is the
@@ -356,7 +431,7 @@ fn os_major(examination: &Examination) -> String {
         "windows" => {
             // Windows has no `/etc/os-release` analogue: `distro_id` /
             // `distro_version` are populated only under `runtime_is_linux()`
-            // in `examine.rs::probe_os`, and stay empty here. The only
+            // in `examine/host_env.rs::probe_os`, and stay empty here. The only
             // version-bearing field on this platform is `os_version` itself,
             // `cmd /C ver`'s banner, e.g. "Microsoft Windows [Version
             // 10.0.22631.4460]" -- extract the NT major component that
@@ -376,7 +451,7 @@ fn os_major(examination: &Examination) -> String {
 /// than published, because an unrecognised value is as likely to name a
 /// company as a distribution.
 ///
-/// Windows has no such file: `examine.rs::probe_os` populates `distro_id` only
+/// Windows has no such file: `examine/host_env.rs::probe_os` populates `distro_id` only
 /// under `runtime_is_linux()`, so the value there is a constant rather than
 /// anything read from the machine.
 fn distro(examination: &Examination) -> String {
@@ -410,7 +485,7 @@ fn distro(examination: &Examination) -> String {
 /// machine with a fully installed HIP SDK.
 ///
 /// Within each platform the path decides absence and the version decides
-/// readability, because `examine.rs` collapses both into an empty string:
+/// readability, because `examine/rocm_install_probe.rs` collapses both into an empty string:
 /// "no install was found" and "an install was found whose version could not
 /// be read" arrive identical. Those are different facts to anybody counting,
 /// in the same way [`ReadOutcome`] keeps an unreadable report apart from an
@@ -455,7 +530,7 @@ fn rocm_release(examination: &Examination) -> String {
 /// simply never touched, would be indistinguishable from that ordinary case
 /// and would also read as absent here.
 ///
-/// `"skipped"` is what `examine.rs` records when
+/// `"skipped"` is what `examine/framework.rs` records when
 /// [`crate::examine::FrameworkProbe::Skip`] was requested and the probe never
 /// ran at all. Unlike the default, that is not
 /// "looked and found nothing", so it is left to fall through the allowlist
@@ -586,7 +661,15 @@ pub fn read_report(json: &str) -> ReadOutcome {
             ReadOutcome::Unread { schema_seen }
         };
     }
+    // Checked against the vocabulary the writer uses, for the reason the refusal
+    // marker is: a report arrives at an address anyone can write to, so a value
+    // no version of this CLI could have written is a forged or corrupted body.
+    // Taking it would carry its free text, control characters included, into
+    // every count and output built from the report. It reads as unread instead:
+    // counted, so it is never lost, and grouped nowhere.
     serde_json::from_value::<Report>(envelope)
+        .ok()
+        .filter(Report::is_in_vocabulary)
         .map_or(ReadOutcome::Unread { schema_seen }, |report| {
             ReadOutcome::Understood(Box::new(report))
         })
@@ -619,6 +702,10 @@ mod tests {
             // A real shape with a marker in the tail. The runtime version is not
             // an approved report field: it narrows toward one machine.
             msvc_redist_version: "14.29.SENTINEL-RUNTIME".to_owned(),
+            // The display driver facts are not approved report fields. A
+            // version and a date narrow toward one machine.
+            adrenalin_version: "SENTINEL-DRIVER-VERSION".to_owned(),
+            adrenalin_date: "SENTINEL-DRIVER-DATE".to_owned(),
             cpu_model: "SENTINEL-CPU".to_owned(),
             distro_id: "SENTINEL-DISTRO".to_owned(),
             rocminfo_status: "SENTINEL-ERROR-TEXT".to_owned(),
@@ -658,6 +745,8 @@ mod tests {
         "SENTINEL-ROCM-BUILD",
         "SENTINEL-ENGINE-BUILD",
         "SENTINEL-RUNTIME",
+        "SENTINEL-DRIVER-VERSION",
+        "SENTINEL-DRIVER-DATE",
     ];
 
     /// An architecture no product will ever have.
@@ -820,7 +909,7 @@ mod tests {
     }
 
     /// I6, continued — the Windows equivalent. `distro_version` is never
-    /// populated there (`examine.rs::probe_os` only sets it under
+    /// populated there (`examine/host_env.rs::probe_os` only sets it under
     /// `runtime_is_linux()`), so the NT major version has to come out of
     /// `os_version` itself, `cmd /C ver`'s banner — but only the major
     /// component, never the banner whole.
@@ -886,19 +975,74 @@ mod tests {
         }
     }
 
-    /// The description a grouper matches on: every published field except the
-    /// ones that describe this build rather than this machine.
+    /// The description a grouper matches on, joined so a test can print it.
     fn description(report: &Report) -> String {
-        format!(
-            "{}|{}|{}-{}|{}|{}-{}",
-            report.entry,
-            report.architecture,
-            report.distro,
-            report.os_major,
-            report.rocm,
-            report.engine,
-            report.engine_version,
+        report.group_key().join("|")
+    }
+
+    /// `GROUP_AXES` names the key's levels by position, so each name has to
+    /// sit where its field lands. Changing one field must move exactly the
+    /// level named for it, and changing a field the key leaves out must move
+    /// none.
+    #[test]
+    fn every_axis_name_sits_where_its_field_lands_in_the_group_key() {
+        type Change = (&'static str, fn(&mut Report));
+        let base = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-6-path"),
+            false,
         )
+        .expect("a released machine reports");
+        let changes: [Change; 9] = [
+            ("entry", |r| r.entry = UNRECOGNISED.to_owned()),
+            ("architecture", |r| r.architecture = "gfx1100".to_owned()),
+            ("rocm", |r| r.rocm = "7.0".to_owned()),
+            ("os", |r| r.distro = "rhel".to_owned()),
+            ("os", |r| r.os_major = "24".to_owned()),
+            ("engine", |r| r.engine = "llama-cpp".to_owned()),
+            ("engine", |r| r.engine_version = "2.6".to_owned()),
+            ("", |r| r.cli_version = "9.9.9".to_owned()),
+            ("", |r| r.fix_offered = !r.fix_offered),
+        ];
+        for (axis, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            let moved: Vec<&str> = (0..GROUP_AXES.len())
+                .filter(|&i| changed.group_key()[i] != base.group_key()[i])
+                .map(|i| GROUP_AXES[i])
+                .collect();
+            let expected: Vec<&str> = std::iter::once(axis).filter(|a| !a.is_empty()).collect();
+            assert_eq!(
+                moved, expected,
+                "a change meant for `{axis}` moved {moved:?}"
+            );
+        }
+        let mut build = base.clone();
+        build.schema += 1;
+        build.architecture_matrix = "another matrix".to_owned();
+        build.os_family = "other".to_owned();
+        assert_eq!(
+            build.group_key(),
+            base.group_key(),
+            "build-only fields must not split groups"
+        );
+    }
+
+    #[test]
+    fn the_group_key_names_an_engine_with_its_release_and_an_absent_one_once() {
+        let with = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            None,
+            false,
+        )
+        .expect("a released machine reports");
+        assert_eq!(with.group_key()[4], "pytorch-2.5");
+        assert_eq!(GROUP_AXES[4], "engine");
+
+        let mut without = with;
+        without.engine = NONE.to_owned();
+        without.engine_version = NONE.to_owned();
+        assert_eq!(without.group_key()[4], NONE);
     }
 
     fn describe(machine: &Examination, entry: Option<&str>) -> String {
@@ -1176,9 +1320,91 @@ mod tests {
         }
     }
 
+    /// Every report the writer produces passes the reader's vocabulary check.
+    ///
+    /// The check is the writer's rules run backwards, so the two must agree on
+    /// every shape the writer can emit: each fallback word, each platform, a
+    /// recognised entry and an unrecognised one. A reader stricter than its
+    /// writer would quietly turn real reports into unread ones.
+    #[test]
+    fn every_report_the_writer_produces_reads_back() {
+        let mut machines = vec![
+            machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            machine("gfx1100", ("rhel", "9"), "7.0", ("llama-cpp", "0.9")),
+            machine("gfx90a", ("SENTINEL-DISTRO", "24"), "", ("unknown", "")),
+            machine("gfx942", ("", ""), "SENTINEL", ("skipped", "")),
+            machine_of_sentinels("gfx1100"),
+        ];
+        let mut windows = machine_of_sentinels("gfx1100");
+        windows.os_family = "windows".to_owned();
+        windows.os_version = "Microsoft Windows [Version 10.0.22631.4460]".to_owned();
+        windows.hip_sdk_version = "6.4.1".to_owned();
+        machines.push(windows);
+        let mut localized = machine_of_sentinels("gfx1100");
+        localized.os_family = "windows".to_owned();
+        localized.os_version = "Microsoft Windows [Versie 10.0]".to_owned();
+        machines.push(localized);
+
+        for (nth, machine) in machines.iter().enumerate() {
+            for entry in [None, Some("fix-1-arch")] {
+                let report = prepare_report(machine, entry, entry.is_some())
+                    .expect("a released machine reports");
+                let serialized = serde_json::to_string(&report).expect("a report serializes");
+                assert!(
+                    matches!(read_report(&serialized), ReadOutcome::Understood(_)),
+                    "machine {nth} with entry {entry:?} wrote a report its own reader refuses: \
+                     {serialized}"
+                );
+            }
+        }
+    }
+
+    /// A value no version of this CLI writes makes the report unread.
+    ///
+    /// Reports arrive at an address anyone can write to. A forged body that
+    /// put a name, or terminal control characters, in a grouped field would
+    /// otherwise carry that text into every count built from it.
+    #[test]
+    fn a_report_with_a_value_outside_the_vocabulary_is_not_read() {
+        let genuine = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-1-arch"),
+            true,
+        )
+        .expect("a released machine reports");
+        let marker = "Jane Doe \u{1b}[31m";
+        for field in [
+            "entry",
+            "architecture",
+            "rocm",
+            "distro",
+            "os_major",
+            "engine",
+            "engine_version",
+        ] {
+            let mut forged = serde_json::to_value(&genuine).expect("a report serializes");
+            forged[field] = serde_json::Value::String(marker.to_owned());
+            assert_eq!(
+                read_report(&forged.to_string()),
+                ReadOutcome::Unread {
+                    schema_seen: REPORT_SCHEMA_VERSION
+                },
+                "a forged `{field}` was read as a report"
+            );
+        }
+        // An engine and a version that do not belong together are not a pair
+        // the writer produces either.
+        let mut mismatched = serde_json::to_value(&genuine).expect("a report serializes");
+        mismatched["engine"] = serde_json::Value::String(NONE.to_owned());
+        assert!(matches!(
+            read_report(&mismatched.to_string()),
+            ReadOutcome::Unread { .. }
+        ));
+    }
+
     /// An engine name this build does not recognise is not published.
     ///
-    /// Today every value of `framework` is a literal written by `examine.rs`,
+    /// Today every value of `framework` is a literal written by `examine/framework.rs`,
     /// so this guards a future probe rather than the current one: the moment
     /// one sets that field from parsed output, an allowlist is the difference
     /// between a name and whatever the parse produced. Found by mutation --
@@ -1210,8 +1436,8 @@ mod tests {
     /// `"unknown"` is `Examination::framework`'s struct default, and a
     /// completed probe leaves it there when neither engine was found -- the
     /// ordinary case for most machines. Found by mutation: the prior code
-    /// special-cased an empty string here, a value `examine.rs` never
-    /// actually writes, so every one of these tests passed against a branch
+    /// special-cased an empty string here, a value `examine/framework.rs`
+    /// never actually writes, so every one of these tests passed against a branch
     /// that could never run, while the case that does run every day fell
     /// through to [`UNKNOWN`] and mislabelled an absence as unreadable.
     #[test]
@@ -1256,7 +1482,7 @@ mod tests {
 
     /// An absent ROCm and an unreadable one are different facts.
     ///
-    /// `examine.rs` collapses both into an empty `rocm_version`, so without
+    /// `examine/rocm_install_probe.rs` collapses both into an empty `rocm_version`, so without
     /// this the report would say "not installed" about a machine whose install
     /// merely could not be read -- turning an install problem into an absence
     /// for anybody counting.

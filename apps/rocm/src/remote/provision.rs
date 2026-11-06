@@ -117,7 +117,7 @@ fn remote_installer_command(channel: &str) -> String {
     // checksum and signature verification all run there, for it.
     format!(
         "curl -fsSL {INSTALLER_URL} | sh -s -- {}",
-        super::shell_quote(channel)
+        rocm_core::posix_shell_quote(channel)
     )
 }
 
@@ -253,8 +253,8 @@ fn install_from_archive_command(
     // a quoted suffix is one word to the shell.
     format!(
         "{signing_env}ROCM_CLI_ARCHIVE={remote_dir}/{} sh {remote_dir}/install.sh {}",
-        super::shell_quote(asset),
-        super::shell_quote(channel)
+        rocm_core::posix_shell_quote(asset),
+        rocm_core::posix_shell_quote(channel)
     )
 }
 
@@ -332,7 +332,7 @@ fn signing_env_fragment_from(
     Ok(pem.map(|pem| {
         format!(
             "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM={} ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ",
-            super::shell_quote(&pem)
+            rocm_core::posix_shell_quote(&pem)
         )
     }))
 }

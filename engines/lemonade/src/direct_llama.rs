@@ -2,19 +2,25 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Result, anyhow, bail};
-use rocm_core::{AppPaths, runtime_home_dir};
+use anyhow::{Context, Result, anyhow, bail};
+use rocm_core::{AppPaths, format_http_base_url, http_get_text_with_auth, runtime_home_dir};
+use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::backend_alignment::{LemonadeRuntime, ROCM_LLAMACPP_BACKEND_DIRS};
-use crate::install::{LemonadeInstallManifest, platform_binary_name};
+use crate::install::{LemonadeInstallManifest, LemonadeRuntime, platform_binary_name};
 use crate::process::{
-    LemonadeProcessEnvironment, run_lemonade_model_load, run_lemonade_pull,
-    serve_direct_llama_server, spawn_lemond, wait_for_lemonade_cli_status,
+    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
+    model_names_match, query_chat_smoke_endpoint, run_lemonade_model_load, run_lemonade_pull,
+    spawn_lemond, wait_for_lemonade_cli_status,
 };
-use crate::state::{free_local_port, resolve_lemonade_model_ref, terminate_pid};
+use crate::state::{
+    free_local_port, mark_json_status, merge_json_state, resolve_lemonade_model_ref, terminate_pid,
+    write_running_state,
+};
 use crate::{
     DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_MODEL_GGUF, DEFAULT_MODEL_REPO_DIR, ROCM_BACKEND_NAME,
     ServeHttpRequest,
@@ -193,6 +199,218 @@ pub(crate) fn ensure_direct_llama_model_available(
     result
 }
 
+/// Run one of Lemonade's packaged `llama-server` binaries (`server`) directly on a
+/// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
+/// a canonical Hugging Face name is served under exactly that name — Lemonade's router
+/// renames registered models, but an llama-server alias is a free-form string.
+pub(crate) fn serve_direct_llama_server(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    process_env: &LemonadeProcessEnvironment,
+    server: &Path,
+    log_path: Option<&Path>,
+    reason: &anyhow::Error,
+) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
+        format!(
+            "Lemonade downloaded model `{}` was not found for direct serving",
+            request.model_ref
+        )
+    })?;
+    if !server.is_file() {
+        bail!("Lemonade llama-server is missing at {}", server.display());
+    }
+    let backend = llama_server_backend_label(server);
+
+    if let Some(log_path) = log_path
+        && let Some(parent) = log_path.parent()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(log_path) = log_path {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        writeln!(
+            log,
+            "\nLaunching Lemonade packaged {backend} llama-server directly: {reason:#}"
+        )
+        .ok();
+    }
+
+    let mut direct_env = process_env.clone();
+    if let Some(server_dir) = server.parent() {
+        push_existing_path(&mut direct_env.path_entries, server_dir.to_path_buf());
+        push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
+    }
+
+    let mut command = ProcessCommand::new(server);
+    command
+        .arg("-m")
+        .arg(&model_path)
+        .arg("--host")
+        .arg(&request.host)
+        .arg("--port")
+        .arg(request.port.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--alias")
+        .arg(&request.model_ref)
+        .stdin(Stdio::null());
+    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
+        command.args(&engine_recipe.required_flags);
+    }
+    // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
+    // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
+    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // secret never lands in the process table). Reusing the managed file rather than
+    // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
+    // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
+    if let Some(key_file) = rocm_engine_protocol::resolve_endpoint_api_key_file() {
+        command.arg("--api-key-file").arg(&key_file);
+    }
+    if let Some(log_path) = log_path {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open {}", log_path.display()))?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    apply_lemonade_process_environment(&mut command, &direct_env)?;
+    hide_child_console_window(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", server.display()))?;
+    write_running_state(
+        request,
+        runtime,
+        std::process::id(),
+        Some(child.id()),
+        "running",
+    )?;
+    // If the server never becomes ready (or fails the smoke test), don't leak the child
+    // or leave the state stuck at `running`: kill it and mark the service failed.
+    let readiness = (|| -> Result<()> {
+        wait_for_openai_models_ready(
+            &request.host,
+            request.port,
+            &request.model_ref,
+            Duration::from_mins(2),
+        )?;
+        if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
+            bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
+        }
+        Ok(())
+    })();
+    if let Err(error) = readiness {
+        let _ = terminate_pid(child.id(), true);
+        let _ = child.wait();
+        let _ = mark_json_status(&request.state_path, "failed");
+        return Err(error);
+    }
+    merge_json_state(
+        &request.state_path,
+        &json!({
+            "status": "ready",
+            "server_pid": child.id(),
+            // Identity token for the server PID, captured while the child is alive.
+            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
+            "backend_state": "ready",
+            "backend_requested": backend,
+            "backend_mode": "lemonade-packaged-llama-server",
+            "load_response": {
+                "status": "loaded",
+                "method": "lemonade-packaged-llama-server",
+                "model_name": request.model_ref,
+                "model_path": model_path,
+                "llamacpp_backend": backend
+            },
+        }),
+    )?;
+    let status = child
+        .wait()
+        .context("failed waiting for Lemonade packaged llama-server")?;
+    mark_json_status(
+        &request.state_path,
+        if status.success() {
+            "stopped"
+        } else {
+            "failed"
+        },
+    )?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Lemonade packaged llama-server exited with status {status}")
+    }
+}
+
+fn wait_for_openai_models_ready(
+    host: &str,
+    port: u16,
+    model_ref: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let endpoint = format_http_base_url(host, port);
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let start = std::time::Instant::now();
+    let mut last_error = None;
+    while start.elapsed() < timeout {
+        match http_get_text_with_auth(
+            &endpoint,
+            "/v1/models",
+            endpoint_api_key.as_deref(),
+            Duration::from_secs(3),
+        )
+        .and_then(|body| parse_models_ready(&body, model_ref))
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    bail!(
+        "Lemonade packaged llama-server did not become ready: {}",
+        last_error.unwrap_or_else(|| "not checked".to_owned())
+    )
+}
+
+fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
+    let value = serde_json::from_str::<Value>(body.trim())
+        .context("failed to parse /v1/models response")?;
+    Ok(models_payload_has_loaded_model(&value, model_ref))
+}
+
+fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
+    value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                ["id", "model", "name"]
+                    .into_iter()
+                    .filter_map(|field| model.get(field).and_then(Value::as_str))
+                    .any(|loaded| model_names_match(loaded, model_ref))
+            })
+        })
+}
+
+fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() || paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
+}
+
 /// A canonical Hugging Face checkpoint reference: `owner/repo` with an optional
 /// `:variant` suffix (a quantization label such as `BF16`/`Q4_0`, or an exact
 /// `file.gguf`).
@@ -271,32 +489,8 @@ pub(crate) fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Op
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
-/// Like [`find_llama_server_binary`], but scoped to the single backend Lemonade
-/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
-/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
-/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
-/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
-/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
-/// does. This is what lets alignment verification reject a stale ROCm directory left
-/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
-pub(crate) fn find_llama_server_binary_for_backend(
-    manifest: &LemonadeInstallManifest,
-    backend_name: &str,
-) -> Option<PathBuf> {
-    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
-    let binary = platform_binary_name("llama-server");
-    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &ROCM_LLAMACPP_BACKEND_DIRS
-    } else {
-        &["vulkan"]
-    };
-    family
-        .iter()
-        .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
-}
-
 /// Look for `binary` directly in `dir`, then one level down in each subdirectory.
-fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     let direct = dir.join(binary);
     if direct.is_file() {
         return Some(direct);
@@ -709,62 +903,6 @@ mod tests {
             backend_name: ROCM_BACKEND_NAME.to_owned(),
             installed_at_unix_ms: 0,
         }
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_rocm_family() {
-        let dir = scratch_dir("find-server-scoped-rocm");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale vulkan install from an earlier attempt must never satisfy a "rocm"
-        // scoped lookup.
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            None
-        );
-
-        // Any directory in the ROCm family satisfies it, matching the unscoped scan's
-        // priority order.
-        let nightly_dir = llamacpp.join("rocm-nightly");
-        fs::create_dir_all(&nightly_dir).unwrap();
-        fs::write(nightly_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            Some(nightly_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_vulkan_only() {
-        let dir = scratch_dir("find-server-scoped-vulkan");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale rocm-stable install from an earlier attempt must never satisfy a
-        // "vulkan" scoped lookup, even though it would win the unscoped priority scan.
-        let rocm_dir = llamacpp.join("rocm-stable");
-        fs::create_dir_all(&rocm_dir).unwrap();
-        fs::write(rocm_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            None
-        );
-
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            Some(vulkan_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

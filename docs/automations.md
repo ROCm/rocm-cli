@@ -12,7 +12,10 @@ grant a new action, choose a tool, override watcher mode, or run shell.
 
 ## Local Webhook Source
 
-Start the persistent watcher loop with a loopback-only webhook source:
+Start the watcher loop with a loopback-only webhook source. The loop runs only
+while at least one watcher is enabled and exits on its own within a few seconds
+otherwise, so enable one first (for example `rocm automations enable
+gpu-metrics`):
 
 ```bash
 rocmd run --automations-enabled --local-webhook-port 18080
@@ -86,6 +89,17 @@ the exact `/automations approve <id>` and `/automations reject <id>` controls.
 Raw backend action and restricted-tool names are kept out of this overview so
 the user-facing history stays readable.
 
+In `propose` mode, while a restart request for a managed server is still
+awaiting review, `server-recover` does not queue another one for that server.
+It records a
+`restart_proposal_already_pending` event instead, so a server that stays
+unhealthy shows one pending request rather than a new one on every recovery
+check. If the review requests cannot be read (for example the file is
+corrupt), `server-recover` records a `restart_proposal_check_failed` error
+event and queues no restart for that server until they can be read again: it
+cannot tell whether one is already pending, and the failure is reported rather
+than raised so the `rocmd` daemon keeps running.
+
 For `cache-warm`, the webhook accepts exactly `cache.warm` and can only request
 a reviewed prefetch request for an artifact ref already present in the model
 recipe registry:
@@ -153,8 +167,10 @@ For `gpu-thermal-protect`, rocm-cli can also create events from local
 `gpu.thermal_pressure` or `gpu.memory_pressure`. In `observe` mode it records
 the pressure only. In `propose` and `contained` modes it queues a reviewed
 `stop_server` proposal only when the target managed server is explicit or
-there is exactly one running managed server. It does not stop a model server
-automatically:
+there is exactly one running managed server. While a stop request for a server
+is still waiting for review, a further alert for that server is recorded and
+queues no second request, however many other proposals were queued after it.
+It does not stop a model server automatically:
 
 ```powershell
 Invoke-RestMethod `
@@ -163,6 +179,33 @@ Invoke-RestMethod `
   -Body '{"watcher_hint":"gpu-thermal-protect","kind":"gpu.thermal_pressure","service_id":"<service-id>","reason":"hotspot_temperature_threshold","payload":{"summary":"GPU 0 hotspot temperature is 96 C (limit 95 C)"}}' `
   http://127.0.0.1:18080/automation-events
 ```
+
+## History And Retention
+
+Automations keep three local histories under the rocm-cli data directory
+(`~/.rocm` by default):
+
+- `automations/events.jsonl`: what each watcher did.
+- `audit/events.jsonl`: the audit log, written by both `rocm` and `rocmd`.
+- `automations/proposals.jsonl`: review requests and their status.
+
+The event log and the audit log are capped by size. When one reaches 8 MiB,
+the next write renames it to `events.jsonl.1` (shifting an existing `.1` to
+`.2`, and so on) and starts a new file. Four rotated files are kept, so each
+log holds at most about 40 MiB; the oldest is deleted by the next rotation.
+With the `gpu-metrics` watcher enabled, the busiest writer, that is roughly
+two months of history; without it, considerably more. `rocm automations` and
+the dashboard read across the rotated files, so recent activity stays visible
+right after a rotation.
+
+A log that already grew past 8 MiB before this cap existed is rotated aside
+whole, so it can take up to four more rotations before that oversized file is
+deleted and the log falls under the cap.
+
+Review requests are never rotated away, because a pending request must stay
+available to approve or reject. Instead, approving or rejecting a request
+trims the history: every pending request is kept, along with the 200 most
+recently reviewed ones, and older reviewed requests are removed.
 
 ## Artifact Prefetch Action
 
