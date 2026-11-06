@@ -78,17 +78,6 @@ pub enum Probe<T> {
 }
 
 impl<T> Probe<T> {
-    /// Turn a raw reading into a parsed one; a reading `f` rejects is `Unreadable`.
-    #[must_use]
-    pub fn parse<U>(self, f: impl FnOnce(T) -> Option<U>) -> Probe<U> {
-        match self {
-            Self::Absent => Probe::Absent,
-            Self::Unreadable => Probe::Unreadable,
-            Self::Unparsed(hint) => Probe::Unparsed(hint),
-            Self::Read(value) => f(value).map_or(Probe::Unreadable, Probe::Read),
-        }
-    }
-
     /// Fall back to `next` when this probe produced no reading.
     ///
     /// A reading from either wins. Without one, the result is `Absent` only if
@@ -233,6 +222,11 @@ impl DrainTarget {
 
 /// The free-memory floor to wait for on a pool of `total_mib`: the
 /// model-sized ceiling, but never more than 90% of the pool.
+///
+/// The 90% cap is a tolerance, not a demand for an empty pool: on the CI Strix
+/// Halo hosts' ~100 GiB GTT pool (102 400 MiB, floor 92 160 MiB) about 10 GiB
+/// can still be held when the wait ends as drained. That is the accepted cost
+/// of a floor that a pool with some memory permanently in use can still meet.
 #[must_use]
 pub fn required_free_mib(total_mib: u64) -> u64 {
     MAX_FREE_FLOOR_MIB.min(total_mib / 100 * 90)
@@ -286,6 +280,13 @@ pub fn probe_budget(now: Instant, deadline: Instant) -> Duration {
     SMI_PROBE_TIMEOUT.min(deadline.saturating_duration_since(now))
 }
 
+/// Whether a sample started at `now` has its probes held to less than a full
+/// [`SMI_PROBE_TIMEOUT`] by `deadline` (see [`DrainWait::observe_truncated`]).
+#[must_use]
+pub fn sample_is_truncated(now: Instant, deadline: Instant) -> bool {
+    probe_budget(now, deadline) < SMI_PROBE_TIMEOUT
+}
+
 /// How the drain wait ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -337,6 +338,21 @@ impl DrainWait {
             // A tool that vanishes mid-wait is a sample nobody could read.
             Judgement::NoTooling | Judgement::Unreadable => self.unread(),
         }
+    }
+
+    /// As [`observe`](Self::observe), for a sample taken when the deadline had
+    /// already cut its probes short (`truncated`, see [`probe_budget`]).
+    ///
+    /// A truncated sample that gave no reading says nothing about the tool: it
+    /// was stopped by the deadline, not stalled. Counting it would let a probe
+    /// killed in the last seconds replace a below-floor reading with
+    /// "unreadable" at the deadline. It is ignored, so the wait ends on the last
+    /// real reading. A truncated sample that does read counts as usual.
+    pub fn observe_truncated(&mut self, judgement: Judgement, truncated: bool) -> Option<Verdict> {
+        if truncated && matches!(judgement, Judgement::Unreadable | Judgement::Unparsed(_)) {
+            return None;
+        }
+        self.observe(judgement)
     }
 
     fn unread(&mut self) -> Option<Verdict> {
@@ -524,6 +540,15 @@ pub fn sample_device_memory(
 ///
 /// These tools can stall on a wedged driver, and the drain wait is best-effort:
 /// a stalled probe must cost one sample, not the worker.
+///
+/// This is a behaviour change on discrete lanes: the previous probe ran
+/// `amd-smi metric -m` with no timeout, so a slow call (an 8-GPU `metric` call
+/// can be slow) simply took as long as it took, and a wedged one hung the
+/// worker. Now `amd-smi` is cut off at this bound, or at the time left before
+/// the deadline, and the `rocm-smi` fallback is asked next with its own bound,
+/// so a sample costs at most two bounds and still gets a reading whenever
+/// `rocm-smi` answers in time. It is not unbounded either way, and a tool that
+/// never answers is reported as unreadable after a few samples.
 pub const SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SMI_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -819,14 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_keeps_absent_and_unreadable_and_rejects_what_it_cannot_read() {
-        assert_eq!(Probe::<u8>::Absent.parse(Some), Probe::Absent);
-        assert_eq!(Probe::<u8>::Unreadable.parse(Some), Probe::Unreadable);
-        assert_eq!(Probe::Read(3_u8).parse(|n| Some(n + 1)), Probe::Read(4));
-        assert_eq!(Probe::Read(3_u8).parse(|_| None::<u8>), Probe::Unreadable);
-    }
-
-    #[test]
     fn rocm_smi_csv_gtt_is_read_in_mib() {
         let text = "device,GTT Total Memory (B),GTT Total Used Memory (B)\n\
                     card0,107374182400,41787392\n";
@@ -973,6 +990,44 @@ mod tests {
              installed but gave no usable reading)"
         );
         assert!(!line.contains("NOT drained"), "{line}");
+    }
+
+    #[test]
+    fn a_probe_the_deadline_cut_short_does_not_replace_a_below_floor_reading() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe_truncated(undrained(), false), None);
+        // The last sample's probe was killed by the deadline and gave nothing.
+        assert_eq!(
+            wait.observe_truncated(Judgement::Unreadable, true),
+            None,
+            "a truncated sample with no reading is not counted"
+        );
+        assert_eq!(
+            wait.observe_truncated(Judgement::Unparsed("rocm-smi: killed".to_owned()), true),
+            None
+        );
+        assert_eq!(
+            wait.timed_out(),
+            Verdict::NotDrained(select_drain_target(strix_holding(1_000))),
+            "the wait ends on the last real reading, not on the probe the deadline stopped"
+        );
+    }
+
+    #[test]
+    fn an_unread_sample_that_was_not_cut_short_still_counts_and_a_truncated_reading_still_reads() {
+        let mut wait = DrainWait::default();
+        assert_eq!(wait.observe_truncated(undrained(), false), None);
+        assert_eq!(wait.observe_truncated(Judgement::Unreadable, false), None);
+        assert!(
+            matches!(wait.timed_out(), Verdict::Unreadable { samples: 1, .. }),
+            "a stalled probe with the full budget is a real miss"
+        );
+        let mut wait = DrainWait::default();
+        let verdict = wait.observe_truncated(drained(), true);
+        assert!(
+            matches!(verdict, Some(Verdict::Drained(_))),
+            "a truncated sample that read is judged like any other: {verdict:?}"
+        );
     }
 
     #[test]
@@ -1290,6 +1345,24 @@ mod tests {
         assert_eq!(
             probe_budget(now + Duration::from_secs(5), now),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_sample_is_truncated_only_when_less_than_a_full_probe_timeout_is_left() {
+        let now = Instant::now();
+        assert!(!sample_is_truncated(now, now + Duration::from_secs(100)));
+        assert!(
+            !sample_is_truncated(now, now + SMI_PROBE_TIMEOUT),
+            "exactly a full probe timeout left is not truncated"
+        );
+        assert!(sample_is_truncated(
+            now,
+            now + SMI_PROBE_TIMEOUT.saturating_sub(Duration::from_millis(1))
+        ));
+        assert!(
+            sample_is_truncated(now + Duration::from_secs(5), now),
+            "past the deadline is truncated"
         );
     }
 

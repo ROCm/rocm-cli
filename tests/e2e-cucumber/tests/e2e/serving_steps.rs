@@ -14,6 +14,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::device_memory::{
     DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Pool, Probe, bounded_stdout, describe_verdict,
     judge, parse_amd_smi_vram, parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
+    sample_is_truncated,
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
@@ -289,9 +290,12 @@ async fn wait_for_free_vram() -> String {
     let mut wait = DrainWait::default();
     loop {
         // Every probe is held to the time left, so the wait ends at its deadline
-        // rather than a few probe timeouts after it.
+        // rather than a few probe timeouts after it. A sample started with less
+        // than a full probe timeout left is `truncated`: if it gives no reading
+        // that is the deadline's doing, not the tool's, and is not counted.
+        let truncated = sample_is_truncated(Instant::now(), deadline);
         let sample = judge(probe_device_memory(deadline).await);
-        if let Some(verdict) = wait.observe(sample) {
+        if let Some(verdict) = wait.observe_truncated(sample, truncated) {
             return describe_verdict(verdict, started.elapsed().as_secs());
         }
         let left = deadline.saturating_duration_since(Instant::now());
