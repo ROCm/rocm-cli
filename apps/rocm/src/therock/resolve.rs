@@ -14,6 +14,7 @@ pub(super) use self::tarball::{resolve_tarball_artifact, resolve_tarball_artifac
 #[cfg(test)]
 pub(super) use self::wheel::select_rocm_version;
 pub(super) use self::wheel::{
-    AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
-    resolve_pip_runtime_with_timeout, unverified_torchaudio_note, wheel_runtime_composition,
+    AggregateDeviceTarget, TorchaudioPin, canonical_auto_select_needs_next_python,
+    resolve_pip_runtime, resolve_pip_runtime_with_timeout, unverified_torchaudio_note,
+    wheel_runtime_composition,
 };
