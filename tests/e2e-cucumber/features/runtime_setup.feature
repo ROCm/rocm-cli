@@ -327,7 +327,10 @@ Feature: Runtime configuration
   # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
   # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
   # predates a matching ROCm-version asset), and Tier 2's newest build
-  # succeeds -- producing exactly the line this scenario asserts.
+  # succeeds -- producing exactly the line this scenario asserts. That held for
+  # an SDK whose TheRock tarball Lemonade could download; for a 7.14.x SDK Tier 2
+  # fails too (the tarball is not published where Lemonade 11.5.1 looks), which is
+  # why `expectations.toml` carries a Windows row for this scenario (ROCMAI-899).
   #
   # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
   # environment and has no llama.cpp backend to align; `@nightly` for the same
