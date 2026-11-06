@@ -2777,6 +2777,165 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         });
 }
 
+/// Create `path` as a symbolic link to itself, so opening it fails with a loop
+/// error. The scenario that uses it is `@requires-os:linux`.
+#[cfg(unix)]
+fn make_unreadable_record(path: &std::path::Path) {
+    std::os::unix::fs::symlink(path, path).expect("failed to plant the unreadable record");
+}
+
+#[cfg(not(unix))]
+fn make_unreadable_record(_path: &std::path::Path) {
+    panic!("the unreadable-registry scenario is Linux-only (@requires-os:linux)");
+}
+
+/// Make the managed-service registry unreadable and wait for the failure to
+/// reach the screen. The registry is made unreadable by adding one record file
+/// that cannot be opened: a symbolic link to itself, which fails with a loop
+/// error rather than "not found" (a dangling link would read as a record that
+/// was removed on purpose, and be skipped). That is a single atomic step that
+/// leaves the existing record and the directory in place, and it works for a
+/// privileged user, which a permission change does not. The dashboard process
+/// polls the registry on its own schedule, so the step must never expose a
+/// registry with the records gone: deleting the directory before putting
+/// something in its place would let a poll in between read an absent registry,
+/// which is a confirmed-empty one, and retire the model the scenario expects to
+/// survive. The header warnings badge growing is the evidence that a frame the
+/// daemon assembled after the failed pass is on display (the daemon adds a
+/// warning for as long as the registry cannot be read); the count is read before
+/// the change because other warnings, such as no amd-smi on a GPU-less runner,
+/// are already present and constant.
+#[when("the managed-service registry becomes unreadable")]
+async fn managed_registry_becomes_unreadable(world: &mut E2eWorld) {
+    let before = warning_badge_count(&session(world).screen_text());
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let looping = services_dir.join("unreadable.json");
+    make_unreadable_record(&looping);
+
+    session(world)
+        .wait_for_screen_where(
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the unreadable registry never reached the header warnings badge, so no \
+                 frame here is known to postdate the failed read: {e}"
+            )
+        });
+}
+
+/// The badge growing is what the `When` step waited for; this reads it back so
+/// the scenario states the expectation, and a failure here names the half that
+/// broke: the registry failure went unreported, rather than the model dropped.
+#[then("the header warns that the registry is not being read")]
+async fn header_warns_registry_unread(world: &mut E2eWorld) {
+    assert!(
+        warning_badge_count(&session(world).screen_text()) > 0,
+        "the header shows no warning after the registry became unreadable"
+    );
+}
+
+/// The model must be on screen in the frame that carries the warning and stay
+/// on every frame for a few seconds after it. A daemon that retired the model
+/// on a failed read would drop it in the same frame as the warning appears, so
+/// the first sample already catches it; the dwell covers a retirement that
+/// trails by a discovery tick.
+#[then("the managed model stays displayed")]
+async fn managed_model_stays_displayed(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let screen = session(world).screen_text();
+        assert!(
+            screen.contains(&model),
+            "the managed model left the screen while its registry could not be read:\n{screen}"
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The model `another managed model is served` adds beside the first one.
+const OTHER_MODEL: &str = "TestModel/E2E-2B";
+
+/// Serve a second model: write a record for it into the registry, as `rocm serve`
+/// does, by copying the first model's record under another service id and name.
+/// It is written to a temporary name and renamed into place, so a poll of the
+/// registry never reads half a record (which would read as a malformed one, not
+/// as the new service).
+///
+/// The record points at a disposable `sleep` child, not at the harness, for the
+/// reason `managed_model_record_points_at_disposable_process` gives: the World's
+/// teardown runs `rocm services stop <id> --yes` for every record but the first
+/// model's, and that signals whatever process the record names. The child is kept
+/// in `recorded_process`, which teardown reaps.
+#[when("another managed model is served")]
+async fn another_managed_model_is_served(world: &mut E2eWorld) {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn the disposable process for the second model");
+    let pid = child.id();
+    let start_ticks = rocm_core::process_start_ticks(pid);
+    world.recorded_process = Some(child);
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let first = std::fs::read(services_dir.join("e2e-mock.json"))
+        .expect("the first model's record should be in the registry");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&first).expect("the first model's record should be JSON");
+    record["service_id"] = "e2e-second".into();
+    record["model_ref"] = OTHER_MODEL.into();
+    record["canonical_model_id"] = OTHER_MODEL.into();
+    record["supervisor_pid"] = pid.into();
+    record["engine_pid"] = pid.into();
+    record["supervisor_start_ticks"] = serde_json::to_value(start_ticks).unwrap();
+    let staged = services_dir.join("e2e-second.json.tmp");
+    std::fs::write(
+        &staged,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize the second record"),
+    )
+    .expect("failed to stage the second record");
+    std::fs::rename(&staged, services_dir.join("e2e-second.json"))
+        .expect("failed to publish the second record");
+}
+
+/// The second model is on screen although the registry still holds a record that
+/// cannot be opened. The step before it left the header warning in place, so the
+/// registry is known to be failing while this waits.
+#[then("the other managed model is displayed")]
+async fn other_managed_model_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(OTHER_MODEL, default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the newly served model never appeared while one registry record could not \
+                 be read: {e}"
+            )
+        });
+}
+
 /// EAI-7960 principal regression assertion.
 ///
 /// The frame under assertion is provably post-failure (the header warnings

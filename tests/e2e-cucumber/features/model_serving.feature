@@ -396,6 +396,34 @@ Feature: Model serving
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+  # The `/dev/kfd` pre-flight (EAI-8457) is covered by `examine-31` in
+  # `examine.feature`, not here, and this note records why the scenario lives
+  # there rather than alongside the serve probes it also guards.
+  # The behaviour: on a Linux host where the KFD device cannot be opened,
+  # `rocm_core::amd_smi_json` declines the launch outright, so `serve`'s
+  # `gpu_vram_usage` and `detect_gpu_count` degrade to service state alone where
+  # they previously attempted the spawn. The same chokepoint serves `rocmd`'s
+  # bridge snapshot, and that surface is the one a scenario can observe
+  # directly: the snapshot reports `amd_smi_available` and a note that says why,
+  # as JSON, in one command. `serve`'s probes discard their error with `.ok()?`
+  # by design, so the declined branch is visible there only as the absence of a
+  # GPU-aware placement -- which a GPU-less lane cannot tell apart from having
+  # no GPU. One scenario on the observable surface beats a weaker one here.
+  # Reaching either branch needs the `e2e-test-hooks` seam
+  # `ROCM_E2E_KFD_DEVICE` (`rocm_core::preflight_kfd_device`), which moves the
+  # device the gate opens. `ROCM_CLI_TEST_HOST_ROOT` cannot substitute: the gate
+  # keeps the real node's veto on purpose, so a simulated root can make it
+  # decline but never allow -- see
+  # `the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto`.
+  # Also covered at unit level in `rocm-core`, each confirmed non-vacuous by
+  # mutation: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts the gate
+  # stops the *spawn* (a fake `amd-smi` leaves a marker file that must not
+  # appear), with the same fixture re-run against a readable device to prove the
+  # fake would otherwise have executed;
+  # `the_public_amd_smi_entry_point_gates_on_the_real_kfd_device` pins that the
+  # production wrapper gates on the real device; and
+  # `the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it` pins that the
+  # seam above relocates the probe instead of skipping it.
   # Regression test for the reuse exemption (ROCMAI-419 review). Under the
   # default `gpu_required` policy a host with no usable AMD GPU refuses `rocm
   # serve` outright, before any engine work. Re-issuing `serve` against a managed
@@ -671,12 +699,35 @@ Feature: Model serving
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
 
+  # ROCMAI-873: on WSL the GPU is reached through /dev/dxg and ROCDXG, and there
+  # is no /dev/kfd. The no-usable-GPU refusal used to tell every user to "confirm
+  # /dev/kfd is present", which a WSL user cannot do. It now names the status
+  # `rocm examine` reports for the path the probe actually asked about, and the
+  # last step runs that command on the same machine to show it exists and reports
+  # the condition (`wsl_rocdxg_missing`).
+  #
+  # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
+  # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
+  # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
+  # verdict) and the unit tests on the serve gate; there is no scenario for the
+  # launch that follows, because it would start preparing a real engine.
+  @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
+  Scenario: serve-42 - Serving on a WSL host whose ROCDXG library the loader cannot find is refused with WSL advice
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user serves a model under the GPU-required default on that machine
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the refusal points the user at the WSL driver status instead of /dev/kfd
+    And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
+
+
   # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
   # 65536 and non-numeric values share the same parser and message) is rejected
   # before any engine or GPU work, so it needs no GPU and gates every PR
   # (ungated), like its sibling serve-14.
   @id:serve-invalid-port-rejected
-  Scenario: serve-42 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-43 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -693,7 +744,7 @@ Feature: Model serving
   # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-43 - Serving on a port another managed service already holds is refused
+  Scenario: serve-44 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port
@@ -701,17 +752,17 @@ Feature: Model serving
     And the user is told to stop the service holding that port
 
   # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
-  # sibling of serve-43). No managed-service record exists here, so
+  # sibling of serve-44). No managed-service record exists here, so
   # `resolve_serve_port` never reaches the "reserved by managed service" branch
   # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
   # routing to `explicit_bind_error`'s "already in use by another process"
-  # message. Needs the same `@requires-gpu` as serve-43 for the same reason:
+  # message. Needs the same `@requires-gpu` as serve-44 for the same reason:
   # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
   # completed model/GPU resolution in hand (GPU indices are selected earlier in
   # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
   # `serve` has no CPU fallback that gets there.
   @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
-  Scenario: serve-44 - Serving on a port an untracked process already holds is refused
+  Scenario: serve-45 - Serving on a port an untracked process already holds is refused
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model explicitly on the occupied port
@@ -723,7 +774,7 @@ Feature: Model serving
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: serve-45 - Automatic serving skips an occupied default port
+  Scenario: serve-46 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection
@@ -733,7 +784,7 @@ Feature: Model serving
   # model) is already live on a different port, serve refuses instead of
   # reporting success on the old port. Same planted record and lane as serve-24.
   @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
-  Scenario: serve-46 - An explicit port that differs from a running equivalent service is refused
+  Scenario: serve-47 - An explicit port that differs from a running equivalent service is refused
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
     When the user serves that same model again on an explicit port other than the running one
@@ -744,7 +795,7 @@ Feature: Model serving
   # live managed service now holds, before it spawns anything. No GPU: the
   # refusal comes from the on-disk records.
   @id:serve-restart-refused-when-port-claimed @requires-os:linux
-  Scenario: serve-47 - Restarting a service whose port another service holds is refused
+  Scenario: serve-48 - Restarting a service whose port another service holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     And a stopped managed service is recorded on the default serve port

@@ -13,9 +13,10 @@
 //! its endpoint changes. On Lemonade: the endpoint is announced once, scraped,
 //! and announced gone when it stops answering.
 //!
-//! The registry's retirement of a vanished service and Lemonade's change of id
-//! are not driven through the loop here; they are covered only by the unit tests
-//! in `runner.rs`. The Docker source has no seam that works without a container
+//! The registry's retirement of a vanished service is driven through the loop
+//! here too, for an empty registry and for one whose directory cannot be read.
+//! Lemonade's change of id is not driven through the loop here; it is covered only
+//! by the unit tests in `runner.rs`. The Docker source has no seam that works without a container
 //! daemon, so its reconcile is covered only by the unit tests next to the shared
 //! helper in `runner.rs`.
 
@@ -157,15 +158,19 @@ fn lemonade_opts(port: u16) -> RunnerOptions {
 /// record: a torn read would look like the service vanishing and coming back,
 /// which is exactly what the tests below assert does not happen.
 fn write_record(services_dir: &std::path::Path, port: u16) {
+    write_record_for(services_dir, SVC_ID, port);
+}
+
+fn write_record_for(services_dir: &std::path::Path, id: &str, port: u16) {
     std::fs::create_dir_all(services_dir).unwrap();
     let json = format!(
-        r#"{{"service_id":"{SVC_ID}","engine":"vllm","model_ref":"Reconcile/1B","canonical_model_id":"Reconcile/1B","host":"127.0.0.1","port":{port},"status":"ready","created_at_unix_ms":0}}"#
+        r#"{{"service_id":"{id}","engine":"vllm","model_ref":"Reconcile/1B","canonical_model_id":"Reconcile/1B","host":"127.0.0.1","port":{port},"status":"ready","created_at_unix_ms":0}}"#
     );
     // The registry only reads `*.json`, so the `.tmp` suffix keeps the
     // half-written file invisible to it.
-    let tmp = services_dir.join(format!("{SVC_ID}.json.tmp"));
+    let tmp = services_dir.join(format!("{id}.json.tmp"));
     std::fs::write(&tmp, json).unwrap();
-    std::fs::rename(&tmp, services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+    std::fs::rename(&tmp, services_dir.join(format!("{id}.json"))).unwrap();
 }
 
 /// Read events until `pick` returns a value, or fail at the deadline.
@@ -435,6 +440,514 @@ async fn managed_endpoint_change_starts_the_instance_clean() {
         moved.running_reqs, None,
         "the old endpoint's request count leaked onto the new one"
     );
+}
+
+// ── Managed-service registry: what the loop does when the registry changes ──
+
+/// A running loop with one managed service that has been scraped at least once,
+/// so the tests below start from an instance that carries live fields.
+struct LiveManaged {
+    rx: broadcast::Receiver<Event>,
+    services_dir: std::path::PathBuf,
+    server: MockServer,
+    // Held so the registry directory outlives the test body.
+    _tmp: tempfile::TempDir,
+    _runner: tokio::task::JoinHandle<()>,
+}
+
+impl LiveManaged {
+    /// The port the service's record names, for writing the record back.
+    const fn last_port(&self) -> u16 {
+        self.server.port
+    }
+}
+
+async fn start_live_managed() -> LiveManaged {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+    let server = spawn_server(|_| vllm_metrics()).await;
+    write_record(&services_dir, server.port);
+    let (mut rx, runner) = spawn_runner(managed_opts(services_dir.clone()));
+    snapshot_where(&mut rx, |snap| {
+        instance(snap, SVC_ID)
+            .filter(|i| approx(i.kv_cache_usage_pct, KV_PCT))
+            .map(|_| ())
+    })
+    .await;
+    LiveManaged {
+        rx,
+        services_dir,
+        server,
+        _tmp: tmp,
+        _runner: runner,
+    }
+}
+
+/// Wait until the service is announced gone and a snapshot no longer lists it:
+/// the announcement and the snapshot are the two things a dashboard shows.
+async fn assert_service_is_retired(rx: &mut broadcast::Receiver<Event>) {
+    next_event(rx, |ev| match ev {
+        Event::InstanceGone { container_id } if container_id == SVC_ID => Some(()),
+        _ => None,
+    })
+    .await;
+    snapshot_where(rx, |snap| instance(snap, SVC_ID).is_none().then_some(())).await;
+}
+
+/// Replace the registry directory with a regular file of the same name, so
+/// listing it fails with something other than "not found". Portable: it needs no
+/// permission change, so it behaves the same for a privileged user and on Windows.
+///
+/// The directory is briefly absent between the two calls, which would read as a
+/// confirmed-empty registry. The runner is a task on this test's own
+/// current-thread runtime and reads the registry synchronously, so it cannot run
+/// between them: nothing here awaits. A test that moves to a multi-thread runtime
+/// must swap atomically instead.
+fn replace_registry_dir_with_a_file(services_dir: &std::path::Path) {
+    std::fs::remove_dir_all(services_dir).unwrap();
+    std::fs::write(services_dir, b"not a directory").unwrap();
+}
+
+/// A registry that is confirmed empty (the directory is there and holds no
+/// record) retires the service it knew about.
+#[tokio::test]
+async fn managed_confirmed_empty_registry_retires_the_known_instance() {
+    let mut live = start_live_managed().await;
+
+    std::fs::remove_file(live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// A registry directory that does not exist is also confirmed empty: it is
+/// created the first time something is served, so its absence means no services.
+#[tokio::test]
+async fn managed_absent_registry_dir_retires_the_known_instance() {
+    let mut live = start_live_managed().await;
+
+    std::fs::remove_dir_all(&live.services_dir).unwrap();
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// What the stream and the snapshots showed over a window of snapshots.
+#[derive(Default)]
+struct Window {
+    /// Every discovered/gone announcement for [`SVC_ID`], in order.
+    announcements: Vec<&'static str>,
+    snapshots: usize,
+    /// Snapshots in the window that did not list the service.
+    missing: usize,
+    /// The service as the last snapshot in the window listed it.
+    last: Option<Instance>,
+    /// The warnings the last snapshot in the window carried.
+    warnings: Vec<String>,
+}
+
+/// Watch `count` snapshots, recording what was announced and what each snapshot
+/// listed, under one deadline.
+async fn watch(rx: &mut broadcast::Receiver<Event>, count: usize) -> Window {
+    let mut window = Window::default();
+    observe(
+        rx,
+        "a window of snapshots",
+        &mut window,
+        |w, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) if inst.container_id == SVC_ID => {
+                    w.announcements.push("discovered");
+                }
+                Event::InstanceGone { container_id } if container_id == SVC_ID => {
+                    w.announcements.push("gone");
+                }
+                Event::Snapshot(snap) => {
+                    w.snapshots += 1;
+                    w.last = instance(snap, SVC_ID).cloned();
+                    w.missing += usize::from(w.last.is_none());
+                    w.warnings.clone_from(&snap.warnings);
+                }
+                _ => {}
+            }
+            w.snapshots >= count
+        },
+        |w| {
+            format!(
+                "{} snapshots, {} without the service, announcements {:?}",
+                w.snapshots, w.missing, w.announcements
+            )
+        },
+    )
+    .await;
+    window
+}
+
+fn registry_warning(window: &Window) -> Option<&String> {
+    window
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("managed registry"))
+}
+
+/// Snapshots to watch across a read failure: several discovery ticks, so a loop
+/// that retired the service would have done so well before the window ends.
+const OUTAGE_SNAPSHOTS: usize = 8;
+
+/// The service as a still-scraped managed instance should look: present, with
+/// the live fields its endpoint reports.
+fn assert_still_live(inst: &Instance) {
+    assert!(inst.port.is_some(), "the instance lost its endpoint");
+    assert!(
+        approx(inst.kv_cache_usage_pct, KV_PCT),
+        "the instance lost its kv cache reading: {:?}",
+        inst.kv_cache_usage_pct
+    );
+    assert_eq!(
+        inst.running_reqs,
+        Some(1),
+        "the instance lost its request count"
+    );
+}
+
+/// A registry directory that cannot be listed says nothing about the services in
+/// it, so the known service stays: not announced gone, still in every snapshot
+/// with the data it holds, and the header says why the registry is not being
+/// followed.
+#[tokio::test]
+async fn managed_unlistable_registry_dir_keeps_the_known_instance() {
+    let mut live = start_live_managed().await;
+
+    replace_registry_dir_with_a_file(&live.services_dir);
+    let window = watch(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        window.announcements,
+        Vec::<&str>::new(),
+        "a failed read must not announce the service gone or discovered"
+    );
+    assert_eq!(window.missing, 0, "a snapshot dropped the service");
+    assert_still_live(window.last.as_ref().expect("the service is listed"));
+    let warning = registry_warning(&window).expect("the header should say the registry is unread");
+    assert!(
+        warning.contains("keeping the last known services"),
+        "{warning}"
+    );
+}
+
+/// Restores a directory's permissions on drop, so the temp dir can be cleaned
+/// up even when the test fails part-way.
+#[cfg(unix)]
+struct RestorePermissions(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The same through a permission error rather than a path error. Unix only,
+/// because Windows has no mode bits to drop; skipped when the process can still
+/// list the directory with its read bit removed (running as root).
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_registry_dir_keeps_the_known_instance() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut live = start_live_managed().await;
+    let _restore = RestorePermissions(live.services_dir.clone());
+
+    std::fs::set_permissions(&live.services_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&live.services_dir).is_ok() {
+        eprintln!("skipped: this process can list a mode-000 directory (running as root)");
+        return;
+    }
+    let window = watch(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(window.announcements, Vec::<&str>::new());
+    assert_eq!(window.missing, 0, "a snapshot dropped the service");
+    assert_still_live(window.last.as_ref().expect("the service is listed"));
+    assert!(registry_warning(&window).is_some(), "{:?}", window.warnings);
+}
+
+/// When the registry becomes readable again with the same service in it, the
+/// service was never gone: nothing is announced, and the warning clears.
+#[tokio::test]
+async fn managed_registry_recovery_does_not_reannounce_the_known_instance() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    replace_registry_dir_with_a_file(&live.services_dir);
+    let outage = watch(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+    assert!(registry_warning(&outage).is_some());
+
+    std::fs::remove_file(&live.services_dir).unwrap();
+    write_record(&live.services_dir, port);
+    let after = watch(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        after.announcements,
+        Vec::<&str>::new(),
+        "recovery must not read as a discovery storm"
+    );
+    assert_eq!(after.missing, 0);
+    assert_still_live(after.last.as_ref().expect("the service is listed"));
+    assert_eq!(
+        registry_warning(&after),
+        None,
+        "the warning must clear once the registry reads again"
+    );
+}
+
+/// A registry that comes back readable and empty is a confirmed-empty registry:
+/// the service that was kept through the outage is retired now.
+#[tokio::test]
+async fn managed_registry_recovering_empty_retires_the_instance_kept_through_the_outage() {
+    let mut live = start_live_managed().await;
+
+    replace_registry_dir_with_a_file(&live.services_dir);
+    let outage = watch(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+    assert_eq!(outage.missing, 0);
+
+    std::fs::remove_file(&live.services_dir).unwrap();
+    std::fs::create_dir(&live.services_dir).unwrap();
+
+    assert_service_is_retired(&mut live.rx).await;
+}
+
+/// One corrupt record does not hide the others: the well-formed service stays
+/// and a new well-formed one beside the corrupt file is still discovered.
+#[tokio::test]
+async fn managed_malformed_record_does_not_hide_the_other_services() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    std::fs::write(live.services_dir.join("corrupt.json"), "{ not valid").unwrap();
+    write_record_for(&live.services_dir, "second-svc", port);
+
+    let second_announced = std::cell::Cell::new(false);
+    let mut window = Window::default();
+    observe(
+        &mut live.rx,
+        "the second service to be announced beside a corrupt record",
+        &mut window,
+        |w, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) if inst.container_id == "second-svc" => {
+                    second_announced.set(true);
+                }
+                Event::InstanceGone { container_id } => {
+                    panic!("{container_id} was announced gone beside a corrupt record")
+                }
+                Event::Snapshot(snap) => {
+                    w.snapshots += 1;
+                    w.missing += usize::from(instance(snap, SVC_ID).is_none());
+                    w.warnings.clone_from(&snap.warnings);
+                }
+                _ => {}
+            }
+            second_announced.get() && w.snapshots >= SETTLE_SNAPSHOTS
+        },
+        |w| {
+            format!(
+                "{} snapshots, second announced: {}",
+                w.snapshots,
+                second_announced.get()
+            )
+        },
+    )
+    .await;
+
+    assert_eq!(window.missing, 0, "the well-formed service was dropped");
+    assert_eq!(
+        registry_warning(&window),
+        None,
+        "a corrupt record is not an unreadable registry"
+    );
+}
+
+// ── Managed-service registry: one record that cannot be opened ──────────────
+//
+// State matrix for a registry where some record cannot be read, one test per
+// row (the rows with no unreadable record, an empty registry, and a directory
+// that cannot be listed are the tests above):
+//
+// | State                                              | Announced        | Snapshots list    | Header warning |
+// | -------------------------------------------------- | ---------------- | ----------------- | -------------- |
+// | one record unreadable, a new valid record appears  | the new one once | known + new       | yes            |
+// | one record unreadable, a known record is removed   | nothing          | known stays       | yes            |
+// | the same, then the unreadable record is fixed      | gone, once       | the removed one goes | clears      |
+// | the known service's own record becomes unreadable  | nothing          | known stays       | yes            |
+// | ... and then reads again                           | nothing          | known stays       | clears         |
+//
+// A record that cannot be opened is a symbolic link to itself, which fails with a
+// loop error (not "not found", which would read as a record removed on purpose),
+// needs no permission change and so also works when the tests run as root.
+
+/// Make `<name>.json` in the registry something that cannot be opened.
+#[cfg(unix)]
+fn write_unreadable_record(services_dir: &std::path::Path, name: &str) {
+    let file = format!("{name}.json");
+    // A relative target, so the link keeps pointing at itself when renamed.
+    std::os::unix::fs::symlink(&file, services_dir.join(&file)).unwrap();
+}
+
+/// What the stream and the snapshots showed, for every service, over a window of
+/// snapshots.
+#[cfg(unix)]
+#[derive(Default)]
+struct Roster {
+    /// Every discovered/gone announcement, in order, with the service id.
+    announcements: Vec<(String, &'static str)>,
+    snapshots: usize,
+    /// Snapshots in the window that did not list [`SVC_ID`].
+    missing_known: usize,
+    /// The ids the last snapshot in the window listed, sorted.
+    ids: Vec<String>,
+    /// [`SVC_ID`] as the last snapshot in the window listed it.
+    known: Option<Instance>,
+    /// The warnings the last snapshot in the window carried.
+    warnings: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Roster {
+    fn registry_warning(&self) -> Option<&String> {
+        self.warnings
+            .iter()
+            .find(|w| w.starts_with("managed registry"))
+    }
+}
+
+/// Watch `count` snapshots, recording every announcement and what the snapshots
+/// listed, under one deadline.
+#[cfg(unix)]
+async fn watch_roster(rx: &mut broadcast::Receiver<Event>, count: usize) -> Roster {
+    let mut roster = Roster::default();
+    observe(
+        rx,
+        "a window of snapshots",
+        &mut roster,
+        |r, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) => r
+                    .announcements
+                    .push((inst.container_id.clone(), "discovered")),
+                Event::InstanceGone { container_id } => {
+                    r.announcements.push((container_id.clone(), "gone"));
+                }
+                Event::Snapshot(snap) => {
+                    r.snapshots += 1;
+                    r.known = instance(snap, SVC_ID).cloned();
+                    r.missing_known += usize::from(r.known.is_none());
+                    r.ids = snap
+                        .instances
+                        .iter()
+                        .map(|i| i.container_id.clone())
+                        .collect();
+                    r.ids.sort();
+                    r.warnings.clone_from(&snap.warnings);
+                }
+                _ => {}
+            }
+            r.snapshots >= count
+        },
+        |r| {
+            format!(
+                "{} snapshots, listing {:?}, announcements {:?}",
+                r.snapshots, r.ids, r.announcements
+            )
+        },
+    )
+    .await;
+    roster
+}
+
+/// A new service is added while one other record cannot be opened: the readable
+/// records still add their services, announced once, and nothing is retired.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_record_does_not_hide_a_new_service() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    write_unreadable_record(&live.services_dir, "stale");
+    write_record_for(&live.services_dir, "second-svc", port);
+    let roster = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        roster.announcements,
+        [("second-svc".to_string(), "discovered")],
+        "the new service is announced once, and nothing is announced gone"
+    );
+    assert_eq!(
+        roster.missing_known, 0,
+        "a snapshot dropped the known service"
+    );
+    assert_eq!(roster.ids, [SVC_ID.to_string(), "second-svc".to_string()]);
+    let warning = roster
+        .registry_warning()
+        .expect("the header should name the unreadable record");
+    assert!(warning.contains("stale.json"), "{warning}");
+}
+
+/// While a record cannot be opened a service whose record is removed keeps its
+/// row, because the unreadable record could be any known service's; once the
+/// record reads again the registry is read in full and the removed service is
+/// retired, with the warning cleared.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_record_defers_retirement_until_it_reads_again() {
+    let mut live = start_live_managed().await;
+
+    write_unreadable_record(&live.services_dir, "stale");
+    std::fs::remove_file(live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+    let during = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        during.announcements,
+        Vec::<(String, &str)>::new(),
+        "a removed record must not retire anything while another cannot be read"
+    );
+    assert_eq!(during.missing_known, 0, "a snapshot dropped the service");
+    assert_eq!(during.ids, [SVC_ID.to_string()]);
+    assert!(during.registry_warning().is_some(), "{:?}", during.warnings);
+
+    std::fs::remove_file(live.services_dir.join("stale.json")).unwrap();
+    assert_service_is_retired(&mut live.rx).await;
+    let after = watch_roster(&mut live.rx, SETTLE_SNAPSHOTS).await;
+    assert_eq!(after.ids, Vec::<String>::new());
+    assert_eq!(
+        after.registry_warning(),
+        None,
+        "the warning must clear once the registry reads in full"
+    );
+}
+
+/// The known service's own record becomes unreadable (here it is replaced by a
+/// self-referencing link, atomically): the service keeps its row and its live
+/// fields, and is not announced again when the record reads again.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_own_record_becoming_unreadable_keeps_the_instance_and_recovers_quietly() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    let tmp_link = live.services_dir.join(format!("{SVC_ID}.json.tmp"));
+    std::os::unix::fs::symlink(format!("{SVC_ID}.json"), &tmp_link).unwrap();
+    std::fs::rename(&tmp_link, live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+    let during = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(during.announcements, Vec::<(String, &str)>::new());
+    assert_eq!(during.missing_known, 0, "a snapshot dropped the service");
+    assert_still_live(during.known.as_ref().expect("the service is listed"));
+    assert!(during.registry_warning().is_some(), "{:?}", during.warnings);
+
+    write_record(&live.services_dir, port);
+    let after = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+    assert_eq!(after.announcements, Vec::<(String, &str)>::new());
+    assert_eq!(after.missing_known, 0);
+    assert_eq!(after.ids, [SVC_ID.to_string()]);
+    assert_eq!(after.registry_warning(), None);
 }
 
 // ── Lemonade endpoint ───────────────────────────────────────────────────────
