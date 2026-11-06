@@ -13,7 +13,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail, ensure};
 
 use super::mise_lock::{self, MISE_LOCK};
-use super::profiles::{LOCK_DIR, Profiles, normalize_name};
+use super::profiles::{LOCK_DIR, Profiles, normalize_name, slash_path};
 use super::pylock::PyLock;
 
 /// The whole summary when nothing moved. `scripts/validate_runtime_update.py`
@@ -40,7 +40,7 @@ fn summary(root: &Path, base: &str) -> Result<String> {
     lock_files.extend(
         profiles
             .targets()
-            .map(|(name, _, os, _)| git_path(&Profiles::lock_path(name, os))),
+            .map(|(name, _, os, _)| slash_path(&Profiles::lock_path(name, os))),
     );
     lock_files.extend(files_at(root, &base, LOCK_DIR)?);
 
@@ -55,11 +55,6 @@ fn summary(root: &Path, base: &str) -> Result<String> {
         }
     }
     Ok(render(&before, &after))
-}
-
-/// A workspace-relative path as git spells it: `/`-separated on every OS.
-fn git_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 /// The files directly under `dir` at `commit` (none if it has no such dir).
@@ -619,11 +614,11 @@ mod tests {
     #[test]
     fn windows_paths_are_spelled_the_way_git_names_them() {
         assert_eq!(
-            git_path(Path::new("runtimes\\locks\\pylock.p-windows.toml")),
+            slash_path(Path::new("runtimes\\locks\\pylock.p-windows.toml")),
             "runtimes/locks/pylock.p-windows.toml"
         );
         assert_eq!(
-            git_path(Path::new("runtimes/locks/x.toml")),
+            slash_path(Path::new("runtimes/locks/x.toml")),
             "runtimes/locks/x.toml"
         );
     }

@@ -45,8 +45,8 @@ minimum_release_age = "7d"
 description = "Re-lock binaries and Python runtime profiles at their current pins"
 run = [
   "\"{{mise_bin}}\" lock",
-  # Cooled like `update`, so a first lock or a newly added requirement does
-  # not take a PyPI release younger than the cooldown either.
+  # Each lock is resolved again at the cutoff it records; the cooldown sets
+  # the cutoff of a lock that does not exist yet.
   "\"{{mise_bin}}\" exec -- cargo xtask deps lock --cooldown-days 7",
   "cargo xtask deps check",
 ]

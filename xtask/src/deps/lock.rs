@@ -35,10 +35,11 @@ const UV_ENV_KEPT: [&str; 7] = [
 pub(crate) struct LockOptions {
     /// Lock only this profile.
     pub(crate) profile: Option<String>,
-    /// Move every package to the newest version its requirement allows,
-    /// instead of keeping the versions already locked.
+    /// Resolve against a new cutoff (now, less the cooldown) instead of the
+    /// one each lock records, so packages move to newer releases.
     pub(crate) upgrade: bool,
-    /// Ignore PyPI releases younger than this many days.
+    /// Ignore PyPI releases younger than this many days when a new cutoff is
+    /// set: with `--upgrade`, or for a lock that does not exist yet.
     pub(crate) cooldown_days: Option<u32>,
 }
 
@@ -92,7 +93,14 @@ pub(crate) fn run(options: &LockOptions) -> Result<()> {
     let work = crate::paths::target_dir(&root).join("deps-lock");
     let env_keys: Vec<OsString> = std::env::vars_os().map(|(key, _)| key).collect();
     let uv = SystemUv { work: work.clone() };
-    run_with(&root, &work, options, &uv, env_keys)
+    run_with(
+        &root,
+        &work,
+        options,
+        &uv,
+        env_keys,
+        std::time::SystemTime::now().into(),
+    )
 }
 
 fn run_with(
@@ -101,6 +109,7 @@ fn run_with(
     options: &LockOptions,
     uv: &dyn Uv,
     env_keys: Vec<OsString>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let profiles = Profiles::load(root)?;
     if let Some(name) = &options.profile {
@@ -113,10 +122,9 @@ fn run_with(
 
     fs::create_dir_all(work)?;
     let uv_config = root.join(&profiles.policy.uv_config);
-    let exemptions = match options.cooldown_days {
-        Some(_) => cooldown_exemptions(&profiles, undated_index_projects(&uv_config, uv)?),
-        None => BTreeSet::new(),
-    };
+    // Every resolution has a cutoff, so the exemptions always apply.
+    let exemptions = cooldown_exemptions(&profiles, undated_index_projects(&uv_config, uv)?);
+    let new_cutoff = cutoff_before(now, options.cooldown_days.unwrap_or(0));
     let cleared: Vec<String> = uv_env_to_clear(env_keys.into_iter());
 
     let uv_config_text = fs::read_to_string(&uv_config)
@@ -129,13 +137,20 @@ fn run_with(
         let committed = root.join(Profiles::lock_path(name, os));
         let requirements = work.join(format!("{name}-{os}.in"));
         fs::write(&requirements, profile.requirements.join("\n") + "\n")?;
-        // uv reads an existing output file as version preferences, which is
-        // what keeps an ordinary re-lock from moving anything.
+        // What keeps an ordinary re-lock from moving anything is the cutoff
+        // the lock records: a fresh resolution against the same cutoff and
+        // the same indexes reproduces it. The old lock is never handed to uv
+        // as version preferences: with these indexes that does not converge
+        // (successive runs alternate between AMD's mirrored versions of a
+        // package and PyPI's), so a re-lock would never match.
         let output = work.join(lock_file_name(name, os));
         let _ = fs::remove_file(&output);
-        if !options.upgrade && committed.exists() {
-            fs::copy(&committed, &output)?;
-        }
+        let cutoff = match fs::read_to_string(&committed) {
+            Ok(text) if !options.upgrade => {
+                pylock::recorded_cutoff(&text).unwrap_or_else(|| new_cutoff.clone())
+            }
+            _ => new_cutoff.clone(),
+        };
 
         let command = uv_command(
             compile_args(
@@ -145,8 +160,8 @@ fn run_with(
                     output: &output,
                     profile,
                     platform,
+                    cutoff: &cutoff,
                 },
-                options,
                 &exemptions,
             ),
             &cleared,
@@ -160,6 +175,7 @@ fn run_with(
             name,
             os,
             &profiles.inputs_digest(name, os, &uv_config_text),
+            &cutoff,
         )?;
         resolved.push((committed, locked));
     }
@@ -192,14 +208,19 @@ struct CompileInputs<'a> {
     output: &'a Path,
     profile: &'a Profile,
     platform: &'a str,
+    /// RFC 3339 `--exclude-newer` cutoff.
+    cutoff: &'a str,
+}
+
+/// `days` days before `now`, to the second, as the RFC 3339 cutoff uv takes.
+fn cutoff_before(now: chrono::DateTime<chrono::Utc>, days: u32) -> String {
+    (now - chrono::Duration::days(i64::from(days)))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 /// The `uv` arguments for one profile and OS.
-fn compile_args(
-    inputs: &CompileInputs<'_>,
-    options: &LockOptions,
-    exemptions: &BTreeSet<String>,
-) -> Vec<OsString> {
+fn compile_args(inputs: &CompileInputs<'_>, exemptions: &BTreeSet<String>) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["pip", "compile", "--quiet", "--no-header", "--config-file"]
         .into_iter()
         .map(OsString::from)
@@ -217,16 +238,11 @@ fn compile_args(
     args.push(inputs.requirements.into());
     args.push("-o".into());
     args.push(inputs.output.into());
-    if options.upgrade {
-        args.push("--upgrade".into());
-    }
-    if let Some(days) = options.cooldown_days {
-        args.push("--exclude-newer".into());
-        args.push(format!("{days} days").into());
-        for project in exemptions {
-            args.push("--exclude-newer-package".into());
-            args.push(format!("{project}=false").into());
-        }
+    args.push("--exclude-newer".into());
+    args.push(inputs.cutoff.into());
+    for project in exemptions {
+        args.push("--exclude-newer-package".into());
+        args.push(format!("{project}=false").into());
     }
     args
 }
@@ -361,7 +377,10 @@ fn simple_index_projects(html: &str) -> BTreeSet<String> {
 fn remove_stale_locks(root: &Path, profiles: &Profiles) -> Result<()> {
     for stray in profiles.stray_lock_entries(root)? {
         let path = root.join(&stray);
-        eprintln!("removing {}, which no profile locks", stray.display());
+        eprintln!(
+            "removing {}, which no profile locks",
+            super::profiles::slash_path(&stray)
+        );
         // `symlink_metadata`, so a symlink is removed rather than followed.
         let is_dir = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect {}", path.display()))?
@@ -394,13 +413,20 @@ requirements = ["torch==2.13.*"]
 linux = "x86_64-manylinux_2_28"
 "#;
 
+    /// The fixed "now" of every test run: 2026-11-06T12:00:00Z.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .to_utc()
+    }
+
     fn strings(args: &[OsString]) -> Vec<String> {
         args.iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     }
 
-    fn compile(options: &LockOptions, exemptions: &[&str]) -> Vec<String> {
+    fn compile(cutoff: &str, exemptions: &[&str]) -> Vec<String> {
         let profiles = Profiles::parse(PROFILES).unwrap();
         let inputs = CompileInputs {
             uv_config: Path::new("uv.toml"),
@@ -408,21 +434,15 @@ linux = "x86_64-manylinux_2_28"
             output: Path::new("pylock.p-linux.toml"),
             profile: &profiles.profile["p"],
             platform: "x86_64-manylinux_2_28",
+            cutoff,
         };
         let exemptions = exemptions.iter().map(|e| (*e).to_owned()).collect();
-        strings(&compile_args(&inputs, options, &exemptions))
+        strings(&compile_args(&inputs, &exemptions))
     }
 
     #[test]
-    fn a_plain_relock_pins_python_platform_and_config_and_adds_nothing_else() {
-        let args = compile(
-            &LockOptions {
-                profile: None,
-                upgrade: false,
-                cooldown_days: None,
-            },
-            &[],
-        );
+    fn every_resolution_pins_python_platform_config_and_its_cutoff() {
+        let args = compile("2026-10-30T12:00:00Z", &["rocm", "torch"]);
         assert_eq!(
             args,
             [
@@ -439,33 +459,20 @@ linux = "x86_64-manylinux_2_28"
                 "p.in",
                 "-o",
                 "pylock.p-linux.toml",
-            ]
-        );
-    }
-
-    #[test]
-    fn upgrade_and_cooldown_add_their_flags_and_exemptions() {
-        let args = compile(
-            &LockOptions {
-                profile: None,
-                upgrade: true,
-                cooldown_days: Some(7),
-            },
-            &["rocm", "torch"],
-        );
-        let tail = &args[13..];
-        assert_eq!(
-            tail,
-            [
-                "--upgrade",
                 "--exclude-newer",
-                "7 days",
+                "2026-10-30T12:00:00Z",
                 "--exclude-newer-package",
                 "rocm=false",
                 "--exclude-newer-package",
                 "torch=false",
             ]
         );
+    }
+
+    #[test]
+    fn a_cutoff_is_the_cooldown_before_now_to_the_second() {
+        assert_eq!(cutoff_before(now(), 7), "2026-10-30T12:00:00Z");
+        assert_eq!(cutoff_before(now(), 0), "2026-11-06T12:00:00Z");
     }
 
     #[test]
@@ -561,23 +568,6 @@ linux = "x86_64-manylinux_2_28"
         failing.stderr(std::process::Stdio::null());
         let err = uv.compile(failing).unwrap_err();
         assert!(format!("{err:#}").starts_with("uv exited with"), "{err:#}");
-    }
-
-    #[test]
-    fn a_cooldown_alone_does_not_upgrade() {
-        let args = compile(
-            &LockOptions {
-                profile: None,
-                upgrade: false,
-                cooldown_days: Some(7),
-            },
-            &[],
-        );
-        assert!(!args.contains(&"--upgrade".to_owned()), "{args:?}");
-        assert!(
-            args.ends_with(&["--exclude-newer".to_owned(), "7 days".to_owned()]),
-            "{args:?}"
-        );
     }
 
     /// Records what the run asked uv to do, and writes a minimal lock where
@@ -687,6 +677,7 @@ linux = "x86_64-manylinux_2_28"
             &plain(),
             &FakeUv::new("0.13.5"),
             vec![],
+            now(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("pins uv 0.13.6"), "{err:#}");
@@ -703,6 +694,7 @@ linux = "x86_64-manylinux_2_28"
             &plain(),
             &FakeUv::new("0.13.6"),
             vec![],
+            now(),
         )
         .unwrap();
         let written = fs::read_to_string(locks.join("pylock.p-linux.toml")).unwrap();
@@ -713,23 +705,40 @@ linux = "x86_64-manylinux_2_28"
         assert!(!locks.join("pylock.gone-linux.toml").exists());
     }
 
+    /// The old lock is never handed to uv. A re-lock resolves at the cutoff
+    /// the lock records; `--upgrade`, or a lock that does not exist yet, takes
+    /// a new cutoff the cooldown before now.
     #[test]
-    fn the_committed_lock_is_offered_as_preferences_only_without_upgrade() {
+    fn a_relock_reuses_the_recorded_cutoff_and_upgrade_takes_a_new_one() {
         let root = workspace();
         let committed = root.path().join("runtimes/locks/pylock.p-linux.toml");
-        fs::write(&committed, "lock-version = \"1.0\"\n").unwrap();
+        fs::write(
+            &committed,
+            "# header\n# exclude-newer: 2026-01-01T00:00:00Z\nlock-version = \"1.0\"\n",
+        )
+        .unwrap();
         let uv = FakeUv::new("0.13.6");
+        let cooled = LockOptions {
+            cooldown_days: Some(7),
+            ..plain()
+        };
         run_with(
             root.path(),
             &root.path().join("work"),
-            &plain(),
+            &cooled,
             &uv,
             vec![],
+            now(),
         )
         .unwrap();
+        // The re-lock records the cutoff it actually resolved at.
+        assert_eq!(
+            pylock::recorded_cutoff(&fs::read_to_string(&committed).unwrap()).as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
         let upgrade = LockOptions {
             upgrade: true,
-            ..plain()
+            ..cooled
         };
         run_with(
             root.path(),
@@ -737,29 +746,37 @@ linux = "x86_64-manylinux_2_28"
             &upgrade,
             &uv,
             vec![],
+            now(),
         )
         .unwrap();
-        let seen: Vec<Option<String>> = uv
-            .calls
+
+        let cutoffs: Vec<String> = uv
+            .args
             .borrow()
             .iter()
-            .map(|(before, _)| before.clone())
+            .map(|args| args[args.iter().position(|a| a == "--exclude-newer").unwrap() + 1].clone())
             .collect();
-        // Profiles run in order p, q; only p has a committed lock. The plain
-        // run offers uv exactly that lock, the upgrade run offers nothing.
+        // Profiles run in order p, q; only p has a committed lock.
         assert_eq!(
-            seen,
+            cutoffs,
             [
-                Some("lock-version = \"1.0\"\n".to_owned()),
-                None,
-                None,
-                None
+                "2026-01-01T00:00:00Z",
+                "2026-10-30T12:00:00Z",
+                "2026-10-30T12:00:00Z",
+                "2026-10-30T12:00:00Z",
             ]
+        );
+        assert!(
+            uv.calls.borrow().iter().all(|(before, _)| before.is_none()),
+            "uv must never be given a previous lock as preferences"
+        );
+        // Each lock records the cutoff it was resolved at.
+        assert_eq!(
+            pylock::recorded_cutoff(&fs::read_to_string(&committed).unwrap()).as_deref(),
+            Some("2026-10-30T12:00:00Z")
         );
     }
 
-    /// Each target is resolved for its own OS's platform and its profile's
-    /// Python, so a "windows" lock is never resolved for Linux.
     #[test]
     fn each_target_is_resolved_for_its_own_platform() {
         let root = workspace();
@@ -780,6 +797,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &uv,
             vec![],
+            now(),
         )
         .unwrap();
         let value_after = |args: &[String], flag: &str| {
@@ -822,6 +840,7 @@ linux = "x86_64-manylinux_2_28"
             &plain(),
             &FakeUv::new("0.13.6"),
             vec![],
+            now(),
         )
         .unwrap();
         assert!(locks.join("pylock.p-linux.toml").is_file());
@@ -835,7 +854,15 @@ linux = "x86_64-manylinux_2_28"
         let env = ["UV_INDEX", "UV_NO_CACHE", "HOME"]
             .map(OsString::from)
             .to_vec();
-        run_with(root.path(), &root.path().join("work"), &plain(), &uv, env).unwrap();
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &plain(),
+            &uv,
+            env,
+            now(),
+        )
+        .unwrap();
         assert_eq!(
             uv.calls.borrow()[0].1,
             ["GH_TOKEN", "GITHUB_TOKEN", "UV_INDEX"]
@@ -856,6 +883,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &uv,
             vec![],
+            now(),
         )
         .unwrap();
         // Both profiles were compiled, so the loop below checks something.
@@ -883,6 +911,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &uv,
             vec![],
+            now(),
         )
         .unwrap();
         assert_eq!(uv.args.borrow().len(), 1, "only profile p is compiled");
@@ -906,6 +935,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &FakeUv::new("0.13.6"),
             vec![],
+            now(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("no profile named"), "{err:#}");
@@ -938,6 +968,7 @@ linux = "x86_64-manylinux_2_28"
             &plain(),
             &FailsOnQ(FakeUv::new("0.13.6")),
             vec![],
+            now(),
         );
         assert!(err.is_err());
         assert_eq!(
@@ -968,6 +999,7 @@ linux = "x86_64-manylinux_2_28"
             &plain(),
             &Garbled,
             vec![],
+            now(),
         )
         .unwrap_err();
         assert!(
@@ -1005,6 +1037,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &FakeUv::new("0.13.6"),
             vec![],
+            now(),
         )
         .unwrap();
         for removed in [
@@ -1057,6 +1090,7 @@ linux = "x86_64-manylinux_2_28"
             &options,
             &FakeUv::writing(body),
             vec![],
+            now(),
         )
         .unwrap();
         let profiles = Profiles::load(root.path()).unwrap();
@@ -1118,6 +1152,7 @@ linux = "x86_64-manylinux_2_28"
             &upgrade,
             &FakeUv::new("0.13.6"),
             vec![],
+            now(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("failed to write"), "{err:#}");

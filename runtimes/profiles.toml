@@ -15,7 +15,7 @@ uv-config = "runtimes/uv.toml"
 # Packages only AMD builds for ROCm. Two roles: `cargo xtask deps check`
 # refuses a lock that takes one of them from any other host, so a missing ROCm
 # build can never be silently replaced by a same-named package from PyPI; and
-# `deps lock --cooldown-days` exempts them from the cooldown, since AMD's
+# `deps lock` exempts them from its `exclude-newer` cutoff, since AMD's
 # indexes publish no upload times. An AMD-only dependency missing from this
 # list makes the weekly update fail; add it here.
 vendor-hosts = ["stable.repo.amd.com", "rocm.frameworks.amd.com"]

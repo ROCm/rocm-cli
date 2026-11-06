@@ -20,6 +20,13 @@ pub(crate) const PROFILES_FILE: &str = "runtimes/profiles.toml";
 /// it.
 pub(crate) const LOCK_DIR: &str = "runtimes/locks";
 
+/// A workspace-relative path as it is spelled in messages, docs and git:
+/// `/`-separated on every OS. `Path::join` uses `\\` on Windows, which would
+/// print `runtimes/locks\\pylock…`.
+pub(crate) fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Operating systems a profile can be locked for.
 pub(crate) const KNOWN_OSES: [&str; 2] = ["linux", "windows"];
 

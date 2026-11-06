@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use super::mise_lock;
-use super::profiles::{Profile, Profiles, Requirement, normalize_name};
+use super::profiles::{Profile, Profiles, Requirement, normalize_name, slash_path};
 use super::pylock::{self, PyLock};
 
 pub(crate) fn run() -> Result<()> {
@@ -54,7 +54,7 @@ fn collect(root: &Path) -> Result<Vec<String>> {
         Err(err) => {
             problems.push(format!(
                 "{}: missing or unreadable ({err})",
-                uv_path.display()
+                slash_path(uv_path)
             ));
             None
         }
@@ -65,9 +65,12 @@ fn collect(root: &Path) -> Result<Vec<String>> {
             Ok(text) => problems.extend(
                 lock_problems(&profiles, name, profile, os, uv_config.as_deref(), &text)
                     .into_iter()
-                    .map(|p| format!("{}: {p}", path.display())),
+                    .map(|p| format!("{}: {p}", slash_path(&path))),
             ),
-            Err(err) => problems.push(format!("{}: missing or unreadable ({err})", path.display())),
+            Err(err) => problems.push(format!(
+                "{}: missing or unreadable ({err})",
+                slash_path(&path)
+            )),
         }
     }
     problems.extend(lock_dir_problems(root, &profiles)?);
@@ -79,7 +82,7 @@ fn lock_dir_problems(root: &Path, profiles: &Profiles) -> Result<Vec<String>> {
     Ok(profiles
         .stray_lock_entries(root)?
         .into_iter()
-        .map(|path| format!("{}: not a lock any profile produces", path.display()))
+        .map(|path| format!("{}: not a lock any profile produces", slash_path(&path)))
         .collect())
 }
 
@@ -106,6 +109,11 @@ pub(crate) fn lock_problems(
              requirements, or uv.toml, changed since"
                 .to_owned(),
         );
+    }
+    // Without its cutoff a lock cannot be reproduced: a re-lock would
+    // resolve against a new one and move packages.
+    if text.starts_with(&header) && pylock::recorded_cutoff(text).is_none() {
+        out.push("records no `# exclude-newer:` cutoff to re-lock at".to_owned());
     }
     let lock = match PyLock::parse(text) {
         Ok(lock) => lock,
@@ -281,9 +289,10 @@ linux = "x86_64-manylinux_2_28"
     fn head(os: &str) -> String {
         let profiles = Profiles::parse(PROFILES).unwrap();
         format!(
-            "{}{}",
+            "{}{}{}",
             pylock::header("p", os),
-            pylock::inputs_line(&profiles.inputs_digest("p", os, UV))
+            pylock::inputs_line(&profiles.inputs_digest("p", os, UV)),
+            pylock::cutoff_line("2026-10-30T08:00:00Z")
         )
     }
 
@@ -442,6 +451,16 @@ linux = "x86_64-manylinux_2_28"
                 .iter()
                 .any(|p| p.starts_with("runtimes/uv.toml: missing or unreadable (")),
             "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_lock_without_its_cutoff_is_reported() {
+        let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com")
+            .replace(&pylock::cutoff_line("2026-10-30T08:00:00Z"), "");
+        assert_eq!(
+            problems_of(&text),
+            ["records no `# exclude-newer:` cutoff to re-lock at"]
         );
     }
 
@@ -750,7 +769,7 @@ linux = "x86_64-manylinux_2_28"
             .map(|name| {
                 format!(
                     "{}: not a lock any profile produces",
-                    Path::new("runtimes/locks").join(name).display()
+                    format_args!("runtimes/locks/{name}")
                 )
             })
             .collect();

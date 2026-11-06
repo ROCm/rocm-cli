@@ -64,6 +64,21 @@ pub(crate) fn header(profile: &str, os: &str) -> String {
     )
 }
 
+/// The header line recording the `--exclude-newer` cutoff the lock was
+/// resolved at; an ordinary re-lock resolves at the same cutoff.
+pub(crate) fn cutoff_line(cutoff: &str) -> String {
+    format!("# exclude-newer: {cutoff}\n")
+}
+
+/// The cutoff a lock records, if its header carries a valid one.
+pub(crate) fn recorded_cutoff(text: &str) -> Option<String> {
+    text.lines()
+        .take_while(|line| line.starts_with('#'))
+        .find_map(|line| line.strip_prefix("# exclude-newer: "))
+        .filter(|cutoff| chrono::DateTime::parse_from_rfc3339(cutoff).is_ok())
+        .map(str::to_owned)
+}
+
 /// The header line recording what the lock was resolved from (see
 /// `Profiles::inputs_digest`).
 pub(crate) fn inputs_line(digest: &str) -> String {
@@ -73,15 +88,22 @@ pub(crate) fn inputs_line(digest: &str) -> String {
 /// Turn uv's output (written with `--no-header`) into the committed lock.
 /// Refuses a lock that points at a local file: a committed lock must be
 /// installable on any machine.
-pub(crate) fn finalize(raw: &str, profile: &str, os: &str, inputs: &str) -> Result<String> {
+pub(crate) fn finalize(
+    raw: &str,
+    profile: &str,
+    os: &str,
+    inputs: &str,
+    cutoff: &str,
+) -> Result<String> {
     ensure!(
         !raw.contains("\"file://"),
         "uv wrote a local file:// artifact into the {profile}/{os} lock"
     );
     Ok(format!(
-        "{}{}{}",
+        "{}{}{}{}",
         header(profile, os),
         inputs_line(inputs),
+        cutoff_line(cutoff),
         raw.trim_start_matches('\n')
     ))
 }
@@ -125,16 +147,41 @@ wheels = [{ url = "https://files.pythonhosted.org/numpy-2.3.0-cp314-cp314-win_am
     /// header and the lock body.
     #[test]
     fn finalize_drops_leading_blank_lines() {
-        let out = finalize(&format!("\n\n{RAW}"), "p", "linux", "ab").unwrap();
+        let out = finalize(
+            &format!("\n\n{RAW}"),
+            "p",
+            "linux",
+            "ab",
+            "2026-10-30T12:00:00Z",
+        )
+        .unwrap();
         assert_eq!(
             out,
-            format!("{}# inputs: sha256:ab\n{RAW}", header("p", "linux"))
+            format!(
+                "{}# inputs: sha256:ab\n# exclude-newer: 2026-10-30T12:00:00Z\n{RAW}",
+                header("p", "linux")
+            )
         );
     }
 
     #[test]
+    fn the_recorded_cutoff_is_read_only_from_the_header_and_only_if_valid() {
+        let lock = finalize(RAW, "p", "linux", "ab", "2026-10-30T12:00:00Z").unwrap();
+        assert_eq!(
+            recorded_cutoff(&lock).as_deref(),
+            Some("2026-10-30T12:00:00Z")
+        );
+        assert_eq!(recorded_cutoff(RAW), None);
+        let invalid = lock.replace("2026-10-30T12:00:00Z", "last week");
+        assert_eq!(recorded_cutoff(&invalid), None);
+        // A line in the body is not the header's.
+        let in_body = format!("{RAW}# exclude-newer: 2026-10-30T12:00:00Z\n");
+        assert_eq!(recorded_cutoff(&in_body), None);
+    }
+
+    #[test]
     fn finalize_prepends_the_header_and_keeps_the_body() {
-        let out = finalize(RAW, "p", "windows", "ab").unwrap();
+        let out = finalize(RAW, "p", "windows", "ab", "2026-10-30T12:00:00Z").unwrap();
         assert!(out.starts_with(&header("p", "windows")));
         let lock = PyLock::parse(&out).unwrap();
         assert_eq!(lock.packages.len(), 2);
@@ -148,7 +195,7 @@ wheels = [{ url = "https://files.pythonhosted.org/numpy-2.3.0-cp314-cp314-win_am
     #[test]
     fn a_local_artifact_is_refused() {
         let raw = RAW.replace("https://files.pythonhosted.org/", "file:///home/u/wheels/");
-        assert!(finalize(&raw, "p", "linux", "ab").is_err());
+        assert!(finalize(&raw, "p", "linux", "ab", "2026-10-30T12:00:00Z").is_err());
     }
 
     #[test]

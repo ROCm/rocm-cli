@@ -44,7 +44,7 @@ with `--cd runtimes`.
 
 | Command | Does |
 |---|---|
-| `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries and every Python profile at the current pins (network; see below) |
+| `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries at the current pins and every Python profile at the cutoff its lock records (network; see below) |
 | `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown, then re-lock |
 | `cargo xtask deps check` | Verify every lock, offline (also run by `cargo test -p xtask`) |
 | `cargo xtask deps diff --base <rev>` | Markdown table of versions changed since `<rev>`. Every row carries a short digest after the version (of the asset for a binary, of all its artifacts' hashes for a Python package), so an artifact re-uploaded at the same version shows up too |
@@ -132,6 +132,8 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
   requirements and the text of `uv.toml` as they are now, so a lock left stale
   by an edit to any of them is caught offline, even where it still happens to
   satisfy the requirements;
+- that header records the `exclude-newer` cutoff the lock was resolved at,
+  which is what lets a re-lock reproduce it;
 - every requirement in its profile is locked at a version that satisfies it;
 - every artifact is an `https` URL with a SHA-256, served by PyPI
   (`files.pythonhosted.org`) or a `vendor-hosts` index, so a download the
@@ -184,9 +186,15 @@ downloads entirely.
 
 Like [`.github/dependabot.yml`](../.github/dependabot.yml), updates wait 7
 days so a bad release can be found and pulled first. mise applies it to
-binaries (`minimum_release_age`). For Python locks, both mise tasks run
-`deps lock --cooldown-days 7` (`lock` too, so a first lock or a newly added
-requirement is cooled as well), which passes uv `--exclude-newer`; AMD's indexes publish no
+binaries (`minimum_release_age`). For Python locks, every lock is resolved at
+an `--exclude-newer` cutoff and records it in its header
+(`# exclude-newer: <time>`). `update` runs `deps lock --upgrade
+--cooldown-days 7`, which sets a new cutoff 7 days before now; `lock` resolves
+each lock again at the cutoff it records, so it reproduces the lock unless an
+input changed, and a lock that does not exist yet gets a cutoff 7 days before
+now. The previous lock is not handed to uv as version preferences: with these
+indexes that does not converge, as successive runs alternate between AMD's
+mirrored version of a package and PyPI's. AMD's indexes publish no
 upload times and uv treats an undated file as too new, so the AMD-only
 projects they serve — those matching `vendor-packages` in `profiles.toml` — are
 exempted (`--exclude-newer-package <name>=false`). Everything else, including

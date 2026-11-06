@@ -31,19 +31,22 @@ pub(crate) const LOCK_COMMAND: &str = "runtimes/bin/mise run --cd runtimes lock"
 #[derive(Subcommand)]
 pub(crate) enum DepsCommand {
     /// Compile each Python runtime profile into its per-OS lock with the uv
-    /// pinned in `runtimes/mise.toml`. Without `--upgrade`, versions already
-    /// locked are kept.
+    /// pinned in `runtimes/mise.toml`. Each lock records the `exclude-newer`
+    /// cutoff it was resolved at; without `--upgrade` a re-lock resolves at
+    /// that same cutoff, so it reproduces the lock unless an input changed.
     Lock {
         /// Lock only this profile.
         #[arg(long)]
         profile: Option<String>,
-        /// Move every package to the newest version its requirement allows.
+        /// Resolve at a new cutoff, the cooldown before now, so packages move
+        /// to the newest releases their requirements allow.
         #[arg(long)]
         upgrade: bool,
-        /// Ignore releases younger than this many days. AMD's indexes publish
-        /// no upload times, so the AMD-only packages named in the profile
-        /// policy are exempt; everything else, including what those indexes
-        /// mirror from PyPI, is held back.
+        /// How many days before now a new cutoff is set (with `--upgrade`, or
+        /// for a lock that does not exist yet). AMD's indexes publish no upload
+        /// times, so the AMD-only packages named in the profile policy are
+        /// exempt from every cutoff; everything else, including what those
+        /// indexes mirror from PyPI, is held back.
         #[arg(long)]
         cooldown_days: Option<u32>,
     },
