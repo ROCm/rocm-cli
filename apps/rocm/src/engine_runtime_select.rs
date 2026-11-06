@@ -57,7 +57,10 @@
 //! `resolve_runtime_selector_to_exact_key` is also `pub(crate)`: `engines_cmd.rs`
 //! calls it in production, and `runtimes_cmd.rs`'s own test module calls it
 //! directly too. `single_ready_runtime_key` is called only from
-//! `validate_engine_selection_runtime` in this same module and stays private.
+//! `validate_engine_selection_runtime` in this same module and stays private;
+//! it does not decide which runtime counts as "the one ready runtime" itself,
+//! it asks `runtime_adopt::select_single_ready_runtime`, the rule
+//! `rocm comfyui install` shares.
 //! `optional_arg` and
 //! `engine_recipe_json_arg` are `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
@@ -104,10 +107,8 @@ use rocm_core::{
 };
 use rocm_engine_protocol::EngineRecipeHint;
 
-use crate::runtimes_cmd::{
-    recover_setup_runtime_registration, select_runtime_manifest,
-    validate_runtime_manifest_for_activation,
-};
+use crate::runtime_adopt::{SetupRecovery, SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtimes_cmd::{recover_setup_runtime_registration, select_runtime_manifest};
 use crate::therock;
 
 #[derive(Debug, Clone)]
@@ -212,16 +213,14 @@ pub(crate) fn validate_engine_selection_runtime(
 
 fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
-    recover_setup_runtime_registration(paths, &config)?;
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let ready = manifests
-        .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
-        .collect::<Vec<_>>();
-    Ok(match ready.as_slice() {
-        [manifest] => Some(manifest.runtime_key.clone()),
-        _ => None,
-    })
+    // Zero or several ready runtimes leave the selection open: the caller that
+    // needs a runtime says so in its own words.
+    Ok(
+        match select_single_ready_runtime(paths, &config, SetupRecovery::Persist)? {
+            SingleReadyRuntime::One(manifest) => Some(manifest.runtime_key),
+            SingleReadyRuntime::Zero { .. } | SingleReadyRuntime::Many { .. } => None,
+        },
+    )
 }
 
 pub(crate) fn resolve_runtime_selector_to_exact_key(
@@ -612,6 +611,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::runtime_registry::validate_runtime_manifest_for_activation;
     use crate::status_for_readiness;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{test_app_paths, test_paths};
@@ -1047,6 +1047,139 @@ mod tests {
         assert!(selection.env_id.is_none());
         assert!(selection.source.is_none());
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Zero ready runtimes, the registry empty: the engine path answers with no
+    /// selection rather than an error, and writes nothing. The caller reports
+    /// the missing runtime in its own words (`engines_cmd.rs` and `serve_cmd.rs`).
+    #[test]
+    fn engine_selection_with_no_registered_runtime_stays_unselected_and_writes_nothing()
+    -> Result<()> {
+        let (root, paths) = test_paths("no-registered-runtime-selection");
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert!(selection.runtime_id.is_none());
+        assert!(selection.env_id.is_none());
+        assert!(selection.source.is_none());
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Zero ready runtimes, one registered but unusable: still no selection.
+    /// Readiness is `validate_runtime_manifest_for_activation`, so a runtime
+    /// whose interpreter is gone does not count, and it is not picked as "the
+    /// only one" either.
+    #[test]
+    fn engine_selection_does_not_count_an_unusable_runtime_as_ready() -> Result<()> {
+        let (root, paths) = test_paths("unusable-runtime-selection");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        let python = manifest
+            .python_executable
+            .as_deref()
+            .expect("the fixture records an interpreter");
+        std::fs::remove_file(python)?;
+        assert!(validate_runtime_manifest_for_activation(&manifest).is_err());
+
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert!(selection.runtime_id.is_none());
+        assert!(selection.source.is_none());
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The setup-recovery half of the rule: a ready runtime that only
+    /// `recover_setup_runtime_registration` can make visible is found by the
+    /// engine path, and finding it re-files its registry entry, so the message
+    /// and the state are one fact (the selection names a key that
+    /// `rocm runtimes list` now shows).
+    #[test]
+    fn engine_selection_recovers_the_setup_runtime_the_registry_lost() -> Result<()> {
+        let (root, paths) = test_paths("setup-recovery-selection");
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new(),
+            "the registry must start without the runtime for this test to mean anything"
+        );
+
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
+        )?;
+
+        assert_eq!(
+            selection.runtime_id.as_deref(),
+            Some(manifest.runtime_key.as_str())
+        );
+        assert_eq!(selection.source.as_deref(), Some("single_ready_runtime"));
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)]
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Recovering the setup runtime writes its registry entry, and a registry
+    /// that cannot take it is reported as that on every path that recovers:
+    /// an explicit `--runtime-id` and the one-ready-runtime default (which
+    /// `serve` and `engines install` both reach). Neither may answer as if there
+    /// were no runtime, or carry on without one: the runtime is there, and the
+    /// failure is what stops the command. The error and the registry are
+    /// asserted together.
+    #[test]
+    fn engine_selection_reports_a_registry_that_cannot_take_the_setup_runtime_back() -> Result<()> {
+        for explicit in [true, false] {
+            let (root, paths) = test_paths("setup-recovery-unwritable-registry");
+            let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                &paths,
+                "release-pip-gfx120x-all-7-14-0",
+            )?;
+            let registry = crate::test_support::make_runtime_registry_unwritable(&paths)?;
+            let runtime_id = explicit.then_some(manifest.runtime_key.as_str());
+
+            let error = validate_engine_selection_runtime(
+                &paths,
+                resolve_engine_selection(&RocmCliConfig::load(&paths)?, "vllm", runtime_id, None),
+            )
+            .expect_err("a registry that cannot be written cannot take the entry back");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "failed to restore setup runtime `{}`",
+                    manifest.runtime_key
+                )),
+                "explicit: {explicit}, got: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&registry)?,
+                "not a directory",
+                "explicit: {explicit}: a failed restore leaves the registry as it was"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
         Ok(())
     }
 }
