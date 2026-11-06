@@ -41,11 +41,8 @@ pub(crate) fn serve_hf_checkpoint(
     // A variant is required: a bare `owner/repo` would need Lemonade's interactive
     // variant menu (which cannot be answered from this non-interactive path) and, if a
     // GGUF happened to be cached, risks silently serving the wrong quantization.
-    if checkpoint.variant.is_none() {
-        bail!(
-            "`{model}` needs an explicit quantization variant to serve; use `owner/repo:variant`, e.g. `{model}:Q4_K_M` (see the repo's GGUF files on Hugging Face for the available variants)",
-            model = request.model_ref
-        );
+    if let Some(message) = hf_checkpoint_variant_required(&request.model_ref) {
+        bail!("{message}");
     }
     let Some(server) = find_llama_server_binary(&runtime.manifest) else {
         bail!(
@@ -455,6 +452,38 @@ pub(crate) fn parse_hf_checkpoint(model_ref: &str) -> Option<HfCheckpoint> {
     })
 }
 
+/// Why `model_ref` cannot be served, when it is a canonical Hugging Face checkpoint
+/// given without a `:variant`. `None` means this particular objection does not apply —
+/// the reference carries a variant, or is not an `owner/repo` checkpoint at all.
+///
+/// The refusal lives here, beside the parser, because two callers at very different
+/// depths need the same answer: the pre-launch `ResolveModel` the CLI makes before it
+/// starts anything, and `serve_hf_checkpoint` inside the background engine process.
+/// Only one of the two is visible to the user on a given platform, so wording written
+/// out twice would drift and leave whichever one the user actually sees as the stale
+/// copy.
+///
+/// It deliberately names no quantization. Nothing on this path has looked inside the
+/// repository, so any example label would be invented: the repo may ship only
+/// safetensors and have no GGUF build at all, or ship GGUFs under labels that cannot be
+/// guessed from the name. Advice that fails a second time is worse than advice that
+/// sends the user to look.
+///
+/// ASCII only: this reaches a Windows console, where the OEM code page renders
+/// non-ASCII punctuation as mojibake (ROCMAI-543), and Windows is the platform where
+/// this is the user's one and only sight of the problem.
+pub(crate) fn hf_checkpoint_variant_required(model_ref: &str) -> Option<String> {
+    let checkpoint = parse_hf_checkpoint(model_ref)?;
+    checkpoint.variant.is_none().then(|| {
+        format!(
+            "`{model_ref}` needs an explicit GGUF variant to serve; use \
+             `owner/repo:<variant>` with a quantization listed in the repo's \
+             `.gguf` files. A repo with no `.gguf` files cannot be served by \
+             Lemonade: look for a GGUF build of the model"
+        )
+    })
+}
+
 /// A safe Hugging Face path component: a non-empty run of `[A-Za-z0-9._-]` that is not
 /// a `.`/`..` traversal token. Matches the Hugging Face id and quantization-label
 /// charset and, by excluding `/`, `\`, and traversal tokens, keeps a user-supplied
@@ -755,6 +784,35 @@ mod tests {
         assert!(parse_hf_checkpoint("owner/repo:../secret").is_none());
         assert!(parse_hf_checkpoint(r"owner\..\..--x/repo").is_none());
         assert!(parse_hf_checkpoint("owner/repo:a/b.gguf").is_none());
+    }
+
+    #[test]
+    fn only_a_variantless_checkpoint_needs_a_variant() {
+        let message = hf_checkpoint_variant_required("owner/repo")
+            .expect("a bare owner/repo names no GGUF file and cannot be served");
+        assert!(
+            message.contains("`owner/repo:<variant>`"),
+            "the refusal must show the form that would work, got:\n{message}"
+        );
+        // Nothing here has read the repository's file list, so an example
+        // quantization would be invented — and following invented advice fails a
+        // second time.
+        assert!(
+            !message.contains("Q4_K_M") && !message.contains("Q4_0"),
+            "the refusal must not suggest a quantization the CLI has not seen, got:\n{message}"
+        );
+        // On Windows this refusal is the user's only sight of the problem, and a
+        // Windows console on the OEM code page turns non-ASCII punctuation into
+        // mojibake (ROCMAI-543).
+        assert!(
+            message.is_ascii(),
+            "the refusal must be ASCII-only to survive a Windows console, got:\n{message}"
+        );
+        // A variant was given, so this objection does not apply.
+        assert_eq!(hf_checkpoint_variant_required("owner/repo:Q4_0"), None);
+        // Short names are not checkpoints, so this check has no opinion on them.
+        assert_eq!(hf_checkpoint_variant_required("qwen"), None);
+        assert_eq!(hf_checkpoint_variant_required(DEFAULT_MODEL), None);
     }
 
     #[test]

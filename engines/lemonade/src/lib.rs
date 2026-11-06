@@ -418,6 +418,16 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
+    // Refuse an unservable model reference on the pre-launch round trip `rocm serve`
+    // makes, not only in `serve_hf_checkpoint`. That backstop runs three layers down,
+    // inside the background engine process — which on Windows is spawned with no
+    // stdout or stderr, and whose exit status nobody reads — so its refusal is
+    // invisible there: the user gets an empty log, exit 0, and a service recorded as
+    // stopped, with nothing anywhere saying what was wrong. Answering here puts the
+    // reason on the user's terminal before any engine starts or any record is written.
+    if let Some(message) = crate::direct_llama::hf_checkpoint_variant_required(&request.model_ref) {
+        bail!("{message}");
+    }
     let device_policy = crate::device_policy::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
@@ -834,5 +844,57 @@ mod tests {
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {
         assert_eq!(STOP_SCOPE, rocm_core::KillScope::Single);
+    }
+
+    /// A `ResolveModel` request as `rocm serve` makes it for a plain
+    /// `rocm serve <model> --engine lemonade`: no runtime, no device policy, no
+    /// recipe, so only the model reference is under test.
+    fn resolve_model_request(model_ref: &str) -> ResolveModelRequest {
+        ResolveModelRequest {
+            model_ref: model_ref.to_owned(),
+            runtime_id: None,
+            device_policy: None,
+            recipe_override: None,
+            engine_recipe: None,
+        }
+    }
+
+    #[test]
+    fn resolving_a_hugging_face_repo_without_a_variant_is_refused() {
+        let error = resolve_model_response(resolve_model_request("Qwen/Qwen2.5-1.5B-Instruct"))
+            .expect_err("a bare owner/repo has no GGUF to serve and must be refused up front");
+        let message = error.to_string();
+        assert!(
+            message.contains("`owner/repo:<variant>`"),
+            "the refusal must show the form that would work, got:\n{message}"
+        );
+        // The repository was never inspected, so naming a quantization would be a
+        // guess — and a wrong guess sends the user into a second failure. This
+        // repo, for one, ships only safetensors and has no `Q4_K_M` build.
+        assert!(
+            !message.contains("Q4_K_M") && !message.contains("Q4_0"),
+            "the refusal must not suggest a quantization the CLI has not seen, got:\n{message}"
+        );
+    }
+
+    #[test]
+    fn resolving_a_servable_model_still_succeeds() {
+        // An `owner/repo:variant` is passed through verbatim: the user named an
+        // exact checkpoint and quantization, and nothing may substitute for it.
+        for model_ref in [
+            "Qwen/Qwen2.5-1.5B-Instruct:Q4_K_M",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+        ] {
+            let response = resolve_model_response(resolve_model_request(model_ref))
+                .unwrap_or_else(|error| panic!("{model_ref} must still resolve: {error}"));
+            assert_eq!(response.canonical_model_id, model_ref);
+        }
+        // Short names are not checkpoints at all, so the guard must leave them to
+        // the alias expansion that has always handled them.
+        for model_ref in ["qwen", DEFAULT_MODEL] {
+            let response = resolve_model_response(resolve_model_request(model_ref))
+                .unwrap_or_else(|error| panic!("{model_ref} must still resolve: {error}"));
+            assert_eq!(response.canonical_model_id, DEFAULT_MODEL);
+        }
     }
 }
