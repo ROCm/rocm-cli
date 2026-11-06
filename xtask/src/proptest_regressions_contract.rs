@@ -9,7 +9,9 @@
 //! lines) by the SOURCE FILE the `proptest!` block is written in. With the
 //! default `FileFailurePersistence::SourceParallel("proptest-regressions")`,
 //! a block in `<crate>/src/<path>.rs` reads and writes
-//! `<crate>/proptest-regressions/<path>.txt`. Move the test to another file
+//! `<crate>/proptest-regressions/<path>.txt`, where `src/` stands for the
+//! nearest ancestor directory of the source file that holds a `main.rs` or
+//! `lib.rs` (it is `src/` for every crate in this tree). Move the test to another file
 //! and its seed file is no longer read: no warning, no failure, and the
 //! recorded counterexample is silently never replayed again. That happened
 //! twice during module splits in `apps/rocm` -- once for real
@@ -30,7 +32,15 @@
 //! anything (a fixed bug leaves a harmless, still-replayed seed), or which
 //! `proptest!` block in a file owns which line (proptest does not record
 //! that; all blocks in a file share one seed file). It also assumes the
-//! default persistence. A test configured with `failure_persistence: None`
+//! default persistence and that layout. A crate with a `src/bin/<x>/main.rs`
+//! would be reported as an orphan by mistake: proptest takes `src/bin/<x>/` as
+//! the directory holding `main.rs` and writes `src/bin/proptest-regressions/main.txt`,
+//! which this maps to `src/bin/src/main.rs`. No crate here has such a binary
+//! with a property test; avoiding the false alarm needs a directory listing
+//! to find the `main.rs`, which the pure mapping does not have. Property tests
+//! under a crate's `tests/` directory are not seen either: no ancestor of such a
+//! file holds `main.rs` or `lib.rs`, so proptest warns and writes the seed next
+//! to the test file, not under `proptest-regressions/`. A test configured with `failure_persistence: None`
 //! never writes a seed file, and one with a different `FileFailurePersistence`
 //! would put its seeds outside `proptest-regressions/`, where this does not
 //! look. `cfg(test)` only, like the other source-scan contracts in this
@@ -113,7 +123,10 @@ mod tests {
     /// The crate directory is everything before the `proptest-regressions`
     /// component, which is empty for a crate at the repository root. The
     /// inverse of proptest's own rule: strip the directory, swap `.txt` for
-    /// `.rs`, and put the result under the crate's `src/`.
+    /// `.rs`, and put the result under the crate's `src/`. proptest's rule is
+    /// the nearest ancestor holding `main.rs` or `lib.rs`, which is `src/` for
+    /// every crate in this tree; see the module docs for the layouts where it
+    /// is not.
     fn expected_source(seed: &str) -> Option<String> {
         let parts: Vec<&str> = seed.split('/').collect();
         let at = parts.iter().position(|part| *part == REGRESSIONS_DIR)?;
@@ -234,7 +247,8 @@ mod tests {
         format!(
             "{} proptest seed file(s) that no test reads. proptest names a seed file after the \
              source file of the test (<crate>/src/<path>.rs reads \
-             <crate>/{REGRESSIONS_DIR}/<path>.txt), so the likely cause is that the property \
+             <crate>/{REGRESSIONS_DIR}/<path>.txt, with src/ the directory holding \
+             main.rs or lib.rs), so the likely cause is that the property \
              test moved to another file, or the file was renamed: the saved counterexample is \
              then never replayed again, with no warning. Fix: put its `cc` lines in \
              <crate>/{REGRESSIONS_DIR}/<path of the file the test is in now, relative to src/, \

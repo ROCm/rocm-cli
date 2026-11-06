@@ -289,7 +289,9 @@ Download Removal below; it follows the same rule.
 When a property fails, proptest saves the shrunk case as a `cc <hash> # shrinks
 to ...` line in a file named after the source file the `proptest!` block is
 written in, and replays it before any new case on every later run: a block in
-`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`. Moving
+`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`, where
+`src/` is the nearest ancestor directory holding a `main.rs` or `lib.rs` (it is
+`src/` for every crate in this tree). Moving
 the test to another file therefore leaves its saved cases behind, and proptest
 does not warn: they just stop being replayed. **Carry the saved cases to the
 test's new file in the same commit**; what that takes depends on how much moved:
@@ -308,13 +310,20 @@ test's new file in the same commit**; what that takes depends on how much moved:
 This is enforced in part by a test, not by an `xtask` subcommand:
 `every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
 `xtask` walks the tree and **fails the build** on a file under any
-`proptest-regressions/` directory whose `<crate>/src/<path>.rs` is missing or
+`proptest-regressions/` directory whose `<crate>/src/<path>.rs` (`src/` being the
+directory with `main.rs` or `lib.rs`) is missing or
 holds no `proptest!` block in code (a mention in a comment or a string literal
 does not count; whitespace or a comment between `proptest` and the `!`, as in
 `proptest ! { .. }`, still does), naming the file and the source file it expected. It cannot see
 the opposite mistake, a split that `git mv`d the regression file away from tests
 that still need it: no file is orphaned then, one is just missing, so read the
-diff of a split for it. Run the check on its own with:
+diff of a split for it. Two more things it does not check: a crate with a
+`src/bin/<x>/main.rs` that has a property test would be reported as an orphan by
+mistake, because proptest then keeps its seeds in `src/bin/proptest-regressions/`
+(nothing in this tree has one); and a property test under a crate's `tests/`
+directory is invisible to it, since proptest cannot find a `main.rs` or `lib.rs`
+above such a file and writes the seed next to the test file instead. Run the
+check on its own with:
 
 ```bash
 cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
