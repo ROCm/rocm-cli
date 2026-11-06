@@ -34,12 +34,14 @@
 //! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
-//! `comfyui-15` covers the other half of that selection: with nothing chosen,
-//! the install recovers the runtime `rocm setup` created before it counts the
-//! ready ones, as `rocm serve` does, so a runtime the registry lost is found and
-//! its entry written back. It plants a ready runtime and the setup folder that
-//! names it, but no registry entry, and previews the install with `--dry-run`,
-//! which prints the `--runtime-id` of the runtime it chose.
+//! `comfyui-15` and `comfyui-16` cover the other half of that selection: with
+//! nothing chosen, the install recovers the runtime `rocm setup` created before
+//! it counts the ready ones, as `rocm serve` does, so a runtime the registry
+//! lost is found. They plant a ready runtime and the setup folder that names it,
+//! but no registry entry. `comfyui-15` previews the install with `--dry-run`,
+//! which prints the `--runtime-id` of the runtime it chose and writes nothing,
+//! so the registry still has no entry afterwards; `comfyui-16` runs the install
+//! against an existing checkout and finds the entry written back.
 //!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
 //! mirroring `download_progress_pty.feature`'s tarball scenario but for
@@ -620,6 +622,52 @@ async fn registry_has_the_setup_runtime_again(world: &mut E2eWorld) {
         entry.is_file(),
         "selecting the runtime setup created should have written {} back",
         entry.display()
+    );
+}
+
+/// A preview promises not to change files, and the registry entry is a file: the
+/// runtime it named is not registered by having been previewed.
+#[then("the runtime registry still has no entry for it")]
+async fn registry_still_lacks_the_setup_runtime(world: &mut E2eWorld) {
+    let entry = registry_dir(world).join(format!("{SETUP_RUNTIME_KEY}.json"));
+    assert!(
+        !entry.exists(),
+        "a `--dry-run` preview must not write {}",
+        entry.display()
+    );
+}
+
+#[given("a ComfyUI checkout that needs nothing beyond the runtime's torch stack")]
+async fn comfyui_checkout_needing_no_dependencies(world: &mut E2eWorld) {
+    let source_dir = data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(SETUP_RUNTIME_KEY)
+        .join("apps")
+        .join("comfyui")
+        .join("source");
+    // Every ComfyUI release has a `main.py`. The requirements name only the
+    // torch stack the runtime provides, which the install filters out, so it
+    // reaches no package index.
+    write_fixture(&source_dir.join("main.py"), "");
+    write_fixture(
+        &source_dir.join("requirements.txt"),
+        "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
+    );
+}
+
+#[then("the install uses the runtime setup created")]
+async fn install_uses_the_setup_runtime(world: &mut E2eWorld) {
+    let text = refusal_text(world);
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the install should succeed, got:\n{text}"
+    );
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        stdout.contains("action: install") && stdout.contains("ROCm runtime: 7.13.0"),
+        "the install should report the runtime setup created, got:\n{text}"
     );
 }
 

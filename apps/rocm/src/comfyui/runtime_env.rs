@@ -17,7 +17,7 @@
 //! ComfyUI types.
 
 use super::{ComfyUiManifest, ComfyUiRuntimeEnvironment, SelectedRuntime};
-use crate::runtime_adopt::{SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtime_adopt::{SetupRecovery, SingleReadyRuntime, select_single_ready_runtime};
 use crate::runtimes_cmd::runtime_usability_status;
 use crate::therock;
 use anyhow::{Context, Result, bail};
@@ -33,12 +33,13 @@ pub(super) fn select_runtime(
     paths: &AppPaths,
     config: &RocmCliConfig,
     selector: Option<&str>,
+    recovery: SetupRecovery,
 ) -> Result<SelectedRuntime> {
     let manifest = match selector.map(str::trim).filter(|value| !value.is_empty()) {
         Some(selector) => {
             select_runtime_by_selector(&registered_runtimes(paths)?, selector)?.clone()
         }
-        None => select_default_runtime(paths, config)?,
+        None => select_default_runtime(paths, config, recovery)?,
     };
     if runtime_usability_status(&manifest) != "ready" {
         bail!(
@@ -134,6 +135,7 @@ fn install_rocm_first() -> anyhow::Error {
 fn select_default_runtime(
     paths: &AppPaths,
     config: &RocmCliConfig,
+    recovery: SetupRecovery,
 ) -> Result<therock::InstalledRuntimeManifest> {
     if let Some(active_key) = config.active_runtime_key.as_deref() {
         return select_runtime_by_selector(&registered_runtimes(paths)?, active_key).cloned();
@@ -143,7 +145,9 @@ fn select_default_runtime(
             select_runtime_by_default_id(&registered_runtimes(paths)?, default_runtime_id).cloned()
         }
         // Nothing says which runtime to use: the rule the engine paths share.
-        None => single_ready_runtime_or_refusal(select_single_ready_runtime(paths, config)?),
+        None => {
+            single_ready_runtime_or_refusal(select_single_ready_runtime(paths, config, recovery)?)
+        }
     }
 }
 
@@ -425,6 +429,17 @@ mod tests {
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::fs;
 
+    /// `select_runtime` as a real install runs it: a runtime that only setup
+    /// recovery can make visible has its registry entry written back. The
+    /// preview mode has its own tests.
+    fn persisting_select_runtime(
+        paths: &AppPaths,
+        config: &RocmCliConfig,
+        selector: Option<&str>,
+    ) -> Result<SelectedRuntime> {
+        select_runtime(paths, config, selector, SetupRecovery::Persist)
+    }
+
     #[test]
     fn default_runtime_selection_uses_single_ready_runtime() -> Result<()> {
         let paths = test_paths("comfyui-single-ready-runtime");
@@ -656,7 +671,7 @@ mod tests {
         );
 
         // `select_runtime`'s bail when nothing is registered at all.
-        let error = select_runtime(&paths, &RocmCliConfig::default(), None)
+        let error = persisting_select_runtime(&paths, &RocmCliConfig::default(), None)
             .expect_err("no registered runtime means no selection");
         let message = error.to_string();
         assert!(
@@ -863,7 +878,7 @@ mod tests {
         let unusable = unusable_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
         write_runtime_manifest(&paths, &unusable)?;
 
-        let error = select_runtime(
+        let error = persisting_select_runtime(
             &paths,
             &RocmCliConfig::default(),
             Some("release-wheel-gfx94x-dcgpu-7-13-0"),
@@ -981,7 +996,7 @@ mod tests {
     -> Result<()> {
         let paths = test_paths("comfyui-selection-none-registered");
 
-        let message = select_runtime(&paths, &RocmCliConfig::default(), None)
+        let message = persisting_select_runtime(&paths, &RocmCliConfig::default(), None)
             .expect_err("no registered runtime means no selection")
             .to_string();
 
@@ -1006,7 +1021,7 @@ mod tests {
             20,
         )?;
 
-        let selected = select_runtime(&paths, &RocmCliConfig::default(), None)?;
+        let selected = persisting_select_runtime(&paths, &RocmCliConfig::default(), None)?;
 
         assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
         assert_eq!(
@@ -1037,7 +1052,7 @@ mod tests {
         );
         fs::remove_file(&python)?;
 
-        let message = select_runtime(&paths, &RocmCliConfig::default(), None)
+        let message = persisting_select_runtime(&paths, &RocmCliConfig::default(), None)
             .expect_err("an unusable runtime is not ready")
             .to_string();
 
@@ -1053,7 +1068,7 @@ mod tests {
         );
 
         fs::write(&python, "python")?;
-        let selected = select_runtime(&paths, &RocmCliConfig::default(), None)?;
+        let selected = persisting_select_runtime(&paths, &RocmCliConfig::default(), None)?;
         assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
         Ok(())
     }
@@ -1080,7 +1095,7 @@ mod tests {
         )?;
         let mut config = RocmCliConfig::default();
 
-        let message = select_runtime(&paths, &config, None)
+        let message = persisting_select_runtime(&paths, &config, None)
             .expect_err("several ready runtimes and no choice must not select")
             .to_string();
 
@@ -1093,11 +1108,11 @@ mod tests {
             "unexpected refusal: {message}"
         );
 
-        let selected = select_runtime(&paths, &config, Some(&first.runtime_key))?;
+        let selected = persisting_select_runtime(&paths, &config, Some(&first.runtime_key))?;
         assert_eq!(selected.manifest.runtime_key, first.runtime_key);
 
         crate::runtimes_cmd::activate_runtime(&paths, &mut config, &second.runtime_key)?;
-        let selected = select_runtime(&paths, &config, None)?;
+        let selected = persisting_select_runtime(&paths, &config, None)?;
         assert_eq!(selected.manifest.runtime_key, second.runtime_key);
         Ok(())
     }
@@ -1120,7 +1135,7 @@ mod tests {
         );
         assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
 
-        let selected = select_runtime(&paths, &config, None)?;
+        let selected = persisting_select_runtime(&paths, &config, None)?;
 
         assert_eq!(selected.manifest.runtime_key, manifest.runtime_key);
         assert_eq!(
@@ -1149,7 +1164,7 @@ mod tests {
         )?;
         let config = RocmCliConfig::load(&paths)?;
 
-        let message = select_runtime(&paths, &config, None)
+        let message = persisting_select_runtime(&paths, &config, None)
             .expect_err("an unusable setup runtime is an error")
             .to_string();
 
@@ -1252,10 +1267,13 @@ mod tests {
             };
             let comfyui_paths = test_paths(&format!("comfyui-engine-agree-{label}-comfyui"));
             plant_state(&comfyui_paths)?;
-            let comfyui =
-                select_runtime(&comfyui_paths, &RocmCliConfig::load(&comfyui_paths)?, None)
-                    .ok()
-                    .map(|selected| selected.manifest.runtime_key);
+            let comfyui = persisting_select_runtime(
+                &comfyui_paths,
+                &RocmCliConfig::load(&comfyui_paths)?,
+                None,
+            )
+            .ok()
+            .map(|selected| selected.manifest.runtime_key);
             let engine_paths = test_paths(&format!("comfyui-engine-agree-{label}-engine"));
             plant_state(&engine_paths)?;
             let engine = validate_engine_selection_runtime(

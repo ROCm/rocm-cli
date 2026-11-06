@@ -106,7 +106,7 @@ use rocm_core::{
 };
 use rocm_engine_protocol::EngineRecipeHint;
 
-use crate::runtime_adopt::{SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtime_adopt::{SetupRecovery, SingleReadyRuntime, select_single_ready_runtime};
 use crate::runtimes_cmd::{recover_setup_runtime_registration, select_runtime_manifest};
 use crate::therock;
 
@@ -214,10 +214,12 @@ fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
     // Zero or several ready runtimes leave the selection open: the caller that
     // needs a runtime says so in its own words.
-    Ok(match select_single_ready_runtime(paths, &config)? {
-        SingleReadyRuntime::One(manifest) => Some(manifest.runtime_key),
-        SingleReadyRuntime::Zero { .. } | SingleReadyRuntime::Many { .. } => None,
-    })
+    Ok(
+        match select_single_ready_runtime(paths, &config, SetupRecovery::Persist)? {
+            SingleReadyRuntime::One(manifest) => Some(manifest.runtime_key),
+            SingleReadyRuntime::Zero { .. } | SingleReadyRuntime::Many { .. } => None,
+        },
+    )
 }
 
 pub(crate) fn resolve_runtime_selector_to_exact_key(

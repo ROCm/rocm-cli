@@ -121,7 +121,7 @@ impl InstalledRuntimeManifest {
         wheel_composition_includes_devel(self.wheel_composition.as_ref()).unwrap_or(self.devel)
     }
 
-    fn normalize_host_paths(mut self) -> Self {
+    pub(crate) fn normalize_host_paths(mut self) -> Self {
         self.install_root = normalize_manifest_path(self.install_root);
         self.python_launcher = self
             .python_launcher
