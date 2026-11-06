@@ -7,8 +7,9 @@
 //! non-streaming responses, and the SSE emitters that turn a streamed response
 //! into `ProviderStreamEvent`s.
 //!
-//! Depends on the shared request/response types in `providers` and on the ROCm
-//! tool schema in `tool_schema`; the local HTTP transport in `local_http`
+//! Depends on the shared request/response types in `providers`, on the ROCm
+//! tool schema in `tool_schema` and on the chat-template rule in
+//! [`rocm_dash_core::chat_template`]; the local HTTP transport in `local_http`
 //! reads [`OpenAiSseEmitter`] from here, so the dependency is one-way.
 
 use super::tool_schema::{rocm_anthropic_tool_definitions, rocm_openai_tool_definitions};
