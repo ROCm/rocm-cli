@@ -740,3 +740,25 @@ Feature: Interactive dashboard
     And the instance detail lists recent throughput samples
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #796: on an idle host the Observe CPU panel drew a few scattered dots
+  # instead of a graph. Any sample whose fill rounded below one braille dot row
+  # was dropped, which on an idle machine is nearly every sample. The widget
+  # tests pin the dot maths; this scenario pins what the user sees, since the
+  # regression was only ever visible as a picture. A recording supplies the idle
+  # host the demo generator never produces — it keeps inference-shaped load
+  # around 28%, well clear of the rounding that caused the bug. Sixty entries
+  # two seconds apart outlast the scenario, as in dash-38.
+  #
+  # Observe gives its CPU slot about four rows, too few for the separate
+  # per-core box, so the dashboard keeps the box carrying history and folds the
+  # core count into its title. Both halves of that are asserted here: the count
+  # survived the dropped box, and the idle trace is a line rather than a gap.
+  @id:dash-idle-cpu-graph-is-continuous @requires-os:linux
+  Scenario: dash-43 - The CPU graph stays a line when the host is idle
+    When the user opens the dashboard replaying an idle host
+    When the user opens the Observe view
+    Then the CPU graph is drawn as a continuous line
+    And the CPU box reports the host's core count
+    When the user quits the dashboard
+    Then the dashboard exits successfully

@@ -48,6 +48,11 @@ fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
 }
 
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
+///
+/// Snapshots with no GPUs are skipped. Every `pick` here folds or sums over
+/// `gpus`, so a GPU-less snapshot yields 0, and the widget draws a baseline
+/// for every sample it is handed: a host with no GPU would read as one sitting
+/// at 0 °C and 0 W rather than as one with nothing to report.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state: &AppState,
     pick: F,
@@ -55,6 +60,7 @@ fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state
         .history
         .iter()
+        .filter(|s| !s.gpus.is_empty())
         .map(|s| pick(s).clamp(0.0, 100.0) as u64)
         .collect()
 }
@@ -1707,5 +1713,28 @@ mod tests {
             glyph_color_for("running-job", &JobStatus::Running),
             theme.accent
         );
+    }
+
+    #[test]
+    fn history_skips_snapshots_with_no_gpus() {
+        // Every `pick` folds or sums over `gpus`, so a GPU-less snapshot comes
+        // out as 0. Since the widget now draws a baseline for every sample it
+        // is handed, letting those through would paint a host with no GPU as
+        // one idling at 0 °C and 0 W.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.history.push_back(Snapshot::default());
+        s.history.push_back(Snapshot::default());
+        assert!(
+            history(&s, snap_util).is_empty(),
+            "a GPU-less snapshot reached the series"
+        );
+
+        let mut with_gpu = Snapshot::default();
+        with_gpu.gpus.push(GpuMetrics {
+            gpu_utilization_pct: 50.0,
+            ..Default::default()
+        });
+        s.history.push_back(with_gpu);
+        assert_eq!(history(&s, snap_util), vec![50]);
     }
 }

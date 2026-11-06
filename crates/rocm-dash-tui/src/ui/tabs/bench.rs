@@ -317,17 +317,25 @@ fn sparkline_max(data: &[u64]) -> u64 {
 
 fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let n = state.bench_rows.len();
-    let title = format!("prompt_tps · last {n} rows");
+    // Rows without a prompt_tps measurement are left out of the series rather
+    // than folded in as zero. The widget draws a baseline for every sample it
+    // is given, so a `unwrap_or(0.0)` here would render "not measured" as a
+    // measured zero; the title says how many of the rows actually carry one.
+    let data: Vec<u64> = state
+        .bench_rows
+        .iter()
+        .filter_map(|r| r.prompt_tps)
+        .map(|v| v.max(0.0) as u64)
+        .collect();
+    let title = if data.len() == n {
+        format!("prompt_tps · last {n} rows")
+    } else {
+        format!("prompt_tps · {} of last {n} rows", data.len())
+    };
     let inner = panel::bento(f, area, Some(&title), BoxRole::Success, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-
-    let data: Vec<u64> = state
-        .bench_rows
-        .iter()
-        .map(|r| r.prompt_tps.unwrap_or(0.0).max(0.0) as u64)
-        .collect();
     let max = sparkline_max(&data);
     // Higher prompt_tps is better, so use a "cool" gradient that ramps from
     // muted accent up through bright accent into ok-green for peak values —
@@ -358,6 +366,37 @@ mod tests {
             mean_prompt_tps: None,
             mean_gen_tps: None,
         }
+    }
+
+    #[test]
+    fn unmeasured_rows_stay_out_of_the_series_and_the_title_says_so() {
+        // The widget draws a baseline for every sample it is handed, so a row
+        // with no prompt_tps must not reach it as a zero: "not measured" and
+        // "measured 0 tok/s" would become the same picture.
+        let rows = [
+            BenchmarkRow {
+                prompt_tps: Some(120.0),
+                ..Default::default()
+            },
+            BenchmarkRow {
+                prompt_tps: None,
+                ..Default::default()
+            },
+            BenchmarkRow {
+                prompt_tps: Some(90.0),
+                ..Default::default()
+            },
+        ];
+        let data: Vec<u64> = rows
+            .iter()
+            .filter_map(|r| r.prompt_tps)
+            .map(|v| v.max(0.0) as u64)
+            .collect();
+        assert_eq!(data, vec![120, 90], "an unmeasured row reached the widget");
+        assert_eq!(
+            format!("prompt_tps · {} of last {} rows", data.len(), rows.len()),
+            "prompt_tps · 2 of last 3 rows"
+        );
     }
 
     #[test]
