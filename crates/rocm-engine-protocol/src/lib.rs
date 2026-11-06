@@ -2,6 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod fake_engine;
+
+mod stdio_client;
+pub use stdio_client::{
+    ENGINE_PROGRESS_STDERR_ENV, EngineStdioOptions, decode_engine_response,
+    engine_request_envelope, run_engine_stdio,
+};
+
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -29,24 +38,6 @@ pub const DEFAULT_LOG_TAIL_LINES: usize = 80;
 /// user's shell silently authenticate an endpoint we intended to leave open
 /// (e.g. a loopback bind).
 pub const ENDPOINT_API_KEY_FILE_ENV: &str = "ROCM_SERVE_API_KEY_FILE";
-
-/// Whether `host` names a public (non-loopback) bind, i.e. one that must be
-/// protected by an endpoint API key.
-///
-/// Shared so `rocm` (which decides at `serve` time whether to mint a key) and
-/// `rocmd` (which respawns recorded services during recovery) apply the same
-/// policy to the same `ManagedServiceRecord::host` value.
-///
-/// Deliberately an exact match against the three loopback spellings the CLI
-/// accepts, so anything unrecognized — an IPv6 loopback alias, a differently
-/// cased `localhost`, a hostname that happens to resolve locally — is treated
-/// as public and therefore *requires* a key. Misclassifying a loopback bind as
-/// public costs a key nobody needed; the reverse would open an unauthenticated
-/// network listener.
-#[must_use]
-pub fn is_public_bind_host(host: &str) -> bool {
-    !matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
 
 /// Resolve the endpoint API key an engine adapter must enforce, if any.
 ///
@@ -277,6 +268,17 @@ impl GpuSelection {
             format!("invalid --gpu value `{value}`: `{trimmed}` is not a GPU index")
         })?;
         Ok(Self::Index(index))
+    }
+}
+
+/// The two arguments `flag value` when `value` is set, none when it is not, for
+/// building the command line of an engine or supervisor child. Shared so `rocm`
+/// and `rocmd` spell optional flags the same way.
+#[must_use]
+pub fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
+    match value {
+        Some(value) => vec![flag.to_owned(), value.to_owned()],
+        None => Vec::new(),
     }
 }
 
@@ -823,27 +825,6 @@ mod tests {
     }
 
     #[test]
-    fn is_public_bind_host_recognizes_only_the_accepted_loopback_spellings() {
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            assert!(!is_public_bind_host(host), "{host} must be loopback");
-        }
-        for host in [
-            "0.0.0.0",
-            "::",
-            "192.168.1.10",
-            "example.test",
-            // Conservative on purpose: an unrecognized spelling of a loopback
-            // address is classified public, so it requires a key rather than
-            // opening an unauthenticated listener.
-            "LOCALHOST",
-            "127.0.0.2",
-            "[::1]",
-        ] {
-            assert!(is_public_bind_host(host), "{host} must be public");
-        }
-    }
-
-    #[test]
     fn request_roundtrip_preserves_method() {
         let envelope = EngineRequestEnvelope {
             method: EngineMethod::Detect,
@@ -890,6 +871,15 @@ mod tests {
         // Multiple GPUs are no longer supported.
         assert!(GpuSelection::parse_cli_value("0,1").is_err());
         assert!(GpuSelection::parse_cli_value("0,2,3").is_err());
+    }
+
+    #[test]
+    fn optional_arg_is_the_flag_and_value_or_nothing() {
+        assert_eq!(
+            optional_arg("--runtime-id", Some("therock-release:gfx120X-all")),
+            ["--runtime-id", "therock-release:gfx120X-all"]
+        );
+        assert!(optional_arg("--runtime-id", None).is_empty());
     }
 
     #[test]

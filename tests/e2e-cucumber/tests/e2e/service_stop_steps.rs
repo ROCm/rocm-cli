@@ -158,6 +158,13 @@ async fn keyless_managed_server_with_running_process(world: &mut E2eWorld) {
     plant_server_with_running_process(world, "127.0.0.1", false);
 }
 
+/// The server a stop leaves behind when it is bound publicly: its endpoint key
+/// is dropped by the stop, so a record read back later has none.
+#[given("a public managed server whose endpoint key is gone and whose recorded process is running")]
+async fn public_managed_server_without_its_key(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "0.0.0.0", false);
+}
+
 fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key: bool) {
     let process = Command::new("sleep")
         .arg("300")
@@ -166,9 +173,161 @@ fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key:
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to start the process to record");
+    let ticks = start_ticks(process.id());
+    plant_server_record(world, host, with_key, process, Some(ticks));
+}
+
+/// A ready, publicly bound server whose recorded PID is a live process that is
+/// not the server: what a recycled PID looks like. The record's start-time token
+/// is not the process's own, so the stop has to refuse the PID rather than signal
+/// it. The token is the process's real one offset by one on Linux, and `1` (a
+/// `FILETIME` in 1601, which no live process has) on Windows.
+#[given("a managed server whose recorded process id now belongs to a different process")]
+async fn managed_server_with_a_recycled_pid(world: &mut E2eWorld) {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("ping", &["-n", "300", "127.0.0.1"])
+    } else {
+        ("sleep", &["300"])
+    };
+    let bystander = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process that holds the recorded PID");
+    let stale_ticks = if cfg!(windows) {
+        1
+    } else {
+        start_ticks(bystander.id()).wrapping_add(1)
+    };
+    plant_server_record(world, "0.0.0.0", true, bystander, Some(stale_ticks));
+}
+
+/// The stop's promise about the process that holds the recorded PID, checked on
+/// the process: it was not signalled, so it is still running.
+#[then("the process now holding the recorded process id is still running")]
+async fn process_holding_the_pid_still_runs(world: &mut E2eWorld) {
+    let process = world
+        .recorded_process
+        .as_mut()
+        .expect("scenario recorded no process");
+    assert!(
+        process
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "the stop signalled a process that is not the recorded server"
+    );
+}
+
+/// Where the parent the Windows scenario records writes the PID of the process
+/// it started, for the scenario to read.
+fn descendant_pid_path(world: &E2eWorld) -> PathBuf {
+    services_dir(world).join("descendant.pid")
+}
+
+/// A ready, publicly bound server whose recorded supervisor is a parent process
+/// that has started a child of its own, recorded the way Windows records it:
+/// the PID alone, with no start-time token (there is none to read there).
+///
+/// The parent is PowerShell, the child `ping` for five minutes: both ship with
+/// Windows, need nothing installed, and are disposable. PowerShell starts the
+/// child itself, so the child's parent is the recorded PID, which is the
+/// relationship `taskkill /T` follows; it writes the child's PID where the
+/// scenario can read it and then stays alive. Both outlive the scenario only if
+/// the stop fails to take them, and the World's teardown reaps the parent.
+#[given("a managed server whose recorded process has started another process")]
+async fn managed_server_whose_process_started_another(world: &mut E2eWorld) {
+    let services = services_dir(world);
+    std::fs::create_dir_all(&services).expect("failed to create services dir");
+    let pid_file = descendant_pid_path(world);
+    let process = spawn_parent_with_descendant(&pid_file);
+    let pid = process.id();
+    plant_server_record(world, "0.0.0.0", true, process, None);
+
+    // The premise, so the Then step cannot pass for the wrong reason: the
+    // descendant exists and is running, and so is the parent.
+    let descendant = wait_for_descendant_pid(&pid_file);
+    // Kept first, with its creation time where the host reads one, so teardown
+    // can end the child on its own even when the stop (or a step) fails and the
+    // parent is gone: a later stop cannot recover a child from a dead parent.
+    world.recorded_descendant = Some(rocm_core::ProcessIdentity::capture(descendant));
+    assert_ne!(descendant, pid, "the child must be a different process");
+    assert!(
+        windows_process_is_running(descendant),
+        "premise: the process the recorded one started must be running"
+    );
+    assert!(
+        world
+            .recorded_process
+            .as_mut()
+            .expect("scenario recorded no process")
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "premise: the recorded process must be running"
+    );
+}
+
+fn spawn_parent_with_descendant(pid_file: &std::path::Path) -> std::process::Child {
+    // A single-quoted PowerShell string: an apostrophe in the path is doubled.
+    let pid_file = pid_file.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath ping.exe -ArgumentList '-n','300','127.0.0.1' \
+         -WindowStyle Hidden -PassThru; \
+         Set-Content -LiteralPath '{pid_file}' -Value $child.Id; \
+         Start-Sleep -Seconds 300"
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process to record")
+}
+
+/// The child's PID, once the parent has written it.
+fn wait_for_descendant_pid(pid_file: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorded process never wrote the PID of the process it started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Whether Windows has a process `pid`, by `tasklist`: a match prints a CSV
+/// row naming it, and no match prints an INFO line without one.
+fn windows_process_is_running(pid: u32) -> bool {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("failed to run tasklist");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Write the record for a ready server whose supervisor is `process`, with
+/// `ticks` as its start-time token when there is one, and take `process` into
+/// the World so the scenario (and its teardown) can check and reap it.
+fn plant_server_record(
+    world: &mut E2eWorld,
+    host: &str,
+    with_key: bool,
+    process: std::process::Child,
+    ticks: Option<u64>,
+) {
     let pid = process.id();
     world.recorded_process = Some(process);
-    let ticks = start_ticks(pid);
 
     let services = services_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");
@@ -237,6 +396,13 @@ async fn stop_with_yes(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user restarts it with --yes")]
+async fn restart_with_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "restart", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the daemon's stop_server tool stops that server")]
 async fn stop_server_tool(world: &mut E2eWorld) {
     let mut command = Command::new(crate::rocmd_binary());
@@ -279,6 +445,105 @@ async fn record_marked_stopped(world: &mut E2eWorld) {
     );
 }
 
+#[then(
+    "the CLI refuses the restart because it would reopen the public server without authentication"
+)]
+async fn restart_refused_without_authentication(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(
+        rc, 0,
+        "a restart that would reopen the server anonymously must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains(
+            "managed service is bound to the public host `0.0.0.0` but has no endpoint API key, \
+             so restarting it would reopen it without authentication."
+        ),
+        "{combined}"
+    );
+}
+
+/// The `rocm serve` command the refusal names, run against the real parser:
+/// its `<model>` placeholder filled in, and `--help` last, so the parse ends in
+/// help only if every word before it was accepted. A command with a flag `rocm`
+/// does not have is shown to be rejected the same way, so the check cannot pass
+/// by `--help` alone.
+#[then("the refusal names a serve command that rocm accepts")]
+async fn refusal_names_an_accepted_serve_command(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    let advised: Vec<&str> = combined
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with("rocm serve <model>"))
+        .collect();
+    assert_eq!(
+        advised.len(),
+        1,
+        "the refusal must name exactly one `rocm serve <model>` command:\n{combined}"
+    );
+    assert!(
+        advised[0].contains("--host 0.0.0.0 --port <port> --allow-public-bind"),
+        "the command must bring the server back on its public host, with the explicit port a \
+         non-default host requires: {}",
+        advised[0]
+    );
+    let mut args: Vec<String> = advised[0]
+        .split_whitespace()
+        .skip(1)
+        .map(|word| match word {
+            "<model>" => "Qwen/Qwen3-0.6B".to_owned(),
+            "<port>" => "8000".to_owned(),
+            word => word.to_owned(),
+        })
+        .collect();
+    args.push("--help".to_owned());
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &words);
+    assert_eq!(rc, 0, "rocm rejected {words:?}:\n{stdout}\n{stderr}");
+
+    let mut bogus = words.clone();
+    bogus.insert(bogus.len() - 1, "--no-such-flag");
+    let (_, _, rc) = crate::run_rocm(world, &bogus);
+    assert_ne!(
+        rc, 0,
+        "a flag rocm does not have must be rejected before --help: {bogus:?}"
+    );
+}
+
+#[then("the server is left running, with no stop recorded and no key file")]
+async fn server_left_as_it_was(world: &mut E2eWorld) {
+    let pid = recorded_pid(world);
+    let process = world
+        .recorded_process
+        .as_mut()
+        .expect("scenario recorded no process");
+    assert!(
+        process
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "the refused restart stopped the running server"
+    );
+    // Not `ready` any more: the CLI's liveness refresh reads the planted server's
+    // closed port as `starting` before it gets as far as the restart. What a
+    // refused restart must not do is mark it stopped or drop its process.
+    let record = read_record(world);
+    assert_ne!(record["status"], "stopped", "{record}");
+    assert_eq!(record["supervisor_pid"], u64::from(pid), "{record}");
+    assert!(
+        record["stop_requested_unix_ms"].is_null(),
+        "a refused restart stops nothing, so it records no stop request: {record}"
+    );
+    let key = endpoint_key_path(world);
+    assert!(
+        !key.exists(),
+        "a refused restart must not create a key: {}",
+        key.display()
+    );
+}
+
 #[then("the tool reports the server stopped, naming the process it stopped")]
 async fn tool_reports_stopped(world: &mut E2eWorld) {
     let stdout = world.cli_output.as_deref().unwrap_or_default();
@@ -311,21 +576,83 @@ async fn tool_reports_stopped(world: &mut E2eWorld) {
     );
 }
 
+/// The standalone `rocmd` reaches an engine through the `rocm` beside it (it has
+/// no engine verb of its own), so its `Stop` request is answered rather than
+/// failing with the standalone binary's "unrecognized subcommand". The report
+/// carries the engine's answer or the error that took its place.
+#[then("the tool asked the engine to stop and the engine answered")]
+async fn engine_answered_the_stop(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    let report: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(engine_stop["attempted"], true, "{report}");
+    assert!(
+        engine_stop.get("error").is_none(),
+        "the engine's answer was an error instead: {report}"
+    );
+    assert!(engine_stop["stopped"].is_boolean(), "{report}");
+}
+
 #[then("the recorded process is no longer running")]
 async fn recorded_process_gone(world: &mut E2eWorld) {
+    assert_recorded_process_exited(world);
+}
+
+/// The Windows tree kill, observed: the recorded process AND the one it started
+/// are gone after the stop. Without the `taskkill /T` step the stop ends only
+/// the recorded process (`TerminateProcess` on the root), and the child keeps
+/// running, which is what the second check catches.
+#[then("the recorded process and the process it started are no longer running")]
+async fn recorded_process_and_its_child_gone(world: &mut E2eWorld) {
+    assert_recorded_process_exited(world);
+    let pid = wait_for_descendant_pid(&descendant_pid_path(world));
+    // `taskkill` returns once it has asked for the termination; give the exit
+    // a moment to land before calling the process a survivor.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while windows_process_is_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop took the recorded process down but left the process it \
+             started (PID {pid}) running: the tree kill did not reach it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// The report says one process was stopped (the recorded one: a tree kill that
+/// already took the root is reported as forced, so it counts), checked next to
+/// the processes themselves rather than instead of them.
+#[then("the report counts one stopped process")]
+async fn report_counts_one_stopped_process(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(combined.contains("stopped processes: 1"), "{combined}");
+}
+
+fn assert_recorded_process_exited(world: &mut E2eWorld) {
     let process = world
         .recorded_process
         .as_mut()
         .expect("scenario recorded no process");
     // The report's claim, checked against the process itself: it has exited
-    // (and is reaped here), rather than merely having been signalled.
-    let exited = process
-        .try_wait()
-        .expect("failed to check the recorded process");
-    assert!(
-        exited.is_some(),
-        "the stop reported the process gone, but it is still running"
-    );
+    // (and is reaped here), rather than merely having been signalled. The stop
+    // confirms an exit from the OS's exit code, and this handle is signalled by
+    // the process object's teardown, so allow that teardown a few seconds on a
+    // loaded host before calling a process a survivor.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let exited = process
+            .try_wait()
+            .expect("failed to check the recorded process");
+        if exited.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop reported the process gone, but it is still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[then("the server's record reads stopped and names no process")]

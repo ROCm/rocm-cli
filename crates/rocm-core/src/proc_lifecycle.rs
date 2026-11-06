@@ -32,8 +32,10 @@ pub enum KillScope {
 /// A spawned process identified in a way that is robust to PID recycling.
 ///
 /// `start_ticks` is the kernel start-time of the process (clock ticks since
-/// boot). It is `None` on platforms without `/proc`, where identity cannot be
-/// verified and callers fall back to best-effort behaviour.
+/// boot) on Linux, and its creation time as a `FILETIME` on Windows. It is
+/// `None` on other platforms, and for a record written before Windows recorded
+/// one, where identity cannot be verified and callers fall back to best-effort
+/// behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -88,7 +90,21 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
     if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
         return IdentityState::Gone;
     }
-    match (id.start_ticks, process_start_ticks(id.pid)) {
+    classify_live_identity(id.start_ticks, process_start_ticks(id.pid))
+}
+
+/// The identity verdict for a PID that is running: what its recorded token
+/// (`recorded`) says about the token read from the live process now (`live`).
+///
+/// The one decision every stop path turns on, apart from the system reads, so
+/// a test covers each case on every host. A process is refused only when a
+/// token was recorded and the live one is provably different. A record with no
+/// token (an older record, or one written where no token could be read) cannot
+/// be refuted and is a match whatever the live process reads, so its stop and
+/// its tree kill go ahead as they always did. A recorded token that cannot be
+/// confirmed now is neither signalled nor reported stopped.
+const fn classify_live_identity(recorded: Option<u64>, live: Option<u64>) -> IdentityState {
+    match (recorded, live) {
         (Some(expected), Some(actual)) => {
             if expected == actual {
                 IdentityState::Matches
@@ -101,6 +117,18 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
         (Some(_), None) => IdentityState::Indeterminate,
         // No recorded identity (legacy state): best-effort proceed.
         (None, _) => IdentityState::Matches,
+    }
+}
+
+/// The verdict that ends a termination before anything is signalled, when the
+/// recorded identity says not to: `None` for a process that matches and so goes
+/// on to be stopped.
+const fn refusal_before_signalling(state: IdentityState) -> Option<TerminationOutcome> {
+    match state {
+        IdentityState::Gone => Some(TerminationOutcome::AlreadyGone),
+        IdentityState::Recycled => Some(TerminationOutcome::IdentityMismatch),
+        IdentityState::Indeterminate => Some(TerminationOutcome::Unverified),
+        IdentityState::Matches => None,
     }
 }
 
@@ -194,11 +222,8 @@ pub fn terminate_verified(
     grace: Duration,
     force: bool,
 ) -> TerminationOutcome {
-    match identity_state(id) {
-        IdentityState::Gone => return TerminationOutcome::AlreadyGone,
-        IdentityState::Recycled => return TerminationOutcome::IdentityMismatch,
-        IdentityState::Indeterminate => return TerminationOutcome::Unverified,
-        IdentityState::Matches => {}
+    if let Some(verdict) = refusal_before_signalling(identity_state(id)) {
+        return verdict;
     }
 
     let tree = matches!(scope, KillScope::Tree);
@@ -261,6 +286,248 @@ pub fn terminate_verified(
     }
 }
 
+/// How long a managed stop waits on a recorded process before it escalates.
+///
+/// Each recorded process, tree included, gets this long to exit after `SIGTERM`
+/// before the stop escalates to `SIGKILL`, and then this long again before it
+/// reports a timeout. The one value behind `rocm services stop` and `rocmd`'s
+/// `stop_server`: both stop the same records, so neither may wait for a
+/// different time.
+pub const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// What a managed stop did about one PID a service record names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedPidOutcome {
+    /// The PID is the stopping process's own. It is reported but never
+    /// signalled, and it counts as stopped: `rocmd` and an attached `rocm
+    /// serve` record themselves as the supervisor of the service they launched,
+    /// and the launcher is not the service.
+    OwnProcess,
+    /// The PID was handed to the verified termination, with this verdict.
+    Terminated(TerminationOutcome),
+}
+
+impl RecordedPidOutcome {
+    /// The label a stop report carries: `self` for the stopping process's own
+    /// PID, otherwise [`TerminationOutcome::as_str`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnProcess => "self",
+            Self::Terminated(outcome) => outcome.as_str(),
+        }
+    }
+}
+
+/// One recorded PID's fate in a managed stop.
+///
+/// Kept per PID because the outcomes that leave a stop unconfirmed are reported
+/// differently: a `timed_out` PID was signalled and it, or a process under it,
+/// outlived the deadline, while an `unverified` one was not signalled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedPidStop {
+    pub pid: u32,
+    /// Which recorded PID this is: `supervisor`, `engine`, or
+    /// `supervisor_and_engine` when the record holds the same PID for both.
+    pub role: &'static str,
+    pub outcome: RecordedPidOutcome,
+}
+
+impl RecordedPidStop {
+    /// Whether a signal went out to this PID. A `timed_out` PID counts: the
+    /// signal was sent and only the exit was never observed, which
+    /// [`stopped`](Self::stopped) reports separately.
+    #[must_use]
+    pub const fn signaled(self) -> bool {
+        matches!(
+            self.outcome,
+            RecordedPidOutcome::Terminated(
+                TerminationOutcome::Graceful
+                    | TerminationOutcome::Forced
+                    | TerminationOutcome::TimedOut
+            )
+        )
+    }
+
+    /// Whether the stop escalated to a forced kill for this PID. That is not
+    /// "the forced kill worked": a forced stop only reaches `timed_out` by way
+    /// of the escalation, and [`stopped`](Self::stopped) says whether the
+    /// process actually went away.
+    #[must_use]
+    pub const fn forced(self) -> bool {
+        matches!(
+            self.outcome,
+            RecordedPidOutcome::Terminated(
+                TerminationOutcome::Forced | TerminationOutcome::TimedOut
+            )
+        )
+    }
+
+    /// Whether the recorded process is confirmed no longer running.
+    #[must_use]
+    pub const fn stopped(self) -> bool {
+        match self.outcome {
+            RecordedPidOutcome::OwnProcess => true,
+            RecordedPidOutcome::Terminated(outcome) => outcome.stopped(),
+        }
+    }
+
+    /// The entry a stop report lists for this PID under `pid_outcomes`.
+    #[must_use]
+    pub fn report_entry(self) -> serde_json::Value {
+        serde_json::json!({
+            "pid": self.pid,
+            "role": self.role,
+            "outcome": self.outcome.as_str(),
+        })
+    }
+}
+
+/// Terminate the processes a service record names, verifying each PID's
+/// identity first, and report what happened to each.
+///
+/// PIDs are recycled, so a persisted PID is not by itself evidence that the
+/// recorded process still holds it. Each PID is paired with **its own**
+/// start-time token (`supervisor_start_ticks` with `supervisor_pid`,
+/// `engine_start_ticks` with `engine_pid`) and handed to `terminate`, which
+/// production supplies as [`terminate_recorded_pid`]. When the two PIDs
+/// coincide, the entry is reported once, under the role `supervisor_and_engine`,
+/// and keeps a known token in preference to a missing one: a token is never read
+/// across from the PID it does not belong to. The supervisor is visited first.
+///
+/// A zero PID names nothing and is skipped. The stopping process's own PID is
+/// reported as [`RecordedPidOutcome::OwnProcess`] and `terminate` is not called
+/// for it.
+///
+/// `terminate` is injectable so a caller's test can supply the verdicts it
+/// cannot construct on demand (a process that survives `SIGKILL`, one whose
+/// identity cannot be read).
+pub fn terminate_recorded_service_pids(
+    record: &crate::ManagedServiceRecord,
+    terminate: impl Fn(&ProcessIdentity) -> TerminationOutcome,
+) -> Vec<RecordedPidStop> {
+    let mut entries: Vec<(u32, &'static str, Option<u64>)> = Vec::new();
+    for (pid, role, ticks) in [
+        (
+            Some(record.supervisor_pid),
+            "supervisor",
+            record.supervisor_start_ticks,
+        ),
+        (record.engine_pid, "engine", record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0) else {
+            continue;
+        };
+        if let Some(existing) = entries.iter_mut().find(|(seen, _, _)| *seen == pid) {
+            // Only the engine entry can land here, aliasing the supervisor: the
+            // one PID is both, and is reported as both.
+            existing.1 = "supervisor_and_engine";
+            if existing.2.is_none() {
+                existing.2 = ticks;
+            }
+        } else {
+            entries.push((pid, role, ticks));
+        }
+    }
+
+    entries
+        .into_iter()
+        .map(|(pid, role, ticks)| {
+            let outcome = if pid == std::process::id() {
+                RecordedPidOutcome::OwnProcess
+            } else {
+                RecordedPidOutcome::Terminated(terminate(&ProcessIdentity::new(pid, ticks)))
+            };
+            RecordedPidStop { pid, role, outcome }
+        })
+        .collect()
+}
+
+/// Terminate one recorded process, and its descendants, after verifying its
+/// identity. The production `terminate` of [`terminate_recorded_service_pids`].
+///
+/// The stop is forced: a managed stop is definitive, so it must not report
+/// success while an engine worker still holds the GPU. Only a process whose
+/// recorded identity is confirmed is ever reached by it.
+///
+/// On Windows the descendants are taken separately, first. [`terminate_verified`]
+/// cannot walk a process tree there (`process_tree_pids` returns just the root),
+/// and the engine runs one level below the recorded PID, because the daemon
+/// launches it through an `__engine-serve-http` process: a root-only kill would
+/// leave the engine running and still holding the device.
+///
+/// The tree kill runs only for a PID that passes the same identity gate as the
+/// rest of the stop. A record written with a start-time token carries the
+/// process's creation time on Windows ([`process_start_ticks`]), so a PID that
+/// an unrelated process has since taken reads back [`IdentityState::Recycled`]
+/// and neither it nor its subtree is touched. A record written before Windows
+/// recorded a token has none to refute, and for it the gate only turns away a
+/// PID that is not running at all: that old record can still name a recycled
+/// PID, and `taskkill /T /F` then takes that process and its subtree. A stop
+/// that confirms clears the record's PIDs, so that exposure shrinks to the
+/// records written before the token existed and not yet stopped.
+pub fn terminate_recorded_pid(identity: &ProcessIdentity) -> TerminationOutcome {
+    terminate_recorded_pid_with(identity, platform_tree_kill(), identity_state, |identity| {
+        terminate_verified(identity, KillScope::Tree, MANAGED_STOP_GRACE, true)
+    })
+}
+
+/// [`terminate_recorded_pid`] with its three platform and system touchpoints
+/// supplied by the caller, so a test drives the tree-kill step on every host:
+/// `tree_kill` takes one PID's descendants down (`None` where the platform
+/// needs no separate step), `state_of` reads the PID's identity, and `terminate`
+/// is the verified termination of the root.
+fn terminate_recorded_pid_with(
+    identity: &ProcessIdentity,
+    tree_kill: Option<&dyn Fn(u32)>,
+    state_of: impl Fn(&ProcessIdentity) -> IdentityState,
+    terminate: impl Fn(&ProcessIdentity) -> TerminationOutcome,
+) -> TerminationOutcome {
+    if let Some(tree_kill) = tree_kill
+        && matches!(state_of(identity), IdentityState::Matches)
+    {
+        // Taken while the root is still alive: `taskkill /T` resolves children
+        // through the live parent, so it cannot reach them once the root is gone.
+        tree_kill(identity.pid);
+        // `terminate` still owns the bounded wait and the verdict, but a root
+        // the tree kill already took now reads back as `AlreadyGone` — which
+        // would deny a stop this command did perform.
+        return match terminate(identity) {
+            TerminationOutcome::AlreadyGone => TerminationOutcome::Forced,
+            outcome => outcome,
+        };
+    }
+    terminate(identity)
+}
+
+/// The separate descendant kill this platform needs before the verified
+/// termination of a root, if any: `taskkill /T /F` on Windows, none elsewhere,
+/// where [`terminate_verified`] walks the tree itself.
+// The `cfg` arms differ in what they return, so the non-Windows arm cannot be a
+// `const fn` without giving the two platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
+fn platform_tree_kill() -> Option<&'static dyn Fn(u32)> {
+    #[cfg(windows)]
+    {
+        Some(&taskkill_tree)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn taskkill_tree(pid: u32) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Poll until every process in `members` has exited, or `grace` elapses.
 ///
 /// A member is exited once its PID is gone or now belongs to a different process
@@ -300,8 +567,9 @@ fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
 
 /// Read the kernel start-time (field 22 of `/proc/<pid>/stat`) for `pid`.
 ///
-/// Returns `None` when the value cannot be read, including on non-Linux
-/// platforms, where identity verification degrades to best-effort.
+/// Returns `None` when the value cannot be read, including on platforms with
+/// neither `/proc` nor a creation time to read (neither Linux nor Windows),
+/// where identity verification degrades to best-effort.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn process_start_ticks(pid: u32) -> Option<u64> {
@@ -309,7 +577,56 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
     parse_start_ticks(&stat)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Read the creation time of `pid` (`GetProcessTimes`) as the token that tells
+/// the process from a later one that reuses its PID.
+///
+/// The value is the creation time as a Windows `FILETIME` (100 ns intervals
+/// since 1601), not clock ticks since boot: only equality with a value read
+/// earlier from the same PID means anything. `None` when the process cannot be
+/// opened for querying (it is gone, or belongs to a more privileged account).
+#[cfg(windows)]
+#[must_use]
+#[allow(unsafe_code)] // Win32 FFI
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: plain Win32 calls. The handle is checked before use and closed on
+    // every path, and the four out-parameters are valid for the one call.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let read = GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        );
+        CloseHandle(handle);
+        (read != 0).then(|| filetime_ticks(creation.dwLowDateTime, creation.dwHighDateTime))
+    }
+}
+
+/// The 64-bit value of a Windows `FILETIME`, which a Win32 call returns as two
+/// 32-bit halves. Kept apart from the FFI so a test can run it on every host.
+#[cfg(any(windows, test))]
+fn filetime_ticks(low: u32, high: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 #[must_use]
 // Platform stub. The `cfg` sibling calls non-const code, so making only this
 // arm `const` would give the two platforms different signatures and push
@@ -445,7 +762,7 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn identity_matches_our_own_process() {
         let pid = std::process::id();
@@ -454,7 +771,7 @@ mod tests {
         assert_eq!(identity_state(&id), IdentityState::Matches);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn identity_mismatch_when_start_ticks_differ() {
         // Same live PID (ours), but a different recorded start-time: a recycled
@@ -474,7 +791,7 @@ mod tests {
         assert_eq!(identity_state(&id), IdentityState::Gone);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn refuses_to_signal_on_identity_mismatch() {
         // Our own PID with a wrong start-time. A forced stop must NOT kill us:
@@ -613,5 +930,550 @@ mod tests {
             "forced Tree stop must SIGKILL the SIGTERM-ignoring descendant"
         );
         reap(child);
+    }
+
+    // ---- The managed-stop routine `rocm` and `rocmd` share. ----
+
+    use std::cell::RefCell;
+
+    /// A PID no host has in use.
+    const SUPERVISOR_PID: u32 = 999_999_998;
+    const ENGINE_PID: u32 = 999_999_997;
+
+    fn record_naming(
+        supervisor: u32,
+        supervisor_ticks: Option<u64>,
+        engine: Option<u32>,
+        engine_ticks: Option<u64>,
+    ) -> crate::ManagedServiceRecord {
+        let paths = crate::AppPaths {
+            config_dir: std::path::PathBuf::from("config"),
+            data_dir: std::path::PathBuf::from("data"),
+            cache_dir: std::path::PathBuf::from("cache"),
+        };
+        let mut record = crate::ManagedServiceRecord::new(
+            &paths,
+            "svc-managed-stop",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor,
+            None,
+            None,
+            None,
+        );
+        record.supervisor_start_ticks = supervisor_ticks;
+        record.engine_pid = engine;
+        record.engine_start_ticks = engine_ticks;
+        record
+    }
+
+    /// The identities `terminate_recorded_service_pids` handed its termination
+    /// function, in call order, and the stops it reported.
+    fn stop_with(
+        record: &crate::ManagedServiceRecord,
+        outcome: TerminationOutcome,
+    ) -> (Vec<ProcessIdentity>, Vec<RecordedPidStop>) {
+        let seen = RefCell::new(Vec::new());
+        let stops = terminate_recorded_service_pids(record, |identity| {
+            seen.borrow_mut().push(*identity);
+            outcome
+        });
+        (seen.into_inner(), stops)
+    }
+
+    #[test]
+    fn managed_stop_grace_is_ten_seconds() {
+        assert_eq!(MANAGED_STOP_GRACE, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn managed_stop_terminates_supervisor_then_engine_each_with_its_own_start_time() {
+        let record = record_naming(SUPERVISOR_PID, Some(11), Some(ENGINE_PID), Some(22));
+
+        let (seen, stops) = stop_with(&record, TerminationOutcome::Graceful);
+
+        assert_eq!(
+            seen,
+            vec![
+                ProcessIdentity::new(SUPERVISOR_PID, Some(11)),
+                ProcessIdentity::new(ENGINE_PID, Some(22)),
+            ],
+            "the supervisor first, and no start-time read across from the other PID"
+        );
+        assert_eq!(
+            stops
+                .iter()
+                .map(|stop| (stop.pid, stop.role))
+                .collect::<Vec<_>>(),
+            vec![(SUPERVISOR_PID, "supervisor"), (ENGINE_PID, "engine")]
+        );
+    }
+
+    #[test]
+    fn managed_stop_terminates_a_pid_recorded_twice_once_and_keeps_a_known_start_time() {
+        // Either entry may be the one that carries the token.
+        for (supervisor_ticks, engine_ticks, expected) in [
+            (None, Some(33), Some(33)),
+            (Some(44), None, Some(44)),
+            (Some(44), Some(33), Some(44)),
+            (None, None, None),
+        ] {
+            let record = record_naming(
+                SUPERVISOR_PID,
+                supervisor_ticks,
+                Some(SUPERVISOR_PID),
+                engine_ticks,
+            );
+
+            let (seen, stops) = stop_with(&record, TerminationOutcome::Graceful);
+
+            assert_eq!(
+                seen,
+                vec![ProcessIdentity::new(SUPERVISOR_PID, expected)],
+                "{supervisor_ticks:?} / {engine_ticks:?}"
+            );
+            assert_eq!(stops.len(), 1);
+            assert_eq!(stops[0].role, "supervisor_and_engine");
+        }
+    }
+
+    #[test]
+    fn managed_stop_skips_a_zero_pid_and_an_absent_engine() {
+        let record = record_naming(0, None, Some(0), None);
+
+        let (seen, stops) = stop_with(&record, TerminationOutcome::Graceful);
+
+        assert!(seen.is_empty());
+        assert!(stops.is_empty());
+    }
+
+    #[test]
+    fn managed_stop_reports_its_own_pid_as_self_and_never_terminates_it() {
+        let own = std::process::id();
+        let record = record_naming(own, None, Some(ENGINE_PID), None);
+
+        let (seen, stops) = stop_with(&record, TerminationOutcome::Graceful);
+
+        assert_eq!(
+            seen,
+            vec![ProcessIdentity::new(ENGINE_PID, None)],
+            "the stopping process is never signalled"
+        );
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0].pid, own);
+        assert_eq!(stops[0].role, "supervisor");
+        assert_eq!(stops[0].outcome, RecordedPidOutcome::OwnProcess);
+        assert_eq!(stops[0].outcome.as_str(), "self");
+        assert!(!stops[0].signaled() && !stops[0].forced());
+        assert!(stops[0].stopped(), "the launcher is not the service");
+        assert_eq!(
+            stops[0].report_entry(),
+            serde_json::json!({"pid": own, "role": "supervisor", "outcome": "self"})
+        );
+    }
+
+    #[test]
+    fn managed_stop_reports_a_pid_that_is_both_roles_and_its_own_as_self() {
+        let own = std::process::id();
+        let record = record_naming(own, None, Some(own), None);
+
+        let (seen, stops) = stop_with(&record, TerminationOutcome::Graceful);
+
+        assert!(seen.is_empty());
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].role, "supervisor_and_engine");
+        assert_eq!(stops[0].outcome, RecordedPidOutcome::OwnProcess);
+    }
+
+    #[test]
+    fn managed_stop_classifies_each_outcome_as_signaled_forced_and_stopped() {
+        use TerminationOutcome::{
+            AlreadyGone, Forced, Graceful, IdentityMismatch, TimedOut, Unverified,
+        };
+        let record = record_naming(SUPERVISOR_PID, None, None, None);
+
+        // (outcome, signaled, forced, stopped)
+        let expected = [
+            (AlreadyGone, false, false, true),
+            (IdentityMismatch, false, false, true),
+            (Unverified, false, false, false),
+            (Graceful, true, false, true),
+            (Forced, true, true, true),
+            (TimedOut, true, true, false),
+        ];
+        for (outcome, signaled, forced, stopped) in expected {
+            let (_, stops) = stop_with(&record, outcome);
+            assert_eq!(stops.len(), 1);
+            let stop = stops[0];
+            assert_eq!(stop.outcome, RecordedPidOutcome::Terminated(outcome));
+            assert_eq!(stop.outcome.as_str(), outcome.as_str());
+            assert_eq!(
+                (stop.signaled(), stop.forced(), stop.stopped()),
+                (signaled, forced, stopped),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// What one `terminate_recorded_pid_with` call did, in order.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step {
+        TreeKill(u32),
+        Terminate(u32),
+    }
+
+    /// Run `terminate_recorded_pid_with` for `pid`, with a tree-kill step
+    /// present or not, the identity in `state`, and the root's termination
+    /// answering `outcome`. Returns the verdict and the steps taken.
+    fn tree_kill_run(
+        has_tree_kill: bool,
+        state: IdentityState,
+        outcome: TerminationOutcome,
+    ) -> (TerminationOutcome, Vec<Step>) {
+        let steps = RefCell::new(Vec::new());
+        let tree_kill = |pid: u32| steps.borrow_mut().push(Step::TreeKill(pid));
+        let verdict = terminate_recorded_pid_with(
+            &ProcessIdentity::new(SUPERVISOR_PID, None),
+            has_tree_kill.then_some(&tree_kill as &dyn Fn(u32)),
+            |_| state,
+            |identity| {
+                steps.borrow_mut().push(Step::Terminate(identity.pid));
+                outcome
+            },
+        );
+        (verdict, steps.into_inner())
+    }
+
+    #[test]
+    fn the_tree_is_killed_before_the_root_is_terminated() {
+        let (_, steps) = tree_kill_run(true, IdentityState::Matches, TerminationOutcome::Forced);
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::TreeKill(SUPERVISOR_PID),
+                Step::Terminate(SUPERVISOR_PID)
+            ],
+            "`taskkill /T` resolves children through the live parent, so the \
+             tree kill has to come first"
+        );
+    }
+
+    #[test]
+    fn a_root_the_tree_kill_already_took_is_reported_forced_not_already_gone() {
+        let (verdict, _) = tree_kill_run(
+            true,
+            IdentityState::Matches,
+            TerminationOutcome::AlreadyGone,
+        );
+
+        assert_eq!(
+            verdict,
+            TerminationOutcome::Forced,
+            "the stop did perform the kill; reading the root back as gone must not deny it"
+        );
+    }
+
+    #[test]
+    fn the_verdict_after_a_tree_kill_is_the_terminations_own_for_every_other_outcome() {
+        use TerminationOutcome::{Forced, Graceful, IdentityMismatch, TimedOut, Unverified};
+        for outcome in [Graceful, Forced, TimedOut, Unverified, IdentityMismatch] {
+            let (verdict, _) = tree_kill_run(true, IdentityState::Matches, outcome);
+
+            assert_eq!(verdict, outcome);
+        }
+    }
+
+    #[test]
+    fn no_tree_kill_is_run_for_a_pid_that_is_gone_recycled_or_unverifiable() {
+        for state in [
+            IdentityState::Gone,
+            IdentityState::Recycled,
+            IdentityState::Indeterminate,
+        ] {
+            let (verdict, steps) = tree_kill_run(true, state, TerminationOutcome::AlreadyGone);
+
+            assert_eq!(
+                steps,
+                vec![Step::Terminate(SUPERVISOR_PID)],
+                "{state:?}: a stranger's process tree must not be taken"
+            );
+            assert_eq!(
+                verdict,
+                TerminationOutcome::AlreadyGone,
+                "{state:?}: and the verdict is the termination's, unmapped"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_tree_kill_step_the_root_is_terminated_and_its_verdict_unmapped() {
+        let (verdict, steps) = tree_kill_run(
+            false,
+            IdentityState::Matches,
+            TerminationOutcome::AlreadyGone,
+        );
+
+        assert_eq!(steps, vec![Step::Terminate(SUPERVISOR_PID)]);
+        assert_eq!(verdict, TerminationOutcome::AlreadyGone);
+    }
+
+    /// Every way a recorded token and the live process's token can stand, with
+    /// what the stop does about each: whether the Windows tree kill runs, and the
+    /// verdict the stop reports (the label and whether it counts as stopped).
+    ///
+    /// The live process is running in every row; the tokens go through the same
+    /// decision production uses ([`classify_live_identity`] and
+    /// [`refusal_before_signalling`]), with the system reads and the signalling
+    /// supplied, so each row runs on every host. A process is refused only when
+    /// a token was recorded and the live one is provably different.
+    #[test]
+    fn what_a_stop_does_for_each_recorded_and_live_token() {
+        const LIVE: u64 = 0x01DC_0000_0000_0001;
+        struct Row {
+            name: &'static str,
+            recorded: Option<u64>,
+            live: Option<u64>,
+            tree_kill_runs: bool,
+            label: &'static str,
+            stopped: bool,
+        }
+        let row = |name, recorded, live, tree_kill_runs, label, stopped| Row {
+            name,
+            recorded,
+            live,
+            tree_kill_runs,
+            label,
+            stopped,
+        };
+        let rows = [
+            // The shape `service-stop-07` records, and any record older than the
+            // token: nothing to refute, so the whole tree is taken as before.
+            row("no token recorded", None, Some(LIVE), true, "forced", true),
+            row(
+                "no token recorded, none readable",
+                None,
+                None,
+                true,
+                "forced",
+                true,
+            ),
+            row(
+                "token matches",
+                Some(LIVE),
+                Some(LIVE),
+                true,
+                "forced",
+                true,
+            ),
+            // A recycled PID: the process is a stranger, left alone.
+            row(
+                "token differs",
+                Some(LIVE + 1),
+                Some(LIVE),
+                false,
+                "identity_mismatch",
+                true,
+            ),
+            // A recorded token that cannot be read back is neither signalled nor
+            // reported stopped.
+            row(
+                "token unreadable",
+                Some(LIVE),
+                None,
+                false,
+                "unverified",
+                false,
+            ),
+        ];
+        for Row {
+            name: row,
+            recorded,
+            live,
+            tree_kill_runs,
+            label,
+            stopped,
+        } in rows
+        {
+            let steps = RefCell::new(Vec::new());
+            let tree_kill = |pid: u32| steps.borrow_mut().push(Step::TreeKill(pid));
+            let verdict = terminate_recorded_pid_with(
+                &ProcessIdentity::new(SUPERVISOR_PID, recorded),
+                Some(&tree_kill as &dyn Fn(u32)),
+                |id| classify_live_identity(id.start_ticks, live),
+                |id| {
+                    steps.borrow_mut().push(Step::Terminate(id.pid));
+                    // What the verified termination answers: its refusal for a
+                    // process the identity rules out, otherwise the tree kill
+                    // has already taken the root and it reads back as gone.
+                    refusal_before_signalling(classify_live_identity(id.start_ticks, live))
+                        .unwrap_or(TerminationOutcome::AlreadyGone)
+                },
+            );
+            let expected_steps = if tree_kill_runs {
+                vec![
+                    Step::TreeKill(SUPERVISOR_PID),
+                    Step::Terminate(SUPERVISOR_PID),
+                ]
+            } else {
+                vec![Step::Terminate(SUPERVISOR_PID)]
+            };
+            assert_eq!(steps.into_inner(), expected_steps, "{row}: steps");
+            assert_eq!(verdict.as_str(), label, "{row}: verdict");
+            assert_eq!(verdict.stopped(), stopped, "{row}: counts as stopped");
+        }
+    }
+
+    #[test]
+    fn a_recorded_token_refutes_a_live_one_only_when_both_are_known_and_differ() {
+        use IdentityState::{Indeterminate, Matches, Recycled};
+        assert_eq!(classify_live_identity(None, None), Matches);
+        assert_eq!(classify_live_identity(None, Some(7)), Matches);
+        assert_eq!(classify_live_identity(Some(7), Some(7)), Matches);
+        assert_eq!(classify_live_identity(Some(7), Some(8)), Recycled);
+        assert_eq!(classify_live_identity(Some(7), None), Indeterminate);
+        assert_eq!(refusal_before_signalling(Matches), None);
+    }
+
+    #[test]
+    fn only_windows_has_a_separate_tree_kill_step() {
+        // Ties the injected tests above to what production actually runs: the
+        // step they exercise is the one `terminate_recorded_pid` has on Windows
+        // and does without elsewhere, where `terminate_verified` walks the tree.
+        assert_eq!(platform_tree_kill().is_some(), cfg!(windows));
+    }
+
+    #[test]
+    fn terminate_recorded_pid_reports_an_absent_pid_as_already_gone() {
+        let outcome = terminate_recorded_pid(&ProcessIdentity::new(SUPERVISOR_PID, None));
+
+        assert_eq!(outcome, TerminationOutcome::AlreadyGone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_recorded_pid_stops_a_running_verified_process() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let id = ProcessIdentity::capture(child.id());
+
+        let outcome = terminate_recorded_pid(&id);
+
+        assert!(outcome.stopped(), "{outcome:?}");
+        assert!(matches!(
+            outcome,
+            TerminationOutcome::Graceful | TerminationOutcome::Forced
+        ));
+        reap(child);
+        assert!(!crate::process_is_running(id.pid));
+    }
+
+    #[test]
+    fn a_filetime_is_its_high_word_above_its_low_word() {
+        // The Windows creation time arrives as two 32-bit halves; swapping them
+        // or dropping the shift would make every process read as a different one.
+        assert_eq!(
+            filetime_ticks(0x89AB_CDEF, 0x0123_4567),
+            0x0123_4567_89AB_CDEF
+        );
+        assert_eq!(filetime_ticks(1, 0), 1);
+        assert_eq!(filetime_ticks(0, 1), 1 << 32);
+        assert_eq!(filetime_ticks(u32::MAX, u32::MAX), u64::MAX);
+    }
+
+    /// The managed stop's own entry point refuses a PID whose recorded identity no
+    /// longer matches, and reaches neither it nor its tree. Our own PID with a
+    /// wrong start-time is what a recycled PID looks like; if the stop went
+    /// ahead, `taskkill /T /F` on Windows (a plain forced kill elsewhere) would
+    /// end this test process instead of asserting. On Windows this runs the real
+    /// tree-kill gate: the verdict has to come from the identity check, before
+    /// any `taskkill`.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches() {
+        let pid = std::process::id();
+        let real = process_start_ticks(pid).expect("own start-time");
+        let stale = ProcessIdentity::new(pid, Some(real.wrapping_add(1)));
+
+        let outcome = terminate_recorded_pid(&stale);
+
+        assert_eq!(outcome, TerminationOutcome::IdentityMismatch);
+        assert!(crate::process_is_running(pid), "nothing was signalled");
+    }
+
+    /// The same refusal against a bystander that is a different process holding
+    /// the recorded PID (the recycled case), then the stop of that process when
+    /// its identity does match. Windows only: that is where a tree kill by PID
+    /// follows the identity gate, and where a creation-time token is read.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+        let real = process_start_ticks(pid).expect("a live process has a creation time");
+        assert_eq!(
+            process_start_ticks(pid),
+            Some(real),
+            "the creation time of one process does not change"
+        );
+        assert_ne!(
+            Some(real),
+            process_start_ticks(std::process::id()),
+            "two processes do not share one"
+        );
+
+        let outcome =
+            terminate_recorded_pid(&ProcessIdentity::new(pid, Some(real.wrapping_add(1))));
+        assert_eq!(outcome, TerminationOutcome::IdentityMismatch);
+        assert!(
+            child.try_wait().expect("check the bystander").is_none(),
+            "a PID whose recorded creation time differs is a stranger and must keep running"
+        );
+
+        let outcome = terminate_recorded_pid(&ProcessIdentity::capture(pid));
+        assert!(outcome.stopped(), "{outcome:?}");
+        let _ = child.wait();
+        assert!(!crate::process_is_running(pid));
+    }
+
+    /// A record with no token (written before Windows recorded one, and the shape
+    /// `service-stop-07` plants) cannot be refuted and still gets the whole stop:
+    /// the process ends. Windows only, where a real process is stopped by PID.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_recorded_pid_stops_a_process_recorded_without_a_token() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+
+        let outcome = terminate_recorded_pid(&ProcessIdentity::new(pid, None));
+
+        assert!(outcome.stopped(), "{outcome:?}");
+        assert_eq!(outcome.as_str(), "forced");
+        assert!(
+            child.wait().is_ok() && !crate::process_is_running(pid),
+            "the process recorded without a token must be gone"
+        );
     }
 }

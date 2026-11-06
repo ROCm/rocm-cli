@@ -99,13 +99,11 @@ mod update_cmd;
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
 // this re-export. `env_root_for_service`, `attach_background_stdio`,
-// `detach_background_command`, `managed_engine_startup_failure_detail`,
-// `managed_service_process_command`, and
-// `ensure_public_service_has_endpoint_key` are no longer needed here either:
-// their only caller outside `dispatch()`, `restart_internal_managed_service`
-// (and the endpoint-key check inside it), moved out to `services_text.rs` in
-// ROCMAI-209 (Phase 6f) and has since moved on to `service_control.rs`, which
-// reaches them via its own imports instead.
+// `detach_background_command`, `managed_engine_startup_failure_detail`, and
+// `managed_service_process_command` are no longer needed here either: their
+// only caller outside `dispatch()`, `restart_internal_managed_service`, moved
+// out to `services_text.rs` in ROCMAI-209 (Phase 6f) and has since moved on to
+// `service_control.rs`, which reaches them via its own imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`.
@@ -190,10 +188,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(all(test, not(windows)))]
-use std::process::Stdio;
-#[cfg(all(test, not(windows)))]
-use std::process::{Command as ProcessCommand, ExitStatus};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -221,33 +215,6 @@ fn reset_sigpipe() {
 // `missing_const_for_fn` onto every caller in turn.
 #[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
-
-/// Run `f` with SIGPIPE temporarily ignored, restoring the previous
-/// disposition afterwards.
-///
-/// [`reset_sigpipe`] sets `SIG_DFL` process-wide so stdout/stderr pipe writes
-/// terminate the process conventionally. But a write to a spawned child's stdin
-/// whose reader has already exited would then kill `rocm` with SIGPIPE before
-/// the caller can turn the resulting `EPIPE` into a diagnostic. Wrap such writes
-/// in this helper so the failure surfaces as an `io::Error` (`BrokenPipe`)
-/// instead of a signal.
-#[cfg(unix)]
-#[allow(unsafe_code)] // libc FFI
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: reading/installing a signal disposition is always safe.
-    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let result = f();
-    // SAFETY: restoring the disposition captured above is always safe.
-    unsafe {
-        libc::signal(libc::SIGPIPE, previous);
-    }
-    result
-}
-
-#[cfg(not(unix))]
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    f()
-}
 
 /// Marker error carrying `rocm fix`'s exit code back through `main()`'s
 /// ordinary return path, instead of calling `std::process::exit` mid-stack
@@ -1446,89 +1413,6 @@ pub(crate) mod tests {
                 "the update path must name itself as the approval source: {line}"
             );
         }
-    }
-
-    /// Regression test for the engine child-stdin write under the process-wide
-    /// `SIG_DFL` that `main` installs via [`reset_sigpipe`]. If an engine child
-    /// exits before reading its stdin, the parent's write to that pipe must
-    /// surface as a `BrokenPipe` error — handled by the caller's diagnostics —
-    /// rather than killing `rocm` with SIGPIPE before those diagnostics run.
-    ///
-    /// The bug only reproduces under `SIG_DFL`; the test harness leaves SIGPIPE
-    /// at Rust's default `SIG_IGN`, and flipping it process-wide would race
-    /// sibling tests. So this re-execs itself in fresh processes that install
-    /// `SIG_DFL` first, and checks BOTH directions:
-    /// - unguarded write to a dead child's stdin is fatal (killed by SIGPIPE) —
-    ///   this is the regression the plain `SIG_DFL` reset introduced;
-    /// - the same write wrapped in [`with_sigpipe_ignored`] survives and returns
-    ///   an error instead — this is the fix.
-    ///
-    /// Each child reaps its short-lived grandchild before writing, so the read
-    /// end is closed deterministically and the outcome does not race.
-    #[cfg(unix)]
-    #[test]
-    fn engine_stdin_write_under_sig_dfl_is_guarded_not_fatal() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        // Grandchild helper: reproduce main()'s SIG_DFL, spawn a process that
-        // exits immediately, reap it, then write to its now-closed stdin. The
-        // "guarded" arm wraps the write; the "unguarded" arm does not.
-        if let Some(mode) = std::env::var_os("ROCM_TEST_SIGPIPE_ARM") {
-            reset_sigpipe();
-            let mut grandchild = ProcessCommand::new("true")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn a process that exits immediately");
-            let mut stdin = grandchild.stdin.take().expect("grandchild stdin");
-            grandchild.wait().expect("reap grandchild");
-            // Heap-allocated so the buffer doesn't trip clippy::large-stack-arrays;
-            // it must exceed the pipe buffer so the write actually reaches the
-            // closed read end rather than being swallowed by kernel buffering.
-            let payload = vec![b'x'; 64 * 1024];
-            if mode == "guarded" {
-                let result = with_sigpipe_ignored(|| stdin.write_all(&payload));
-                assert!(
-                    result.is_err(),
-                    "guarded write to a dead pipe should return BrokenPipe, not succeed"
-                );
-            } else {
-                // Unguarded: under SIG_DFL this write delivers SIGPIPE and never
-                // returns. If the process somehow survives, exit 0 so the parent's
-                // "should have been signalled" assertion fails loudly.
-                let _ = stdin.write_all(&payload);
-            }
-            return;
-        }
-
-        let exe = std::env::current_exe().expect("current test executable");
-        let run_arm = |mode: &str| -> ExitStatus {
-            ProcessCommand::new(&exe)
-                .args([
-                    "tests::engine_stdin_write_under_sig_dfl_is_guarded_not_fatal",
-                    "--exact",
-                    "--nocapture",
-                ])
-                .env("ROCM_TEST_SIGPIPE_ARM", mode)
-                .status()
-                .expect("re-exec the test arm in a child process")
-        };
-
-        let unguarded = run_arm("unguarded");
-        assert_eq!(
-            unguarded.signal(),
-            Some(libc::SIGPIPE),
-            "sanity check: an unguarded stdin write under SIG_DFL must be killed by \
-             SIGPIPE (got {unguarded:?}); if not, the test no longer proves the guard matters"
-        );
-
-        let guarded = run_arm("guarded");
-        assert!(
-            guarded.success(),
-            "guarded child-stdin write was fatal under SIG_DFL ({guarded:?}) — \
-             SIGPIPE reached the process instead of surfacing as an error"
-        );
     }
 
     #[test]

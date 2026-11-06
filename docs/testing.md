@@ -205,6 +205,42 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### The engine stdio client
+
+`rocm` and `rocmd` run an engine child through one client,
+[`stdio_client.rs`](../crates/rocm-engine-protocol/src/stdio_client.rs) in
+`rocm-engine-protocol`. Its conversation (the request line, the environment each
+option sets, what a failing exit or an unusable answer is reported as, the
+SIGPIPE guard) is tested there against `FakeEngine`, a shell-script engine child
+from [`fake_engine.rs`](../crates/rocm-engine-protocol/src/fake_engine.rs) that
+records its argv, environment and stdin; the pure parts (the command a call
+builds, `decode_engine_response`, stderr collection) run on every platform, and
+the ones that start the fake are `#[cfg(unix)]`. The `rocm` and `rocmd` callers
+each run their own entry point against the same fake and pin only what they
+choose: the program and verb, the app paths, and whether stderr is forwarded (see
+`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). A caller that
+grew its own private copy of the conversation would fail those tests.
+
+The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
+its default action, which is how `rocm` runs, because the test harness leaves it
+ignored and changing it process-wide would race sibling tests. A write that is
+not guarded kills that process, and the parent test reports the signal. Two
+writes are covered that way: the request to the child's stdin, and the forwarding
+of the child's stderr to this process's stderr (a line of progress, and the note
+recorded when reading it fails). The forwarding test writes into a real pipe whose
+reader is closed, because a mock sink that returns `BrokenPipe` itself never
+raises the signal. `FakeEngine` quotes the response and its scratch directory
+for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
+apostrophe, reaches the client intact.
+
+A child whose answer cannot be read is killed and reaped before the error is
+returned, as it is when the request cannot be written, so the long-lived daemon
+does not collect a running engine or a zombie per failure.
+`a_failed_read_of_the_answer_kills_and_reaps_the_child` (Linux only) runs the
+read step on a real child with a reader that fails and checks that the child's
+`/proc` entry is gone: a killed child that was never waited on would keep it as a
+zombie.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
@@ -1456,6 +1492,16 @@ second terminal to watch the download.
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
 
+The `service_logs` tool (what the assistant and MCP clients call to read a
+server's log) answers through `rocm_core::service_log_tool_summary`, so an empty
+log (`has no log output yet`) and a log whose newest line is longer than the
+4 MiB a log view reads (`none is shown: the newest line is longer than ...`, with
+`newest_line_exceeds_read_bound` set in the structured reply) are not both
+reported as zero lines read. The CLI's copy of the tool is run by scenarios
+`logs-13` and `logs-14` through `rocm mcp-call service_logs`; the daemon's copy
+is covered by `cargo test -p rocmd --lib service_logs`, because the harness
+drives only the `rocm` binary.
+
 TUI log pagination focused tests:
 
 ```bash
@@ -1511,8 +1557,12 @@ cargo test -p rocm --bin rocm respawn_allows_loopback
 cargo test -p rocm --bin rocm restart_refuses_a_public_service
 cargo test -p rocm-core generate_endpoint_api_key
 cargo test -p rocm-engine-protocol endpoint_api_key
-cargo test -p rocm-engine-protocol is_public_bind_host
+cargo test -p rocm-core is_public_bind_host
+cargo test -p rocm-core endpoint_key
+cargo test -p rocm --bin rocm the_command_a_respawn_refusal_names_clears_the_refusal
 cargo test -p rocmd recovery_respawn_fails_closed
+cargo test -p rocmd supervising_a_
+cargo test -p rocmd server_recover_refuses_a_keyless_public_service
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
@@ -1550,7 +1600,13 @@ The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
 to respawn once its key is gone, rather than coming back unauthenticated. That
 covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusal
-happens before anything is stopped, so it cannot take down a running service. A
+happens before anything is stopped, so it cannot take down a running service.
+Both binaries apply the same guard, `rocm-core`'s
+`ensure_public_service_has_endpoint_key`, so the refusal reads the same for a
+launch, a restart and a daemon respawn bar the action it names; the unit tests
+check each caller's text against the guard's, and follow the `rocm serve
+<model> …` command it names through the real parser, `serve`'s own key policy
+and the key file it stores. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
@@ -1558,8 +1614,9 @@ that later observes the process dead. `service-stop-01`
 (`features/service_stop.feature`) covers `services stop` succeeding against a
 running record on the mock lane and the record being persisted as stopped, and
 `service-stop-02` covers the key being dropped once the daemon's `stop_server`
-confirms a stop. There is still no e2e coverage of `services restart`, which
-remains unit-tested only. Reusing a running service for a
+confirms a stop. `service-stop-08` covers a `services restart` of a public server whose key is
+gone being refused, naming a `rocm serve` command that `rocm` accepts, with the
+running server left running; a restart that goes ahead remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
 Linux-only since the Windows managed Lemonade spawn can't enforce the key)
@@ -1772,6 +1829,78 @@ directly, exits 0, and records whether that signal worked, adding a second
 stderr `note:` when it did not (`cargo test -p rocm --bin rocm services_stop_` and
 `cargo test -p rocm --bin rocm attached_ctrl_c_`).
 
+`rocm services stop` and `rocmd`'s `stop_server` terminate the processes a
+record names through one routine,
+[`terminate_recorded_service_pids`](../crates/rocm-core/src/proc_lifecycle.rs),
+and wait `MANAGED_STOP_GRACE` for each; neither binary keeps a copy. The
+routine is tested in `rocm-core` (`cargo test -p rocm-core proc_lifecycle::`):
+the supervisor is visited before the engine, each PID with its own start-time,
+a PID recorded under both roles once, and the stopping process's own PID is
+reported as `self` in `pid_outcomes` and never signalled, in both commands.
+On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
+`terminate_verified` cannot walk a process tree there; that step is tested
+through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
+and its neighbours) and, against a real tree, by a Windows-only scenario
+(`service-stop-07`, below). The callers' own tests check
+that each reaches the routine and reports what it returns
+(`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
+`cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
+that no private copy of the routine or its constant has come back. A confirmed
+stop also clears the PIDs and start-time tokens it stopped from the record
+(`ManagedServiceRecord::clear_recorded_processes`, one call from both
+binaries), and an unconfirmed one keeps them; a PID recorded without a token is
+signalled on trust alone once the OS has recycled it, so a stale one must not
+survive for a second stop to find.
+`a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing`
+runs the real routine with the per-PID signal injected, and asserts the
+persisted record after the first stop and that a second stop signals nothing;
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
+other direction. `service-stop-07`
+(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill:
+it records a PowerShell parent that has started a `ping` child, runs `rocm
+services stop --yes`, and asserts that both processes are gone together with the
+report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
+no process, no stop request, key file gone). The child is the tree kill's own
+work: with the `taskkill /T` step removed the stop ends only the recorded
+process and the scenario fails on the surviving child. The scenario keeps the
+child's own identity (`E2eWorld::recorded_descendant`) and teardown ends it when
+it is still that process, so a stop that fails to take it down does not leave
+`ping` running for its five minutes behind a dead parent; the decision is
+`e2e_cucumber::stray_process::leftover_action`, which a table test covers on
+every host (ended only while it is still the recorded process, never once gone,
+reused or unconfirmed). `service-stop-01` plants
+PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
+injected unit tests above cover its ordering and verdicts on every host.
+
+The tree kill is behind the same identity gate as the rest of the stop. On
+Windows `process_start_ticks` is the process creation time (`GetProcessTimes`, a
+`FILETIME`), so a record written by this version refutes a PID that an unrelated
+process has taken, and the stop reports `identity_mismatch` without running
+`taskkill` on it; only a record written before Windows recorded a token has
+nothing to refute: a stop refuses a PID only when a token was recorded and the
+live one differs, and `what_a_stop_does_for_each_recorded_and_live_token` pins
+that for every case on every host (no token, which is also the shape
+`service-stop-07` records; a token that matches; one that differs; one that
+cannot be read back), asserting whether the tree kill runs and the verdict the
+stop reports together. `a_filetime_is_its_high_word_above_its_low_word` runs the
+conversion on every host. `terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
+runs the real stop against this test's own PID with a wrong token on Linux and
+Windows (a stop that went ahead would end the test process), and
+`terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+repeats it against a bystander on Windows only and then stops that bystander
+with its true token. `service-stop-09` is the live version on every OS: it
+records a running process under a token no live process has, stops the server,
+and asserts that the process is still running and the record names no process.
+Neither Windows-only test nor the Windows half of `service-stop-09` ran where
+this was written; the Windows CI jobs are what exercise them. A stop that cannot
+verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
+eq <pid>"` on Windows (`process_check_command`).
+`service-stop-06` (Linux) is the same stop of a real recorded process through
+`rocm services stop`, checking the persisted state: the process exited and the
+record names none. Run the Windows scenario on a Windows host with
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-07"`
+and a prebuilt `ROCM_CLI_BINARY`.
+
 No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
 `rocm serve` launch — an engine and a runtime the mock lane does not have,
 which is why the chat scenarios there plant a record behind a mock server
@@ -1796,7 +1925,8 @@ unconfirmed rather than having its PIDs cleared.
 `features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
 drives the real `rocmd sandbox-tool stop_server` against a live recorded
 process and checks the confirmed report against the process, the record and
-the endpoint key file. Run it with
+the endpoint key file, and that the standalone `rocmd` got an answer to its
+engine `Stop` request (it reaches the engine through the `rocm` beside it). Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
 `service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
@@ -1806,11 +1936,18 @@ stop report that outcome for the recorded process without signalling it: each
 checks the report on stderr, exit 1, the kept PID and stop request, and that no
 stop command is named. -03 and -04 plant an endpoint key and check that the
 `kept:` line names it and the key file is still there; -05 plants none and
-checks that the line omits it and no key file exists. Because the seam
+checks that the line omits it and no key file exists. `service-stop-08` plants a
+publicly bound server with no key file and runs `rocm services restart --yes`:
+it checks the refusal's text and exit status, that the `rocm serve` command it
+names parses (its `<model>` filled in, `--help` last, with a bogus flag as the
+negative control), and that the recorded process is still running and the
+record is not marked stopped. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop"`.
+"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
+suite's own host filter, so it would also run the Windows-only
+`service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
 Manual restricted-tool smoke:
 

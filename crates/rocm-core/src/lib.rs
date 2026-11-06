@@ -52,6 +52,7 @@ pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
 pub mod service_record;
+mod sigpipe;
 pub mod terminal;
 pub mod user_path;
 
@@ -103,7 +104,10 @@ pub use download::{
     download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
-pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
+pub use endpoint_key::{
+    ServiceStart, endpoint_api_key_has_forbidden_chars, ensure_public_service_has_endpoint_key,
+    generate_endpoint_api_key, is_public_bind_host,
+};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
     engine_state_inference_verified, managed_service_endpoint_model_ready,
@@ -138,7 +142,11 @@ use host_gpu::{
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
-pub use log_tail::tail_lines;
+pub use log_tail::{
+    LOG_VIEW_MAX_TAIL_READ, LogDecode, LogTail, newest_line_exceeds_bound_notice,
+    service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
+    tail_log_decoded,
+};
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
@@ -164,10 +172,11 @@ pub use net::{
     http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
-pub use paths::{AppPaths, engine_plugin_dirs};
+pub use paths::{AppPaths, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
+    RecordedPidStop, TerminationOutcome, identity_state, process_start_ticks,
+    terminate_recorded_pid, terminate_recorded_service_pids, terminate_verified,
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
@@ -219,6 +228,7 @@ pub use service_record::{
     INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
     engine_stop_decides_confirmation,
 };
+pub use sigpipe::with_sigpipe_ignored;
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
