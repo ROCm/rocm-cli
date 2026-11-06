@@ -571,7 +571,11 @@ fn plan_python_launcher_in(
             PlannedPython::WouldPrepareManaged {
                 version,
                 requirement,
-                tag_checked: tag.is_some(),
+                tag_check: if tag.is_some() {
+                    TagCheck::Checked
+                } else {
+                    TagCheck::Unchecked
+                },
             }
         }
     })
@@ -583,14 +587,26 @@ pub(super) enum PlannedPython {
     /// An interpreter that is usable as it stands.
     Ready(PythonLauncher),
     /// No interpreter is usable. A real install would prepare managed Python
-    /// `version`; this preview has not. `tag_checked` is whether the wheel tag
+    /// `version`; this preview has not. `tag_check` says whether the wheel tag
     /// `version` reports could be read off its name and matched against the
     /// requirement; when it could not, only installing it would say.
     WouldPrepareManaged {
         version: String,
         requirement: PythonRequirement,
-        tag_checked: bool,
+        tag_check: TagCheck,
     },
+}
+
+/// Whether a version a preview would prepare could be matched against the
+/// wheel tag the layout requires before it is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TagCheck {
+    /// The tag was read off the version's name and matches the requirement.
+    Checked,
+    /// The tag cannot be read off the version's name (another implementation, a
+    /// range, a wildcard that leaves the minor open): only installing it would
+    /// tell.
+    Unchecked,
 }
 
 impl PlannedPython {
@@ -631,10 +647,10 @@ impl PlannedPython {
             Self::WouldPrepareManaged {
                 version,
                 requirement,
-                tag_checked,
+                tag_check,
             } => Some(format!(
                 "no usable Python was found; a real install would use uv to install managed Python {version}{} and save its path in the configuration, which this preview did not do",
-                unchecked_tag_caveat(*tag_checked, *requirement)
+                unchecked_tag_caveat(*tag_check, *requirement)
             )),
         }
     }
@@ -667,10 +683,10 @@ impl PlannedPython {
             Self::WouldPrepareManaged {
                 version,
                 requirement,
-                tag_checked,
+                tag_check,
             } => format!(
                 "No usable Python found; a real install would prepare Python {version}{}. This preview does not.",
-                unchecked_tag_caveat(*tag_checked, *requirement)
+                unchecked_tag_caveat(*tag_check, *requirement)
             ),
         }
     }
@@ -706,14 +722,13 @@ impl PlannedPython {
 /// could. One function for [`PlannedPython::note`] and
 /// [`PlannedPython::progress_text`], so the two cannot word the same caveat
 /// differently.
-fn unchecked_tag_caveat(tag_checked: bool, requirement: PythonRequirement) -> String {
-    if tag_checked {
-        String::new()
-    } else {
-        format!(
+fn unchecked_tag_caveat(tag_check: TagCheck, requirement: PythonRequirement) -> String {
+    match tag_check {
+        TagCheck::Checked => String::new(),
+        TagCheck::Unchecked => format!(
             " (its wheel tag cannot be checked until it is installed; {} is required)",
             requirement.tag
-        )
+        ),
     }
 }
 
@@ -1566,14 +1581,18 @@ exit 1
         let PlannedPython::WouldPrepareManaged {
             ref version,
             requirement,
-            tag_checked,
+            tag_check,
         } = planned
         else {
             panic!("a host with no Python must be planned as needing one, got {planned:?}");
         };
         assert_eq!(version, DEFAULT_MANAGED_PYTHON_VERSION);
         assert_eq!(requirement, python_requirement(SourceLayout::Canonical));
-        assert!(tag_checked, "the default version's tag is readable");
+        assert_eq!(
+            tag_check,
+            TagCheck::Checked,
+            "the default version's tag is readable"
+        );
         let note = planned
             .note()
             .expect("a preview that skipped a step says so");
@@ -1661,18 +1680,18 @@ exit 1
 
         // Announced: the default, a patch release of the required minor, a
         // blank override (read as unset) and a version whose tag cannot be read.
-        for (version, announced, checked) in [
-            (None, "3.12", true),
-            (Some("3.12.4"), "3.12.4", true),
-            (Some("cpython@3.12"), "cpython@3.12", true),
-            (Some("  "), "3.12", true),
-            (Some("pypy@3.10"), "pypy@3.10", false),
+        for (version, announced, tag_check) in [
+            (None, "3.12", TagCheck::Checked),
+            (Some("3.12.4"), "3.12.4", TagCheck::Checked),
+            (Some("cpython@3.12"), "cpython@3.12", TagCheck::Checked),
+            (Some("  "), "3.12", TagCheck::Checked),
+            (Some("pypy@3.10"), "pypy@3.10", TagCheck::Unchecked),
         ] {
             let (result, lines) = run(version, false, true);
             let planned = result.unwrap_or_else(|error| panic!("{version:?}: {error:#}"));
             let PlannedPython::WouldPrepareManaged {
                 version: planned_version,
-                tag_checked,
+                tag_check: planned_check,
                 ..
             } = &planned
             else {
@@ -1681,11 +1700,12 @@ exit 1
                 );
             };
             assert_eq!(planned_version, announced, "{version:?}");
-            assert_eq!(*tag_checked, checked, "{version:?}");
-            let caveat = if checked {
-                ""
-            } else {
-                " (its wheel tag cannot be checked until it is installed; cp312 is required)"
+            assert_eq!(*planned_check, tag_check, "{version:?}");
+            let caveat = match tag_check {
+                TagCheck::Checked => "",
+                TagCheck::Unchecked => {
+                    " (its wheel tag cannot be checked until it is installed; cp312 is required)"
+                }
             };
             assert_eq!(lines, vec![promise(announced, caveat)], "{version:?}");
             assert!(
@@ -2153,7 +2173,7 @@ exit 1
                 matches!(
                     &planned,
                     PlannedPython::WouldPrepareManaged {
-                        tag_checked: true,
+                        tag_check: TagCheck::Checked,
                         ..
                     }
                 ),
@@ -2170,7 +2190,7 @@ exit 1
             matches!(
                 &planned,
                 PlannedPython::WouldPrepareManaged {
-                    tag_checked: false,
+                    tag_check: TagCheck::Unchecked,
                     ..
                 }
             ),
@@ -2259,7 +2279,7 @@ exit 1
             let planned = PlannedPython::WouldPrepareManaged {
                 version: requirement.version.to_owned(),
                 requirement,
-                tag_checked: true,
+                tag_check: TagCheck::Checked,
             };
 
             let compatibility = planned.wheel_compatibility()?;
