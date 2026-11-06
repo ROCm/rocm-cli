@@ -229,6 +229,58 @@ pub(crate) fn write_test_pip_runtime(
     Ok(manifest)
 }
 
+/// Leave `paths` as `rocm setup` followed by a lost registry entry would: a ready
+/// wheel runtime whose install tree holds its own `.rocm-cli-runtime.json` and
+/// that `config.json` names as the setup folder, but that the runtime registry
+/// has no entry for. Only `recover_setup_runtime_registration` can make it
+/// visible again, so a selection that finds it has run that recovery.
+pub(crate) fn write_test_setup_runtime_missing_from_registry(
+    paths: &AppPaths,
+    runtime_key: &str,
+) -> Result<therock::InstalledRuntimeManifest> {
+    let manifest = write_test_pip_runtime(
+        paths,
+        runtime_key,
+        "therock-release:gfx120X-all",
+        "7.13.0",
+        20,
+    )?;
+    fs::remove_file(runtime_manifest_path(paths, runtime_key))?;
+    let mut config = rocm_core::RocmCliConfig::default();
+    config.setup.therock_venv = Some(manifest.install_root.clone());
+    config.save(paths)?;
+    Ok(manifest)
+}
+
+/// Make the runtime registry impossible to write for any user, an administrator
+/// included: a plain file stands where its directory should be, so listing the
+/// registry finds nothing and creating it fails. A read-only directory would
+/// not do, because it does not stop `root`, which is who the e2e suite can run as.
+/// Returns the path of that file, so a test can show it was left as it was.
+pub(crate) fn make_runtime_registry_unwritable(paths: &AppPaths) -> Result<PathBuf> {
+    let registry = runtime_registry_dir(paths);
+    let _ = fs::remove_dir_all(&registry);
+    if let Some(parent) = registry.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&registry, "not a directory")?;
+    Ok(registry)
+}
+
+/// File names in the runtime registry directory, sorted; empty when the
+/// directory does not exist. Lets a test assert that a selection did, or did
+/// not, write a registry entry.
+pub(crate) fn runtime_registry_entry_names(paths: &AppPaths) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(runtime_registry_dir(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 mod tests {
     use super::*;
 
