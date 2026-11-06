@@ -19,8 +19,8 @@
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly.
-//! `ServicesCommand` stays in `main.rs` (a dedicated clap subcommand's enum
-//! usually does, per `docs/architecture.md`'s convention note). Since this
+//! `ServicesCommand` lives in `cli.rs` with the rest of the clap command
+//! tree. Since this
 //! split, `services()` has moved to `services_cmd.rs`, the record removal and
 //! pruning it dispatches to to `service_records.rs`, `record_cli_audit_event`
 //! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
@@ -57,11 +57,12 @@ use crate::managed_service_status::{
     existing_live_managed_service_in, load_managed_services, managed_service_is_live,
 };
 use crate::serve_port;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_hints;
 use crate::services_text::read_optional_tail_lines;
 use crate::services_text::{
     render_service_action_result, render_service_action_result_with_helper_note,
-    run_internal_sandbox_tool, service_stop_unconfirmed,
+    service_stop_unconfirmed,
 };
 use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
@@ -3982,8 +3983,8 @@ mod tests {
         // the same seam production injects a real signal through; here it just
         // confirms every recorded process gone without touching the test
         // process itself.
-        crate::services_text::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
-            crate::services_text::RecordedStopTermination::confirmed_stopped()
+        crate::service_control::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
+            crate::service_control::RecordedStopTermination::confirmed_stopped()
         })?;
 
         let decision = resolve_managed_port_in_transaction(

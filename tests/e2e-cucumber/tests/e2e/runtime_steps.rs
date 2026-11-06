@@ -1061,24 +1061,12 @@ async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
 
 #[then("the managed runtime folder path is not recursively nested")]
 async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
-    // `rocm examine` prints `Folder: <install_root>` for the active runtime.
+    // `rocm examine` prints `active_runtime_root: <install_root>` for the active
+    // managed runtime; the judgement lives in the library so unit tests run it.
     let output = world.cli_output.as_ref().expect("no examine output");
-    let Some(folder) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Folder:"))
-        .map(str::trim)
-    else {
-        panic!("no 'Folder:' line in examine output:\n{output}");
-    };
-    // A healthy path contains `runtimes/wheel` at most once. Re-provisioning
-    // inside an existing runtime produces `runtimes/wheel/.../runtimes/wheel/`
-    // (dogfooding #17). Count occurrences of the marker segment.
-    let nested = folder.matches("runtimes/wheel").count() > 1
-        || folder.matches("runtimes\\wheel").count() > 1;
-    assert!(
-        !nested,
-        "managed runtime folder path is recursively nested (dogfooding #17):\n{folder}"
-    );
+    if let Err(reason) = e2e_cucumber::runtime_root::check_runtime_root_not_nested(output) {
+        panic!("{reason}\nexamine output:\n{output}");
+    }
 }
 
 #[when("the user checks for runtime updates")]

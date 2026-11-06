@@ -18,7 +18,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, interactive_terminal};
+use rocm_core::{AppPaths, require_yes_or_interactive};
 
 use crate::uninstall_plan::{
     UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
@@ -72,14 +72,10 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
         return Ok(());
     }
 
-    if !options.yes {
-        if !interactive_terminal() {
-            bail!("uninstall requires --yes outside an interactive terminal");
-        }
-        if !confirm_uninstall()? {
-            println!("uninstall cancelled");
-            return Ok(());
-        }
+    let already_approved = require_yes_or_interactive(options.yes, "uninstall")?;
+    if !already_approved && !confirm_uninstall()? {
+        println!("uninstall cancelled");
+        return Ok(());
     }
 
     execute_plan(&plan, &mut |line| println!("{line}"))?;

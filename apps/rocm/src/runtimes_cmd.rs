@@ -14,10 +14,10 @@
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`runtimes(command)`,
 //! re-imported via `use crate::runtimes_cmd::{runtimes, ...};`).
-//! `RuntimesCommand` remains in the crate root (part of the `Command`/`Cli`
-//! clap definition) and is reached via `use crate::RuntimesCommand`, the same
-//! way `EnginesCommand` stayed behind when `engines()` moved to
-//! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` stays
+//! `RuntimesCommand` lives in `cli.rs` (part of the `Command`/`Cli` clap
+//! definition) and is reached via `use crate::RuntimesCommand`, a re-import in
+//! `main.rs`, the same way `engines_cmd.rs` reaches `EnginesCommand`.
+//! `RuntimeActivationResult` stays
 //! `pub(crate)`: it is read by `append_update_activate_summary` in
 //! `update_cmd.rs`'s `apply_runtime_update` flow. The uninstall plan and apply
 //! code lives in `runtime_uninstall.rs`, and the active-runtime marker model in
@@ -39,8 +39,8 @@
 use std::fmt::Write as _;
 use std::fs;
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal};
+use anyhow::{Context, Result};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
 
 use crate::runtime_adopt::{
     AdoptRuntimeOptions, adopt_runtime_from_python_options, import_runtime_manifest,
@@ -213,12 +213,9 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
-            let plan = if yes {
+            let plan = if require_yes_or_interactive(yes, "runtimes uninstall")? {
                 plan
             } else {
-                if !interactive_terminal() {
-                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
-                }
                 match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
                     RuntimeUninstallConfirmation::Cancelled => {
                         println!("runtime uninstall cancelled");

@@ -724,8 +724,25 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
+  # ROCMAI-196: the instance detail modal's "recent throughput" panel is
+  # fed from the dashboard's snapshot history. The scripted-metrics managed
+  # model gives real scraped ticks, so this scenario asserts only a populated
+  # row. The idle and no-data placeholders and the short-terminal collapse
+  # are pinned by render tests in `ui/instance_detail.rs`.
+  @id:dash-instance-detail-recent-throughput @requires-os:linux
+  Scenario: dash-42 - Instance detail lists recent throughput samples for a serving model
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the user opens instance detail
+    Then instance details are displayed
+    And the instance detail lists recent throughput samples
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   @id:dash-serve-wizard-opens-collapsed @requires-os:linux
-  Scenario: dash-42 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+  Scenario: dash-43 - Opening the serve wizard shows only the model, Advanced settings, and Launch
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -736,7 +753,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
-  Scenario: dash-43 - Escape cancels an in-progress host edit without closing the serve wizard
+  Scenario: dash-44 - Escape cancels an in-progress host edit without closing the serve wizard
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -751,7 +768,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
-  Scenario: dash-44 - An automatic serve form stages a bare serve command with an automatic port
+  Scenario: dash-45 - An automatic serve form stages a bare serve command with an automatic port
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -767,7 +784,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
-  Scenario: dash-45 - A custom host with an automatic port is refused in the form
+  Scenario: dash-46 - A custom host with an automatic port is refused in the form
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -787,7 +804,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-refuses-public-host @requires-os:linux
-  Scenario: dash-46 - A public host is refused in the form with the CLI pointer
+  Scenario: dash-47 - A public host is refused in the form with the CLI pointer
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard

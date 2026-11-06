@@ -35,7 +35,7 @@
 //! instead of moving: `const fn status_for_readiness` sits between
 //! `wait_for_service_http_ready_with_progress` and
 //! `service_http_readiness_paths`, but it already had callers outside this
-//! cluster — `services_text.rs`'s `record_restart_readiness` (which
+//! cluster — `service_control.rs`'s `record_restart_readiness` (which
 //! `restart_internal_managed_service_with` calls) and `service_launch.rs`,
 //! which reaches it unqualified via `use crate::{...};` — so it stays a shared
 //! crate-root function. Within this module only the retained tests below call
@@ -61,21 +61,21 @@
 //! `optional_arg` and
 //! `engine_recipe_json_arg` are `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
-//! from `main.rs`'s `dispatch()` and `services_text.rs`'s `restart_child_argv`.
+//! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
 //! `app_path_env_vars`/`apply_app_path_env` are `pub(crate)`, read from
 //! `engine_ipc.rs`, `app_path_env_vars` is also read from `chat.rs`, and
 //! `apply_app_path_env` is also read from `engines_cmd.rs`,
-//! `service_launch.rs`, and `services_text.rs`'s
+//! `service_launch.rs`, and `service_control.rs`'s
 //! `restart_internal_managed_service_with`; `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
-//! and `services_text.rs`'s `restart_internal_managed_service_with`.
+//! and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
 //! `managed_service_launcher_path` is `pub(crate)`, read from
-//! `service_launch.rs` and `services_text.rs`'s `restart_internal_managed_service_with`.
-//! `wait_for_service_http_ready` is `pub(crate)`, read from `services_text.rs`'s
+//! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
+//! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
 //! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
 //! is `pub(crate)`, read from `service_launch.rs`. `http_post_local_service_json`
-//! is `pub(crate)`, read from `services_text.rs`'s `unload_lemonade_service_model`.
+//! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
 //! `service_model_names_match` is `pub(crate)`, read from `chat.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `service_http_readiness_response_ready`, `lemonade_health_ready_for_model`,

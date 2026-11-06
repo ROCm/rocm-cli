@@ -5,7 +5,7 @@
 use crate::persistence::load_service_record;
 use crate::watchers::stop_requested;
 use anyhow::{Context, Result};
-use rocm_core::{AppPaths, ManagedServiceRecord, daemon_binary_path};
+use rocm_core::{AppPaths, ManagedServiceRecord};
 use std::fs;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -43,7 +43,6 @@ pub(crate) fn supervise_service(
     fs::create_dir_all(paths.services_dir())?;
 
     let gpu_indices = parse_gpu_indices_arg(gpu.as_deref())?;
-    let _ = daemon_binary_path();
 
     let mut record = ManagedServiceRecord::new(
         paths,

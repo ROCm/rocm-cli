@@ -147,7 +147,8 @@ Feature: GPU detection and system inspection
   # `rocm examine`'s own engine_inventory block prefixes the effective default
   # engine with the same `*` marker, via a renderer separate from `engines
   # list`'s (see `append_examine_engine_inventory` vs
-  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # `render_engine_inventory_text_with_paths`, both in
+  # apps/rocm/src/examine_report_text.rs) — the
   # two used to be able to drift apart. examine-13 only ever drove `engines
   # list`, leaving this second renderer's legend unexercised end-to-end.
   @id:examine-shows-default-engine-legend
@@ -272,7 +273,7 @@ Feature: GPU detection and system inspection
   # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
   # the WSL lane, where the managed runtime really does carry a `.so`. This
   # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
-  # diagnose.rs -- the same boundary, stated once there and once here.
+  # diagnose/catalog.rs -- the same boundary, stated once there and once here.
   @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
   Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
     Given a managed runtime is active
