@@ -274,7 +274,7 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
 Guardrails:
 
-- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function usually stays in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum and dispatch outright — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
+- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function goes in the domain module (`comfyui::run`) or a `*_cmd.rs` sibling, with only the top-level `dispatch()` match staying in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum as well — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
 - source file size is checked by `cargo xtask check-module-size` ([`module_size.rs`](xtask/src/module_size.rs)): no source file may exceed 1,500 production lines (test-gated items excluded), with one limit for every file and no exemption mechanism. A PR that would push a file past it splits the file in the same change; do not raise the limit or opt a file out. Merely editing a file that is already over the limit does not by itself require a split: those files are split under their own tickets, and the check cannot become blocking until none is left. Today the CI step and pre-commit hook only report; see `docs/architecture.md`
@@ -324,7 +324,7 @@ Required consistency points:
 ### `skills/rocm-doctor/` — published from here, and a test fixture
 
 `skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
-(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+(`include_str!` in `apps/rocm/src/chat/turn.rs`). `skills/rocm-doctor/` is different
 on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the

@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn freeform_plan_dedup_prevents_provider_assisted_divergence() -> Result<()> {
-        // Regression for the `chat.rs` `natural_language_plan` call site,
+        // Regression for the `chat/mcp_bridge.rs` `natural_language_plan` call site,
         // which used to call `render_freeform_plan` and the now-removed
         // `freeform_plan_next_action_with_context` independently -- each
         // calling `build_freeform_plan_with_context` on its own.

@@ -22,13 +22,14 @@
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`), which only `chat.rs` reads. `service_records.rs`
+//! (`friendly_engine_label`), which only `chat/summaries.rs` reads. `service_records.rs`
 //! calls into it for the in-use check behind service-record removal and pruning
 //! (`managed_service_is_live`, `recorded_service_pids`) and for
 //! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
 //! `load_managed_services` for the codex-bridge snapshot;
 //! `services_text.rs` reads the sidebar helpers for the local-servers view;
-//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `chat/turn.rs` and `chat/mcp_bridge.rs` call into it for the services tool
+//! and the local-assistant readiness check;
 //! `runtime_services.rs` calls into it when reconciling live servers against a
 //! runtime activation; `service_launch.rs` is the only caller of the
 //! `existing_live_managed_service_in` duplicate-launch guard it runs before
