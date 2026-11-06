@@ -36,6 +36,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::rust_source::strip_literals_and_comments;
     use std::path::{Path, PathBuf};
 
     /// The directory name proptest's default persistence uses.
@@ -122,16 +123,22 @@ mod tests {
         Some(path.join("/"))
     }
 
-    /// True when `source` has a `proptest!` block outside a comment.
+    /// True when `source` has a `proptest!` block in code.
     ///
-    /// Line-based and deliberately plain: a `proptest!` named in a `//` or
-    /// `///` comment (as in a note about where a test moved) must not keep an
-    /// orphaned seed alive. It does not parse Rust, so a block inside a string
-    /// literal would count; nothing in this tree does that.
+    /// A `proptest!` named in a comment or a string literal must not keep an
+    /// orphaned seed alive: a note about where a test moved, whether a `//`
+    /// line, a trailing `// ...` after code, or a `/* ... */` block (nested
+    /// ones included), and a test disabled by wrapping it in a block comment, are
+    /// not property tests. So the text is tokenized first, with the same
+    /// [`strip_literals_and_comments`] the other source-scan contracts use,
+    /// which blanks the contents of comments, string literals, raw strings and
+    /// char literals, and only what is left is searched.
+    ///
+    /// It still does not parse Rust: a `proptest!` that only appears as an
+    /// identifier suffix (`my_proptest!`) or inside another macro's arguments
+    /// counts. Nothing in this tree does either.
     fn has_proptest_block(source: &str) -> bool {
-        source
-            .lines()
-            .any(|line| !line.trim_start().starts_with("//") && line.contains(PROPTEST_MACRO))
+        strip_literals_and_comments(source).contains(PROPTEST_MACRO)
     }
 
     /// Why a seed file is not read by any test.
@@ -201,11 +208,13 @@ mod tests {
              source file of the test (<crate>/src/<path>.rs reads \
              <crate>/{REGRESSIONS_DIR}/<path>.txt), so the likely cause is that the property \
              test moved to another file, or the file was renamed: the saved counterexample is \
-             then never replayed again, with no warning. Fix: `git mv` the seed file to \
+             then never replayed again, with no warning. Fix: put its `cc` lines in \
              <crate>/{REGRESSIONS_DIR}/<path of the file the test is in now, relative to src/, \
-             .txt>, and check it is read by appending a deliberately unparsable line and running \
-             the test with `--nocapture` (proptest prints `unparsable line, ignoring`); remove \
-             the line again. If the test is gone, delete the seed file.\n{}",
+             .txt>: `git mv` the file when nothing is there yet, and append the lines to the \
+             existing file when something is (a destination that already has seeds of its own \
+             keeps them). Then check it is read by appending a deliberately unparsable line and \
+             running the test with `--nocapture` (proptest prints `unparsable line, \
+             ignoring`); remove the line again. If the test is gone, delete the seed file.\n{}",
             orphans.len(),
             lines.join("\n")
         )
@@ -362,6 +371,106 @@ mod tests {
         assert_eq!(orphans.len(), 1);
     }
 
+    /// The seed of `apps/rocm/src/main.rs`, whose property test moved away and
+    /// left only `source` behind: it is an orphan whenever `source` has no
+    /// `proptest!` in code.
+    fn orphans_when_main_holds(source: &str) -> Vec<Orphan> {
+        let files = [("apps/rocm/src/main.rs", source)];
+        let seeds = strings(&["apps/rocm/proptest-regressions/main.txt"]);
+        orphaned_seeds(&seeds, fixture(&files))
+    }
+
+    #[test]
+    fn a_proptest_named_outside_code_does_not_keep_a_seed_alive() {
+        // Everything a note about a moved test, or a disabled one, can look like
+        // without being a property test. Each used to be accepted: only a line
+        // that STARTED with `//` was excluded.
+        let expected = vec![Orphan::NoPropertyTest {
+            seed: "apps/rocm/proptest-regressions/main.txt".to_string(),
+            expected: "apps/rocm/src/main.rs".to_string(),
+        }];
+        let mut accepted = Vec::new();
+        for (what, source) in [
+            (
+                "a trailing line comment",
+                "fn main() {} // proptest! moved elsewhere\n",
+            ),
+            (
+                "a block comment on one line",
+                "fn main() {} /* proptest! moved elsewhere */\n",
+            ),
+            (
+                "a block comment around the whole property block",
+                "/*\nproptest! {\n    #[test]\n    fn p() {}\n}\n*/\nfn main() {}\n",
+            ),
+            (
+                "a nested block comment",
+                "/* outer /* inner */ proptest! { fn p() {} } still outer */\nfn main() {}\n",
+            ),
+            (
+                "a block comment that opens after code",
+                "fn main() {} /* proptest! {\n    fn p() {}\n} */\n",
+            ),
+            (
+                "a string literal",
+                "const NOTE: &str = \"the proptest! moved elsewhere\";\n",
+            ),
+            (
+                "a raw string literal",
+                "const NOTE: &str = r#\"the \"proptest!\" moved\"#;\n",
+            ),
+        ] {
+            if orphans_when_main_holds(source) != expected {
+                accepted.push(what);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "the guard counted a proptest! outside code as a property test: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn a_property_block_next_to_comments_and_literals_still_counts() {
+        // The other direction: stripping must not hide a real block. Each is
+        // a source the guard has to accept, so the stricter scan cannot turn a
+        // seed that something reads into a false orphan.
+        let mut hidden = Vec::new();
+        for (what, source) in [
+            ("after a block comment", "/* note */ proptest! { }\n"),
+            ("after a line comment", "// note\nproptest! { }\n"),
+            (
+                "after a nested block comment",
+                "/* a /* b */ c */ proptest! { }\n",
+            ),
+            (
+                "after a string literal",
+                "const A: &str = \"x\"; proptest! { }\n",
+            ),
+            (
+                "after a lifetime",
+                "fn f<'a>(_: &'a str) {} proptest! { }\n",
+            ),
+            (
+                "after a char literal",
+                "const C: char = '\"'; proptest! { }\n",
+            ),
+            (
+                "with a comment inside the block",
+                "proptest! {\n    // a note\n    #[test] fn p() {}\n}\n",
+            ),
+            ("through its path", "::proptest::proptest! { }\n"),
+        ] {
+            if !orphans_when_main_holds(source).is_empty() {
+                hidden.push(what);
+            }
+        }
+        assert!(
+            hidden.is_empty(),
+            "the guard did not see a real proptest! block: {hidden:?}"
+        );
+    }
+
     #[test]
     fn the_failure_names_the_file_the_likely_cause_and_the_fix() {
         let text = describe(&[Orphan::NoPropertyTest {
@@ -375,6 +484,9 @@ mod tests {
         assert!(text.contains("apps/rocm/src/main.rs"), "{text}");
         assert!(text.contains("moved to another file"), "{text}");
         assert!(text.contains("git mv"), "{text}");
+        // A destination that already has seeds keeps them: the advice must not
+        // be an unconditional `git mv`, which would replace or refuse there.
+        assert!(text.contains("append the lines"), "{text}");
         assert!(text.contains("unparsable line, ignoring"), "{text}");
     }
 
