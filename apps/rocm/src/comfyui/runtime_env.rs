@@ -7,7 +7,10 @@
 //!
 //! [`select_runtime`] turns an explicit `--runtime-id` or the configured
 //! default into the one ready managed Python runtime an install runs against,
-//! and explains how to pick one when none or several qualify. The
+//! and explains how to pick one when none or several qualify. A choice that
+//! names the runtime `rocm setup` created finds it even when its registry entry
+//! was lost (see `pick_from_registry`), so the `--runtime-id` an install preview
+//! prints works from the state the preview left. The
 //! `runtime_environment_*` functions build the `VIRTUAL_ENV`, `ROCM_PATH`,
 //! `PATH` and library-path settings a ComfyUI child process runs with, and
 //! [`apply_runtime_environment`] puts them on a command.
@@ -17,7 +20,9 @@
 //! ComfyUI types.
 
 use super::{ComfyUiManifest, ComfyUiRuntimeEnvironment, SelectedRuntime};
-use crate::runtime_adopt::{SetupRecovery, SingleReadyRuntime, select_single_ready_runtime};
+use crate::runtime_adopt::{
+    SetupRecovery, SingleReadyRuntime, registered_runtimes_with_setup, select_single_ready_runtime,
+};
 use crate::runtimes_cmd::runtime_usability_status;
 use crate::therock;
 use anyhow::{Context, Result, bail};
@@ -36,9 +41,9 @@ pub(super) fn select_runtime(
     recovery: SetupRecovery,
 ) -> Result<SelectedRuntime> {
     let manifest = match selector.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(selector) => {
-            select_runtime_by_selector(&registered_runtimes(paths)?, selector)?.clone()
-        }
+        Some(selector) => pick_from_registry(paths, config, recovery, |manifests| {
+            select_runtime_by_selector(manifests, selector)
+        })?,
         None => select_default_runtime(paths, config, recovery)?,
     };
     if runtime_usability_status(&manifest) != "ready" {
@@ -117,13 +122,36 @@ fn format_runtime_statuses<'a>(
         .join(", ")
 }
 
-/// Every registered runtime, or the refusal to install ROCm when there is none.
-fn registered_runtimes(paths: &AppPaths) -> Result<Vec<therock::InstalledRuntimeManifest>> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    if manifests.is_empty() {
-        return Err(install_rocm_first());
+/// Apply `pick` (a choice that names a runtime: `--runtime-id`, the active
+/// runtime or the configured default) to the registry. A runtime that `rocm
+/// setup` created and whose registry entry was lost is not a refusal either:
+/// when the registry alone has no answer, `pick` runs once more over the
+/// registry plus that runtime, the way the engine paths resolve an explicit
+/// `--runtime-id`. Which write that implies is `recovery`'s: a preview adds the
+/// runtime to the list without writing its entry, so the `--runtime-id` an
+/// install preview prints is a command that works from the state the preview
+/// left. If setup's runtime cannot be used, the registry's own answer stands.
+fn pick_from_registry(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    recovery: SetupRecovery,
+    pick: impl for<'a> Fn(
+        &'a [therock::InstalledRuntimeManifest],
+    ) -> Result<&'a therock::InstalledRuntimeManifest>,
+) -> Result<therock::InstalledRuntimeManifest> {
+    let registered = therock::load_runtime_manifests(paths)?;
+    let refusal = if registered.is_empty() {
+        install_rocm_first()
+    } else {
+        match pick(&registered) {
+            Ok(manifest) => return Ok(manifest.clone()),
+            Err(error) => error,
+        }
+    };
+    match registered_runtimes_with_setup(paths, config, recovery) {
+        Ok(with_setup) if with_setup.len() > registered.len() => pick(&with_setup).cloned(),
+        _ => Err(refusal),
     }
-    Ok(manifests)
 }
 
 fn install_rocm_first() -> anyhow::Error {
@@ -138,12 +166,14 @@ fn select_default_runtime(
     recovery: SetupRecovery,
 ) -> Result<therock::InstalledRuntimeManifest> {
     if let Some(active_key) = config.active_runtime_key.as_deref() {
-        return select_runtime_by_selector(&registered_runtimes(paths)?, active_key).cloned();
+        return pick_from_registry(paths, config, recovery, |manifests| {
+            select_runtime_by_selector(manifests, active_key)
+        });
     }
     match config.default_runtime_id.as_deref() {
-        Some(default_runtime_id) => {
-            select_runtime_by_default_id(&registered_runtimes(paths)?, default_runtime_id).cloned()
-        }
+        Some(default_runtime_id) => pick_from_registry(paths, config, recovery, |manifests| {
+            select_runtime_by_default_id(manifests, default_runtime_id)
+        }),
         // Nothing says which runtime to use: the rule the engine paths share.
         None => {
             single_ready_runtime_or_refusal(select_single_ready_runtime(paths, config, recovery)?)
@@ -1164,6 +1194,141 @@ mod tests {
             "got: {message}"
         );
         assert_eq!(runtime_registry_entry_names(&paths), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// A choice that names the runtime setup created, by `--runtime-id` (key or
+    /// id), the active runtime or the configured default, finds it even though
+    /// its registry entry was lost. That is what makes the `--runtime-id` an
+    /// install preview prints a command that works from the state the preview
+    /// left: a preview adds the runtime to what it searches and writes nothing,
+    /// a real run writes the entry back. Each row asserts the pick and the
+    /// registry together.
+    #[test]
+    fn a_choice_naming_the_setup_runtime_finds_it_after_its_registry_entry_was_lost() -> Result<()>
+    {
+        type Choice = fn(&therock::InstalledRuntimeManifest, &mut RocmCliConfig) -> Option<String>;
+        let choices: [(&str, Choice); 4] = [
+            ("explicit key", |manifest, _| {
+                Some(manifest.runtime_key.clone())
+            }),
+            ("explicit id", |manifest, _| {
+                Some(manifest.runtime_id.clone())
+            }),
+            ("active runtime", |manifest, config| {
+                config.active_runtime_key = Some(manifest.runtime_key.clone());
+                None
+            }),
+            ("configured default", |manifest, config| {
+                config.default_runtime_id = Some(manifest.runtime_id.clone());
+                None
+            }),
+        ];
+        for (label, choice) in choices {
+            for recovery in [SetupRecovery::PreviewOnly, SetupRecovery::Persist] {
+                let paths = test_paths(&format!(
+                    "comfyui-choice-setup-{}-{recovery:?}",
+                    label.replace(' ', "-")
+                ));
+                let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                    &paths,
+                    "release-pip-gfx120x-all-7-14-0",
+                )?;
+                let mut config = RocmCliConfig::load(&paths)?;
+                let selector = choice(&manifest, &mut config);
+
+                let selected = select_runtime(&paths, &config, selector.as_deref(), recovery)
+                    .with_context(|| format!("{label}, {recovery:?}"))?;
+
+                assert_eq!(
+                    selected.manifest.runtime_key, manifest.runtime_key,
+                    "{label}, {recovery:?}"
+                );
+                let expected_entries = match recovery {
+                    SetupRecovery::PreviewOnly => Vec::new(),
+                    SetupRecovery::Persist => vec![format!("{}.json", manifest.runtime_key)],
+                };
+                assert_eq!(
+                    runtime_registry_entry_names(&paths),
+                    expected_entries,
+                    "{label}, {recovery:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// What the recovery must not turn into: a choice that names some other
+    /// runtime is answered by the registry whether or not setup's runtime is
+    /// usable, a name that matches nothing is still refused (with the setup
+    /// runtime among those found when it is usable), and an unusable setup
+    /// runtime leaves the registry's own refusal standing instead of replacing
+    /// it with an error about a runtime the user did not ask for.
+    #[test]
+    fn recovering_the_setup_runtime_does_not_change_the_answer_for_other_choices() -> Result<()> {
+        let paths = test_paths("comfyui-choice-other-than-setup");
+        let setup = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        let registry = runtime_registry_entry_names(&paths);
+        assert_eq!(registry, [format!("{}.json", other.runtime_key)]);
+
+        let picked = select_runtime(
+            &paths,
+            &config,
+            Some(&other.runtime_key),
+            SetupRecovery::PreviewOnly,
+        )?;
+        assert_eq!(picked.manifest.runtime_key, other.runtime_key);
+
+        let miss = select_runtime(
+            &paths,
+            &config,
+            Some("no-such-runtime"),
+            SetupRecovery::PreviewOnly,
+        )
+        .expect_err("nothing is called that")
+        .to_string();
+        assert!(
+            miss.contains("ROCm runtime not found: `no-such-runtime`")
+                && miss.contains(&setup.runtime_key),
+            "{miss}"
+        );
+        assert_eq!(runtime_registry_entry_names(&paths), registry);
+
+        fs::remove_file(
+            setup
+                .python_executable
+                .as_deref()
+                .context("the fixture records an interpreter")?,
+        )?;
+        for recovery in [SetupRecovery::PreviewOnly, SetupRecovery::Persist] {
+            let picked = select_runtime(&paths, &config, Some(&other.runtime_key), recovery)
+                .with_context(|| format!("an unusable setup runtime, {recovery:?}"))?;
+            assert_eq!(picked.manifest.runtime_key, other.runtime_key);
+            let miss = select_runtime(&paths, &config, Some("no-such-runtime"), recovery)
+                .expect_err("nothing is called that")
+                .to_string();
+            assert!(
+                miss.contains("ROCm runtime not found: `no-such-runtime`")
+                    && !miss.contains("is not usable"),
+                "{recovery:?}: {miss}"
+            );
+            assert_eq!(
+                runtime_registry_entry_names(&paths),
+                registry,
+                "{recovery:?}"
+            );
+        }
         Ok(())
     }
 

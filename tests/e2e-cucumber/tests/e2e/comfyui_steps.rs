@@ -34,14 +34,16 @@
 //! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
-//! `comfyui-15` and `comfyui-16` cover the other half of that selection: with
+//! `comfyui-15` to `comfyui-17` cover the other half of that selection: with
 //! nothing chosen, the install recovers the runtime `rocm setup` created before
 //! it counts the ready ones, as `rocm serve` does, so a runtime the registry
 //! lost is found. They plant a ready runtime and the setup folder that names it,
 //! but no registry entry. `comfyui-15` previews the install with `--dry-run`,
 //! which prints the `--runtime-id` of the runtime it chose and writes nothing,
 //! so the registry still has no entry afterwards; `comfyui-16` runs the install
-//! against an existing checkout and finds the entry written back.
+//! against an existing checkout and finds the entry written back; `comfyui-17`
+//! runs the command the preview printed, from the state the preview left, and
+//! finds the same entry written back.
 //!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
 //! mirroring `download_progress_pty.feature`'s tarball scenario but for
@@ -493,6 +495,34 @@ async fn plant_two_ready_runtimes(world: &mut E2eWorld) {
 #[when("the user installs ComfyUI without choosing a runtime")]
 async fn install_comfyui_without_runtime(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Runs the `install command:` line of the preview in `world.cli_output`, as a
+/// user would copy it: every word after `rocm` is an argument. The runtime key
+/// planted for these scenarios needs no shell quoting, so splitting on
+/// whitespace is the whole parse; the first word is checked so a line in
+/// another shape fails here rather than running something else.
+#[when("the user runs the install command the preview printed")]
+async fn run_the_install_command_the_preview_printed(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let line = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("install command:"))
+        .unwrap_or_else(|| panic!("the preview printed no install command:\n{stdout}"));
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(
+        words.first().copied(),
+        Some("rocm"),
+        "the printed command should start with `rocm`: {line}"
+    );
+    assert!(
+        words.contains(&"--runtime-id") && !words.contains(&"--dry-run"),
+        "the printed command should name its runtime and not preview: {line}"
+    );
+    let (stdout, stderr, rc) = crate::run_rocm(world, &words[1..]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);

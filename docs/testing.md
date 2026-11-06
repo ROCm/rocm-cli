@@ -780,16 +780,20 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
-`comfyui-15` and `comfyui-16` cover which runtime `rocm comfyui install` uses
+`comfyui-15` to `comfyui-17` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
 was lost is found. The real run (`comfyui-16`, against an existing checkout that
 needs no dependencies) writes the entry back; the `--dry-run` preview
 (`comfyui-15`) names the same runtime but writes nothing, because a preview
-promises not to change files. Both run with no GPU:
+promises not to change files. The preview prints the install command with that
+runtime's `--runtime-id`, and `comfyui-17` runs that command as printed from the
+state the preview left: an explicit `--runtime-id`, like an active or default
+runtime, finds the runtime setup created when the registry alone cannot answer,
+so the command works and writes the entry back. All three run with no GPU:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-1[56]"
+cargo xtask e2e -- -n "comfyui-1[567]"
 ```
 
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed

@@ -501,12 +501,27 @@ pub(crate) fn select_single_ready_runtime(
     config: &RocmCliConfig,
     recovery: SetupRecovery,
 ) -> Result<SingleReadyRuntime> {
+    Ok(classify_single_ready_runtime(
+        registered_runtimes_with_setup(paths, config, recovery)?,
+    ))
+}
+
+/// Every runtime the registry holds, with the one `rocm setup` created counted
+/// even if its registry entry was lost. With [`SetupRecovery::Persist`] the
+/// entry is written back first (`recover_setup_runtime_registration`); with
+/// [`SetupRecovery::PreviewOnly`] nothing is written, and the setup runtime is
+/// added from its own manifest as the registry would hold it once restored, so
+/// both return the same list. An error when the setup runtime exists but
+/// cannot be used.
+pub(crate) fn registered_runtimes_with_setup(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    recovery: SetupRecovery,
+) -> Result<Vec<therock::InstalledRuntimeManifest>> {
     match recovery {
         SetupRecovery::Persist => {
             recover_setup_runtime_registration(paths, config)?;
-            Ok(classify_single_ready_runtime(
-                therock::load_runtime_manifests(paths)?,
-            ))
+            therock::load_runtime_manifests(paths)
         }
         SetupRecovery::PreviewOnly => {
             let setup = find_setup_runtime(paths, config)?;
@@ -524,7 +539,7 @@ pub(crate) fn select_single_ready_runtime(
                 );
                 sort_manifests_newest_install_first(&mut registered);
             }
-            Ok(classify_single_ready_runtime(registered))
+            Ok(registered)
         }
     }
 }

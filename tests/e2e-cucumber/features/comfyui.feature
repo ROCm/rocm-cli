@@ -339,7 +339,8 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # names the same runtime but leaves the registry as it found it, because it
   # promises not to change files (this scenario). The preview prints the
   # `--runtime-id` of the command it would run, which is how it shows the
-  # choice. No GPU is needed: readiness is filesystem and manifest state.
+  # choice; comfyui-17 runs that command as printed. No GPU is needed: readiness
+  # is filesystem and manifest state.
   @id:comfyui-install-finds-the-runtime-setup-created
   Scenario: comfyui-15 - A ComfyUI install preview finds the runtime setup created without writing the registry
     Given a ready ROCm runtime that setup created and the registry has forgotten
@@ -357,5 +358,21 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     Given a ready ROCm runtime that setup created and the registry has forgotten
     And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
     When the user installs ComfyUI without choosing a runtime
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
+
+  # The preview's `install command:` line is how it shows the choice, so it has
+  # to be a command that works from the state the preview left, where the
+  # registry still has no entry for the runtime it named. Its `--runtime-id` is
+  # an explicit choice, which finds the runtime setup created the same way a
+  # missing choice does, instead of refusing with "Install ROCm first". Run as
+  # printed, the command installs into that runtime and writes the entry back.
+  @id:comfyui-install-preview-command-works-as-printed
+  Scenario: comfyui-17 - The install command a ComfyUI install preview prints works from the state the preview left
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the runtime registry still has no entry for it
+    When the user runs the install command the preview printed
     Then the install uses the runtime setup created
     And the runtime registry has an entry for it again
