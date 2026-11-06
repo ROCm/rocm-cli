@@ -227,6 +227,10 @@ Keep docs and behavior claims in sync while editing:
   file outside it), and a link leaving a skill folder in `skills/`
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
+- when you add, rename or remove a production source file, update its entry in
+  `docs/architecture.md` in the same change; `cargo xtask check-architecture-doc`
+  fails on a file with no entry (§6), but not on an entry whose description
+  went stale
 - when a statement such as "X is not supported" or "there is no Y" becomes false,
   grep the same surfaces for the old claim before pushing
 - write the PR body from the final diff, not the first commit, and re-read it after
@@ -274,6 +278,7 @@ Guardrails:
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
 - source file size is checked by `cargo xtask check-module-size` ([`module_size.rs`](xtask/src/module_size.rs)): no source file may exceed 1,500 production lines (test-gated items excluded), with one limit for every file and no exemption mechanism. A PR that would push a file past it splits the file in the same change; do not raise the limit or opt a file out. Merely editing a file that is already over the limit does not by itself require a split: those files are split under their own tickets, and the check cannot become blocking until none is left. Today the CI step and pre-commit hook only report; see `docs/architecture.md`
+- every production source file (a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src`) has an entry in `docs/architecture.md`, enforced by `cargo xtask check-architecture-doc` ([architecture_doc.rs](xtask/src/architecture_doc.rs)) in the `clippy` CI job and in the `architecture-doc` prek hook at commit and push. Add the entry in the same change as the file. Do not add the file to the check's `EXEMPT` list to make it pass: that list holds only what was uncited when the check was added and can only shrink, so remove an entry from it when you document that file. The check reads no prose, so keeping an entry's description true is still on you
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
