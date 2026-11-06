@@ -1493,6 +1493,306 @@ mod tests {
         Ok(())
     }
 
+    /// A registry directory that stops writing, as far as this process can be
+    /// stopped: a read-only directory, which does not stop `root`. `None` where it
+    /// would not bite (the process can write anyway, or the host has no such
+    /// modes), so a caller skips the row instead of passing for the wrong reason.
+    /// Restores the mode on drop.
+    #[cfg(unix)]
+    struct ReadOnlyRegistry {
+        path: PathBuf,
+        original: fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyRegistry {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_registry_read_only(paths: &AppPaths) -> Option<ReadOnlyRegistry> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = crate::runtimes_cmd::runtime_registry_dir(paths);
+        let original = fs::metadata(&path).ok()?.permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).ok()?;
+        let guard = ReadOnlyRegistry { path, original };
+        let probe = guard.path.join(".write-probe");
+        if fs::write(&probe, "").is_ok() {
+            let _ = fs::remove_file(probe);
+            return None;
+        }
+        Some(guard)
+    }
+
+    #[cfg(not(unix))]
+    struct ReadOnlyRegistry;
+
+    #[cfg(not(unix))]
+    fn make_registry_read_only(_paths: &AppPaths) -> Option<ReadOnlyRegistry> {
+        None
+    }
+
+    /// Every state `rocm comfyui install` can pick a runtime from, one row each:
+    /// what the user chose (nothing, a registered runtime by name, the setup
+    /// runtime by name) against how many ready runtimes the registry holds (0, 1,
+    /// 2), what the setup folder holds (nothing, a usable runtime whose registry
+    /// entry was lost, a runtime that is no longer usable), whether the registry
+    /// takes a new entry, and whether the install is a preview or a real run.
+    ///
+    /// The rules the rows pin: a choice that names a registered runtime is
+    /// answered by the registry whatever setup holds. With nothing chosen the
+    /// ready runtimes are counted, and a setup runtime that cannot be used is not
+    /// one of them: it does not stop a registered ready runtime from being picked
+    /// (one) or refused as ambiguous (two), and is reported only when it was the
+    /// last hope (none registered). A setup runtime that can be used is counted,
+    /// and a failure to write its entry back is reported as that, whatever else
+    /// the count would have said. Each row asserts the message and the registry
+    /// together.
+    #[test]
+    fn comfyui_runtime_selection_state_matrix() -> Result<()> {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Chosen {
+            Nothing,
+            Registered,
+            SetupRuntime,
+        }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum SetupFolder {
+            Absent,
+            Usable,
+            Unusable,
+        }
+        struct Expected {
+            selected: Option<&'static str>,
+            error_has: Vec<String>,
+            error_lacks: &'static [&'static str],
+            setup_entry_written: bool,
+        }
+
+        let registered_keys = ["runtime-a", "runtime-b"];
+        const SETUP_KEY: &str = "runtime-s";
+        const MULTIPLE: &str = "Multiple ROCm runtimes are ready";
+        let restore_failed = format!("failed to restore setup runtime `{SETUP_KEY}`");
+        let mut rows_run = 0;
+        let mut rows_skipped = 0;
+
+        for chosen in [Chosen::Nothing, Chosen::Registered, Chosen::SetupRuntime] {
+            for ready in 0..=2usize {
+                for setup in [
+                    SetupFolder::Absent,
+                    SetupFolder::Usable,
+                    SetupFolder::Unusable,
+                ] {
+                    for registry_writable in [true, false] {
+                        for recovery in [SetupRecovery::Persist, SetupRecovery::PreviewOnly] {
+                            if chosen == Chosen::Registered && ready == 0 {
+                                continue; // nothing registered to name
+                            }
+                            let row = format!(
+                                "{chosen:?}, {ready} ready, setup {setup:?}, writable {registry_writable}, {recovery:?}"
+                            );
+                            let paths = test_paths(&format!(
+                                "comfyui-selection-matrix-{}",
+                                rows_run + rows_skipped
+                            ));
+                            for (index, key) in registered_keys.iter().take(ready).enumerate() {
+                                write_test_pip_runtime(
+                                    &paths,
+                                    key,
+                                    "therock-release:gfx120X-all",
+                                    "7.14.0",
+                                    10 + index as u128,
+                                )?;
+                            }
+                            if setup != SetupFolder::Absent {
+                                let manifest =
+                                    crate::test_support::write_test_setup_runtime_missing_from_registry(
+                                        &paths, SETUP_KEY,
+                                    )?;
+                                if setup == SetupFolder::Unusable {
+                                    fs::remove_file(
+                                        manifest
+                                            .python_executable
+                                            .as_deref()
+                                            .context("the fixture records an interpreter")?,
+                                    )?;
+                                }
+                            }
+                            let config = RocmCliConfig::load(&paths)?;
+                            // A registry that cannot take an entry: a plain file for
+                            // an empty one (stops `root` too), a read-only directory
+                            // where it holds runtimes.
+                            let registry_path = crate::runtimes_cmd::runtime_registry_dir(&paths);
+                            let _read_only;
+                            if !registry_writable {
+                                if ready == 0 {
+                                    crate::test_support::make_runtime_registry_unwritable(&paths)?;
+                                } else {
+                                    match make_registry_read_only(&paths) {
+                                        Some(guard) => _read_only = guard,
+                                        None => {
+                                            rows_skipped += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            rows_run += 1;
+
+                            let persists = recovery == SetupRecovery::Persist;
+                            let setup_usable = setup == SetupFolder::Usable;
+                            let write_fails = persists && !registry_writable && setup_usable;
+                            let writes = persists && registry_writable && setup_usable;
+                            let ready_keys = registered_keys[..ready].to_vec();
+                            let expected = match chosen {
+                                Chosen::Nothing => match (setup, ready) {
+                                    (SetupFolder::Usable, _) if write_fails => Expected {
+                                        selected: None,
+                                        error_has: vec![restore_failed.clone()],
+                                        error_lacks: &["Install ROCm first", MULTIPLE],
+                                        setup_entry_written: false,
+                                    },
+                                    (SetupFolder::Usable, 0) => Expected {
+                                        selected: Some(SETUP_KEY),
+                                        error_has: vec![],
+                                        error_lacks: &[],
+                                        setup_entry_written: writes,
+                                    },
+                                    (SetupFolder::Usable, _) => Expected {
+                                        selected: None,
+                                        error_has: std::iter::once(MULTIPLE.to_owned())
+                                            .chain(ready_keys.iter().map(|key| (*key).to_owned()))
+                                            .chain([SETUP_KEY.to_owned()])
+                                            .collect(),
+                                        error_lacks: &["Install ROCm first"],
+                                        setup_entry_written: writes,
+                                    },
+                                    (SetupFolder::Unusable, 0) => Expected {
+                                        selected: None,
+                                        error_has: vec![
+                                            format!("setup runtime `{SETUP_KEY}`"),
+                                            "is not usable".to_owned(),
+                                        ],
+                                        error_lacks: &["Install ROCm first"],
+                                        setup_entry_written: false,
+                                    },
+                                    (SetupFolder::Absent, 0) => Expected {
+                                        selected: None,
+                                        error_has: vec!["Install ROCm first".to_owned()],
+                                        error_lacks: &["is not usable"],
+                                        setup_entry_written: false,
+                                    },
+                                    (_, 1) => Expected {
+                                        selected: Some("runtime-a"),
+                                        error_has: vec![],
+                                        error_lacks: &[],
+                                        setup_entry_written: false,
+                                    },
+                                    (_, _) => Expected {
+                                        selected: None,
+                                        error_has: std::iter::once(MULTIPLE.to_owned())
+                                            .chain(ready_keys.iter().map(|key| (*key).to_owned()))
+                                            .collect(),
+                                        error_lacks: &["is not usable", SETUP_KEY],
+                                        setup_entry_written: false,
+                                    },
+                                },
+                                Chosen::Registered => Expected {
+                                    selected: Some("runtime-a"),
+                                    error_has: vec![],
+                                    error_lacks: &[],
+                                    setup_entry_written: false,
+                                },
+                                Chosen::SetupRuntime => match setup {
+                                    SetupFolder::Usable if write_fails => Expected {
+                                        selected: None,
+                                        error_has: vec![restore_failed.clone()],
+                                        error_lacks: &["Install ROCm first", "not found"],
+                                        setup_entry_written: false,
+                                    },
+                                    SetupFolder::Usable => Expected {
+                                        selected: Some(SETUP_KEY),
+                                        error_has: vec![],
+                                        error_lacks: &[],
+                                        setup_entry_written: writes,
+                                    },
+                                    SetupFolder::Absent | SetupFolder::Unusable => Expected {
+                                        selected: None,
+                                        error_has: vec![if ready == 0 {
+                                            "Install ROCm first".to_owned()
+                                        } else {
+                                            format!("ROCm runtime not found: `{SETUP_KEY}`")
+                                        }],
+                                        error_lacks: &["is not usable"],
+                                        setup_entry_written: false,
+                                    },
+                                },
+                            };
+
+                            let selector = match chosen {
+                                Chosen::Nothing => None,
+                                Chosen::Registered => Some("runtime-a"),
+                                Chosen::SetupRuntime => Some(SETUP_KEY),
+                            };
+                            let outcome = select_runtime(&paths, &config, selector, recovery);
+
+                            match (outcome, expected.selected) {
+                                (Ok(selected), Some(key)) => {
+                                    assert_eq!(selected.manifest.runtime_key, key, "{row}")
+                                }
+                                (Ok(selected), None) => panic!(
+                                    "{row}: expected a refusal, picked {}",
+                                    selected.manifest.runtime_key
+                                ),
+                                (Err(error), Some(key)) => {
+                                    panic!("{row}: expected {key}, got: {error:#}")
+                                }
+                                (Err(error), None) => {
+                                    let message = format!("{error:#}");
+                                    for needle in &expected.error_has {
+                                        assert!(
+                                            message.contains(needle.as_str()),
+                                            "{row}: `{needle}` missing from: {message}"
+                                        );
+                                    }
+                                    for needle in expected.error_lacks {
+                                        assert!(
+                                            !message.contains(needle),
+                                            "{row}: `{needle}` must not appear in: {message}"
+                                        );
+                                    }
+                                }
+                            }
+
+                            let mut entries: Vec<String> =
+                                ready_keys.iter().map(|key| format!("{key}.json")).collect();
+                            if expected.setup_entry_written {
+                                entries.push(format!("{SETUP_KEY}.json"));
+                            }
+                            entries.sort();
+                            assert_eq!(runtime_registry_entry_names(&paths), entries, "{row}");
+                            if !registry_writable && ready == 0 {
+                                assert_eq!(
+                                    fs::read_to_string(&registry_path)?,
+                                    "not a directory",
+                                    "{row}: a failed restore leaves the registry as it was"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The rows that need a registry holding runtimes that refuses a write skip
+        // themselves where the process can write anyway; the rest must have run.
+        assert_eq!(rows_run + rows_skipped, 96, "the matrix has 96 rows");
+        assert!(rows_run >= 60, "ran {rows_run}, skipped {rows_skipped}");
+        Ok(())
+    }
+
     /// The two paths that pick "the one ready runtime" must not drift apart:
     /// for each registry state below, ComfyUI selects a runtime exactly when
     /// the engine paths do, and the same one. Both reach the rule through
@@ -1514,6 +1814,7 @@ mod tests {
             ReadyAndUnusable,
             SetupRuntimeLost,
             SetupRuntimeLostBesideAReadyOne,
+            UnusableSetupRuntimeBesideAReadyOne,
         }
         for (label, state, expected) in [
             ("empty", State::Empty, None),
@@ -1534,6 +1835,11 @@ mod tests {
                 "setup-runtime-lost-beside-a-ready-one",
                 State::SetupRuntimeLostBesideAReadyOne,
                 None,
+            ),
+            (
+                "unusable-setup-runtime-beside-a-ready-one",
+                State::UnusableSetupRuntimeBesideAReadyOne,
+                Some("runtime-a"),
             ),
         ] {
             // Each path gets its own copy of the state: a recovery run by one
@@ -1577,6 +1883,15 @@ mod tests {
                         crate::test_support::write_test_setup_runtime_missing_from_registry(
                             paths,
                             "runtime-s",
+                        )?;
+                    }
+                    State::UnusableSetupRuntimeBesideAReadyOne => {
+                        plant("runtime-a")?;
+                        break_runtime(
+                            &crate::test_support::write_test_setup_runtime_missing_from_registry(
+                                paths,
+                                "runtime-s",
+                            )?,
                         )?;
                     }
                 }

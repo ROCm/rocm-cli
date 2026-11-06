@@ -780,7 +780,7 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
-`comfyui-15` to `comfyui-18` cover which runtime `rocm comfyui install` uses
+`comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
 was lost is found. The real run (`comfyui-16`, against an existing checkout that
@@ -797,10 +797,15 @@ directory would not): the preview still succeeds, and the real run fails naming
 the runtime whose entry it could not restore, rather than saying "Install ROCm
 first", and leaves the registry as it was. The variant with a read-only registry
 directory that holds other runtimes is a unit test, because a read-only
-directory is writable to `root`. All four run with no GPU:
+directory is writable to `root`. `comfyui-19` covers the other way a setup folder
+can matter: when its runtime is no longer usable (its interpreter is gone) and one
+ready runtime is registered, the preview uses the registered one and does not
+register the unusable one, because an unusable runtime is not a ready runtime and
+cannot change the count; its own error is reported only when no registered
+runtime is ready, which a unit test covers. All five run with no GPU:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-1[5678]"
+cargo xtask e2e -- -n "comfyui-1[5-9]"
 ```
 
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed

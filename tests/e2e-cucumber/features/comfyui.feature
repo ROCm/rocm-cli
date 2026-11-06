@@ -396,3 +396,18 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     When the user runs the install command the preview printed
     Then the install is refused because the runtime's registry entry could not be restored
     And the runtime registry is as it was
+
+  # With no runtime chosen, a setup folder whose runtime can no longer be used
+  # (here its interpreter is gone) is not a ready runtime and cannot change which
+  # runtimes are ready, so it does not stop an install that has exactly one ready
+  # runtime registered: the install uses that one, as a choice that names it
+  # does, and the unusable setup runtime is not written into the registry. Its
+  # own error is reported only when no registered runtime is ready (a unit
+  # test). No GPU is needed: readiness is filesystem and manifest state.
+  @id:comfyui-install-uses-the-ready-runtime-beside-an-unusable-setup-runtime
+  Scenario: comfyui-19 - A setup runtime that is no longer usable does not stop a ComfyUI install that has one ready runtime
+    Given a ready ROCm runtime in the registry
+    And a setup folder whose runtime is no longer usable
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects the registered runtime
+    And the runtime registry holds only the registered runtime

@@ -34,7 +34,7 @@
 //! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
-//! `comfyui-15` to `comfyui-18` cover the other half of that selection: with
+//! `comfyui-15` to `comfyui-19` cover the other half of that selection: with
 //! nothing chosen, the install recovers the runtime `rocm setup` created before
 //! it counts the ready ones, as `rocm serve` does, so a runtime the registry
 //! lost is found. They plant a ready runtime and the setup folder that names it,
@@ -45,7 +45,9 @@
 //! runs the command the preview printed, from the state the preview left, and
 //! finds the same entry written back. `comfyui-18` runs that command with a
 //! registry that cannot be written and finds the failure to restore the entry
-//! reported.
+//! reported. `comfyui-19` plants a setup folder whose runtime is no longer
+//! usable next to one ready registered runtime and finds the preview using the
+//! registered one without registering the unusable one.
 //!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
 //! mirroring `download_progress_pty.feature`'s tarball scenario but for
@@ -748,6 +750,83 @@ async fn install_uses_the_setup_runtime(world: &mut E2eWorld) {
     assert!(
         stdout.contains("action: install") && stdout.contains("ROCm runtime: 7.13.0"),
         "the install should report the runtime setup created, got:\n{text}"
+    );
+}
+
+// --- comfyui-19: an unusable setup runtime beside a ready registered one ---
+
+/// The setup runtime `comfyui-19` plants and breaks. Not [`SETUP_RUNTIME_KEY`],
+/// so the two scenarios cannot be mistaken for each other in a failure.
+const STALE_SETUP_RUNTIME_KEY: &str = "e2e-stale-setup-runtime";
+
+#[given("a ready ROCm runtime in the registry")]
+async fn plant_one_registered_ready_runtime(world: &mut E2eWorld) {
+    plant_ready_runtime(&data_dir(world), RUNTIME_KEY);
+}
+
+#[given("a setup folder whose runtime is no longer usable")]
+async fn plant_setup_folder_with_an_unusable_runtime(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    let manifest = plant_ready_runtime_tree(&data, STALE_SETUP_RUNTIME_KEY);
+    let install_root = data
+        .join("runtimes")
+        .join("roots")
+        .join(STALE_SETUP_RUNTIME_KEY);
+    write_fixture(
+        &install_root.join(".rocm-cli-runtime.json"),
+        &serde_json::to_string_pretty(&manifest).expect("manifest serialises"),
+    );
+    write_fixture(
+        &root(world).join("config").join("config.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "setup": { "therock_venv": install_root.display().to_string() },
+        }))
+        .expect("config serialises"),
+    );
+    // The interpreter is what the readiness check needs and what goes missing
+    // when a setup folder goes stale. Without removing it this runtime would be
+    // a second ready one and the scenario would assert the wrong thing.
+    let python = manifest["python_executable"]
+        .as_str()
+        .expect("the planted manifest records an interpreter");
+    std::fs::remove_file(python).unwrap_or_else(|e| panic!("failed to remove {python}: {e}"));
+}
+
+#[then("the preview selects the registered runtime")]
+async fn preview_selects_the_registered_runtime(world: &mut E2eWorld) {
+    let text = refusal_text(world);
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the preview should succeed, got:\n{text}"
+    );
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        stdout.lines().any(|line| line.contains("install command:")
+            && line.contains(&format!("--runtime-id {RUNTIME_KEY}"))),
+        "the preview should name the registered runtime in its install command, got:\n{text}"
+    );
+    // The recovery error names the runtime ("setup runtime `<key>` ... is not
+    // usable"); other output can say "not usable" about something else, such as
+    // the Python the install prepares.
+    assert!(
+        !text.contains(STALE_SETUP_RUNTIME_KEY),
+        "the unusable setup runtime must not be reported while another runtime is ready, got:\n{text}"
+    );
+}
+
+#[then("the runtime registry holds only the registered runtime")]
+async fn registry_holds_only_the_registered_runtime(world: &mut E2eWorld) {
+    let mut names: Vec<String> = std::fs::read_dir(registry_dir(world))
+        .unwrap_or_else(|e| panic!("the registry should be readable: {e}"))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![format!("{RUNTIME_KEY}.json")],
+        "the unusable setup runtime must not be written into the registry"
     );
 }
 

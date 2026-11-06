@@ -420,13 +420,9 @@ fn find_setup_runtime(paths: &AppPaths, config: &RocmCliConfig) -> Result<Option
     }))
 }
 
-pub(crate) fn recover_setup_runtime_registration(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<Option<String>> {
-    let Some(setup) = find_setup_runtime(paths, config)? else {
-        return Ok(None);
-    };
+/// Write the registry entry of a setup runtime that the registry has lost, and
+/// nothing when it is there. The one place that write and its error message live.
+fn restore_setup_registration(paths: &AppPaths, setup: &SetupRuntime) -> Result<()> {
     if !setup.registered {
         write_runtime_manifest(paths, &setup.manifest, ManifestOverwrite::Refuse).with_context(
             || {
@@ -438,6 +434,17 @@ pub(crate) fn recover_setup_runtime_registration(
             },
         )?;
     }
+    Ok(())
+}
+
+pub(crate) fn recover_setup_runtime_registration(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    let Some(setup) = find_setup_runtime(paths, config)? else {
+        return Ok(None);
+    };
+    restore_setup_registration(paths, &setup)?;
     Ok(Some(setup.manifest.runtime_key))
 }
 
@@ -496,14 +503,33 @@ pub(crate) enum SingleReadyRuntime {
 /// written, and the setup runtime is counted from its own manifest as the
 /// registry would hold it once restored, so the answer is the one `Persist`
 /// gives.
+///
+/// A setup runtime that cannot be used (its manifest is unreadable or points
+/// elsewhere, or it fails the readiness check) is not a ready runtime and
+/// cannot change the count, so it does not stop a registered ready runtime from
+/// being picked, or from being refused as ambiguous with another. That is the
+/// answer a choice that names a runtime gets from the registry too. When the
+/// registry holds no ready runtime the setup runtime was the only candidate and
+/// its error is the answer. A setup runtime that can be used but whose registry
+/// entry cannot be written is different: it is one of the runtimes being
+/// counted, so the failed write is reported as it is.
 pub(crate) fn select_single_ready_runtime(
     paths: &AppPaths,
     config: &RocmCliConfig,
     recovery: SetupRecovery,
 ) -> Result<SingleReadyRuntime> {
-    Ok(classify_single_ready_runtime(
-        registered_runtimes_with_setup(paths, config, recovery)?,
-    ))
+    let setup = match find_setup_runtime(paths, config) {
+        Ok(setup) => setup,
+        Err(unusable) => {
+            return match classify_single_ready_runtime(therock::load_runtime_manifests(paths)?) {
+                SingleReadyRuntime::Zero { .. } => Err(unusable),
+                answer => Ok(answer),
+            };
+        }
+    };
+    Ok(classify_single_ready_runtime(registered_runtimes_with(
+        paths, setup, recovery,
+    )?))
 }
 
 /// Every runtime the registry holds, with the one `rocm setup` created counted
@@ -518,13 +544,23 @@ pub(crate) fn registered_runtimes_with_setup(
     config: &RocmCliConfig,
     recovery: SetupRecovery,
 ) -> Result<Vec<therock::InstalledRuntimeManifest>> {
+    registered_runtimes_with(paths, find_setup_runtime(paths, config)?, recovery)
+}
+
+/// [`registered_runtimes_with_setup`] for a setup runtime already found.
+fn registered_runtimes_with(
+    paths: &AppPaths,
+    setup: Option<SetupRuntime>,
+    recovery: SetupRecovery,
+) -> Result<Vec<therock::InstalledRuntimeManifest>> {
     match recovery {
         SetupRecovery::Persist => {
-            recover_setup_runtime_registration(paths, config)?;
+            if let Some(setup) = &setup {
+                restore_setup_registration(paths, setup)?;
+            }
             therock::load_runtime_manifests(paths)
         }
         SetupRecovery::PreviewOnly => {
-            let setup = find_setup_runtime(paths, config)?;
             let mut registered = therock::load_runtime_manifests(paths)?;
             if let Some(setup) = setup
                 && !setup.registered
@@ -1218,6 +1254,71 @@ mod tests {
         assert_eq!(preview, persist);
         assert!(crate::test_support::runtime_registry_entry_names(&paths).is_empty());
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A setup runtime that is no longer usable is not a ready runtime, so it
+    /// does not change what the registry alone answers: one registered ready
+    /// runtime is picked, two are refused as ambiguous with exactly those two
+    /// named, and the registry is not written. Only when the registry holds no
+    /// ready runtime is the setup runtime's own error the answer. Both recoveries
+    /// agree, and the answer and the registry are asserted together.
+    #[test]
+    fn an_unusable_setup_runtime_does_not_hide_the_registrys_ready_runtimes() -> Result<()> {
+        for recovery in [SetupRecovery::Persist, SetupRecovery::PreviewOnly] {
+            for (registered, expected) in [
+                (vec![], Err("is not usable")),
+                (vec!["runtime-a"], Ok(vec!["runtime-a"])),
+                (
+                    vec!["runtime-a", "runtime-b"],
+                    Ok(vec!["runtime-b", "runtime-a"]),
+                ),
+            ] {
+                let (root, paths) = test_paths("single-ready-unusable-setup");
+                for (index, key) in registered.iter().enumerate() {
+                    write_test_pip_runtime(
+                        &paths,
+                        key,
+                        "therock-release:gfx120X-all",
+                        "7.14.0",
+                        10 + index as u128,
+                    )?;
+                }
+                let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+                    &paths,
+                    "runtime-s",
+                )?;
+                fs::remove_file(
+                    lost.python_executable
+                        .as_deref()
+                        .context("the fixture records an interpreter")?,
+                )?;
+                let config = RocmCliConfig::load(&paths)?;
+                let entries = crate::test_support::runtime_registry_entry_names(&paths);
+                assert_eq!(entries.len(), registered.len());
+
+                let outcome = single_ready_outcome(&paths, &config, recovery);
+
+                let label = format!("{recovery:?}, {} registered", registered.len());
+                match expected {
+                    Ok(keys) => assert_eq!(
+                        outcome,
+                        Ok(keys.into_iter().map(str::to_owned).collect()),
+                        "{label}"
+                    ),
+                    Err(text) => {
+                        let message = outcome.expect_err("nothing else is ready");
+                        assert!(message.contains(text), "{label}: {message}");
+                    }
+                }
+                assert_eq!(
+                    crate::test_support::runtime_registry_entry_names(&paths),
+                    entries,
+                    "{label}: the unusable setup runtime is not registered"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
         Ok(())
     }
 
