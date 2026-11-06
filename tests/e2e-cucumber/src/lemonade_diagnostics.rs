@@ -581,7 +581,8 @@ mod tests {
         }
         assert_eq!(
             backend_candidates(root.path()),
-            vec![found_at_two, found_at_three]
+            // Sorted by path, so `a/b/...` precedes `a/build/...`.
+            vec![found_at_three, found_at_two]
         );
     }
 
