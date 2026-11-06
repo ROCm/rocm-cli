@@ -165,6 +165,10 @@ jobs:
               # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
               - 'tests/e2e-cucumber/README.md'
+              # `cargo xtask check-architecture-doc` (clippy job) compares this
+              # module map with the source tree; deleting or rewording an entry
+              # can break it though no *.rs file moved.
+              - 'docs/architecture.md'
               # license_headers_hook_has_no_file_type_filter (xtask) reads this
               # file's license-headers hook config; an edit here that reopens the
               # file-type-filter gap must still run that test on the PR.
@@ -1419,6 +1423,10 @@ jobs:
       - name: First-party crate dependency edges are within the allowlist
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask check-crate-edges
+
+      - name: Every production source file has an entry in docs/architecture.md
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask check-architecture-doc
 
       - name: Published Doctor catalog is current
         if: needs.changes.outputs.rust == 'true'
