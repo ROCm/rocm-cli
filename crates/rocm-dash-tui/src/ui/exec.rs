@@ -6,7 +6,11 @@
 //!
 //! Every screen that routes a mutating action through the
 //! approval gate + job-bridge resolves the binary the same way, so the logic
-//! lives here once instead of being re-implemented per screen.
+//! lives here once instead of being re-implemented per screen. That includes
+//! the `rocm runtimes adopt` argv: the runtime manager and the onboarding
+//! wizard both stage it for approval, so [`adopt_args`] builds it for both.
+
+use std::path::Path;
 
 /// The `rocm` binary to invoke: this process's own path (so an in-tree dev
 /// build calls itself), or the bare name `rocm` (PATH lookup) when
@@ -74,10 +78,122 @@ pub fn display_args(args: &[String]) -> String {
         .join(" ")
 }
 
+/// The conventional Python executable inside an environment root.
+///
+/// This is the layout `rocm-core` uses per host (`Scripts\python.exe` on
+/// Windows, `bin/python` elsewhere), kept here without a `rocm-core` dependency
+/// because the crate-edge check forbids that edge. The approval modal shows the
+/// exact argv, so the user verifies the path before anything runs.
+pub fn derive_python_executable(root: &str) -> String {
+    python_executable_for(root, cfg!(windows))
+}
+
+/// [`derive_python_executable`] with the host passed in, so a unit test can
+/// reach the layout of the other platform. `windows` selects
+/// `Scripts/python.exe`; the separator between the parts is still the running
+/// host's.
+fn python_executable_for(root: &str, windows: bool) -> String {
+    let root = Path::new(root);
+    let path = if windows {
+        root.join("Scripts").join("python.exe")
+    } else {
+        root.join("bin").join("python")
+    };
+    path.to_string_lossy().into_owned()
+}
+
+/// The `rocm runtimes adopt` argument list (without the executable).
+///
+/// `--root` is `root` and `--python` is [`derive_python_executable`] of it.
+/// Shared by the runtime manager's Adopt action and the onboarding wizard's
+/// Adopt-existing-folder path, so the approval modal shows the same argv from
+/// both.
+pub fn adopt_args(root: &str) -> Vec<String> {
+    adopt_args_for(root, cfg!(windows))
+}
+
+/// [`adopt_args`] with the host passed in; see [`python_executable_for`].
+fn adopt_args_for(root: &str, windows: bool) -> Vec<String> {
+    vec![
+        "runtimes".to_string(),
+        "adopt".to_string(),
+        "--root".to_string(),
+        root.to_string(),
+        "--python".to_string(),
+        python_executable_for(root, windows),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// An env root in the running host's own path syntax, so `Path::join`
+    /// produces one exact string per host and the expectations below can be
+    /// literals rather than a restatement of the code under test.
+    #[cfg(unix)]
+    const ENV_ROOT: &str = "/opt/rocm-env";
+    #[cfg(windows)]
+    const ENV_ROOT: &str = r"C:\rocm-env";
+
+    #[cfg(unix)]
+    const WINDOWS_LAYOUT: &str = "/opt/rocm-env/Scripts/python.exe";
+    #[cfg(windows)]
+    const WINDOWS_LAYOUT: &str = r"C:\rocm-env\Scripts\python.exe";
+
+    #[cfg(unix)]
+    const UNIX_LAYOUT: &str = "/opt/rocm-env/bin/python";
+    #[cfg(windows)]
+    const UNIX_LAYOUT: &str = r"C:\rocm-env\bin\python";
+
+    #[test]
+    fn python_executable_for_picks_each_platforms_layout() {
+        assert_eq!(python_executable_for(ENV_ROOT, true), WINDOWS_LAYOUT);
+        assert_eq!(python_executable_for(ENV_ROOT, false), UNIX_LAYOUT);
+    }
+
+    #[test]
+    fn derive_python_executable_follows_the_host() {
+        let want = if cfg!(windows) {
+            WINDOWS_LAYOUT
+        } else {
+            UNIX_LAYOUT
+        };
+        assert_eq!(derive_python_executable(ENV_ROOT), want);
+    }
+
+    #[test]
+    fn adopt_args_for_is_the_exact_runtimes_adopt_argv() {
+        for (windows, python) in [(true, WINDOWS_LAYOUT), (false, UNIX_LAYOUT)] {
+            assert_eq!(
+                adopt_args_for(ENV_ROOT, windows),
+                vec![
+                    "runtimes".to_string(),
+                    "adopt".to_string(),
+                    "--root".to_string(),
+                    ENV_ROOT.to_string(),
+                    "--python".to_string(),
+                    python.to_string(),
+                ],
+                "windows = {windows}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_args_uses_the_host_layout() {
+        let python = if cfg!(windows) {
+            WINDOWS_LAYOUT
+        } else {
+            UNIX_LAYOUT
+        };
+        assert_eq!(adopt_args(ENV_ROOT)[5], python);
+        assert_eq!(
+            adopt_args(ENV_ROOT),
+            adopt_args_for(ENV_ROOT, cfg!(windows))
+        );
+    }
 
     /// By absolute path, not `"sh"`: a `PATH` lookup at spawn time races any
     /// test in this binary that narrows the process-global `PATH`, and the
