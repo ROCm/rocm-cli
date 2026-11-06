@@ -840,9 +840,15 @@ output, plus metadata and formatting (invalid UTF-8 bytes may expand when render
 Each probe has a five-second timeout. The inventory, including hashing, has a
 20-second budget and the probes have their own 20-second budget, which starts
 when the service stop returns; hashing runs off the async executor, rejects files
-over 32 MiB, and checks its deadline between 64 KiB reads. A candidate over the
-size cap gets no fingerprint, and its entry says so with `sha256 unavailable:
-executable exceeds 32 MiB hash limit`; it is still listed and probed. Filesystem
+over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
+one buffer whatever the size. The cap sits well above a dynamically linked
+`llama-server` (a few MiB, with the HIP kernels in separate libraries) and above
+what a statically linked multi-target build is expected to weigh, because a
+missing fingerprint on the lane this report is for would defeat it; it is an
+assumption about those builds, not a measured size, and a larger file is a
+finding in its own right. A candidate over the size cap gets no fingerprint, and
+its entry says so with `sha256 unavailable: executable exceeds 512 MiB hash
+limit`; it is still listed and probed. Filesystem
 operations and process cleanup are not preemptible, so this is not a hard
 wall-clock limit on the entire report.
 A candidate or configured build pin is **not proof** of which binary the router
@@ -850,9 +856,9 @@ launched; a failed probe is retained as evidence, not treated as an identity.
 Probes inherit the harness environment rather than reconstructing the engine's
 managed library paths, so a probe loader error alone does not establish why the
 serve failed. The report reads files first and executes a backend second. The
-manifest, pins, candidate paths, fingerprints and `version.txt` are read once the serve has exited
-non-zero or its readiness wait has timed out and the log has been read and
-archived, but before the service is stopped, so they describe the state being
+manifest, pins, candidate paths, fingerprints and `version.txt` are read once the
+serve has exited non-zero or its readiness wait has timed out and the log has
+been read and archived, but before the service is stopped, so they describe the state being
 diagnosed. The `--version` and `--help` probes run after the stop returns, in the
 report's "probes, run after the service stop was attempted" section: llama.cpp
 builds commonly initialise a GPU backend even for `--version`, and doing that next

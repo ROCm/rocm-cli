@@ -29,7 +29,16 @@ const INVENTORY_BUDGET: Duration = Duration::from_secs(20);
 /// Time for the probes, started after the stop returns so a slow stop does not
 /// use it up.
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
-const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest executable that is fingerprinted.
+///
+/// A fingerprint that is absent on the lane the report is for is a defect, so the
+/// cap is set well above a dynamically linked `llama-server` (a few MiB; the HIP
+/// kernels live in separate shared libraries). It is still finite: a build that
+/// statically linked kernels for several GPU targets can reach hundreds of MiB, and
+/// a corrupt cache entry should not be hashed at all. Hashing streams 64 KiB at a
+/// time, so memory stays bounded whatever this is; the time is bounded by the
+/// inventory budget, which the hashing loop checks between reads.
+const MAX_HASH_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Budgets {
@@ -340,14 +349,32 @@ fn empty_search_note(runtime: &Path) -> String {
     )
 }
 
+/// `limit` as the report words it: whole MiB when it is one, else bytes.
+fn describe_hash_limit(limit: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if limit.is_multiple_of(MIB) {
+        format!("{} MiB", limit / MIB)
+    } else {
+        format!("{limit} bytes")
+    }
+}
+
 fn fingerprint(server: &Path, deadline: Instant) -> std::io::Result<String> {
+    fingerprint_with_limit(server, deadline, MAX_HASH_BYTES)
+}
+
+fn fingerprint_with_limit(server: &Path, deadline: Instant, limit: u64) -> std::io::Result<String> {
+    let too_large = || {
+        std::io::Error::other(format!(
+            "executable exceeds {} hash limit",
+            describe_hash_limit(limit)
+        ))
+    };
     let mut file = std::fs::File::open(server)?;
-    // A real server is much smaller; do not hash an arbitrarily large corrupt
-    // cache entry while reporting a failure. Never label a partial hash as SHA256.
-    if file.metadata()?.len() > MAX_HASH_BYTES {
-        return Err(std::io::Error::other(
-            "executable exceeds 32 MiB hash limit",
-        ));
+    // Do not hash an arbitrarily large corrupt cache entry while reporting a
+    // failure. Never label a partial hash as SHA256.
+    if file.metadata()?.len() > limit {
+        return Err(too_large());
     }
     let mut hasher = Sha256::new();
     let mut count = 0;
@@ -363,10 +390,8 @@ fn fingerprint(server: &Path, deadline: Instant) -> std::io::Result<String> {
         }
         let read = file.read(&mut buffer)?;
         count += read as u64;
-        if count > MAX_HASH_BYTES {
-            return Err(std::io::Error::other(
-                "executable exceeds 32 MiB hash limit",
-            ));
+        if count > limit {
+            return Err(too_large());
         }
         if read == 0 {
             break;
@@ -517,21 +542,49 @@ mod tests {
     fn hash_limit_accepts_the_boundary_but_never_returns_a_partial_hash() {
         let root = tempfile::tempdir().unwrap();
         let server = root.path().join("llama-server");
+        let limit = 3 * 64 * 1024 + 5;
         let file = std::fs::File::create(&server).unwrap();
-        file.set_len(MAX_HASH_BYTES).unwrap();
+        file.set_len(limit).unwrap();
+        assert_eq!(
+            fingerprint_with_limit(&server, Instant::now() + INVENTORY_BUDGET, limit)
+                .unwrap()
+                .len(),
+            64
+        );
+        file.set_len(limit + 1).unwrap();
+        assert_eq!(
+            fingerprint_with_limit(&server, Instant::now() + INVENTORY_BUDGET, limit)
+                .unwrap_err()
+                .to_string(),
+            format!("executable exceeds {limit} bytes hash limit")
+        );
+    }
+
+    /// The cap is not the old 32 MiB: a server above it, such as a static HIP build,
+    /// must still get a fingerprint on the lane this report is for. The file is
+    /// sparse, so the test hashes zeros rather than holding real data.
+    #[test]
+    fn a_server_above_the_old_32_mib_cap_is_still_fingerprinted() {
+        const OLD_CAP: u64 = 32 * 1024 * 1024;
+        assert!(MAX_HASH_BYTES >= 256 * 1024 * 1024);
+        let root = tempfile::tempdir().unwrap();
+        let server = root.path().join("llama-server");
+        std::fs::File::create(&server)
+            .unwrap()
+            .set_len(OLD_CAP + 1)
+            .unwrap();
         assert_eq!(
             fingerprint(&server, Instant::now() + INVENTORY_BUDGET)
                 .unwrap()
                 .len(),
             64
         );
-        file.set_len(MAX_HASH_BYTES + 1).unwrap();
-        assert_eq!(
-            fingerprint(&server, Instant::now() + INVENTORY_BUDGET)
-                .unwrap_err()
-                .to_string(),
-            "executable exceeds 32 MiB hash limit"
-        );
+    }
+
+    #[test]
+    fn hash_limit_is_worded_in_the_unit_it_was_set_in() {
+        assert_eq!(describe_hash_limit(512 * 1024 * 1024), "512 MiB");
+        assert_eq!(describe_hash_limit(1000), "1000 bytes");
     }
 
     #[test]
@@ -681,7 +734,10 @@ mod tests {
             .unwrap();
         let report = evidence(&write_manifest(root.path())).await;
         assert!(
-            report.contains("sha256 unavailable: executable exceeds 32 MiB hash limit"),
+            report.contains(&format!(
+                "sha256 unavailable: executable exceeds {} hash limit",
+                describe_hash_limit(MAX_HASH_BYTES)
+            )),
             "{report}"
         );
         assert!(!report.contains("sha256: "), "{report}");
