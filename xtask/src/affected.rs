@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 /// Default base ref used when none is supplied on the command line. Matches
 /// [`crate::verify_commits`] so both commands diff against the same point.
-const DEFAULT_BASE: &str = "origin/main";
+pub(crate) const DEFAULT_BASE: &str = "origin/main";
 
 /// The workspace dependency graph, reduced to what selection needs: each
 /// member's source directory (workspace-relative, `/`-separated) and the
@@ -311,9 +311,50 @@ fn build_graph(metadata: &Metadata) -> Graph {
 /// List files changed in `base...HEAD` (three-dot: relative to the merge base,
 /// the same "what this branch changed" diff layer one filters on).
 fn changed_files(base: &str) -> Result<Vec<String>> {
-    let range = format!("{base}...HEAD");
-    let output = Command::new("git")
-        .args(["diff", "--name-only", &range])
+    changed_files_between(base, "HEAD")
+}
+
+/// List files changed in `base...head`.
+///
+/// `--no-renames` makes a moved file list both its old and its new path.
+/// Without it git reports only the new path, so a file moved out of one crate
+/// into another would select the destination crate and miss the one that lost
+/// the file.
+pub(crate) fn changed_files_between(base: &str, head: &str) -> Result<Vec<String>> {
+    diff_name_only(None, base, head)
+}
+
+/// The variables git reads to pick a repository. git exports an absolute
+/// `GIT_DIR` to a hook run from a linked worktree, so a child that runs
+/// `git -C <other repo>` must not inherit them, or it talks to the outer repo.
+const GIT_REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Clear [`GIT_REPO_ENV`] from `cmd`, for a git run against an explicit directory.
+pub(crate) fn scrub_git_env(cmd: &mut Command) -> &mut Command {
+    for var in GIT_REPO_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// [`changed_files_between`] in `dir` (the current directory when `None`).
+fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
+    let range = format!("{base}...{head}");
+    let mut git = Command::new("git");
+    if let Some(dir) = dir {
+        scrub_git_env(&mut git).arg("-C").arg(dir);
+    }
+    let output = git
+        .args(["diff", "--name-only", "--no-renames", &range])
         .output()
         .context("failed to run `git diff`")?;
     if !output.status.success() {
@@ -533,6 +574,98 @@ mod tests {
         );
         let want: BTreeSet<String> = ["engine", "app"].into_iter().map(String::from).collect();
         assert_eq!(sel, Selection::Packages(want));
+    }
+
+    /// Run `git` in `dir` with a fixed identity and no signing, for the
+    /// throwaway repositories below.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let mut git = Command::new("git");
+        let status = scrub_git_env(&mut git)
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A hook run from a linked worktree has `GIT_DIR` set; a git run against a
+    /// throwaway repository must not inherit it or it would act on the outer one.
+    #[test]
+    fn scrub_git_env_clears_every_repo_selecting_variable() {
+        let mut git = Command::new("git");
+        git.env("GIT_DIR", "/outer/.git").env("GIT_INDEX_FILE", "x");
+        scrub_git_env(&mut git);
+        let envs: std::collections::BTreeMap<_, _> = git
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_none()))
+            .collect();
+        for var in GIT_REPO_ENV {
+            assert_eq!(envs.get(*var), Some(&true), "{var} is not cleared");
+        }
+    }
+
+    /// The loop above only checks the variables [`GIT_REPO_ENV`] lists, so it
+    /// cannot notice one missing from the list. This one runs git: with the
+    /// repository-selecting variables a hook exports pointing at another
+    /// repository, a scrubbed `git -C <repo>` must still resolve to `<repo>`.
+    #[test]
+    fn scrubbed_git_ignores_a_repository_a_hook_exported() {
+        let outer = tempfile::tempdir().expect("outer repo");
+        let inner = tempfile::tempdir().expect("inner repo");
+        git_in(outer.path(), &["init", "-q"]);
+        git_in(inner.path(), &["init", "-q"]);
+        let resolve = |arg: &str| {
+            let mut git = Command::new("git");
+            git.env("GIT_DIR", outer.path().join(".git"))
+                .env("GIT_WORK_TREE", outer.path());
+            scrub_git_env(&mut git);
+            let output = git
+                .arg("-C")
+                .arg(inner.path())
+                .args(["rev-parse", arg])
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git rev-parse {arg} failed");
+            std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("git printed an existing path")
+        };
+        let inner_root = std::fs::canonicalize(inner.path()).expect("inner path");
+        assert_eq!(resolve("--show-toplevel"), inner_root);
+        assert_eq!(resolve("--absolute-git-dir"), inner_root.join(".git"));
+    }
+
+    /// A file moved from one crate to another must select both crates. With git's
+    /// default rename detection only the new path is listed, the crate that lost
+    /// the file is not selected, and a push that breaks it is not checked.
+    #[test]
+    fn changed_files_between_lists_both_paths_of_a_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("crates/a/src")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("crates/b/src")).expect("mkdir b");
+        std::fs::write(root.join("crates/a/src/moved.rs"), "pub fn f() {}\n").expect("write");
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "base"]);
+        git_in(root, &["checkout", "-q", "-b", "feature"]);
+        git_in(
+            root,
+            &["mv", "crates/a/src/moved.rs", "crates/b/src/moved.rs"],
+        );
+        git_in(root, &["commit", "-q", "-m", "move"]);
+
+        let mut files = diff_name_only(Some(root), "main", "feature").expect("git diff");
+        files.sort();
+        assert_eq!(files, ["crates/a/src/moved.rs", "crates/b/src/moved.rs"]);
     }
 
     #[test]
