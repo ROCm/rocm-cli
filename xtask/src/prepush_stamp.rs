@@ -110,7 +110,11 @@ const ENV_IGNORED: &[&str] = &[
 const ENV_IGNORED_PREFIXES: &[&str] = &["CARGO_TERM_", "CARGO_PKG_", "CARGO_BIN_EXE_"];
 
 fn hex_digest(text: &str) -> String {
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    hex_digest_bytes(text.as_bytes())
+}
+
+fn hex_digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Whether `--rerun` or [`RERUN_VAR`] asks for recorded passes to be ignored.
@@ -123,26 +127,42 @@ pub fn rerun_requested(flag: bool, lookup: impl Fn(&str) -> Option<String>) -> b
 
 /// Digest of the environment variables that can change a cargo step, in a
 /// stable order. Only the digest is kept, never a value.
-pub fn env_digest(vars: impl IntoIterator<Item = (String, String)>) -> String {
-    let mut relevant: Vec<(String, String)> = vars
+pub fn env_digest<K, V>(vars: impl IntoIterator<Item = (K, V)>) -> String
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    // The process environment is read as `OsString`s: a variable holding bytes
+    // that are not valid Unicode (on Linux, any variable at all) must not abort
+    // an optional check, so nothing here needs a `String`. Names are matched as
+    // text, which is enough because every prefix and exempt name is ASCII, and
+    // values are hashed as the bytes they are.
+    let mut relevant: Vec<(Vec<u8>, Vec<u8>)> = vars
         .into_iter()
         .filter(|(name, _)| {
+            let name = name.as_ref().to_string_lossy();
             ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
-                && !ENV_IGNORED.contains(&name.as_str())
+                && !ENV_IGNORED.contains(&name.as_ref())
                 && !ENV_IGNORED_PREFIXES
                     .iter()
                     .any(|prefix| name.starts_with(prefix))
         })
+        .map(|(name, value)| {
+            (
+                name.as_ref().as_encoded_bytes().to_vec(),
+                value.as_ref().as_encoded_bytes().to_vec(),
+            )
+        })
         .collect();
     relevant.sort();
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     for (name, value) in relevant {
-        text.push_str(&name);
-        text.push('=');
-        text.push_str(&value);
-        text.push('\n');
+        bytes.extend_from_slice(&name);
+        bytes.push(b'=');
+        bytes.extend_from_slice(&value);
+        bytes.push(b'\n');
     }
-    hex_digest(&text)
+    hex_digest_bytes(&bytes)
 }
 
 /// Everything one pass depends on.
@@ -506,7 +526,7 @@ impl Probe for SystemProbe {
     }
 
     fn env_digest(&self) -> String {
-        env_digest(std::env::vars())
+        env_digest(std::env::vars_os())
     }
 }
 
@@ -1346,6 +1366,127 @@ mod tests {
         assert_eq!(git_in(outer.path(), &["rev-parse", "HEAD"]), outer_head);
         assert_eq!(git_in(outer.path(), &["rev-list", "--count", "HEAD"]), "1");
         assert_eq!(git_in(outer.path(), &["status", "--porcelain"]), "");
+    }
+
+    // ---- non-Unicode environment variables must never abort the optional stamp ----
+
+    #[cfg(unix)]
+    fn non_unicode(prefix: &str, tail: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(tail);
+        std::ffi::OsString::from_vec(bytes)
+    }
+
+    /// Unicode values hash to the same digest they always did, so stamps recorded
+    /// before the digest read the environment as bytes stay valid.
+    #[test]
+    fn the_environment_digest_of_unicode_values_is_the_digest_of_the_text() {
+        assert_eq!(
+            env_digest(vars(&[("RUSTFLAGS", "-D warnings"), ("PATH", "/bin")])),
+            hex_digest("RUSTFLAGS=-D warnings\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unrelated_variable_with_non_unicode_bytes_is_ignored_and_does_not_panic() {
+        let base = env_digest(vars(&[("RUSTFLAGS", "-D warnings")]));
+        let with_noise = env_digest([
+            (
+                std::ffi::OsString::from("RUSTFLAGS"),
+                std::ffi::OsString::from("-D warnings"),
+            ),
+            (
+                std::ffi::OsString::from("PATH"),
+                non_unicode("/bin", &[0xff]),
+            ),
+            (non_unicode("HOME_", &[0xfe]), std::ffi::OsString::from("x")),
+            (
+                std::ffi::OsString::from("LANG"),
+                non_unicode("", &[0x80, 0x81]),
+            ),
+        ]);
+        assert_eq!(
+            with_noise, base,
+            "unrelated variables never reach the digest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relevant_variable_with_non_unicode_bytes_is_hashed_as_the_bytes_it_is() {
+        let digest = |value: &[u8]| {
+            env_digest([(
+                std::ffi::OsString::from("RUSTFLAGS"),
+                non_unicode("", value),
+            )])
+        };
+        let absent = env_digest(Vec::<(String, String)>::new());
+        assert_ne!(digest(&[0xff]), absent, "the variable counts");
+        // A lossy conversion would turn both bytes into U+FFFD and collapse them.
+        assert_ne!(
+            digest(&[0xff]),
+            digest(&[0xfe]),
+            "the bytes are hashed, not a lossy text"
+        );
+        assert_eq!(digest(&[0xff]), digest(&[0xff]), "and the digest is stable");
+
+        // The same holds when the invalid bytes are in the name, after a prefix.
+        let named = |tail: &[u8]| {
+            env_digest([(non_unicode("CARGO_X", tail), std::ffi::OsString::from("1"))])
+        };
+        assert_ne!(named(&[0xff]), absent);
+        assert_ne!(named(&[0xff]), named(&[0xfe]));
+    }
+
+    const NON_UNICODE_CHILD_VAR: &str = "ROCM_STAMP_TEST_NON_UNICODE_CHILD";
+
+    /// Does nothing on its own. The test below re-runs this binary with
+    /// non-Unicode bytes in unrelated and in relevant variables, and this body
+    /// then drives the real probe: `std::env::vars()` would panic here.
+    #[test]
+    fn non_unicode_environment_child() {
+        if std::env::var_os(NON_UNICODE_CHILD_VAR).is_none() {
+            return;
+        }
+        let probe = SystemProbe::default();
+        let first = Probe::env_digest(&probe);
+        assert_eq!(first, Probe::env_digest(&probe), "the digest is stable");
+        assert_eq!(first.len(), 64, "a SHA-256 digest: {first}");
+        println!("non-unicode-child-ran {first}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_real_probe_computes_its_digest_under_non_unicode_environment_variables() {
+        let run = |rustflags: &[u8]| {
+            let output = Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "prepush_stamp::tests::non_unicode_environment_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(NON_UNICODE_CHILD_VAR, "1")
+                .env("ROCM_STAMP_TEST_UNRELATED", non_unicode("v", &[0xff, 0xfe]))
+                .env(non_unicode("UNRELATED_", &[0xff]), "x")
+                .env("RUSTFLAGS", non_unicode("", rustflags))
+                .output()
+                .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            stdout
+                .split_once("non-unicode-child-ran ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("the child did not run its body: {stdout}"))
+                .to_string()
+        };
+        let one = run(&[0xff]);
+        // A relevant non-Unicode value changes the digest, losslessly.
+        assert_ne!(one, run(&[0xfe]));
+        assert_eq!(one, run(&[0xff]));
     }
 
     // ---- scratch files left by a write that died ----

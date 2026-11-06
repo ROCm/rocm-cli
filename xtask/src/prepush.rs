@@ -469,6 +469,13 @@ fn spawn_cargo(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A process environment variable as text. A value that is not valid Unicode is
+/// still a set value (`std::env::var` reports it as an error, which `.ok()` would
+/// read as unset, so a non-Unicode `ROCM_PRE_PUSH_RERUN` would be ignored).
+fn process_env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+}
+
 /// Entry point for the `pre-push-check` subcommand.
 pub fn run(check: Check, base: Option<String>, dry_run: bool, rerun: bool) -> Result<()> {
     let store: Box<dyn prepush_stamp::Store> = match prepush_stamp::FsStore::in_git_common_dir(None)
@@ -482,12 +489,12 @@ pub fn run(check: Check, base: Option<String>, dry_run: bool, rerun: bool) -> Re
         store.as_ref(),
         prepush_stamp::now_secs(),
         rerun,
-        |name| std::env::var(name).ok(),
+        process_env,
     );
     let request = Request {
         base,
         dry_run,
-        env: Env::from_lookup(|name| std::env::var(name).ok()),
+        env: Env::from_lookup(process_env),
     };
     execute(
         check,

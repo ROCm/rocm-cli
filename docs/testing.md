@@ -460,7 +460,8 @@ looks for it first. The stamp stands for:
   the same content pushed to a second remote, still hits;
 - the compiler and cargo identity (`rustc -vV`, `cargo -vV`) and a digest of the `CARGO_*` and
   `RUST*` environment (never the values), minus a short list of per-run variables such as
-  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`.
+  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable whose value is not valid
+  Unicode never stops the hook: an unrelated one is ignored and a relevant one is hashed as the bytes it is.
 
 The working tree has to be clean for a stamp to be used or written, because cargo checks the working
 tree, not the pushed commit: with uncommitted changes the step runs and says why, and an untracked
