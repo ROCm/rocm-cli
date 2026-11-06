@@ -9,8 +9,10 @@
 //! directly. That is every one of these reads, and only these:
 //!
 //! - device nodes: `/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`;
-//! - `sysfs`: the KFD topology under `/sys/class/kfd/kfd/topology/nodes`, the
-//!   DRM cards under `/sys/class/drm`, `/sys/module/amdgpu` and
+//! - `sysfs`: the `/sys/class/kfd/kfd` class device and the KFD topology under
+//!   `/sys/class/kfd/kfd/topology/nodes`, the
+//!   DRM cards under `/sys/class/drm`, `/sys/bus/pci/drivers/amdgpu`,
+//!   `/sys/module/amdgpu` and
 //!   `/sys/module/amdgpu/version`;
 //! - `procfs`: `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`,
 //!   `/proc/cmdline`, `/proc/modules` (the fallback when `lsmod` cannot run)
