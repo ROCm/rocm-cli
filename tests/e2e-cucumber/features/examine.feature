@@ -586,3 +586,15 @@ Feature: GPU detection and system inspection
     Given a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode
     When the user inspects that machine in machine-readable form
     Then both reports say rocminfo is installed
+
+  # The control for `examine-36`: the same machine, with `.` as the first PATH
+  # entry instead of an empty one. A `.` entry is an ordinary directory, so the
+  # lookup finds the stand-in in the working directory. That only happens if the
+  # `rocm` child really runs from it, so this scenario fails when the harness does
+  # not apply the working directory, and `examine-36`'s "not installed" is then
+  # meaningful: the two differ in nothing but the entry.
+  @id:examine-rocminfo-in-working-directory-named-on-path-is-found @requires-os:linux
+  Scenario: examine-38 - Both reports find a rocminfo in the working directory when PATH names it
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed

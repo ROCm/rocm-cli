@@ -2424,10 +2424,17 @@ async fn wsl_machine_with_rocminfo_on_path(world: &mut E2eWorld) {
     set_planted_wsl_path(world, &[tools]);
 }
 
-#[given(
-    "a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH"
-)]
-async fn wsl_machine_with_rocminfo_only_in_the_working_directory(world: &mut E2eWorld) {
+/// The machine of `examine-36` and `examine-38`: the only `rocminfo` is in
+/// `work`, the directory `rocm` is started from, and `path_entry` is the first
+/// entry of its `PATH`. The two scenarios differ in nothing else, so the answer
+/// can only turn on whether that entry names the working directory: `.` does,
+/// and an empty entry does not (the lookup skips it). That is also what shows
+/// `command_dir` reaches the `rocm` child: with `.` the stand-in is found only
+/// if `rocm` really runs from `work`.
+fn plant_wsl_machine_with_rocminfo_only_in_the_working_directory(
+    world: &mut E2eWorld,
+    path_entry: PathBuf,
+) {
     plant_wsl_machine_with_unregistered_rocdxg(world, "");
     let root = world
         .isolated_root
@@ -2437,11 +2444,11 @@ async fn wsl_machine_with_rocminfo_only_in_the_working_directory(world: &mut E2e
         .to_owned();
     let work = root.join("work");
     plant_stand_in_rocminfo(&work);
-    // The empty entry first, where `sh` and `execvp` would read it as `work`.
-    set_planted_wsl_path(world, &[PathBuf::new()]);
-    // A "neither finds it" answer would also come out if the stand-in could not
-    // be reached at all, so show it can: started by bare name from `work` with
-    // this PATH, it must run, which only the empty entry makes possible.
+    set_planted_wsl_path(world, &[path_entry]);
+    // A "not installed" answer would also come out if the stand-in could not be
+    // reached at all, so show it can: started by bare name from `work` with this
+    // PATH, it must run, which only an entry that names `work` (or the empty
+    // entry, which `execvp` reads as `work`) makes possible.
     let path = world
         .command_env
         .iter()
@@ -2452,9 +2459,25 @@ async fn wsl_machine_with_rocminfo_only_in_the_working_directory(world: &mut E2e
         .env("PATH", path)
         .current_dir(&work)
         .status()
-        .expect("the stand-in must resolve through the empty PATH entry");
+        .expect("the stand-in must resolve through the first PATH entry");
     assert!(reached.success(), "the stand-in rocminfo failed: {reached}");
     world.command_dir = Some(work);
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_behind_an_empty_path_entry(world: &mut E2eWorld) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::new());
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_on_a_path_entry_naming_the_working_directory(
+    world: &mut E2eWorld,
+) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::from("."));
 }
 
 /// A directory name that is not valid Unicode: the byte 0xff is never UTF-8.
