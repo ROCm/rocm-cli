@@ -1773,7 +1773,12 @@ Windows `process_start_ticks` is the process creation time (`GetProcessTimes`, a
 `FILETIME`), so a record written by this version refutes a PID that an unrelated
 process has taken, and the stop reports `identity_mismatch` without running
 `taskkill` on it; only a record written before Windows recorded a token has
-nothing to refute. `a_filetime_is_its_high_word_above_its_low_word` runs the
+nothing to refute: a stop refuses a PID only when a token was recorded and the
+live one differs, and `what_a_stop_does_for_each_recorded_and_live_token` pins
+that for every case on every host (no token, which is also the shape
+`service-stop-07` records; a token that matches; one that differs; one that
+cannot be read back), asserting whether the tree kill runs and the verdict the
+stop reports together. `a_filetime_is_its_high_word_above_its_low_word` runs the
 conversion on every host. `terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
 runs the real stop against this test's own PID with a wrong token on Linux and
 Windows (a stop that went ahead would end the test process), and

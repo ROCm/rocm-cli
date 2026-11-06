@@ -90,7 +90,21 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
     if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
         return IdentityState::Gone;
     }
-    match (id.start_ticks, process_start_ticks(id.pid)) {
+    classify_live_identity(id.start_ticks, process_start_ticks(id.pid))
+}
+
+/// The identity verdict for a PID that is running: what its recorded token
+/// (`recorded`) says about the token read from the live process now (`live`).
+///
+/// The one decision every stop path turns on, apart from the system reads, so
+/// a test covers each case on every host. A process is refused only when a
+/// token was recorded and the live one is provably different. A record with no
+/// token (an older record, or one written where no token could be read) cannot
+/// be refuted and is a match whatever the live process reads, so its stop and
+/// its tree kill go ahead as they always did. A recorded token that cannot be
+/// confirmed now is neither signalled nor reported stopped.
+const fn classify_live_identity(recorded: Option<u64>, live: Option<u64>) -> IdentityState {
+    match (recorded, live) {
         (Some(expected), Some(actual)) => {
             if expected == actual {
                 IdentityState::Matches
@@ -103,6 +117,18 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
         (Some(_), None) => IdentityState::Indeterminate,
         // No recorded identity (legacy state): best-effort proceed.
         (None, _) => IdentityState::Matches,
+    }
+}
+
+/// The verdict that ends a termination before anything is signalled, when the
+/// recorded identity says not to: `None` for a process that matches and so goes
+/// on to be stopped.
+const fn refusal_before_signalling(state: IdentityState) -> Option<TerminationOutcome> {
+    match state {
+        IdentityState::Gone => Some(TerminationOutcome::AlreadyGone),
+        IdentityState::Recycled => Some(TerminationOutcome::IdentityMismatch),
+        IdentityState::Indeterminate => Some(TerminationOutcome::Unverified),
+        IdentityState::Matches => None,
     }
 }
 
@@ -196,11 +222,8 @@ pub fn terminate_verified(
     grace: Duration,
     force: bool,
 ) -> TerminationOutcome {
-    match identity_state(id) {
-        IdentityState::Gone => return TerminationOutcome::AlreadyGone,
-        IdentityState::Recycled => return TerminationOutcome::IdentityMismatch,
-        IdentityState::Indeterminate => return TerminationOutcome::Unverified,
-        IdentityState::Matches => {}
+    if let Some(verdict) = refusal_before_signalling(identity_state(id)) {
+        return verdict;
     }
 
     let tree = matches!(scope, KillScope::Tree);
@@ -1199,6 +1222,123 @@ mod tests {
         assert_eq!(verdict, TerminationOutcome::AlreadyGone);
     }
 
+    /// Every way a recorded token and the live process's token can stand, with
+    /// what the stop does about each: whether the Windows tree kill runs, and the
+    /// verdict the stop reports (the label and whether it counts as stopped).
+    ///
+    /// The live process is running in every row; the tokens go through the same
+    /// decision production uses ([`classify_live_identity`] and
+    /// [`refusal_before_signalling`]), with the system reads and the signalling
+    /// supplied, so each row runs on every host. A process is refused only when
+    /// a token was recorded and the live one is provably different.
+    #[test]
+    fn what_a_stop_does_for_each_recorded_and_live_token() {
+        const LIVE: u64 = 0x01DC_0000_0000_0001;
+        struct Row {
+            name: &'static str,
+            recorded: Option<u64>,
+            live: Option<u64>,
+            tree_kill_runs: bool,
+            label: &'static str,
+            stopped: bool,
+        }
+        let row = |name, recorded, live, tree_kill_runs, label, stopped| Row {
+            name,
+            recorded,
+            live,
+            tree_kill_runs,
+            label,
+            stopped,
+        };
+        let rows = [
+            // The shape `service-stop-07` records, and any record older than the
+            // token: nothing to refute, so the whole tree is taken as before.
+            row("no token recorded", None, Some(LIVE), true, "forced", true),
+            row(
+                "no token recorded, none readable",
+                None,
+                None,
+                true,
+                "forced",
+                true,
+            ),
+            row(
+                "token matches",
+                Some(LIVE),
+                Some(LIVE),
+                true,
+                "forced",
+                true,
+            ),
+            // A recycled PID: the process is a stranger, left alone.
+            row(
+                "token differs",
+                Some(LIVE + 1),
+                Some(LIVE),
+                false,
+                "identity_mismatch",
+                true,
+            ),
+            // A recorded token that cannot be read back is neither signalled nor
+            // reported stopped.
+            row(
+                "token unreadable",
+                Some(LIVE),
+                None,
+                false,
+                "unverified",
+                false,
+            ),
+        ];
+        for Row {
+            name: row,
+            recorded,
+            live,
+            tree_kill_runs,
+            label,
+            stopped,
+        } in rows
+        {
+            let steps = RefCell::new(Vec::new());
+            let tree_kill = |pid: u32| steps.borrow_mut().push(Step::TreeKill(pid));
+            let verdict = terminate_recorded_pid_with(
+                &ProcessIdentity::new(SUPERVISOR_PID, recorded),
+                Some(&tree_kill as &dyn Fn(u32)),
+                |id| classify_live_identity(id.start_ticks, live),
+                |id| {
+                    steps.borrow_mut().push(Step::Terminate(id.pid));
+                    // What the verified termination answers: its refusal for a
+                    // process the identity rules out, otherwise the tree kill
+                    // has already taken the root and it reads back as gone.
+                    refusal_before_signalling(classify_live_identity(id.start_ticks, live))
+                        .unwrap_or(TerminationOutcome::AlreadyGone)
+                },
+            );
+            let expected_steps = if tree_kill_runs {
+                vec![
+                    Step::TreeKill(SUPERVISOR_PID),
+                    Step::Terminate(SUPERVISOR_PID),
+                ]
+            } else {
+                vec![Step::Terminate(SUPERVISOR_PID)]
+            };
+            assert_eq!(steps.into_inner(), expected_steps, "{row}: steps");
+            assert_eq!(verdict.as_str(), label, "{row}: verdict");
+            assert_eq!(verdict.stopped(), stopped, "{row}: counts as stopped");
+        }
+    }
+
+    #[test]
+    fn a_recorded_token_refutes_a_live_one_only_when_both_are_known_and_differ() {
+        use IdentityState::{Indeterminate, Matches, Recycled};
+        assert_eq!(classify_live_identity(None, None), Matches);
+        assert_eq!(classify_live_identity(None, Some(7)), Matches);
+        assert_eq!(classify_live_identity(Some(7), Some(7)), Matches);
+        assert_eq!(classify_live_identity(Some(7), Some(8)), Recycled);
+        assert_eq!(classify_live_identity(Some(7), None), Indeterminate);
+        assert_eq!(refusal_before_signalling(Matches), None);
+    }
+
     #[test]
     fn only_windows_has_a_separate_tree_kill_step() {
         // Ties the injected tests above to what production actually runs: the
@@ -1308,5 +1448,32 @@ mod tests {
         assert!(outcome.stopped(), "{outcome:?}");
         let _ = child.wait();
         assert!(!crate::process_is_running(pid));
+    }
+
+    /// A record with no token (written before Windows recorded one, and the shape
+    /// `service-stop-07` plants) cannot be refuted and still gets the whole stop:
+    /// the process ends. Windows only, where a real process is stopped by PID.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_recorded_pid_stops_a_process_recorded_without_a_token() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("ping")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id();
+
+        let outcome = terminate_recorded_pid(&ProcessIdentity::new(pid, None));
+
+        assert!(outcome.stopped(), "{outcome:?}");
+        assert_eq!(outcome.as_str(), "forced");
+        assert!(
+            child.wait().is_ok() && !crate::process_is_running(pid),
+            "the process recorded without a token must be gone"
+        );
     }
 }
