@@ -310,7 +310,7 @@ impl PlanAudience {
             }
             Self::Captured => None,
             // The assistant's own uninstall is an approval action; see
-            // `lifecycle_read_mutate_split_is_honest` in `chat.rs`.
+            // `lifecycle_read_mutate_split_is_honest` in `tool_policy.rs`.
             Self::Assistant => Some("Nothing was removed. Removal needs your approval."),
         }
     }
@@ -647,7 +647,7 @@ mod tests {
 
     /// The assistant's preview has no flag to offer, so it must not point at a
     /// command line it cannot run; what it can truthfully say is that removal
-    /// needs approval (`lifecycle_read_mutate_split_is_honest` in `chat.rs` pins
+    /// needs approval (`lifecycle_read_mutate_split_is_honest` in `tool_policy.rs` pins
     /// that its own `uninstall` is an approval action). It does not say "these
     /// items": the preview always plans with the default options, while the
     /// approval carries the user's own.

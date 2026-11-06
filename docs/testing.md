@@ -1045,7 +1045,7 @@ mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
 its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
-which `lifecycle_read_mutate_split_is_honest` in `apps/rocm/src/chat.rs` backs.
+which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 
