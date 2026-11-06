@@ -18,12 +18,32 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::AppPaths;
-use crate::INFERENCE_VERIFIED_STATE_KEY;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
+
+/// Engine state-file key recording when inference was first confirmed.
+///
+/// Written by the engine healthchecks and adopted by
+/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
+/// re-probe what an engine already verified.
+pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
+
+/// Engine state-file key recording the last inference probe attempt.
+pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
+
+/// Minimum gap between inference probes against a service that is still loading.
+///
+/// Only a *successful* probe latches, so without this a warming model would be
+/// re-probed by every readiness poll — and each attempt costs up to
+/// [`crate::INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// supervisor ticks every few seconds and `services list` sits in front of a
+/// user, so the unthrottled cost lands exactly where it is most visible. The
+/// price of throttling is that readiness can be noticed up to this late.
+pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ManagedServiceRecord {

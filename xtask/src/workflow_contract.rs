@@ -1228,8 +1228,8 @@ jobs:
             .find_map(|(name, step)| (name == "Decide whether to run").then_some(step))
             .expect("ci.yml's `e2e` job has a \"Decide whether to run\" step");
         let mut script = dedent(&run_block(&step).expect(
-            "the E2E gate step has no `run: |` block; `run_block` reads only that \
-             literal form, not `run: |-`, `run: >` or a one-line `run:`",
+            "the E2E gate step has no block-scalar `run:`; `run_block` reads `run: |`, \
+             `run: |-`, `run: >` and the like, but not a one-line `run:`",
         ))
         .expect("the gate step's script is not empty");
         let values = [
@@ -1602,9 +1602,9 @@ jobs:
                 assert!(
                     run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
                     "{workflow} job `{job}` names a GPU preflight step but no non-empty \
-                     `run: |` block was found in it, so as far as this check can tell it \
-                     waits for nothing. Only the literal `run: |` form is recognised: a \
-                     `run: |-`, `run: >` or one-line `run:` script reads as missing here"
+                     block-scalar `run:` was found in it, so as far as this check can tell \
+                     it waits for nothing. Only a block-scalar `run:` (`|`, `|-`, `>`, …) \
+                     is read: a one-line `run:` script reads as missing here"
                 );
             }
         }
@@ -1701,13 +1701,17 @@ jobs:
             .collect()
     }
 
-    /// The report artifact a lane's upload step names (`name: e2e-*-report`).
+    /// The report artifact(s) a lane's upload step names (`name:
+    /// e2e-*-report`), comma-separated when the lane carries a `channel`
+    /// axis: both the `release` and `nightly` leg must have uploaded, since
+    /// either can independently die before writing its own report.
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
         // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
         // per leg, each behind its own mutually exclusive `if:` — pair every
         // artifact name with the `if:` directly above it in the same step, then
-        // pick the `current` leg to stand for the whole lane, the same way a
-        // channel axis below is checked through its `release` leg.
+        // pick the `current` leg to stand for the whole lane. (A channel axis,
+        // unlike this `sdk_version` axis, is checked by requiring both its
+        // `release` and `nightly` legs — see the doc comment above.)
         let mut last_if: Option<&str> = None;
         let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
         for line in job_block(text, job).lines() {
@@ -1739,9 +1743,26 @@ jobs:
                     .0
             }
         };
-        // The report job has no `matrix` context, so a lane with a channel axis is
-        // checked through its `release` leg, which stands for the whole lane.
-        chosen.replace("${{ matrix.channel }}", "release")
+        // The report job has no `matrix` context, so a lane with a channel
+        // axis is checked through each of its legs explicitly, read from the
+        // lane's own `channel: [..]` list rather than assumed.
+        if chosen.contains("${{ matrix.channel }}") {
+            let channels = job_block(text, job)
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("channel: ["))
+                .and_then(|rest| rest.split_once(']'))
+                .unwrap_or_else(|| {
+                    panic!("{workflow} job `{job}` uses matrix.channel but has no `channel: [..]`")
+                })
+                .0;
+            channels
+                .split(',')
+                .map(|c| chosen.replace("${{ matrix.channel }}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            chosen.to_string()
+        }
     }
 
     #[test]
@@ -1922,7 +1943,10 @@ jobs:
             })
             .collect();
         let jobs: Vec<&str> = lanes.iter().map(|(job, _)| job.as_str()).collect();
-        let every_artifact: Vec<&str> = lanes.iter().map(|(_, a)| a.as_str()).collect();
+        // A channel-axis lane's value is comma-joined (its `release` and
+        // `nightly` legs); flatten to the individual artifact names the real
+        // upload steps would produce, matching what `gh api` would list.
+        let every_artifact: Vec<&str> = lanes.iter().flat_map(|(_, a)| a.split(',')).collect();
         let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
         let all = |result: &'static str| -> Vec<(&str, &str)> {
             jobs.iter().map(|job| (*job, result)).collect()
@@ -1987,10 +2011,12 @@ jobs:
         let (middle_artifact, (last, last_artifact)) = (&lanes[1].1, lanes.last().unwrap());
         let mut skip_middle = all("success");
         skip_middle[1].1 = "skipped";
+        // A lane's value may be comma-joined (channel legs), so match each name.
+        let belongs_to = |lane_artifacts: &str, a: &str| lane_artifacts.split(',').any(|m| m == a);
         let after_skip: Vec<&str> = every_artifact
             .iter()
             .copied()
-            .filter(|a| a != middle_artifact && a != last_artifact)
+            .filter(|a| !belongs_to(middle_artifact, a) && !belongs_to(last_artifact, a))
             .collect();
         let (code, log, _) = run_report_check(&step, &skip_middle, Some(&after_skip));
         assert_eq!(
@@ -2006,7 +2032,7 @@ jobs:
         let two_missing: Vec<&str> = without_victim
             .iter()
             .copied()
-            .filter(|a| a != last_artifact)
+            .filter(|a| !belongs_to(last_artifact, a))
             .collect();
         let (code, log, summary) = run_report_check(&step, &all("success"), Some(&two_missing));
         assert_eq!(code, 1, "two lanes missing must fail:\n{log}");
@@ -2016,6 +2042,39 @@ jobs:
                     && summary.contains(lane.as_str()),
                 "every missing lane must be named, including `{lane}`:\n{log}\n{summary}"
             );
+        }
+
+        // A channel-axis lane's legs are checked independently: missing any one
+        // of them must still fail, naming only that leg, not the lane's other
+        // (present) ones. Each leg takes a turn as the missing one, so a loop
+        // that silently stops checking one of them is caught.
+        let (channel_job, channel_artifacts) = lanes
+            .iter()
+            .find(|(_, a)| a.contains(','))
+            .expect("e2e-selfhosted.yml has a channel-matrixed lane");
+        let legs: Vec<&str> = channel_artifacts.split(',').collect();
+        for missing_leg in &legs {
+            let one_leg_missing: Vec<&str> = every_artifact
+                .iter()
+                .copied()
+                .filter(|a| a != missing_leg)
+                .collect();
+            let (code, log, _) = run_report_check(&step, &all("success"), Some(&one_leg_missing));
+            assert_eq!(
+                code, 1,
+                "a channel lane missing `{missing_leg}` must still fail:\n{log}"
+            );
+            assert!(
+                log.contains(&format!("::error::lane {channel_job} ran"))
+                    && log.contains(&format!("uploaded no {missing_leg}")),
+                "the annotation must name the missing leg `{missing_leg}`:\n{log}"
+            );
+            for present_leg in legs.iter().filter(|l| *l != missing_leg) {
+                assert!(
+                    !log.contains(&format!("uploaded no {present_leg}")),
+                    "the present leg `{present_leg}` must not be flagged as missing:\n{log}"
+                );
+            }
         }
 
         // A lane absent from `needs` has no result to say it was skipped, so
@@ -2155,20 +2214,22 @@ jobs:
         step
     }
 
-    /// The lines of a step's `run: |` block, still indented.
+    /// The lines of a step's block-scalar `run:` (`run: |`, `|-`, `>`, `>-`,
+    /// …), still indented and, for a folded `>` block, not yet folded: see
+    /// [`run_script`] for the script the shell is handed.
     ///
-    /// Only the literal `run: |` form is recognised. `run: |-`, `run: >` and a
-    /// one-line `run: cmd` all read as no block, so a check that asserts a step
-    /// *has* a script relies on every workflow in this repo using `run: |`, and
-    /// has to say so in its failure message rather than claim the step is empty.
+    /// Every block-scalar header is recognised (see [`run_block_header`]), but a
+    /// one-line `run: cmd` reads as no block, so a check that asserts a step
+    /// *has* a script relies on every such step in this repo using a block
+    /// scalar, and has to say so in its failure message rather than claim the
+    /// step is empty.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
     /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
+        let (run_at, run_indent, _, _) = run_block_header(&lines)?;
         let mut body: Vec<&str> = lines[run_at + 1..]
             .iter()
             .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
@@ -2180,7 +2241,97 @@ jobs:
         Some(body)
     }
 
-    /// The non-comment lines of a step's `run: |` block, joined.
+    /// Where a step's block-scalar `run:` opens: the index of its `run:` line
+    /// in `lines`, the column of the `run` key, whether the block is folded
+    /// (`>`) rather than literal (`|`), and its indentation indicator, if it
+    /// has one. The key may be the step's first (`- run: |`), two columns in
+    /// from the dash.
+    ///
+    /// Any block-scalar header counts — `|` or `>`, with or without a
+    /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
+    /// without a trailing comment — since every one of them hands the step a
+    /// multi-line script.
+    ///
+    /// The first `run:` key at any depth is taken, so a `run:` nested under
+    /// some other key (an action's `with:` input) would be read as the
+    /// step's script. No workflow here has one; a step that does would need
+    /// this to match only at the step's own key column.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool, Option<usize>)> {
+        lines.iter().enumerate().find_map(|(at, line)| {
+            let code = strip_comment(line).trim();
+            let (key, key_column) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), indent_of(line) + 2),
+                None => (code, indent_of(line)),
+            };
+            let indicator = key.strip_prefix("run:")?.trim();
+            let folded = match indicator.chars().next()? {
+                '|' => false,
+                '>' => true,
+                _ => return None,
+            };
+            let modifiers = &indicator[1..];
+            if !modifiers
+                .chars()
+                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+            {
+                return None;
+            }
+            let indent = modifiers
+                .chars()
+                .find_map(|c| c.to_digit(10))
+                .map(|digit| digit as usize);
+            Some((at, key_column, folded, indent))
+        })
+    }
+
+    /// The script a step's block-scalar `run:` hands its shell, one entry per
+    /// line: [`run_block`]'s lines, folded the way YAML folds a `>` block.
+    ///
+    /// In a folded block a line break between two lines at the block's own
+    /// indent becomes a space, so two such lines are ONE line of script; a
+    /// blank line ends the line, and a more-indented line keeps the breaks
+    /// around it. A literal `|` block is the script as written.
+    ///
+    /// The block's indent is the `run` key's column plus its indentation
+    /// indicator (`>2`) when it has one, as YAML reads it; otherwise the
+    /// indent of its first non-blank line.
+    fn run_script(step: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let (_, run_indent, folded, indicator) = run_block_header(&lines)?;
+        let body = run_block(step)?;
+        if !folded {
+            return Some(body.iter().map(|line| (*line).to_owned()).collect());
+        }
+        let indent = indicator.map_or_else(
+            || {
+                body.iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or(0, |line| indent_of(line))
+            },
+            |digit| run_indent + digit,
+        );
+        let mut script: Vec<String> = Vec::new();
+        let mut folds_onto_last = false;
+        for line in body {
+            if line.trim().is_empty() {
+                script.push(String::new());
+                folds_onto_last = false;
+                continue;
+            }
+            let at_block_indent = indent_of(line) == indent;
+            match script.last_mut() {
+                Some(last) if at_block_indent && folds_onto_last => {
+                    last.push(' ');
+                    last.push_str(line.trim_start());
+                }
+                _ => script.push(line.to_owned()),
+            }
+            folds_onto_last = at_block_indent;
+        }
+        Some(script)
+    }
+
+    /// The non-comment lines of a step's block-scalar `run:`, joined.
     ///
     /// A preflight step's body is the only place a lane can still spell its own
     /// floor (the WSL `${…:-8}` default, the PowerShell `else { 8 }`), and a
@@ -2363,7 +2514,8 @@ jobs:
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
     /// to end yields `None`; `preflight_powershell_script` carries those. Like
-    /// every caller of [`run_block`], only the literal `run: |` form is read.
+    /// every caller of [`run_block`], only a block-scalar `run:` is read, and a
+    /// folded `>` one line by line, without folding.
     fn preflight_shell_script(step: &str) -> Option<String> {
         let body = run_block(step)?;
         let body = match body
@@ -2794,8 +2946,8 @@ jobs:
                 .and_then(|block| dedent(&block))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{workflow}'s clock-settling step has no `run: |` body (only the literal \
-                         `run: |` form is read; `run: |-`, `run: >` and one-line `run:` are not)"
+                        "{workflow}'s clock-settling step has no block-scalar `run:` body \
+                         (`run: |`, `run: >` and the like are read; a one-line `run:` is not)"
                     )
                 });
             bodies.push((workflow, body));
@@ -4183,6 +4335,524 @@ fi
         assert!(
             run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),
             "a matrix with platforms must reach the publish step"
+        );
+    }
+
+    /// Mirrors `wiki_publish_guard_stops_on_the_generators_empty_output`, but
+    /// for the release-readiness wiki job: runs its real three-way guard
+    /// (missing table.md / degenerate table.md / well-formed table.md)
+    /// against `render_table`'s actual output, so a regression in the guard
+    /// or the renderer's degenerate case is caught by behavior rather than a
+    /// pinned string.
+    ///
+    /// A missing table.md means release-readiness-nightly failed outright
+    /// (bad `git describe`, `gh issue list` auth failure, xtask crash)
+    /// before writing anything -- this must still reach the publish step, but
+    /// with an explicit "evidence unavailable" notice instead of the real
+    /// table, so the wiki never silently keeps a stale verdict with no sign
+    /// it's stale.
+    ///
+    /// Unreadable E2E evidence is itself a NO-GO signal, not a reason to hide
+    /// the page: `render_table` always emits the status-table header, so
+    /// this case reaches the publish step the same as a well-formed table.
+    /// Only a present-but-degenerate table (no status-table header at all)
+    /// trips the guard and leaves the last good page in place.
+    #[cfg(unix)]
+    #[test]
+    fn release_readiness_wiki_publish_guard_handles_missing_degenerate_and_well_formed_tables() {
+        use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
+
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-release-readiness-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if [ ! -f release-readiness/table.md ]")
+            })
+            .expect("publish job has the missing-table guard");
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if t.starts_with("if ") {
+                depth += 1;
+            } else if t == "fi" {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i;
+                    break;
+                }
+            }
+        }
+        assert!(end > start, "guard block must close with a matching fi");
+        let guard = lines[start..=end].join("\n");
+
+        // table: None simulates release-readiness-nightly failing before
+        // writing anything at all; Some(s) simulates a table.md with
+        // content `s`. Returns (stdout, published page content).
+        let run = |table: Option<&str>| -> (String, String) {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("release-readiness")).unwrap();
+            if let Some(s) = table {
+                std::fs::write(dir.join("release-readiness/table.md"), s).unwrap();
+            }
+            let page = format!(
+                "release-readiness-wiki-guard-test-{}.md",
+                dir.file_name().unwrap().to_string_lossy()
+            );
+            let script = format!("set -euo pipefail\npage={page}\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(dir)
+                .env("GITHUB_RUN_NUMBER", "42")
+                .env("RUN_URL", "https://example.invalid/run/42")
+                .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+                .env("COMMIT_URL", "https://example.invalid/commit/0123456789ab")
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            let page_path = format!("/tmp/{page}");
+            let page_content = std::fs::read_to_string(&page_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&page_path);
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                page_content,
+            )
+        };
+
+        let (missing_stdout, missing_page) = run(None);
+        assert!(
+            missing_stdout.contains("REACHED_PUBLISH"),
+            "a missing table.md (nightly job failed outright) must still reach the publish step"
+        );
+        assert!(
+            missing_page.contains("EVIDENCE UNAVAILABLE"),
+            "a missing table.md must publish an explicit stale-evidence notice, not silently keep the old page"
+        );
+
+        let (degenerate_stdout, _) = run(Some(""));
+        assert!(
+            !degenerate_stdout.contains("REACHED_PUBLISH"),
+            "a present-but-degenerate table.md (no status-table header) must still stop the publish and leave the last good page in place"
+        );
+
+        let unreadable = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::NoGo,
+            failing_gates: vec!["E2E (report unreadable)".to_string()],
+            e2e_fail_total: None,
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (unreadable_stdout, unreadable_page) = run(Some(&unreadable));
+        assert!(
+            unreadable_stdout.contains("REACHED_PUBLISH"),
+            "unreadable E2E evidence is a NO-GO verdict, not a reason to hide the wiki page"
+        );
+        assert!(
+            !unreadable_page.contains("EVIDENCE UNAVAILABLE"),
+            "a readable (if NO-GO) table must publish the real table, not the missing-table notice"
+        );
+
+        let well_formed = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::Go,
+            failing_gates: vec![],
+            e2e_fail_total: Some(0),
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (well_formed_stdout, well_formed_page) = run(Some(&well_formed));
+        assert!(
+            well_formed_stdout.contains("REACHED_PUBLISH"),
+            "a well-formed table must reach the publish step"
+        );
+        assert!(
+            well_formed_page.contains("Area | Evidence | Status"),
+            "a well-formed table's content must actually make it into the published page"
+        );
+    }
+
+    /// The narrative published to the wiki is LLM-drafted from untrusted
+    /// issue/commit text, so it can contain copied markdown links, images,
+    /// reference-style links, or raw HTML. Runs the job's real escaping
+    /// command (not a copy of its regex) against the three bypasses an
+    /// earlier link-stripping regex let through unchanged, so a regression
+    /// back to naive link-stripping is caught by behavior.
+    #[cfg(unix)]
+    #[test]
+    fn publish_release_readiness_wiki_escapes_markdown_link_and_html_syntax() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+
+        let run = |input: &str| -> String {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            std::fs::create_dir(dir.path().join("release-readiness"))
+                .expect("create release-readiness dir");
+            std::fs::write(dir.path().join("release-readiness/narrative.md"), input)
+                .expect("write narrative.md");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line)
+                .current_dir(dir.path())
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "sed command failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(
+            run(r#"<img src="https://example.com/p.png">"#),
+            r#"> &lt;img src="https://example.com/p.png"&gt;"#,
+            "a raw <img> tag must render as inert text, not a live image"
+        );
+        assert_eq!(
+            run("[a][1]\n[1]: https://example.com/x"),
+            "> \\[a\\]\\[1\\]\n> \\[1\\]: https://example.com/x",
+            "a reference-style link must render as inert text, not a live link"
+        );
+        assert_eq!(
+            run("[outer [inner](https://a.example)](https://b.example)"),
+            r"> \[outer \[inner\](https://a.example)\](https://b.example)",
+            "every bracket in a nested link must be escaped, leaving no live link"
+        );
+        assert_eq!(
+            run(r"\[click\](https://evil.example)"),
+            r"> \\\[click\\\](https://evil.example)",
+            "a narrative pre-escaping its own brackets must not produce a live link: \
+             the literal backslash must itself be escaped before `[`/`]` are"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_release_readiness_wiki_quotes_the_narrative_so_it_cannot_forge_a_top_level_verdict()
+    {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("release-readiness")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("release-readiness/narrative.md"),
+            "## Release Readiness \u{2014} GO\n| E2E | 0 failure(s) |\n**All gates passed**\n",
+        )
+        .expect("write narrative.md");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(line)
+            .current_dir(dir.path())
+            .output()
+            .expect("run bash");
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            assert!(
+                l.starts_with("> "),
+                "every narrative line must be block-quoted, got `{l}`"
+            );
+        }
+        assert!(
+            job.contains("## Narrative (drafted by an LLM"),
+            "the narrative heading must say it is LLM-drafted and not the verdict: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_prompt_never_receives_the_verdict() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains(
+                "jq 'del(.verdict) | .known_issues |= .[:100]' release-readiness/facts.json"
+            ),
+            "the prompt input must be facts.json with `.verdict` removed: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_artifact_hand_offs_use_matching_names() {
+        let nightly = read_workflow("nightly.yml");
+        for (uploader, consumers, name) in [
+            (
+                "release-readiness-nightly",
+                &[
+                    "release-readiness-narrative",
+                    "publish-release-readiness-wiki",
+                ][..],
+                "release-readiness-nightly",
+            ),
+            (
+                "release-readiness-narrative",
+                &["publish-release-readiness-wiki"][..],
+                "release-readiness-narrative",
+            ),
+        ] {
+            let needle = format!("name: {name}\n");
+            assert!(
+                job_block(&nightly, uploader).contains(&needle),
+                "`{uploader}` must upload an artifact named `{name}`"
+            );
+            for consumer in consumers {
+                assert!(
+                    job_block(&nightly, consumer).contains(&needle),
+                    "`{consumer}` must download the artifact named `{name}`"
+                );
+            }
+        }
+        // The consolidated report `release-readiness-nightly` reads must be
+        // the one `e2e-report-nightly` uploads.
+        let report_upload = job_block(&nightly, "e2e-report-nightly");
+        let report_name = report_upload
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("name: "))
+            .find(|n| n.starts_with("e2e-consolidated-report"))
+            .expect("e2e-report-nightly uploads a consolidated report artifact");
+        assert!(
+            job_block(&nightly, "release-readiness-nightly").contains(report_name),
+            "release-readiness-nightly must download `{report_name}`"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_can_push_to_the_wiki() {
+        let nightly = read_workflow("nightly.yml");
+        assert!(
+            job_block(&nightly, "publish-release-readiness-wiki").contains("contents: write"),
+            "pushing to the wiki repo needs `contents: write`"
+        );
+    }
+
+    /// `release-readiness-nightly` must gate E2E lane coverage through
+    /// `e2e-report-nightly`'s own result, not through each lane job's own
+    /// `continue-on-error: true`-masked result (which is always `success`
+    /// regardless of what actually happened). Ties the gate to the one place
+    /// that already fails correctly when a lane silently drops out — see
+    /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
+    /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
+    /// covers every lane, including ones added later, without this job
+    /// needing its own copy of the lane list.
+    #[test]
+    fn release_readiness_nightly_gates_on_the_e2e_report_job_not_individual_lanes() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        assert!(
+            needs.contains(&"e2e-report-nightly".to_string()),
+            "release-readiness-nightly must depend on e2e-report-nightly's result; needs: {needs:?}"
+        );
+        // The `needs.<job>.result` expressions below read an empty string for a
+        // job that is not listed here, which every night would read as a failed
+        // build.
+        for build in ["nightly", "windows-nightly"] {
+            assert!(
+                needs.contains(&build.to_string()),
+                "release-readiness-nightly must list `{build}` in needs, or its result \
+                 reads empty; needs: {needs:?}"
+            );
+        }
+        for lane in [
+            "e2e-gpu-nightly",
+            "e2e-gpu-nightly-rad3",
+            "e2e-gpu-nightly-mi350p",
+            "e2e-gpu-nightly-strix",
+            "e2e-gpu-nightly-strix-windows",
+            "e2e-gpu-nightly-w7900",
+            "e2e-wsl-nightly",
+        ] {
+            assert!(
+                !needs.contains(&lane.to_string()),
+                "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
+                 directly: continue-on-error on that job means its own `result` is always \
+                 `success`, so gating on it can never fire"
+            );
+        }
+
+        assert!(
+            job.contains("--e2e-report-job-result \"${{ needs.e2e-report-nightly.result }}\""),
+            "release-readiness-nightly's xtask invocation must pass e2e-report-nightly's result \
+             as --e2e-report-job-result"
+        );
+        assert!(
+            job.contains("--nightly-result \"${{ needs.nightly.result }}\""),
+            "release-readiness-nightly must read --nightly-result from needs.nightly.result, \
+             not a hard-coded value -- otherwise a failed Linux nightly build never fails the \
+             gate: {job}"
+        );
+        assert!(
+            job.contains("--windows-result \"${{ needs.windows-nightly.result }}\""),
+            "release-readiness-nightly must read --windows-result from \
+             needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
+             result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_runs_even_if_an_upstream_job_failed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("if: ${{ !cancelled() }}"),
+            "release-readiness-nightly must still run when e2e-report-nightly or a build job \
+             failed (the default `if` would skip it instead, leaving the wiki showing a stale \
+             GO from the last run that did succeed): {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_guard_is_exact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            job.contains(
+                "if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' \
+                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}"
+            ),
+            "publish-release-readiness-wiki's guard must stay exactly this: `!cancelled()` so \
+             it still runs (and publishes the stale-evidence notice) when release-readiness-\
+             nightly failed outright, `!= 'skipped'` rather than `== 'success'` so that failure \
+             still publishes rather than being skipped, and the repo/main-branch guards: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_jobs_checkout_without_persisting_credentials() {
+        let nightly = read_workflow("nightly.yml");
+        for job_name in ["release-readiness-nightly", "release-readiness-narrative"] {
+            let job = job_block(&nightly, job_name);
+            assert!(
+                job.contains("persist-credentials: false"),
+                "{job_name}'s checkout must not persist credentials: these jobs shell out over \
+                 untrusted issue/commit text, and a persisted, readable GITHUB_TOKEN would be \
+                 reachable by anything injected into that text in a later step (both jobs hold \
+                 only `contents: read`, so the exposure is token readability, not write access)"
+            );
+        }
+    }
+
+    #[test]
+    fn release_readiness_narrative_delimiter_is_random_not_fixed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("delimiter=\"$(openssl rand -hex 8)\"")
+                && job.contains("echo \"json<<${delimiter}\"")
+                && job.contains("echo \"${delimiter}\""),
+            "the GITHUB_OUTPUT heredoc delimiter must stay randomly generated: facts.json \
+             embeds untrusted GitHub issue titles, and a fixed delimiter (e.g. `EOF`) would let \
+             one that happens to contain that token terminate the heredoc early and inject \
+             further GITHUB_OUTPUT assignments: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_reaches_the_shell_only_through_env() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("NARRATIVE: ${{ steps.draft.outputs.response }}")
+                && job.contains("run: printf '%s\\n' \"$NARRATIVE\""),
+            "the LLM-drafted narrative must reach the shell only through the $NARRATIVE env \
+             var, never inlined as `${{ steps.draft.outputs.response }}` directly in `run:` -- \
+             that would let the narrative's own text execute as shell: {job}"
+        );
+
+        // The two assertions above only check that the safe lines exist; they
+        // can't fail on a *second*, unsafe occurrence added elsewhere (e.g. a
+        // later step inlining `${{ steps.draft.outputs.response }}` straight
+        // into its own `run:`). Pin every occurrence in the job to the two
+        // known-safe spots: the "Save narrative" step's `if:` guard, and the
+        // `NARRATIVE:` env line feeding it to the shell.
+        let offending: Vec<&str> = job
+            .lines()
+            .filter(|l| l.contains("steps.draft.outputs.response"))
+            .filter(|l| {
+                let t = l.trim();
+                t != "if: always() && steps.draft.outputs.response"
+                    && t != "NARRATIVE: ${{ steps.draft.outputs.response }}"
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "steps.draft.outputs.response must appear nowhere in the job except the \"Save \
+             narrative\" step's `if:` guard and its NARRATIVE env line: found it in {offending:?}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_checkout_fetches_full_history() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("fetch-depth: 0"),
+            "release-readiness-nightly's checkout must fetch full history (fetch-depth: 0): \
+             `git describe --tags` and the commit range since the last release tag both need \
+             it, and the default shallow clone would make `git describe` fail every night: {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_needs_both_upstream_jobs() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        for required in ["release-readiness-nightly", "release-readiness-narrative"] {
+            assert!(
+                needs.contains(&required.to_string()),
+                "publish-release-readiness-wiki must depend on `{required}`: dropping \
+                 `release-readiness-narrative` from `needs` would let the publish job race the \
+                 narrative download instead of waiting for it; needs: {needs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_artifact_downloads_tolerate_a_missing_artifact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert_eq!(
+            job.matches("continue-on-error: true").count(),
+            2,
+            "both artifact-download steps in publish-release-readiness-wiki (the \
+             release-readiness table and the narrative) must set `continue-on-error: true`: \
+             without it, a missing artifact (no table because release-readiness-nightly failed \
+             outright, or no narrative because COPILOT_PAT doesn't exist yet) would fail \
+             download-artifact and make this job's own fallback handling unreachable: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_wiki_page_does_not_collide_with_the_e2e_matrix_page() {
+        let nightly = read_workflow("nightly.yml");
+        let publish_e2e = job_block(&nightly, "publish-e2e-wiki");
+        let publish_readiness = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            publish_e2e.contains("page=E2E-Support-Matrix.md"),
+            "publish-e2e-wiki's page name changed out from under this test; update it: {publish_e2e}"
+        );
+        assert!(
+            publish_readiness.contains("page=Release-Readiness.md"),
+            "publish-release-readiness-wiki must keep publishing to a distinct wiki page name; \
+             renaming it to collide with E2E-Support-Matrix.md would silently overwrite the E2E \
+             support matrix page instead: {publish_readiness}"
         );
     }
 
@@ -6906,20 +7576,34 @@ permissions:
 
     /// Every `shell: pwsh` step in `text` as `(name, step block)`.
     ///
-    /// The step is found from its `shell: pwsh` line by walking up to the
-    /// nearest `- ` item shallower than it, so the key order inside the step
-    /// does not matter.
+    /// The step is found from its `shell: pwsh` line: that line itself when
+    /// `shell:` is the step's first key (`- shell: pwsh`), and otherwise by
+    /// walking up to the nearest `- ` item shallower than it, so the key order
+    /// inside the step does not matter.
     fn pwsh_steps(text: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = text.lines().collect();
         let mut steps = Vec::new();
         for (at, line) in lines.iter().enumerate() {
-            if strip_comment(line).trim() != "shell: pwsh" {
+            let code = strip_comment(line).trim();
+            let (key, is_item) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (code, false),
+            };
+            if key
+                .strip_prefix("shell:")
+                .is_none_or(|shell| strip_quotes(shell.trim()) != "pwsh")
+            {
                 continue;
             }
             let shell_indent = indent_of(line);
-            let Some(start) = (0..at).rev().find(|&i| {
-                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
-            }) else {
+            let start = if is_item {
+                Some(at)
+            } else {
+                (0..at).rev().find(|&i| {
+                    indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+                })
+            };
+            let Some(start) = start else {
                 continue;
             };
             let step = step_block(&lines, start);
@@ -6929,9 +7613,14 @@ permissions:
     }
 
     /// PowerShell words that open a statement but are not a program to run.
-    const PWSH_KEYWORDS: [&str; 15] = [
+    ///
+    /// Every entry is a keyword to pwsh's own tokenizer
+    /// (`TokenTraits::HasTrait(kind, TokenFlags::Keyword)`), so none can name
+    /// a program at the start of a statement.
+    const PWSH_KEYWORDS: [&str; 22] = [
         "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
-        "catch", "finally", "throw", "exit", "return",
+        "catch", "finally", "throw", "exit", "return", "break", "continue", "begin", "process",
+        "end", "param", "trap",
     ];
 
     /// Whether a trimmed, comment-free pwsh statement runs an external
@@ -6957,7 +7646,7 @@ permissions:
             && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
     }
 
-    /// The statements of a pwsh `run: |` body, in order.
+    /// The statements of a pwsh `run:` script, in order.
     ///
     /// A line is split at its top-level `;`s (see
     /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
@@ -7063,29 +7752,205 @@ permissions:
     }
 
     /// The native-command statements in a pwsh body whose exit status
-    /// nothing reads: not the body's last statement, and not followed by a
-    /// statement that inspects `$LASTEXITCODE`.
+    /// nothing reads (see [`exit_status_is_read`]).
     fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
         let statements = pwsh_statements(body);
         statements
             .iter()
             .enumerate()
             .filter(|(i, line)| {
-                is_native_command_line(line)
-                    && statements
-                        .get(i + 1)
-                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+                is_native_command_line(line) && !exit_status_is_read(&statements[i + 1..])
             })
             .map(|(_, line)| line.clone())
             .collect()
     }
 
-    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
-    /// block, or its one-line `run:` value, which can chain statements with
-    /// `;` just the same.
+    /// Whether a native command's exit status is still in `$LASTEXITCODE`
+    /// when something reads it, given the statements that follow it.
+    ///
+    /// The statements are walked in order:
+    ///
+    /// - one that assigns `$LASTEXITCODE` overwrites the status: unread;
+    /// - one that otherwise mentions `$LASTEXITCODE` reads it: read;
+    /// - one that [leaves it alone](leaves_last_exit_code_alone) is passed
+    ///   over;
+    /// - anything else might run another program, or leave the script, before
+    ///   the status is read: unread.
+    ///
+    /// Running off the end is a read: GitHub's pwsh wrapper appends
+    /// `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+    /// so the step itself exits with the status.
+    fn exit_status_is_read(after: &[String]) -> bool {
+        for statement in after {
+            if assigns_last_exit_code(statement) {
+                return false;
+            }
+            if reads_last_exit_code(statement) {
+                return true;
+            }
+            if !leaves_last_exit_code_alone(statement) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a pwsh statement assigns `$LASTEXITCODE` (`= 0`, `+= 1`, with
+    /// or without a `global:`/`script:`/`local:` scope), so the status it
+    /// held is gone.
+    fn assigns_last_exit_code(statement: &str) -> bool {
+        let lower = statement.trim().to_ascii_lowercase();
+        let Some(variable) = lower.strip_prefix('$') else {
+            return false;
+        };
+        let variable = ["global:", "script:", "local:"]
+            .iter()
+            .find_map(|scope| variable.strip_prefix(scope))
+            .unwrap_or(variable);
+        variable.strip_prefix("lastexitcode").is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
+                .iter()
+                .any(|operator| rest.starts_with(operator))
+        })
+    }
+
+    /// Cmdlets that only write output, a stream or a file: none of them runs
+    /// a program or sets `$LASTEXITCODE`.
+    const PWSH_INERT_CMDLETS: [&str; 11] = [
+        "Write-Output",
+        "Write-Host",
+        "Write-Information",
+        "Write-Verbose",
+        "Write-Debug",
+        "Write-Warning",
+        "Out-File",
+        "Out-Null",
+        "Out-Host",
+        "Add-Content",
+        "Set-Content",
+    ];
+
+    /// Whether a pwsh statement can neither run a program nor touch
+    /// `$LASTEXITCODE`, so a native command's status survives it.
+    ///
+    /// Deliberately narrow, and erring towards "might": every quote in the
+    /// statement closes, and outside single quotes, which are literal, it
+    /// has no `(` (a subexpression
+    /// `$(…)` or a `(…)` argument runs a command, even inside double quotes),
+    /// no `{` (a script block), no `&` (the call operator, `&&`) and no
+    /// expanding `@"` here-string. What is left is a pipeline whose first
+    /// element is a value — a variable, a string or a number — or an
+    /// assignment of one, or one of [`PWSH_INERT_CMDLETS`], and whose every
+    /// later element is one of those cmdlets. Anything else, a keyword
+    /// (`exit`, a loop's closing `}`) or a function call included, is not.
+    fn leaves_last_exit_code_alone(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        if code.contains(['(', '{', '&']) || code.contains("@\"") {
+            return false;
+        }
+        code.split('|').enumerate().all(|(at, element)| {
+            let element = element.trim();
+            let first = element.split_whitespace().next().unwrap_or_default();
+            PWSH_INERT_CMDLETS
+                .iter()
+                .any(|cmdlet| cmdlet.eq_ignore_ascii_case(first))
+                || (at == 0 && is_value_or_assignment(element))
+        })
+    }
+
+    /// Whether a pipeline element is a plain value (`$x`, `"text"`, `'text'`,
+    /// `42`, a literal here-string) or `$name = …` of one, with a target other
+    /// than `$LASTEXITCODE`. A `+=`-style operator counts as `=`.
+    fn is_value_or_assignment(element: &str) -> bool {
+        let value = match element.split_once('=') {
+            Some((target, value)) if element.starts_with('$') => {
+                let target = target
+                    .trim_end()
+                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
+                    .trim_end();
+                let name = target.trim_start_matches('$');
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    || assigns_last_exit_code(element)
+                {
+                    return false;
+                }
+                // `$a = $b = cargo …` chains: the value must pass in turn.
+                return is_value_or_assignment(value.trim());
+            }
+            _ => element,
+        };
+        value.starts_with(['$', '"', '\''])
+            || value.starts_with("@'")
+            || value.starts_with(|c: char| c.is_ascii_digit())
+    }
+
+    /// `statement` with the text inside its single-quoted strings removed:
+    /// that text is literal, so nothing in it can run. Double-quoted strings
+    /// are kept whole, since `$(…)` inside one does run, and a `'` inside one
+    /// is just a character.
+    ///
+    /// `None` when a quote is still open at the end: what it hides cannot be
+    /// told from literal text, so the caller must assume the worst. A stray
+    /// `'@ | git …` would otherwise reduce to a lone `'`, a plain value.
+    fn without_single_quoted_text(statement: &str) -> Option<String> {
+        let mut kept = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = statement.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => {
+                    quote = None;
+                    kept.push(c);
+                }
+                (Some('\''), _) => {}
+                (_, '`') => {
+                    kept.push(c);
+                    if let Some(escaped) = chars.next() {
+                        kept.push(escaped);
+                    }
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    kept.push(c);
+                }
+                _ => kept.push(c),
+            }
+        }
+        quote.is_none().then_some(kept)
+    }
+
+    /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
+    /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
+    /// the same variable and count just the same.
+    ///
+    /// Only a mention outside single quotes counts (`'$LASTEXITCODE'` is
+    /// literal text), and only of the whole name (`$LASTEXITCODEX` is another
+    /// variable). A statement with a quote left open reads nothing.
+    fn reads_last_exit_code(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        let code = code.to_ascii_lowercase();
+        code.match_indices("$lastexitcode").any(|(at, name)| {
+            !code[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its
+    /// block-scalar `run:` (`|`, `|-`, `>`, `>-`, …, folded as YAML folds it),
+    /// or its one-line `run:` value, which can chain statements with `;` just
+    /// the same.
     fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
-        match run_block(step) {
-            Some(body) => unchecked_native_commands(&body),
+        match run_script(step) {
+            Some(script) => {
+                unchecked_native_commands(&script.iter().map(String::as_str).collect::<Vec<_>>())
+            }
             None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
         }
     }
@@ -7125,9 +7990,10 @@ permissions:
     /// python b.py --self-test   # exits 0
     /// ```
     ///
-    /// the step is green. Every native command that is not the body's last
-    /// statement must therefore have its `$LASTEXITCODE` read on the next
-    /// line, or be split into its own step (#633), or be allow-listed above
+    /// the step is green. Every native command must therefore have its
+    /// `$LASTEXITCODE` read before anything that could run another program or
+    /// reset it (see [`exit_status_is_read`]; the end of the body counts as a
+    /// read), or be split into its own step (#633), or be allow-listed above
     /// with the reason its failure still surfaces.
     #[test]
     fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
@@ -7173,7 +8039,8 @@ permissions:
             "these `shell: pwsh` steps run a native command whose failure the step \
              would not report, because pwsh carries on and the step takes only the last \
              command's exit code — split each into its own step, or check \
-             `$LASTEXITCODE` right after it:\n  {}",
+             `$LASTEXITCODE` before anything that could run another program or \
+             reset it:\n  {}",
             offenders.join("\n  ")
         );
         // An allow-list entry that no longer matches anything exempts nothing
@@ -7445,5 +8312,257 @@ permissions:
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, ["Package Windows bundle", "Plain"]);
+    }
+
+    /// PowerShell variable names are case-insensitive: a check spelled
+    /// `$LastExitCode` reads the same variable as `$LASTEXITCODE`.
+    #[test]
+    fn unchecked_native_commands_reads_last_exit_code_in_any_case() {
+        for check in [
+            "if ($LastExitCode -ne 0) { exit $LastExitCode }",
+            "if ($lastexitcode -ne 0) { exit 1 }",
+        ] {
+            let body = ["cargo build", check, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{check:?} reads the status: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+    }
+
+    /// A statement that opens with a PowerShell keyword runs no program, so
+    /// it is not a native command left unchecked before `cargo xtask e2e`.
+    #[test]
+    fn a_statement_opening_with_a_pwsh_keyword_is_not_a_native_command() {
+        for statement in [
+            "break",
+            "continue",
+            "begin {",
+            "process {",
+            "end {",
+            "param([string] $Target)",
+            "trap { Write-Output 'trapped' }",
+        ] {
+            assert!(
+                !is_native_command_line(statement),
+                "{statement:?} reads as a native command"
+            );
+            assert!(
+                unchecked_native_commands(&[statement, "cargo xtask e2e"]).is_empty(),
+                "{statement:?}"
+            );
+        }
+    }
+
+    /// Every block-scalar form of `run:` hands a pwsh step a script, so every
+    /// form is checked. Read only as `run: |`, a `run: |-`, `run: >` or
+    /// `run: >-` step fell through to the one-line reading, whose value is the
+    /// bare indicator, and so escaped the contract whatever its script did.
+    #[test]
+    fn unchecked_native_commands_reads_every_block_scalar_run_form() {
+        // Literal forms: each line is a line of script.
+        for header in ["run: |", "run: |-", "run: |+", "run: |2", "run: |-  # note"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+        // Folded forms: a blank line separates two lines of script.
+        for header in ["run: >", "run: >-", "run: >+"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+    }
+
+    /// A folded `run: >` block is read as YAML folds it: lines at the block's
+    /// indent join with a space into one line of script, a blank line starts
+    /// a new one, and a more-indented line keeps its own line. Taken line by
+    /// line instead, the first two lines below would read as two commands and
+    /// the first as unchecked, where pwsh is handed one `cargo` command.
+    #[test]
+    fn a_folded_run_block_is_read_as_yaml_folds_it() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >-\n          \
+                    cargo build\n          --locked\n\n          if ($LASTEXITCODE) {\n            \
+                    exit 1\n          }\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "          cargo build --locked",
+                "",
+                "          if ($LASTEXITCODE) {",
+                "            exit 1",
+                "          }",
+            ]
+        );
+        assert!(unchecked_native_commands_in_step(step).is_empty());
+    }
+
+    /// A folded block with an indentation indicator (`>2`) sets its own
+    /// indent: the run key's column plus the digit, not the indent of its
+    /// first line. Here the first line is more indented than that, so it
+    /// keeps its own line, and the two lines at the block's indent fold into
+    /// one. PyYAML reads both fixtures this way.
+    #[test]
+    fn a_folded_run_block_honours_its_indentation_indicator() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >2\n            \
+                    python a.py --self-test\n          python b.py --self-test\n          \
+                    python c.py\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "            python a.py --self-test",
+                "          python b.py --self-test python c.py",
+            ]
+        );
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["python a.py --self-test"]
+        );
+        // `run:` as the step's first key: the key, not the dash, sets the
+        // column the digit counts from.
+        let step =
+            "      - run: >2\n            a1\n          b\n          c\n        shell: pwsh\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            ["            a1", "          b c"]
+        );
+    }
+
+    /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
+    /// the step is pwsh, and its script checked, just the same. Matched only
+    /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
+    /// `- run: |` read as no script at all.
+    #[test]
+    fn a_pwsh_step_is_checked_whichever_key_comes_first() {
+        let script = "            python a.py --self-test\n            \
+                      python b.py --self-test\n";
+        for step in [
+            format!("      - shell: pwsh\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - shell: 'pwsh'\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - run: |\n{script}        shell: pwsh\n        name: Self-tests\n"),
+        ] {
+            let text = format!("jobs:\n  win:\n    runs-on: windows-latest\n    steps:\n{step}");
+            let found: Vec<(String, Vec<String>)> = pwsh_steps(&text)
+                .into_iter()
+                .map(|(name, step)| (name, unchecked_native_commands_in_step(&step)))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    "Self-tests".to_owned(),
+                    vec!["python a.py --self-test".to_owned()]
+                )],
+                "{step}"
+            );
+        }
+    }
+
+    /// A `$LASTEXITCODE` check need not be the very next statement: what
+    /// sits between may only be statements that can neither run a program
+    /// nor touch `$LASTEXITCODE`. Each case below was run through pwsh after
+    /// a native command exiting 3, under GitHub's wrapper: in every accepted
+    /// case the check still saw 3.
+    #[test]
+    fn a_later_last_exit_code_check_counts_when_nothing_between_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["Write-Output 'built'"][..],
+            &["Write-Host \"built $target\""],
+            &["$artifact = 'dist/rocm.zip'"],
+            &["$env:RESULT = $artifact", "$count += 1"],
+            &["\"k=v\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append"],
+            &[
+                "@'",
+                "## Summary (cargo build; git status)",
+                "'@ | Add-Content $env:GITHUB_STEP_SUMMARY",
+            ],
+            &["Write-Output 'one'", "$x = 'two'", "Write-Host $x"],
+            &["Write-Output 'done (all targets) & {more}'"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{between:?} leaves the status for the check: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+        // The end of the body is a read too: GitHub's wrapper exits with
+        // `$LASTEXITCODE`, which a trailing cmdlet leaves alone.
+        assert!(unchecked_native_commands(&["cargo build", "Write-Output 'done'"]).is_empty());
+    }
+
+    /// The other side of the rule: a statement that can run a program, leave
+    /// the script, or set `$LASTEXITCODE` between a native command and the
+    /// check leaves that command unchecked. Run through pwsh after a native
+    /// command exiting 3 (`.\scripts\collect.ps1` standing for a script
+    /// that ends `exit 0`), each of these lost the 3 before the check —
+    /// another status took its place, or the step left first — except the
+    /// two marked: one this check cannot tell from a statement that does,
+    /// and a loop's closing brace, which is not a statement on its own.
+    #[test]
+    fn a_later_last_exit_code_check_does_not_count_past_a_statement_that_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["git rev-parse HEAD"][..],
+            &["Write-Output (git rev-parse HEAD)"],
+            &["Write-Output \"sha: $(git rev-parse HEAD)\""],
+            &["Write-Output \"it's $(git rev-parse HEAD)\""],
+            &["& .\\scripts\\collect.ps1"],
+            &["$LASTEXITCODE = 0"],
+            &["$global:LastExitCode = 0"],
+            &["$sha = git rev-parse HEAD"],
+            &["$a = $b = git rev-parse HEAD"],
+            &["Write-Output 'x' | git hash-object --stdin"],
+            // Conservative: runs git only if Write-Output fails.
+            &["Write-Output 'x' || git rev-parse HEAD"],
+            &["@\"", "$(git rev-parse HEAD)", "\"@ | Out-File summary.md"],
+            &["Invoke-Expression 'git rev-parse HEAD'"],
+            &["Write-Output 'x' && git rev-parse HEAD"],
+            // A hashtable value is a statement, and runs.
+            &["Write-Output @{ sha = git rev-parse HEAD }"],
+            &["Write-Output @\"", "$(git rev-parse HEAD)", "\"@"],
+            &["exit 0"],
+            // A loop's closing brace: the check reads the last pass only.
+            &["}"],
+            &["Write-Output 'fine'", "git rev-parse HEAD"],
+            // An unclosed `'` hides the rest of the statement, so the
+            // statement is not known to be inert: here a stray closing
+            // marker would leave just `'`, which reads as a plain value.
+            &["'@ | git hash-object --stdin"],
+            &["Write-Output 'open | git hash-object --stdin"],
+            // `$LASTEXITCODE` inside single quotes is literal text, and
+            // `$LASTEXITCODEX` is another variable: neither reads the status.
+            &["git log --grep '$LASTEXITCODE'"],
+            &["Invoke-Thing $LASTEXITCODEX"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).contains(&"cargo build".to_owned()),
+                "{between:?} can reset the status, yet `cargo build` reads as checked"
+            );
+        }
+        assert_eq!(
+            unchecked_native_commands(&["cargo build", "exit 0"]),
+            ["cargo build"]
+        );
     }
 }

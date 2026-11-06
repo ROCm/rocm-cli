@@ -663,7 +663,7 @@ Feature: Diagnosing failures and listing fixes
   # gate, so the text is the same on every lane, and the scenario asserts the
   # printed lines and not the exit code. It does not run the line. The test
   # `the_msvc_verify_runs_in_cmd_and_powershell` in
-  # crates/rocm-core/src/fix.rs does that, and only on Windows.
+  # crates/rocm-core/src/fix/catalog.rs does that, and only on Windows.
   @id:diagnose-msvc-verify-line-text-is-powershell-safe
   Scenario: diagnose-43 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
     Given a user who has chosen the fix for the missing MSVC runtime
@@ -680,11 +680,11 @@ Feature: Diagnosing failures and listing fixes
   # and Windows PowerShell 5.1 drops the empty argument, so setx failed with
   # "Invalid syntax" and cleared nothing; the step refuses an empty-string
   # argument too. Text only, like diagnose-43. `the_override_verify_runs_in_cmd_and_powershell`
-  # in crates/rocm-core/src/fix.rs runs the override verify line, on Windows.
+  # in crates/rocm-core/src/fix/catalog.rs runs the override verify line, on Windows.
   # These three scenarios see what `rocm fix <id> --dry-run` prints from the
   # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
   # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
-  # in crates/rocm-core/src/diagnose.rs, and a printed line the rule passes is
+  # in crates/rocm-core/src/diagnose/catalog.rs, and a printed line the rule passes is
   # still not proven to run: the Windows-only tests named above do that.
   @id:diagnose-override-fix-lines-are-powershell-safe
   Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
@@ -709,10 +709,10 @@ Feature: Diagnosing failures and listing fixes
   # the binary. The exact line is asserted, and that it names `python3`: a stock
   # Ubuntu has no `python`. Text only: the line is run by
   # `the_override_fix_verify_runs_where_only_python3_exists` in
-  # crates/rocm-core/src/diagnose.rs, on Unix hosts. The Windows arms of these
+  # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
   # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
   # (text) and the Windows-only `*_verify_runs_*` tests in
-  # crates/rocm-core/src/fix.rs (run); there is no Windows scenario for them.
+  # crates/rocm-core/src/fix/catalog.rs (run); there is no Windows scenario for them.
   @id:diagnose-override-verify-line-names-python3 @requires-os:linux
   Scenario: diagnose-46 - The verify line printed for the GPU override cause reads the override and uses python3
     Given a Linux machine whose shell has a GPU override set
@@ -739,7 +739,7 @@ Feature: Diagnosing failures and listing fixes
   # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
   # an ambient HIP framework needs the SDK is held by the unit test
   # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
-  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # in crates/rocm-core/src/diagnose/windows.rs. The oracle also counts a weak listing
   # (below the match threshold) as present, which is what production does for
   # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
   # bonus wrong, so whoever changes it must update this scenario's oracle too.

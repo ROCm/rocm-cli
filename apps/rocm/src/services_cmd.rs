@@ -10,7 +10,7 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `ServicesCommand`, the clap enum it matches on,
-//! stays in `main.rs` with the rest of the `Command`/`Cli` definition.
+//! lives in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `main.rs`'s `dispatch()` calls `services` through the re-import
 //! `use crate::services_cmd::services;`, and `advised_commands.rs`'s test
 //! reaches `run_approved_service_action` as `super::run_approved_service_action`
@@ -18,10 +18,11 @@
 //! callers.
 //!
 //! This module reads from `services_text.rs` (the status, logs and action-result
-//! text and the sandbox tool call), `service_records.rs` (remove and prune) and
-//! `service_hints.rs` (the advice text), and records its audit events through
-//! `cli_audit.rs`; none of those modules calls back into this one outside
-//! tests (`services_text.rs`'s tests drive `finish_service_action` directly).
+//! text), `service_control.rs` (the sandbox tool call), `service_records.rs`
+//! (remove and prune) and `service_hints.rs` (the advice text), and records its
+//! audit events through `cli_audit.rs`; none of those modules calls back into
+//! this one outside tests (`service_control.rs`'s tests drive
+//! `finish_service_action` directly).
 //!
 //! The cluster's one regression test lives in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::`.
@@ -31,6 +32,7 @@ use rocm_core::AppPaths;
 
 use crate::ServicesCommand;
 use crate::cli_audit::record_cli_audit_event;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_hints::{
     self, sandbox_tool_arg_from_service_tool, service_action_command, service_action_past_tense,
     service_action_verb,
@@ -41,7 +43,7 @@ use crate::service_records::{
 use crate::services_text::{
     follow_service_logs, render_service_action_result,
     render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
-    render_services_text, run_internal_sandbox_tool, service_stop_unconfirmed, validate_service_id,
+    render_services_text, service_stop_unconfirmed, validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {

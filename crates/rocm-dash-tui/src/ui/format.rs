@@ -141,6 +141,13 @@ pub fn tps_opt(value: Option<f64>) -> String {
     }
 }
 
+/// Latency in milliseconds (TTFT/TPOT). `123ms`. `—` when None or non-finite.
+pub fn ms_opt(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map_or_else(|| "—".to_string(), |v| format!("{v:.0}ms"))
+}
+
 /// Energy efficiency: generation throughput per watt. `0.42 tok/W`. `-` when
 /// None or non-finite (no throughput sample or no GPU power telemetry).
 pub fn tokens_per_watt(value: Option<f64>) -> String {
@@ -236,6 +243,25 @@ pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> Stri
         Some(v) if !v.is_finite() => "—".to_string(),
         Some(v) => {
             let base = format!("{v:.0}");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Latency (TTFT/TPOT) for narrow table cells.
+///
+/// - `None` / non-finite → `"—"`
+/// - `Some(v)`, Held → `"{v:.0}ms*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.0}ms"`
+pub fn latency_cell(ms: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match ms.filter(|v| v.is_finite()) {
+        None => "—".to_string(),
+        Some(v) => {
+            let base = format!("{v:.0}ms");
             if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
                 format!("{base}{HELD_MARKER}")
             } else {
@@ -607,6 +633,16 @@ mod tests {
             observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             freshness: ObservationFreshness::Fresh,
         }
+    }
+
+    #[test]
+    fn latency_cell_marks_held_and_never_prints_non_finite() {
+        assert_eq!(latency_cell(None, None), "—");
+        assert_eq!(latency_cell(Some(f64::NAN), Some(&held_obs())), "—");
+        assert_eq!(latency_cell(Some(150.4), Some(&held_obs())), "150ms*");
+        assert_eq!(latency_cell(Some(150.4), Some(&fresh_obs())), "150ms");
+        // Unknown freshness (legacy snapshot) is never shown as held.
+        assert_eq!(latency_cell(Some(150.4), None), "150ms");
     }
 
     fn held_obs() -> ObservationMetadata {
