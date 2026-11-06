@@ -219,6 +219,29 @@ unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
 outright, instead of leaving the wiki showing a stale verdict with no sign
 it's stale.
 
+The three readiness jobs (`release-readiness-nightly`,
+`release-readiness-narrative` and `publish-release-readiness-wiki`) also run after
+a *scheduled* run has been cancelled; the narrative job still needs the facts job
+to have succeeded, and the publish job still needs a facts job that was not
+skipped plus the repo and `main` guards. GitHub cancels a job that waits 24 hours
+for a self-hosted runner ("exceeded the maximum execution time while awaiting a
+runner for 24h0m0s"), so a night on which a GPU pool never picks up its lanes ends
+cancelled. The report job those jobs read from, `e2e-report-nightly`, already ran
+under `always()`. Observed on the 2026-11-05 and 2026-11-06 runs: its step "Check
+every lane that ran uploaded its report" ran and failed, so the verdict followed
+that job's result and named the missing E2E evidence. A manually dispatched run
+that someone cancels keeps the plain `!cancelled()` rule and publishes nothing,
+so a hand-cancelled dispatch run cannot overwrite the page with a partial
+verdict. The conditions are pinned by
+`release_readiness_nightly_runs_even_if_an_upstream_job_failed`,
+`release_readiness_narrative_guard_is_exact`,
+`publish_release_readiness_wiki_guard_is_exact` and
+`release_readiness_jobs_keep_their_run_after_cancel_semantics` in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs). Not yet observed with
+these jobs in place: what GitHub reports for a run after a queue timeout, and
+whether that lane-check step (guarded by `!cancelled()`) still fails the job
+there. Confirm both on the first scheduled run that stalls this way.
+
 The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
 `e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
 `e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,

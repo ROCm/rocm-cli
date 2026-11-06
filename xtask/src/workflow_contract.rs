@@ -4809,10 +4809,77 @@ fi
         let nightly = read_workflow("nightly.yml");
         let job = job_block(&nightly, "release-readiness-nightly");
         assert!(
-            job.contains("if: ${{ !cancelled() }}"),
+            job.contains(&format!(
+                "if: ${{{{ {RELEASE_READINESS_RUNS_AFTER_CANCEL} }}}}"
+            )),
             "release-readiness-nightly must still run when e2e-report-nightly or a build job \
              failed (the default `if` would skip it instead, leaving the wiki showing a stale \
-             GO from the last run that did succeed): {job}"
+             GO from the last run that did succeed), and when a scheduled run is cancelled \
+             after its queued lanes time out: {job}"
+        );
+    }
+
+    /// The `if:` core shared by every release-readiness job. `always()` is what keeps a
+    /// job running once its run is cancelled -- `e2e-report-nightly` already relies on
+    /// it, and it is how that job produced a report after the Nov 6 cancel -- and the
+    /// rest narrows it: a scheduled run is cancelled by GitHub itself when a GPU lane
+    /// waits 24h for a runner that never comes ("exceeded the maximum execution time
+    /// while awaiting a runner"), so it must still publish the NO-GO that says so, but
+    /// a hand-cancelled dispatch run keeps the `!cancelled()` rule and publishes nothing.
+    const RELEASE_READINESS_RUNS_AFTER_CANCEL: &str =
+        "always() && (github.event_name == 'schedule' || !cancelled())";
+
+    /// The three readiness jobs' conditions are checked against the words that make them
+    /// work, not only against the shared constant above: editing the constant and the
+    /// workflow together back to a bare `!cancelled()` would keep the exact-match tests
+    /// green, and with it a stalled scheduled night would publish nothing again. The
+    /// report job they read from must also keep `always()`, because it is what lets the
+    /// lane evidence exist at all once a run is cancelled.
+    #[test]
+    fn release_readiness_jobs_keep_their_run_after_cancel_semantics() {
+        let nightly = read_workflow("nightly.yml");
+        for job_name in [
+            "release-readiness-nightly",
+            "release-readiness-narrative",
+            "publish-release-readiness-wiki",
+        ] {
+            let condition = job_scalar(job_block(&nightly, job_name), "if");
+            for required in [
+                "always()",
+                "github.event_name == 'schedule'",
+                "!cancelled()",
+            ] {
+                assert!(
+                    condition.contains(required),
+                    "{job_name}'s `if:` must contain `{required}`: {condition}"
+                );
+            }
+        }
+        let report = job_scalar(job_block(&nightly, "e2e-report-nightly"), "if");
+        assert_eq!(
+            report, "always()",
+            "e2e-report-nightly must keep running after a cancelled run, or the readiness \
+             jobs that read its report have nothing to read: {report}"
+        );
+    }
+
+    /// The narrative job runs after the same cancelled scheduled run as the facts job,
+    /// but only when the facts job succeeded: without that clause it would draft prose
+    /// from a facts artifact that was never written. Compared exactly, so appending a
+    /// disjunct (`|| true`) or moving a parenthesis, either of which changes which
+    /// runs execute, fails here.
+    #[test]
+    fn release_readiness_narrative_guard_is_exact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert_eq!(
+            job_scalar(job, "if"),
+            format!(
+                "${{{{ ({RELEASE_READINESS_RUNS_AFTER_CANCEL}) \
+                 && needs.release-readiness-nightly.result == 'success' }}}}"
+            ),
+            "release-readiness-narrative's guard must be the shared run-after-cancel \
+             condition and the facts job's success, exactly: {job}"
         );
     }
 
@@ -4821,14 +4888,16 @@ fi
         let nightly = read_workflow("nightly.yml");
         let job = job_block(&nightly, "publish-release-readiness-wiki");
         assert!(
-            job.contains(
-                "if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' \
-                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}"
-            ),
-            "publish-release-readiness-wiki's guard must stay exactly this: `!cancelled()` so \
-             it still runs (and publishes the stale-evidence notice) when release-readiness-\
-             nightly failed outright, `!= 'skipped'` rather than `== 'success'` so that failure \
-             still publishes rather than being skipped, and the repo/main-branch guards: {job}"
+            job.contains(&format!(
+                "if: ${{{{ ({RELEASE_READINESS_RUNS_AFTER_CANCEL}) \
+                 && needs.release-readiness-nightly.result != 'skipped' \
+                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}}}"
+            )),
+            "publish-release-readiness-wiki's guard must stay exactly this: the shared \
+             run-after-cancel condition so it still runs (and publishes the stale-evidence \
+             notice) when release-readiness-nightly failed outright or a scheduled run was \
+             cancelled, `!= 'skipped'` rather than `== 'success'` so that failure still \
+             publishes rather than being skipped, and the repo/main-branch guards: {job}"
         );
     }
 

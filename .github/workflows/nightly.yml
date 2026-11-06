@@ -1749,7 +1749,12 @@ jobs:
       - nightly
       - windows-nightly
       - e2e-report-nightly
-    if: ${{ !cancelled() }}
+    # `always()` + `schedule`, not bare `!cancelled()`: the self-hosted GPU lanes can
+    # wait 24h for a runner and GitHub then cancels the whole scheduled run
+    # ("exceeded the maximum execution time while awaiting a runner for 24h0m0s"), which
+    # is exactly when the page has to say the evidence is missing. A hand-cancelled
+    # dispatch run keeps `!cancelled()`. See nightly's readiness contract tests.
+    if: ${{ always() && (github.event_name == 'schedule' || !cancelled()) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1810,7 +1815,7 @@ jobs:
     permissions:
       contents: read
     needs: release-readiness-nightly
-    if: ${{ !cancelled() && needs.release-readiness-nightly.result == 'success' }}
+    if: ${{ (always() && (github.event_name == 'schedule' || !cancelled())) && needs.release-readiness-nightly.result == 'success' }}
     steps:
       # Needed because the prompt below is read from the repo
       # (system-prompt-file), not just the downloaded facts artifact.
@@ -1902,7 +1907,7 @@ jobs:
     needs:
       - release-readiness-nightly
       - release-readiness-narrative
-    if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    if: ${{ (always() && (github.event_name == 'schedule' || !cancelled())) && needs.release-readiness-nightly.result != 'skipped' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-release-readiness-wiki
       cancel-in-progress: false
