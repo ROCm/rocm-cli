@@ -500,14 +500,24 @@ fn assert_recorded_process_exited(world: &mut E2eWorld) {
         .as_mut()
         .expect("scenario recorded no process");
     // The report's claim, checked against the process itself: it has exited
-    // (and is reaped here), rather than merely having been signalled.
-    let exited = process
-        .try_wait()
-        .expect("failed to check the recorded process");
-    assert!(
-        exited.is_some(),
-        "the stop reported the process gone, but it is still running"
-    );
+    // (and is reaped here), rather than merely having been signalled. The stop
+    // confirms an exit from the OS's exit code, and this handle is signalled by
+    // the process object's teardown, so allow that teardown a few seconds on a
+    // loaded host before calling a process a survivor.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let exited = process
+            .try_wait()
+            .expect("failed to check the recorded process");
+        if exited.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop reported the process gone, but it is still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[then("the server's record reads stopped and names no process")]
