@@ -367,6 +367,20 @@ async fn cli_plans_itself_and_says_why(world: &mut E2eWorld, reason: String) {
         !out.contains("\nexecution\n"),
         "nothing may be executed:\n{out}"
     );
+    // The same fact, stated positively so it cannot pass vacuously if the
+    // execution heading ever changes shape: the plan renderer indents everything
+    // under its one `request plan` heading, so a run that printed anything of its
+    // own (an `execution` section, a launch report, an error) would add another
+    // unindented line.
+    let sections: Vec<&str> = out
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with(char::is_whitespace))
+        .collect();
+    assert_eq!(
+        sections,
+        ["request plan"],
+        "the output must be the plan alone, with nothing run after it:\n{out}"
+    );
     // The message, asserted together with the behavior above: it gives the
     // rule's reason and names the assistant's plan as what was refused.
     let note = format!(
