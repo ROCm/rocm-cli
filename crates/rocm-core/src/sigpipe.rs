@@ -122,17 +122,25 @@ mod tests {
             });
             assert_eq!(current_disposition(), libc::SIG_DFL, "nested");
 
-            // Two threads whose regions overlap, the first to enter leaving first.
+            // Two threads whose regions overlap, the first to enter leaving
+            // first. The second thread waits until the first is inside its
+            // region before it enters its own, so the order is the same on
+            // every run: were it left to the scheduler, a per-call save and
+            // restore would pass whenever the "second" closure happened to run
+            // first.
+            let first_in = Barrier::new(2);
             let entered = Barrier::new(2);
             let first_left = Barrier::new(2);
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     with_sigpipe_ignored(|| {
+                        first_in.wait();
                         entered.wait();
                     });
                     first_left.wait();
                 });
                 scope.spawn(|| {
+                    first_in.wait();
                     with_sigpipe_ignored(|| {
                         entered.wait();
                         first_left.wait();
