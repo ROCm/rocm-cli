@@ -18,10 +18,11 @@
 //! warning cheaper.
 //!
 //! **Fail safe.** Whenever the affected set cannot be determined (`git diff`
-//! fails because the base is not fetched, `cargo metadata` fails, ...) the step
-//! runs over the whole workspace, as it did before, and says why. A step is
-//! skipped only when the selection is known and contains nothing for that step
-//! to check, and it prints the reason then too.
+//! fails because the base is not fetched, `cargo metadata` fails, the range lists
+//! no changed files at all, ...) the step runs over the whole workspace, as it
+//! did before, and says why. A step is skipped only when the selection is known
+//! and contains nothing for that step to check, and it prints the reason then
+//! too.
 //!
 //! The range comes from the refs prek exports to a pre-push hook:
 //! `PRE_COMMIT_FROM_REF` is the commit the remote already has (the remote
@@ -275,6 +276,12 @@ pub fn resolve_selection(
     let resolved = changed_files()
         .context("could not list the changed files")
         .and_then(|files| {
+            // The hook only runs when the push contains a Rust file, so a range
+            // that lists no changed files means the range is wrong, not that
+            // nothing changed.
+            if files.is_empty() {
+                bail!("the pushed range lists no changed files");
+            }
             let graph = load_graph().context("could not read the workspace dependency graph")?;
             Ok(hook_selection(&files, &graph))
         });
@@ -552,6 +559,37 @@ mod tests {
 
         let (selection, _) = resolve_selection(|| Ok(graph()), || files(&["CHANGELOG.md"]));
         assert_eq!(selection, Selection::Empty);
+    }
+
+    /// The hook fires only for a push that contains a Rust file, so an empty
+    /// list of changed files is a wrong range (a base that is not an ancestor, a
+    /// from-ref equal to the pushed commit), not a clean push. Skipping all three
+    /// steps on it would turn a bad range into a silent pass.
+    #[test]
+    fn an_empty_list_of_changed_files_falls_back_to_the_whole_workspace_and_says_why() {
+        let (selection, fallback) = resolve_selection(|| Ok(graph()), || files(&[]));
+        assert_eq!(selection, Selection::Workspace);
+        let reason = fallback.expect("an empty range gives a reason");
+        assert!(reason.contains("lists no changed files"), "{reason}");
+        // Every step then runs over the workspace instead of skipping.
+        for check in [Check::Clippy, Check::ClippyE2e, Check::Test] {
+            assert!(
+                matches!(plan(check, &selection), Plan::Cargo(_)),
+                "{check:?}"
+            );
+        }
+        // The banner names the fallback and the reason, not a narrowed scope.
+        let line = banner(
+            Check::Test,
+            &push_from_env(None, None),
+            &selection,
+            Some(&reason),
+        );
+        assert!(
+            line.contains("could not determine the affected crates"),
+            "{line}"
+        );
+        assert!(line.contains("lists no changed files"), "{line}");
     }
 
     #[test]

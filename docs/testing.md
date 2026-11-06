@@ -402,9 +402,10 @@ selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_REA
 covered, so a new cross-crate read cannot be added without a decision.
 
 A step that has nothing to check says so and exits successfully. A step whose affected crates
-cannot be determined (the pushed range's base is not available locally, or `cargo metadata`
-fails) runs over the whole workspace and prints why, so narrowing never replaces a check with
-silence. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
+cannot be determined (the pushed range's base is not available locally, the range lists no
+changed files at all, or `cargo metadata` fails) runs over the whole workspace and prints why, so
+narrowing never replaces a check with silence. An empty list counts as undeterminable because the
+hook only fires for a push that contains a Rust file, so an empty list means the range is wrong. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
 filter, as before, including a lockfile-only push.
 
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
