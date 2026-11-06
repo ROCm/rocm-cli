@@ -154,6 +154,15 @@ impl std::error::Error for RegistryReadError {
     }
 }
 
+/// What a scan does with a record file that exists but cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableRecord {
+    /// The whole pass fails: nothing is known about the service the file held.
+    Fail,
+    /// The file is skipped and the other records still load.
+    Skip,
+}
+
 /// Read every managed-service record under `services_dir`, telling a registry
 /// that is confirmed empty apart from one that could not be read.
 ///
@@ -174,6 +183,26 @@ impl std::error::Error for RegistryReadError {
 /// Side-effect-free, and the canonical rocm-cli `load_managed_services` semantics
 /// minus the engine-state status overlay, which the supervisor owns.
 pub fn read_service_records(services_dir: &Path) -> Result<RegistryRead, RegistryReadError> {
+    read_service_records_with(services_dir, |path| fs::read(path))
+}
+
+/// [`read_service_records`] with the record reader injected, so a test can make
+/// one record unreadable on every platform (a mode-000 file works only on Unix,
+/// and not as root).
+fn read_service_records_with(
+    services_dir: &Path,
+    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<RegistryRead, RegistryReadError> {
+    scan_registry(services_dir, read_record, UnreadableRecord::Fail)
+}
+
+/// The scan behind [`read_service_records`] and [`load_service_records`]; the two
+/// differ only in what they do with a record file that cannot be read.
+fn scan_registry(
+    services_dir: &Path,
+    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+    on_unreadable: UnreadableRecord,
+) -> Result<RegistryRead, RegistryReadError> {
     let entries = match fs::read_dir(services_dir) {
         Ok(entries) => entries,
         Err(source) => {
@@ -193,17 +222,24 @@ pub fn read_service_records(services_dir: &Path) -> Result<RegistryRead, Registr
     };
     let mut read = RegistryRead::default();
     for entry in entries {
-        let entry = entry.map_err(|source| RegistryReadError {
-            path: services_dir.to_path_buf(),
-            source,
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) if on_unreadable == UnreadableRecord::Skip => continue,
+            Err(source) => {
+                return Err(RegistryReadError {
+                    path: services_dir.to_path_buf(),
+                    source,
+                });
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|v| v.to_str()) != Some("json") || path.is_dir() {
             continue;
         }
-        let bytes = match fs::read(&path) {
+        let bytes = match read_record(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) if on_unreadable == UnreadableRecord::Skip => continue,
             Err(source) => return Err(RegistryReadError { path, source }),
         };
         match serde_json::from_slice::<ServiceRecord>(&bytes) {
@@ -220,12 +256,23 @@ pub fn read_service_records(services_dir: &Path) -> Result<RegistryRead, Registr
 /// Load every managed-service record under `services_dir`, newest first.
 ///
 /// Best-effort, for the one-shot readers (the dashboard's launcher and exit
-/// prompt) that have nothing to retire: a directory that cannot be read yields an
-/// empty list, and a malformed record is skipped. The daemon's discovery loop
-/// must not use this, because it cannot tell an unreadable registry from an empty
-/// one; it calls [`read_service_records`].
+/// prompt) that have nothing to retire: a directory that cannot be listed yields
+/// an empty list, and a record that cannot be read or parsed is skipped on its
+/// own, so one bad file never hides the services beside it. The daemon's
+/// discovery loop must not use this, because it cannot tell an unreadable
+/// registry from an empty one; it calls [`read_service_records`], which fails the
+/// pass on an unreadable record instead.
 pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
-    read_service_records(services_dir)
+    load_service_records_with(services_dir, |path| fs::read(path))
+}
+
+/// [`load_service_records`] with the record reader injected (see
+/// [`read_service_records_with`]).
+fn load_service_records_with(
+    services_dir: &Path,
+    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Vec<ServiceRecord> {
+    scan_registry(services_dir, read_record, UnreadableRecord::Skip)
         .map(|read| read.records)
         .unwrap_or_default()
 }
@@ -528,6 +575,126 @@ mod tests {
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
         let err = result.expect_err("an unreadable record must not read as a missing one");
         assert_eq!(err.path, locked);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The one-shot readers (launcher, exit prompt, services overlay) stay
+    /// best-effort per record: one unreadable record file hides only itself,
+    /// while the strict reader the daemon's loop uses fails on the same
+    /// registry. Unix only for the real mode-000 file, and skipped as root; the
+    /// portable twin below injects the failing read.
+    #[cfg(unix)]
+    #[test]
+    fn load_skips_one_unreadable_record_and_keeps_the_readable_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("load-unreadable-record");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 300),
+        )
+        .unwrap();
+        let locked = dir.join("locked.json");
+        fs::write(
+            &locked,
+            record_json("svc-locked", "vllm", 8002, "running", 200),
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            eprintln!("skipped: this process can read a mode-000 file (running as root)");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let loaded = load_service_records(&dir);
+        let strict = read_service_records(&dir);
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+        let ids: Vec<&str> = loaded.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert_eq!(
+            strict.expect_err("the strict reader must still fail").path,
+            locked
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A registry with three records, one of which the injected reader refuses
+    /// with a permission error. Runs on every platform, unlike the mode-000 test.
+    fn registry_with_one_record_refused() -> (PathBuf, impl Fn(&Path) -> std::io::Result<Vec<u8>>) {
+        let dir = test_dir("scan-refused-record");
+        for (name, id, created) in [
+            ("a", "svc-a", 100),
+            ("locked", "svc-locked", 200),
+            ("b", "svc-b", 300),
+        ] {
+            fs::write(
+                dir.join(format!("{name}.json")),
+                record_json(id, "vllm", 8000, "running", created),
+            )
+            .unwrap();
+        }
+        let refused = dir.join("locked.json");
+        let read_record = move |path: &Path| {
+            if path == refused {
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            } else {
+                fs::read(path)
+            }
+        };
+        (dir, read_record)
+    }
+
+    #[test]
+    fn load_keeps_the_readable_records_beside_one_that_cannot_be_read() {
+        let (dir, read_record) = registry_with_one_record_refused();
+        let loaded = load_service_records_with(&dir, read_record);
+        let ids: Vec<&str> = loaded.iter().map(|r| r.service_id.as_str()).collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_fails_the_pass_on_a_record_that_cannot_be_read() {
+        let (dir, read_record) = registry_with_one_record_refused();
+        let err = read_service_records_with(&dir, read_record)
+            .expect_err("the strict reader must not read past an unreadable record");
+        assert_eq!(err.path, dir.join("locked.json"));
+        assert_eq!(err.source.kind(), ErrorKind::PermissionDenied);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compatibility loader and the strict reader share one scan, and a
+    /// registry with one corrupt record and two readable ones gives both the two
+    /// readable records (a corrupt record is malformed in both, never a failure).
+    #[test]
+    fn load_and_read_agree_on_a_registry_with_one_corrupt_record() {
+        let dir = test_dir("load-read-corrupt");
+        fs::write(
+            dir.join("a.json"),
+            record_json("svc-a", "vllm", 8000, "running", 100),
+        )
+        .unwrap();
+        fs::write(dir.join("corrupt.json"), "{ not valid").unwrap();
+        fs::write(
+            dir.join("b.json"),
+            record_json("svc-b", "vllm", 8001, "running", 200),
+        )
+        .unwrap();
+
+        let loaded: Vec<String> = load_service_records(&dir)
+            .into_iter()
+            .map(|r| r.service_id)
+            .collect();
+        let read = read_service_records(&dir).expect("a corrupt record is not a read failure");
+        let strict: Vec<String> = read.records.into_iter().map(|r| r.service_id).collect();
+        assert_eq!(loaded, ["svc-b", "svc-a"]);
+        assert_eq!(strict, loaded);
+        assert_eq!(read.malformed, [dir.join("corrupt.json")]);
         let _ = fs::remove_dir_all(&dir);
     }
 
