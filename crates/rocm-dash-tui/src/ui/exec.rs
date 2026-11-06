@@ -84,14 +84,10 @@ pub fn display_args(args: &[String]) -> String {
 /// Windows, `bin/python` elsewhere), kept here without a `rocm-core` dependency
 /// because the crate-edge check forbids that edge. The approval modal shows the
 /// exact argv, so the user verifies the path before anything runs.
-pub fn derive_python_executable(root: &str) -> String {
-    python_executable_for(root, cfg!(windows))
-}
-
-/// [`derive_python_executable`] with the host passed in, so a unit test can
-/// reach the layout of the other platform. `windows` selects
-/// `Scripts/python.exe`; the separator between the parts is still the running
-/// host's.
+///
+/// `windows` selects `Scripts/python.exe`; the separator between the parts is
+/// still the running host's. The host is chosen once, in [`adopt_args`], and
+/// passed down so a unit test can reach the layout of the other platform.
 fn python_executable_for(root: &str, windows: bool) -> String {
     let root = Path::new(root);
     let path = if windows {
@@ -104,15 +100,16 @@ fn python_executable_for(root: &str, windows: bool) -> String {
 
 /// The `rocm runtimes adopt` argument list (without the executable).
 ///
-/// `--root` is `root` and `--python` is [`derive_python_executable`] of it.
-/// Shared by the runtime manager's Adopt action and the onboarding wizard's
+/// `--root` is `root` and `--python` is the conventional Python executable
+/// inside it for the running host (`Scripts\python.exe` on Windows,
+/// `bin/python` elsewhere). Shared by the runtime manager's Adopt action and the onboarding wizard's
 /// Adopt-existing-folder path, so the approval modal shows the same argv from
 /// both.
 pub fn adopt_args(root: &str) -> Vec<String> {
     adopt_args_for(root, cfg!(windows))
 }
 
-/// [`adopt_args`] with the host passed in; see [`python_executable_for`].
+/// [`adopt_args`] with the host passed in, so both layouts are unit-testable.
 fn adopt_args_for(root: &str, windows: bool) -> Vec<String> {
     vec![
         "runtimes".to_string(),
@@ -151,16 +148,6 @@ mod tests {
     fn python_executable_for_picks_each_platforms_layout() {
         assert_eq!(python_executable_for(ENV_ROOT, true), WINDOWS_LAYOUT);
         assert_eq!(python_executable_for(ENV_ROOT, false), UNIX_LAYOUT);
-    }
-
-    #[test]
-    fn derive_python_executable_follows_the_host() {
-        let want = if cfg!(windows) {
-            WINDOWS_LAYOUT
-        } else {
-            UNIX_LAYOUT
-        };
-        assert_eq!(derive_python_executable(ENV_ROOT), want);
     }
 
     #[test]
