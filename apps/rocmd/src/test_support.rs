@@ -239,3 +239,34 @@ mod tests {
         assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
     }
 }
+
+/// Tests that run a script they just wrote take this lock. Writing an
+/// executable while another thread forks can leave the new file "text file
+/// busy" at its first exec; the lock keeps these tests from doing it to each
+/// other, and each retries for the forks it cannot see.
+#[cfg(unix)]
+static SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+pub(crate) fn lock_script_tests() -> std::sync::MutexGuard<'static, ()> {
+    SCRIPT_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write `body` as a `/bin/sh` script at `path` and make it executable. Every
+/// writer is closed before this returns, so the first exec cannot find the
+/// file open for writing. The script may use only the shell's own commands
+/// and `/bin` tools, and the caller is expected to say so by name when one is
+/// missing.
+#[cfg(unix)]
+pub(crate) fn write_executable_script(path: &std::path::Path, body: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = fs::File::create(path)?;
+    write!(file, "#!/bin/sh\n{body}")?;
+    file.set_permissions(fs::Permissions::from_mode(0o755))?;
+    file.sync_all()?;
+    Ok(())
+}

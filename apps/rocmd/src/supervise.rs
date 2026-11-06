@@ -597,6 +597,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::test_support::UNCONFIRMED_STOP_PID;
     use crate::test_support::{identity_probe_record, temp_app_paths, unique_test_root};
+    #[cfg(target_os = "linux")]
+    use crate::test_support::{lock_script_tests, write_executable_script};
     use crate::watchers::find_recoverable_service;
 
     /// Drive `supervise_service` far enough to reach the key guard, and return
@@ -1306,12 +1308,6 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that run a script they just wrote take this lock. Writing an
-    /// executable while another thread forks can leave the new file "text file
-    /// busy" at its first exec, and the retry below covers forks the lock cannot
-    /// see.
-    static SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The restart, when the daemon is embedded in `rocm`, launches `supervise`
     /// on the `rocmd` it is given. Before the choice was made, it re-executed
     /// `rocm` itself and the new supervisor died on an unrecognised subcommand.
@@ -1323,12 +1319,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn restart_runs_supervise_on_the_rocmd_it_is_given() -> Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let _serial = SCRIPT_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = lock_script_tests();
         for tool in ["/bin/sh", "/bin/sleep"] {
             assert!(
                 Path::new(tool).exists(),
@@ -1343,17 +1334,13 @@ mod tests {
         // is the stand-in.
         let host = DaemonHost::new(root.join("rocm"), true);
         let stand_in = root.join("rocmd");
-        {
-            // Every writer is closed before the first exec.
-            let mut file = fs::File::create(&stand_in)?;
-            write!(
-                file,
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 3\n",
+        write_executable_script(
+            &stand_in,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 3\n",
                 seen.display()
-            )?;
-            file.set_permissions(fs::Permissions::from_mode(0o755))?;
-            file.sync_all()?;
-        }
+            ),
+        )?;
 
         let service_id = "svc-restart-given-rocmd";
         let mut record = identity_probe_record(&paths, service_id, 11470);
@@ -1436,12 +1423,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn supervise_runs_the_engine_on_the_rocm_beside_rocmd() -> Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let _serial = SCRIPT_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = lock_script_tests();
         for tool in ["/bin/sh", "/bin/sleep"] {
             assert!(
                 Path::new(tool).exists(),
@@ -1452,17 +1434,13 @@ mod tests {
         paths.ensure()?;
         let seen = root.join("rocm-args.txt");
         let stand_in = root.join("rocm");
-        {
-            // Every writer is closed before the first exec.
-            let mut file = fs::File::create(&stand_in)?;
-            write!(
-                file,
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 5\n",
+        write_executable_script(
+            &stand_in,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 5\n",
                 seen.display()
-            )?;
-            file.set_permissions(fs::Permissions::from_mode(0o755))?;
-            file.sync_all()?;
-        }
+            ),
+        )?;
 
         let service_id = "svc-supervise-engine-on-rocm";
         let mut attempts = 0;

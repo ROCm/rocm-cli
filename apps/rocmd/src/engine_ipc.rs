@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::daemon_host::DaemonHost;
 use anyhow::{Context, Result, bail};
 use rocm_core::AppPaths;
 use rocm_engine_protocol::{
@@ -114,12 +115,36 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
+    engine_request_on(
+        &DaemonHost::detect()?,
+        paths,
+        engine,
+        service_id,
+        method,
+        request,
+    )
+}
+
+/// [`engine_request`] on a given host, so a test can supply the binary that
+/// answers. The stdio command is `rocm`'s alone, so the daemon runs it on the
+/// `rocm` binary, not on whatever it is itself.
+fn engine_request_on<T, R>(
+    daemon_host: &DaemonHost,
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    method: EngineMethod,
+    request: &T,
+) -> Result<R>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
     let envelope = EngineRequestEnvelope {
         method,
         payload: serde_json::to_value(request).context("failed to serialize engine request")?,
     };
-    let engine_binary =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
+    let engine_binary = daemon_host.rocm_binary()?;
     let mut command = ProcessCommand::new(&engine_binary);
     command
         .arg("__engine-stdio")
@@ -340,5 +365,86 @@ mod tests {
             tokens_per_sec: None,
         };
         assert!(!healthcheck_response_ready(&listing_only));
+    }
+
+    /// The stdio command is `rocm`'s alone: a daemon run as `rocmd` asks the
+    /// engine through the `rocm` beside it, which `rocmd` answered with an
+    /// unrecognised-subcommand error, so its readiness checks and its engine
+    /// stops could never succeed.
+    ///
+    /// The stand-in `rocm` records its arguments, reads the request line and
+    /// answers with an `ok` envelope.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd() -> Result<()> {
+        use crate::test_support::{lock_script_tests, write_executable_script};
+
+        let _serial = lock_script_tests();
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "this test needs /bin/sh to stand in for rocm"
+        );
+        let (root, paths) = temp_app_paths("engine-request-on-rocm");
+        let seen = root.join("rocm-args.txt");
+        write_executable_script(
+            &root.join("rocm"),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nread -r _request\n{}\n",
+                seen.display(),
+                r#"printf '%s\n' '{"ok":true,"data":{"status":"ready"}}'"#
+            ),
+        )?;
+        let daemon_host = DaemonHost::new(root.join("rocmd"), false);
+
+        // The first exec of a new file can lose a race with an unrelated fork
+        // (ETXTBSY); the spawn then fails at once, and one more try is enough.
+        let mut outcome = Err(anyhow::anyhow!("not attempted"));
+        for _ in 0..10 {
+            outcome = engine_request_on::<_, serde_json::Value>(
+                &daemon_host,
+                &paths,
+                "vllm",
+                "svc-engine-request",
+                EngineMethod::Healthcheck,
+                &serde_json::json!({ "service_id": "svc-engine-request" }),
+            );
+            match &outcome {
+                Err(error) if format!("{error:#}").contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
+        let args = fs::read_to_string(&seen).unwrap_or_default();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["__engine-stdio", "vllm"],
+            "the engine must be asked through `rocm __engine-stdio <engine>`"
+        );
+        assert_eq!(outcome?, serde_json::json!({ "status": "ready" }));
+        Ok(())
+    }
+
+    /// With no `rocm` beside `rocmd` the request fails, and says what it looked
+    /// for, instead of running a command `rocmd` does not have.
+    #[test]
+    fn engine_request_without_a_rocm_beside_rocmd_names_it() {
+        let (root, paths) = temp_app_paths("engine-request-no-rocm");
+        let error = engine_request_on::<_, serde_json::Value>(
+            &DaemonHost::new(root.join("rocmd"), false),
+            &paths,
+            "vllm",
+            "svc-engine-request",
+            EngineMethod::Healthcheck,
+            &serde_json::json!({ "service_id": "svc-engine-request" }),
+        )
+        .expect_err("no rocm to ask");
+        fs::remove_dir_all(root).ok();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("no engine commands"), "{text}");
+        assert!(text.contains("unable to locate sibling binary"), "{text}");
     }
 }
