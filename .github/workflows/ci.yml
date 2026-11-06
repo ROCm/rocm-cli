@@ -144,6 +144,11 @@ jobs:
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
+              # A proptest saved-failure file is read by the seed guard in xtask
+              # (`cargo xtask affected` adds xtask when one changes). Renaming or
+              # deleting one moves no *.rs file, so without this entry a seed-only
+              # change would skip every rust-gated job.
+              - '**/proptest-regressions/**'
               # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
               # this file's hawkeye/cargo-about pins. This entry only gates
               # whether the rust-flagged jobs run at all; `cargo xtask affected`

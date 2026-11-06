@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 //! Shared fixtures for building a throwaway [`AppPaths`] under a per-test,
-//! per-process directory, and for seeding the automation audit store that both
-//! `automation.rs`'s and `jsonl_store.rs`'s tests drive.
+//! per-process directory, and for seeding the automation audit store that
+//! `automation.rs`'s tests drive. `jsonl_store.rs`'s tests use only the
+//! throwaway directory: the engine is generic, so they carry their own record.
 //!
 //! Used from every module split out of this crate's former `lib.rs` god file
 //! so the naming/uniqueness scheme for test artifact directories stays in one

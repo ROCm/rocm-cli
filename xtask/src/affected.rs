@@ -16,11 +16,17 @@
 //! Skipping a test that should have run is the failure mode this guards
 //! against, so when in doubt it runs everything.
 //!
+//! One rule adds a crate nothing depends on: a changed `proptest-regressions`
+//! file, or a Rust file whose diff adds or removes a `proptest!` line, selects
+//! `xtask`, which holds the seed guard that reads the whole tree (see
+//! `PROPTEST_GUARD_CRATE`).
+//!
 //! As with [`crate::verify_commits`], the decision logic ([`select`],
 //! [`owning_crate`], [`reverse_closure`]) is pure and unit-tested without git or
 //! cargo; the I/O lives at the edges ([`load_graph`], [`changed_files`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -149,6 +155,21 @@ fn forces_full_workspace(file: &str) -> bool {
         || file.starts_with(".github/workflows/")
 }
 
+/// The workspace member whose tests include the proptest seed guard
+/// (`every_proptest_regression_file_belongs_to_a_property_test_that_reads_it`
+/// in `proptest_regressions_contract.rs`). That guard reads the whole tree, so
+/// a change in another crate can fail it: moving a `proptest!` block inside
+/// `apps/rocm` leaves its seed behind in `apps/rocm/proptest-regressions/`, and
+/// nothing in the reverse-dependency closure of `apps/rocm` runs the guard.
+const PROPTEST_GUARD_CRATE: &str = "xtask";
+
+/// True for a file under a `proptest-regressions` directory: the saved-failure
+/// files the guard above checks.
+fn is_proptest_seed_file(file: &str) -> bool {
+    file.split('/')
+        .any(|segment| segment == "proptest-regressions")
+}
+
 /// True for changed files that cannot affect any Rust crate's build or tests, so
 /// they neither select a crate nor force a full run.
 fn is_ignorable(file: &str) -> bool {
@@ -158,19 +179,49 @@ fn is_ignorable(file: &str) -> bool {
     is_markdown || file.starts_with("docs/") || file == "LICENSE" || file.starts_with("LICENSE.")
 }
 
+/// [`select_with_proptest_sources`] for a caller that has only the changed-file
+/// names: a changed file under a `proptest-regressions` directory still selects
+/// the `xtask` seed guard, but a Rust file that moved a `proptest!` block is not
+/// recognised without its diff.
+pub fn select(changed_files: &[String], graph: &Graph) -> Selection {
+    select_with_proptest_sources(changed_files, &[], graph)
+}
+
 /// Pure selection logic: turn the changed-file list into a [`Selection`].
+///
+/// `proptest_sources` is the subset of changed Rust files whose diff adds or
+/// removes a `proptest!` line ([`proptest_source_files`]). It, and any changed
+/// file under a `proptest-regressions` directory, adds `xtask` to the selection
+/// so the seed guard runs on the pull request instead of only in the merge
+/// queue. When the graph has no `xtask` member the guard cannot be selected, so
+/// the answer is the whole workspace.
 ///
 /// Order matters — a single force-full file (e.g. `Cargo.lock`) outweighs any
 /// number of crate-attributable files. Files owned by a crate seed the changed
 /// set; ignorable files are dropped; anything left unattributed is treated as
 /// force-full, because an unrecognized path might affect anything.
-pub fn select(changed_files: &[String], graph: &Graph) -> Selection {
+pub fn select_with_proptest_sources(
+    changed_files: &[String],
+    proptest_sources: &[String],
+    graph: &Graph,
+) -> Selection {
     let mut changed_crates: BTreeSet<String> = BTreeSet::new();
     let mut saw_relevant = false;
 
     for file in changed_files {
         if forces_full_workspace(file) {
             return Selection::Workspace;
+        }
+        if is_proptest_seed_file(file) || proptest_sources.contains(file) {
+            if !graph
+                .crate_dirs
+                .iter()
+                .any(|(name, _)| name == PROPTEST_GUARD_CRATE)
+            {
+                return Selection::Workspace;
+            }
+            changed_crates.insert(PROPTEST_GUARD_CRATE.to_string());
+            saw_relevant = true;
         }
         if let Some(owner) = owning_crate(file, &graph.crate_dirs) {
             changed_crates.insert(owner.to_string());
@@ -348,15 +399,38 @@ pub(crate) fn scrub_git_env(cmd: &mut Command) -> &mut Command {
 
 /// [`changed_files_between`] in `dir` (the current directory when `None`).
 fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
+    diff_names(dir, base, head, &[], &[])
+}
+
+/// List the Rust files changed in `base...HEAD` whose diff adds or removes a
+/// line containing `proptest!` (git's `-G` pickaxe, so a block moved out of one
+/// file and into another lists both). The pattern also matches a longer name
+/// such as `my_proptest!`; an extra hit only adds `xtask` to the selection.
+fn proptest_source_files(dir: Option<&Path>, base: &str) -> Result<Vec<String>> {
+    diff_names(dir, base, "HEAD", &["-G", "proptest!"], &["*.rs"])
+}
+
+/// `git diff --name-only --no-renames <options> base...head [-- <pathspec>]` in
+/// `dir` (the current directory when `None`).
+fn diff_names(
+    dir: Option<&Path>,
+    base: &str,
+    head: &str,
+    options: &[&str],
+    pathspec: &[&str],
+) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");
     let mut git = Command::new("git");
     if let Some(dir) = dir {
         scrub_git_env(&mut git).arg("-C").arg(dir);
     }
-    let output = git
-        .args(["diff", "--name-only", "--no-renames", &range])
-        .output()
-        .context("failed to run `git diff`")?;
+    git.args(["diff", "--name-only", "--no-renames"])
+        .args(options)
+        .arg(&range);
+    if !pathspec.is_empty() {
+        git.arg("--").args(pathspec);
+    }
+    let output = git.output().context("failed to run `git diff`")?;
     if !output.status.success() {
         bail!(
             "`git diff {range}` failed: {}",
@@ -376,7 +450,8 @@ pub fn run(base: Option<String>) -> Result<()> {
     let base = base.unwrap_or_else(|| DEFAULT_BASE.to_string());
     let graph = load_graph()?;
     let files = changed_files(&base)?;
-    let selection = select(&files, &graph);
+    let proptest_sources = proptest_source_files(None, &base)?;
+    let selection = select_with_proptest_sources(&files, &proptest_sources, &graph);
     println!("{}", selection.to_cargo_args());
     Ok(())
 }
@@ -384,6 +459,10 @@ pub fn run(base: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(pkgs: &[&str]) -> BTreeSet<String> {
+        pkgs.iter().map(|p| (*p).to_string()).collect()
+    }
 
     fn graph() -> Graph {
         // A small stand-in for the real workspace: core <- protocol <- engine,
@@ -394,6 +473,7 @@ mod tests {
             ("engine".to_string(), "engines/engine".to_string()),
             ("leaf".to_string(), "crates/leaf".to_string()),
             ("app".to_string(), "apps/app".to_string()),
+            ("xtask".to_string(), "xtask".to_string()),
         ];
         // forward: protocol->core, engine->{core,protocol}, app->{engine,leaf}
         // reverse: core->{protocol,engine}, protocol->{engine}, engine->{app}, leaf->{app}
@@ -403,6 +483,7 @@ mod tests {
         rev_deps.insert("engine".into(), vec!["app".into()]);
         rev_deps.insert("leaf".into(), vec!["app".into()]);
         rev_deps.insert("app".into(), vec![]);
+        rev_deps.insert("xtask".into(), vec![]);
         Graph {
             crate_dirs,
             rev_deps,
@@ -666,6 +747,111 @@ mod tests {
         let mut files = diff_name_only(Some(root), "main", "feature").expect("git diff");
         files.sort();
         assert_eq!(files, ["crates/a/src/moved.rs", "crates/b/src/moved.rs"]);
+    }
+
+    #[test]
+    fn a_changed_proptest_seed_file_selects_the_xtask_guard() {
+        // The seed guard lives in xtask and reads every crate's seeds; `app`
+        // has no edge to xtask, so without this rule a seed edit in `app`
+        // selects only `app`. Both the seed's own crate and the guard run.
+        let sel = select(
+            &["apps/app/proptest-regressions/a/b.txt".to_string()],
+            &graph(),
+        );
+        assert_eq!(sel, Selection::Packages(names(&["app", "xtask"])));
+        assert_eq!(sel.to_cargo_args(), "-p app -p xtask");
+    }
+
+    #[test]
+    fn a_changed_proptest_source_selects_the_xtask_guard() {
+        // The case the guard exists for: a `proptest!` block moves between
+        // files inside one crate and the seed is forgotten, so no seed file is
+        // in the change at all; only the diff of the Rust files says so.
+        let files = [
+            "apps/app/src/old.rs".to_string(),
+            "apps/app/src/new.rs".to_string(),
+        ];
+        assert_eq!(
+            select_with_proptest_sources(&files, &files, &graph()),
+            Selection::Packages(names(&["app", "xtask"]))
+        );
+        // The same Rust change with no `proptest!` line in its diff does not.
+        assert_eq!(
+            select_with_proptest_sources(&files, &[], &graph()),
+            Selection::Packages(names(&["app"]))
+        );
+    }
+
+    #[test]
+    fn a_proptest_change_without_an_xtask_member_runs_the_workspace() {
+        // Nothing to select the guard with, so fall back rather than skip it.
+        let mut g = graph();
+        g.crate_dirs.retain(|(name, _)| name != "xtask");
+        g.rev_deps.remove("xtask");
+        let seed = ["apps/app/proptest-regressions/x.txt".to_string()];
+        assert_eq!(select(&seed, &g), Selection::Workspace);
+        let src = ["apps/app/src/x.rs".to_string()];
+        assert_eq!(
+            select_with_proptest_sources(&src, &src, &g),
+            Selection::Workspace
+        );
+    }
+
+    #[test]
+    fn only_a_proptest_regressions_directory_counts_as_a_seed_path() {
+        assert!(is_proptest_seed_file(
+            "apps/rocm/proptest-regressions/main.txt"
+        ));
+        assert!(is_proptest_seed_file(
+            "crates/c/proptest-regressions/ui/format.txt"
+        ));
+        // A file merely named alike, or a Rust file, is not a seed.
+        assert!(!is_proptest_seed_file(
+            "apps/rocm/proptest-regressions-notes.md"
+        ));
+        assert!(!is_proptest_seed_file(
+            "apps/rocm/src/proptest-regressions.rs"
+        ));
+        assert!(!is_proptest_seed_file("apps/rocm/src/main.rs"));
+        // Unrelated crate changes still leave xtask out.
+        assert_eq!(
+            select(&["apps/app/src/lib.rs".to_string()], &graph()),
+            Selection::Packages(names(&["app"]))
+        );
+    }
+
+    #[test]
+    fn proptest_source_files_lists_rust_files_whose_diff_touches_a_proptest_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_in(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo.join("moved_from.rs"),
+            "proptest! { fn a() {} }\nfn keep() {}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("plain.rs"), "fn plain() {}\n").unwrap();
+        std::fs::write(repo.join("notes.md"), "proptest! is mentioned\n").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "base"]);
+        git_in(repo, &["checkout", "-q", "-b", "topic"]);
+        // The block moves out of one Rust file and into another. A Rust file
+        // whose diff has no proptest line, and a Markdown note that does but
+        // is not Rust, change too; neither may be listed.
+        std::fs::write(repo.join("moved_from.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(repo.join("moved_to.rs"), "proptest! { fn a() {} }\n").unwrap();
+        std::fs::write(repo.join("plain.rs"), "fn plain() { let _ = 1; }\n").unwrap();
+        std::fs::write(repo.join("notes.md"), "proptest! is mentioned again\n").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "move"]);
+
+        let mut got = proptest_source_files(Some(repo), "main").expect("diff");
+        got.sort();
+        assert_eq!(got, ["moved_from.rs", "moved_to.rs"]);
+        // The plain name-only diff, which the selector otherwise relies on,
+        // sees all four files: the narrowing above is what the `-G` adds.
+        let all = diff_name_only(Some(repo), "main", "topic").expect("diff");
+        assert_eq!(all.len(), 4, "{all:?}");
     }
 
     #[test]
