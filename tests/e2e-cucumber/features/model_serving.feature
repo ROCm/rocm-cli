@@ -698,3 +698,25 @@ Feature: Model serving
     # suppression was untested: deleting the guard left the scenario green and a
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
+
+  # ROCMAI-873: on WSL the GPU is reached through /dev/dxg and ROCDXG, and there
+  # is no /dev/kfd. The no-usable-GPU refusal used to tell every user to "confirm
+  # /dev/kfd is present", which a WSL user cannot do. It now names the status
+  # `rocm examine` reports for the path the probe actually asked about, and the
+  # last step runs that command on the same machine to show it exists and reports
+  # the condition (`wsl_rocdxg_missing`).
+  #
+  # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
+  # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
+  # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
+  # verdict) and the unit tests on the serve gate; there is no scenario for the
+  # launch that follows, because it would start preparing a real engine.
+  @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
+  Scenario: serve-42 - Serving on a WSL host whose ROCDXG library the loader cannot find is refused with WSL advice
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user serves a model under the GPU-required default on that machine
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the refusal points the user at the WSL driver status instead of /dev/kfd
+    And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
