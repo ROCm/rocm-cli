@@ -134,7 +134,8 @@ cargo test -p xtask chat_import_contract
 ```
 
 It flags `crate::chat`, `super::chat` and `self::chat` as a path, `chat` as a
-member of a `use crate::{..}` group, and `mod chat`. It does not flag a
+member of a `use crate::{..}` group, and `mod chat`, and a raw identifier
+(`r#chat`) counts as `chat`. It does not flag a
 `#[cfg(test)]` item, so a `mod tests` block may use `chat`, and it does not
 flag the identifiers and prose that merely contain the word, such as
 `chat_cli_arg_value`. It reads the four listed files only, not the modules they

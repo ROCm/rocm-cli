@@ -18,7 +18,8 @@
 //! assistant, and neither is an import. What it flags in production code is
 //! `chat` reached as a module: `crate::chat`, `super::chat` or `self::chat` as a
 //! path (a `use`, or an inline call such as `crate::chat::f()`), `chat` as a
-//! member of a `use crate::{..}` group, and `mod chat`.
+//! member of a `use crate::{..}` group, and `mod chat`. A raw identifier
+//! (`r#chat`) is the same name and is flagged the same way.
 //!
 //! Test code is exempt. A `#[cfg(test)]` item (a `mod tests` block, or a single
 //! `#[cfg(test)] use`/`fn`) may reach into `chat`: a test is not part of the
@@ -53,6 +54,16 @@ mod tests {
         "apps/rocm/src/prompt_text.rs",
         "apps/rocm/src/rocm_argv.rs",
         "apps/rocm/src/tool_policy.rs",
+    ];
+
+    /// The reserved words, strict and future. Only these keep their `r#` in
+    /// [`tokenize`]; any other raw identifier is the plain name.
+    const KEYWORDS: &[&str] = &[
+        "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+        "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+        "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+        "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "try",
+        "type", "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
     ];
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +102,30 @@ mod tests {
                 i += 1;
             } else if c.is_whitespace() {
                 i += 1;
+            } else if c == 'r'
+                && chars.get(i + 1) == Some(&'#')
+                && chars
+                    .get(i + 2)
+                    .is_some_and(|next| next.is_alphabetic() || *next == '_')
+            {
+                // A raw identifier, `r#chat`: one token that names `chat`.
+                let start = i + 2;
+                i = start;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                // `r#type` is a name that happens to spell a keyword, so it
+                // keeps its prefix and cannot be mistaken for the keyword.
+                let name = if KEYWORDS.contains(&name.as_str()) {
+                    format!("r#{name}")
+                } else {
+                    name
+                };
+                tokens.push(Token {
+                    tok: Tok::Ident(name),
+                    line,
+                });
             } else if c.is_alphanumeric() || c == '_' {
                 let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -410,5 +445,64 @@ mod tests {
                 "{source:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_raw_identifier_spelling_of_chat_is_reported() {
+        // `r#chat` names the same module as `chat`, so every form above has a
+        // raw twin that must fail the guard too.
+        for (source, line) in [
+            ("use crate::r#chat;\n", 1),
+            ("use crate::{r#chat};\n", 1),
+            ("use crate::{Cli, r#chat, providers};\n", 1),
+            ("use crate::{Cli, r#chat as c};\n", 1),
+            ("use crate::{\n    Cli,\n    r#chat,\n};\n", 3),
+            ("use crate::{r#chat::any_substring, Cli};\n", 1),
+            ("use super::r#chat::ensure_flag;\n", 1),
+            ("use self::r#chat;\n", 1),
+            ("mod r#chat;\n", 1),
+            ("pub mod r#chat;\n", 1),
+            ("fn f() {\n    let _ = crate::r#chat::f();\n}\n", 2),
+            ("#[cfg(not(test))]\nuse crate::r#chat;\n", 2),
+        ] {
+            assert_eq!(lines_of(source), vec![line], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn raw_identifiers_that_are_not_the_chat_module_are_ignored() {
+        for source in [
+            "use crate::providers::r#chat;\n",
+            "use crate::r#chat_cli_arg_value;\n",
+            "fn f() {\n    let r#chat = 1;\n    let _ = r#chat;\n}\n",
+            "use crate::{providers::{r#chat}, Cli};\n",
+            "struct S {\n    r#type: u8,\n}\n",
+        ] {
+            assert!(
+                chat_imports_in_production_code(source).is_empty(),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_identifier_is_one_token_and_a_raw_keyword_stays_distinct() {
+        let names = |source: &str| -> Vec<String> {
+            tokenize(source)
+                .into_iter()
+                .filter_map(|t| match t.tok {
+                    Tok::Ident(name) => Some(name),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(names("r#chat"), vec!["chat"]);
+        assert_eq!(names("crate::r#chat::f"), vec!["crate", "chat", "f"]);
+        // `r#type` is a field or variable called `type`, not the keyword that
+        // starts a type alias, so it must not read as one.
+        assert_eq!(names("r#type"), vec!["r#type"]);
+        assert_eq!(names("r#match r#fn"), vec!["r#match", "r#fn"]);
+        // An `r` that is only the start of an ordinary identifier is untouched.
+        assert_eq!(names("r rest #[x]"), vec!["r", "rest", "x"]);
     }
 }
