@@ -158,6 +158,28 @@ Expected result:
   asking and prints a line crediting that flag by name — not `--yes`.
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
+- On a host with no usable Python (a minimal container; run with `PATH` pointing
+  at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
+  `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
+  line says `not prepared by this preview`, `python_source:` says `managed`,
+  and a `python_note:` line says a real install would use `uv` to install the
+  managed Python. Afterwards the data folder has no `tools` folder and the
+  config folder has no `config.json`: the preview downloaded no `uv` or Python
+  and saved no Python path. A real install on the same host does both. The
+  plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
+  interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
+  resolves `3.12` itself and may pick a different Python 3.12 than the managed
+  one a real install prepares. This holds for the canonical layout. A preview
+  pinned to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) still needs
+  `uv` to resolve the package versions, so on a clean host it can download the
+  managed `uv` and create the `tools` folder, although it prepares no Python and
+  saves no Python path.
+- With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
+  `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
+  (such as `3.13` for the canonical layout), on the same host the preview fails
+  with the install's own message. Its output before the failure states only
+  what was found (for example that the `PATH` Python is not usable) and never
+  says a real install would prepare or use a managed Python.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
