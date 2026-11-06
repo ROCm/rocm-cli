@@ -1,0 +1,65 @@
+# Third-party binaries pinned with mise: the ones rocm-cli downloads (Lemonade)
+# and the tooling that locks the Python runtime stacks (uv).
+#
+# `crates/rocm-deps/build.rs` generates Lemonade's version, URLs and digests
+# from the generated `mise.lock` beside this file; the Lemonade adapter checks
+# downloads against those digests, so no non-test source holds a second copy of
+# the version or digests. The Python runtime stacks are pinned separately,
+# in `profiles.toml`, because mise's `pypi` backend cannot lock them
+# (docs/runtime-dependencies.md says why).
+#
+# From the repository root:
+#   runtimes/bin/mise run --cd runtimes update   # bump past the cooldown, re-lock
+#   runtimes/bin/mise run --cd runtimes lock     # re-lock after editing a pin
+# The weekly runtime-deps-update workflow runs `update` on its own.
+
+[settings]
+lockfile = true
+# rocm-cli supports Linux and Windows only; lock exactly those.
+lockfile_platforms = ["linux-x64", "windows-x64"]
+# Same cooldown as .github/dependabot.yml: let a bad release be found and
+# pulled before it is adopted. Applies to `mise upgrade` and `mise lock`.
+minimum_release_age = "7d"
+
+[tools]
+# Lemonade's embeddable release. Each platform names its asset exactly: the
+# release also carries .msi/.deb/.rpm installers, and a pattern shared by both
+# platforms has been seen to lock the Windows zip for linux-x64.
+"github:lemonade-sdk/lemonade" = { version = "11.5.1", platforms = { linux-x64 = { asset_pattern = "lemonade-embeddable-*-ubuntu-x64.tar.gz" }, windows-x64 = { asset_pattern = "lemonade-embeddable-*-windows-x64.zip" } } }
+# Tooling, not a runtime: uv resolves the Python locks (`cargo xtask deps
+# lock`). rocm-cli still installs its own uv at runtime; rocm-deps generates no
+# constants for it (see TOOLING_ONLY in crates/rocm-deps/src/pins_gen.rs).
+# Every tool is named by its backend and repository, never a short name:
+# `cargo xtask deps check` requires mise.lock to record exactly that backend,
+# and only that repository's release downloads.
+"aqua:astral-sh/uv" = "0.13.6"
+
+# Every step that needs a tool goes through `{{mise_bin}}`, the binary running
+# this task: a bare `mise` is not on PATH when the bootstrap wrapper started
+# the task. It is quoted because on Windows it usually lives under a user
+# profile, whose path can contain spaces. Steps that need uv run under
+# `{{mise_bin}} exec`, which works PATH out afresh, so they see a uv that an
+# earlier step just bumped.
+
+[tasks.lock]
+description = "Re-lock binaries and Python runtime profiles at their current pins"
+run = [
+  "\"{{mise_bin}}\" lock",
+  # Cooled like `update`, so a first lock or a newly added requirement does
+  # not take a PyPI release younger than the cooldown either.
+  "\"{{mise_bin}}\" exec -- cargo xtask deps lock --cooldown-days 7",
+  "cargo xtask deps check",
+]
+
+[tasks.check]
+description = "Verify every runtime lock is complete and consistent"
+run = "cargo xtask deps check"
+
+[tasks.update]
+description = "Move pins to the newest releases past the cooldown, then re-lock"
+run = [
+  "\"{{mise_bin}}\" upgrade --bump",
+  "\"{{mise_bin}}\" lock",
+  "\"{{mise_bin}}\" exec -- cargo xtask deps lock --upgrade --cooldown-days 7",
+  "cargo xtask deps check",
+]

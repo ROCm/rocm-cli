@@ -289,7 +289,7 @@ A contract surface: verify all impacted engines after any protocol change here (
 
 ### `crates/rocm-deps`
 
-Pinned versions of the third-party runtimes rocm-cli manages (from workspace-root [`runtime-deps.toml`](../runtime-deps.toml), turned into constants by [`build.rs`](../crates/rocm-deps/build.rs)). Small and already single-purpose; not part of the modularization effort's target list.
+Pinned versions of the third-party runtimes rocm-cli manages (locked in [`runtimes/mise.lock`](../runtimes/mise.lock), turned into constants at build time by [`pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs), which [`build.rs`](../crates/rocm-deps/build.rs) runs; see [runtime-dependencies.md](runtime-dependencies.md)). Small and already single-purpose; not part of the modularization effort's target list.
 
 ### `crates/e2e-report`
 

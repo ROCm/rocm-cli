@@ -16,6 +16,7 @@ mod catalog;
 mod coverage;
 mod crate_edges;
 mod demos;
+mod deps;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
@@ -137,6 +138,12 @@ pub(crate) enum Command {
         /// of checking against it. Use after adding tests to ratchet a floor up.
         #[arg(long)]
         bless: bool,
+    },
+    /// Lock and check the third-party runtimes rocm-cli installs (binaries
+    /// pinned with mise, Python stacks locked per OS with uv).
+    Deps {
+        #[command(subcommand)]
+        command: deps::DepsCommand,
     },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
@@ -369,6 +376,7 @@ fn run() -> Result<()> {
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
+        Command::Deps { command } => deps::run(command)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,
