@@ -42,14 +42,26 @@
 //! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
 //! about this process's environment, not the hardware.
 //!
-//! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
-//! pre-flight. It decides whether a real `amd-smi` process may start, so
-//! `apps/rocm/src/dash.rs` passes `host_path("/dev/kfd")` to the dash daemon
-//! and the collector requires both that path and the real `/dev/kfd` to be
-//! readable. A simulated root can hide the GPU from the dashboard but cannot
-//! start `amd-smi` on a machine without one. The WSL reachability verdict
-//! still substitutes for the whole device check, as it always has, so the veto
-//! does not cover it.
+//! Routed, but with the real device keeping a veto: the two `amd-smi`
+//! pre-flights. Each decides whether a real `amd-smi` process may start, so
+//! each requires `host_path("/dev/kfd")` *and* the real `/dev/kfd` to be
+//! readable. A simulated root can hide the GPU from them, but cannot start
+//! `amd-smi` on a machine without one. They are:
+//!
+//! - the `rocm dash` collector's, where `apps/rocm/src/dash.rs` passes the
+//!   re-rooted path down to the dash daemon. `rocm-dash-collectors` does depend
+//!   on this crate (EAI-8457) and shares [`crate::device_readable_bounded`], but
+//!   it is still *handed* the re-rooted path rather than calling [`host_path`]
+//!   itself: the path has to come from the same resolution `apps/rocm` used for
+//!   its own probes, and the daemon that carries it in between
+//!   (`rocm-dash-daemon`) has no dependency on this crate to resolve it with.
+//!   The presentation layer, `rocm-dash-tui`, has no edge to this crate at all
+//!   and is the one the `crate_edges.rs` allowlist still forbids;
+//! - the synchronous one behind `crate::amd_smi_json`, which `rocm serve` and
+//!   `rocmd` reach and which calls [`host_path`] itself.
+//!
+//! The WSL reachability verdict still substitutes for the whole device check in
+//! both, as it always has, so the veto does not cover it.
 //!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the

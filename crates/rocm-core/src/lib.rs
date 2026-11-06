@@ -20,13 +20,16 @@ pub mod confirm;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
+mod download;
 pub mod endpoint_key;
+mod endpoint_readiness;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
 mod gfx_target;
 pub mod hardware_root;
 pub mod host_gpu;
+mod jsonl_store;
 pub mod log_tail;
 pub mod managed_runtime;
 pub mod model_catalog;
@@ -34,6 +37,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+mod package_plan;
 pub mod paths;
 pub mod placeholder;
 mod probe_exec;
@@ -43,6 +47,7 @@ pub mod quoting;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
+pub mod report_trend;
 pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
@@ -55,27 +60,29 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub mod vllm_oom;
 pub mod windows_driver;
-pub use amd_smi::resolve_amd_smi_binary;
+pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
-    AutomationTriggerEvent, BuiltinWatcherSpec, EVENT_LOG_ROTATE_BYTES,
-    EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, find_automation_proposal, generate_proposal_id, jsonl_lock_path,
-    load_automation_proposals, load_recent_audit_events, load_recent_automation_events,
-    load_recent_automation_proposals, update_automation_proposal_status,
+    AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
+    REVIEWED_PROPOSALS_RETAINED, WatcherRuntimeSnapshot, append_audit_event,
+    append_automation_event, append_automation_proposal, find_automation_proposal,
+    generate_proposal_id, load_automation_proposals, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals,
+    update_automation_proposal_status,
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
-    AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
-    EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
-    PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
+    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
+    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
+    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
+    WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
-pub use confirm::interactive_terminal;
+pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -91,7 +98,18 @@ pub use disk_space::{
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
+pub use download::{
+    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
+    download_file_streaming_with_progress, download_file_to_path,
+    download_file_to_path_with_progress,
+};
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
+pub use endpoint_readiness::{
+    EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
+    engine_state_inference_verified, managed_service_endpoint_model_ready,
+    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
+    openai_chat_completion_status, openai_models_endpoint_has_model,
+};
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
@@ -106,11 +124,11 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
-    default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
+    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
+    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
     detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -118,15 +136,14 @@ use host_gpu::{
     detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
+pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::tail_lines;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
     active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
 };
-use managed_runtime::{
-    collect_sdk_library_paths, managed_sdk_tool_path, managed_therock_sdk_probe_candidates,
-};
+use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
     GfxSupport, MODEL_RECIPE_STALE_AFTER_MS, ModelArtifactCacheStatus, ModelCatalogPlatform,
     ModelRecipeArtifactRecord, ModelRecipeArtifactSourcePolicyRecord, ModelRecipeEndpointRecord,
@@ -141,16 +158,9 @@ pub use model_catalog::{
     resolve_model_recipe_artifact, verify_model_recipe_index_signature,
 };
 pub use net::{
-    Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
-    DownloadRequest, EndpointReadiness, EndpointReadinessOutcome, HttpResponseParts,
-    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL, INFERENCE_PROBE_TIMEOUT,
-    INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
-    download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
-    format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
-    http_post_json_with_auth, managed_service_endpoint_model_ready,
-    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model, parse_http_endpoint,
+    DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
+    format_host_for_url, format_host_port, format_http_base_url, http_get_text,
+    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -173,6 +183,10 @@ pub use report::{
     refusal_envelope,
 };
 pub use report_rollup::{Group as ReportGroup, Rollup as ReportRollup};
+pub use report_trend::{
+    RiseRule as ReportRiseRule, RuleProblem as ReportRuleProblem, TrendView as ReportTrendView,
+    Week as ReportWeek,
+};
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
@@ -196,13 +210,20 @@ pub use runtime::{
 };
 pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{
-    ManagedServiceNotFound, ManagedServiceRecord, engine_stop_decides_confirmation,
+    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
+    INFERENCE_VERIFIED_STATE_KEY, ManagedServiceNotFound, ManagedServiceRecord,
+    engine_stop_decides_confirmation,
 };
+pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
     uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+};
+pub use vllm_oom::{
+    VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
+    vllm_oom_display_line,
 };
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
@@ -238,6 +259,27 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
 /// captured output: stderr if non-blank after trimming, else stdout, else a
 /// literal "no output"; the result is trimmed.
 pub fn command_failure_detail(output: &std::process::Output) -> String {
+    command_failure_detail_or_else(output, || "no output".to_owned())
+}
+
+/// The stderr-then-stdout precedence behind [`command_failure_detail`], with the
+/// both-blank fallback left to the caller.
+///
+/// Exists so the precedence rule lives in exactly one place. [`amd_smi_json`]
+/// needs the same ordering but a different last resort — `exit status <code>`
+/// rather than `no output`, because a silent amd-smi's exit code is the only
+/// diagnostic left — and inlining the two `is_empty` checks there to get it put
+/// the same rule in two places. `fallback` is a closure because formatting an
+/// `ExitStatus` is wasted work on the overwhelmingly common non-blank path.
+///
+/// `pub(crate)`, not `pub`: the only caller outside this module is
+/// [`amd_smi_json`], also in this crate. External callers that want the
+/// precedence rule want [`command_failure_detail`], which is the public pair of
+/// this and carries the fallback they would otherwise have to supply.
+pub(crate) fn command_failure_detail_or_else(
+    output: &std::process::Output,
+    fallback: impl FnOnce() -> String,
+) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return stderr;
@@ -246,7 +288,7 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
     if !stdout.is_empty() {
         return stdout;
     }
-    "no output".to_owned()
+    fallback()
 }
 
 /// The `--gpu-memory-utilization` workaround for a shared/busy GPU.
@@ -266,9 +308,17 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
 /// weights of most models people actually serve, so it trades one startup
 /// failure for another. Pinned by
 /// `the_utilization_hint_example_matches_the_recipe_command`.
+///
+/// The stated bound must be the one `rocm serve` actually accepts:
+/// `parse_gpu_memory_utilization` rejects `<= 0` and accepts `1`, so the domain
+/// is `(0, 1]` and the older `<0-1>` wording wrongly advertised `0`. Pinned by
+/// `the_utilization_hint_states_the_bound_the_parser_accepts`, because this
+/// wording has already been reverted once by a merge that resolved the line from
+/// a pre-fix tree.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
 
 pub fn sanitize_component(value: &str) -> String {
     value
@@ -309,7 +359,7 @@ pub fn unix_time_millis() -> u128 {
 /// - Serializing writers: this takes no lock, so two read-modify-write
 ///   cycles that overlap still lose one update (last rename wins). A caller
 ///   whose new content depends on the old must hold a lock across the whole
-///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
+///   cycle, as the JSONL proposal store does (`jsonl_store::jsonl_lock_path`).
 ///   Two callers in the *same process* within the same millisecond are a
 ///   sharper case of this, not just a milder one: they generate the exact
 ///   same temp path below, so concurrent `fs::write`s truncating that one

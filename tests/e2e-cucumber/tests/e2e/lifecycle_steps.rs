@@ -17,6 +17,7 @@
 //! by [`LifecycleState`]'s `Drop`, even when a step fails.
 
 use std::fmt::Write as _;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1916,7 +1917,12 @@ fn run_installer_pty(
     // Draw the stream the way a terminal would. Wrapping is the emulator's
     // doing and never appears in the byte stream, so this is the only view in
     // which an over-wide bar actually tears.
-    let mut parser = vt100::Parser::new(PTY_ROWS, pty_cols, 0);
+    // vt100 0.18 takes non-zero dimensions. Both are known good here: PTY_ROWS
+    // is a fixed constant and every scenario drives a terminal at least as wide
+    // as NARROW_PTY_COLS.
+    let rows = NonZeroU16::new(PTY_ROWS).expect("PTY_ROWS is a non-zero constant");
+    let cols = NonZeroU16::new(pty_cols).expect("a pty needs a non-zero width to render into");
+    let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(&raw);
     // `rows()`, not `contents()`: the latter stitches a wrapped row back onto
     // the one it came from, reporting a 96-column line on an 80-column screen

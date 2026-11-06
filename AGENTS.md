@@ -127,8 +127,8 @@ itself.
 The message and the code it describes are usually in different functions and often
 different files, so nothing links them by construction. Where the printed line can be
 derived from the same value the branch is taken on — as `preapproved_install_line` in
-`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
-computed from the decision cannot disagree with it.
+`apps/rocm/src/therock/consent.rs` derives it from the approval source — prefer that: a
+message computed from the decision cannot disagree with it.
 
 **A new test is shown to fail when the code it covers is broken.** Before pushing, break
 the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
@@ -246,13 +246,15 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`therock.rs`](apps/rocm/src/therock.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each behind `require_yes_or_interactive` (below); [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`require_yes_or_interactive(yes, action)`** — the guard in front of a mutating command that confirms with that `[y/N]` prompt. `Ok(true)` means `--yes` already approved it (skip the prompt), `Ok(false)` means there is no `--yes` but a terminal, so the caller still asks, and otherwise it bails with `"{action} requires --yes outside an interactive terminal"`. A new `--yes`-gated command reuses it instead of re-deriving the `yes` / `interactive_terminal()` / `bail!` sequence. Not for a refusal that deliberately differs: [`therock/consent.rs`](apps/rocm/src/therock/consent.rs)'s `sdk_install_approval` names two consents that are not interchangeable, and [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` has its own exit code and checks stdin only
 
 CLI:
 
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
 - [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtimes list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`JsonOrText`**/**`print_json_or_text`** — a command with a `--json` flag that prints one value either way implements `JsonOrText` (`render_text` returns the whole text form) and calls `print_json_or_text(json, &value)`, which writes pretty JSON plus one newline or the text verbatim and returns an error if serialization or the write fails (e.g. `rocm storage report`, `rocm diagnose`); new commands should use it instead of writing `if json { serde_json::to_string_pretty(..) } else { .. }`, and existing `--json` call sites move over as they are touched. Streaming output, output whose JSON and text differ in shape, and commands that interleave other work (side effects, audit events) with the printing stay hand-written
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
@@ -260,14 +262,15 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
 - **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
-- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. `BoxRole::from_tone` in [`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs) derives a card border from the same tone. To color a new status enum, add its tone function there rather than a bespoke match per screen
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. To color a new status enum, add its tone function there rather than a bespoke match per screen
 - **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them
+- **[`scroll.rs`](crates/rocm-dash-tui/src/app/scroll.rs)**'s `ScrollState` (in `app/`, not `ui/`, beside the `AppState` scroll methods) — an offset plus its upper bound, whose `scroll_by(delta)` is the one "add a signed delta, clamp into `[0, max]`, saturate to `u16`" implementation. The job console (both axes), the LOGS dock and the instance Detail modal clamp through it; a new scrollable surface that keeps a `u16` offset with a known bound builds a `ScrollState` from them and stores `pos` back instead of repeating the `i32` clamp arithmetic. The chat transcript and the GPU list clamp with a `min()` against a measured bound (chat also follows the tail) and stay out of it
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
 Guardrails:
 
-- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum and its dispatch function usually stay in `main.rs`, though not always — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
+- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function usually stays in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum and dispatch outright — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
@@ -331,10 +334,11 @@ on two counts, and both change how you edit it:
   what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
-  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
-  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
-  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
-  means changing the CLI **first**, then the two docs. That feature is what
+  The failure catalog itself is authoritative in [fix/catalog.rs](crates/rocm-core/src/fix/catalog.rs)
+  (the `RECIPES` list) and [diagnose.rs](crates/rocm-core/src/diagnose.rs) with
+  the modules it declares, such as [catalog.rs](crates/rocm-core/src/diagnose/catalog.rs)
+  (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
+  failure mode means changing the CLI **first**, then the two docs. That feature is what
   catches you if you forget. Two sentences in
   [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
   sentence "requires `contract_version` N or higher": scenario skill-07 parses

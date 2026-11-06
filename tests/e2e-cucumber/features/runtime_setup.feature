@@ -415,3 +415,61 @@ Feature: Runtime configuration
     When the user dry-runs an SDK install for the gfx90c Vega iGPU
     Then the install is refused as having no ROCm build for that GPU
     And the refusal offers no package family to install instead
+
+  # When the machine already has its own (unmanaged) ROCm and that ROCm is newer
+  # than the SDK the install picks, the preview says why the older SDK is
+  # selected. Such a host often reports its version with a packaging build
+  # number on the end, which must not stop the CLI from reading it.
+  #
+  # Linux-only: `--format tarball` is rejected outright on Windows. Hermetic:
+  # the catalog is a loopback fixture and `--family` is named, so no GPU and no
+  # network are needed and this runs on the ordinary E2E lane.
+  #
+  # Technical details: the host install is planted under the scenario's root
+  # and exported as ROCM_PATH; its `.info/version` reads `7.20.1-33`. The
+  # catalog serves one release tarball, ROCm 7.10.0, for `gfx120X-all`.
+  @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
+  Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a newer version with a packaging build number
+    When the user previews a tarball SDK install
+    Then the preview explains that the host's newer ROCm is passed over for the selected SDK
+
+  # A host version the CLI cannot read is "can't tell", and "can't tell" is
+  # never "newer". The regression this pins: a suffix that merely starts with a
+  # digit was dropped whole, so the host was read as a plain, newer release and
+  # the preview claimed so. runtime-20 is what makes the absence below
+  # evidence: it shows the same preview printing the note when the host
+  # version is readable and newer.
+  #
+  # Technical details: `.info/version` reads `7.20.1-33rc1`, which with its
+  # suffix dropped would be `7.20.1`, newer than the catalog's 7.10.0.
+  @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
+  Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a version with an unreadable build suffix
+    When the user previews a tarball SDK install
+    Then the preview selects the newest SDK in the catalog
+    And the preview does not claim the host's ROCm is newer
+
+  # The `tool_call:` lines `rocm <request>` prints are the command the operator
+  # reviews before re-running with `--yes`, and the one that then runs. Their
+  # quoter used to wrap a value only when it held whitespace, so a folder whose
+  # name carries a lone `'` rendered bare and left a line no shell can parse —
+  # the operator was shown something that denotes no argv at all. The
+  # assertion reads each line back through a POSIX word-splitter and demands
+  # `--prefix` followed by exactly the requested folder: what the line has to
+  # mean, rather than one spelling of it. (A space alone does not distinguish
+  # the two quoters on this surface — the old one wrapped whitespace — which is
+  # why the folder name carries a quote.)
+  #
+  # The argv the dispatched install receives is not observable here: the Given
+  # stops it on its first step, as in runtime-15, and for the same reasons —
+  # offline, instant, writes nothing, identical on every lane. The executed
+  # `tool_call:` line is the closest observable account of it.
+  @id:runtime-freeform-prefix-with-quote-is-one-argument
+  Scenario: runtime-22 - A natural-language install into a folder named with a quote keeps the folder one argument
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install into a folder whose name has a quote
+    Then the request plan names that folder as a single argument
+    And the executed command names that folder as a single argument
