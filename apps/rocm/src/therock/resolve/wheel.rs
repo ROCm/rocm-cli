@@ -15,7 +15,11 @@
 //! `torch`, `torchvision` and `torchaudio` listings agree; on the next layout
 //! `torchaudio_pin` pins a torchaudio first (the hardware-verified release when
 //! it is published) and `resolve_published_pip_package_versions` has
-//! `uv pip compile` choose the rest. `wheel_runtime_composition` turns a
+//! `uv pip compile` choose the rest. That compile is the one step that may fetch
+//! `uv`: a real install and an update (`resolve_pip_runtime`) acquire it, and a
+//! preview (`preview_pip_runtime`) runs one that is already present and
+//! otherwise stops with an `UnresolvedPipRuntime`, which is decided in
+//! `plan_version_resolution` (in `uv_access`). `wheel_runtime_composition` turns a
 //! resolution into the exact package specs (`therock_pip_package_specs`) an
 //! install gives `uv` and records in the manifest, and
 //! `canonical_auto_select_needs_next_python` peeks at the channel's own `rocm`
@@ -45,13 +49,17 @@ use super::super::source::{
 use super::super::version::{
     ParsedVersion, compare_version_strings, is_stable_runtime_version, parse_version,
 };
+use super::uv_access::{
+    UvAccess, UvPolicy, VersionResolution, plan_version_resolution, uv_for_compile,
+};
 use crate::runtime_registry::WheelRuntimeComposition;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, detect_host_gfx_target, ensure_uv_binary, extract_first_gfx_token,
+    AppPaths, detect_host_gfx_target, ensure_uv_binary, extract_first_gfx_token, find_uv_binary,
     normalize_therock_family, runtime_is_windows, uv_command_env,
 };
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -480,6 +488,43 @@ pub(in crate::therock) struct PipRuntimeResolution {
     pub(in crate::therock) published_device_targets: Vec<String>,
 }
 
+/// What a resolution knows once it has been asked for with a given [`UvAccess`].
+#[derive(Debug, Clone)]
+pub(in crate::therock) enum PipRuntimePlan {
+    Resolved(PipRuntimeResolution),
+    /// A preview of the ROCm 10 layout on a host with no `uv`. Only
+    /// [`UvAccess::PresentOnly`] yields it.
+    NeedsUv(UnresolvedPipRuntime),
+}
+
+/// A ROCm 10 resolution stopped before `uv pip compile`: everything chosen without
+/// `uv`, and none of what depends on it.
+///
+/// Known: the family, the device target, the index, the `rocm` version and the
+/// torchaudio pin, and the requirement lines `uv` would be asked to resolve. Not
+/// known: the `torch` and `torchvision` versions, which only `uv pip compile`
+/// produces, nor whether the published stack is jointly installable. Everything
+/// built from them (the package specs, the runtime key, the install folder and
+/// manifest the key names) is therefore unknown too, which is why this carries no
+/// [`TheRockPipPackageVersions`]: a value that cannot be made cannot be mistaken
+/// for one.
+#[derive(Debug, Clone)]
+pub(in crate::therock) struct UnresolvedPipRuntime {
+    pub(in crate::therock) family: String,
+    pub(in crate::therock) family_source: String,
+    pub(in crate::therock) index_url: String,
+    pub(in crate::therock) layout: SourceLayout,
+    /// The `rocm` version the install would be for.
+    pub(in crate::therock) rocm_version: String,
+    pub(in crate::therock) newest_repo_version: Option<String>,
+    /// The requirement lines `uv pip compile` would be given, as
+    /// [`PipRuntimeResolution::version_resolution_specs`] holds them once it ran.
+    pub(in crate::therock) version_resolution_specs: Vec<String>,
+    pub(in crate::therock) torchaudio_pin: TorchaudioPin,
+    pub(in crate::therock) device_target: AggregateDeviceTarget,
+    pub(in crate::therock) published_device_targets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(in crate::therock) struct TheRockPipPackageVersions {
     rocm: String,
@@ -618,6 +663,10 @@ pub(in crate::therock) fn resolve_pip_runtime(
 
 /// `layout_override` is how an update keeps a runtime on the stream it was
 /// installed from; a fresh install passes `None` and lets the request decide.
+///
+/// Always [`UvAccess::Acquire`]: a real install and an update take the managed `uv`
+/// when the ROCm 10 layout needs one, as they always have. A preview asks
+/// [`preview_pip_runtime`] instead.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::therock) fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
@@ -629,6 +678,69 @@ pub(in crate::therock) fn resolve_pip_runtime_with_timeout(
     include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
+    match resolve_pip_runtime_plan(
+        paths,
+        channel,
+        family_override,
+        wheel_compatibility,
+        version_selector,
+        layout_override,
+        include_devel,
+        download_timeout_secs,
+        UvAccess::Acquire,
+    )? {
+        PipRuntimePlan::Resolved(resolution) => Ok(resolution),
+        // `plan_version_resolution` answers `Skip` only to `UvAccess::PresentOnly`,
+        // and a test holds it to that, so this is a broken invariant, not a state.
+        PipRuntimePlan::NeedsUv(_) => {
+            bail!("internal error: a resolution that may acquire uv stopped for want of one")
+        }
+    }
+}
+
+/// [`resolve_pip_runtime`] for a preview: it never downloads `uv` or creates the
+/// folders that hold it. A `uv` that is already there is used, so the answer is the
+/// resolution a real install would reach; with none, a ROCm 10 request comes back as
+/// [`PipRuntimePlan::NeedsUv`], holding what `uv` is not needed for.
+pub(in crate::therock) fn preview_pip_runtime(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family_override: Option<&str>,
+    wheel_compatibility: &WheelCompatibility,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
+    include_devel: bool,
+) -> Result<PipRuntimePlan> {
+    resolve_pip_runtime_plan(
+        paths,
+        channel,
+        family_override,
+        wheel_compatibility,
+        version_selector,
+        layout_override,
+        include_devel,
+        None,
+        UvAccess::PresentOnly,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_pip_runtime_plan(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family_override: Option<&str>,
+    wheel_compatibility: &WheelCompatibility,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
+    include_devel: bool,
+    download_timeout_secs: Option<u64>,
+    uv_access: UvAccess,
+) -> Result<PipRuntimePlan> {
+    let uv = UvPolicy {
+        access: uv_access,
+        find_present: &|| find_uv_binary(paths),
+        acquire: &|| ensure_uv_binary(paths),
+    };
     let family_resolution = resolve_family(paths, family_override)?;
     let layout = match layout_override {
         Some(layout) => layout,
@@ -680,6 +792,7 @@ pub(in crate::therock) fn resolve_pip_runtime_with_timeout(
         version_selector,
         include_devel,
         download_timeout_secs,
+        &uv,
     )
     .with_context(|| {
         format!(
@@ -704,7 +817,8 @@ fn resolve_pip_runtime_from_index(
     version_selector: Option<&RuntimeVersionSelector>,
     include_devel: bool,
     download_timeout_secs: Option<u64>,
-) -> Result<PipRuntimeResolution> {
+    uv: &UvPolicy<'_>,
+) -> Result<PipRuntimePlan> {
     let index_url = source.index_url.as_str();
     let mut version_resolution_specs = None;
     let mut torchaudio_selection = None;
@@ -720,99 +834,6 @@ fn resolve_pip_runtime_from_index(
             "release channel only installs stable TheRock wheel versions, but no stable `rocm` package versions were found in {index_url}; try `rocm install sdk --channel release --format tarball` for stable release artifacts, or use `--channel nightly --format wheel` for preview builds"
         );
     }
-    let package_versions = if matches!(source.layout, SourceLayout::Next) {
-        let device_target = match &source.device_target {
-            AggregateDeviceTarget::Exact(target) => target.as_str(),
-            AggregateDeviceTarget::Undetermined(reason) => {
-                bail!(
-                    "cannot resolve ROCm X package metadata without an exact device target: {reason}"
-                )
-            }
-        };
-        let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
-            .with_context(|| {
-                let requested = version_selector.map_or_else(
-                    || "latest compatible version".to_owned(),
-                    RuntimeVersionSelector::describe,
-                );
-                format!("no TheRock rocm package was found for {requested} in {index_url}")
-            })?;
-        // Chosen here, not by `uv`: see `published_pip_requirements`.
-        let torchaudio_versions = load_simple_index_versions(
-            paths,
-            index_url,
-            "torchaudio",
-            Some(wheel_compatibility),
-            download_timeout_secs,
-        )?;
-        let pin = torchaudio_pin(
-            &torchaudio_versions,
-            &rocm_version,
-            rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
-            index_url,
-        )?;
-        // The canonical branch below budgets one `download_timeout_secs` per
-        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
-        // fetches). `uv pip compile` still fetches metadata for all four
-        // packages in one subprocess call — the torchaudio listing above only
-        // chose its version — so it needs a comparable aggregate budget, not
-        // the single-fetch one: reusing the bare per-fetch value here would make
-        // a startup check that budgets 2s per fetch reliably time out a call
-        // doing 4 fetches' worth of work. That listing is one more fetch on top,
-        // with its own single-fetch budget.
-        let requirements =
-            published_pip_requirements(&rocm_version, &pin.version, device_target, include_devel);
-        let versions = resolve_published_pip_package_versions(
-            paths,
-            index_url,
-            &requirements,
-            wheel_compatibility,
-            download_timeout_secs.map(|secs| secs.saturating_mul(4)),
-        )?;
-        version_resolution_specs = Some(requirements);
-        torchaudio_selection = Some(pin);
-        versions
-    } else {
-        let torch_versions = load_simple_index_versions(
-            paths,
-            index_url,
-            "torch",
-            Some(wheel_compatibility),
-            download_timeout_secs,
-        )?;
-        let torchvision_versions = load_simple_index_versions(
-            paths,
-            index_url,
-            "torchvision",
-            Some(wheel_compatibility),
-            download_timeout_secs,
-        )?;
-        let torchaudio_versions = load_simple_index_versions(
-            paths,
-            index_url,
-            "torchaudio",
-            Some(wheel_compatibility),
-            download_timeout_secs,
-        )?;
-        select_matching_pip_package_versions(
-            channel,
-            &rocm_versions,
-            &torch_versions,
-            &torchvision_versions,
-            &torchaudio_versions,
-            version_selector,
-        )
-        .with_context(|| {
-            let requested = version_selector.map_or_else(
-                || "latest compatible version".to_owned(),
-                RuntimeVersionSelector::describe,
-            );
-            format!(
-                "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
-            )
-        })?
-    };
-    let latest_version = package_versions.rocm.clone();
     // The repo's newest version for this channel, ignoring wheel availability.
     // Only meaningful when we auto-selected "latest" (no explicit request), so a
     // caller can warn when that newest version has no installable wheels.
@@ -823,7 +844,126 @@ fn resolve_pip_runtime_from_index(
     } else {
         None
     };
-    Ok(PipRuntimeResolution {
+    let package_versions = match plan_version_resolution(source.layout, uv.access, uv.find_present)
+    {
+        VersionResolution::ScrapeIndexes => {
+            let torch_versions = load_simple_index_versions(
+                paths,
+                index_url,
+                "torch",
+                Some(wheel_compatibility),
+                download_timeout_secs,
+            )?;
+            let torchvision_versions = load_simple_index_versions(
+                paths,
+                index_url,
+                "torchvision",
+                Some(wheel_compatibility),
+                download_timeout_secs,
+            )?;
+            let torchaudio_versions = load_simple_index_versions(
+                paths,
+                index_url,
+                "torchaudio",
+                Some(wheel_compatibility),
+                download_timeout_secs,
+            )?;
+            select_matching_pip_package_versions(
+                channel,
+                &rocm_versions,
+                &torch_versions,
+                &torchvision_versions,
+                &torchaudio_versions,
+                version_selector,
+            )
+            .with_context(|| {
+                let requested = version_selector.map_or_else(
+                    || "latest compatible version".to_owned(),
+                    RuntimeVersionSelector::describe,
+                );
+                format!(
+                    "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+                )
+            })?
+        }
+        resolution @ (VersionResolution::Compile(_) | VersionResolution::Skip) => {
+            let device_target = match &source.device_target {
+                AggregateDeviceTarget::Exact(target) => target.as_str(),
+                AggregateDeviceTarget::Undetermined(reason) => {
+                    bail!(
+                        "cannot resolve ROCm X package metadata without an exact device target: {reason}"
+                    )
+                }
+            };
+            let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
+                .with_context(|| {
+                    let requested = version_selector.map_or_else(
+                        || "latest compatible version".to_owned(),
+                        RuntimeVersionSelector::describe,
+                    );
+                    format!("no TheRock rocm package was found for {requested} in {index_url}")
+                })?;
+            // Chosen here, not by `uv`: see `published_pip_requirements`.
+            let torchaudio_versions = load_simple_index_versions(
+                paths,
+                index_url,
+                "torchaudio",
+                Some(wheel_compatibility),
+                download_timeout_secs,
+            )?;
+            let pin = torchaudio_pin(
+                &torchaudio_versions,
+                &rocm_version,
+                rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
+                index_url,
+            )?;
+            let requirements = published_pip_requirements(
+                &rocm_version,
+                &pin.version,
+                device_target,
+                include_devel,
+            );
+            let VersionResolution::Compile(choice) = resolution else {
+                // No `uv` to run and none to fetch: report what is known, and
+                // leave the versions `uv` would choose to the install.
+                return Ok(PipRuntimePlan::NeedsUv(UnresolvedPipRuntime {
+                    family: family_resolution.family.clone(),
+                    family_source: family_resolution.source.clone(),
+                    index_url: index_url.to_owned(),
+                    layout: source.layout,
+                    rocm_version,
+                    newest_repo_version,
+                    version_resolution_specs: requirements,
+                    torchaudio_pin: pin,
+                    device_target: source.device_target.clone(),
+                    published_device_targets: source.published_device_targets.clone(),
+                }));
+            };
+            // The canonical branch above budgets one `download_timeout_secs` per
+            // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
+            // fetches). `uv pip compile` still fetches metadata for all four
+            // packages in one subprocess call — the torchaudio listing above only
+            // chose its version — so it needs a comparable aggregate budget, not
+            // the single-fetch one: reusing the bare per-fetch value here would make
+            // a startup check that budgets 2s per fetch reliably time out a call
+            // doing 4 fetches' worth of work. That listing is one more fetch on top,
+            // with its own single-fetch budget.
+            let compile_uv = uv_for_compile(choice, uv.acquire)?;
+            let versions = resolve_published_pip_package_versions(
+                paths,
+                &compile_uv,
+                index_url,
+                &requirements,
+                wheel_compatibility,
+                download_timeout_secs.map(|secs| secs.saturating_mul(4)),
+            )?;
+            version_resolution_specs = Some(requirements);
+            torchaudio_selection = Some(pin);
+            versions
+        }
+    };
+    let latest_version = package_versions.rocm.clone();
+    Ok(PipRuntimePlan::Resolved(PipRuntimeResolution {
         family: family_resolution.family.clone(),
         family_source: family_resolution.source.clone(),
         index_url: index_url.to_owned(),
@@ -835,7 +975,7 @@ fn resolve_pip_runtime_from_index(
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
-    })
+    }))
 }
 
 pub(in crate::therock) fn select_rocm_version(
@@ -937,19 +1077,22 @@ fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageV
 /// `requirements` is passed in rather than composed here so that the lines sent
 /// to `uv` and the lines the resolution reports back (and the preview prints)
 /// are one value, not two that can disagree.
+///
+/// `uv` is passed in rather than acquired here, so what may fetch it is decided in
+/// one place ([`plan_version_resolution`]) and a preview can run this with a `uv`
+/// that is already present without being able to download another.
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
+    uv: &Path,
     index_url: &str,
     requirements: &[String],
     compatibility: &WheelCompatibility,
     download_timeout_secs: Option<u64>,
 ) -> Result<TheRockPipPackageVersions> {
-    let uv =
-        ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
     let python_version = uv_python_version(compatibility)?;
     let python_platform = uv_python_platform(compatibility)?;
     let requirements = format!("{}\n", requirements.join("\n"));
-    let mut child = Command::new(&uv)
+    let mut child = Command::new(uv)
         .args([
             "pip",
             "compile",
@@ -1369,6 +1512,7 @@ mod tests {
     use super::super::super::test_support::test_runtime_manifest;
     use super::*;
     use crate::runtime_registry::{InstalledRuntimeManifest, wheel_composition_includes_devel};
+    use std::path::PathBuf;
 
     /// A representative slice of what the canonical aggregate index publishes.
     /// Notably it has no `gfx943`: MI300 steppings other than `gfx942` have no
@@ -2321,5 +2465,599 @@ mod tests {
         if !runtime_is_windows() {
             assert!(hint.contains("--format tarball"));
         }
+    }
+
+    // ---- who may fetch `uv`: the real resolution ---------------------------
+
+    /// Serves fixed pages over HTTP until dropped. A request for a path it does
+    /// not hold is a 404.
+    #[cfg(unix)]
+    struct IndexServer {
+        base: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl IndexServer {
+        fn start(pages: Vec<(String, String)>) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("local addr").port();
+            listener.set_nonblocking(true).expect("nonblocking");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = std::sync::Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let page = pages.iter().find(|(served, _)| served == path);
+                    let (status, body) = match page {
+                        Some((_, body)) => ("200 OK", body.as_str()),
+                        None => ("404 Not Found", ""),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                base: format!("http://127.0.0.1:{port}"),
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for IndexServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wheel_links(package: &str, versions: &[&str]) -> String {
+        use std::fmt::Write as _;
+
+        versions.iter().fold(String::new(), |mut html, version| {
+            let file = format!("{package}-{version}-py3-none-any.whl");
+            let _ = writeln!(html, "<a href=\"{file}\">{file}</a>");
+            html
+        })
+    }
+
+    /// One canonical and one ROCm 10 index, as the preview's resolution reads them.
+    #[cfg(unix)]
+    fn two_layout_index() -> IndexServer {
+        let mut pages = Vec::new();
+        for (layout, stack) in [
+            (
+                "current",
+                [
+                    ("rocm", "7.10.0"),
+                    ("torch", "2.9.0+rocm7.10.0"),
+                    ("torchvision", "0.24.0+rocm7.10.0"),
+                    ("torchaudio", "2.9.0+rocm7.10.0"),
+                ],
+            ),
+            (
+                "next",
+                [
+                    ("rocm", "10.0.0"),
+                    ("torch", "2.10.0+rocm10.0.0"),
+                    ("torchvision", "0.25.0+rocm10.0.0"),
+                    ("torchaudio", "2.9.1+rocm10.0.0"),
+                ],
+            ),
+        ] {
+            for (package, version) in stack {
+                pages.push((
+                    format!("/{layout}/{package}/"),
+                    wheel_links(package, &[version]),
+                ));
+            }
+        }
+        IndexServer::start(pages)
+    }
+
+    /// A `uv` that logs its arguments, reads the requirements it is piped, and
+    /// answers `uv pip compile` with the ROCm 10 stack above.
+    #[cfg(unix)]
+    fn write_logging_uv(dir: &Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("uv-runs.log");
+        let uv = dir.join("uv");
+        std::fs::create_dir_all(dir).expect("create the uv folder");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncat > /dev/null\nprintf '%s\\n' 'rocm==10.0.0' 'torch==2.10.0+rocm10.0.0' 'torchvision==0.25.0+rocm10.0.0' 'torchaudio==2.9.1+rocm10.0.0'\n",
+            log.display()
+        );
+        rocm_core::fake_executable::write_fake_executable(&uv, script)
+            .expect("plant the stand-in uv");
+        (uv, log)
+    }
+
+    /// What one cell of the matrix did: the answer, and what it touched.
+    #[cfg(unix)]
+    struct UvAccessRun {
+        plan: Result<PipRuntimePlan>,
+        /// Times a present `uv` was looked for.
+        looked: usize,
+        /// Times the managed `uv` was acquired (downloaded, for a real one).
+        acquired: usize,
+        /// The arguments `uv` was run with, one run per line.
+        uv_runs: String,
+        /// Whether the managed tools folder, where a download goes, exists.
+        tools_folder: bool,
+    }
+
+    /// Runs the real resolution against the served index for `layout`, with `uv`
+    /// "present" at the logging stand-in or not, and `acquire` answering for the
+    /// managed `uv` with that stand-in or with a failure.
+    #[cfg(unix)]
+    fn resolve_through_policy(
+        layout: SourceLayout,
+        access: UvAccess,
+        uv_present: bool,
+        acquire_succeeds: bool,
+    ) -> UvAccessRun {
+        let (root, paths) = super::super::super::test_support::test_paths("uv-access");
+        let (uv, log) = write_logging_uv(&root.join("bin"));
+        let server = two_layout_index();
+        let (index, python_tag) = match layout {
+            SourceLayout::Canonical => (format!("{}/current", server.base), "cp312"),
+            SourceLayout::Next => (format!("{}/next", server.base), "cp314"),
+        };
+        let source = ResolvedAggregateWheelSource {
+            index_url: index,
+            layout,
+            device_target: AggregateDeviceTarget::Exact("gfx1200".to_owned()),
+            published_device_targets: vec!["gfx1200".to_owned()],
+        };
+        let compatibility = WheelCompatibility {
+            python_tag: python_tag.to_owned(),
+            platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
+        };
+        let looked = std::cell::Cell::new(0);
+        let acquired = std::cell::Cell::new(0);
+        let find_present = || {
+            looked.set(looked.get() + 1);
+            uv_present.then(|| uv.clone())
+        };
+        let acquire = || {
+            acquired.set(acquired.get() + 1);
+            if acquire_succeeds {
+                Ok(uv.clone())
+            } else {
+                bail!("the managed uv could not be downloaded")
+            }
+        };
+        let policy = UvPolicy {
+            access,
+            find_present: &find_present,
+            acquire: &acquire,
+        };
+        let plan = resolve_pip_runtime_from_index(
+            &paths,
+            TheRockChannel::Release,
+            &super::super::super::test_support::family_for_test("gfx1200", Some("gfx1200")),
+            &source,
+            &compatibility,
+            None,
+            false,
+            None,
+            &policy,
+        );
+        let run = UvAccessRun {
+            plan,
+            looked: looked.get(),
+            acquired: acquired.get(),
+            uv_runs: std::fs::read_to_string(&log).unwrap_or_default(),
+            tools_folder: rocm_core::managed_tools_dir(&paths.data_dir).exists(),
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        run
+    }
+
+    #[cfg(unix)]
+    fn stack_of(plan: &PipRuntimePlan) -> &TheRockPipPackageVersions {
+        match plan {
+            PipRuntimePlan::Resolved(resolution) => &resolution.package_versions,
+            PipRuntimePlan::NeedsUv(_) => {
+                panic!("the plan stopped before the versions were chosen")
+            }
+        }
+    }
+
+    /// The resolution itself, every layout and access with a `uv` present or not,
+    /// each row asserting the outcome, what was touched, and for the row that stops
+    /// the message the preview prints about it. It runs the real resolution against
+    /// a served index, so a preview that fetched `uv` would show up as an acquire
+    /// or a tools folder, and a real install that stopped fetching it would show up
+    /// as a plan with no versions.
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_never_acquires_uv_and_a_real_resolution_still_does() {
+        use SourceLayout::{Canonical, Next};
+        use UvAccess::{Acquire, PresentOnly};
+
+        // ROCm 10, a preview, no uv present: the one row that stops. It asks
+        // whether one is present and touches nothing, so no `uv` ran, none was
+        // acquired and no tools folder was made.
+        let run = resolve_through_policy(Next, PresentOnly, false, false);
+        let Ok(PipRuntimePlan::NeedsUv(unresolved)) = &run.plan else {
+            panic!("expected a plan that stopped before uv, got {:?}", run.plan);
+        };
+        assert_eq!(
+            (
+                run.looked,
+                run.acquired,
+                run.uv_runs.as_str(),
+                run.tools_folder
+            ),
+            (1, 0, "", false),
+            "a preview with no uv present must acquire nothing and run nothing"
+        );
+        // What it knows without `uv`: the ROCm version, the pinned torchaudio and
+        // the requirement lines `uv` would be given.
+        assert_eq!(unresolved.rocm_version, "10.0.0");
+        assert_eq!(unresolved.torchaudio_pin.version, "2.9.1+rocm10.0.0");
+        assert_eq!(
+            unresolved.version_resolution_specs,
+            [
+                "rocm[libraries,device-gfx1200]==10.0.0",
+                "torch[device-gfx1200]",
+                "torchvision[device-gfx1200]",
+                "torchaudio==2.9.1+rocm10.0.0",
+            ]
+        );
+        // And the message says what it did not do, in the same row.
+        let text = preview_text_with_prefix(unresolved, None);
+        for line in [
+            "  runtime_key: not resolved by this preview",
+            "  package_specs: not resolved by this preview",
+            "  command: not resolved by this preview",
+            "  manifest: not resolved by this preview",
+        ] {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing `{line}` in:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("resolution_note: no uv is installed"),
+            "the preview must say why:\n{text}"
+        );
+        assert!(
+            !text.contains("2.10.0+rocm10.0.0") && !text.contains("0.25.0+rocm10.0.0"),
+            "no version only uv could have chosen may be printed:\n{text}"
+        );
+
+        // ROCm 10, a preview, a uv present: it runs, once, and the plan is the
+        // one a real install reaches. Nothing is acquired.
+        let run = resolve_through_policy(Next, PresentOnly, true, false);
+        let stack = stack_of(run.plan.as_ref().expect("resolves with the present uv"));
+        assert_eq!(
+            (stack.torch.as_str(), stack.compatibility_key.as_str()),
+            ("2.10.0+rocm10.0.0", "10.0.0")
+        );
+        assert_eq!(
+            (run.looked, run.acquired, run.tools_folder),
+            (1, 0, false),
+            "a preview with a uv present must not acquire another"
+        );
+        assert_eq!(run.uv_runs.lines().count(), 1, "{}", run.uv_runs);
+        assert!(run.uv_runs.starts_with("pip compile "), "{}", run.uv_runs);
+
+        // ROCm 10, a real install or an update: the managed uv is acquired, once,
+        // whether or not one is present (acquiring is what finds an installed
+        // one), and never looked for first. This is what must not change.
+        for uv_present in [false, true] {
+            let run = resolve_through_policy(Next, Acquire, uv_present, true);
+            let stack = stack_of(run.plan.as_ref().expect("resolves with the acquired uv"));
+            assert_eq!(stack.torch, "2.10.0+rocm10.0.0");
+            assert_eq!(
+                (run.looked, run.acquired),
+                (0, 1),
+                "an install acquires uv, with one present: {uv_present}"
+            );
+            assert_eq!(run.uv_runs.lines().count(), 1, "{}", run.uv_runs);
+        }
+        // A failed acquisition fails the resolution with the context it always had,
+        // and no plan stands in for it.
+        let run = resolve_through_policy(Next, Acquire, false, false);
+        let error = format!(
+            "{:#}",
+            run.plan.expect_err("an install cannot go without uv")
+        );
+        assert!(
+            error.contains("failed to acquire uv for ROCm X metadata resolution: the managed uv could not be downloaded"),
+            "{error}"
+        );
+        assert_eq!((run.looked, run.acquired), (0, 1));
+
+        // The canonical layout needs no uv for either access, present or not: the
+        // versions are read off the simple indexes, and nothing is looked for,
+        // acquired or run.
+        for access in [Acquire, PresentOnly] {
+            for uv_present in [false, true] {
+                let run = resolve_through_policy(Canonical, access, uv_present, true);
+                let stack = stack_of(run.plan.as_ref().expect("resolves from the indexes"));
+                assert_eq!(
+                    (stack.rocm.as_str(), stack.torch.as_str()),
+                    ("7.10.0", "2.9.0+rocm7.10.0")
+                );
+                assert_eq!(
+                    (
+                        run.looked,
+                        run.acquired,
+                        run.uv_runs.as_str(),
+                        run.tools_folder
+                    ),
+                    (0, 0, "", false),
+                    "{access:?}, uv present: {uv_present}"
+                );
+            }
+        }
+    }
+
+    // ---- the plan a preview without uv prints --------------------------------
+    //
+    // Built by hand rather than from a served index, so that these run on every
+    // platform, the Windows CI job included: the wording and the shape of the plan
+    // do not depend on a stand-in `uv`.
+
+    const PLAN_INDEX: &str = "http://index.test/next";
+
+    fn rocm10_specs() -> Vec<String> {
+        published_pip_requirements("10.0.0", "2.9.1+rocm10.0.0", "gfx1200", false)
+    }
+
+    fn rocm10_pin() -> TorchaudioPin {
+        torchaudio_pin(&["2.9.1+rocm10.0.0".to_owned()], "10.0.0", None, PLAN_INDEX)
+            .expect("the one published torchaudio is pinned")
+    }
+
+    /// What a ROCm 10 resolution knows before `uv` has run.
+    fn unresolved_runtime() -> UnresolvedPipRuntime {
+        UnresolvedPipRuntime {
+            family: "gfx1200".to_owned(),
+            family_source: "manifest".to_owned(),
+            index_url: PLAN_INDEX.to_owned(),
+            layout: SourceLayout::Next,
+            rocm_version: "10.0.0".to_owned(),
+            newest_repo_version: None,
+            version_resolution_specs: rocm10_specs(),
+            torchaudio_pin: rocm10_pin(),
+            device_target: AggregateDeviceTarget::Exact("gfx1200".to_owned()),
+            published_device_targets: vec!["gfx1200".to_owned()],
+        }
+    }
+
+    /// The same resolution once `uv` has chosen the versions.
+    fn resolved_runtime() -> PipRuntimeResolution {
+        let unresolved = unresolved_runtime();
+        PipRuntimeResolution {
+            family: unresolved.family,
+            family_source: unresolved.family_source,
+            index_url: unresolved.index_url,
+            layout: unresolved.layout,
+            latest_version: "10.0.0".to_owned(),
+            newest_repo_version: None,
+            version_resolution_specs: Some(unresolved.version_resolution_specs),
+            torchaudio_pin: Some(unresolved.torchaudio_pin),
+            package_versions: TheRockPipPackageVersions {
+                rocm: "10.0.0".to_owned(),
+                torch: "2.10.0+rocm10.0.0".to_owned(),
+                torchvision: "0.25.0+rocm10.0.0".to_owned(),
+                torchaudio: "2.9.1+rocm10.0.0".to_owned(),
+                compatibility_key: "10.0.0".to_owned(),
+            },
+            device_target: unresolved.device_target,
+            published_device_targets: unresolved.published_device_targets,
+        }
+    }
+
+    /// The Python a clean host would prepare, and the wheel tags that follow from it.
+    fn clean_host_python() -> (
+        super::super::super::python::PlannedPython,
+        WheelCompatibility,
+    ) {
+        use super::super::super::python::{PlannedPython, TagCheck, python_requirement};
+        (
+            PlannedPython::WouldPrepareManaged {
+                version: "3.14".to_owned(),
+                requirement: python_requirement(SourceLayout::Next),
+                tag_check: TagCheck::Checked,
+            },
+            WheelCompatibility {
+                python_tag: "cp314".to_owned(),
+                platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
+            },
+        )
+    }
+
+    fn preview_text_with_prefix(
+        unresolved: &UnresolvedPipRuntime,
+        prefix: Option<&Path>,
+    ) -> String {
+        let (python, wheel_compatibility) = clean_host_python();
+        super::super::super::wheel_plan::unresolved_wheel_preview(
+            &super::super::super::wheel_plan::UnresolvedPreview {
+                channel: TheRockChannel::Release,
+                version_selector: None,
+                unresolved,
+                device_target_override: None,
+                prefix,
+                host_version_newer: None,
+                python: &python,
+                wheel_compatibility: &wheel_compatibility,
+            },
+        )
+    }
+
+    /// The whole text, so that no line can be added, dropped or reworded without
+    /// this test saying so. Everything made from the torch and torchvision
+    /// versions reads `not resolved by this preview`, and `resolution_note` says
+    /// why, in the voice of `python_note` beside it.
+    #[test]
+    fn the_plan_a_preview_without_uv_prints_is_exactly_this() {
+        let unresolved = unresolved_runtime();
+        let text = preview_text_with_prefix(&unresolved, None);
+        let generation = unresolved.layout.generation();
+        let pin = unresolved.torchaudio_pin.describe();
+        let expected = format!(
+            "\
+sdk install
+  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system
+  channel: release
+  canonical_source: {PLAN_INDEX}
+  selected_rocm_version: 10.0.0
+  build_date: not encoded in stable version
+  source_layout_generation: {generation}
+  format: wheel
+  target_family: gfx1200
+  target_family_source: manifest
+  device_target: gfx1200
+  index_url: {PLAN_INDEX}
+  latest_compatible_version: 10.0.0
+  compatibility_key: 10.0.0
+  target: not resolved by this preview
+  runtime_key: not resolved by this preview
+  python_launcher: not prepared by this preview
+  python_source: managed
+  python_note: no usable Python was found; a real install would use uv to install managed Python 3.14 and save its path in the configuration, which this preview did not do
+  resolution_note: no uv is installed, so a real install would fetch it and run `uv pip compile` to choose the torch and torchvision versions and to check that the published packages install together, which this preview did not do; the package specs, runtime key, install folder, manifest and command depend on those versions and are not resolved here
+  python_wheel_tag: cp314
+  platform_wheel_tags: linux_x86_64,any
+  version_resolution_specs: rocm[libraries,device-gfx1200]==10.0.0 torch[device-gfx1200] torchvision[device-gfx1200] torchaudio==2.9.1+rocm10.0.0
+  torchaudio_selection: {pin}
+  package_specs: not resolved by this preview
+  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction
+  mode: dry-run
+  command: not resolved by this preview
+  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process
+  manifest: not resolved by this preview
+"
+        );
+        assert_eq!(text, expected);
+    }
+
+    /// A `--prefix` does not depend on the versions, so it is the plan's target
+    /// even though the runtime key is not known; the key is what would otherwise
+    /// name the folder.
+    #[test]
+    fn an_explicit_prefix_is_the_target_of_a_preview_without_uv() {
+        let (root, _) = super::super::super::test_support::test_paths("uv-access-prefix");
+        std::fs::create_dir_all(&root).expect("create the prefix parent");
+        let prefix = root.join("my runtime");
+        let text = preview_text_with_prefix(&unresolved_runtime(), Some(&prefix));
+        let resolved = rocm_core::resolve_path_through_symlinks(&prefix);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            text.lines()
+                .any(|line| line == format!("  target: {}", resolved.display())),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line == "  runtime_key: not resolved by this preview"),
+            "{text}"
+        );
+    }
+
+    /// The keys a plan prints, in order.
+    fn plan_keys(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_once(": ").map(|(key, _)| key))
+            .collect()
+    }
+
+    /// One writer serves both plans, so a line the resolved plan gains cannot be
+    /// missing from the other: the two print the same keys in the same order, and
+    /// the unresolved one adds only `resolution_note`.
+    #[test]
+    fn a_resolved_and_an_unresolved_plan_print_the_same_keys() {
+        use super::super::super::wheel_plan::{
+            PlanStack, ResolvedStack, WheelPlan, write_dry_run_tail, write_wheel_plan,
+        };
+
+        let unresolved = preview_text_with_prefix(&unresolved_runtime(), None);
+        let resolution = resolved_runtime();
+        let composition = wheel_runtime_composition(&resolution, &resolution.device_target, false);
+        let runtime_key = super::super::super::wheel_runtime_key(
+            TheRockChannel::Release,
+            &resolution.latest_version,
+            &composition,
+        );
+        let install_root = PathBuf::from("/runtimes").join(&runtime_key);
+        let manifest_path = PathBuf::from("/manifests").join(&runtime_key);
+        let (python, compatibility) = clean_host_python();
+        let plan = WheelPlan {
+            channel: TheRockChannel::Release,
+            version_selector: None,
+            index_url: &resolution.index_url,
+            layout_generation: resolution.layout.generation(),
+            latest_version: &resolution.latest_version,
+            family: &resolution.family,
+            family_source: &resolution.family_source,
+            device_target: &resolution.device_target,
+            host_version_newer: None,
+            python: &python,
+            wheel_compatibility: &compatibility,
+            version_resolution_specs: resolution.version_resolution_specs.as_deref(),
+            torchaudio_pin: resolution.torchaudio_pin.as_ref(),
+            no_wheel_warning: None,
+            stack: PlanStack::Resolved(ResolvedStack {
+                compatibility_key: &resolution.package_versions.compatibility_key,
+                install_root: &install_root,
+                runtime_key: &runtime_key,
+                package_specs: &composition.package_specs,
+                manifest_path: &manifest_path,
+            }),
+        };
+        let mut resolved = String::new();
+        write_wheel_plan(&mut resolved, &plan);
+        write_dry_run_tail(&mut resolved, &plan);
+
+        let mut expected = plan_keys(&resolved);
+        let at = expected
+            .iter()
+            .position(|key| *key == "python_note")
+            .expect("a python_note: this host would prepare Python")
+            + 1;
+        expected.insert(at, "resolution_note");
+        assert_eq!(plan_keys(&unresolved), expected);
+        // And the resolved plan carries what the unresolved one cannot: the
+        // versions `uv` chose, in the package specs, and a real folder and key.
+        assert!(
+            resolved.contains("torch[device-gfx1200]==2.10.0+rocm10.0.0"),
+            "{resolved}"
+        );
+        assert!(!resolved.contains("not resolved"), "{resolved}");
+        assert!(!resolved.contains("resolution_note"), "{resolved}");
     }
 }
