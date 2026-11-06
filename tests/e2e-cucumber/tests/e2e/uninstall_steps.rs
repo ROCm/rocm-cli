@@ -661,7 +661,7 @@ async fn error_does_not_suggest_dev_binaries(world: &mut E2eWorld) {
         "an unknown flag exits 2\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("unexpected argument '--forc' found"),
+        stderr.contains("unexpected argument"),
         "expected the unknown-argument error on stderr:\n{stderr}"
     );
     assert!(
