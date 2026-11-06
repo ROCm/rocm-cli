@@ -460,8 +460,9 @@ looks for it first. The stamp stands for:
   the same content pushed to a second remote, still hits;
 - the compiler and cargo identity (`rustc -vV`, `cargo -vV`) and a digest of the `CARGO_*` and
   `RUST*` environment (never the values), minus a short list of per-run variables such as
-  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable whose value is not valid
-  Unicode never stops the hook: an unrelated one is ignored and a relevant one is hashed as the bytes it is.
+  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable
+  whose value is not valid Unicode never stops the hook: an unrelated one is ignored and a
+  relevant one is hashed as the bytes it is.
 
 The working tree has to be clean for a stamp to be used or written, because cargo checks the working
 tree, not the pushed commit: with uncommitted changes the step runs and says why, and an untracked
@@ -472,22 +473,26 @@ the retry then skips.
 
 Stamps live in `rocm-cli-prepush-passes` under the git common directory, so every worktree of a
 clone shares them, nothing lands in the work tree and `cargo clean` does not erase them. Each write
-drops stamps older than seven days, keeps at most 64, and removes scratch files left by a write that
-died (a write goes through a scratch file and a rename, and cleans it up when the rename fails). Any error locating, reading or verifying a
+drops stamps older than seven days and keeps at most 64. A write goes through a scratch file and a
+rename, and removes the scratch file itself when the rename fails; a process killed mid-write
+leaves its scratch file behind until a later write prunes it, once it is more than an hour old (a
+younger one may belong to a concurrent writer). Any error locating, reading or verifying a
 stamp means the step runs (git is run for an explicit directory with `GIT_DIR` and the other
 repository-selecting variables removed, which git and prek export to a hook run from a linked
 worktree); a stamp that does not match its key exactly, is dated in the future or is
 unreadable is ignored (the step names it); a failed write is reported and never fails the hook.
 
-The skip message says what a stamp does not cover: user-level cargo configuration, installed tools,
-files git ignores (the one thing a clean `git status` cannot see) and flaky tests. Force a run with `--rerun` or `ROCM_PRE_PUSH_RERUN=1` (the
-hook has no flags, so use the variable there), or delete the directory the message names. `SKIP=<hook
-id>` still skips a hook outright, and `verify-commits` is a separate hook that checks commit
-signatures on every push. A skip proves that this tree passed these checks earlier, not that they ran
-during this push; for a fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it drops
-this step's earlier pass before running, so if the rerun fails the next ordinary run runs the step
-instead of skipping on the pass it was meant to double-check, and a successful rerun records a fresh
-one. Other steps' and other selections' passes are left alone, and `--dry-run` never touches a stamp.
+The skip message says what a stamp does not cover: user-level cargo configuration, installed
+tools, files git ignores (the one thing a clean `git status` cannot see) and flaky tests. Force
+a run with `--rerun` or `ROCM_PRE_PUSH_RERUN=1` (the hook has no flags, so use the variable
+there), or delete the directory the message names. `SKIP=<hook id>` still skips a hook outright,
+and `verify-commits` is a separate hook that checks commit signatures on every push. A skip
+proves that this tree passed these checks earlier, not that they ran during this push; for a
+fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it
+drops this step's earlier pass before running, so if the rerun fails the next ordinary run runs
+the step instead of skipping on the pass it was meant to double-check, and a successful rerun
+records a fresh one. Other steps' and other selections' passes are left alone, and `--dry-run`
+never touches a stamp.
 
 Preview what a push would check without compiling (a dry run also says when a real run would skip):
 

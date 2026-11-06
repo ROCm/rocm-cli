@@ -81,8 +81,9 @@ pub const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// At most this many stamps are kept; the oldest go first.
 pub const MAX_STAMPS: usize = 64;
 
-/// A scratch file older than this belongs to a write that died; a younger one
-/// may be a concurrent writer's, so it is left alone.
+/// A write killed mid-way leaves its scratch file behind until a later write
+/// prunes it, once it is older than this: an older scratch file belongs to a
+/// write that died, a younger one may be a concurrent writer's and is left alone.
 pub const TMP_MAX_AGE_SECS: u64 = 60 * 60;
 
 /// A stamp dated this far ahead of the clock is treated as corrupt.
