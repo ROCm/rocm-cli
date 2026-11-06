@@ -22,6 +22,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_ENGINE: AtomicU32 = AtomicU32::new(0);
 
+/// `value` as a single-quoted POSIX shell word. Inside single quotes nothing is
+/// special except the quote itself, which cannot be escaped there: close the
+/// literal, emit an escaped quote, and reopen it (`'\''`). An apostrophe in a
+/// response (`can't stop`) or in `TMPDIR` would otherwise end the literal early.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 pub struct FakeEngine {
     dir: PathBuf,
     script: PathBuf,
@@ -37,7 +45,13 @@ impl FakeEngine {
     /// it straight away cannot fail with `ETXTBSY` while other tests on parallel
     /// threads spawn children of their own.
     pub fn new(label: &str, reads_stdin: bool, body: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        Self::new_in(&std::env::temp_dir(), label, reads_stdin, body)
+    }
+
+    /// [`FakeEngine::new`] with its scratch directory created under `base`
+    /// instead of the system temporary directory.
+    pub fn new_in(base: &Path, label: &str, reads_stdin: bool, body: &str) -> Self {
+        let dir = base.join(format!(
             "rocm-fake-engine-{label}-{}-{}",
             std::process::id(),
             NEXT_ENGINE.fetch_add(1, Ordering::Relaxed)
@@ -52,8 +66,8 @@ impl FakeEngine {
         rocm_core::fake_executable::write_fake_executable(
             &script,
             format!(
-                "#!/bin/sh\ndir='{}'\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\nenv > \"$dir/env\"\n{read_stdin}{body}\n",
-                dir.display()
+                "#!/bin/sh\ndir={}\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\nenv > \"$dir/env\"\n{read_stdin}{body}\n",
+                shell_quote(&dir.to_string_lossy())
             ),
         )
         .expect("write the fake engine script");
@@ -66,7 +80,7 @@ impl FakeEngine {
         Self::new(
             label,
             true,
-            &format!("printf '%s' '{response}'\nexit {status}"),
+            &format!("printf '%s' {}\nexit {status}", shell_quote(response)),
         )
     }
 
@@ -101,5 +115,60 @@ impl FakeEngine {
 impl Drop for FakeEngine {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    /// Run `engine` the way a client does: request on stdin, answer on stdout.
+    fn run(engine: &FakeEngine) -> (std::process::ExitStatus, String, String) {
+        let mut child = Command::new(engine.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"request\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn shell_quote_survives_each_character_a_literal_can_hold() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("can't"), r"'can'\''t'");
+        assert_eq!(shell_quote("''"), r"''\'''\'''");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn a_response_with_an_apostrophe_is_printed_verbatim() {
+        let response = r#"{"ok":false,"error":{"code":"x","message":"can't stop"}}"#;
+        let engine = FakeEngine::answering("fake-apostrophe-response", response, 0);
+        let (status, stdout, stderr) = run(&engine);
+        assert!(status.success(), "{status:?}: {stderr}");
+        assert_eq!(stdout, response);
+        assert_eq!(stderr, "", "the script must parse");
+    }
+
+    #[test]
+    fn a_scratch_directory_with_an_apostrophe_still_records_the_launch() {
+        let base =
+            std::env::temp_dir().join(format!("rocm-fake-engine-it's-{}", std::process::id()));
+        let engine = FakeEngine::new_in(&base, "fake-apostrophe-dir", true, "exit 0");
+        let (status, _, stderr) = run(&engine);
+        assert!(status.success(), "{status:?}: {stderr}");
+        assert_eq!(stderr, "", "the script must parse");
+        assert_eq!(engine.stdin(), "request\n");
+        drop(engine);
+        let _ = fs::remove_dir_all(&base);
     }
 }

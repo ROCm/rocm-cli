@@ -489,6 +489,19 @@ mod tests {
         }
 
         #[test]
+        fn a_response_with_an_apostrophe_reaches_the_caller_intact() {
+            // The fake writes its answer through a shell literal; an apostrophe
+            // in valid JSON must not end that literal early.
+            let engine = FakeEngine::answering(
+                "client-apostrophe",
+                r#"{"ok":false,"error":{"code":"stop_failed","message":"can't stop"}}"#,
+                0,
+            );
+            let error = run(&engine, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(error.to_string(), "stop_failed: can't stop");
+        }
+
+        #[test]
         fn the_options_reach_the_running_child() {
             let engine = FakeEngine::answering("client-options", STOPPED, 0);
             let paths = AppPaths {
