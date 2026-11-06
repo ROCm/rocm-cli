@@ -7,15 +7,18 @@
 //! The daemon runs in one of two hosts: the `rocmd` binary (`rocmd run`), or
 //! embedded in `rocm` (`rocm daemon run`, which enters through
 //! [`crate::run_from_args`]). The two binaries do not answer the same commands:
-//! `supervise` belongs to `rocmd` alone. A spawn that re-executes the current
-//! executable is right only in the host that has the command, so a spawn asks
-//! this module for the binary instead of reading `current_exe` itself.
+//! `supervise` belongs to `rocmd` alone, and the hidden engine commands
+//! (`__engine-serve-http`, `__engine-stdio`) belong to `rocm` alone. A spawn
+//! that re-executes the current executable is right only in the host that has
+//! the command, so a spawn asks this module for the binary instead of reading
+//! `current_exe` itself.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const ROCMD_BINARY: &str = "rocmd";
+const ROCM_BINARY: &str = "rocm";
 
 /// Set once by the embedded entry point. An explicit signal rather than a guess
 /// from the executable's name, which a renamed or upper-cased binary defeats.
@@ -68,6 +71,37 @@ impl DaemonHost {
         sibling(&self.current_exe, ROCMD_BINARY).context(
             "the daemon runs inside `rocm`, which has no `supervise` command, \
              and recovery restarts a service through the `rocmd` binary installed next to it",
+        )
+    }
+
+    /// The binary that has the hidden engine commands: this one when the daemon
+    /// is embedded in `rocm`, the `rocm` installed beside `rocmd` when it is not.
+    pub(crate) fn rocm_binary(&self) -> Result<PathBuf> {
+        self.rocm_binary_via(rocm_core::sibling_binary_path_from)
+    }
+
+    /// [`Self::rocm_binary`] with the sibling lookup passed in.
+    fn rocm_binary_via(
+        &self,
+        sibling: impl FnOnce(&Path, &str) -> Result<PathBuf>,
+    ) -> Result<PathBuf> {
+        if self.embedded_in_rocm {
+            return Ok(self.current_exe.clone());
+        }
+        sibling(&self.current_exe, ROCM_BINARY).context(
+            "the `rocmd` binary has no engine commands, and a managed service's engine \
+             runs through the `rocm` binary installed next to it",
+        )
+    }
+
+    /// A host whose own executable is taken to have every command, so a test
+    /// that reaches a spawn runs the test binary, as each one did before the
+    /// binary was chosen here.
+    #[cfg(test)]
+    pub(crate) fn test_binary_standing_in_for_rocm() -> Self {
+        Self::new(
+            std::env::current_exe().expect("the test binary has a path"),
+            true,
         )
     }
 }
@@ -131,6 +165,54 @@ mod tests {
         assert!(text.contains("no `supervise` command"), "{text}");
         assert!(
             text.contains("unable to locate sibling binary rocmd"),
+            "{text}"
+        );
+    }
+
+    /// The hidden engine commands are `rocm`'s: a daemon that is `rocmd`, under
+    /// any name, runs them on the `rocm` beside it, and says what it looked for.
+    #[test]
+    fn the_rocmd_daemon_runs_engine_commands_on_the_sibling_rocm() {
+        for exe in ROCMD_NAMES.into_iter().chain(["rocm"]) {
+            let asked = RefCell::new(None);
+            let chosen = DaemonHost::new(PathBuf::from(exe), false)
+                .rocm_binary_via(|from, name| {
+                    *asked.borrow_mut() = Some((from.to_path_buf(), name.to_owned()));
+                    Ok(PathBuf::from("/opt/rocm-cli/bin/rocm"))
+                })
+                .unwrap();
+            assert_eq!(chosen, PathBuf::from("/opt/rocm-cli/bin/rocm"), "{exe}");
+            assert_eq!(
+                asked.into_inner(),
+                Some((PathBuf::from(exe), "rocm".to_owned())),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_in_rocm_keeps_its_own_executable_for_engine_commands() {
+        for exe in ROCM_NAMES {
+            let chosen = DaemonHost::new(PathBuf::from(exe), true)
+                .rocm_binary_via(|_, _| {
+                    panic!("{exe}: embedded in rocm, so it has the engine commands itself")
+                })
+                .unwrap();
+            assert_eq!(chosen, PathBuf::from(exe));
+        }
+    }
+
+    #[test]
+    fn a_missing_rocm_beside_rocmd_is_named() {
+        let error = DaemonHost::new(PathBuf::from("/opt/rocm-cli/bin/rocmd"), false)
+            .rocm_binary_via(|_, _| {
+                anyhow::bail!("unable to locate sibling binary rocm; checked /opt/rocm-cli/bin")
+            })
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("no engine commands"), "{text}");
+        assert!(
+            text.contains("unable to locate sibling binary rocm"),
             "{text}"
         );
     }

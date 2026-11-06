@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::daemon_host::DaemonHost;
 use anyhow::{Context, Result};
 use rocm_core::{AppPaths, ManagedServiceRecord};
 use std::fs;
@@ -22,6 +23,41 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supervise_service(
+    paths: &AppPaths,
+    service_id: String,
+    engine: String,
+    model_ref: String,
+    canonical_model_id: String,
+    runtime_id: Option<String>,
+    env_id: Option<String>,
+    host: String,
+    port: u16,
+    device_policy: String,
+    gpu: Option<String>,
+    engine_recipe_json: Option<String>,
+) -> Result<()> {
+    supervise_service_on(
+        &DaemonHost::detect()?,
+        paths,
+        service_id,
+        engine,
+        model_ref,
+        canonical_model_id,
+        runtime_id,
+        env_id,
+        host,
+        port,
+        device_policy,
+        gpu,
+        engine_recipe_json,
+    )
+}
+
+/// [`supervise_service`] on a given host, so a test can supply the binary that
+/// runs the engine.
+#[allow(clippy::too_many_arguments)]
+fn supervise_service_on(
+    daemon_host: &DaemonHost,
     paths: &AppPaths,
     service_id: String,
     engine: String,
@@ -106,6 +142,10 @@ pub(crate) fn supervise_service(
             .is_some(),
         record.requires_api_key,
     )?;
+    // The engine runs through the hidden commands of the `rocm` binary, which
+    // `rocmd` does not have. Found before the first write, like the guard above,
+    // so a supervisor that cannot find it leaves the record as it was.
+    let rocm_binary = daemon_host.rocm_binary()?;
     record.write()?;
 
     let log_file = fs::File::create(&record.log_path)
@@ -114,8 +154,6 @@ pub(crate) fn supervise_service(
         .try_clone()
         .context("failed to clone service log file handle")?;
 
-    let rocm_binary =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
     let mut command = ProcessCommand::new(rocm_binary);
     command
         .args(engine_serve_http_args(
@@ -584,7 +622,8 @@ mod tests {
         let service_id = service_id.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = supervise_service(
+            let outcome = supervise_service_on(
+                &DaemonHost::test_binary_standing_in_for_rocm(),
                 &paths,
                 service_id,
                 "llamacpp".to_owned(),
@@ -651,7 +690,8 @@ mod tests {
         let owned_id = service_id.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = supervise_service(
+            let outcome = supervise_service_on(
+                &DaemonHost::test_binary_standing_in_for_rocm(),
                 &owned_paths,
                 owned_id,
                 "llamacpp".to_owned(),
@@ -952,7 +992,8 @@ mod tests {
         // A directory where the supervisor expects to create a file.
         fs::create_dir_all(&log_path)?;
 
-        let outcome = supervise_service(
+        let outcome = supervise_service_on(
+            &DaemonHost::test_binary_standing_in_for_rocm(),
             &paths,
             service_id.to_owned(),
             "llamacpp".to_owned(),
@@ -1072,7 +1113,8 @@ mod tests {
         // `supervise_service_persists_the_supervisor_identity_token`.
         fs::create_dir_all(&seeded.log_path)?;
 
-        let outcome = supervise_service(
+        let outcome = supervise_service_on(
+            &DaemonHost::test_binary_standing_in_for_rocm(),
             &paths,
             service_id.to_owned(),
             "llamacpp".to_owned(),
@@ -1381,6 +1423,150 @@ mod tests {
         assert_eq!(after.status, "failed");
         assert_eq!(after.supervisor_pid, before.supervisor_pid);
         assert_eq!(after.restart_count, before.restart_count);
+        Ok(())
+    }
+
+    /// A supervisor run by the `rocmd` binary starts its engine on the `rocm`
+    /// beside it: `__engine-serve-http` is a hidden command of `rocm` alone, and
+    /// `rocmd` answered it with an unrecognised-subcommand error.
+    ///
+    /// The stand-in `rocm` is a script that records its arguments. The supervisor
+    /// waits for its engine for minutes, so it runs on a thread that is left
+    /// behind; the test reads what the engine was started with.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_runs_the_engine_on_the_rocm_beside_rocmd() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = SCRIPT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tool in ["/bin/sh", "/bin/sleep"] {
+            assert!(
+                Path::new(tool).exists(),
+                "this test needs {tool} to stand in for rocm"
+            );
+        }
+        let (root, paths) = temp_app_paths("supervise-engine-on-rocm");
+        paths.ensure()?;
+        let seen = root.join("rocm-args.txt");
+        let stand_in = root.join("rocm");
+        {
+            // Every writer is closed before the first exec.
+            let mut file = fs::File::create(&stand_in)?;
+            write!(
+                file,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec /bin/sleep 5\n",
+                seen.display()
+            )?;
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+            file.sync_all()?;
+        }
+
+        let service_id = "svc-supervise-engine-on-rocm";
+        let mut attempts = 0;
+        while !seen.exists() && attempts < 10 {
+            attempts += 1;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            // The daemon is `rocmd`, which does not exist here; the `rocm` beside
+            // it is the stand-in.
+            let (paths, daemon_host, service_id) = (
+                paths.clone(),
+                DaemonHost::new(root.join("rocmd"), false),
+                service_id,
+            );
+            thread::spawn(move || {
+                let outcome = supervise_service_on(
+                    &daemon_host,
+                    &paths,
+                    service_id.to_owned(),
+                    "llamacpp".to_owned(),
+                    "a-model".to_owned(),
+                    "a-model".to_owned(),
+                    None,
+                    None,
+                    "127.0.0.1".to_owned(),
+                    11472,
+                    "gpu_required".to_owned(),
+                    None,
+                    None,
+                );
+                let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !seen.exists() && std::time::Instant::now() < deadline {
+                // The first exec of a new file can lose a race with an unrelated
+                // fork (ETXTBSY): the spawn fails at once, and the next attempt
+                // starts again. Any other early return is a real failure.
+                if let Ok(Err(error)) = receiver.try_recv() {
+                    assert!(
+                        error.contains("Text file busy"),
+                        "supervisor stopped: {error}"
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let args = fs::read_to_string(&seen).unwrap_or_default();
+        fs::remove_dir_all(&root).ok();
+
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args.get(..3),
+            Some(&["__engine-serve-http", "llamacpp", service_id][..]),
+            "the engine must be started as `rocm __engine-serve-http <engine> <service>`: {args:?}"
+        );
+        Ok(())
+    }
+
+    /// With no `rocm` beside `rocmd` the supervisor stops before it writes
+    /// anything, and says what it looked for: the service's record is as it was,
+    /// and no log was created for an engine that never started.
+    #[test]
+    fn supervise_without_a_rocm_beside_rocmd_changes_nothing() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-no-rocm");
+        let service_id = "svc-supervise-no-rocm";
+        // A failed service whose supervisor is gone: a write by a supervisor
+        // that then stops would change both fields.
+        let mut seeded = identity_probe_record(&paths, service_id, 11434);
+        seeded.status = "failed".to_owned();
+        seeded.supervisor_pid = 0;
+        seeded.write()?;
+        let before = load_service_record(&paths, service_id)?;
+        fs::remove_file(&before.log_path).ok();
+
+        let outcome = supervise_service_on(
+            &DaemonHost::new(root.join("rocmd"), false),
+            &paths,
+            service_id.to_owned(),
+            "llamacpp".to_owned(),
+            "a-model".to_owned(),
+            "a-model".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11434,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let after = load_service_record(&paths, service_id);
+        let log_created = before.log_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        let error = format!("{:#}", outcome.expect_err("no rocm to run the engine on"));
+        assert!(error.contains("no engine commands"), "{error}");
+        assert!(error.contains("unable to locate sibling binary"), "{error}");
+        let after = after?;
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.supervisor_pid, before.supervisor_pid);
+        assert_eq!(after.restart_count, before.restart_count);
+        assert!(
+            !log_created,
+            "no engine log for an engine that never started"
+        );
         Ok(())
     }
 
