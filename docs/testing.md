@@ -915,7 +915,6 @@ cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_key_includes_version_for_side_by_side_installs
 cargo test -p rocm --bin rocm engine_plugin
-cargo test -p rocm --bin rocm missing_packaged_engine_reason
 cargo test -p rocm --bin rocm model_registry
 cargo test -p rocm --bin rocm render_model_registry_text_reports_host_ram_fit
 cargo test -p rocm --bin rocm model_recipe
@@ -1588,7 +1587,7 @@ pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
 non-terminating error, so the line would print it and still exit 0). The `where`
 and `-Command` matches ignore case.
 `fails_in_windows_powershell` in
-[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) applies it to every catalog recipe that
 applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
 line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
 `diagnose-43`, `diagnose-44` and `diagnose-45` in
@@ -1604,7 +1603,7 @@ add a case there, and a rule that gets it wrong fails on its own side.
 The rule reads text; it does not prove a line runs. On Windows,
 `cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
 fix-22 into cmd and into Windows PowerShell and checks the exit code and
-output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+output (the tests in [fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) named
 `the_override_verify_runs_in_cmd_and_powershell`,
 `the_hip_sdk_verify_runs_the_exe_under_hip_path`,
 `the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
@@ -1615,7 +1614,7 @@ also must exit non-zero when their DLL is missing, fix-15 in
 `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
 that only `rocm diagnose` prints
 (`the_igpu_verify_pins_the_variable_it_names` in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
 (`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
@@ -1642,14 +1641,14 @@ in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
 the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
 Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
 GPU or not, and are skipped on Windows. The arms are also checked against the
-catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+catalog in [host.rs](../crates/rocm-core/src/diagnose/host.rs)
 (`the_override_fix_verify_matches_the_catalog_copy`,
 `the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
 `the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
 `the_override_fix_verify_runs_where_only_python3_exists` run the lines
 `rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
 `hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
-([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+([fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)) runs the catalog's `verify_linux`
 line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
 Provider audit focused test:
@@ -1681,25 +1680,29 @@ Automation history stores (events, audit, proposals):
 
 ```bash
 cargo test -p rocm-core automation::tests
+cargo test -p rocm-core jsonl_store::tests
 ```
 
 These cover the three JSONL stores in
-[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+[automation.rs](../crates/rocm-core/src/automation.rs) and the generic JSONL
+store engine under them in
+[jsonl_store.rs](../crates/rocm-core/src/jsonl_store.rs): concurrent writers
 across threads and processes losing no records, size-based rotation of the
 event and audit logs under the same lock (no record lost or duplicated while
 writers rotate, recent reads spanning the rollover, a failed rotation still
 keeping the record and printing its one-shot warning to stderr, lock-free
 readers never reading a file twice or skipping a generation), and proposal
 compaction keeping every pending proposal, the
-newest reviewed ones, and legacy proposal ids. Most of those drive
+newest reviewed ones, and legacy proposal ids. The rotation tests in
+`jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests go through the public
+rotation policy; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
 itself stays covered. The repair of a torn tail, which normally replaces the
 store and falls back to cutting the debris in place when that replacement
-fails, has its own tests there: each step injected to fail, the error naming
+fails, has its own tests in `jsonl_store::tests`: each step injected to fail, the error naming
 both causes when both fail, and a real fault on each platform (a directory
 that takes no new files on Unix, a handle without delete sharing on Windows).
 The user-visible side is `automations-07` through `automations-09`, plus
@@ -1738,7 +1741,12 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper).
+(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
+that runs it with lemonade it is an expected failure in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
+serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
+the row also matches other Linux lemonade hosts, where a pass is tolerated).
 
 Natural-language plan handoff tests:
 
@@ -2526,7 +2534,9 @@ Every Rust reader of `/etc/os-release` parses it with
 value `sh` would assign or nothing: the driver plan
 ([`driver_plan.rs`](../apps/rocm/src/driver_plan.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
-naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
+naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs), with the
+os-release seam they share in
+[`package_plan.rs`](../crates/rocm-core/src/package_plan.rs)), `rocm
 examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
 ([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
@@ -2599,6 +2609,7 @@ through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
 cargo test -p rocm-core --lib os_release
 cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
 cargo test -p rocm-core --lib openmpi::tests
+cargo test -p rocm-core --lib package_plan::tests
 cargo test -p rocm --bin rocm os_release
 cargo test -p rocm --bin rocm -- a_fallback_read_plans an_unreadable_file_plans_nothing_and_names_itself
 cargo test -p rocm-core --lib hardware_root::tests::read_os_release
@@ -2659,6 +2670,140 @@ for them, including for the fallback; their parsing is covered by the unit
 tests above, and the fallback itself by `hardware_root`'s own unit tests,
 since both now read through the same helper with an identity resolver.
 
+## amd-smi KFD pre-flight
+
+Every synchronous `amd-smi` launch goes through
+[`rocm_core::amd_smi_json`](../crates/rocm-core/src/amd_smi.rs), which first
+tries to open `/dev/kfd` for reading and declines the launch outright when it
+cannot. Against a device in the wrong kernel state `amd-smi` blocks in
+uninterruptible sleep, where no signal and therefore no caller timeout reaches
+it, so declining is the only outcome that bounds `rocmd`'s telemetry poll and
+`serve`'s GPU probes. The open is itself bounded (2s) and the number of probes
+that may be parked at once is capped (8), so the gate's own probe cannot inherit
+the stall it exists to refuse. The dashboard collector
+([amd_smi.rs](../crates/rocm-dash-collectors/src/amd_smi.rs)) gates its own
+launch on the same device through the same shared probe,
+`rocm_core::device_readable_bounded`.
+
+The gate declines on *any* unreachable device, including the fast errno cases
+(absent node, permission denied) that cannot hang anything. That is wider than
+the hazard and deliberate; `kfd_readable`'s doc comment says why, and names what
+`serve` still answers from on such a host.
+
+```bash
+cargo test -p rocm-core --lib amd_smi
+cargo test -p rocm-core --lib --features e2e-test-hooks -- the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it the_public_amd_smi_entry_point_gates_on_the_real_kfd_device
+```
+
+The unit tests cover the gate in isolation: that it stops the *spawn* rather
+than reporting a failure afterwards (a stub `amd-smi` leaves a marker file, and
+its absence is the evidence), that the probe declines rather than hangs against
+a device whose `open` blocks (a FIFO with no writer), that the in-flight budget
+declines rather than parking threads without bound, that the WSL and off-Linux
+wave-throughs hold, and that the public entry point gates on `/dev/kfd` itself
+rather than on some other path.
+
+**The `ROCM_E2E_KFD_DEVICE` seam.** `rocm_core::preflight_kfd_device` reads this
+variable and uses the path it names as the device the pre-flight opens. Only a
+build carrying the `e2e-test-hooks` feature honours it; a released artefact has
+no override compiled in and always gates on `/dev/kfd`. It moves the gate rather
+than removing it, so a scenario pointing it at an unopenable path gets the
+declining branch and one pointing it at an ordinary file gets the allowed
+branch, while with the variable unset the behaviour is production's on every
+build.
+
+`ROCM_CLI_TEST_HOST_ROOT` cannot stand in for it. The gate keeps the real
+`/dev/kfd`'s veto on purpose, so a simulated root can only ever make it decline,
+never allow — which is what stops a test hook starting a real `amd-smi` on a
+machine with no GPU, and also what makes the *allowed* branch unreachable under
+a simulated root on the GPU-less lane that runs per PR.
+
+`examine-31` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) covers the
+declining branch end to end. It plants a stub `amd-smi` that would answer the
+telemetry probe perfectly and records that it ran, points the seam at a path
+inside the scenario's isolated root that is never created, and checks that
+`rocmd`'s bridge snapshot still exits 0, reports `amd_smi_available: false`,
+carries a note saying the launch was *declined*, and names the device **this
+run** pointed the pre-flight at. Both of the last two are what make it
+non-vacuous: without the marker the scenario would pass against a gate that had
+been deleted and merely failed the spawn, and without the named device it would
+pass against a build that ignored the seam, since the GPU-less lane has no
+readable `/dev/kfd` of its own either. Linux-only, like its `examine-24` to
+`examine-26` telemetry siblings: the stub is a shell script, and the gate is a
+wave-through on every other platform.
+
+```bash
+cargo xtask e2e -- -n 'examine-31 '
+```
+
+No scenario drives the `rocm serve` / `rocm model` call sites through the gate.
+Those probes degrade to service-state-only GPU selection rather than failing,
+so there is no user-visible *output* for a scenario to assert on.
+
+Be precise about what does cover them, because the two halves have different
+guards. What the call sites do **with a missing count** is covered by
+`gpu_policy.rs`'s unit tests — `effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows`
+pins the `None` fall-through. That the call sites **route through the
+chokepoint at all** is *not* covered by any unit test: it is guarded by
+`xtask/src/amd_smi_launch_contract.rs`, a static text scan that fails the build
+when a file outside its allowlist calls `resolve_amd_smi_binary`. A rewrite that
+kept the count behaviour but spawned `amd-smi` directly would be caught by that
+scan and by nothing else. The decline
+itself is no longer discarded — `gpu_policy.rs`'s `amd_smi_probe_json` logs it
+at `info` with the full error chain, which is what makes "why did `--gpu auto`
+not rank my GPUs?" answerable without re-running. It is not `warn`, because on
+a GPU-less host it fires on every `serve`, where it is the expected answer and
+not a fault; and not `debug`, because the default filter is `warn,rocm=info`,
+so a `debug` line is invisible unless the user already suspected this — the
+wrong way round for the case that needs it, where the 2s open bound trips on a
+slow but healthy host and the decline is indistinguishable from "no GPU".
+
+### Keeping new launch sites inside the gate
+
+A chokepoint only holds while every launch site uses it, and nothing in a
+behavioural test suite fails when one stops: the regression is the *absence* of
+a call. [amd_smi_launch_contract.rs](../xtask/src/amd_smi_launch_contract.rs) is
+the structural guard for that. It scans every `.rs` file in the tree (comments
+stripped) for calls to `rocm_core::resolve_amd_smi_binary` — the only way to
+find the binary, since the managed SDK ships `amd-smi` inside the runtime
+wheel's bin directory rather than on `PATH` — and fails unless the calling file
+is one of two allowlisted, justified sites. Reverting either `gpu_policy.rs`
+probe to a raw `Command::new(resolve_amd_smi_binary())` now fails this test by
+name. It is bidirectional like the crate-edge allowlist: an entry whose file
+stops calling the resolver is stale and fails too.
+
+```bash
+cargo test -p xtask amd_smi_launch_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a resolver reached through
+a function pointer or a re-export under another name is outside what it can
+see. It closes the cheap, likely regression and claims nothing more.
+
+### What the gate is, and is not
+
+**It is a mitigation heuristic, not a proof.** The gate establishes exactly one
+thing: that `open("/dev/kfd")` returned within 2s. The D-state hang it exists to
+prevent is attributed to `amd-smi`'s *later* `ioctl`s against a wedged device,
+not to the open — so a device whose open succeeds and whose next ioctl wedges is
+not covered, and the 2s bound is a chosen number rather than a measured one. No
+run against a genuinely unhealthy driver was performed for this work: the GPU
+lane has no `amd-smi` at all, and the FIFO fixtures model a blocking `open`,
+which is the closest reachable analogue rather than the real failure. What the
+gate does buy is that the common precondition for the hazard — a device the
+kernel will not hand out — refuses the spawn instead of betting on a timeout
+that cannot reach a process in uninterruptible sleep.
+
+**The decline is broader than the hazard, and broader than the ticket.** Any
+unreachable `/dev/kfd` declines, including the fast errno cases that cannot hang
+anything: an absent node (EAI-8457 states the scenario does not apply with no
+`/dev/kfd`) and `EACCES` for a user outside the `render`/`video` groups.
+`gpu_vram_usage` still falls back to the DRM sysfs counters on such a host, but
+`detect_gpu_count` has **no** sysfs fallback and returns `None`, so `--gpu auto`
+there ranks from the sysfs VRAM rows alone. `kfd_readable`'s doc comment carries
+the same statement next to the code.
+
 ## Windows Runtime Preflight
 
 On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
@@ -2678,8 +2823,10 @@ On a machine whose runtime is older than 14.40, `diagnose` reports
 and runs nothing: the update needs the Windows administrator prompt. After the
 update, the plan's verify command prints the new version.
 
-The version comparison and the symptom keywords are covered by unit tests in
-`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+The version comparison is covered by unit tests in
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs), and the
+symptom keywords by `outdated_runtime_symptom_keywords_score_honestly` in
+[scoring.rs](../crates/rocm-core/src/diagnose/scoring.rs). No end-to-end scenario drives this check, because the e2e suite
 cannot give a Linux host a Windows runtime: the check is gated to Windows. The
 catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
 scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
@@ -2701,7 +2848,7 @@ a KFD node planted under the scenario's own root reports `gfx_target_version
 90012`, so it runs on **every** Linux lane, WSL2 included — `@requires-os:linux`
 matches a host whose `os_family` is `linux`, and WSL2's is. Every `rocm` call in
 that scenario therefore has to carry `ROCM_CLI_TEST_HOST_ROOT`: `rocm fix` gates
-on the OS, and `fix::current_os` resolves WSL *through* the host root, so an
+on the OS, and `fix::consent::current_os` resolves WSL *through* the host root, so an
 unrooted call on a WSL2 runner is read as `wsl` — an OS this entry deliberately
 does not apply on — and exits 3.
 
@@ -2728,7 +2875,7 @@ just because no HIP SDK is installed — has no Linux end-to-end coverage.
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
-[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+[windows.rs](../crates/rocm-core/src/diagnose/windows.rs)
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
 `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
 and their neighbours) and by the Windows manual check in

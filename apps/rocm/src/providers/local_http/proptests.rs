@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Property tests for the local provider's SSE transport readers.
+//! Property tests for the local provider's SSE transport readers, declared
+//! from `local_http.rs` so they sit with the readers they test.
 //!
 //! Each property re-frames one of the SSE bodies the unit tests in
 //! `providers.rs` already use (plus the same shape with CRLF line endings and
@@ -15,7 +16,7 @@ use proptest::prelude::*;
 use std::io::{BufReader, Cursor, ErrorKind, Read};
 
 const OPENAI_FIXTURES: &[&str] = &[
-    // providers.rs `parses_openai_sse_chat_events`.
+    // providers/wire.rs `parses_openai_sse_chat_events`.
     "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n",
     // Same body, CRLF line endings.
     "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",

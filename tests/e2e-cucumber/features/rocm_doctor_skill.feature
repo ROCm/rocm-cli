@@ -36,7 +36,7 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # (`@id:fix-catalog-is-complete`), and that a report says plainly whether a
   # cause was established (`@id:diagnose-json-states-when-nothing-matched`).
   # The exit-code and confirm-before-mutating contract is unit tested in
-  # `crates/rocm-core/src/fix.rs`, where a declined consent or a failed write
+  # `crates/rocm-core/src/fix/runners.rs`, where a declined consent or a failed write
   # can be driven directly.
   #
   # The distinction that earns this feature its place: those tests compare the

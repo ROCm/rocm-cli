@@ -312,7 +312,7 @@ sentence fails the scenario. `skill_reference.rs` reads the print-only count.
 
 Two rules follow:
 
-- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+- The catalog is authoritative in [fix/catalog.rs](../../crates/rocm-core/src/fix/catalog.rs). When one of
   these scenarios fails, the CLI is right and the docs are what change.
 - A skill-only edit must still run this job, so `skills/**` is in the `heavy`
   paths filter that gates the `e2e` job.
@@ -325,6 +325,7 @@ on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
 assertion either way would encode one runner's state.
 
 Claims about *whether* a cause was established therefore live in
-`crates/rocm-core/src/diagnose.rs`, where the `Examination` is constructed rather
-than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+[diagnose.rs](../../crates/rocm-core/src/diagnose.rs) and the modules it
+declares, such as [catalog.rs](../../crates/rocm-core/src/diagnose/catalog.rs),
+where the `Examination` is constructed rather than probed. What this feature asserts holds on any host, so it is clean on WSL2,
 the no-GPU lane, and the GPU lanes alike.

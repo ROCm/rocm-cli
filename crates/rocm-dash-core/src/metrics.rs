@@ -42,6 +42,12 @@ pub struct GpuMetrics {
     pub gpu_utilization_pct: f32,
     pub temperature_c: f32,
     pub power_w: f32,
+    /// The board's power cap (W), when the platform reports one. Warning
+    /// thresholds are derived from it; `None` means unknown (never `0`), and
+    /// consumers must not substitute another part's limit. Serde-default so
+    /// older recordings load.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
@@ -215,19 +221,36 @@ pub struct Instance {
     /// Omitted from JSON when `None` to preserve wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_tps_observation: Option<ObservationMetadata>,
-    /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
-    /// occupies. `None` when throughput or GPU power telemetry is unavailable.
+    /// Efficiency: `gen_tps` ÷ the power (W) attributed to this instance
+    /// ([`Instance::power_w`]). `None` when throughput or GPU power telemetry
+    /// is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
+    /// Board power (W) attributed to this instance: each GPU's power split among
+    /// the instances sharing it (see `efficiency::attribute_power_w`). `None`
+    /// when no occupied GPU reports power. Serde-default for replay back-compat.
+    #[serde(default)]
+    pub power_w: Option<f64>,
     /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
-    /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
-    /// Observe shows `—`. Serde-default for NDJSON replay back-compat.
+    /// histogram. `None` until a window sees new requests (or absent for
+    /// non-vLLM engines); Observe shows `—`. Serde-default for NDJSON replay back-compat.
     #[serde(default)]
     pub ttft_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::ttft_ms`]. A value with no new
+    /// requests in the latest scrape window is `Held` until the observation
+    /// validity window lapses, then cleared. `None` when unknown (legacy
+    /// snapshots). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_observation: Option<ObservationMetadata>,
     /// Live average time-per-output-token (ms), windowed from the vLLM TPOT
-    /// histogram. `None` until two scrapes (or absent); Observe shows `—`.
+    /// histogram. `None` until a window sees new requests (or absent);
+    /// Observe shows `—`.
     #[serde(default)]
     pub tpot_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::tpot_ms`]; same semantics as
+    /// [`Instance::ttft_observation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpot_observation: Option<ObservationMetadata>,
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
@@ -258,6 +281,20 @@ mod tests {
     }
 
     #[test]
+    fn gpu_metrics_deserializes_without_power_limit() {
+        // Replay back-compat: recordings made before `power_limit_w` existed
+        // must load with the limit unknown, never 0.
+        let legacy = r#"{
+            "device_id": "gpu-0", "vram_used_mb": 1, "vram_total_mb": 2,
+            "gpu_utilization_pct": 3.0, "temperature_c": 4.0, "power_w": 5.0,
+            "clock_mhz": null
+        }"#;
+        let g: GpuMetrics = serde_json::from_str(legacy).expect("legacy GPU must parse");
+        assert_eq!(g.power_limit_w, None);
+        assert!((g.power_w - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn instance_round_trips_ttft_tpot_through_serde() {
         // The new live-latency fields survive a serialize → deserialize cycle.
         let inst = Instance {
@@ -270,6 +307,29 @@ mod tests {
         let back: Instance = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.ttft_ms, Some(180.5));
         assert_eq!(back.tpot_ms, Some(22.0));
+    }
+
+    #[test]
+    fn instance_latency_observation_is_omitted_when_unknown_and_round_trips() {
+        // Legacy payloads carry no freshness: it stays `None`, never `Fresh`,
+        // and is not written back out.
+        let json = serde_json::to_string(&Instance::default()).expect("serialize");
+        assert!(!json.contains("ttft_observation") && !json.contains("tpot_observation"));
+        let inst = Instance {
+            ttft_ms: Some(100.0),
+            ttft_observation: Some(ObservationMetadata {
+                observed_at: Utc::now(),
+                freshness: ObservationFreshness::Held,
+            }),
+            ..Default::default()
+        };
+        let back: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).expect("serialize")).expect("parse");
+        assert_eq!(
+            back.ttft_observation.map(|m| m.freshness),
+            Some(ObservationFreshness::Held)
+        );
+        assert!(back.tpot_observation.is_none());
     }
 
     #[test]
