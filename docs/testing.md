@@ -977,11 +977,11 @@ Each probe has a five-second timeout. The inventory, including hashing, has a
 when the service stop returns; hashing runs off the async executor, rejects files
 over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
 one buffer whatever the size. The cap sits well above a dynamically linked
-`llama-server` (a few MiB, with the HIP kernels in separate libraries) and above
-what a statically linked multi-target build is expected to weigh, because a
-missing fingerprint on the lane this report is for would defeat it; it is an
-assumption about those builds, not a measured size, and a larger file is a
-finding in its own right. A candidate over the size cap gets no fingerprint, and
+`llama-server`: the `rocm-stable` build b12109 on the Strix Halo Ubuntu lanes
+was fingerprinted under the former 32 MiB cap, so current builds fit with room to
+spare. The larger cap is margin for a statically linked multi-target build,
+which is an assumption about future builds, not a measured size, and a larger
+file is a finding in its own right. A candidate over the size cap gets no fingerprint, and
 its entry says so with `sha256 unavailable: executable exceeds 512 MiB hash
 limit`; it is still listed and probed. Filesystem
 operations and process cleanup are not preemptible, so this is not a hard
