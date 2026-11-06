@@ -1185,6 +1185,73 @@ mod tests {
         assert_eq!(store.files.borrow().len(), 1, "a skip records nothing");
     }
 
+    /// A pushed range that lists no changed files means the range is wrong, not
+    /// that nothing changed, so on the stamped path too it runs the whole
+    /// workspace: it is never skipped as "no Rust crate", an earlier narrow pass
+    /// does not cover it, and it is skipped only by its own earlier pass.
+    #[test]
+    fn an_empty_changed_file_list_runs_the_whole_workspace_on_the_stamped_path() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let narrow = run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            false,
+        );
+        assert_eq!(narrow.cargo, [XTASK_TEST]);
+
+        let empty = run_at(
+            &stamps(&probe, &store, NOW + 5, false),
+            Check::Test,
+            &[],
+            false,
+            false,
+        );
+        empty.result.expect("the empty-range run");
+        assert_eq!(empty.cargo, [WIDE_TEST], "{}", empty.out);
+        assert!(
+            empty
+                .out
+                .contains("the pushed range lists no changed files"),
+            "{}",
+            empty.out
+        );
+        assert!(!empty.out.contains("skipped"), "{}", empty.out);
+        assert_eq!(store.files.borrow().len(), 2, "the wide pass is recorded");
+
+        let again = run_at(
+            &stamps(&probe, &store, NOW + 10, false),
+            Check::Test,
+            &[],
+            false,
+            false,
+        );
+        assert!(again.cargo.is_empty(), "{:?}", again.cargo);
+        assert!(
+            again
+                .out
+                .contains(&format!("this tree already passed `cargo {WIDE_TEST}`")),
+            "{}",
+            again.out
+        );
+
+        // The lint step falls back the same way and is not skipped as "no crate".
+        let clippy = run_at(
+            &stamps(&probe, &store, NOW + 15, false),
+            Check::Clippy,
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(
+            clippy.cargo,
+            ["clippy --workspace --all-targets -- -D warnings"],
+            "{}",
+            clippy.out
+        );
+    }
+
     #[test]
     fn a_narrow_pass_never_lets_a_wider_selection_skip() {
         let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
