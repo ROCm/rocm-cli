@@ -9,7 +9,7 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `SetupCommand`, the clap enum `setup` matches on,
-//! stays in `main.rs` with the rest of the `Command`/`Cli` definition.
+//! lives in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `dispatch()` calls `setup` through the re-import `use
 //! crate::setup_cmd::{...};`, and `chat.rs`'s read-only handling of `rocm setup`
 //! and `rocm setup status` reaches `render_setup_status_text` as

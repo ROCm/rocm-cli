@@ -723,3 +723,64 @@ Feature: Interactive dashboard
     Then the Home view counts the managed model as running and shows it as loading
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # ROCMAI-196: the instance detail modal's "recent throughput" panel is
+  # fed from the dashboard's snapshot history. The scripted-metrics managed
+  # model gives real scraped ticks, so this scenario asserts only a populated
+  # row. The idle and no-data placeholders and the short-terminal collapse
+  # are pinned by render tests in `ui/instance_detail.rs`.
+  @id:dash-instance-detail-recent-throughput @requires-os:linux
+  Scenario: dash-42 - Instance detail lists recent throughput samples for a serving model
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the user opens instance detail
+    Then instance details are displayed
+    And the instance detail lists recent throughput samples
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The dashboard follows the managed-service registry on a timer. A pass that
+  # cannot read the registry says nothing about the services in it, so it must
+  # not retire the model that is on screen: the header warns that the registry
+  # is not being read, and the model stays. The registry is made unreadable by
+  # adding one record that cannot be opened (a link to itself), in a single step
+  # that leaves the model's own record in place, so no poll of the registry can
+  # see it empty or absent, and no permission setup of the runner (running as
+  # root) can make it readable. A registry that reads but is empty does retire
+  # a service; that contrast, the recovery path and the once-per-streak log
+  # line are asserted by the daemon's own tests in
+  # `crates/rocm-dash-daemon/tests/`, where the loop runs without a terminal.
+  @id:dash-managed-model-survives-unreadable-registry @requires-os:linux
+  Scenario: dash-43 - A managed model stays on screen while its registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    Then the header warns that the registry is not being read
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The same registry failure, from the other side: a service whose record can be
+  # read is still added while some other record cannot be opened. The dashboard
+  # reads what it can and retires nothing, so a model that is started beside a
+  # stale unreadable record appears on screen (and the first model stays). The
+  # daemon's own tests in `crates/rocm-dash-daemon/tests/` assert the rest of the
+  # matrix: a record removed during the failure is not retired until the registry
+  # reads in full, and a record that becomes unreadable is not announced again
+  # when it reads again.
+  @id:dash-new-model-appears-beside-unreadable-record @requires-os:linux
+  Scenario: dash-44 - A newly served model appears while another record in the registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    And another managed model is served
+    Then the other managed model is displayed
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

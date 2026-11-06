@@ -224,7 +224,7 @@ fn remote_doctor(
     // Deliberately not `ensure_ready`: that provisions a missing CLI, and a
     // health check has no business installing software on a machine it was only
     // asked to look at. The daemon's read-only allowlist
-    // (`ensure_rocm_command_is_read_only` in `apps/rocmd/src/lib.rs`) admits
+    // (`ensure_rocm_command_is_read_only` in `apps/rocmd/src/mcp_argv.rs`) admits
     // `remote doctor` without the approval flow, which is only true while this
     // stays a pure read.
     let remote_cli = bootstrap::locate_cli(&transport, target)?;
@@ -545,8 +545,7 @@ fn unwind_partial_serve(
 
     if let Some(service_id) = service_id {
         match transport.exec(&crate::service_hints::remote_service_stop_hint(
-            remote_cli,
-            &rocm_core::posix_shell_quote(service_id),
+            remote_cli, service_id,
         )) {
             Ok(outcome) if outcome.success => {}
             Ok(outcome) => leftovers.push(format!(
@@ -1109,7 +1108,7 @@ fn stop_with_transport(
     let withdrawn = publish::withdraw(transport, record.tailnet_port, record.remote_port);
     let stopped = transport.exec(&crate::service_hints::remote_service_stop_hint(
         &record.remote_cli,
-        &rocm_core::posix_shell_quote(&record.remote_service_id),
+        &record.remote_service_id,
     ));
     let stop_failure = describe_stop_failure(&stopped);
     let model_stopped = stop_failure.is_none();
@@ -2026,6 +2025,55 @@ mod tests {
              the hint prints, --yes included: {:?}",
             transport.calls()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The service ids the two remote stop paths send, split the way the remote
+    /// shell will split them. `remote_service_stop_hint` quotes the id itself,
+    /// so a caller that quoted it again would send the quotes as part of the id.
+    fn sent_stop_argvs(transport: &ScriptedTransport) -> Vec<Vec<String>> {
+        transport
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                TransportCall::Exec { command, .. } if command.contains("services stop") => {
+                    shlex::split(&command)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stop_argv(service_id: &str) -> Vec<String> {
+        ["rocm", "services", "stop", service_id, "--yes"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // Mutation: quoting the id at either call site as well as in the hint
+    // builder, or at neither, fails this.
+    #[test]
+    fn both_remote_stop_paths_send_the_service_id_as_one_word() {
+        let awkward = "svc 'a b'";
+
+        let (root, paths) = temp_paths("unwind-awkward-id");
+        let transport = ScriptedTransport::new(vec![ScriptedStep::ok("services stop", "")]);
+        let leftovers =
+            unwind_partial_serve(&transport, &paths, "sess", "rocm", Some(awkward), None);
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(sent_stop_argvs(&transport), vec![stop_argv(awkward)]);
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, paths) = temp_paths("stop-awkward-id");
+        let mut record = seeded_session(&paths);
+        record.remote_service_id = awkward.to_owned();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedStep::ok("tailscale serve status", "{}"),
+            ScriptedStep::ok("services stop", ""),
+        ]);
+        stop_with_transport(&transport, &paths, &record, false).expect("a confirmed stop succeeds");
+        assert_eq!(sent_stop_argvs(&transport), vec![stop_argv(awkward)]);
         let _ = std::fs::remove_dir_all(root);
     }
 

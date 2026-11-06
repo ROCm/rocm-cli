@@ -11,6 +11,7 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod amd_smi_launch_contract;
 mod ascii_output_contract;
 mod catalog;
 mod coverage;
@@ -23,9 +24,12 @@ mod env_mutation_contract;
 mod eval_fixtures;
 mod lychee;
 mod manifest;
+mod module_size;
 mod package;
 mod paths;
 mod powershell;
+mod prepush;
+mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
 mod rocm_releases;
@@ -105,10 +109,44 @@ pub(crate) enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Run one cargo step of the pre-push hook over only the crates the push
+    /// affects: the changed crates plus their transitive dependents, selected
+    /// as `cargo xtask affected` does, from the range prek exports to the hook
+    /// (`PRE_COMMIT_FROM_REF`..`PRE_COMMIT_TO_REF`).
+    ///
+    /// The step runs over the whole workspace whenever the affected crates
+    /// cannot be determined, and prints why. It is skipped only when the
+    /// selection is known and has nothing for the step to check. CI always
+    /// checks the whole workspace.
+    PrePushCheck {
+        /// Which step to run.
+        #[arg(value_enum)]
+        check: prepush::Check,
+        /// Base ref for the `<base>...HEAD` range, instead of the ref prek
+        /// provides. Without either it defaults to `origin/main`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Print the scope and the cargo command without running it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Fail if any first-party crate has gained a normal/build dependency
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
+    /// Fail if any source file has more than 1,500 production lines, naming
+    /// each offender with its count. Production lines exclude test-gated items
+    /// (inline `#[cfg(test)]` modules and the like) and test-only files. There
+    /// is one limit for every file and no way to exempt one; the definition is
+    /// in `xtask/src/module_size.rs`.
+    CheckModuleSize,
+    /// The same check as `check-module-size`, but it only reports: it prints the
+    /// offenders and exits successfully, including when the check itself cannot
+    /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
+    /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
+    /// non-zero before this code runs. The local pre-commit hook runs this until
+    /// the limit is enforced.
+    CheckModuleSizeAdvisory,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
@@ -289,6 +327,46 @@ pub(crate) enum Command {
     /// baseline, and a rise in the latest is a lower bound. Sends and files
     /// nothing. Counts are reports, not people.
     ReportRollup(report_rollup::Args),
+    /// Compute a mechanical GO/NO-GO release-readiness verdict and status
+    /// table from the nightly build/E2E results and commits since the last
+    /// release tag, plus the categorized facts an LLM narrative step drafts
+    /// prose from (the verdict and table never depend on that step).
+    ReleaseReadiness {
+        /// Baseline tag for `git log <tag>..HEAD` (e.g. the last published
+        /// release tag, resolved by the caller via `git describe --tags
+        /// --abbrev=0 --match 'v*' --exclude 'v*-*'`).
+        #[arg(long)]
+        since_tag: String,
+        /// Path to the consolidated E2E `support-matrix.md` produced by
+        /// `cargo xtask e2e-report` (reused as-is, not regenerated).
+        #[arg(long)]
+        e2e_report: PathBuf,
+        /// The calling workflow's own nightly Linux build job result
+        /// (`needs.nightly.result`).
+        #[arg(long)]
+        nightly_result: String,
+        /// The calling workflow's own nightly Windows build job result
+        /// (`needs.windows-nightly.result`).
+        #[arg(long)]
+        windows_result: String,
+        /// The calling workflow's `e2e-report-nightly` job result (`needs.e2e-report-nightly.result`).
+        /// That job already fails if any E2E lane that ran didn't upload its
+        /// `report.json` (preflight failure, timeout, runner loss), which would
+        /// otherwise just vanish from the consolidated E2E report's totals,
+        /// reading as zero failures. Gating on this job's result (rather than
+        /// each lane job's own `continue-on-error`-masked result, which is
+        /// always `success`) covers every lane, present and future, for free.
+        /// Caveat: a re-run can pass on an earlier attempt's artifact, so this
+        /// can miss a lane.
+        #[arg(long)]
+        e2e_report_job_result: String,
+        /// Path to write the structured facts JSON (input to the narrative step).
+        #[arg(long)]
+        out: PathBuf,
+        /// Path to write the mechanical verdict + status table markdown.
+        #[arg(long)]
+        table_out: PathBuf,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -324,7 +402,14 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::PrePushCheck {
+            check,
+            base,
+            dry_run,
+        } => prepush::run(check, base, dry_run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
+        Command::CheckModuleSize => module_size::run()?,
+        Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
@@ -380,6 +465,23 @@ fn run() -> Result<()> {
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
         Command::ReportRollup(args) => report_rollup::run(&args)?,
+        Command::ReleaseReadiness {
+            since_tag,
+            e2e_report,
+            nightly_result,
+            windows_result,
+            e2e_report_job_result,
+            out,
+            table_out,
+        } => release_readiness::run(
+            &since_tag,
+            &e2e_report,
+            &nightly_result,
+            &windows_result,
+            &e2e_report_job_result,
+            &out,
+            &table_out,
+        )?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

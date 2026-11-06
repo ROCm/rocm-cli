@@ -565,7 +565,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: nextest
 
@@ -1427,6 +1427,34 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask eval-fixtures --check
 
+      # Advisory for now. `cargo xtask check-module-size` is strict on its own;
+      # only this step is non-blocking. `continue-on-error` keeps the job green
+      # while the warning annotation and the job summary list the offenders. When
+      # files are over the limit the step itself shows as failed (red) in the
+      # job's step list, because it ends in `exit 1`, while the job and the check
+      # stay green: that is the advisory phase, not a failure to chase.
+      # Making the limit blocking means deleting `continue-on-error` and the
+      # capture below, leaving the bare command.
+      - name: Source files are within the module-size limit (advisory)
+        if: needs.changes.outputs.rust == 'true'
+        continue-on-error: true
+        run: |
+          report="$RUNNER_TEMP/module-size.txt"
+          if cargo xtask check-module-size > "$report" 2>&1; then
+            cat "$report"
+          else
+            cat "$report"
+            echo "::warning title=Module size (advisory)::$(sed 's/%/%25/g' "$report" | tr '\n' ' ')"
+            {
+              echo '### Source files over the module-size limit (advisory)'
+              echo
+              echo '```'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
       # is gated on sccache being present rather than on the remote backend being
@@ -1506,7 +1534,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-llvm-cov
 

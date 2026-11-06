@@ -4,7 +4,7 @@
 
 //! The text rule for the lines `rocm fix` and `rocm diagnose` print for Windows.
 //!
-//! This is a copy of `fails_in_windows_powershell` in `crates/rocm-core/src/fix.rs`
+//! This is a copy of `fails_in_windows_powershell` in `crates/rocm-core/src/fix/catalog.rs`
 //! (test-only there; this crate does not depend on rocm-core, and
 //! `cargo xtask check-crate-edges` is not to be bypassed). Two copies drift, so
 //! both are tested against the one table in
