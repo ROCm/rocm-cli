@@ -43,9 +43,14 @@ use rocm_core::{
 use serde::Deserialize;
 use std::fmt::Write as _;
 
+// `format_structured_tool_call` lives in `rocm_argv.rs` and stays reachable here
+// as `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
+// `freeform_execution.rs` and `providers.rs`'s tests).
+pub(crate) use crate::rocm_argv::format_structured_tool_call;
+use crate::rocm_argv::serve_args_request_cpu_device;
 use crate::service_launch::is_loopback_host;
-use crate::shell_quote::{has_terminal_control_character, shell_quote};
-use crate::{Cli, chat, providers};
+use crate::shell_quote::has_terminal_control_character;
+use crate::{Cli, prompt_text, providers, rocm_argv, tool_policy};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
 /// below; production code calls [`plan_freeform_request_with_context`]
@@ -368,7 +373,7 @@ fn build_freeform_plan_on(
             .map(|recipe| recipe.canonical_model_id.as_str())
             .or(requested_model)
             .unwrap_or("<model>");
-        let engine = infer_engine_from_request(&lower)
+        let engine = prompt_text::infer_engine_from_request(&lower)
             .or_else(|| resolved_recipe.as_ref().and_then(planner_recipe_engine))
             .unwrap_or(default_engine);
         let device_policy = infer_device_policy_from_request(&lower).or_else(|| {
@@ -376,7 +381,7 @@ fn build_freeform_plan_on(
                 .as_ref()
                 .map(|recipe| recipe.device_policy.as_str())
         });
-        if device_policy.is_some_and(device_policy_is_cpu_mode) {
+        if device_policy.is_some_and(rocm_argv::device_policy_is_cpu_mode) {
             let (parsed, confidence) = serve_plan_parsed_fields_and_confidence(
                 model,
                 engine,
@@ -456,7 +461,7 @@ fn build_freeform_plan_on(
     }
 
     if planner_mentions_comfyui(&lower) {
-        if chat::any_substring(&lower, &["log", "logs"]) {
+        if prompt_text::any_substring(&lower, &["log", "logs"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Inspect,
@@ -471,7 +476,7 @@ fn build_freeform_plan_on(
                 Vec::new(),
             );
         }
-        if chat::any_substring(&lower, &["start", "run", "launch", "open"]) {
+        if prompt_text::any_substring(&lower, &["start", "run", "launch", "open"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Serve,
@@ -522,8 +527,8 @@ fn build_freeform_plan_on(
         } else {
             "release"
         };
-        let build_date = chat::requested_therock_build_date_from_prompt(&lower);
-        let Some(prefix) = chat::requested_install_prefix_from_prompt(trimmed) else {
+        let build_date = prompt_text::requested_therock_build_date_from_prompt(&lower);
+        let Some(prefix) = prompt_text::requested_install_prefix_from_prompt(trimmed) else {
             let mut parsed = vec![
                 ("channel".to_owned(), channel.to_owned()),
                 ("format".to_owned(), "wheel".to_owned()),
@@ -717,31 +722,6 @@ fn planned_device_policy_without_fallback(policy: &str) -> &str {
         "gpu_preferred" => "gpu_required",
         other => other,
     }
-}
-
-fn device_policy_is_cpu_mode(policy: &str) -> bool {
-    matches!(
-        policy.trim().to_ascii_lowercase().as_str(),
-        "cpu" | "cpu_only"
-    )
-}
-
-pub(crate) fn serve_args_request_cpu_device(args: &[String]) -> bool {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--device=")
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-        if arg == "--device"
-            && let Some(value) = iter.peek()
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn planner_resolve_model_recipe(
@@ -1031,12 +1011,12 @@ pub(crate) fn validate_provider_planner_tool_call(
         [command] if command == "examine" => {}
         [command, subcommand] if command == "engines" && subcommand == "list" => {}
         [command, subcommand, ..] if command == "install" && subcommand == "sdk" => {
-            chat::validate_chat_rocm_command_safety(&call.args)?;
+            tool_policy::validate_chat_rocm_command_safety(&call.args)?;
         }
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
         [command, ..] if command == "serve" => {
-            if chat::chat_cli_has_flag(&call.args, "--allow-public-bind") {
+            if rocm_argv::chat_cli_has_flag(&call.args, "--allow-public-bind") {
                 bail!("provider planner cannot request public network binding");
             }
             if serve_args_request_cpu_device(&call.args) {
@@ -1044,13 +1024,13 @@ pub(crate) fn validate_provider_planner_tool_call(
                     "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution"
                 );
             }
-            if let Some(host) = chat::chat_cli_arg_value(&call.args, "--host")
+            if let Some(host) = rocm_argv::chat_cli_arg_value(&call.args, "--host")
                 && !is_loopback_host(host)
             {
                 bail!("provider planner cannot request non-local host `{host}`");
             }
-            if chat::chat_cli_has_flag(&call.args, "--foreground")
-                || !chat::chat_cli_has_flag(&call.args, "--managed")
+            if rocm_argv::chat_cli_has_flag(&call.args, "--foreground")
+                || !rocm_argv::chat_cli_has_flag(&call.args, "--managed")
             {
                 bail!("provider planner must request managed serving with --managed");
             }
@@ -1235,11 +1215,11 @@ fn planner_is_inspect_request(lower: &str) -> bool {
 }
 
 fn planner_mentions_comfyui(lower: &str) -> bool {
-    chat::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
+    prompt_text::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
 }
 
 fn planner_requests_comfyui_install(lower: &str) -> bool {
-    chat::any_substring(
+    prompt_text::any_substring(
         lower,
         &[
             "can you setup",
@@ -1257,19 +1237,6 @@ fn planner_requests_comfyui_install(lower: &str) -> bool {
 fn contains_planner_word(text: &str, expected: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
         .any(|word| word == expected)
-}
-
-pub(crate) fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
-    // Word-boundary match, not substring: "aim" as a bare `.contains` also
-    // matches "aiming"/"claim"/"maintain", silently steering an unrelated
-    // chat request onto the Docker-backed AIM engine.
-    let words: std::collections::HashSet<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
-    ["lemonade", "vllm", "aim"]
-        .into_iter()
-        .find(|engine| words.contains(engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -1321,48 +1288,8 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
-/// Render an argv as the command line a human is shown for it.
-///
-/// This is the only thing an operator sees before approving a mutating tool
-/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
-/// line) is offered to be copied and run. So it has to denote the argv it was
-/// built from: quoted with [`shell_quote`], every argument splits back to
-/// itself under a shell's own word-splitting, and nothing inside a value can
-/// read as a second command.
-///
-/// Values carrying terminal control characters never get here — they are
-/// refused at validation ([`has_terminal_control_character`]), because no
-/// amount of quoting stops a `\r` from rewriting the line the operator is
-/// reading.
-pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| shell_quote(arg)));
-    parts.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::infer_engine_from_request;
-
-    /// "aim" must match as its own word, not as a substring of an unrelated
-    /// word like "aiming"/"claim"/"maintain" in a free-text chat request.
-    #[test]
-    fn infer_engine_from_request_does_not_match_aim_as_a_substring() {
-        assert_eq!(
-            infer_engine_from_request("serve a small model, aiming for low latency"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("please explain how to maintain a claim"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("serve qwen3.5-9b with aim"),
-            Some("aim")
-        );
-    }
-
     use super::*;
     use crate::tests::test_paths;
 

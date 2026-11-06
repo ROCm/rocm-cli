@@ -405,7 +405,7 @@ pub fn process_is_running(pid: u32) -> bool {
 /// serialize check-then-act sequences over shared on-disk state — e.g. the
 /// daemon autostart decision, the managed-serve GPU select-then-claim, a
 /// `uv` install, and each JSONL store's append-or-repair and read-modify-write
-/// (see `jsonl_lock_path` in `automation.rs`) — so two concurrent invocations
+/// (see `jsonl_lock_path` in `jsonl_store.rs`) — so two concurrent invocations
 /// cannot both pass the same check, or interleave a write with another's.
 ///
 /// The lock is released when the guard is dropped, and by the OS if the process

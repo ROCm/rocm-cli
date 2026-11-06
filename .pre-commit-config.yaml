@@ -202,7 +202,7 @@ repos:
         # rather than merely reported.
         entry: cargo xtask catalog
         language: system
-        files: '^(crates/rocm-core/src/fix\.rs|xtask/.*|doctor-catalog\.json)$'
+        files: '^(crates/rocm-core/src/fix\.rs|crates/rocm-core/src/fix/.*|xtask/.*|doctor-catalog\.json)$'
         pass_filenames: false
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job

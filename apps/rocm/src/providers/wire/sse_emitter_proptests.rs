@@ -9,7 +9,7 @@
 //!   split of each body produces the events (and the error, for a body that
 //!   fails) of the whole body, and the whole body produces the exact events
 //!   each fixture lists. OpenAI fixture 1 is the body of
-//!   `parses_openai_sse_chat_events` in `providers.rs`. The others are written
+//!   `parses_openai_sse_chat_events` in `wire.rs`. The others are written
 //!   here, in the shapes those servers send, to reach what that one body does
 //!   not: CRLF line endings (what Python SSE servers emit by default),
 //!   multi-byte UTF-8 content so that a split can land inside a UTF-8 sequence,
@@ -30,7 +30,7 @@
 //!   field-reading branch, so the guard does not go quiet on one.
 //! - An ignored reproducer for #516 (in-band OpenAI error payloads).
 //!
-//! The transport readers the sibling `proptests` module covers (chunked,
+//! The transport readers that `local_http`'s `proptests` module covers (chunked,
 //! `Content-Length` and close-delimited bodies) feed only the OpenAI emitter,
 //! on the local-provider path. On the remote-provider path, the only one the
 //! Anthropic emitter has, both emitters are fed by `stream_json_with_headers`
@@ -57,7 +57,7 @@ type Fixture = (
 );
 
 const OPENAI_FIXTURES: &[Fixture] = &[
-    // providers.rs `parses_openai_sse_chat_events`.
+    // providers/wire.rs `parses_openai_sse_chat_events`.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n",
         &[("hel", false), ("lo", false), ("", true)],
