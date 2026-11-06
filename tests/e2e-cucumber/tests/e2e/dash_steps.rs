@@ -2703,6 +2703,72 @@ async fn managed_model_stays_displayed(world: &mut E2eWorld) {
     }
 }
 
+/// The model `another managed model is served` adds beside the first one.
+const OTHER_MODEL: &str = "TestModel/E2E-2B";
+
+/// Serve a second model: write a record for it into the registry, as `rocm serve`
+/// does, by copying the first model's record under another service id and name.
+/// It is written to a temporary name and renamed into place, so a poll of the
+/// registry never reads half a record (which would read as a malformed one, not
+/// as the new service).
+///
+/// The record points at a disposable `sleep` child, not at the harness, for the
+/// reason `managed_model_record_points_at_disposable_process` gives: the World's
+/// teardown runs `rocm services stop <id> --yes` for every record but the first
+/// model's, and that signals whatever process the record names. The child is kept
+/// in `recorded_process`, which teardown reaps.
+#[when("another managed model is served")]
+async fn another_managed_model_is_served(world: &mut E2eWorld) {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn the disposable process for the second model");
+    let pid = child.id();
+    let start_ticks = rocm_core::process_start_ticks(pid);
+    world.recorded_process = Some(child);
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let first = std::fs::read(services_dir.join("e2e-mock.json"))
+        .expect("the first model's record should be in the registry");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&first).expect("the first model's record should be JSON");
+    record["service_id"] = "e2e-second".into();
+    record["model_ref"] = OTHER_MODEL.into();
+    record["canonical_model_id"] = OTHER_MODEL.into();
+    record["supervisor_pid"] = pid.into();
+    record["engine_pid"] = pid.into();
+    record["supervisor_start_ticks"] = serde_json::to_value(start_ticks).unwrap();
+    let staged = services_dir.join("e2e-second.json.tmp");
+    std::fs::write(
+        &staged,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize the second record"),
+    )
+    .expect("failed to stage the second record");
+    std::fs::rename(&staged, services_dir.join("e2e-second.json"))
+        .expect("failed to publish the second record");
+}
+
+/// The second model is on screen although the registry still holds a record that
+/// cannot be opened. The step before it left the header warning in place, so the
+/// registry is known to be failing while this waits.
+#[then("the other managed model is displayed")]
+async fn other_managed_model_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(OTHER_MODEL, default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the newly served model never appeared while one registry record could not \
+                 be read: {e}"
+            )
+        });
+}
+
 /// EAI-7960 principal regression assertion.
 ///
 /// The frame under assertion is provably post-failure (the header warnings

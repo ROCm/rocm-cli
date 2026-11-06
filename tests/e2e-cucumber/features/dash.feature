@@ -763,3 +763,24 @@ Feature: Interactive dashboard
     And the managed model stays displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # The same registry failure, from the other side: a service whose record can be
+  # read is still added while some other record cannot be opened. The dashboard
+  # reads what it can and retires nothing, so a model that is started beside a
+  # stale unreadable record appears on screen (and the first model stays). The
+  # daemon's own tests in `crates/rocm-dash-daemon/tests/` assert the rest of the
+  # matrix: a record removed during the failure is not retired until the registry
+  # reads in full, and a record that becomes unreadable is not announced again
+  # when it reads again.
+  @id:dash-new-model-appears-beside-unreadable-record @requires-os:linux
+  Scenario: dash-44 - A newly served model appears while another record in the registry cannot be read
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the managed-service registry becomes unreadable
+    And another managed model is served
+    Then the other managed model is displayed
+    And the managed model stays displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
