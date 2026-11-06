@@ -16,7 +16,8 @@
 //! relative markdown link in `docs/architecture.md` (a complete inline link,
 //! `[text](path)`, with its text on one line, that renders as a link: a path
 //! inside an HTML comment, a code block or a code span does not count, and
-//! neither does a link missing its `[` or `)` or one with an escaped bracket),
+//! neither does a link missing its `[` or `)`, one with an escaped bracket, an
+//! image, or the outer brackets of a link that contains another link),
 //! or be listed in [`EXEMPT`], or be a test-only helper (see
 //! [`is_test_helper`]). It reads the
 //! index and the working tree, never a git diff, so it behaves the same in CI,
@@ -25,9 +26,11 @@
 //! [`EXEMPT`] is the files that existed, uncited, when the check was added. It
 //! follows the pattern of `ALLOWLIST` in [`crate::crate_edges`] and is checked
 //! in both directions: a source file in neither the doc nor the list fails,
-//! and so does a list entry that is now cited or no longer exists. The list can
-//! therefore only shrink by documenting a file, and growing it is a reviewed
-//! change to this file.
+//! and so does a list entry that is now cited or no longer exists. The list is
+//! meant to shrink as files are documented. Nothing can stop a determined edit
+//! from adding to it, so [`EXEMPT_CEILING`] pins its size in a test: growing
+//! the list means raising that constant too, a second, visible line in the diff
+//! that a reviewer has to accept.
 //!
 //! What this does not check: whether an entry's prose still describes the file,
 //! and functions that move between two files that are both already cited.
@@ -52,9 +55,9 @@ const SOURCE_ROOTS: [&str; 3] = ["apps", "crates", "engines"];
 /// Production files that have no entry in `docs/architecture.md` yet: everything
 /// that was uncited when this check was added, mostly the dashboard crates.
 /// Do not add to this list to make the check pass: document the file in the doc
-/// instead. An entry belongs here only when a file deliberately has no entry,
-/// and that is a reviewed decision. Remove an entry when the file gets one.
-/// Keep it sorted.
+/// instead. Growing it is a reviewed exception and also needs
+/// [`EXEMPT_CEILING`] raised. Remove an entry when the file gets one. Keep it
+/// sorted.
 const EXEMPT: &[&str] = &[
     "apps/rocmd/src/main.rs",
     "crates/rocm-dash-collectors/src/amd_smi.rs",
@@ -134,6 +137,11 @@ const EXEMPT: &[&str] = &[
     "engines/lemonade/src/main.rs",
     "engines/vllm/src/main.rs",
 ];
+
+/// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
+/// not raise it to make the check pass, since a file with no entry in the module
+/// map should get one. Raising it is the visible, reviewed way to grow the list.
+const EXEMPT_CEILING: usize = 77;
 
 /// Whether `path` is a tracked-file path this check covers: a `.rs` file under
 /// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
@@ -242,9 +250,9 @@ fn code_span_len(text: &str) -> Option<usize> {
 ///
 /// It scans once, left to right, so the usual precedence holds: a backtick
 /// inside a comment is part of the comment, and `<!--` inside a code span is
-/// code. Where it cannot tell (an unclosed backtick), it errs towards hiding a
-/// link, which can only make the check fail, never pass. Indented code blocks
-/// are not recognised.
+/// code. A backslash-escaped backtick or `<` opens nothing. Where it cannot tell
+/// (an unclosed backtick), it errs towards hiding a link, which can only make
+/// the check fail, never pass. Indented code blocks are not recognised.
 fn link_source_text(doc: &str) -> String {
     let doc = doc.replace("\r\n", "\n");
     let mut out = String::with_capacity(doc.len());
@@ -266,6 +274,13 @@ fn link_source_text(doc: &str) -> String {
                 out.push('\n');
                 continue;
             }
+        }
+        if escapes_next(doc.as_bytes(), at) {
+            // An escaped backtick or `<` opens nothing. Keep both characters so
+            // `link_destinations` still sees the escape.
+            out.push_str(&rest[..2]);
+            at += 2;
+            continue;
         }
         if rest.starts_with("<!--") {
             at += rest.find("-->").map_or(rest.len(), |end| end + 3);
@@ -385,15 +400,27 @@ fn inline_destination(text: &str) -> Option<(String, usize)> {
     (bytes.get(at) == Some(&b')')).then_some((destination, at + 1))
 }
 
+/// An unmatched `[` while scanning for links.
+struct Opener {
+    /// Preceded by an unescaped `!`: an image, whose destination is not a link.
+    image: bool,
+    /// Cleared once a link has formed inside this one: links do not nest, so the
+    /// outer brackets then render as plain text.
+    active: bool,
+}
+
 /// The destination of every complete inline link, `[text](destination)`, in
 /// `text`. A bracket or parenthesis escaped with a backslash does not count,
 /// the `[` must be on the same line as its `]`, and a link missing its `[`, its
 /// `)` or its destination is not a link: the rendered page shows it as plain
-/// text, so it must not count as a citation either.
+/// text, so it must not count as a citation either. The same goes for an image,
+/// `![alt](destination)`, and for the outer brackets of a link that contains
+/// another link; an image inside a link's text is fine.
 fn link_destinations(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
-    let mut open = 0usize;
+    let mut openers: Vec<Opener> = Vec::new();
+    let mut last_bang = None;
     let mut at = 0;
     while at < bytes.len() {
         if escapes_next(bytes, at) {
@@ -401,14 +428,24 @@ fn link_destinations(text: &str) -> Vec<String> {
             continue;
         }
         match bytes[at] {
-            b'\n' => open = 0,
-            b'[' => open += 1,
-            b']' if open > 0 => {
-                open -= 1;
-                if bytes.get(at + 1) == Some(&b'(')
+            b'\n' => openers.clear(),
+            b'!' => last_bang = Some(at),
+            b'[' => openers.push(Opener {
+                image: at > 0 && last_bang == Some(at - 1),
+                active: true,
+            }),
+            b']' => {
+                if let Some(opener) = openers.pop()
+                    && opener.active
+                    && bytes.get(at + 1) == Some(&b'(')
                     && let Some((destination, length)) = inline_destination(&text[at + 2..])
                 {
-                    found.push(destination);
+                    if !opener.image {
+                        found.push(destination);
+                        for outer in openers.iter_mut().filter(|outer| !outer.image) {
+                            outer.active = false;
+                        }
+                    }
                     at += 2 + length;
                     continue;
                 }
@@ -445,8 +482,7 @@ fn check(tracked: &[String], cited: &BTreeSet<String>, exempt: &[&str]) -> Vec<S
         if !cited.contains(*path) && !exempt.contains(path) && !is_test_helper(path) {
             violations.push(format!(
                 "`{path}` is not cited in {DOC}: add an entry for it to the module map, as a \
-                 relative markdown link. If it deliberately has no entry, add it to EXEMPT in \
-                 xtask/src/architecture_doc.rs instead"
+                 relative markdown link"
             ));
         }
     }
@@ -495,11 +531,24 @@ fn tracked_files(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The violation, if any, of `entries` exempt files exceeding `ceiling`.
+fn ceiling_violation(entries: usize, ceiling: usize) -> Option<String> {
+    (entries > ceiling).then(|| {
+        format!(
+            "EXEMPT holds {entries} entries but EXEMPT_CEILING is {ceiling}: a file with no entry \
+             in the module map should get one, not an EXEMPT line. Growing the list means raising \
+             EXEMPT_CEILING in xtask/src/architecture_doc.rs too, which is a reviewed exception"
+        )
+    })
+}
+
 /// Run the check against the real workspace.
 fn violations_in(root: &Path) -> Result<Vec<String>> {
     let doc =
         std::fs::read_to_string(root.join(DOC)).with_context(|| format!("failed to read {DOC}"))?;
-    Ok(check(&tracked_files(root)?, &cited_paths(&doc), EXEMPT))
+    let mut violations = check(&tracked_files(root)?, &cited_paths(&doc), EXEMPT);
+    violations.extend(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING));
+    Ok(violations)
 }
 
 /// Fail if a production source file has no entry in `docs/architecture.md`, or
@@ -803,7 +852,80 @@ mod tests {
             cited_paths("[x](../crates/a/src/b(1).rs)"),
             cites(&["crates/a/src/b(1).rs"])
         );
-        assert!(cited_cli("![image](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn an_image_is_not_a_citation() {
+        assert!(!cited_cli("![cli](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("see ![cli](../apps/rocm/src/cli.rs \"title\")"));
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        let violations = check(
+            &tracked,
+            &cited_paths("![cli](../apps/rocm/src/cli.rs)"),
+            &[],
+        );
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn an_escaped_exclamation_mark_does_not_make_an_image() {
+        assert!(cited_cli("\\![cli](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli("wow! [cli](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn an_image_inside_a_links_text_leaves_the_link_valid() {
+        let doc = "[![icon](../apps/rocm/src/icon.rs)](../apps/rocm/src/cli.rs)";
+        assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/cli.rs"]));
+    }
+
+    #[test]
+    fn a_link_containing_a_link_cites_only_the_inner_one() {
+        // Links cannot nest: the page renders only the inner link, so the outer
+        // destination is plain text.
+        let doc = "[cli [d](../apps/rocm/src/d.rs)](../apps/rocm/src/cli.rs)";
+        assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/d.rs"]));
+        assert!(!cited_cli(
+            "[cli [details](../README.md)](../apps/rocm/src/cli.rs)"
+        ));
+        // Plain brackets in the text do not form a link, so the outer one stays.
+        assert!(cited_cli("[cli [note]](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli("[cli [note] x](../apps/rocm/src/cli.rs)"));
+        // Later links on the line are unaffected.
+        let doc = "[a [b](../apps/rocm/src/b.rs)](../x.rs) and [c](../apps/rocm/src/c.rs)";
+        assert_eq!(
+            cited_paths(doc),
+            cites(&["apps/rocm/src/b.rs", "apps/rocm/src/c.rs"])
+        );
+    }
+
+    #[test]
+    fn an_escaped_backtick_does_not_open_a_code_span() {
+        assert!(cited_cli(
+            "Use \\` for a backtick; [`cli.rs`](../apps/rocm/src/cli.rs)"
+        ));
+        // An escaped backslash does not escape the backtick after it.
+        assert!(!cited_cli("\\\\`[cli](../apps/rocm/src/cli.rs)`"));
+        // An escaped `<` does not open a comment.
+        assert!(cited_cli("\\<!-- [cli](../apps/rocm/src/cli.rs) -->"));
+    }
+
+    #[test]
+    fn the_exempt_list_stays_within_its_ceiling() {
+        assert_eq!(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING), None);
+        assert_eq!(ceiling_violation(77, 77), None);
+        assert_eq!(ceiling_violation(70, 77), None);
+        let violation = ceiling_violation(78, 77).expect("one over the ceiling fails");
+        assert!(violation.contains("78 entries"));
+        assert!(violation.contains("EXEMPT_CEILING is 77"));
+    }
+
+    #[test]
+    fn the_failure_message_for_an_uncited_file_only_asks_for_an_entry() {
+        let violations = check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("add an entry for it to the module map"));
+        assert!(!violations[0].contains("EXEMPT"));
     }
 
     #[test]
