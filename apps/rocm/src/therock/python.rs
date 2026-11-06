@@ -736,7 +736,7 @@ fn unchecked_tag_caveat(tag_check: TagCheck, requirement: PythonRequirement) -> 
 /// It changes only the wording of the two progress lines about a Python that
 /// turned out unusable: an install says what it goes on to do, a preview states
 /// the finding and leaves the prediction to the decision's own line.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LookupPurpose {
     Install,
     Preview,
@@ -1761,6 +1761,82 @@ exit 1
                 "Installing Python 3.12 via uv...".to_owned()
             ]
         );
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    /// The two lines about a Python that exists but cannot serve the install are
+    /// worded for the purpose of the search: an install says what it goes on to
+    /// do, a preview states only the finding (what a real install would then do
+    /// is decided afterwards, and said by the decision's own line). Pinned here
+    /// as they are printed, so that the two wordings stay what they are as the
+    /// code that prints them changes; the decisions those lines sit in are
+    /// covered by `a_dry_runs_whole_python_output_follows_one_decision_in_every_state`
+    /// and `a_dry_run_decides_from_an_injected_environment_on_every_platform`.
+    ///
+    /// A text file stands for the unusable interpreters (neither the PATH one nor
+    /// the saved one can be launched), so this runs on every platform. Bootstrap is
+    /// disabled in the injected environment so both searches end in a refusal
+    /// before anything could be prepared.
+    #[test]
+    fn the_findings_about_an_unusable_python_are_worded_for_the_purpose_of_the_search() -> Result<()>
+    {
+        use super::super::process::PROGRESS_LINE_SINK;
+
+        let (root, paths) = test_paths("python-unusable-findings");
+        let search_dir = root.join("search");
+        fs::create_dir_all(&search_dir)?;
+        fs::write(search_dir.join("python3"), "not an interpreter")?;
+        let saved_dir = paths.data_dir.join("tools").join("python");
+        fs::create_dir_all(&saved_dir)?;
+        let saved = saved_dir.join("python");
+        fs::write(&saved, "not an interpreter")?;
+        save_managed_python_manifest(
+            &paths,
+            &ManagedPythonManifest {
+                executable: saved,
+                version: DEFAULT_MANAGED_PYTHON_VERSION.to_owned(),
+                installed_at_unix_ms: 123,
+            },
+        )?;
+        let env = PythonResolverEnv {
+            python_override: None,
+            search_dirs: vec![search_dir],
+            managed_python_version: None,
+            managed_bootstrap_disabled: true,
+        };
+        let requirement = python_requirement(SourceLayout::Canonical);
+
+        for (purpose, expected) in [
+            (
+                LookupPurpose::Install,
+                [
+                    "Python from PATH is not usable for this ROCm install (cp312 is required); using ROCm CLI's managed Python.",
+                    "Saved managed Python is not usable for this ROCm install (cp312 is required); preparing Python again.",
+                ],
+            ),
+            (
+                LookupPurpose::Preview,
+                [
+                    "Python from PATH is not usable for this ROCm install (cp312 is required).",
+                    "Saved managed Python is not usable for this ROCm install (cp312 is required).",
+                ],
+            ),
+        ] {
+            PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+            let outcome = find_python_launcher_in(&paths, &env, requirement, purpose);
+            let lines = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+            assert_eq!(lines, expected, "{purpose:?}");
+            let error = outcome
+                .err()
+                .expect("bootstrap is disabled, so the search refuses");
+            assert!(
+                error
+                    .to_string()
+                    .contains("managed Python bootstrap is disabled"),
+                "{purpose:?}: {error:#}"
+            );
+        }
         fs::remove_dir_all(&root).ok();
         Ok(())
     }
