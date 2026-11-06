@@ -894,7 +894,12 @@ mod tests {
     }
 
     /// The most recent `limit` records of the store at `path`, reading up to
-    /// the generations a real store keeps.
+    /// the generations a real store keeps. The 4 mirrors
+    /// `EVENT_LOG_ROTATED_GENERATIONS` in `automation.rs`, which the audit
+    /// reader these tests replaced used. It is a literal, not that constant,
+    /// so these tests keep no edge to `automation.rs`; if the production
+    /// value changes, change this one on purpose, since the tests reading
+    /// through it then no longer see the span a real store keeps.
     fn load_recent_entries(path: &Path, limit: usize) -> Result<Vec<Entry>> {
         load_recent_jsonl_records(path, 4, limit, "entry")
     }
@@ -1549,6 +1554,41 @@ mod tests {
         assert_eq!(live?, format!("{}\n{}\n", entry_line("a"), entry_line("b")));
         assert_eq!(first?, entry_line("old") + "\n");
         assert_eq!(recent?, ["old", "a", "b"]);
+        Ok(())
+    }
+
+    // A live file at the cap that also ends in torn debris is rotated aside
+    // whole, before the tail is inspected, so the repair never rewrites a copy
+    // that is about to be moved away. The torn-tail tests above append with no
+    // rotation policy and the rotation tests never seed debris, so this is the
+    // one test that has repair and rotation meet on the same store.
+    #[test]
+    fn a_torn_live_file_at_the_cap_is_rotated_whole_and_the_new_record_starts_a_clean_file()
+    -> Result<()> {
+        let (root, path) = temp_store("rotation-of-a-torn-file")?;
+        let torn = &entry_line("torn")[..20];
+        let seeded = format!("{}\n{torn}", entry_line("a"));
+        seed_store(&path, &seeded)?;
+        let rotation = JsonlRotation {
+            max_bytes: seeded.len() as u64,
+            generations: 2,
+        };
+        let appended = append_rotating(&path, "b", rotation);
+        let live = fs::read_to_string(&path);
+        let rotated = fs::read_to_string(jsonl_generation_path(&path, 1));
+        let recent = recent_tags(&path, 2, 10);
+        fs::remove_dir_all(root).ok();
+        appended?;
+        assert_eq!(
+            rotated?, seeded,
+            "the rotated copy keeps its debris untouched: it was not repaired first"
+        );
+        assert_eq!(
+            live?,
+            entry_line("b") + "\n",
+            "the live file starts clean, with only the new record"
+        );
+        assert_eq!(recent?, ["a", "b"], "readers skip the debris and span both");
         Ok(())
     }
 
