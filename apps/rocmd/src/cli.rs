@@ -166,7 +166,7 @@ pub fn parse_args(args: Vec<OsString>) -> std::result::Result<(), clap::Error> {
 }
 
 pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
-    // `rocm daemon run` is the one caller; see `daemon_host` for why the daemon
+    // `rocm daemon` is the one caller; see `daemon_host` for why the daemon
     // has to know it is not running as the `rocmd` binary.
     crate::daemon_host::mark_embedded_in_rocm();
     let cli = Cli::try_parse_from(args)?;

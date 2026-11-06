@@ -2060,7 +2060,7 @@ it reports the unconfirmed stop and starts nothing. Its own later writes are
 applied to the record as it is on disk, and only while it still reads as the
 restart left it, so a stop asked for during the restart keeps its marker.
 
-The daemon runs as the `rocmd` binary or embedded in `rocm` (`rocm daemon run`),
+The daemon runs as the `rocmd` binary or embedded in `rocm` (`rocm daemon`),
 and each binary has commands the other lacks: `supervise` is `rocmd`'s, and the
 hidden engine commands (`__engine-serve-http`, `__engine-stdio`) are `rocm`'s.
 Every daemon spawn therefore asks `DaemonHost` for the binary instead of

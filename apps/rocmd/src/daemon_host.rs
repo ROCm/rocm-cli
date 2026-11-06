@@ -5,7 +5,7 @@
 //! Which binary a daemon spawn runs.
 //!
 //! The daemon runs in one of two hosts: the `rocmd` binary (`rocmd run`), or
-//! embedded in `rocm` (`rocm daemon run`, which enters through
+//! embedded in `rocm` (`rocm daemon`, which enters through
 //! [`crate::run_from_args`]). The two binaries do not answer the same commands:
 //! `supervise` belongs to `rocmd` alone, and the hidden engine commands
 //! (`__engine-serve-http`, `__engine-stdio`) belong to `rocm` alone. A spawn
@@ -120,6 +120,7 @@ impl DaemonHost {
     /// The same for a test that restarts a service: the test binary is the
     /// `rocmd` that is re-executed.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn test_binary_standing_in_for_rocmd() -> Self {
         Self::new(
             std::env::current_exe().expect("the test binary has a path"),
@@ -268,7 +269,7 @@ mod tests {
         assert!(format!("{error:#}").contains("pass it a host"), "{error:#}");
     }
 
-    /// `rocm daemon run` enters through `run_from_args`, and that is what marks
+    /// `rocm daemon` enters through `run_from_args`, and that is what marks
     /// the process. The flag is process-wide, so it is checked in a child run of
     /// this test binary instead of being set here, where it would change the
     /// answer for every other test.
