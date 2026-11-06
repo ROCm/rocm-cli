@@ -337,8 +337,10 @@ pub(crate) const SERVE_SAFETY_REFUSALS: &[ServeSafetyCase] = &[
 pub(crate) const SERVE_FOREGROUND_AND_MANAGED: &[&str] =
     &["serve", "qwen", "--managed", "--foreground"];
 
-/// `rocm serve` argvs the serve safety policy lets through, and that also parse
-/// as a `rocm` command, so the planner reaches its safety check with them.
+/// `rocm serve` argvs the serve safety policy lets through on both surfaces, and
+/// that also parse as a `rocm` command, so the planner reaches its safety check
+/// with them. A host other than `127.0.0.1` carries an explicit `--port`, which
+/// the chat policy requires there (see [`SERVE_PORT_RULE_CHAT_ONLY`]).
 pub(crate) const SERVE_SAFETY_ACCEPTED: &[&[&str]] = &[
     &["serve", "qwen", "--managed"],
     &[
@@ -352,8 +354,32 @@ pub(crate) const SERVE_SAFETY_ACCEPTED: &[&[&str]] = &[
     ],
     &["serve", "qwen", "--device=gpu_required", "--managed"],
     &["serve", "qwen", "--host", "127.0.0.1", "--managed"],
-    &["serve", "qwen", "--host=localhost", "--managed"],
-    &["serve", "qwen", "--host", "::1", "--managed"],
+    &[
+        "serve",
+        "qwen",
+        "--host=localhost",
+        "--port",
+        "8000",
+        "--managed",
+    ],
+    &["serve", "qwen", "--host", "::1", "--port=8000", "--managed"],
+];
+
+/// `rocm serve` argvs the planner lets through but the chat policy refuses: a
+/// loopback host other than `127.0.0.1` without an explicit `--port`. The chat
+/// policy applies `rocm serve`'s own port rule so that an approval card is never
+/// offered for a command the CLI then refuses; the planner's check has no port
+/// rule. Each entry is the argv and the full message the chat policy refuses it
+/// with.
+pub(crate) const SERVE_PORT_RULE_CHAT_ONLY: &[(&[&str], &str)] = &[
+    (
+        &["serve", "qwen", "--host=localhost", "--managed"],
+        "`rocm serve --host localhost` needs an explicit `--port <1-65535>`. Automatic port selection is supported only on the default host 127.0.0.1, where ROCm can prove a port is free before launching; on any other address the engine owns the bind.",
+    ),
+    (
+        &["serve", "qwen", "--host", "::1", "--managed"],
+        "`rocm serve --host ::1` needs an explicit `--port <1-65535>`. Automatic port selection is supported only on the default host 127.0.0.1, where ROCm can prove a port is free before launching; on any other address the engine owns the bind.",
+    ),
 ];
 
 /// `args` as the owned argv both surfaces take.

@@ -2068,6 +2068,24 @@ mod tests {
         Ok(())
     }
 
+    /// The planner has no port rule: a loopback host other than `127.0.0.1`
+    /// without `--port` is planned, where the chat policy refuses it
+    /// (`chat_requires_a_port_on_a_loopback_host_other_than_the_default`).
+    #[test]
+    fn planner_accepts_a_loopback_host_without_a_port() -> Result<()> {
+        use crate::test_support::{SERVE_PORT_RULE_CHAT_ONLY, owned_argv};
+
+        for (args, _) in SERVE_PORT_RULE_CHAT_ONLY {
+            let plan = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(args),
+            )?;
+            assert_eq!(plan.actions[0].args, owned_argv(args), "{args:?}");
+        }
+        Ok(())
+    }
+
     /// The rules fire in a fixed order, so an argv that breaks several reports
     /// the first one: public bind, then CPU, then host, then managed.
     #[test]

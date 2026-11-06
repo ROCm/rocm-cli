@@ -2712,6 +2712,32 @@ mod tests {
         }
     }
 
+    /// The chat policy also applies `rocm serve`'s port rule, which the planner's
+    /// check does not: a loopback host other than `127.0.0.1` needs an explicit
+    /// `--port`. Each argv is refused with the exact message and proposes nothing,
+    /// and the same argv with a port is accepted (the shared accepted table).
+    /// `planner_accepts_a_loopback_host_without_a_port` holds the planner side.
+    #[test]
+    fn chat_requires_a_port_on_a_loopback_host_other_than_the_default() {
+        use crate::test_support::{SERVE_PORT_RULE_CHAT_ONLY, owned_argv};
+
+        for (args, expected) in SERVE_PORT_RULE_CHAT_ONLY {
+            let error = validate_chat_rocm_command_safety(&owned_argv(args))
+                .expect_err("a non-default host needs a port")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+            let call = rocm_command_call(args);
+            let error = chat_rocm_command_action(&call)
+                .expect_err("no approval card for a command the CLI refuses")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+            let error = validate_chat_tool_call(&call)
+                .expect_err("the tool-call entry refuses it too")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+        }
+    }
+
     /// The rules fire in a fixed order, so an argv that breaks several reports
     /// the first one: public bind, then CPU, then host, then managed.
     #[test]
