@@ -1161,17 +1161,115 @@ mod tests {
     }
 
     /// Calls that put bytes in a file, which is what a second writer of a registry
-    /// entry would use. Matched as text, so `tokio::fs::write(` counts too.
-    const WRITE_PRIMITIVES: [&str; 8] = [
+    /// entry would use. Matched as text, so `tokio::fs::write(` counts too. The
+    /// file builders (`OpenOptions`, `File::options`) are not here: they write
+    /// only when a write option is chained on them, see [`open_options_write`].
+    const WRITE_PRIMITIVES: [&str; 7] = [
         "fs::write(",
         "File::create(",
         "File::create_new(",
-        "OpenOptions::new(",
         "fs::copy(",
         "fs::rename(",
         "fs::hard_link(",
         "write_all(",
     ];
+
+    /// The file builders, and the options that make one write. `OpenOptions::new()`
+    /// followed by `.read(true).open(..)` is a read-only probe and not a writer.
+    const FILE_BUILDERS: [&str; 2] = ["OpenOptions::new(", "File::options("];
+    const WRITE_OPTIONS: [&str; 5] = ["write", "append", "create", "create_new", "truncate"];
+
+    /// The index just past the `)` that closes the `(` at `open`, skipping string
+    /// literals, or the end of `text` when it never closes.
+    fn skip_parens(text: &[u8], open: usize) -> usize {
+        let mut depth = 0usize;
+        let mut at = open;
+        let mut in_string = false;
+        while at < text.len() {
+            let byte = text[at];
+            if in_string {
+                match byte {
+                    b'\\' => at += 1,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return at + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        text.len()
+    }
+
+    /// Whether `production` builds a file with a builder that can write. The
+    /// method chain after the builder is read across lines and whitespace: it is
+    /// a read-only probe only when the chain reaches `.open(` and none of
+    /// [`WRITE_OPTIONS`] is called on it. A builder that is stored (`let mut o =
+    /// OpenOptions::new();`) or whose chain does not reach `.open(` cannot be
+    /// judged and counts as a writer.
+    fn open_options_write(production: &str) -> bool {
+        let text = production.as_bytes();
+        for builder in FILE_BUILDERS {
+            for (at, _) in production.match_indices(builder) {
+                let mut next = skip_parens(text, at + builder.len() - 1);
+                let mut methods = Vec::new();
+                loop {
+                    while text.get(next).is_some_and(u8::is_ascii_whitespace) {
+                        next += 1;
+                    }
+                    if text.get(next) != Some(&b'.') {
+                        break;
+                    }
+                    next += 1;
+                    while text.get(next).is_some_and(u8::is_ascii_whitespace) {
+                        next += 1;
+                    }
+                    let start = next;
+                    while text
+                        .get(next)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        next += 1;
+                    }
+                    methods.push(&production[start..next]);
+                    while text.get(next).is_some_and(u8::is_ascii_whitespace) {
+                        next += 1;
+                    }
+                    if text.get(next) == Some(&b'(') {
+                        next = skip_parens(text, next);
+                    }
+                }
+                let writes = methods.iter().any(|method| WRITE_OPTIONS.contains(method));
+                if writes || !methods.contains(&"open") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Every way `production` writes a file, by name.
+    fn write_calls(production: &str) -> Vec<&'static str> {
+        let mut calls: Vec<&'static str> = WRITE_PRIMITIVES
+            .iter()
+            .copied()
+            .filter(|primitive| production.contains(primitive))
+            .collect();
+        if open_options_write(production) {
+            calls.push("OpenOptions with a write option");
+        }
+        calls
+    }
 
     /// `source` as the compiler sees production code, for a text scan: everything
     /// from the file's `#[cfg(test)]` test module on is cut, and comments are
@@ -1258,16 +1356,13 @@ mod tests {
 
     /// Why `production` writes a registry entry on its own, one line per way it
     /// can reach the registry, or nothing. A file that both writes (any of
-    /// [`WRITE_PRIMITIVES`]) and names the registry directory (by any of
+    /// [`WRITE_PRIMITIVES`], or a file builder with a write option, see
+    /// [`open_options_write`]) and names the registry directory (by any of
     /// [`registry_location_spellings`]) is a writer, however far apart the two
     /// are and whatever the path variable is called. A file that only reads or
     /// removes entries has no write call and is not one.
     fn registry_writer_findings(production: &str) -> Vec<String> {
-        let writes: Vec<&str> = WRITE_PRIMITIVES
-            .iter()
-            .copied()
-            .filter(|primitive| production.contains(primitive))
-            .collect();
+        let writes = write_calls(production);
         if writes.is_empty() {
             return Vec::new();
         }
@@ -1281,14 +1376,68 @@ mod tests {
     /// only reads. The cases are the ways the previous scan (a 200-character
     /// window after `fs::write(` looking for three names) went blind: a path built
     /// from literals, a path held in a variable away from the write, one literal,
-    /// a `//` inside a string literal before the write.
+    /// a `//` inside a string literal before the write. A file builder
+    /// (`OpenOptions`, `File::options`) counts as a write only when a write option
+    /// is chained on it or the chain cannot be read; a read-only probe in a file
+    /// that builds the registry path, as `amd_smi.rs` does, is not a writer.
     #[test]
     fn registry_writer_detector_sees_every_way_of_building_the_path() {
         let filler = "// padding\n".repeat(40);
         let far_apart = format!(
             "fn dir(p: &AppPaths) -> PathBuf {{ p.data_dir.join(\"runtimes\").join(\"registry\") }}\n{filler}fn save(d: &Path) {{ fs::write(d.join(\"x.json\"), b\"\").ok(); }}"
         );
-        let cases: [(&str, String, bool); 9] = [
+        let registry = "fn dir(p: &AppPaths) -> PathBuf { p.data_dir.join(\"runtimes\").join(\"registry\") }\n";
+        let cases: [(&str, String, bool); 17] = [
+            (
+                "amd_smi shape: the registry path is built, and only read-only probes open files",
+                format!(
+                    "{registry}fn probe(path: &Path) -> bool {{ fs::OpenOptions::new().read(true).open(path).is_ok() }}\nfn device(path: &Path) -> bool {{ std::fs::OpenOptions::new().read(true).open(path).is_ok() }}"
+                ),
+                false,
+            ),
+            (
+                "a read-only probe whose chain spans lines",
+                format!(
+                    "{registry}fn probe(path: &Path) -> bool {{\n    OpenOptions::new()\n        .read(true)\n        .open(path)\n        .is_ok()\n}}"
+                ),
+                false,
+            ),
+            (
+                "a read-only probe through File::options",
+                format!("{registry}fn probe(p: &Path) -> bool {{ File::options().read(true).open(p).is_ok() }}"),
+                false,
+            ),
+            (
+                "OpenOptions with .write(true)",
+                format!(
+                    "{registry}fn save(d: &Path) {{ OpenOptions::new().write(true).create(true).open(d.join(\"k.json\")).ok(); }}"
+                ),
+                true,
+            ),
+            (
+                "OpenOptions with a write option on a later line",
+                format!(
+                    "{registry}fn save(d: &Path) {{\n    fs::OpenOptions::new()\n        .read(true)\n        .truncate(true)\n        .open(d.join(\"k.json\"))\n        .ok();\n}}"
+                ),
+                true,
+            ),
+            (
+                "File::options with .append(true)",
+                format!("{registry}fn save(d: &Path) {{ File::options().append(true).open(d).ok(); }}"),
+                true,
+            ),
+            (
+                "a builder kept in a variable cannot be judged",
+                format!(
+                    "{registry}fn save(d: &Path) {{ let mut options = OpenOptions::new(); options.write(true); options.open(d).ok(); }}"
+                ),
+                true,
+            ),
+            (
+                "a chain that never reaches .open( cannot be judged",
+                format!("{registry}fn save() {{ let options = OpenOptions::new().read(true).clone(); drop(options); }}"),
+                true,
+            ),
             (
                 "through the helper",
                 "fn f(p: &AppPaths) { fs::write(runtime_manifest_path(p, \"k\"), b\"\").ok(); }"
@@ -1363,8 +1512,11 @@ mod tests {
     ///
     /// What this does not catch, by design: a writer that is handed the registry
     /// path by a function in another file and never spells it, a write primitive
-    /// that is not in [`WRITE_PRIMITIVES`] (a new helper with its own name), and
-    /// code outside the source roots it reads. Review catches those; this test
+    /// that is not in [`WRITE_PRIMITIVES`] (a new helper with its own name), a
+    /// file builder whose write option is set through something other than the
+    /// methods in [`WRITE_OPTIONS`] (the chain is read as text; a chain that
+    /// reaches `.open(` with only read options is a read), and code outside the
+    /// source roots it reads. Review catches those; this test
     /// catches the ordinary ways of growing a second writer.
     #[test]
     fn only_the_shared_routine_writes_a_registry_entry() {
