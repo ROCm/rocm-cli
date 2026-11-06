@@ -44,6 +44,13 @@ R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
 rung instead of being removed outright.
 
+[`queue-run.yml`](../.github/workflows/queue-run.yml) runs GPU lanes on a
+shared GPU queue, one per GPU model, so no runner holds a GPU for the length
+of a job, and publishes the result;
+[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) publishes a
+finished run again. They are not a rung yet and gate nothing; see
+[nightly-on-the-queue.md](nightly-on-the-queue.md).
+
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
 "release/**"]`. On that trigger, every self-hosted GPU job additionally pins
@@ -112,6 +119,18 @@ mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
 `xtask/src/workflow_contract.rs` enforces this, because the failure is quiet —
 the lane simply passes on the wrong GPU and reports under the label it was
 named for.
+
+No workflow other than [`queue-run.yml`](../.github/workflows/queue-run.yml)
+and [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) may name the
+`queue-report` label.
+The shared-queue publishing runner carries that label alone, without GitHub's
+default `self-hosted`, OS and architecture labels, so a job reaches it only by
+naming that label, and `queue_nightly_publisher_holds_no_credential` in
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs) fails if another workflow on `main` names it
+literally. A label assembled from an expression is not seen; the rule guards
+against mistakes, not evasion. The runner is registered to this repository
+alone, so no runner group reaches it. See
+[nightly-on-the-queue.md](nightly-on-the-queue.md).
 
 `e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
@@ -509,6 +528,13 @@ does not dispatch self-hosted-runner jobs from an external fork's
 `pull_request` event without explicit approval. The hardware jobs only run
 against branches and PRs within the repository (and on `workflow_dispatch`,
 which requires write access to trigger).
+
+That holds for every self-hosted runner here, and so does its limit: approval
+does not change what an approved fork job may do, and labels do not restrict
+which jobs reach a runner, so a job naming a runner's labels can run there.
+Only the shared-queue publishing runner is built around that, by holding no
+queue credential; see
+[nightly-on-the-queue.md](nightly-on-the-queue.md#why-it-works-this-way).
 
 ## Notes
 
