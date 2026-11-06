@@ -662,6 +662,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -673,7 +674,6 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
-
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -720,3 +720,13 @@ Feature: Model serving
     And the user is told no AMD GPU was detected
     And the refusal points the user at the WSL driver status instead of /dev/kfd
     And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
+
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags

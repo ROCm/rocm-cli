@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 /// Default base ref used when none is supplied on the command line. Matches
 /// [`crate::verify_commits`] so both commands diff against the same point.
-const DEFAULT_BASE: &str = "origin/main";
+pub(crate) const DEFAULT_BASE: &str = "origin/main";
 
 /// The workspace dependency graph, reduced to what selection needs: each
 /// member's source directory (workspace-relative, `/`-separated) and the
@@ -179,6 +179,14 @@ fn is_ignorable(file: &str) -> bool {
     is_markdown || file.starts_with("docs/") || file == "LICENSE" || file.starts_with("LICENSE.")
 }
 
+/// [`select_with_proptest_sources`] for a caller that has only the changed-file
+/// names: a changed file under a `proptest-regressions` directory still selects
+/// the `xtask` seed guard, but a Rust file that moved a `proptest!` block is not
+/// recognised without its diff.
+pub fn select(changed_files: &[String], graph: &Graph) -> Selection {
+    select_with_proptest_sources(changed_files, &[], graph)
+}
+
 /// Pure selection logic: turn the changed-file list into a [`Selection`].
 ///
 /// `proptest_sources` is the subset of changed Rust files whose diff adds or
@@ -192,7 +200,11 @@ fn is_ignorable(file: &str) -> bool {
 /// number of crate-attributable files. Files owned by a crate seed the changed
 /// set; ignorable files are dropped; anything left unattributed is treated as
 /// force-full, because an unrecognized path might affect anything.
-pub fn select(changed_files: &[String], proptest_sources: &[String], graph: &Graph) -> Selection {
+pub fn select_with_proptest_sources(
+    changed_files: &[String],
+    proptest_sources: &[String],
+    graph: &Graph,
+) -> Selection {
     let mut changed_crates: BTreeSet<String> = BTreeSet::new();
     let mut saw_relevant = false;
 
@@ -350,31 +362,75 @@ fn build_graph(metadata: &Metadata) -> Graph {
 /// List files changed in `base...HEAD` (three-dot: relative to the merge base,
 /// the same "what this branch changed" diff layer one filters on).
 fn changed_files(base: &str) -> Result<Vec<String>> {
-    diff_names(Path::new("."), base, &[], &[])
+    changed_files_between(base, "HEAD")
+}
+
+/// List files changed in `base...head`.
+///
+/// `--no-renames` makes a moved file list both its old and its new path.
+/// Without it git reports only the new path, so a file moved out of one crate
+/// into another would select the destination crate and miss the one that lost
+/// the file.
+pub(crate) fn changed_files_between(base: &str, head: &str) -> Result<Vec<String>> {
+    diff_name_only(None, base, head)
+}
+
+/// The variables git reads to pick a repository. git exports an absolute
+/// `GIT_DIR` to a hook run from a linked worktree, so a child that runs
+/// `git -C <other repo>` must not inherit them, or it talks to the outer repo.
+const GIT_REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Clear [`GIT_REPO_ENV`] from `cmd`, for a git run against an explicit directory.
+pub(crate) fn scrub_git_env(cmd: &mut Command) -> &mut Command {
+    for var in GIT_REPO_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// [`changed_files_between`] in `dir` (the current directory when `None`).
+fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
+    diff_names(dir, base, head, &[], &[])
 }
 
 /// List the Rust files changed in `base...HEAD` whose diff adds or removes a
 /// line containing `proptest!` (git's `-G` pickaxe, so a block moved out of one
 /// file and into another lists both). The pattern also matches a longer name
 /// such as `my_proptest!`; an extra hit only adds `xtask` to the selection.
-fn proptest_source_files(repo: &Path, base: &str) -> Result<Vec<String>> {
-    diff_names(repo, base, &["-G", "proptest!"], &["*.rs"])
+fn proptest_source_files(dir: Option<&Path>, base: &str) -> Result<Vec<String>> {
+    diff_names(dir, base, "HEAD", &["-G", "proptest!"], &["*.rs"])
 }
 
-/// `git -C <repo> diff --name-only <options> <base>...HEAD -- <pathspec>`.
-fn diff_names(repo: &Path, base: &str, options: &[&str], pathspec: &[&str]) -> Result<Vec<String>> {
-    let range = format!("{base}...HEAD");
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo)
-        .args(["diff", "--name-only"])
+/// `git diff --name-only --no-renames <options> base...head [-- <pathspec>]` in
+/// `dir` (the current directory when `None`).
+fn diff_names(
+    dir: Option<&Path>,
+    base: &str,
+    head: &str,
+    options: &[&str],
+    pathspec: &[&str],
+) -> Result<Vec<String>> {
+    let range = format!("{base}...{head}");
+    let mut git = Command::new("git");
+    if let Some(dir) = dir {
+        scrub_git_env(&mut git).arg("-C").arg(dir);
+    }
+    git.args(["diff", "--name-only", "--no-renames"])
         .args(options)
         .arg(&range);
     if !pathspec.is_empty() {
-        command.arg("--").args(pathspec);
+        git.arg("--").args(pathspec);
     }
-    let output = command.output().context("failed to run `git diff`")?;
+    let output = git.output().context("failed to run `git diff`")?;
     if !output.status.success() {
         bail!(
             "`git diff {range}` failed: {}",
@@ -394,8 +450,8 @@ pub fn run(base: Option<String>) -> Result<()> {
     let base = base.unwrap_or_else(|| DEFAULT_BASE.to_string());
     let graph = load_graph()?;
     let files = changed_files(&base)?;
-    let proptest_sources = proptest_source_files(Path::new("."), &base)?;
-    let selection = select(&files, &proptest_sources, &graph);
+    let proptest_sources = proptest_source_files(None, &base)?;
+    let selection = select_with_proptest_sources(&files, &proptest_sources, &graph);
     println!("{}", selection.to_cargo_args());
     Ok(())
 }
@@ -403,13 +459,6 @@ pub fn run(base: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Selection from the changed files alone: no changed file adds or removes a
-    /// `proptest!` line. Shadows the glob-imported [`super::select`] so the tests
-    /// that predate the proptest guard stay as they were.
-    fn select(changed_files: &[String], graph: &Graph) -> Selection {
-        super::select(changed_files, &[], graph)
-    }
 
     fn names(pkgs: &[&str]) -> BTreeSet<String> {
         pkgs.iter().map(|p| (*p).to_string()).collect()
@@ -608,6 +657,98 @@ mod tests {
         assert_eq!(sel, Selection::Packages(want));
     }
 
+    /// Run `git` in `dir` with a fixed identity and no signing, for the
+    /// throwaway repositories below.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let mut git = Command::new("git");
+        let status = scrub_git_env(&mut git)
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A hook run from a linked worktree has `GIT_DIR` set; a git run against a
+    /// throwaway repository must not inherit it or it would act on the outer one.
+    #[test]
+    fn scrub_git_env_clears_every_repo_selecting_variable() {
+        let mut git = Command::new("git");
+        git.env("GIT_DIR", "/outer/.git").env("GIT_INDEX_FILE", "x");
+        scrub_git_env(&mut git);
+        let envs: std::collections::BTreeMap<_, _> = git
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_none()))
+            .collect();
+        for var in GIT_REPO_ENV {
+            assert_eq!(envs.get(*var), Some(&true), "{var} is not cleared");
+        }
+    }
+
+    /// The loop above only checks the variables [`GIT_REPO_ENV`] lists, so it
+    /// cannot notice one missing from the list. This one runs git: with the
+    /// repository-selecting variables a hook exports pointing at another
+    /// repository, a scrubbed `git -C <repo>` must still resolve to `<repo>`.
+    #[test]
+    fn scrubbed_git_ignores_a_repository_a_hook_exported() {
+        let outer = tempfile::tempdir().expect("outer repo");
+        let inner = tempfile::tempdir().expect("inner repo");
+        git_in(outer.path(), &["init", "-q"]);
+        git_in(inner.path(), &["init", "-q"]);
+        let resolve = |arg: &str| {
+            let mut git = Command::new("git");
+            git.env("GIT_DIR", outer.path().join(".git"))
+                .env("GIT_WORK_TREE", outer.path());
+            scrub_git_env(&mut git);
+            let output = git
+                .arg("-C")
+                .arg(inner.path())
+                .args(["rev-parse", arg])
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git rev-parse {arg} failed");
+            std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("git printed an existing path")
+        };
+        let inner_root = std::fs::canonicalize(inner.path()).expect("inner path");
+        assert_eq!(resolve("--show-toplevel"), inner_root);
+        assert_eq!(resolve("--absolute-git-dir"), inner_root.join(".git"));
+    }
+
+    /// A file moved from one crate to another must select both crates. With git's
+    /// default rename detection only the new path is listed, the crate that lost
+    /// the file is not selected, and a push that breaks it is not checked.
+    #[test]
+    fn changed_files_between_lists_both_paths_of_a_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("crates/a/src")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("crates/b/src")).expect("mkdir b");
+        std::fs::write(root.join("crates/a/src/moved.rs"), "pub fn f() {}\n").expect("write");
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "base"]);
+        git_in(root, &["checkout", "-q", "-b", "feature"]);
+        git_in(
+            root,
+            &["mv", "crates/a/src/moved.rs", "crates/b/src/moved.rs"],
+        );
+        git_in(root, &["commit", "-q", "-m", "move"]);
+
+        let mut files = diff_name_only(Some(root), "main", "feature").expect("git diff");
+        files.sort();
+        assert_eq!(files, ["crates/a/src/moved.rs", "crates/b/src/moved.rs"]);
+    }
+
     #[test]
     fn a_changed_proptest_seed_file_selects_the_xtask_guard() {
         // The seed guard lives in xtask and reads every crate's seeds; `app`
@@ -631,12 +772,12 @@ mod tests {
             "apps/app/src/new.rs".to_string(),
         ];
         assert_eq!(
-            super::select(&files, &files, &graph()),
+            select_with_proptest_sources(&files, &files, &graph()),
             Selection::Packages(names(&["app", "xtask"]))
         );
         // The same Rust change with no `proptest!` line in its diff does not.
         assert_eq!(
-            super::select(&files, &[], &graph()),
+            select_with_proptest_sources(&files, &[], &graph()),
             Selection::Packages(names(&["app"]))
         );
     }
@@ -650,7 +791,10 @@ mod tests {
         let seed = ["apps/app/proptest-regressions/x.txt".to_string()];
         assert_eq!(select(&seed, &g), Selection::Workspace);
         let src = ["apps/app/src/x.rs".to_string()];
-        assert_eq!(super::select(&src, &src, &g), Selection::Workspace);
+        assert_eq!(
+            select_with_proptest_sources(&src, &src, &g),
+            Selection::Workspace
+        );
     }
 
     #[test]
@@ -676,41 +820,11 @@ mod tests {
         );
     }
 
-    /// Run `git` in `repo` with signing, hooks and the caller's `GIT_*`
-    /// environment out of the way, and return stdout.
-    fn git(repo: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
-            .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("run git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
     #[test]
     fn proptest_source_files_lists_rust_files_whose_diff_touches_a_proptest_block() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
-        git(repo, &["init", "-q", "-b", "main"]);
+        git_in(repo, &["init", "-q", "-b", "main"]);
         std::fs::write(
             repo.join("moved_from.rs"),
             "proptest! { fn a() {} }\nfn keep() {}\n",
@@ -718,9 +832,9 @@ mod tests {
         .unwrap();
         std::fs::write(repo.join("plain.rs"), "fn plain() {}\n").unwrap();
         std::fs::write(repo.join("notes.md"), "proptest! is mentioned\n").unwrap();
-        git(repo, &["add", "."]);
-        git(repo, &["commit", "-q", "-m", "base"]);
-        git(repo, &["checkout", "-q", "-b", "topic"]);
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "base"]);
+        git_in(repo, &["checkout", "-q", "-b", "topic"]);
         // The block moves out of one Rust file and into another. A Rust file
         // whose diff has no proptest line, and a Markdown note that does but
         // is not Rust, change too; neither may be listed.
@@ -728,15 +842,15 @@ mod tests {
         std::fs::write(repo.join("moved_to.rs"), "proptest! { fn a() {} }\n").unwrap();
         std::fs::write(repo.join("plain.rs"), "fn plain() { let _ = 1; }\n").unwrap();
         std::fs::write(repo.join("notes.md"), "proptest! is mentioned again\n").unwrap();
-        git(repo, &["add", "."]);
-        git(repo, &["commit", "-q", "-m", "move"]);
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "move"]);
 
-        let mut got = proptest_source_files(repo, "main").expect("diff");
+        let mut got = proptest_source_files(Some(repo), "main").expect("diff");
         got.sort();
         assert_eq!(got, ["moved_from.rs", "moved_to.rs"]);
         // The plain name-only diff, which the selector otherwise relies on,
         // sees all four files: the narrowing above is what the `-G` adds.
-        let all = diff_names(repo, "main", &[], &[]).expect("diff");
+        let all = diff_name_only(Some(repo), "main", "topic").expect("diff");
         assert_eq!(all.len(), 4, "{all:?}");
     }
 
