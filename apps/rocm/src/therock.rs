@@ -41,8 +41,7 @@ pub(crate) use self::probe::{
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_requirement, resolve_python_launcher,
-    wheel_compatibility_for_python,
+    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
 };
 use self::resolve::{
     AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
@@ -364,30 +363,24 @@ fn install_wheel_runtime(
             }
         }
     };
-    progress_line(format!(
-        "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
-        managed_python_version(python_requirement)
-    ));
-    let python_launcher = resolve_python_launcher(paths, python_requirement)?;
-    progress_line(match python_launcher.source {
-        "path" => format!(
-            "Using Python from PATH: {}.",
-            python_launcher.executable.display()
-        ),
-        "env" => format!(
-            "Using Python from ROCM_CLI_PYTHON: {}.",
-            python_launcher.executable.display()
-        ),
-        "managed" => format!(
-            "Using ROCm CLI's portable Python: {}.",
-            python_launcher.executable.display()
-        ),
-        _ => format!(
-            "Using Python from {}.",
-            python_launcher.executable.display()
-        ),
+    // A preview promises nothing here: whether a Python would be prepared, and
+    // which, is only known once the search below has run (a version override can
+    // make the answer a refusal), and is reported then.
+    progress_line(if dry_run {
+        "Checking Python for the ROCm install.".to_owned()
+    } else {
+        format!(
+            "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
+            managed_python_version(python_requirement)
+        )
     });
-    let wheel_compatibility = wheel_compatibility_for_python(&python_launcher.executable)?;
+    // A preview must not prepare the Python it reports: resolving one can
+    // download a managed `uv` and Python and save the result in the
+    // configuration. It asks what a real install would do instead and prints
+    // that. A real install resolves, and so prepares, exactly as it always did.
+    // It also prints the line naming the interpreter, once the decision is made.
+    let python = python_for_install(paths, python_requirement, dry_run)?;
+    let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
@@ -479,12 +472,11 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
-    let _ = writeln!(
-        output,
-        "  python_launcher: {}",
-        python_launcher.executable.display()
-    );
-    let _ = writeln!(output, "  python_source: {}", python_launcher.source);
+    let _ = writeln!(output, "  python_launcher: {}", python.launcher_display());
+    let _ = writeln!(output, "  python_source: {}", python.source().as_str());
+    if let Some(note) = python.note() {
+        let _ = writeln!(output, "  python_note: {note}");
+    }
     let _ = writeln!(
         output,
         "  python_wheel_tag: {}",
@@ -539,7 +531,7 @@ fn install_wheel_runtime(
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
-        let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
+        let venv_args = uv_venv_args(&python.venv_python_arg(), &install_root);
         // This line is offered as the command to run, so it has to be one a
         // shell reads back as the argv it previews. The install root in it
         // comes from a `--prefix` the local assistant can choose
@@ -568,6 +560,9 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
         return Ok(SdkInstallResult::plan(output));
     }
+
+    // Only a preview returns above with an interpreter it has not prepared.
+    let python_launcher = python.into_launcher()?;
 
     // Requirement: surface the "newest version has no wheels" case as a warning
     // on the real install path too, not only in the dry-run plan.

@@ -896,6 +896,11 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
         "ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE",
         format!("{base}/archive/comfyui-source.tar.gz").into(),
     ));
+    // This planted runtime would otherwise make the install's startup update
+    // check run first, ahead of the download this scenario observes: on the
+    // Strix Halo WSL2 lane the check's `uv` and Python downloads sometimes
+    // outlast `PTY_SCREEN_TIMEOUT`, so the spinner is never reached.
+    disable_startup_update_check(world);
 }
 
 #[when("the user installs ComfyUI under a real terminal")]
@@ -1040,13 +1045,29 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
     {
         write_fixture(&source.join(relative), contents);
     }
-    // With a runtime installed, a scenario's first `rocm` call otherwise runs
-    // the CLI's startup update check for this planted runtime: a real `uv`
-    // download, a managed-Python setup and a package-index query, 10-15s on a
-    // hosted runner. Nothing here is about updates, and while that call runs
-    // it blocks the thread cucumber polls every other scenario from (#661).
-    // Every command these scenarios run goes through
-    // `run_keeping_scenario_env`, so this reaches all of them.
+    disable_startup_update_check(world);
+}
+
+/// Keeps the CLI's startup update check from running in this scenario.
+///
+/// With a runtime installed, a scenario's first `rocm` call otherwise runs the
+/// check for the planted runtime: a real `uv` download, a managed-Python setup
+/// and a package-index query. That takes 10-15s on a hosted runner and
+/// unbounded time on a slow network, it prints its progress on the terminal of
+/// the command that triggered it, and while it runs it blocks the thread
+/// cucumber polls every other scenario from (#661). A scenario that waits for
+/// the install's own output under a deadline (`comfyui-04`'s download spinner)
+/// would spend that deadline inside the check instead. Nothing here is about
+/// updates.
+///
+/// This is `command_env`, so it reaches the two ways these scenarios run `rocm`
+/// that apply it: `run_keeping_scenario_env` (through
+/// `run_rocm_with_scenario_env` in `tests/e2e.rs`, which reads `command_env`;
+/// the wrapper restores it afterwards) and `TuiSession::spawn` in
+/// `tests/e2e/tui_driver.rs` (through `spawn_binary_with_env`, which overlays
+/// `command_env` onto the child and leaves it in place). It does not reach
+/// plain `run_rocm` or `run_rocm_ok`, which ignore `command_env`.
+fn disable_startup_update_check(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));

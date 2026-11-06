@@ -26,8 +26,8 @@ use super::family::family_override_or_recovered_arch;
 use super::io::write_file_atomically;
 use super::process::SuppressProgressOutput;
 use super::python::{
-    PythonLauncher, python_launcher_install_ready, python_requirement, resolve_python_launcher,
-    wheel_compatibility_for_python,
+    PythonLauncher, PythonSource, python_launcher_install_ready, python_requirement,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use super::resolve::{
     AggregateDeviceTarget, resolve_pip_runtime_with_timeout, resolve_tarball_artifact_with_timeout,
@@ -435,7 +435,7 @@ fn resolve_latest_for_manifest(
                 .filter(|path| python_launcher_install_ready(path, requirement).is_ok())
                 .map(|executable| PythonLauncher {
                     executable,
-                    source: "manifest",
+                    source: PythonSource::Manifest,
                 });
             let python_executable = match manifest_python {
                 Some(python) => python,
@@ -776,6 +776,7 @@ mod tests {
         let resolver_env_guard = OverridePythonResolverEnv::new(PythonResolverEnv {
             python_override: None,
             search_dirs: vec![bin_dir],
+            ..PythonResolverEnv::from_process_env()
         });
 
         PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());

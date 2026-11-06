@@ -1516,7 +1516,7 @@ async fn assert_freeform_execution_prefix_is_one_word(world: &mut E2eWorld) {
     );
 }
 
-/// Where scenario runtime-23 plants its interpreter: inside a folder called `tools`,
+/// Where scenario runtime-26 plants its interpreter: inside a folder called `tools`,
 /// which is neither `bin` nor `Scripts`, so nothing about its location names an
 /// environment.
 fn interpreter_outside_a_venv(world: &E2eWorld) -> std::path::PathBuf {
