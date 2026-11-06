@@ -1048,6 +1048,8 @@ pub(crate) enum ComfyuiCommand {
 pub(crate) enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
+    ///
+    /// Recycled PIDs with mismatched recorded start times count as no longer running.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]

@@ -471,6 +471,12 @@ Expected result:
   block at all.
 - `rocm services list --all` shows saved history, including the failed or
   stopped attempts the default view hides.
+- On Linux, listing validates a recorded supervisor or engine PID against its
+  saved process start time. If the numeric PID now belongs to a newer process,
+  the record is persisted as `stopped`, disappears from the default live-only
+  list, and the newer process is left alone. If the start time cannot be read,
+  the service remains conservatively live; older records with no saved start
+  time keep their PID-only behavior.
 - `rocm services logs <service-id> --follow` prints the recent output, then new
   output as it arrives (a download bar redraws on one terminal row), and returns
   by itself with `Service <id> is <status>; stopped following.` once the server

@@ -43,7 +43,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rocm_core::{
     AppPaths, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
-    managed_service_endpoint_readiness, process_is_running,
+    managed_service_endpoint_readiness,
 };
 
 use crate::endpoint_keys;
@@ -178,16 +178,40 @@ pub(crate) fn live_managed_services_for_model(
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
-/// The real process ids a record tracks.
+/// The real processes a record tracks, each paired with its own start-ticks.
 ///
 /// The launcher pid is always recorded; `engine_pid` is adopted once the engine
 /// state file reports one. A `0` pid is a placeholder, never a real process.
-pub(crate) fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
-    [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0)
-        .collect()
+/// When both name the same pid, the supervisor's known start-ticks win a
+/// conflict, and either known token wins over `None`.
+pub(crate) fn recorded_service_pids(
+    record: &ManagedServiceRecord,
+) -> Vec<rocm_core::ProcessIdentity> {
+    let mut identities: Vec<rocm_core::ProcessIdentity> = Vec::new();
+    for (pid, ticks) in [
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+        (record.engine_pid, record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0) else {
+            continue;
+        };
+        match identities.iter_mut().find(|identity| identity.pid == pid) {
+            Some(existing) if existing.start_ticks.is_none() => existing.start_ticks = ticks,
+            Some(_) => {}
+            None => identities.push(rocm_core::ProcessIdentity::new(pid, ticks)),
+        }
+    }
+    identities
+}
+
+/// Whether a recorded process may still be the one the record started.
+/// Unverifiable identities are conservatively alive; legacy records without
+/// start-ticks retain plain PID liveness.
+fn recorded_service_process_is_alive(identity: &rocm_core::ProcessIdentity) -> bool {
+    matches!(
+        rocm_core::identity_state(identity),
+        rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+    )
 }
 
 /// Complete a stop that was requested but could not confirm termination, once
@@ -212,7 +236,7 @@ fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedService
     }
     if recorded_service_pids(record)
         .iter()
-        .any(|pid| process_is_running(*pid))
+        .any(recorded_service_process_is_alive)
     {
         return false;
     }
@@ -271,7 +295,7 @@ pub(crate) fn refresh_managed_service_runtime_liveness(
 
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
+    let has_live_pid = tracked_pids.iter().any(recorded_service_process_is_alive);
     if has_tracked_pid && !has_live_pid {
         // Reconcile the status only. The endpoint key is *not* dropped here:
         // dead pids alone do not distinguish a stopped service from a crashed
@@ -570,6 +594,148 @@ mod tests {
         Ok(())
     }
 
+    /// Run the liveness refresh on a `starting` record whose supervisor and
+    /// engine pid are both a live `sleep` child, recorded with `ticks(real)`.
+    #[cfg(target_os = "linux")]
+    fn refresh_starting_record_for_live_child(
+        name: &str,
+        ticks: impl Fn(u64) -> Option<u64>,
+    ) -> (ManagedServiceRecord, bool) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths(name);
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-liveness",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = ticks(real);
+        record.engine_start_ticks = ticks(real);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+        (record, changed)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_demotes_record_whose_pid_was_recycled() {
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-recycled", |real| {
+                Some(real.wrapping_add(1))
+            });
+        assert_eq!(record.status, "stopped");
+        assert!(changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_keeps_record_whose_pid_identity_matches_not_recycled() {
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-not-recycled", Some);
+        assert_eq!(record.status, "starting");
+        assert!(!changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_keeps_legacy_record_without_start_ticks_not_recycled() {
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-legacy-not-recycled", |_| None);
+        assert_eq!(record.status, "starting");
+        assert!(!changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_demotes_recycled_supervisor_when_engine_ticks_unknown() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("liveness-recycled-engine-unknown");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-liveness",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = Some(real.wrapping_add(1));
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(record.status, "stopped");
+        assert!(changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_prefers_supervisor_token_when_known_tokens_conflict() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("liveness-conflicting-known-tokens");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-liveness",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            9,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = Some(real.wrapping_add(1));
+        record.engine_start_ticks = Some(real);
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(record.status, "stopped");
+        assert!(changed);
+    }
+
     /// A public record with a dead pid and a stored endpoint key, for the
     /// liveness-refresh cases below. The port is one nothing listens on, so the
     /// refresh's endpoint probe fails and it falls through to the pid check.
@@ -625,16 +791,20 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn unconfirmed_stop_clears_the_endpoint_key_once_the_processes_are_gone() {
-        // The other half: a stop that could not confirm termination leaves the
-        // key in place (the engine may still be alive and enforcing it) and
-        // records the intent. Once the processes are observed gone, the deferred
-        // cleanup runs, so no plaintext secret is stranded for a service the
-        // operator did ask to stop.
+    fn unconfirmed_stop_clears_the_endpoint_key_once_the_recorded_identity_is_recycled() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
         let (root, paths) = test_paths("liveness-pending-stop-clears-key");
         let service_id = "svc-pending-stop";
         let mut record = dead_public_service_with_key(&paths, service_id, 11983);
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        record.supervisor_pid = pid;
+        record.supervisor_start_ticks = Some(real.wrapping_add(1));
         record.stop_requested_unix_ms = Some(1);
 
         let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
@@ -644,12 +814,18 @@ mod tests {
         assert_eq!(
             endpoint_keys::endpoint_api_key(&paths, service_id),
             None,
-            "a requested stop must still drop the key"
+            "a requested stop must drop the key once its identity is recycled"
         );
         assert_eq!(
             record.stop_requested_unix_ms, None,
             "the marker is consumed, so the cleanup does not run again"
         );
+        assert!(
+            rocm_core::process_is_running(pid),
+            "the unrelated process holding the recycled pid remains alive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = fs::remove_dir_all(root);
     }
 
