@@ -42,7 +42,9 @@
 //! **Not covered**, and said in the skip message: user-level cargo
 //! configuration (`~/.cargo/config.toml`), installed tools, files git ignores,
 //! network-dependent or flaky tests. `--rerun` or [`RERUN_VAR`] ignores recorded
-//! passes (and records a fresh one), and `SKIP=<hook id>` still skips a hook
+//! passes: it drops this step's earlier pass before running, so a rerun that
+//! fails leaves nothing for the next ordinary run to skip on, and it records a
+//! fresh pass when the step succeeds. `SKIP=<hook id>` still skips a hook
 //! outright. The `verify-commits` hook is a separate hook and runs every time.
 //!
 //! As elsewhere in this crate the decisions are pure and the world is injected:
@@ -318,6 +320,21 @@ impl Stamps<'_> {
         }
         let age = self.now.saturating_sub(passed_at);
         Ok((age <= MAX_AGE_SECS).then_some(age))
+    }
+
+    /// Drop the recorded pass for exactly this key, before a rerun that will
+    /// replace it. A rerun exists because something the key does not cover may
+    /// have changed (user-level cargo configuration, an installed tool), so if it
+    /// fails the earlier pass must not survive to skip the next ordinary run.
+    /// Other steps' and other trees' stamps are different files and stay.
+    /// Returns a note when the stamp could not be removed.
+    pub fn invalidate(&self, key: &Key) -> Option<String> {
+        self.store.remove(&key.file_name()).err().map(|error| {
+            format!(
+                "could not remove the earlier pass stamp ({error:#}); if this run fails, the \
+                 next ordinary run may still skip the step"
+            )
+        })
     }
 
     /// Record that the step passed. Returns a note when nothing was recorded.

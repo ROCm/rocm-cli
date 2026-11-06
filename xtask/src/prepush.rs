@@ -441,6 +441,14 @@ pub fn execute(
         return Ok(());
     }
 
+    // `--rerun` replaces the recorded pass: drop it first, so a run that fails
+    // leaves nothing for the next ordinary run to skip on, and write a fresh one
+    // only once cargo succeeded.
+    if stamps.rerun {
+        if let Some(note) = key.as_ref().and_then(|key| stamps.invalidate(key)) {
+            writeln!(out, "pre-push-check {label}: {note}")?;
+        }
+    }
     run_cargo(&args)?;
     if let Some(note) = key.and_then(|key| stamps.record(&key)) {
         writeln!(out, "pre-push-check {label}: {note}")?;
@@ -1477,6 +1485,188 @@ mod tests {
         assert!(
             store.files.borrow().is_empty(),
             "nothing is recorded for a tree cargo changed"
+        );
+    }
+
+    /// `--rerun` is used when something the key omits may have changed (user-level
+    /// cargo configuration, an installed tool). If that rerun fails, the earlier
+    /// pass must not survive to skip the next ordinary run.
+    #[test]
+    fn a_failed_rerun_does_not_leave_the_earlier_pass_to_skip_the_next_ordinary_run() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("the first, passing run");
+        assert_eq!(store.files.borrow().len(), 1);
+
+        let failed = run_at(
+            &stamps(&probe, &store, NOW + 100, true),
+            Check::Test,
+            &files,
+            false,
+            true,
+        );
+        assert!(failed.result.is_err(), "the rerun fails");
+        assert_eq!(failed.cargo, [XTASK_TEST], "--rerun must run the step");
+        assert!(
+            store.files.borrow().is_empty(),
+            "the earlier pass is dropped before the rerun and nothing replaces it"
+        );
+
+        let retry = run_at(
+            &stamps(&probe, &store, NOW + 200, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        retry.result.expect("the ordinary retry");
+        assert_eq!(
+            retry.cargo,
+            [XTASK_TEST],
+            "the ordinary retry must run the step: {}",
+            retry.out
+        );
+        assert!(!retry.out.contains("skipped"), "{}", retry.out);
+        assert_eq!(
+            store.files.borrow().len(),
+            1,
+            "the passing retry is recorded"
+        );
+    }
+
+    #[test]
+    fn a_failed_rerun_keeps_the_passes_of_other_steps_and_other_selections() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        for (check, files) in [
+            (Check::Test, &["xtask/src/main.rs"][..]),
+            (Check::Test, &["Cargo.lock"][..]),
+            (Check::Clippy, &["xtask/src/main.rs"][..]),
+        ] {
+            run_at(
+                &stamps(&probe, &store, NOW, false),
+                check,
+                files,
+                false,
+                false,
+            )
+            .result
+            .expect("a recorded pass");
+        }
+        assert_eq!(store.files.borrow().len(), 3);
+
+        let failed = run_at(
+            &stamps(&probe, &store, NOW + 100, true),
+            Check::Test,
+            &["xtask/src/main.rs"],
+            false,
+            true,
+        );
+        assert!(failed.result.is_err());
+        assert_eq!(
+            store.files.borrow().len(),
+            2,
+            "only the stamp the rerun replaces is dropped"
+        );
+        // The sibling passes still skip.
+        for (check, files) in [
+            (Check::Test, &["Cargo.lock"][..]),
+            (Check::Clippy, &["xtask/src/main.rs"][..]),
+        ] {
+            let again = run_at(
+                &stamps(&probe, &store, NOW + 200, false),
+                check,
+                files,
+                false,
+                false,
+            );
+            assert!(again.cargo.is_empty(), "{:?}: {}", again.cargo, again.out);
+        }
+    }
+
+    #[test]
+    fn a_dry_run_rerun_leaves_every_stamp_in_place() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("the first run");
+        let before = store.files.borrow().clone();
+
+        let dry = run_at(
+            &stamps(&probe, &store, NOW + 100, true),
+            Check::Test,
+            &files,
+            true,
+            false,
+        );
+        dry.result.expect("the dry run");
+        assert!(
+            dry.cargo.is_empty(),
+            "a dry run runs nothing: {:?}",
+            dry.cargo
+        );
+        assert_eq!(
+            *store.files.borrow(),
+            before,
+            "a dry run neither removes nor rewrites a stamp"
+        );
+    }
+
+    #[test]
+    fn a_passing_rerun_replaces_the_pass_with_a_fresh_one() {
+        let (probe, store) = (FakeProbe::clean("tree-1"), MemStore::default());
+        let files = ["xtask/src/main.rs"];
+        run_at(
+            &stamps(&probe, &store, NOW, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("the first run");
+        run_at(
+            &stamps(&probe, &store, NOW + 100, true),
+            Check::Test,
+            &files,
+            false,
+            false,
+        )
+        .result
+        .expect("the passing rerun");
+        assert_eq!(
+            store.files.borrow().len(),
+            1,
+            "one pass, replaced not added"
+        );
+        let after = run_at(
+            &stamps(&probe, &store, NOW + 130, false),
+            Check::Test,
+            &files,
+            false,
+            false,
+        );
+        assert!(after.cargo.is_empty(), "{}", after.out);
+        assert!(
+            after.out.contains(
+                "this tree already passed `cargo test -p xtask --all-targets` under a minute ago"
+            ),
+            "the fresh pass is the one that skips: {}",
+            after.out
         );
     }
 

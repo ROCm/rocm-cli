@@ -483,7 +483,10 @@ files git ignores (the one thing a clean `git status` cannot see) and flaky test
 hook has no flags, so use the variable there), or delete the directory the message names. `SKIP=<hook
 id>` still skips a hook outright, and `verify-commits` is a separate hook that checks commit
 signatures on every push. A skip proves that this tree passed these checks earlier, not that they ran
-during this push; for a fresh run before relying on the result, use `--rerun`.
+during this push; for a fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it drops
+this step's earlier pass before running, so if the rerun fails the next ordinary run runs the step
+instead of skipping on the pass it was meant to double-check, and a successful rerun records a fresh
+one. Other steps' and other selections' passes are left alone, and `--dry-run` never touches a stamp.
 
 Preview what a push would check without compiling (a dry run also says when a real run would skip):
 
