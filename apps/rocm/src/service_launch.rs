@@ -444,16 +444,23 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// original failure with a second one.
 fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
     if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
-        let outcome = rocm_core::terminate_verified(
-            // The token captured at spawn, not a fresh `capture`: when the child
-            // already exited, a fresh one would describe a recycled pid's new owner
-            // and the forced tree kill would hit it. No token means the pid cannot
-            // be verified, and `terminate_verified` then signals nothing.
-            &rocm_core::ProcessIdentity::new(pid, record.engine_start_ticks),
-            rocm_core::KillScope::Tree,
-            MANAGED_LAUNCH_CLEANUP_GRACE,
-            true,
-        );
+        // The token captured at spawn, not a fresh `capture`: when the child
+        // already exited, a fresh one would describe a recycled pid's new owner
+        // and the forced tree kill would hit it. Where start tokens exist
+        // (Linux), a missing one means the child was gone before it could be
+        // captured, so the pid is unverifiable and nothing is signalled
+        // (`terminate_verified` alone would "best-effort proceed"). Windows
+        // records no token at all, so there the kill proceeds as before.
+        let outcome = if record.engine_start_ticks.is_none() && cfg!(target_os = "linux") {
+            rocm_core::TerminationOutcome::Unverified
+        } else {
+            rocm_core::terminate_verified(
+                &rocm_core::ProcessIdentity::new(pid, record.engine_start_ticks),
+                rocm_core::KillScope::Tree,
+                MANAGED_LAUNCH_CLEANUP_GRACE,
+                true,
+            )
+        };
         record_cli_audit_event(
             paths,
             "service",
@@ -4326,7 +4333,13 @@ mod tests {
 
         abandon_failed_managed_launch(&paths, &record);
 
-        let still_running = bystander.try_wait().expect("poll bystander").is_none();
+        let mismatched_left_alone = bystander.try_wait().expect("poll bystander").is_none();
+        // A child that was gone before its token could be captured leaves none:
+        // that must not fall back to "best-effort" signalling either.
+        record.engine_start_ticks = None;
+        abandon_failed_managed_launch(&paths, &record);
+        let still_running =
+            mismatched_left_alone && bystander.try_wait().expect("poll bystander").is_none();
         let _ = bystander.kill();
         let _ = bystander.wait();
         let _ = fs::remove_dir_all(root);
