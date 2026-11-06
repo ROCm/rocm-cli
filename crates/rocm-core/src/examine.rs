@@ -113,6 +113,21 @@ pub struct WslFacts {
     /// unreadable cache is not an unregistered library, and reporting it as one
     /// told users with a working install to re-run `ldconfig`.
     pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the
+    /// loader searches before the linker cache. A library there loads without
+    /// being registered, so only [`Self::librocdxg_unloadable`] -- not the cache
+    /// answer alone -- says the runtime cannot find it. `false` from the
+    /// `--distro` probe, which runs a non-login shell and sees none of the
+    /// user's environment.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
+    /// Whether `librocdxg.so` is in the same `lib` directory as a
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// TheRock tarball is laid out this way and is never in the linker cache.
+    /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
+    /// can ask it from outside the distribution.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     /// Whether `rocminfo` is on PATH.
     pub rocminfo: bool,
     /// Whether ROCm can actually enumerate a GPU here.
@@ -141,6 +156,27 @@ pub struct WslFacts {
     /// run, and a caller must say so rather than let "nothing matched" read as
     /// a clean bill of health.
     pub locally_probed: bool,
+}
+
+impl WslFacts {
+    /// `librocdxg.so` exists somewhere the probe looked: under a ROCm install, or
+    /// in a directory on `LD_LIBRARY_PATH`. A library reached only through the
+    /// variable (a source build in a home directory) is on disk even though no
+    /// ROCm root holds it.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
+
+    /// The linker cache positively lacks ROCDXG and neither `LD_LIBRARY_PATH` nor
+    /// the runtime's own directory supplies it. `None` from the cache (ldconfig
+    /// could not run) is not evidence, so it is not "unloadable".
+    #[must_use]
+    pub const fn librocdxg_unloadable(&self) -> bool {
+        matches!(self.ldconfig_librocdxg, Some(false))
+            && !self.librocdxg_on_ld_library_path
+            && !self.librocdxg_beside_runtime
+    }
 }
 
 /// One copy of a ROCm library found on the machine.

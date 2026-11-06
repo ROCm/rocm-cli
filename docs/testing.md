@@ -2662,6 +2662,29 @@ distinctly from both a malformed line and an unknown distribution:
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
 ```
 
+`examine-32` and `examine-33` plant a WSL machine under the same simulated root
+(`/dev/dxg`, DXCore and `librocdxg.so`) with a stand-in `ldconfig` on `PATH`
+whose cache does not list the library, and set `LD_LIBRARY_PATH` explicitly. With
+the library's directory on it, `driver_status` is `wsl_rocdxg_ready`; with the
+variable empty it is `wsl_rocdxg_missing`, which is the control that shows the
+first scenario turns on `LD_LIBRARY_PATH` and not on the planted files alone. Both
+run on every Linux lane, because the planted root, not the runner, decides what
+the probe finds.
+
+`examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
+library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
+own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+cache nor the variable involved, which is the layout of a TheRock tarball
+(ROCM-30386). Its control is `examine-33`, which plants the library alone and
+stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
+is what the verdict turns on.
+
+`serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[123] |serve-42 '
+```
+
 The install plans deliberately read the real file, so no scenario plants one
 for them, including for the fallback; their parsing is covered by the unit
 tests above, and the fallback itself by `hardware_root`'s own unit tests,

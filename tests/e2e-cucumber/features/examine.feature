@@ -509,20 +509,60 @@ Feature: GPU detection and system inspection
     When the daemon gathers a bridge snapshot
     Then the snapshot says amd-smi was never launched and names the device
 
+  # ROCDXG is found by the dynamic loader through LD_LIBRARY_PATH as well as
+  # through the linker cache, and a TheRock tarball under /opt/rocm-<version> is
+  # reachable only the first way: nothing registers it with `ldconfig`. The
+  # inspection used to require the cache entry regardless, so a working WSL GPU
+  # read `wsl_rocdxg_missing` and the CLI refused to serve on it (ROCMAI-870).
+  #
+  # The planted root supplies `/dev/dxg`, DXCore and the library under
+  # `/opt/rocm`, and a stand-in `ldconfig` on PATH answers with a cache that
+  # does not list it, so the verdict rests on LD_LIBRARY_PATH alone on every
+  # Linux lane, WSL or not. The `@id:examine-rocdxg-missing-without-loader-path`
+  # scenario below is its control: the same machine without the variable.
+  @id:examine-rocdxg-ready-from-ld-library-path @requires-os:linux
+  Scenario: examine-32 - The inspection reports ROCDXG ready when the loader reaches it through LD_LIBRARY_PATH
+    Given a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  @id:examine-rocdxg-missing-without-loader-path @requires-os:linux
+  Scenario: examine-33 - The inspection reports ROCDXG missing when neither the linker cache nor LD_LIBRARY_PATH reaches it
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_missing"
+    And the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail says the library is missing from the linker cache
+
+  # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
+  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
+  # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
+  # control is `examine-33`, the same machine with the library alone.
+  @id:examine-rocdxg-ready-beside-runtime @requires-os:linux
+  Scenario: examine-34 - The inspection reports ROCDXG ready when the library sits beside the runtime that opens it
+    Given a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
   # kfd is linked into `amdgpu` (`HSA_AMD` is a `bool` Kconfig option), so a
   # healthy machine never lists an `amdkfd` module. The report used to read
   # that as "kfd missing". Each scenario plants a module list naming `amdgpu`
   # only, so the answer can come only from the kernel's kfd interfaces.
   @id:examine-reports-kfd-built-into-the-kernel @requires-os:linux
-  Scenario: examine-32 - The inspection reports kfd on a machine whose module list has no amdkfd
+  Scenario: examine-35 - The inspection reports kfd on a machine whose module list has no amdkfd
     Given a machine whose kernel exposes kfd but lists no amdkfd module
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as loaded
 
-  # A negative control for examine-32, not proof of the fix: it passes with
+  # A negative control for examine-35, not proof of the fix: it passes with
   # the fix reverted too, and fails if the kfd check reports true regardless.
   @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
-  Scenario: examine-33 - The inspection reports kfd as not loaded on a machine without it
+  Scenario: examine-36 - The inspection reports kfd as not loaded on a machine without it
     Given a machine whose kernel has no kfd and lists no amdkfd module
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as not loaded
@@ -534,7 +574,7 @@ Feature: GPU detection and system inspection
   # and Secure Boot enabled, so the evidence lines are reachable if the flag
   # regresses.
   @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
-  Scenario: examine-34 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+  Scenario: examine-37 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
     Given a machine whose kernel has amdgpu built in and lists no amdgpu module
     When the user inspects and diagnoses that machine
     Then the inspection reports amdgpu as loaded
@@ -544,7 +584,7 @@ Feature: GPU detection and system inspection
   # the kernel's kfd interfaces still answer: kfd is linked into amdgpu, so
   # `/dev/kfd` reports both drivers as loaded rather than leaving them unknown.
   @id:examine-reports-drivers-from-kfd-without-a-module-list @requires-os:linux
-  Scenario: examine-35 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
+  Scenario: examine-38 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
     Given a machine whose kernel exposes kfd but whose module list cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as loaded

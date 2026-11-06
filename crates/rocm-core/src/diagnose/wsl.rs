@@ -146,11 +146,12 @@ pub(super) fn check_wsl_2_dxcore_missing(e: &Examination, symptom: &str) -> Diag
 
 pub(super) fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let w = wsl_facts(e);
-    if w.librocdxg || !w.dxg_device {
+    if w.librocdxg_present() || !w.dxg_device {
         return zero("fix-wsl-3-rocdxg-missing", "ROCDXG not installed");
     }
     let mut score = 50;
-    let mut evidence = vec!["librocdxg.so was not found under any ROCm install".to_owned()];
+    let mut evidence =
+        vec!["librocdxg.so was not found under any ROCm install or on LD_LIBRARY_PATH".to_owned()];
     if w.dxcore {
         // The host side is ready and only the distro-side package is absent, which
         // is both the most common case and the one the user can fix alone.
@@ -198,16 +199,24 @@ pub(super) fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> D
     // it beside the real cause just leaves the user to guess which to act on.
     // `Some(false)` only: `None` means ldconfig could not be run, and an
     // unreadable linker cache is not an unregistered library.
-    if !w.librocdxg || w.ldconfig_librocdxg != Some(false) || !w.dxg_device {
+    if !w.librocdxg_present() || !w.librocdxg_unloadable() || !w.dxg_device {
         return zero(
             "fix-wsl-4-rocdxg-not-linked",
             "ROCDXG installed but not on the loader path",
         );
     }
     let mut score = 55;
-    let mut evidence = vec![
-        "librocdxg.so is installed but does not appear in `ldconfig -p`, so the runtime will not load it".to_owned(),
-    ];
+    // Inspected from the Windows host over `wsl.exe`, the probe runs in a
+    // non-login shell and sees none of the user's environment, so it never asked
+    // about LD_LIBRARY_PATH. Saying it did would present a guess as a finding for
+    // an install reached through that variable. Whether the library sits beside the
+    // runtime is a question about files, which the remote probe does ask, so that
+    // source is named either way.
+    let mut evidence = vec![if w.locally_probed {
+        "librocdxg.so is installed but appears neither in `ldconfig -p` nor in a directory on LD_LIBRARY_PATH nor beside a libhsa-runtime64 in a ROCm install, so the runtime will not load it".to_owned()
+    } else {
+        "librocdxg.so is installed but does not appear in `ldconfig -p` and is not beside a libhsa-runtime64 in a ROCm install. LD_LIBRARY_PATH could not be checked from outside the distribution: if ROCDXG is reached through it the runtime can load it anyway, and `rocm diagnose` run inside the distribution says which".to_owned()
+    }];
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
     score += kw_score;
     evidence.extend(kw_ev);
@@ -220,6 +229,7 @@ pub(super) fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> D
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
             "If `ldconfig` alone does not fix it, the install went somewhere outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.".to_owned(),
+            "Without root, export the library's `lib` directory in the shell that runs `rocm`, for example `export LD_LIBRARY_PATH=<dir>:$LD_LIBRARY_PATH`; the loader then finds it with no cache entry. `rocm diagnose --distro` cannot see that variable, so run `rocm diagnose` inside the distro to confirm.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -307,16 +317,17 @@ pub(super) fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) ->
         // specifically -- `None` means rocminfo was absent so the question went
         // unasked, which is not evidence of anything.
         //
-        // Guarded on the linker cache like fix-wsl-4: when `ldconfig` positively
-        // shows librocdxg is not registered, that is the root cause and this
-        // check must not also fire for the same symptom -- the user would be
-        // left choosing between "run ldconfig" and "update the host driver" for
-        // a fault that only the former explains.
+        // Guarded on `librocdxg_unloadable()` like fix-wsl-4: when none of the
+        // linker cache, LD_LIBRARY_PATH and the runtime's own directory lets the
+        // loader find librocdxg, that is the root cause and this check must not
+        // also fire for the same symptom -- the user would be left choosing
+        // between "run ldconfig" and "update the host driver" for a fault that
+        // only the former explains.
         Some(version)
             if w.dxg_device
                 && w.dxcore
-                && w.librocdxg
-                && w.ldconfig_librocdxg != Some(false)
+                && w.librocdxg_present()
+                && !w.librocdxg_unloadable()
                 && w.rocm_sees_gpu == Some(false) =>
         {
             score += 40;
@@ -406,6 +417,7 @@ const WSL_DOCS_URL: &str = "https://rocm.docs.amd.com/projects/radeon-ryzen/en/l
 mod tests {
     use crate::diagnose::test_support::wsl_base;
     use crate::diagnose::{HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH, diagnose};
+    use crate::examine::Examination;
 
     #[test]
     fn a_healthy_wsl_host_gets_no_diagnosis() {
@@ -570,6 +582,196 @@ mod tests {
             !ids.contains(&"fix-wsl-6-host-driver-too-old"),
             "the host-driver-too-old finding must not overlap with the unlinked-library \
              finding on the same fault: ids: {ids:?}"
+        );
+    }
+
+    fn matched_ids(e: &Examination, symptom: &str) -> Vec<String> {
+        diagnose(e, symptom)
+            .matched
+            .iter()
+            .map(|d| d.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_rocdxg_on_the_loader_path_is_not_reported_as_unlinked() {
+        // A TheRock tarball under /opt/rocm-<version> is never in the linker
+        // cache, but the loader finds it through LD_LIBRARY_PATH; `sudo ldconfig`
+        // would not have helped.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.librocdxg_on_ld_library_path = true;
+        let ids = matched_ids(&e, "librocdxg.so: cannot open shared object file");
+        assert!(
+            !ids.iter().any(|i| i == "fix-wsl-4-rocdxg-not-linked"),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_rocdxg_outside_every_rocm_root_but_on_the_loader_path_is_not_reported_missing() {
+        // A source build in a home directory: no ROCm root holds it
+        // (`librocdxg` false) but the variable reaches it, so fix-wsl-3 must not
+        // say it is absent, nor fix-wsl-4 say it is unlinked.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        w.librocdxg_on_ld_library_path = true;
+        let ids = matched_ids(&e, "librocdxg.so: cannot open shared object file");
+        assert!(
+            !ids.iter().any(|i| i == "fix-wsl-3-rocdxg-missing"),
+            "{ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i == "fix-wsl-4-rocdxg-not-linked"),
+            "{ids:?}"
+        );
+        // Without the variable the same facts are a genuinely missing library.
+        e.wsl
+            .as_mut()
+            .expect("wsl facts")
+            .librocdxg_on_ld_library_path = false;
+        let ids = matched_ids(&e, "librocdxg.so: cannot open shared object file");
+        assert!(
+            ids.iter().any(|i| i == "fix-wsl-3-rocdxg-missing"),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_rocdxg_on_the_loader_path_still_lets_the_host_driver_finding_fire() {
+        // With the cache lacking ROCDXG but LD_LIBRARY_PATH supplying it the
+        // plumbing is complete, so a GPU rocminfo cannot see is the host
+        // driver's fault.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.librocdxg_on_ld_library_path = true;
+        w.rocm_sees_gpu = Some(false);
+        let ids = matched_ids(&e, "");
+        assert!(
+            ids.iter().any(|i| i == "fix-wsl-6-host-driver-too-old"),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_rocdxg_beside_the_runtime_is_not_reported_as_unlinked() {
+        // The ROCM-30386 layout: a TheRock tarball keeps librocdxg.so beside
+        // libhsa-runtime64, which opens it through its own `$ORIGIN` runpath.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.librocdxg_beside_runtime = true;
+        let ids = matched_ids(&e, "librocdxg.so: cannot open shared object file");
+        assert!(
+            !ids.iter().any(|i| i == "fix-wsl-4-rocdxg-not-linked"),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_rocdxg_beside_the_runtime_still_lets_the_host_driver_finding_fire() {
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.librocdxg_beside_runtime = true;
+        w.rocm_sees_gpu = Some(false);
+        let ids = matched_ids(&e, "");
+        assert!(
+            ids.iter().any(|i| i == "fix-wsl-6-host-driver-too-old"),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn unloadable_means_the_cache_said_no_and_no_other_source_covered_it() {
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        for (cache, on_path, beside, unloadable) in [
+            (Some(false), false, false, true),
+            (Some(false), true, false, false),
+            (Some(false), false, true, false),
+            (Some(false), true, true, false),
+            (Some(true), false, false, false),
+            (Some(true), true, false, false),
+            (Some(true), false, true, false),
+            // ldconfig could not run: an unreadable cache is not evidence.
+            (None, false, false, false),
+            (None, true, false, false),
+            (None, false, true, false),
+        ] {
+            w.ldconfig_librocdxg = cache;
+            w.librocdxg_on_ld_library_path = on_path;
+            w.librocdxg_beside_runtime = beside;
+            assert_eq!(
+                w.librocdxg_unloadable(),
+                unloadable,
+                "cache {cache:?}, on LD_LIBRARY_PATH {on_path}, beside runtime {beside}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_seen_from_outside_the_distro_does_not_claim_it_checked_the_loader_path() {
+        // `--distro` runs a non-login shell over wsl.exe: it reads the linker
+        // cache but never sees the user's LD_LIBRARY_PATH.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.locally_probed = false;
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let finding = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-wsl-4-rocdxg-not-linked")
+            .expect("the unlinked-library finding must still fire from outside the distro");
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("could not be checked from outside the distribution"),
+            "evidence: {evidence}"
+        );
+        assert!(
+            !evidence.contains("neither in `ldconfig -p` nor"),
+            "a remote probe must not claim it checked LD_LIBRARY_PATH: {evidence}"
+        );
+        assert!(
+            evidence.contains("is not beside a libhsa-runtime64"),
+            "evidence: {evidence}"
+        );
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_seen_from_inside_the_distro_says_it_checked_the_loader_path() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let finding = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-wsl-4-rocdxg-not-linked")
+            .expect("the unlinked-library finding must fire");
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains(
+                "neither in `ldconfig -p` nor in a directory on LD_LIBRARY_PATH nor beside a libhsa-runtime64"
+            ),
+            "evidence: {evidence}"
+        );
+        assert!(!evidence.contains("outside the distribution"), "{evidence}");
+        // The remediation for the no-root case is offered with the finding.
+        assert!(
+            finding
+                .fix
+                .as_ref()
+                .expect("fix")
+                .notes
+                .iter()
+                .any(|n| n.contains("export LD_LIBRARY_PATH")),
+            "{:?}",
+            finding.fix.as_ref().expect("fix").notes
         );
     }
 

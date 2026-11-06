@@ -2354,3 +2354,245 @@ async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
         "{age}"
     );
 }
+
+// ── ROCDXG reachable through LD_LIBRARY_PATH ───────────────────────
+
+/// Plant a WSL machine under the simulated host root: `/dev/dxg`, DXCore, and
+/// `librocdxg.so` under `/opt/rocm`, plus a stand-in `ldconfig` first on PATH
+/// whose cache does not list the library. `LD_LIBRARY_PATH` is set explicitly
+/// (to `loader_path`, possibly empty) so the runner's own value, which may name
+/// a real `/opt/rocm/lib`, cannot decide the scenario.
+fn plant_wsl_machine_with_unregistered_rocdxg(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/dxg"), "").expect("failed to plant /dev/dxg");
+    std::fs::create_dir_all(host.join("usr/lib/wsl/lib"))
+        .expect("failed to create planted WSL lib");
+    std::fs::write(host.join("usr/lib/wsl/lib/libdxcore.so"), "")
+        .expect("failed to plant libdxcore.so");
+    std::fs::create_dir_all(host.join("opt/rocm/lib")).expect("failed to create planted ROCm lib");
+    std::fs::write(host.join("opt/rocm/lib/librocdxg.so"), "")
+        .expect("failed to plant librocdxg.so");
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    // A readable cache that simply lacks the library: `None` (ldconfig could not
+    // run) would be a different case, and one the verdict must not read as "no".
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("ldconfig"),
+        "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6'\n",
+    )
+    .expect("failed to write the fake ldconfig");
+    push_planted_wsl_machine_env(world, loader_path);
+}
+
+/// Hand the planted WSL machine to the next `rocm` invocation. Separate from the
+/// planting so a scenario that runs a second command on the same machine can give
+/// it the same environment: the scenario env is consumed by each run.
+fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let path = std::env::join_paths(std::iter::once(root.join("fake-bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("LD_LIBRARY_PATH", loader_path.into()));
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
+}
+
+#[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
+async fn wsl_machine_with_rocdxg_on_the_loader_path(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+}
+
+#[given("a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH")]
+async fn wsl_machine_with_rocdxg_nowhere_the_loader_looks(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+}
+
+#[given(
+    "a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn wsl_machine_with_rocdxg_beside_the_runtime(world: &mut E2eWorld) {
+    // The same machine as the control above, plus the runtime that opens the
+    // library: the only difference between the two scenarios, so the verdict can
+    // only turn on it.
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let lib = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/opt/rocm/lib");
+    std::fs::write(lib.join("libhsa-runtime64.so.1"), "")
+        .expect("failed to plant libhsa-runtime64.so.1");
+}
+
+#[then(expr = "the inspection reports the ROCDXG driver status {string}")]
+async fn assert_rocdxg_driver_status(world: &mut E2eWorld, status: String) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        status,
+        "{json:#}"
+    );
+}
+
+fn assert_rocdxg_sources(
+    world: &E2eWorld,
+    in_cache: bool,
+    on_loader_path: bool,
+    beside_runtime: bool,
+) {
+    let json = parsed_json(world);
+    let flag = |pointer: &str| {
+        json.pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
+    };
+    // The library itself is on disk in every scenario, so the verdict turns on
+    // the loader sources alone.
+    assert!(flag("/summary/wsl/librocdxg"), "{json:#}");
+    assert_eq!(
+        flag("/summary/wsl/ldconfig_librocdxg"),
+        in_cache,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_on_ld_library_path"),
+        on_loader_path,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_beside_runtime"),
+        beside_runtime,
+        "{json:#}"
+    );
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache"
+)]
+async fn assert_rocdxg_only_on_the_loader_path(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, true, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_in_neither_source(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_only_beside_the_runtime(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, true);
+}
+
+/// The `driver_detail` line is the CLI's own advice about what is wrong. It is
+/// asserted beside the status so that a message naming a registration the
+/// workload does not need cannot ride along with a verdict that says ready.
+fn rocdxg_driver_detail(world: &E2eWorld) -> String {
+    let json = parsed_json(world);
+    inspection_str(&json, "/summary/driver/detail").to_owned()
+}
+
+#[then(
+    "the inspection's driver detail does not send the user to register the library with ldconfig"
+)]
+async fn assert_rocdxg_detail_asks_for_no_registration(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        !detail.contains("ldconfig"),
+        "the library loads through LD_LIBRARY_PATH, so the detail must not name the cache: {detail}"
+    );
+}
+
+#[then("the inspection's driver detail says the library is missing from the linker cache")]
+async fn assert_rocdxg_detail_names_the_cache(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        detail.contains("ldconfig:librocdxg.so"),
+        "nothing lets the loader find the library, so the detail must say so: {detail}"
+    );
+}
+
+// ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
+
+#[when("the user serves a model under the GPU-required default on that machine")]
+async fn user_serves_on_the_planted_wsl_machine(world: &mut E2eWorld) {
+    // The pre-flight refuses before any engine is prepared, so the model and
+    // engine named here are never fetched.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+            "--engine",
+            "lemonade",
+            "--gpu",
+            "auto",
+            "--no-smoke-test",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal points the user at the WSL driver status instead of /dev/kfd")]
+async fn assert_wsl_refusal_advice(world: &mut E2eWorld) {
+    let output = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        !output.contains("/dev/kfd is present"),
+        "WSL has no /dev/kfd, so advice to confirm it cannot clear the condition:\n{output}"
+    );
+    assert!(
+        output.contains("`driver_status` is `wsl_rocdxg_ready`"),
+        "the refusal must name the status `rocm examine` reports as ready:\n{output}"
+    );
+}
+
+#[then(
+    "inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check"
+)]
+async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
+    // The refusal says to run `rocm examine` and compare `driver_status` with the
+    // ready value. Run it on the same planted machine: it must exist, accept
+    // those arguments, and show the condition the refusal is about.
+    push_planted_wsl_machine_env(world, "");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        "wsl_rocdxg_missing",
+        "{json:#}"
+    );
+}
