@@ -31,8 +31,8 @@
 //! `stop_server` answer with its `internal_stop_server_value`, which stays there
 //! next to `service_stop_unconfirmed` and the renderer that reads the same
 //! `stop_unconfirmed` status. `service_launch.rs` and this module import each
-//! other: this module takes `ensure_public_service_has_endpoint_key` and the
-//! spawn helpers from it, and it takes `run_internal_sandbox_tool` from here.
+//! other: this module takes the spawn helpers from it, and it takes
+//! `run_internal_sandbox_tool` from here.
 //!
 //! The regression tests for the stop and restart paths live in this module's own
 //! `mod tests`. They reach shared fixtures (`test_paths`, `ScopedTestEnv`,
@@ -64,7 +64,6 @@ use crate::engine_runtime_select::{
 use crate::engines_cmd::env_root_for_service;
 use crate::gpu_policy::parse_device_policy;
 use crate::managed_service_status::load_managed_services;
-use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
@@ -432,10 +431,11 @@ fn restart_internal_managed_service_with(
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     // Checked before the stop, so a refused restart leaves a running service
     // running instead of stopping it and then failing to bring it back.
-    ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         &record.host,
         preserved_endpoint_key.is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Restart,
     )?;
     let (stop_report, stopped) =
         stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
@@ -815,6 +815,24 @@ mod tests {
         assert!(
             !rendered.contains("--require-api-key"),
             "a service that never passed the flag must not be told it did: {rendered}"
+        );
+        // The restart's refusal is the shared guard's, worded for a restart —
+        // the same text a fresh launch and the daemon print, bar the action. A
+        // private copy here, or the wrong action passed, would differ.
+        assert_eq!(
+            rendered,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "0.0.0.0",
+                false,
+                false,
+                rocm_core::ServiceStart::Restart,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            rendered.contains("restarting it would reopen it without authentication"),
+            "{rendered}"
         );
 
         // The refusal happens before the stop, so the service is left alone.

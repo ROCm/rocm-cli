@@ -18,8 +18,8 @@
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly.
-//! `ServicesCommand` stays in `main.rs` (a dedicated clap subcommand's enum
-//! usually does, per `docs/architecture.md`'s convention note). Since this
+//! `ServicesCommand` lives in `cli.rs` with the rest of the clap command
+//! tree. Since this
 //! split, `services()` has moved to `services_cmd.rs`, the record removal and
 //! pruning it dispatches to to `service_records.rs`, `record_cli_audit_event`
 //! to `cli_audit.rs` (still reached as `crate::record_cli_audit_event` through
@@ -74,11 +74,11 @@ pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<
     Ok(())
 }
 
-/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
-/// policy so `rocmd` classifies a recorded `host` identically when it respawns
-/// the service.
+/// Inverse of [`rocm_core::is_public_bind_host`], which owns the policy so
+/// `rocmd` classifies a recorded `host` identically when it respawns the
+/// service.
 pub(crate) fn is_loopback_host(host: &str) -> bool {
-    !rocm_engine_protocol::is_public_bind_host(host)
+    !rocm_core::is_public_bind_host(host)
 }
 
 /// Resolve the API key that will guard this endpoint, applying the
@@ -166,57 +166,6 @@ pub(crate) fn ensure_public_bind_engine_supported(
             "public binding with the lemonade engine is not supported on Windows: the endpoint \
              API key cannot be enforced there. Use `--engine vllm`, or bind a loopback host \
              (the default 127.0.0.1)."
-        );
-    }
-    Ok(())
-}
-
-/// Refuse to (re)spawn a managed service recorded on a public host when its
-/// endpoint API key is gone, so a respawn cannot reopen the endpoint anonymously.
-///
-/// `serve()` applies the loopback-vs-public policy once, via
-/// [`resolve_endpoint_auth`], and persists the resulting key. Every later spawn
-/// — `rocm services restart`, and `rocmd`'s recovery supervisor — reads that key
-/// file back and would otherwise treat "no key file" as "no auth wanted",
-/// silently downgrading a protected public endpoint to an open one. The real
-/// invariant is a property of the *host*, not of the file: a non-loopback bind
-/// must always be authenticated.
-///
-/// The gap is reachable through ordinary commands, because a stop deletes the
-/// key file and `rocm services restart` accepts a stopped service id (its help
-/// points at `rocm services list --all`).
-///
-/// `key_present` is a plain `bool` rather than a path so both branches are
-/// unit-testable without touching the filesystem, mirroring `is_windows` in
-/// [`ensure_public_bind_engine_supported`].
-pub(crate) fn ensure_public_service_has_endpoint_key(
-    host: &str,
-    key_present: bool,
-    requires_api_key: bool,
-) -> Result<()> {
-    // Two ways a service can need a key. A public bind is the obvious one. The
-    // other is a service that asked for auth on a loopback bind, because
-    // something outside this process republishes the port — a tailnet publish
-    // survives a reboot, let alone a restart, so "loopback" stops meaning
-    // "only this machine" and the bind address can no longer be trusted to
-    // answer the question on its own.
-    if requires_api_key && !key_present {
-        bail!(
-            "managed service was launched with `--require-api-key` but has no endpoint API key, \
-             so restarting it would reopen it without authentication. Something outside this \
-             machine may still be publishing its port. The key is dropped when a service stops \
-             and cannot be recovered. Launch it again with \
-             `rocm serve --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, \
-             to choose the key instead of generating one)."
-        );
-    }
-    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
-        bail!(
-            "managed service is bound to the public host `{host}` but has no endpoint API key, \
-             so restarting it would reopen it without authentication. The key is dropped when a \
-             service stops and cannot be recovered. Launch it again with \
-             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
     Ok(())
@@ -330,7 +279,7 @@ pub(crate) enum ManagedReuseRefusal {
     /// builds — so a server started without one keeps serving anonymously no
     /// matter what is written afterwards. Upgrading the record would be worse
     /// than doing nothing: it would claim auth the live process does not
-    /// enforce, and `ensure_public_service_has_endpoint_key` would pass on the
+    /// enforce, and the endpoint-key respawn guard would pass on the
     /// strength of a key file nothing reads. `rocm remote serve` relies on this:
     /// it publishes a loopback port onto the tailnet and prints "the API key
     /// above is what stops anyone else calling it", which reusing an
@@ -616,10 +565,11 @@ fn spawn_managed_engine_child(
     //
     // The field is threaded, never derived from the key file. Deriving it marked
     // every public bind as having demanded auth — see the assignment above.
-    ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         host,
         endpoint_key_file.is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Launch,
     )?;
     #[cfg(windows)]
     let child_pid = {
@@ -2150,7 +2100,7 @@ mod tests {
         // was launched with `--require-api-key`, and its key file is present but
         // empty — so `requires_api_key` is true while `key_present` is false,
         // which is the only way to reach the first branch. A test calling
-        // `ensure_public_service_has_endpoint_key` directly cannot catch a
+        // `rocm_core::ensure_public_service_has_endpoint_key` directly cannot catch a
         // mis-wired call site, which is the defect that has occurred here twice.
         //
         // The flag is passed explicitly rather than inferred from the key file.
@@ -2212,6 +2162,24 @@ mod tests {
         assert!(
             message.contains("without authentication"),
             "the refusal must say what the risk is: {message}"
+        );
+        // The spawn's refusal is the shared guard's, worded for a launch — the
+        // same text `rocm services restart` and the daemon print, bar the
+        // action. A private copy here, or the wrong action passed, would differ.
+        assert_eq!(
+            message,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Launch,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            message.contains("launching it would open it without authentication"),
+            "{message}"
         );
         Ok(())
     }
@@ -2329,6 +2297,18 @@ mod tests {
         ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
     }
 
+    /// The guard `rocm services restart` runs, as that caller words it. The
+    /// guard itself is `rocm_core`'s and is tested there; these tests are about
+    /// what a restart is told.
+    fn restart_guard(host: &str, key_present: bool, requires_api_key: bool) -> Result<()> {
+        rocm_core::ensure_public_service_has_endpoint_key(
+            host,
+            key_present,
+            requires_api_key,
+            rocm_core::ServiceStart::Restart,
+        )
+    }
+
     #[test]
     fn a_public_bind_is_refused_with_the_command_that_restores_it() {
         // `resolve_endpoint_auth` mints a key for every non-loopback bind whether
@@ -2340,7 +2320,7 @@ mod tests {
         //
         // A plain `--host 0.0.0.0 --allow-public-bind` launch: key file present,
         // `--require-api-key` never passed.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false)
+        let error = restart_guard("0.0.0.0", false, false)
             .expect_err("a public bind with no key must be refused");
         let rendered = format!("{error:#}");
         assert!(
@@ -2353,7 +2333,7 @@ mod tests {
         );
 
         // And the loopback-with-forced-auth case still reports its own reason.
-        let error = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
+        let error = restart_guard("127.0.0.1", false, true)
             .expect_err("a service that demanded auth must not come back without it");
         assert!(
             format!("{error:#}").contains("--require-api-key"),
@@ -2365,7 +2345,7 @@ mod tests {
     fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
         // A stop deletes the key file, so a later restart of a public service
         // would otherwise respawn it with no auth at all.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
+        let error = restart_guard("0.0.0.0", false, false).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("0.0.0.0"), "{error:#}");
         assert!(message.contains("without authentication"), "{error:#}");
@@ -2373,7 +2353,7 @@ mod tests {
         assert!(message.contains("--allow-public-bind"), "{error:#}");
 
         // A public service that still has its key restarts normally.
-        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
+        restart_guard("0.0.0.0", true, false).unwrap();
     }
 
     #[test]
@@ -2381,7 +2361,7 @@ mod tests {
         // Loopback stays credential-free, so every accepted spelling must pass
         // the guard with no key present — when nothing asked for auth.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false, false)
+            restart_guard(host, false, false)
                 .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
         }
     }
@@ -2394,7 +2374,7 @@ mod tests {
         // reopen a reachable endpoint with no authentication, and the bind
         // address gives the guard no way to notice.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            let error = ensure_public_service_has_endpoint_key(host, false, true)
+            let error = restart_guard(host, false, true)
                 .expect_err("a service launched with a key must not restart without one");
             let message = format!("{error:#}");
             assert!(message.contains("without authentication"), "{message}");
@@ -2402,7 +2382,133 @@ mod tests {
         }
 
         // With its key still present it restarts normally.
-        ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
+        restart_guard("127.0.0.1", true, true).unwrap();
+    }
+
+    /// The `rocm serve …` command a refusal tells the user to run: the backtick
+    /// span that starts with `rocm serve`, split into words.
+    fn advised_serve_command(message: &str) -> Vec<String> {
+        let spans: Vec<&str> = message
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("rocm serve"))
+            .collect();
+        assert_eq!(
+            spans.len(),
+            1,
+            "the refusal must name exactly one `rocm serve` command: {message}"
+        );
+        spans[0].split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// Run what `rocm serve` does with `advised` before it spawns anything — the
+    /// real clap parse, `validate_bind_host`, `resolve_endpoint_auth`, and the
+    /// key file `serve()` stores — and return the guard's answer for the service
+    /// that launch would record. Nothing is spawned.
+    fn guard_after_following(
+        advised: &[String],
+        paths: &AppPaths,
+        service_id: &str,
+        start: rocm_core::ServiceStart,
+    ) -> Result<()> {
+        use crate::{Cli, Command, cli_command};
+        use clap::FromArgMatches as _;
+
+        let matches = cli_command()
+            .try_get_matches_from(advised)
+            .unwrap_or_else(|error| panic!("{advised:?} does not parse: {error}"));
+        let Some(Command::Serve {
+            host,
+            allow_public_bind,
+            require_api_key,
+            api_key,
+            ..
+        }) = Cli::from_arg_matches(&matches)?.command
+        else {
+            panic!("{advised:?} is not a `rocm serve` invocation");
+        };
+        validate_bind_host(&host, allow_public_bind)?;
+        let key = resolve_endpoint_auth(&host, api_key.as_deref(), require_api_key)?;
+        if let Some(key) = key.as_deref() {
+            endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
+        }
+        // The expression `spawn_managed_engine_child` computes: a *usable* key.
+        let key_present = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
+            .is_some_and(|path| rocm_engine_protocol::endpoint_api_key_from_file(&path).is_some());
+        rocm_core::ensure_public_service_has_endpoint_key(
+            &host,
+            key_present,
+            require_api_key,
+            start,
+        )
+    }
+
+    /// The command a refusal names is the same for every action that can print
+    /// it — `rocm services restart`, a fresh launch, and the daemon's respawn,
+    /// whose text is the same shared guard's — so each is followed here, from
+    /// the refused state, through the real `rocm serve` front half.
+    #[test]
+    fn the_command_a_respawn_refusal_names_clears_the_refusal() -> Result<()> {
+        use rocm_core::ServiceStart;
+
+        for start in [
+            ServiceStart::Launch,
+            ServiceStart::Restart,
+            ServiceStart::Respawn,
+        ] {
+            for (host, requires_api_key) in [
+                ("127.0.0.1", true),
+                ("localhost", true),
+                ("::1", true),
+                ("0.0.0.0", false),
+                ("192.168.1.10", false),
+                ("gpu-box.example", false),
+            ] {
+                let message = rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    requires_api_key,
+                    start,
+                )
+                .expect_err("a keyless service in this state is refused")
+                .to_string();
+                let advised = advised_serve_command(&message);
+
+                // `rocm serve` takes a required <MODEL>: the command names it as
+                // a placeholder, and parses as printed.
+                assert_eq!(advised[2], "<model>", "{advised:?}");
+                assert_eq!(
+                    crate::advised_commands::rocm_verdict(&advised[1..]),
+                    crate::advised_commands::Verdict::Parses,
+                    "{advised:?}"
+                );
+
+                // With a model in the placeholder's place the command asks for
+                // what the refusal needs (`--require-api-key` for the first rule,
+                // the public bind for the second), and what it stores satisfies
+                // the guard that refused.
+                let mut runnable = advised.clone();
+                runnable[2] = "Qwen/Qwen3-0.6B".to_owned();
+                let (root, paths) = test_paths("respawn-advice-clears");
+                paths.ensure()?;
+                fs::create_dir_all(paths.services_dir())?;
+                let service_id = "lemonade-qwen-3000";
+                assert!(
+                    endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none(),
+                    "the refused state has no key on disk"
+                );
+                guard_after_following(&runnable, &paths, service_id, start).unwrap_or_else(
+                    |error| panic!("{runnable:?} does not clear {host} ({start:?}): {error:#}"),
+                );
+                assert!(
+                    endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+                    "following the advice leaves the service a key to respawn with"
+                );
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        Ok(())
     }
 
     #[test]
