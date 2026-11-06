@@ -2662,7 +2662,7 @@ distinctly from both a malformed line and an unknown distribution:
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
 ```
 
-`examine-31` and `examine-32` plant a WSL machine under the same simulated root
+`examine-32` and `examine-33` plant a WSL machine under the same simulated root
 (`/dev/dxg`, DXCore and `librocdxg.so`) with a stand-in `ldconfig` on `PATH`
 whose cache does not list the library, and set `LD_LIBRARY_PATH` explicitly. With
 the library's directory on it, `driver_status` is `wsl_rocdxg_ready`; with the
@@ -2671,11 +2671,11 @@ first scenario turns on `LD_LIBRARY_PATH` and not on the planted files alone. Bo
 run on every Linux lane, because the planted root, not the runner, decides what
 the probe finds.
 
-`examine-33` plants the same machine with `libhsa-runtime64.so.1` beside the
+`examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
 library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
 own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
 cache nor the variable involved, which is the layout of a TheRock tarball
-(ROCM-30386). Its control is `examine-32`, which plants the library alone and
+(ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
 is what the verdict turns on.
 

@@ -709,7 +709,7 @@ Feature: Model serving
   # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
   # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
   # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
-  # The case where LD_LIBRARY_PATH does reach the library is examine-31 (the
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
   # verdict) and the unit tests on the serve gate; there is no scenario for the
   # launch that follows, because it would start preparing a real engine.
   @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
