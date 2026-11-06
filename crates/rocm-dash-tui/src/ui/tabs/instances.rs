@@ -206,7 +206,7 @@ pub(in crate::ui) const fn status_meta(
 
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let body = if state.conn.is_in_process() {
-        "no instance registry on this platform · vLLM containers aren't available here"
+        "no managed services running · serve one from 3 Serving · vLLM containers aren't available here"
     } else {
         match &state.conn {
             ConnState::Connected { .. } => {
@@ -273,8 +273,10 @@ pub(in crate::ui) mod tests {
         use ratatui::backend::TestBackend;
 
         // The Windows in-process collector (see `ConnState::is_in_process`)
-        // has no instance registry at all, ever — distinct from "a real
-        // daemon is connected but nothing is running" or "still connecting".
+        // has no daemon: its instances come only from the managed-service
+        // registry, so an empty list means nothing is served — distinct from
+        // "a real daemon is connected but nothing is running" or "still
+        // connecting".
         let mut state = mk_state(HashMap::new(), 0);
         state.conn = ConnState::Connected {
             host: "localhost".into(),
@@ -285,8 +287,8 @@ pub(in crate::ui) mod tests {
             .unwrap();
         let grid = buffer_text(&term);
         assert!(
-            grid.contains("no instance registry on this platform"),
-            "should name the platform limitation, not claim a daemon could be started; got:\n{grid}"
+            grid.contains("no managed services running"),
+            "should say nothing is served, not claim a daemon could be started; got:\n{grid}"
         );
         assert!(
             !grid.contains("start daemon"),

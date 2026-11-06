@@ -345,8 +345,9 @@ pub fn resolved_args(
 /// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
 /// live GPU/CPU/memory every tick but — by design, there being no
 /// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
-/// is unix-only) — never sends an instance snapshot, so
-/// `AppState::instances` never gets a first one there.
+/// is unix-only) — never sends an instance snapshot, so this probe is also
+/// where `AppState::instances` comes from there: the dashboard polls it
+/// (`ManagedRegistrySnapshot::instances`) once a second off the UI thread.
 ///
 /// **Known divergence, same shape as [`services_past_attempts`]'s:** this
 /// reads the record's raw on-disk `status`, not process liveness. A service
@@ -366,9 +367,29 @@ impl ManagedRegistryProbe for LiveManagedRegistryProbe {
         let discovery = discover_managed_services(&records);
         ManagedRegistrySnapshot {
             has_live_service: discovery.svcs.iter().any(|svc| svc.status.is_serving()),
+            instances: managed_instances(&discovery),
             managed_ids: discovery.seen,
         }
     }
+}
+
+/// The live managed services as dashboard instances with no telemetry yet —
+/// the same mapping the daemon applies to a newly discovered service.
+fn managed_instances(
+    discovery: &rocm_dash_daemon::registry::ManagedDiscovery,
+) -> Vec<rocm_dash_core::metrics::Instance> {
+    discovery
+        .svcs
+        .iter()
+        .map(|svc| {
+            rocm_dash_core::traits::merge_instance(
+                svc,
+                &rocm_dash_core::traits::InstanceSample::default(),
+                0,
+                0,
+            )
+        })
+        .collect()
 }
 
 /// Managed-service records that are no longer running, read from the same
@@ -706,18 +727,7 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
 fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::Instance> {
     use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
     let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records)
-        .svcs
-        .into_iter()
-        .map(|svc| rocm_dash_core::metrics::Instance {
-            container_id: svc.container_id,
-            container_name: svc.container_name,
-            model_name: svc.model_name,
-            status: svc.status,
-            port: svc.port,
-            ..Default::default()
-        })
-        .collect()
+    managed_instances(&discover_managed_services(&records))
 }
 
 /// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
@@ -1295,6 +1305,61 @@ mod tests {
             !probe_snapshot(&args).has_live_service,
             "the probe must reflect the current registry state, not a one-shot snapshot"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows has no daemon, so the dashboard's instance list comes from the
+    /// probe's `instances` (see `AppState::push_host_gpu_snapshot`). A ready
+    /// Lemonade record must come through with its model and port; a stopped
+    /// record and one with no bound port must not.
+    #[test]
+    fn live_registry_probe_carries_the_live_managed_instances() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "probe-instances-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"lemonade-qwen","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M","port":11436,"status":"ready","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("stopped.json"),
+            br#"{"service_id":"lemonade-old","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct","port":11435,"status":"stopped","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"lemonade-unbound","engine":"lemonade","port":0,"status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        let instances = probe_snapshot(&args).instances;
+        assert_eq!(
+            instances.len(),
+            1,
+            "only the live, bound record: {instances:?}"
+        );
+        let inst = &instances[0];
+        assert_eq!(inst.container_id, "lemonade-qwen");
+        assert_eq!(inst.model_name, "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M");
+        assert_eq!(inst.port, Some(11436));
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
 
         let _ = std::fs::remove_dir_all(&root);
     }

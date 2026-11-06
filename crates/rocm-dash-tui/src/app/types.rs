@@ -184,7 +184,8 @@ impl ConnState {
     /// True for the Windows in-process collector (see
     /// `client::connect_and_run`'s `#[cfg(windows)]` arm), which tags its
     /// `daemon_version` this way since there's no real `rocmdashd` behind
-    /// it — and so no instance registry it could ever populate.
+    /// it — its instances come only from the managed-service registry
+    /// (`AppState::set_managed_instances`), never from discovery.
     pub fn is_in_process(&self) -> bool {
         matches!(self, Self::Connected { version, .. } if version.starts_with(Self::IN_PROCESS_PREFIX))
     }

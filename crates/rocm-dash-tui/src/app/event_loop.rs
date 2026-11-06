@@ -67,6 +67,47 @@ fn seed_registry_probe_and_hosting(
     state.launcher_hosted = launcher_hosted;
 }
 
+/// Whether the dashboard polls the managed-service registry for its instance
+/// list. Only Windows has no daemon to send instances; a focused host draws no
+/// instance list, and `--demo`/`--replay` (`replay`) must never show this
+/// host's real services. `windows` is a parameter rather than a `cfg!` so the
+/// gate itself is unit-tested on every platform.
+const fn polls_managed_registry(focus: Option<Focus>, replay: bool, windows: bool) -> bool {
+    windows && !replay && !should_skip_daemon(focus)
+}
+
+/// Read the managed-service registry every `period` and post the live
+/// services as `ClientMsg::ManagedInstances`. The probe does a blocking disk
+/// read, so it runs under `spawn_blocking` rather than on the event loop — a
+/// slow or antivirus-scanned services directory then delays only the next
+/// poll, never a frame. The first poll is immediate, so a running service is
+/// listed as soon as the dashboard opens. Ends when the receiver is dropped.
+fn spawn_managed_registry_poller(
+    probe: crate::registry_probe::SharedManagedRegistryProbe,
+    tx: mpsc::UnboundedSender<ClientMsg>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(period);
+        // A slow read must not queue a burst of catch-up polls behind it.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let probe = probe.clone();
+            let Ok(snapshot) = tokio::task::spawn_blocking(move || probe.snapshot()).await else {
+                // The probe panicked; keep polling rather than freezing the list.
+                continue;
+            };
+            if tx
+                .send(ClientMsg::ManagedInstances(snapshot.instances))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     // Install the termination-signal watcher BEFORE switching the terminal into
     // raw/alternate-screen mode. A signal that arrives during startup must find
@@ -243,6 +284,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Both `--demo` (a generated session replayed) and `--replay <file>` present
     // non-live data, so mark the session simulated for the honesty chrome.
     state.simulated = state.replay.is_some();
+    if polls_managed_registry(args.focus, state.simulated, cfg!(windows))
+        && let Some(probe) = args.managed_registry_probe.clone()
+    {
+        spawn_managed_registry_poller(probe, chat_tx.clone(), Duration::from_secs(1));
+    }
 
     let mut chat = ChatRuntime::start(&mut state, args, &chat_tx).await;
 
@@ -273,6 +319,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     }
                     Some(ClientMsg::Event(ev)) => state.apply_event(*ev),
                     Some(ClientMsg::HostGpuSnapshot(snap)) => state.push_host_gpu_snapshot(*snap),
+                    Some(ClientMsg::ManagedInstances(live)) => state.set_managed_instances(live),
                     Some(ClientMsg::ReplaySeek) => state.reset_for_seek(),
                     Some(ClientMsg::ReplayPosition { elapsed_s, total_s }) => {
                         if let Some(r) = state.replay.as_mut() {
@@ -978,6 +1025,7 @@ mod tests {
             std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::iter::once("svc-a".to_string()).collect(),
+                ..Default::default()
             }));
         seed_registry_probe_and_hosting(&mut s, Some(probe.clone()), true);
 
@@ -988,5 +1036,111 @@ mod tests {
                 .map(|p| std::sync::Arc::ptr_eq(p, &probe)),
             Some(true)
         );
+    }
+
+    #[test]
+    fn polls_managed_registry_state_matrix() {
+        // The only caller is `event_loop`, which only the Linux e2e lane
+        // drives, and the Windows arm is the one that matters. `windows` is
+        // injected so every row runs on every platform's CI job.
+        assert!(
+            polls_managed_registry(None, false, true),
+            "Windows dashboard polls"
+        );
+        assert!(
+            !polls_managed_registry(None, false, false),
+            "Linux has a daemon"
+        );
+        assert!(
+            !polls_managed_registry(None, true, true),
+            "--demo/--replay must not show this host's real services"
+        );
+        for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {
+            assert!(
+                !polls_managed_registry(Some(focus), false, true),
+                "a focused host draws no instance list: {focus:?}"
+            );
+        }
+    }
+
+    fn probe_with(
+        ids: &[&str],
+    ) -> (
+        crate::registry_probe::SharedManagedRegistryProbe,
+        Vec<rocm_dash_core::metrics::Instance>,
+    ) {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        let instances: Vec<_> = ids
+            .iter()
+            .map(|id| rocm_dash_core::metrics::Instance {
+                container_id: (*id).to_string(),
+                status: rocm_dash_core::metrics::InstanceStatus::Ready,
+                port: Some(11_400),
+                ..Default::default()
+            })
+            .collect();
+        let probe = std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
+            instances: instances.clone(),
+            ..Default::default()
+        }));
+        (probe, instances)
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_posts_the_registry_list_immediately_and_repeatedly() {
+        // The first poll must not wait a full period: a service already
+        // running when the dashboard opens is listed at once, not after
+        // "Nothing running" has been on screen for a second.
+        let (probe, expected) = probe_with(&["svc-a"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(probe, tx, Duration::from_millis(20));
+
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a poll arrived")
+                .expect("channel open");
+            let ClientMsg::ManagedInstances(got) = msg else {
+                panic!("unexpected message: {msg:?}");
+            };
+            assert_eq!(got.len(), expected.len());
+            assert_eq!(got[0].container_id, "svc-a");
+        }
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the poller stops once the receiver is gone")
+            .expect("poller did not panic");
+    }
+
+    #[tokio::test]
+    async fn managed_registry_poller_survives_a_panicking_probe() {
+        // A probe panic (under `spawn_blocking`) must not end the poll loop and
+        // freeze the instance list for the rest of the session.
+        #[derive(Debug, Default)]
+        struct PanicsOnce(std::sync::atomic::AtomicBool);
+        impl crate::registry_probe::ManagedRegistryProbe for PanicsOnce {
+            fn snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
+                assert!(
+                    self.0.swap(true, std::sync::atomic::Ordering::SeqCst),
+                    "first read fails"
+                );
+                crate::registry_probe::ManagedRegistrySnapshot::default()
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_managed_registry_poller(
+            std::sync::Arc::new(PanicsOnce::default()),
+            tx,
+            Duration::from_millis(20),
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a later poll arrived")
+            .expect("channel open");
+        assert!(matches!(msg, ClientMsg::ManagedInstances(_)), "{msg:?}");
+        handle.abort();
     }
 }

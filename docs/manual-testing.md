@@ -799,21 +799,17 @@ Expected result:
 - A prompt appears naming the serving model and warning that it may
   still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first. From the dashboard (not the launcher) on
-  Windows, where the dashboard streams live GPU/CPU/memory but never gets a
-  serving-instance snapshot (no `rocmdashd` unix socket there), the prompt
-  still shows that same stop command and the service id, but not the
-  model's name — the dashboard's own live view is where the name comes
-  from, and it never fills there. The launcher's own copy of the prompt
-  always names the model, Windows included — it reads the managed-service
-  registry directly rather than through the dashboard's daemon connection.
+  placeholder) to stop it first. On Windows the dashboard has no
+  `rocmdashd` unix socket, so it reads the same managed-service registry the
+  launcher does: the prompt names the model there too. Within the first
+  second after `rocm serve` registers a service, before the dashboard's next
+  registry read, it may show the stop command and id without the model's name.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
-  approval+job flow. The launcher's copy of the prompt does not show this
-  hint or respond to `s` — it has no live Services overlay to jump to — and
-  neither does the dashboard on Windows, for the same reason the model's name
-  is missing there.
+  approval+job flow, on Windows too. The launcher's copy of the prompt does
+  not show this hint or respond to `s` — it has no live Services overlay to
+  jump to.
 - Declining (`n`/Esc) returns to where you were — the dashboard, or the
   launcher's own front door, whichever you pressed `q` from. Any plain modal
   that was open when you pressed `q` (the Esc menu, Options, Detail, Theme
@@ -908,8 +904,14 @@ Expected result:
   present. With more than one adapter (for example a hybrid laptop) VRAM
   total stays unmeasured and shows `—` in the Home hero and in the GPU wall
   sidebar, never `0.0%`.
-- The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
-  serving-instance view, so no throughput is ever measured there.
+- The hero's `T/S` row reads `—`, never `0` or `-0`: a managed server is
+  listed with no throughput telemetry behind it, so no rate is ever measured
+  there.
+- With a managed server running (`rocm serve`, then `rocm services list`
+  showing it `ready`), the Home tab's `Running` count, the Serving tab's
+  `Running now` list and the Observe tab list that server within a few seconds
+  of `rocm dash` opening, not "Nothing running". After `rocm services stop`
+  it drops off within a few seconds. Its throughput stays unmeasured.
 - Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
   back when it ends.
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
