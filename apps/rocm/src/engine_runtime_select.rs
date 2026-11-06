@@ -12,10 +12,11 @@
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
 //! (`app_path_env_vars`/`app_path_env_var_values`/`app_path_env_var_refs`/
-//! `apply_app_path_env`), and polling a freshly launched service until it can
-//! actually answer inference requests (`wait_for_service_http_ready`,
-//! `wait_for_service_http_ready_with_progress`,
-//! `service_http_readiness_paths`, `http_get_local_service`,
+//! `apply_app_path_env`), choosing the managed startup budget
+//! (`managed_ready_timeout`), and polling a freshly launched service until it
+//! can actually answer inference requests (`wait_for_service_http_ready`,
+//! `wait_for_service_http_ready_with_progress`, `service_http_readiness_paths`,
+//! `http_get_local_service`,
 //! `http_post_local_service_json`, `service_http_readiness_response_ready`,
 //! `lemonade_health_ready_for_model`, `model_list_ready_for_model`,
 //! `service_model_gpu_ready`, `service_model_reports_rocm_backend`,
@@ -76,10 +77,11 @@
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
 //! `managed_service_launcher_path` is `pub(crate)`, read from
 //! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
-//! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
-//! is `pub(crate)`, read from `service_launch.rs`. `http_post_local_service_json`
-//! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
+//! `managed_ready_timeout` and `wait_for_service_http_ready_with_progress` are
+//! `pub(crate)`, read from `service_launch.rs` and `service_control.rs`;
+//! `wait_for_service_http_ready` remains `pub(crate)` for readiness regression
+//! tests. `http_post_local_service_json` is `pub(crate)`, read from
+//! `service_control.rs`'s `unload_lemonade_service_model`.
 //! `service_model_names_match` is `pub(crate)`, read from `chat/turn.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `service_http_readiness_response_ready`, `lemonade_health_ready_for_model`,
@@ -330,8 +332,18 @@ pub(crate) fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths)
         command.env(key, value);
     }
 }
+/// Readiness budget for a managed launch, taken from the engine's own startup
+/// timeout so the CLI never contradicts it. vLLM's is tunable via
+/// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`; other engines keep the historical wait.
+pub(crate) fn managed_ready_timeout(engine: &str) -> Duration {
+    match engine {
+        "vllm" => rocm_engine_vllm::ready_timeout(),
+        _ => Duration::from_secs(45),
+    }
+}
 
-pub(crate) fn wait_for_service_http_ready(
+#[cfg(test)]
+fn wait_for_service_http_ready(
     engine: &str,
     host: &str,
     port: u16,
@@ -346,7 +358,7 @@ pub(crate) fn wait_for_service_http_ready(
         &|| canonical_model_id.to_owned(),
         endpoint_api_key,
         timeout,
-        &mut |_elapsed| {},
+        &mut |_elapsed| true,
     )
 }
 
@@ -360,11 +372,13 @@ pub(crate) fn wait_for_service_http_ready(
 /// model without answering one is [`EndpointReadiness::Listing`], and the best
 /// result seen before `timeout` is what gets returned.
 ///
-/// Polls until `timeout` elapses, invoking `on_tick(elapsed)` once per iteration
-/// so a caller can animate a spinner. Engine-neutral: `service_http_readiness_paths`
-/// maps each engine to the right listing path. `endpoint_api_key` is sent as a
-/// bearer token so both the listing check and the inference probe still succeed
-/// against a public endpoint that requires authentication.
+/// Polls until `timeout` elapses, invoking `on_tick(elapsed)` once per iteration.
+/// Returning `false` abandons a wait the caller knows cannot succeed, such as
+/// after an engine records a terminal status. Engine-neutral:
+/// `service_http_readiness_paths` maps each engine to the right listing path.
+/// `endpoint_api_key` is sent as a bearer token so both the listing check and
+/// the inference probe still succeed against a public endpoint that requires
+/// authentication.
 pub(crate) fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
@@ -372,10 +386,11 @@ pub(crate) fn wait_for_service_http_ready_with_progress(
     model_name: &dyn Fn() -> String,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
-    on_tick: &mut dyn FnMut(Duration),
+    on_tick: &mut dyn FnMut(Duration) -> bool,
 ) -> EndpointReadiness {
     let start = std::time::Instant::now();
     let endpoint = format_http_base_url(host, port);
+    // High-water mark: a model that listed stays Listing even if its engine dies.
     let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
         // Re-evaluated each pass: a container engine reports the name its server
@@ -413,7 +428,9 @@ pub(crate) fn wait_for_service_http_ready_with_progress(
                 return EndpointReadiness::Serving;
             }
         }
-        on_tick(start.elapsed());
+        if !on_tick(start.elapsed()) {
+            return best;
+        }
         thread::sleep(Duration::from_millis(250));
     }
     best

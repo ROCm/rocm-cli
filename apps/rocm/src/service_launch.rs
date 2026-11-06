@@ -51,7 +51,7 @@ use crate::engine_runtime_select::apply_app_path_env;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
-    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
+    managed_ready_timeout, managed_service_launcher_path, wait_for_service_http_ready_with_progress,
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::{
@@ -1028,13 +1028,10 @@ fn launch_managed_engine_child_locked(
     Ok(child_pid)
 }
 
-/// How long one readiness wait polls before `rocm serve` reports `starting`.
-const READINESS_WAIT: Duration = Duration::from_secs(45);
-
-/// `rocm serve --wait`: keep waiting past [`READINESS_WAIT`] (a first start
-/// downloads the model, which can take far longer) until the server answers or
-/// stops being live. A server that exited ends the wait with the last reading
-/// instead of blocking forever.
+/// `rocm serve --wait`: keep waiting past the engine's initial readiness budget
+/// (a first start can download a model) until the server answers or stops being
+/// live. A server that exited ends the wait with the last reading instead of
+/// blocking forever.
 fn wait_past_readiness_budget(
     mut probe: impl FnMut() -> EndpointReadiness,
     mut still_live: impl FnMut() -> bool,
@@ -1148,9 +1145,11 @@ fn died_during_wait(
 }
 
 /// Record the outcome of a finished wait on the manifest as it is now, changing
-/// only what the wait learned. The copy read at spawn time can be long stale:
-/// `rocmd` may have recorded a restart or a new supervisor pid, and `rocm logs`
-/// refreshes the record, so writing it back whole would revert those.
+/// only what the wait learned. A terminal engine status is newer than the
+/// endpoint's readiness high-water mark and is therefore preserved. The copy
+/// read at spawn time can be long stale: `rocmd` may have recorded a restart or
+/// a new supervisor pid, and `rocm logs` refreshes the record, so writing it
+/// back whole would revert those.
 fn record_wait_outcome(
     paths: &AppPaths,
     held: &mut ManagedServiceRecord,
@@ -1159,11 +1158,14 @@ fn record_wait_outcome(
 ) -> Result<()> {
     let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
         .unwrap_or_else(|_| held.clone());
-    status.clone_into(&mut latest.status);
-    if verified {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    let _ = latest.refresh_from_engine_state();
+    if managed_service_is_live(&latest) {
+        status.clone_into(&mut latest.status);
+        if verified {
+            // Latch the verification the wait just performed, so the readiness
+            // checks behind `services list` and chat read it instead of re-probing.
+            latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+        }
     }
     latest.write()?;
     *held = latest;
@@ -1292,8 +1294,11 @@ fn wait_for_record_ready(
                 latest.served_model_name().to_owned()
             },
             endpoint_api_key,
-            READINESS_WAIT,
-            on_tick,
+            managed_ready_timeout(&record.engine),
+            &mut |elapsed| {
+                on_tick(elapsed);
+                service_still_live(paths, &record.service_id, service_pid_is_alive)
+            },
         )
     };
     if wait_until_ready {
@@ -1338,13 +1343,14 @@ fn wait_on_existing_service(
     ) {
         return Err(error);
     }
-    report.status = status_for_readiness(readiness).to_owned();
+    let readiness_status = status_for_readiness(readiness);
     record_wait_outcome(
         paths,
         &mut record,
-        &report.status,
+        readiness_status,
         readiness == EndpointReadiness::Serving,
     )?;
+    report.status = record.status;
     Ok(report)
 }
 
@@ -1464,11 +1470,11 @@ pub(crate) fn start_managed_service(
     ) {
         return Err(error);
     }
-    let launch_status = status_for_readiness(readiness);
+    let readiness_status = status_for_readiness(readiness);
     record_wait_outcome(
         paths,
         &mut record,
-        launch_status,
+        readiness_status,
         readiness == EndpointReadiness::Serving,
     )?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
@@ -1479,14 +1485,14 @@ pub(crate) fn start_managed_service(
         "info",
         format!(
             "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine, resolve.canonical_model_id, endpoint_url, launch_status
+            engine, resolve.canonical_model_id, endpoint_url, record.status
         ),
         Some(service_id),
     );
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
-        status: launch_status.to_owned(),
+        status: record.status,
         already_running: false,
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
@@ -2383,9 +2389,10 @@ mod tests {
 
     #[test]
     fn wait_on_existing_service_only_waits_for_one_that_is_not_serving_yet() {
-        // The probing path itself blocks for the readiness budget, so only the
-        // cases that must return at once are driven here; a manifest planted
-        // as `starting` would hang a wrong guard for 45 seconds and fail it.
+        // The probing path itself blocks for the engine's readiness budget, so
+        // only the cases that must return at once are driven here; a manifest
+        // planted as `starting` would hang a wrong guard until that budget and
+        // fail the test.
         let (root, paths) = test_paths("wait-existing");
         paths.ensure().expect("paths");
         let mut record = record_tracking_pid(&paths, 0, "starting");
@@ -2520,6 +2527,60 @@ mod tests {
         let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
         assert_eq!(after.status, "starting");
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn terminal_engine_status_ends_launch_wait_and_overrides_listing() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0_u8; 1024];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let (status, body) = if request.starts_with("POST /v1/chat/completions ") {
+                    ("503 Service Unavailable", r#"{"error":"failed"}"#)
+                } else {
+                    ("200 OK", r#"{"data":[{"id":"qwen-canonical"}]}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let (root, paths) = test_paths("launch-terminal-engine-state");
+        paths.ensure()?;
+        let mut record = reusable_record(&paths);
+        record.port = port;
+        record.supervisor_pid = std::process::id();
+        record.status = "running".to_owned();
+        record.write()?;
+        fs::create_dir_all(record.engine_state_path.parent().expect("state dir"))?;
+        fs::write(&record.engine_state_path, r#"{"status":"failed"}"#)?;
+
+        let started = std::time::Instant::now();
+        let readiness = wait_for_record_ready(&paths, &record, false, None, &mut |_| {});
+        record_wait_outcome(&paths, &mut record, status_for_readiness(readiness), false)?;
+
+        assert_eq!(readiness, EndpointReadiness::Listing);
+        assert_eq!(record.status, "failed");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "terminal engine state must end the wait before the vLLM budget"
+        );
+        server.join().expect("readiness server");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

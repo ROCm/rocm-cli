@@ -1446,12 +1446,18 @@ rocm logs --service <service-id>
 rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
-While a first-time model download is running, `rocm serve <model> --wait` keeps
-waiting past the usual 45 seconds until the server answers or its engine gives up
-(vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
-and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
-by the argument parser, covered by a unit test. Run the log follow above from a
-second terminal to watch the download.
+While a first-time model download is running, a plain managed vLLM launch waits
+on vLLM's own readiness budget (5 minutes by default, set with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS`); other engines keep the 45-second initial
+budget. A terminal engine status ends that wait promptly and is persisted rather
+than being reported as still loading. `rocm serve <model> --wait` continues in
+additional budget windows while the server remains alive, until it answers or
+its engine gives up (vLLM and AIM stop after 5 minutes by default; see
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); an
+exit fails the command and points at the service log. `--wait` with `--verbose`
+is refused (`serve-43`); `--foreground` is refused by the argument parser,
+covered by a unit test. Run the log follow above from a second terminal to watch
+the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.

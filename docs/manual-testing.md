@@ -453,7 +453,7 @@ rocm services
 rocm services list --all
 rocm services logs <service-id>
 rocm services logs <service-id> --follow
-rocm serve <model> --wait   # waits past 45s and returns once the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
+rocm serve <model> --wait   # continues in readiness-budget windows until the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -481,11 +481,18 @@ Expected result:
   grows; piped, stdout carries only the log text and the hint (once), ready and
   stopped-following lines go to stderr. A server already `failed` when the follow
   starts also exits non-zero.
-- `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
-  server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
-  with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
-  with `the server exited before it became ready` and a `rocm logs --service`
-  pointer, and the record shows `stopped`.
+- A plain managed vLLM launch uses vLLM's readiness budget (5 minutes by
+  default, override with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`); other engines keep
+  the 45-second initial budget. A terminal engine status ends the wait promptly
+  and is saved (`failed` for an engine-reported failure), not called still
+  loading.
+- `rocm serve <model> --wait` continues in additional readiness-budget windows
+  while the server remains alive, until it answers or its engine gives up (vLLM
+  and AIM: 5 minutes by default, override with
+  `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the
+  server is killed or stopped meanwhile, it exits non-zero with `the server
+  exited before it became ready` and a `rocm logs --service` pointer, and the
+  record shows `stopped`; an engine-reported failure leaves it `failed`.
 - The logs command shows the exact service failure or startup output.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
@@ -968,11 +975,13 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
 ```
 
 - Piped or redirected: the plain machine-readable form ends at
-  `readiness: starting` and carries no *post-launch* note. It does still print
-  the pre-launch planning lines above that, so on a tight card you will see the
-  low-VRAM `note:` with the same `--gpu-memory-utilization` sentence — check
-  that what is missing is the OOM note (the "ran out of GPU memory"
-  confirmation and the `rocm diagnose --symptom` command), not every `note:`.
+  `readiness: <status>` (`starting` if the initial budget ends while the engine
+  is alive, `failed` if the engine reports a terminal failure) and carries no
+  *post-launch* note. It does still print the pre-launch planning lines above
+  that, so on a tight card you will see the low-VRAM `note:` with the same
+  `--gpu-memory-utilization` sentence — check that what is missing is the OOM
+  note (the "ran out of GPU memory" confirmation and the
+  `rocm diagnose --symptom` command), not every `note:`.
 - `--verbose` (or `--foreground`): the engine log streams in your terminal, so
   you read the traceback directly instead.
 - A server that becomes ready, and one that is still loading its model while its

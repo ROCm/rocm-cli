@@ -61,12 +61,12 @@ use crate::engine_runtime_select::apply_app_path_env;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
-    http_post_local_service_json, managed_service_launcher_path, parse_engine_recipe_json_arg,
-    wait_for_service_http_ready,
+    http_post_local_service_json, managed_ready_timeout, managed_service_launcher_path,
+    parse_engine_recipe_json_arg, wait_for_service_http_ready_with_progress,
 };
 use crate::engines_cmd::env_root_for_service;
 use crate::gpu_policy::parse_device_policy;
-use crate::managed_service_status::load_managed_services;
+use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::service_hints;
 use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
@@ -543,14 +543,20 @@ fn restart_internal_managed_service_with(
     restart_internal_managed_service_inner(paths, service_id, runtime_pin, terminate, None)
 }
 
-/// How long a restart waits for the new child to serve.
+/// How long a restart initially waits for the new child to serve.
 #[allow(clippy::missing_const_for_fn)] // not const under `cfg(test)`, where a test shortens it
-fn restart_readiness_timeout() -> Duration {
+fn restart_readiness_timeout(engine: &str) -> Duration {
     #[cfg(test)]
     if let Some(timeout) = tests::READINESS_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
         return timeout;
     }
-    Duration::from_secs(45)
+    managed_ready_timeout(engine)
+}
+
+/// Re-read and refresh the restarted service, ending readiness polling when an
+/// engine state or concurrent service action settles it.
+fn restarted_service_still_live(paths: &AppPaths, service_id: &str) -> bool {
+    load_managed_service(paths, service_id).is_ok_and(|record| managed_service_is_live(&record))
 }
 
 /// How long a restart waits for the launch lock once its stop has completed.
@@ -681,6 +687,9 @@ fn restart_internal_managed_service_inner(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // A prior run's terminal state must not end this run's readiness wait before
+    // the new child has a chance to publish its own state.
+    let _ = fs::remove_file(&record.engine_state_path);
     let current_exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
     let engine_envs_root = env_root_for_service(
@@ -754,13 +763,14 @@ fn restart_internal_managed_service_inner(
     // on its port again, so there is nothing left for the lock to protect, and
     // the readiness wait below can block for many seconds.
     drop(launch_lock);
-    let readiness = wait_for_service_http_ready(
+    let readiness = wait_for_service_http_ready_with_progress(
         &started.engine,
         &started.host,
         started.port,
-        started.served_model_name(),
+        &|| started.served_model_name().to_owned(),
         endpoint_api_key.as_deref(),
-        restart_readiness_timeout(),
+        restart_readiness_timeout(&started.engine),
+        &mut |_elapsed| restarted_service_still_live(paths, &started.service_id),
     );
     record_restart_readiness(paths, &started, readiness)
 }
@@ -840,9 +850,12 @@ fn record_restart_readiness(
     readiness: EndpointReadiness,
 ) -> Result<ManagedServiceRecord> {
     let updated = update_restarting_record(paths, started, |current| {
-        current.status = status_for_readiness(readiness).to_owned();
-        if readiness == EndpointReadiness::Serving {
-            current.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+        let _ = current.refresh_from_engine_state();
+        if managed_service_is_live(current) {
+            current.status = status_for_readiness(readiness).to_owned();
+            if readiness == EndpointReadiness::Serving {
+                current.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+            }
         }
     })?;
     match updated {
@@ -1667,9 +1680,10 @@ mod tests {
 
     #[test]
     fn restart_readiness_write_keeps_a_stop_asked_for_while_it_waited() {
-        // The restart's last write lands after a readiness wait of up to 45
-        // seconds. A stop asked for in that window persists its marker before
-        // it signals anything; writing the restart's own copy back erased it.
+        // The restart's last write lands after a readiness wait of up to the
+        // engine's startup budget. A stop asked for in that window persists its
+        // marker before it signals anything; writing the restart's own copy back
+        // erased it.
         let (root, paths) = test_paths("restart-readiness-keeps-marker");
         paths.ensure().unwrap();
         let service_id = "svc-restart-readiness-keeps-marker";
@@ -1719,6 +1733,53 @@ mod tests {
             returned.status, "stopped",
             "the caller sees the record as it is"
         );
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_replaces_stale_state_and_stops_on_new_terminal_state() -> Result<()> {
+        let (root, paths) = test_paths("restart-terminal-engine-state");
+        paths.ensure()?;
+        let service_id = "svc-restart-terminal-engine-state";
+        let mut record = stop_test_record(&paths, service_id);
+        record.engine = "vllm".to_owned();
+        record.engine_state_path = paths.service_engine_state_path("vllm", service_id);
+        record.status = "failed".to_owned();
+        record.write()?;
+        fs::create_dir_all(record.engine_state_path.parent().expect("state dir"))?;
+        fs::write(&record.engine_state_path, r#"{"status":"failed"}"#)?;
+
+        let stale_state_removed = std::cell::Cell::new(false);
+        let engine_state_path = record.engine_state_path;
+        let spawn: &RestartSpawnOverride<'_> = &|_command| {
+            stale_state_removed.set(!engine_state_path.exists());
+            let child = std::process::Command::new("sleep").arg("30").spawn()?;
+            fs::write(&engine_state_path, r#"{"status":"failed"}"#)?;
+            Ok(child)
+        };
+
+        let wait_started = std::time::Instant::now();
+        let restarted = restart_internal_managed_service_inner(
+            &paths,
+            service_id,
+            None,
+            |_| bare_termination(Vec::new(), true),
+            Some(spawn),
+        )?;
+        let _ = std::process::Command::new("kill")
+            .arg(restarted.supervisor_pid.to_string())
+            .status();
+
+        assert!(
+            stale_state_removed.get(),
+            "the prior run's terminal state must be removed before spawn"
+        );
+        assert_eq!(restarted.status, "failed");
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(30),
+            "the new terminal state must end the vLLM readiness wait"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
