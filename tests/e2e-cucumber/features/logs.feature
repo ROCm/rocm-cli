@@ -99,3 +99,20 @@ Feature: Log inspection
     Given a ComfyUI log file that is empty
     When the user reads the ComfyUI logs
     Then the CLI says the ComfyUI log is empty
+
+  # The `service_logs` tool the assistant and the MCP clients call reads the same
+  # log through the same bound, and used to answer "Read the last 80 line(s)" with
+  # an empty tail for both an empty log and one huge line. `rocm mcp-call` runs
+  # that tool in the CLI; the daemon's copy of it (`rocmd mcp-call`) is covered by
+  # a `rocmd` unit test, because the harness drives only the `rocm` binary.
+  @id:logs-service-logs-tool-longer-than-the-read-bound-is-not-called-empty
+  Scenario: logs-13 - The service_logs tool does not report a log with one over-long line as empty
+    Given a local server record whose log holds one line longer than the log view reads
+    When a tool-using client reads that server's log through the service_logs tool
+    Then the tool says the newest line is too long to show and flags it instead of returning an empty tail unexplained
+
+  @id:logs-service-logs-tool-empty-says-no-output-yet
+  Scenario: logs-14 - The service_logs tool reports an empty log as having no output yet
+    Given a local server record whose log file is empty
+    When a tool-using client reads that server's log through the service_logs tool
+    Then the tool says the server has no log output yet and does not flag an over-long line

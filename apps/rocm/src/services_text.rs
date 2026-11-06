@@ -31,7 +31,7 @@
 //! `validate_service_id`, `list_log_files`, `read_optional_tail_lines`, and the
 //! CLI-lifecycle-log tail formatting helpers (`format_cli_lifecycle_tail_line`,
 //! `lifecycle_event_label`, `humanize_log_label`, `lifecycle_field`,
-//! `read_tail_lines`).
+//! `read_log_tail`).
 //!
 //! The `LogBrowserEntry` struct moved here with the logs browser and stays
 //! private.
@@ -54,7 +54,7 @@
 //! `service_control.rs` and from `managed_service_status.rs`'s own test module;
 //! `read_managed_service_manifest`, `internal_stop_server_value` and
 //! `process_check_command` are `pub(crate)` for `service_control.rs` (the last
-//! one only for its tests); `read_tail_lines`, `render_logs_text`,
+//! one only for its tests); `read_log_tail`, `render_logs_text`,
 //! `render_logs_browser_text`, `render_services_text` and
 //! `render_service_logs_text` are also `pub(crate)` and read from
 //! `chat/mcp_bridge.rs`'s read-only command runner; `validate_service_id` is also
@@ -508,7 +508,7 @@ fn render_service_logs_text_with_options(
         let _ = writeln!(
             output,
             "Recent output: none shown; {}",
-            newest_line_exceeds_bound_notice()
+            rocm_core::newest_line_exceeds_bound_notice()
         );
     } else if recent.lines.is_empty() {
         let _ = writeln!(output, "Recent output: no output yet");
@@ -1272,17 +1272,6 @@ pub(crate) fn read_optional_log_tail(path: &Path, limit: usize, label: &str) -> 
     }
 }
 
-/// The clause a log view prints when a log has content but none of it is
-/// shown because its newest line does not fit the read budget
-/// ([`rocm_core::LogTail::newest_line_exceeds_the_read_bound`]). Derived from the budget
-/// the views read with, so the number cannot drift from it.
-pub(crate) fn newest_line_exceeds_bound_notice() -> String {
-    format!(
-        "the newest line is longer than the {} MiB a log view reads",
-        rocm_core::LOG_VIEW_MAX_TAIL_READ / (1024 * 1024)
-    )
-}
-
 fn format_cli_lifecycle_tail_line(line: &str) -> String {
     let level = lifecycle_field(line, "level").unwrap_or("info");
     let category = lifecycle_field(line, "category").unwrap_or("cli");
@@ -1346,14 +1335,9 @@ fn lifecycle_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The last `limit` lines of a log, read through the shared bounded tail
-/// routine; `label` names the log in the error ("service log", "CLI action
-/// log").
-pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
-    Ok(read_log_tail(path, limit, label)?.lines)
-}
-
-/// [`read_tail_lines`], with what the byte budget left unread.
-fn read_log_tail(path: &Path, limit: usize, label: &str) -> Result<rocm_core::LogTail> {
+/// routine, with what the byte budget left unread; `label` names the log in the
+/// error ("service log", "CLI action log").
+pub(crate) fn read_log_tail(path: &Path, limit: usize, label: &str) -> Result<rocm_core::LogTail> {
     rocm_core::tail_log_decoded(
         path,
         limit,
@@ -1371,6 +1355,11 @@ pub(crate) mod tests {
     use crate::providers;
     use crate::service_control::run_internal_sandbox_tool;
     use crate::tests::test_paths;
+
+    /// The lines of [`read_log_tail`], for the tests that only look at those.
+    fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>> {
+        Ok(read_log_tail(path, limit, label)?.lines)
+    }
 
     fn tail_fixture(name: &str, bytes: &[u8]) -> Result<PathBuf> {
         let (root, _paths) = test_paths(name);

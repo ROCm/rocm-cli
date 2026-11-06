@@ -28,7 +28,7 @@ use crate::managed_service_status::{load_managed_services, managed_service_is_li
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::services_text::{
-    read_tail_lines, render_logs_browser_text, render_logs_text, render_service_logs_text,
+    read_log_tail, render_logs_browser_text, render_logs_text, render_service_logs_text,
     render_services_text,
 };
 use crate::tool_policy::{
@@ -213,16 +213,14 @@ pub(crate) fn run_internal_mcp_call(
                 .into_iter()
                 .find(|service| service.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
-            let tail = read_tail_lines(&record.log_path, lines, "service log")?.join("\n");
+            let log_tail = read_log_tail(&record.log_path, lines, "service log")?;
             Ok(internal_mcp_tool_success(
-                format!(
-                    "Read the last {} line(s) from service `{}`.",
-                    lines, record.service_id
-                ),
+                rocm_core::service_log_tool_summary(&record.service_id, &log_tail),
                 serde_json::json!({
                     "service": record,
                     "lines": lines,
-                    "tail": tail,
+                    "newest_line_exceeds_read_bound": log_tail.newest_line_exceeds_the_read_bound(),
+                    "tail": log_tail.lines.join("\n"),
                 }),
             ))
         }

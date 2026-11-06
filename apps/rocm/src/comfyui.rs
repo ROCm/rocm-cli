@@ -526,7 +526,7 @@ fn render_logs_with_options(
             writeln!(
                 output,
                 "  No output shown: {}.",
-                crate::services_text::newest_line_exceeds_bound_notice()
+                rocm_core::newest_line_exceeds_bound_notice()
             )?;
         } else if tail.lines.is_empty() {
             writeln!(output, "  The saved log is empty.")?;

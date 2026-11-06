@@ -629,16 +629,14 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .into_iter()
                 .find(|service| service.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
-            let tail = read_tail_lines(&record.log_path, lines)?;
+            let log_tail = read_log_tail(&record.log_path, lines)?;
             Ok(tool_success(
-                format!(
-                    "Read the last {} line(s) from service `{}`.",
-                    lines, record.service_id
-                ),
+                rocm_core::service_log_tool_summary(&record.service_id, &log_tail),
                 json!({
                     "service": record,
                     "lines": lines,
-                    "tail": tail,
+                    "newest_line_exceeds_read_bound": log_tail.newest_line_exceeds_the_read_bound(),
+                    "tail": log_tail.lines.join("\n"),
                 }),
             ))
         }
@@ -843,12 +841,16 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
     })
 }
 
-/// The last `limit` lines of a service log joined with newlines, read through
-/// the shared bounded tail routine.
-fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
-    let lines = rocm_core::tail_lines(path, limit, rocm_core::LOG_VIEW_MAX_TAIL_READ)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(lines.join("\n"))
+/// The last `limit` lines of a service log, read through the shared bounded
+/// tail routine, with what the byte budget left unread.
+fn read_log_tail(path: &std::path::Path, limit: usize) -> Result<rocm_core::LogTail> {
+    rocm_core::tail_log_decoded(
+        path,
+        limit,
+        rocm_core::LOG_VIEW_MAX_TAIL_READ,
+        rocm_core::LogDecode::PLAIN,
+    )
+    .with_context(|| format!("failed to read {}", path.display()))
 }
 
 #[cfg(test)]
@@ -861,6 +863,12 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
+
+    /// [`read_log_tail`], joined with newlines, for the tests that only look
+    /// at the text.
+    fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
+        Ok(read_log_tail(path, limit)?.lines.join("\n"))
+    }
 
     fn unique_test_path(label: &str) -> PathBuf {
         let root = workspace_test_artifact_dir();
@@ -928,6 +936,117 @@ mod tests {
 
         ensure_direct_mcp_call_allowed("install_sdk", true)
             .expect("explicitly approved direct MCP mutation should pass the helper guard");
+    }
+
+    /// Call the `service_logs` tool for a service whose log holds `log` (no log
+    /// file at all for `None`), and return the tool's reply with the log's size
+    /// on disk, so a claim the reply makes can be checked against the file.
+    fn service_logs_reply(label: &str, log: Option<&[u8]>) -> Result<(Value, Option<u64>)> {
+        let (root, paths) = temp_app_paths(label);
+        paths.ensure()?;
+        let service_id = format!("svc-{label}");
+        let record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            &service_id,
+            "llamacpp",
+            "a-model",
+            "a-model",
+            "127.0.0.1",
+            18080,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+        let size = match log {
+            Some(bytes) => {
+                fs::write(&record.log_path, bytes)?;
+                Some(fs::metadata(&record.log_path)?.len())
+            }
+            None => None,
+        };
+        let reply = handle_mcp_tool_call(
+            &paths,
+            &json!({"name": "service_logs", "arguments": {"service_id": service_id}}),
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok((reply?, size))
+    }
+
+    #[test]
+    fn service_logs_tell_an_empty_log_from_one_whose_newest_line_exceeds_the_read_bound()
+    -> Result<()> {
+        let bound = usize::try_from(rocm_core::LOG_VIEW_MAX_TAIL_READ)?;
+        let notice = "the newest line is longer than the 4 MiB a log view reads";
+        assert_eq!(
+            rocm_core::LOG_VIEW_MAX_TAIL_READ,
+            4 * 1024 * 1024,
+            "the notice asserted below names this many MiB"
+        );
+
+        // An empty log: nothing was written, and the reply says so.
+        let (reply, size) = service_logs_reply("service-logs-empty", Some(b""))?;
+        assert_eq!(size, Some(0));
+        let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            text, "Service `svc-service-logs-empty` has no log output yet.",
+            "{reply}"
+        );
+        assert_eq!(reply["structuredContent"]["tail"], "");
+        assert_eq!(
+            reply["structuredContent"]["newest_line_exceeds_read_bound"],
+            false
+        );
+
+        // One line longer than the bound, with and without a final newline: the
+        // file has content, so "no output" or "Read the last 0 line(s)" would be
+        // false, and the structured reply carries the same distinction.
+        let one_line = vec![b'x'; bound + 1024];
+        let mut with_newline = one_line.clone();
+        with_newline.push(b'\n');
+        for (name, bytes) in [
+            ("service-logs-long", one_line),
+            ("service-logs-long-nl", with_newline),
+        ] {
+            let (reply, size) = service_logs_reply(name, Some(&bytes))?;
+            assert!(
+                size.is_some_and(|size| size > rocm_core::LOG_VIEW_MAX_TAIL_READ),
+                "{name}: {size:?}"
+            );
+            let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+            assert_eq!(
+                text,
+                format!("Service `svc-{name}` has log output, but none is shown: {notice}."),
+                "{name}: {reply}"
+            );
+            assert_eq!(reply["structuredContent"]["tail"], "", "{name}");
+            assert_eq!(
+                reply["structuredContent"]["newest_line_exceeds_read_bound"], true,
+                "{name}"
+            );
+            assert_eq!(reply["isError"], false, "{name}");
+        }
+
+        // Short lines are read, and the count is the number returned.
+        let (reply, _) = service_logs_reply("service-logs-two", Some(b"a\nb\n"))?;
+        let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            text,
+            "Read the last 2 line(s) from service `svc-service-logs-two`."
+        );
+        assert_eq!(reply["structuredContent"]["tail"], "a\nb");
+        assert_eq!(
+            reply["structuredContent"]["newest_line_exceeds_read_bound"],
+            false
+        );
+
+        // No log file is an error, not an empty tail.
+        let error = service_logs_reply("service-logs-absent", None)
+            .expect_err("a missing log must not read as empty");
+        assert!(format!("{error:#}").contains("failed to read"), "{error:#}");
+        Ok(())
     }
 
     #[test]

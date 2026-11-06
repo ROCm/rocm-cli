@@ -79,6 +79,40 @@ impl LogTail {
     }
 }
 
+/// The clause a log view prints when a log has content but none of it is
+/// shown because its newest line does not fit the read budget
+/// ([`LogTail::newest_line_exceeds_the_read_bound`]). Derived from
+/// [`LOG_VIEW_MAX_TAIL_READ`], the budget the views read with, so the number
+/// cannot drift from it.
+pub fn newest_line_exceeds_bound_notice() -> String {
+    format!(
+        "the newest line is longer than the {} MiB a log view reads",
+        LOG_VIEW_MAX_TAIL_READ / (1024 * 1024)
+    )
+}
+
+/// What the `service_logs` tool says about a service's log tail, so that an
+/// empty log and a log whose newest line does not fit the read bound are not
+/// both reported as "Read the last 0 line(s)". Shared by the daemon's MCP
+/// server and the CLI's own tool bridge, which answer the same tool.
+///
+/// The count is the number of lines returned, not the number asked for.
+pub fn service_log_tool_summary(service_id: &str, tail: &LogTail) -> String {
+    if tail.newest_line_exceeds_the_read_bound() {
+        format!(
+            "Service `{service_id}` has log output, but none is shown: {}.",
+            newest_line_exceeds_bound_notice()
+        )
+    } else if tail.lines.is_empty() {
+        format!("Service `{service_id}` has no log output yet.")
+    } else {
+        format!(
+            "Read the last {} line(s) from service `{service_id}`.",
+            tail.lines.len()
+        )
+    }
+}
+
 /// Reads the last `limit` lines from a file as UTF-8, seeking near the end
 /// instead of reading the whole file for files larger than `max_tail_read`.
 ///
@@ -1129,5 +1163,37 @@ mod tests {
         assert_eq!(tail.lines, vec!["a", "b"]);
         assert_eq!(tail.skipped_bytes, 0);
         Ok(())
+    }
+
+    #[test]
+    fn the_service_log_summary_names_each_of_the_three_states_apart() {
+        let none = LogTail::default();
+        let too_long = LogTail {
+            lines: Vec::new(),
+            skipped_bytes: 1,
+        };
+        let two = LogTail {
+            lines: vec!["a".to_owned(), "b".to_owned()],
+            skipped_bytes: 7,
+        };
+
+        assert_eq!(
+            service_log_tool_summary("svc", &none),
+            "Service `svc` has no log output yet."
+        );
+        assert_eq!(
+            service_log_tool_summary("svc", &too_long),
+            "Service `svc` has log output, but none is shown: the newest line is longer than \
+             the 4 MiB a log view reads."
+        );
+        assert_eq!(
+            service_log_tool_summary("svc", &two),
+            "Read the last 2 line(s) from service `svc`."
+        );
+        assert_eq!(
+            LOG_VIEW_MAX_TAIL_READ,
+            4 * 1024 * 1024,
+            "the notice above names this many MiB"
+        );
     }
 }
