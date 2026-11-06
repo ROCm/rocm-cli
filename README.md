@@ -712,7 +712,9 @@ exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,
-`/opt/rocm`); use `rocm install sdk` instead.
+`/opt/rocm`); use `rocm install sdk` instead. Without `--root`, the environment
+folder is the one that holds the `--python` interpreter's `bin` (or `Scripts`)
+folder; an interpreter anywhere else is refused until you pass `--root`.
 
 ### Disk space
 
