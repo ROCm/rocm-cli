@@ -1897,8 +1897,11 @@ mod tests {
         );
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
         assert!(message.contains("stopped but NOT restarted"), "{message}");
+        // The named command must be runnable non-interactively: without
+        // `--yes` it would bail outside a terminal and never clear the
+        // condition. Asserted literally so it does not just echo the builder.
         assert!(
-            message.contains(&service_hints::service_action_hint("restart", service_id)),
+            message.contains(&format!("rocm services restart {service_id} --yes")),
             "{message}"
         );
         // The claim the message makes: the service really is stopped, and no

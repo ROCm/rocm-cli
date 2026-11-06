@@ -883,6 +883,12 @@ address (`localhost` counts as both loopback addresses) or on a wildcard
 listener that covers it (`0.0.0.0` for IPv4 addresses, `::` for any); the OS is not probed on such a
 host, so any other clash is reported by the engine when it starts.
 
+`rocm services restart` and `rocmd`'s automatic recovery are deliberately
+stricter about hosts than that launch check: they refuse to bring a service
+back on a port that any other live managed service has recorded, whatever host
+that service is bound to, because a `0.0.0.0` listener also covers the loopback
+address.
+
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
 `mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
@@ -1129,8 +1135,8 @@ nothing, and leaves the stop request recorded.
 
 After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
 and re-checks the port before it respawns: if another live managed service is
-now recorded on that port, or the port is bound by another process, it refuses
-and the service stays stopped (`rocm services list` shows it). The lock wait is
+now recorded on that port, or (on the default `127.0.0.1` host only) the port is
+bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
 bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
 `restart` fails saying the server was stopped but not restarted and names
 `rocm services restart <id> --yes` to run once that launch finishes.

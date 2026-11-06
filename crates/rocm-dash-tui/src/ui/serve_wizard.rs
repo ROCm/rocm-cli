@@ -42,7 +42,7 @@ use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
-use crate::ui::widgets::apply_char_key;
+use crate::ui::widgets::{apply_char_key, apply_char_key_filtered};
 
 /// Engine inventory — index 0 is the automatic choice.
 ///
@@ -191,6 +191,22 @@ impl InlineEditor {
         let to = self.byte_at(self.cursor);
         self.value.replace_range(from..to, "");
         self.cursor -= 1;
+    }
+
+    /// Edit through the shared append-only text-field helper (digits only):
+    /// the Port field has no use for a cursor, so it reuses
+    /// [`apply_char_key_filtered`] instead of the cursor editing above. A
+    /// rejected char leaves the initial selection intact.
+    fn edit_append_only(&mut self, key: KeyCode) {
+        if matches!(key, KeyCode::Char(c) if !c.is_ascii_digit()) {
+            return;
+        }
+        if self.selected {
+            self.value.clear();
+            self.selected = false;
+        }
+        apply_char_key_filtered(&mut self.value, key, |c| c.is_ascii_digit());
+        self.cursor = self.len();
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -585,7 +601,11 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
                 w.message = Some(current);
             }
         }
-        KeyCode::Left | KeyCode::Right => {
+        // The Port field is append-only (see the `Char`/`Backspace` arms), so
+        // there is no cursor to move there.
+        KeyCode::Left | KeyCode::Right
+            if w.editor.as_ref().is_some_and(|e| e.field == Field::Host) =>
+        {
             let delta = if code == KeyCode::Left { -1 } else { 1 };
             if let Some(ed) = w.editor.as_mut() {
                 ed.move_cursor(delta);
@@ -593,7 +613,11 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
         }
         KeyCode::Backspace => {
             if let Some(ed) = w.editor.as_mut() {
-                ed.backspace();
+                if ed.field == Field::Port {
+                    ed.edit_append_only(code);
+                } else {
+                    ed.backspace();
+                }
             }
         }
         KeyCode::Enter => {
@@ -640,10 +664,11 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
         }
         KeyCode::Char(c) => {
             if let Some(ed) = w.editor.as_mut() {
-                if ed.field == Field::Port && !c.is_ascii_digit() {
-                    return;
+                if ed.field == Field::Port {
+                    ed.edit_append_only(code);
+                } else {
+                    ed.insert(c);
                 }
-                ed.insert(c);
             }
         }
         _ => {}

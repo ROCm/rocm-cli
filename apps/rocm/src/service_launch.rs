@@ -445,7 +445,11 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
     if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
         let outcome = rocm_core::terminate_verified(
-            &rocm_core::ProcessIdentity::capture(pid),
+            // The token captured at spawn, not a fresh `capture`: when the child
+            // already exited, a fresh one would describe a recycled pid's new owner
+            // and the forced tree kill would hit it. No token means the pid cannot
+            // be verified, and `terminate_verified` then signals nothing.
+            &rocm_core::ProcessIdentity::new(pid, record.engine_start_ticks),
             rocm_core::KillScope::Tree,
             MANAGED_LAUNCH_CLEANUP_GRACE,
             true,
@@ -914,8 +918,11 @@ fn launch_managed_engine_child_locked(
         let child_pid = rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
             .context("failed to launch managed engine process")?;
         // Set before the immediate-exit check below, so a bail! here still leaves
-        // `record.engine_pid` telling cleanup that a child was spawned.
-        record.engine_pid = Some(child_pid);
+        // `record.engine_pid` telling cleanup that a child was spawned. The
+        // start-time token is captured here too, while the child is certainly
+        // ours: cleanup binds its kill to it rather than to whatever owns the
+        // pid by then.
+        record.record_engine_identity(child_pid);
         ensure_spawned_child_survives_startup(
             child_pid,
             &record.log_path,
@@ -948,8 +955,11 @@ fn launch_managed_engine_child_locked(
         .context("failed to launch managed engine process")?;
         let child_pid = child.id();
         // Set before the immediate-exit check below, so a bail! here still leaves
-        // `record.engine_pid` telling cleanup that a child was spawned.
-        record.engine_pid = Some(child_pid);
+        // `record.engine_pid` telling cleanup that a child was spawned. The
+        // start-time token is captured here too, while the child is certainly
+        // ours: cleanup binds its kill to it rather than to whatever owns the
+        // pid by then.
+        record.record_engine_identity(child_pid);
         thread::sleep(Duration::from_millis(200));
         if let Some(status) = child
             .try_wait()
@@ -4288,6 +4298,46 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn abandoned_launch_never_signals_a_pid_that_no_longer_matches_the_spawn_token() -> Result<()> {
+        // The child exited and its pid now belongs to an unrelated live
+        // process: the start token recorded at spawn no longer matches, so the
+        // forced tree kill must not touch it.
+        let (root, paths) = test_paths("abandon-launch-recycled-pid");
+        paths.ensure()?;
+        let mut record = write_live_service_record(
+            &paths,
+            "lemonade-abandon-recycled",
+            "abandon-recycled-model",
+            11_493,
+            "running",
+        )?;
+        let current_exe = std::env::current_exe().expect("current test exe");
+        let mut bystander = ProcessCommand::new(current_exe)
+            .arg("--exact")
+            .arg("service_launch::tests::managed_launch_cleanup_sleeper_child")
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .spawn()
+            .expect("spawn bystander");
+        record.record_engine_identity(bystander.id());
+        record.engine_start_ticks = record.engine_start_ticks.map(|ticks| ticks + 1);
+
+        abandon_failed_managed_launch(&paths, &record);
+
+        let still_running = bystander.try_wait().expect("poll bystander").is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            still_running,
+            "a pid with a mismatched token must be left alone"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn abandoned_launch_terminates_the_spawned_child() -> Result<()> {
         let (root, paths) = test_paths("abandon-launch-terminates-child");
@@ -4310,7 +4360,7 @@ mod tests {
             .spawn()
             .expect("spawn sleeper child");
         let child_pid = child.id();
-        record.engine_pid = Some(child_pid);
+        record.record_engine_identity(child_pid);
 
         abandon_failed_managed_launch(&paths, &record);
 
