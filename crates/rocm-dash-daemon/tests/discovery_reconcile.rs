@@ -765,6 +765,191 @@ async fn managed_malformed_record_does_not_hide_the_other_services() {
     );
 }
 
+// ── Managed-service registry: one record that cannot be opened ──────────────
+//
+// State matrix for a registry where some record cannot be read, one test per
+// row (the rows with no unreadable record, an empty registry, and a directory
+// that cannot be listed are the tests above):
+//
+// | State                                              | Announced        | Snapshots list    | Header warning |
+// | -------------------------------------------------- | ---------------- | ----------------- | -------------- |
+// | one record unreadable, a new valid record appears  | the new one once | known + new       | yes            |
+// | one record unreadable, a known record is removed   | nothing          | known stays       | yes            |
+// | the same, then the unreadable record is fixed      | gone, once       | the removed one goes | clears      |
+// | the known service's own record becomes unreadable  | nothing          | known stays       | yes            |
+// | ... and then reads again                           | nothing          | known stays       | clears         |
+//
+// A record that cannot be opened is a symbolic link to itself, which fails with a
+// loop error (not "not found", which would read as a record removed on purpose),
+// needs no permission change and so also works when the tests run as root.
+
+/// Make `<name>.json` in the registry something that cannot be opened.
+#[cfg(unix)]
+fn write_unreadable_record(services_dir: &std::path::Path, name: &str) {
+    let file = format!("{name}.json");
+    // A relative target, so the link keeps pointing at itself when renamed.
+    std::os::unix::fs::symlink(&file, services_dir.join(&file)).unwrap();
+}
+
+/// What the stream and the snapshots showed, for every service, over a window of
+/// snapshots.
+#[cfg(unix)]
+#[derive(Default)]
+struct Roster {
+    /// Every discovered/gone announcement, in order, with the service id.
+    announcements: Vec<(String, &'static str)>,
+    snapshots: usize,
+    /// Snapshots in the window that did not list [`SVC_ID`].
+    missing_known: usize,
+    /// The ids the last snapshot in the window listed, sorted.
+    ids: Vec<String>,
+    /// [`SVC_ID`] as the last snapshot in the window listed it.
+    known: Option<Instance>,
+    /// The warnings the last snapshot in the window carried.
+    warnings: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Roster {
+    fn registry_warning(&self) -> Option<&String> {
+        self.warnings
+            .iter()
+            .find(|w| w.starts_with("managed registry"))
+    }
+}
+
+/// Watch `count` snapshots, recording every announcement and what the snapshots
+/// listed, under one deadline.
+#[cfg(unix)]
+async fn watch_roster(rx: &mut broadcast::Receiver<Event>, count: usize) -> Roster {
+    let mut roster = Roster::default();
+    observe(
+        rx,
+        "a window of snapshots",
+        &mut roster,
+        |r, ev| {
+            match ev {
+                Event::InstanceDiscovered(inst) => r
+                    .announcements
+                    .push((inst.container_id.clone(), "discovered")),
+                Event::InstanceGone { container_id } => {
+                    r.announcements.push((container_id.clone(), "gone"));
+                }
+                Event::Snapshot(snap) => {
+                    r.snapshots += 1;
+                    r.known = instance(snap, SVC_ID).cloned();
+                    r.missing_known += usize::from(r.known.is_none());
+                    r.ids = snap
+                        .instances
+                        .iter()
+                        .map(|i| i.container_id.clone())
+                        .collect();
+                    r.ids.sort();
+                    r.warnings.clone_from(&snap.warnings);
+                }
+                _ => {}
+            }
+            r.snapshots >= count
+        },
+        |r| {
+            format!(
+                "{} snapshots, listing {:?}, announcements {:?}",
+                r.snapshots, r.ids, r.announcements
+            )
+        },
+    )
+    .await;
+    roster
+}
+
+/// A new service is added while one other record cannot be opened: the readable
+/// records still add their services, announced once, and nothing is retired.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_record_does_not_hide_a_new_service() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    write_unreadable_record(&live.services_dir, "stale");
+    write_record_for(&live.services_dir, "second-svc", port);
+    let roster = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        roster.announcements,
+        [("second-svc".to_string(), "discovered")],
+        "the new service is announced once, and nothing is announced gone"
+    );
+    assert_eq!(
+        roster.missing_known, 0,
+        "a snapshot dropped the known service"
+    );
+    assert_eq!(roster.ids, [SVC_ID.to_string(), "second-svc".to_string()]);
+    let warning = roster
+        .registry_warning()
+        .expect("the header should name the unreadable record");
+    assert!(warning.contains("stale.json"), "{warning}");
+}
+
+/// While a record cannot be opened a service whose record is removed keeps its
+/// row, because the unreadable record could be any known service's; once the
+/// record reads again the registry is read in full and the removed service is
+/// retired, with the warning cleared.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_unreadable_record_defers_retirement_until_it_reads_again() {
+    let mut live = start_live_managed().await;
+
+    write_unreadable_record(&live.services_dir, "stale");
+    std::fs::remove_file(live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+    let during = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(
+        during.announcements,
+        Vec::<(String, &str)>::new(),
+        "a removed record must not retire anything while another cannot be read"
+    );
+    assert_eq!(during.missing_known, 0, "a snapshot dropped the service");
+    assert_eq!(during.ids, [SVC_ID.to_string()]);
+    assert!(during.registry_warning().is_some(), "{:?}", during.warnings);
+
+    std::fs::remove_file(live.services_dir.join("stale.json")).unwrap();
+    assert_service_is_retired(&mut live.rx).await;
+    let after = watch_roster(&mut live.rx, SETTLE_SNAPSHOTS).await;
+    assert_eq!(after.ids, Vec::<String>::new());
+    assert_eq!(
+        after.registry_warning(),
+        None,
+        "the warning must clear once the registry reads in full"
+    );
+}
+
+/// The known service's own record becomes unreadable (here it is replaced by a
+/// self-referencing link, atomically): the service keeps its row and its live
+/// fields, and is not announced again when the record reads again.
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_own_record_becoming_unreadable_keeps_the_instance_and_recovers_quietly() {
+    let mut live = start_live_managed().await;
+    let port = live.last_port();
+
+    let tmp_link = live.services_dir.join(format!("{SVC_ID}.json.tmp"));
+    std::os::unix::fs::symlink(format!("{SVC_ID}.json"), &tmp_link).unwrap();
+    std::fs::rename(&tmp_link, live.services_dir.join(format!("{SVC_ID}.json"))).unwrap();
+    let during = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+
+    assert_eq!(during.announcements, Vec::<(String, &str)>::new());
+    assert_eq!(during.missing_known, 0, "a snapshot dropped the service");
+    assert_still_live(during.known.as_ref().expect("the service is listed"));
+    assert!(during.registry_warning().is_some(), "{:?}", during.warnings);
+
+    write_record(&live.services_dir, port);
+    let after = watch_roster(&mut live.rx, OUTAGE_SNAPSHOTS).await;
+    assert_eq!(after.announcements, Vec::<(String, &str)>::new());
+    assert_eq!(after.missing_known, 0);
+    assert_eq!(after.ids, [SVC_ID.to_string()]);
+    assert_eq!(after.registry_warning(), None);
+}
+
 // ── Lemonade endpoint ───────────────────────────────────────────────────────
 
 fn lemonade_responder(path: &str) -> String {

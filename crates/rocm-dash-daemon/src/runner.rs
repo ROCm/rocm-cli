@@ -590,10 +590,13 @@ pub async fn run_loop(
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
         //
-        // Like the Docker source above, a pass that could not read the registry
-        // reconciles nothing: what is known stays known (no `Gone`, no repeat
-        // `Discovered`), and the instances keep the data they hold. Only a
-        // registry that was read, even an empty one, retires what it lacks.
+        // A pass that could not read the registry in full retires nothing, as
+        // with the Docker source above: what is known stays known (no `Gone`),
+        // and the instances keep the data they hold. Unlike Docker, whose listing
+        // is all or nothing, a registry can fail on one record while the rest
+        // read, so the readable records still add and refresh their services
+        // (announced once, as ever). Only a registry that was read in full, even
+        // an empty one, retires what it lacks.
         if let Some(services_dir) = opts.services_dir.as_ref()
             && discovery_due
         {
@@ -613,7 +616,19 @@ pub async fn run_loop(
                     discovery.known_services = disc.seen;
                     registry_warn = None;
                 }
-                Err(e) => registry_warn = Some(registry_read_warning(&e)),
+                Err(e) => {
+                    // The records that did read still add and refresh their
+                    // services; nothing is retired, because the one that did
+                    // not read could be any of the known ones.
+                    let disc = crate::registry::discover_managed_services(&e.partial.records);
+                    reconcile.upsert_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                    );
+                    discovery.keep_through_partial_registry(disc);
+                    registry_warn = Some(registry_read_warning(&e));
+                }
             }
         }
         if tick_count.is_multiple_of(instance_ticks) {
@@ -1037,6 +1052,19 @@ struct DiscoveryState {
     registry_health: RegistryHealth,
 }
 
+impl DiscoveryState {
+    /// Record what a pass that read only part of the registry found. The services
+    /// it saw join the known set, so a later complete read can retire them, and
+    /// the known ones it did not see stay; the non-vLLM marks of the services it
+    /// saw are refreshed and the others kept, so a kept non-vLLM service is still
+    /// left out of the vLLM scrape.
+    fn keep_through_partial_registry(&mut self, disc: crate::registry::ManagedDiscovery) {
+        self.managed_non_vllm.retain(|id| !disc.seen.contains(id));
+        self.managed_non_vllm.extend(disc.non_vllm);
+        self.known_services.extend(disc.seen);
+    }
+}
+
 /// What the managed-service registry's reads have reported so far. A failure
 /// that lasts is logged on its first pass only, the recovery once, and a set of
 /// malformed records each time it changes; the dashboard's warning badge, which
@@ -1216,6 +1244,22 @@ impl Reconcile<'_> {
         known: &HashSet<String>,
         seen: &HashSet<String>,
     ) {
+        self.upsert_set(source, svcs, known);
+        for gone in known.difference(seen) {
+            self.retire(source, gone);
+        }
+    }
+
+    /// The half of [`Self::reconcile_set`] that adds and refreshes: upsert every
+    /// service in `svcs` and announce the ones `known` did not have. Retires
+    /// nothing, which is what a pass that could only see part of its source needs
+    /// (see [`DiscoveryState::keep_through_partial_registry`]).
+    fn upsert_set(
+        &mut self,
+        source: DiscoverySource,
+        svcs: &[DiscoveredService],
+        known: &HashSet<String>,
+    ) {
         for svc in svcs {
             let same_endpoint = self
                 .state
@@ -1230,9 +1274,6 @@ impl Reconcile<'_> {
             if !known.contains(&svc.container_id) {
                 self.announce(source, svc);
             }
-        }
-        for gone in known.difference(seen) {
-            self.retire(source, gone);
         }
     }
 
@@ -2403,7 +2444,58 @@ mod tests {
         Err(crate::registry::RegistryReadError {
             path: PathBuf::from("services"),
             source: std::io::Error::other(why),
+            partial: crate::registry::RegistryRead::default(),
         })
+    }
+
+    /// State matrix for what a partially read registry does to the discovery
+    /// state, one assertion group per row: a service it saw joins the known set
+    /// and its non-vLLM mark follows the record; one it did not see stays known
+    /// and keeps its mark; nothing leaves either set.
+    #[test]
+    fn partial_registry_read_adds_what_it_saw_and_forgets_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["old-vllm", "old-lemonade", "flips"]),
+            managed_non_vllm: id_set(&["old-lemonade", "flips"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
+            seen: id_set(&["new-lemonade", "new-vllm", "flips"]),
+            non_vllm: id_set(&["new-lemonade"]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            state.known_services,
+            id_set(&[
+                "old-vllm",
+                "old-lemonade",
+                "flips",
+                "new-lemonade",
+                "new-vllm"
+            ]),
+            "the unseen services stay known and the new ones join them"
+        );
+        assert_eq!(
+            state.managed_non_vllm,
+            id_set(&["old-lemonade", "new-lemonade"]),
+            "an unseen non-vLLM service keeps its mark, a seen one follows its record"
+        );
+    }
+
+    #[test]
+    fn partial_registry_read_that_saw_nothing_changes_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["a", "b"]),
+            managed_non_vllm: id_set(&["b"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
+
+        assert_eq!(state.known_services, id_set(&["a", "b"]));
+        assert_eq!(state.managed_non_vllm, id_set(&["b"]));
     }
 
     #[test]

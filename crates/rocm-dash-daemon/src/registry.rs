@@ -29,6 +29,21 @@
 //! (the same assumption the Docker-discovery path already makes). A managed
 //! service on a non-loopback host is surfaced but its metrics are scraped at the
 //! local address. Per-host scrape targeting is tracked as a D7 follow-up.
+//!
+//! **A registry that cannot be read in full (trade-off):** a record file that
+//! exists but cannot be opened (a root-owned file left by `sudo rocm serve`, a
+//! symlink loop) makes [`read_service_records`] fail the pass, because the
+//! service that file held cannot be told apart from one that is gone, and the
+//! daemon's rule is that a failed read never retires anything. The failure
+//! carries what the pass did read ([`RegistryReadError::partial`]), so the daemon
+//! still adds and refreshes those services: a new `rocm serve` appears on the
+//! next discovery tick even beside a stale unreadable record. What stays frozen,
+//! for as long as the file is unreadable (there is no timeout), is retirement:
+//! a service that has stopped or whose record was removed keeps its row (with its
+//! last live fields) until the registry reads in full, and the header warning
+//! names the unreadable path throughout. Retiring on a deadline would reintroduce
+//! the wrongly vanishing row this rule exists to prevent, so the freeze is
+//! visible rather than bounded.
 
 use std::collections::HashSet;
 use std::fs;
@@ -131,15 +146,22 @@ pub struct RegistryRead {
     pub malformed: Vec<PathBuf>,
 }
 
-/// The registry could not be read, so what it holds is unknown. This is not the
-/// same as an empty registry: a caller that retires services which are missing
-/// from a read must not do so on this.
+/// The registry could not be read in full, so what it holds is unknown.
+///
+/// This is not the same as an empty registry: a caller that retires services
+/// which are missing from a read must not do so on this. It may still use what was read
+/// around the failure ([`RegistryReadError::partial`]) to add or refresh services,
+/// because a record that was read is evidence that its service exists, whereas a
+/// record that was not read is no evidence of anything.
 #[derive(Debug)]
 pub struct RegistryReadError {
-    /// The directory that could not be listed, or the record file that could not
-    /// be read.
+    /// The directory that could not be listed, or the first record file that
+    /// could not be read.
     pub path: PathBuf,
     pub source: std::io::Error,
+    /// What the pass did read: every well-formed record it could open, and the
+    /// malformed ones. Empty when the directory itself could not be listed.
+    pub partial: RegistryRead,
 }
 
 impl std::fmt::Display for RegistryReadError {
@@ -154,27 +176,19 @@ impl std::error::Error for RegistryReadError {
     }
 }
 
-/// What a scan does with a record file that exists but cannot be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnreadableRecord {
-    /// The whole pass fails: nothing is known about the service the file held.
-    Fail,
-    /// The file is skipped and the other records still load.
-    Skip,
-}
-
 /// Read every managed-service record under `services_dir`, telling a registry
 /// that is confirmed empty apart from one that could not be read.
 ///
 /// * A directory that does not exist is confirmed empty: it is created the first
 ///   time something is served, so its absence means there are no services. A
 ///   directory that exists but cannot be listed (or a regular file where it
-///   should be) is a read failure.
+///   should be) is a read failure with nothing partial to offer.
 /// * A record file that vanishes between the listing and the read was removed
 ///   on purpose and is skipped. Any other failure to read a record (a permission
-///   or I/O error) is a read failure for the whole pass: the record's service
-///   cannot be told apart from one that is gone, and nothing is known about which
-///   service the unreadable file belonged to.
+///   or I/O error) is a read failure for the pass: the record's service cannot be
+///   told apart from one that is gone, and nothing is known about which service
+///   the unreadable file belonged to. The scan still reads the remaining records,
+///   so [`RegistryReadError::partial`] holds every record that could be read.
 /// * A record that reads but does not parse is malformed. It is reported in
 ///   [`RegistryRead::malformed`] and the other records still load, because the
 ///   rocm-cli writer replaces a record atomically, so a corrupt file is corrupt
@@ -193,16 +207,6 @@ fn read_service_records_with(
     services_dir: &Path,
     read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<RegistryRead, RegistryReadError> {
-    scan_registry(services_dir, read_record, UnreadableRecord::Fail)
-}
-
-/// The scan behind [`read_service_records`] and [`load_service_records`]; the two
-/// differ only in what they do with a record file that cannot be read.
-fn scan_registry(
-    services_dir: &Path,
-    read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
-    on_unreadable: UnreadableRecord,
-) -> Result<RegistryRead, RegistryReadError> {
     let entries = match fs::read_dir(services_dir) {
         Ok(entries) => entries,
         Err(source) => {
@@ -216,20 +220,21 @@ fn scan_registry(
                 Err(RegistryReadError {
                     path: services_dir.to_path_buf(),
                     source,
+                    partial: RegistryRead::default(),
                 })
             };
         }
     };
     let mut read = RegistryRead::default();
+    // The first failure; later ones add nothing a caller can act on.
+    let mut failure: Option<(PathBuf, std::io::Error)> = None;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) if on_unreadable == UnreadableRecord::Skip => continue,
             Err(source) => {
-                return Err(RegistryReadError {
-                    path: services_dir.to_path_buf(),
-                    source,
-                });
+                // The rest of the listing is unknown, so stop reading it.
+                failure.get_or_insert_with(|| (services_dir.to_path_buf(), source));
+                break;
             }
         };
         let path = entry.path();
@@ -239,8 +244,10 @@ fn scan_registry(
         let bytes = match read_record(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(_) if on_unreadable == UnreadableRecord::Skip => continue,
-            Err(source) => return Err(RegistryReadError { path, source }),
+            Err(source) => {
+                failure.get_or_insert((path, source));
+                continue;
+            }
         };
         match serde_json::from_slice::<ServiceRecord>(&bytes) {
             Ok(record) => read.records.push(record),
@@ -250,7 +257,14 @@ fn scan_registry(
     read.records
         .sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
     read.malformed.sort();
-    Ok(read)
+    match failure {
+        None => Ok(read),
+        Some((path, source)) => Err(RegistryReadError {
+            path,
+            source,
+            partial: read,
+        }),
+    }
 }
 
 /// Load every managed-service record under `services_dir`, newest first.
@@ -260,8 +274,8 @@ fn scan_registry(
 /// an empty list, and a record that cannot be read or parsed is skipped on its
 /// own, so one bad file never hides the services beside it. The daemon's
 /// discovery loop must not use this, because it cannot tell an unreadable
-/// registry from an empty one; it calls [`read_service_records`], which fails the
-/// pass on an unreadable record instead.
+/// registry from an empty one; it calls [`read_service_records`] and keeps the
+/// services it could not confirm gone.
 pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
     load_service_records_with(services_dir, |path| fs::read(path))
 }
@@ -272,9 +286,9 @@ fn load_service_records_with(
     services_dir: &Path,
     read_record: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Vec<ServiceRecord> {
-    scan_registry(services_dir, read_record, UnreadableRecord::Skip)
-        .map(|read| read.records)
-        .unwrap_or_default()
+    read_service_records_with(services_dir, read_record)
+        .unwrap_or_else(|failed| failed.partial)
+        .records
 }
 
 /// Convert a managed-service record into a [`DiscoveredService`] for the
@@ -498,6 +512,10 @@ mod tests {
             .expect_err("a file where the registry should be must not read as empty");
         assert_eq!(err.path, not_a_dir);
         assert!(err.to_string().contains("cannot read"), "{err}");
+        assert!(
+            err.partial.records.is_empty() && err.partial.malformed.is_empty(),
+            "a directory that cannot be listed has nothing partial to offer"
+        );
         // The best-effort wrapper keeps its old answer for the one-shot readers.
         assert!(load_service_records(&not_a_dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -575,6 +593,7 @@ mod tests {
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
         let err = result.expect_err("an unreadable record must not read as a missing one");
         assert_eq!(err.path, locked);
+        assert_eq!(err.partial.records.len(), 1, "the readable record is kept");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -662,9 +681,19 @@ mod tests {
     fn read_fails_the_pass_on_a_record_that_cannot_be_read() {
         let (dir, read_record) = registry_with_one_record_refused();
         let err = read_service_records_with(&dir, read_record)
-            .expect_err("the strict reader must not read past an unreadable record");
+            .expect_err("the strict reader must not read an unreadable record as a missing one");
         assert_eq!(err.path, dir.join("locked.json"));
         assert_eq!(err.source.kind(), ErrorKind::PermissionDenied);
+        // The failure does not stop the scan: both readable records are in the
+        // partial read, newest first, whichever side of the locked one they sort.
+        let ids: Vec<&str> = err
+            .partial
+            .records
+            .iter()
+            .map(|r| r.service_id.as_str())
+            .collect();
+        assert_eq!(ids, ["svc-b", "svc-a"]);
+        assert!(err.partial.malformed.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
