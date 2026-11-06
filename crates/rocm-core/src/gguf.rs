@@ -1190,6 +1190,31 @@ mod tests {
         parse(&builder.file(0)).unwrap();
     }
 
+    /// The sliding-window key is decoded as a kept key but never read again, so
+    /// it takes no one of the kept slots: a header at the cap of other shape
+    /// keys is still readable with it, and the flag is set.
+    #[test]
+    fn the_sliding_window_key_does_not_take_a_kept_slot() {
+        let mut builder = Builder::new();
+        for index in 0..MAX_KEPT_KEYS {
+            builder = builder.u32(&format!("a{index}.attention.head_count"), 1);
+        }
+        let header = parse(&builder.u32("x.attention.sliding_window", 4096).file(0)).unwrap();
+        assert!(header.sliding_window);
+    }
+
+    /// A key repeated once the kept slots are full replaces its own value; it is
+    /// not a new distinct key, so the cap does not refuse it.
+    #[test]
+    fn a_repeated_shape_key_at_the_cap_is_not_a_new_distinct_key() {
+        let mut builder = Builder::new();
+        for index in 0..MAX_KEPT_KEYS {
+            builder = builder.u32(&format!("a{index}.attention.head_count"), 1);
+        }
+        builder = builder.u32("a0.attention.head_count", 2);
+        parse(&builder.file(0)).unwrap();
+    }
+
     #[test]
     fn a_header_that_spans_more_than_the_size_bound_is_refused() {
         // Two arrays, each under the bound on its own, that together carry the

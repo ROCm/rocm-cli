@@ -1162,8 +1162,8 @@ pub const ESTIMATE_CAVEAT: &str = "these are estimates from the file's metadata,
 /// The standing note about `rocm serve` when there are suggestions.
 ///
 /// The options they name are the engine's, and `rocm serve` does not pass them
-/// through today. `serve_takes_no_estimate_options_yet` in `apps/rocm/src/main.rs` fails when
-/// `rocm serve` gains one of them, so this text cannot go stale unnoticed.
+/// through today. `serve_takes_no_estimate_options_yet` in `apps/rocm/src/cli.rs` fails
+/// when `rocm serve` gains one of them, so this text cannot go stale unnoticed.
 pub const SERVE_OPTIONS_NOTE: &str = "`rocm serve` does not take a context size, KV cache type or \
      GPU layer count yet, and passes none to the engine, so a model it serves gets the engine's \
      own default context; the options named above are llama.cpp's own llama-server flags";
@@ -2202,6 +2202,43 @@ mod tests {
         );
         assert_eq!(result.architecture.as_deref(), Some("llama?evil?"));
         assert!(evidence_lines(&result).iter().all(|line| line.is_ascii()));
+    }
+
+    /// U+2028 and U+2029 are line separators, not controls: a terminal and a
+    /// log viewer may break the line on them, so they are replaced as well.
+    #[test]
+    fn an_architecture_name_cannot_break_the_line_with_a_unicode_separator() {
+        let builder = llama_like(10).string("general.architecture", "a\u{2028}b\u{2029}c");
+        let (header, size) = header_of(&builder, 4096);
+        let result = estimate(
+            &header,
+            size,
+            1024,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(8.0),
+        );
+        assert_eq!(result.architecture.as_deref(), Some("a?b?c"));
+    }
+
+    /// A header may declare zero query heads while keeping a KV head count and
+    /// no explicit head width; the width would be `embedding / 0`.
+    #[test]
+    fn a_zero_head_count_is_a_missing_width_not_a_division_by_zero() {
+        let result = cannot_estimate(
+            &Builder::new()
+                .string("general.architecture", "x")
+                .u32("x.block_count", 4)
+                .u32("x.embedding_length", 512)
+                .u32("x.attention.head_count", 0)
+                .u32("x.attention.head_count_kv", 2)
+                .tensor("t", &[10]),
+        );
+        assert_eq!(result.outcome, EstimateOutcome::CannotEstimate);
+        assert_eq!(
+            result.cannot_estimate_reason,
+            Some(CannotEstimateReason::MissingMetadata)
+        );
+        assert_eq!(result.total_gib, None);
     }
 
     #[test]

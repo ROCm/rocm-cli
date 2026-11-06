@@ -464,6 +464,8 @@ pub trait GgufSource {
 #[derive(Debug, Clone)]
 pub struct LiveGgufSource {
     hub: String,
+    /// How long listing a repository and reading a header may take in all.
+    budget: Duration,
 }
 
 impl Default for LiveGgufSource {
@@ -482,7 +484,10 @@ impl LiveGgufSource {
             .map(|value| value.trim().trim_end_matches('/').to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_HUB.to_owned());
-        Self { hub }
+        Self {
+            hub,
+            budget: TOTAL_BUDGET,
+        }
     }
 
     /// A source against an explicit hub base URL.
@@ -491,16 +496,26 @@ impl LiveGgufSource {
     pub fn with_hub(hub: &str) -> Self {
         Self {
             hub: hub.trim_end_matches('/').to_owned(),
+            budget: TOTAL_BUDGET,
         }
     }
 
+    /// The same source with a shorter total budget, so a test can show the
+    /// reader is bound by the deadline `open` sets rather than by a fresh one.
+    #[cfg(test)]
+    #[must_use]
+    const fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
     fn agent() -> ureq::Agent {
-        // The same User-Agent the CLI's other downloads send. Redirects (the hub
-        // sends `resolve/main` to its CDN) are followed at most five deep, which
-        // is ureq's default, stated here so it is not changed by accident.
+        // The same User-Agent the CLI's other downloads send. The agent follows
+        // no redirect itself: [`send`] does, so that it can refuse one that
+        // leaves https for plain http.
         ureq::AgentBuilder::new()
             .user_agent("rocm-cli")
-            .redirects(5)
+            .redirects(0)
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -514,11 +529,14 @@ impl LiveGgufSource {
         deadline: Instant,
     ) -> Result<Vec<HubFile>> {
         let url = format!("{}/api/models/{owner}/{repo}?blobs=true", self.hub);
-        let response = agent
-            .get(&url)
-            .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?)
-            .call()
-            .map_err(|error| describe_http_error(&error, &format!("`{owner}/{repo}`")))?;
+        let response = send(
+            agent,
+            "GET",
+            &url,
+            deadline,
+            None,
+            &format!("`{owner}/{repo}`"),
+        )?;
         let mut text = Vec::new();
         // One byte past the cap, so a listing that is exactly too long is told
         // apart from one that fits instead of being cut short and misread as bad
@@ -649,7 +667,7 @@ impl GgufSource for LiveGgufSource {
                     );
                 };
                 let agent = Self::agent();
-                let deadline = Instant::now() + TOTAL_BUDGET;
+                let deadline = Instant::now() + self.budget;
                 let files = self.list_files(&agent, owner, repo, deadline)?;
                 let file = select_gguf_file(&files, variant)?;
                 let path: Vec<String> = file
@@ -690,13 +708,84 @@ fn time_left(deadline: Instant) -> io::Result<Duration> {
     Ok(left.min(REQUEST_TIMEOUT))
 }
 
+/// The most redirects one request follows: the hub sends `resolve/main` to its
+/// CDN, and a chain longer than this is a loop or a mirror that is not one.
+const MAX_REDIRECTS: usize = 5;
+
+/// Send one request and follow its redirects by hand, each hop under what is
+/// left of `deadline`, keeping the `Range` header on every hop.
+///
+/// By hand because the agent cannot say where a redirect is going until it has
+/// gone there, and [`redirect_target`] must refuse one that leaves https for
+/// plain http: `HF_ENDPOINT` is an environment variable, and a mirror that is
+/// not trusted must not be able to send the request out in the clear.
+fn send(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    deadline: Instant,
+    range: Option<&str>,
+    what: &str,
+) -> Result<ureq::Response> {
+    let mut current = url.to_owned();
+    for _ in 0..=MAX_REDIRECTS {
+        let mut request = agent
+            .request(method, &current)
+            .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?);
+        if let Some(range) = range {
+            request = request.set("Range", range);
+        }
+        let response = request
+            .call()
+            .map_err(|error| describe_http_error(&error, what))?;
+        if !matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        let location = response
+            .header("Location")
+            .ok_or_else(|| anyhow!("the hub redirected {what} without saying where"))?;
+        current = redirect_target(&current, location, what)?;
+    }
+    bail!("the hub redirected {what} more than {MAX_REDIRECTS} times")
+}
+
+/// Where a redirect from `current` to `location` goes, or why it is refused: it
+/// must stay on http(s), and a request that began on https never ends on http.
+fn redirect_target(current: &str, location: &str, what: &str) -> Result<String> {
+    let location = location.trim();
+    let (scheme, rest) = current
+        .split_once("://")
+        .ok_or_else(|| anyhow!("{what} is at `{current}`, which is not a URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let lower = location.to_ascii_lowercase();
+    let target = if lower.starts_with("http://") || lower.starts_with("https://") {
+        location.to_owned()
+    } else if location.starts_with("//") {
+        format!("{scheme}:{location}")
+    } else if location.starts_with('/') {
+        format!("{scheme}://{authority}{location}")
+    } else if location.contains("://") {
+        bail!("the hub redirected {what} to something that is not http(s)");
+    } else {
+        let path = rest[authority.len()..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("");
+        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        format!("{scheme}://{authority}{directory}/{location}")
+    };
+    if scheme.eq_ignore_ascii_case("https") && target.to_ascii_lowercase().starts_with("http://") {
+        bail!(
+            "the hub redirected {what} from https to plain http, which is refused: no token is \
+             sent, but the request must not leave an encrypted connection"
+        );
+    }
+    Ok(target)
+}
+
 /// The size of a remote file from its `Content-Length`, without fetching it.
 fn head_size(agent: &ureq::Agent, url: &str, deadline: Instant) -> Result<u64> {
-    let response = agent
-        .head(url)
-        .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?)
-        .call()
-        .map_err(|error| describe_http_error(&error, "the model file"))?;
+    let response = send(agent, "HEAD", url, deadline, None, "the model file")?;
     response
         .header("Content-Length")
         .and_then(|value| value.trim().parse().ok())
@@ -753,13 +842,15 @@ impl RangedReader {
                 MAX_FETCH_BYTES / (1024 * 1024)
             )));
         }
-        let response = self
-            .agent
-            .get(&self.url)
-            .timeout(time_left(self.deadline)?)
-            .set("Range", &format!("bytes={}-{}", self.position, end - 1))
-            .call()
-            .map_err(|error| io::Error::other(describe_http_error(&error, "the model file")))?;
+        let response = send(
+            &self.agent,
+            "GET",
+            &self.url,
+            self.deadline,
+            Some(&format!("bytes={}-{}", self.position, end - 1)),
+            "the model file",
+        )
+        .map_err(|error| io::Error::other(format!("{error:#}")))?;
         // 200 means the server ignored the range and would send the whole file.
         if response.status() != 206 {
             return Err(io::Error::other(format!(
@@ -1468,6 +1559,8 @@ mod tests {
         ShortConsistent,
         /// A `401`, as for a gated repository.
         Unauthorized,
+        /// A `403`, as for a repository that refuses the request.
+        Forbidden,
         /// A `206` that arrives after a pause.
         Slow,
         /// A `206` with no `Content-Range`, so which bytes it carries is unstated.
@@ -1558,6 +1651,12 @@ mod tests {
                             let _ = write!(
                                 stream,
                                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
+                        (_, Serve::Forbidden) => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             );
                         }
                         (
@@ -2054,6 +2153,154 @@ mod tests {
             !error.contains("authentication"),
             "no token is sent, so authentication is not on offer: {error}"
         );
+    }
+
+    /// The hub answers 403 as well as 401 for a repository it will not serve to
+    /// an anonymous client; both read as "gated or private", and neither as a
+    /// generic status.
+    #[test]
+    fn a_forbidden_file_is_said_to_be_gated_or_private_like_an_unauthorized_one() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Forbidden,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf","size":1048576}]}"#.to_owned(),
+        );
+        let mut opened = LiveGgufSource::with_hub(&hub.base)
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        let error = parse_gguf_header(&mut opened.reader)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("gated or private") && !error.contains("answered 403"),
+            "{error}"
+        );
+    }
+
+    /// `open` sets one deadline for the listing and the reads that follow; the
+    /// reader it returns is bound by it, not by a fresh budget of its own.
+    #[test]
+    fn the_reader_open_returns_is_bound_by_the_budget_open_was_given() {
+        let slow = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Slow,
+            r#"{"siblings":[{"rfilename":"m-Q4_K_M.gguf","size":1048576}]}"#.to_owned(),
+        );
+        let mut opened = LiveGgufSource::with_hub(&slow.base)
+            .with_budget(Duration::from_millis(500))
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        let began = Instant::now();
+        assert!(parse_gguf_header(&mut opened.reader).is_err());
+        assert!(
+            began.elapsed() < Duration::from_millis(1400),
+            "waited for the slow reply"
+        );
+    }
+
+    #[test]
+    fn a_variant_directory_may_be_at_most_eight_segments_deep() {
+        let deep = |segments: usize| {
+            let dirs = vec!["d"; segments - 1].join("/");
+            format!("o/r:{dirs}/m-Q4_K_M.gguf")
+        };
+        assert!(matches!(
+            parse_gguf_ref(&deep(8)),
+            Some(GgufRef::Hub { .. })
+        ));
+        assert!(!matches!(
+            parse_gguf_ref(&deep(9)),
+            Some(GgufRef::Hub { .. })
+        ));
+    }
+
+    /// The hub's redirect to its CDN may be relative, absolute or
+    /// scheme-relative; none may carry the request from https to plain http.
+    #[test]
+    fn a_redirect_may_not_leave_https_for_plain_http() {
+        let from = "https://hub.example/o/r/resolve/main/m.gguf?download=1";
+        let refused = |location: &str| {
+            redirect_target(from, location, "the model file")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            refused("http://cdn.example/x").contains("from https to plain http"),
+            "an absolute downgrade"
+        );
+        assert!(
+            refused("HTTP://cdn.example/x").contains("from https to plain http"),
+            "the scheme is not case-sensitive"
+        );
+        assert!(refused("ftp://cdn.example/x").contains("not http(s)"));
+        let allowed = |current: &str, location: &str| {
+            redirect_target(current, location, "the model file").unwrap()
+        };
+        assert_eq!(
+            allowed(from, "https://cdn.example/x"),
+            "https://cdn.example/x"
+        );
+        assert_eq!(allowed(from, "//cdn.example/x"), "https://cdn.example/x");
+        assert_eq!(
+            allowed(from, "/api/x?y=http://z"),
+            "https://hub.example/api/x?y=http://z"
+        );
+        assert_eq!(
+            allowed(from, "other.gguf"),
+            "https://hub.example/o/r/resolve/main/other.gguf"
+        );
+        // A plain-http mirror may stay on http, and may move up to https.
+        assert_eq!(
+            allowed("http://127.0.0.1:9/a/b", "http://127.0.0.1:8/c"),
+            "http://127.0.0.1:8/c"
+        );
+        assert_eq!(
+            allowed("http://127.0.0.1:9/a/b", "https://cdn.example/c"),
+            "https://cdn.example/c"
+        );
+    }
+
+    /// A server that redirects to itself is followed `MAX_REDIRECTS` times and
+    /// then refused, relative `Location` and all.
+    #[test]
+    fn a_redirect_loop_is_stopped_after_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(Mutex::new(0_usize));
+        let counted = Arc::clone(&hits);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                *counted.lock().unwrap() += 1;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let error = send(
+            &LiveGgufSource::agent(),
+            "GET",
+            &format!("{base}/start"),
+            Instant::now() + Duration::from_secs(20),
+            None,
+            "the model file",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("more than 5 times"), "{error}");
+        assert_eq!(*hits.lock().unwrap(), MAX_REDIRECTS + 1);
     }
 
     #[test]

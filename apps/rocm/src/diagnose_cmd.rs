@@ -10,10 +10,10 @@
 //!
 //! Relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. Since then `--model` has gained the GGUF estimate's
-//! flags, and `--report` ignores a model question and says so on stderr. `diagnose` and `fix` are `pub(crate)`: `dispatch()`
-//! calls them through the re-import `use crate::diagnose_cmd::{diagnose,
-//! fix};`. The other three functions have no caller outside this module and
-//! stay private. `diagnose` gets its `--model` verdict from
+//! flags, and `--report` ignores a model question and says so on stderr.
+//! `diagnose` and `fix` are `pub(crate)`: `dispatch()` calls them through the
+//! re-import `use crate::diagnose_cmd::{diagnose, fix};`. The other three
+//! functions have no caller outside this module and stay private. `diagnose` gets its `--model` verdict from
 //! `model_fit.rs`'s `assess_model_on_this_host`, and `fix` reports a failing
 //! exit code to `main()` through `FixExitCode`, which stays in `main.rs` with
 //! the rest of the exit-code plumbing and is reached as `crate::FixExitCode`.
