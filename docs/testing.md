@@ -1783,7 +1783,8 @@ reported as `self` in `pid_outcomes` and never signalled, in both commands.
 On Windows the verified root is preceded by `taskkill /PID <pid> /T /F`, because
 `terminate_verified` cannot walk a process tree there; that step is tested
 through injected functions that run on every host (`the_tree_is_killed_before_the_root_is_terminated`
-and its neighbours), not by killing a real tree. The callers' own tests check
+and its neighbours) and, against a real tree, by a Windows-only scenario
+(`service-stop-07`, below). The callers' own tests check
 that each reaches the routine and reports what it returns
 (`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
 `cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
@@ -1797,11 +1798,21 @@ survive for a second stop to find.
 runs the real routine with the per-PID signal injected, and asserts the
 persisted record after the first stop and that a second stop signals nothing;
 `an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
-other direction. No scenario
-kills a real process tree on Windows: `service-stop-01` plants PID 0 and
-`service-stop-02` is Linux-only, so the Windows tree kill has no live coverage
-beyond compiling there and the injected unit tests, which the `windows-debug`
-lane runs with `cargo test --workspace --all-targets`.
+other direction. `service-stop-07`
+(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill:
+it records a PowerShell parent that has started a `ping` child, runs `rocm
+services stop --yes`, and asserts that both processes are gone together with the
+report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
+no process, no stop request, key file gone). The child is the tree kill's own
+work: with the `taskkill /T` step removed the stop ends only the recorded
+process and the scenario fails on the surviving child. `service-stop-01` plants
+PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
+injected unit tests above cover its ordering and verdicts on every host.
+`service-stop-06` (Linux) is the same stop of a real recorded process through
+`rocm services stop`, checking the persisted state: the process exited and the
+record names none. Run the Windows scenario on a Windows host with
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-07"`
+and a prebuilt `ROCM_CLI_BINARY`.
 
 No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
 `rocm serve` launch — an engine and a runtime the mock lane does not have,
@@ -1841,7 +1852,9 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop"`.
+"service-stop-0[1-6]"`. Not `-n "service-stop"`: a name filter bypasses the
+suite's own host filter, so it would also run the Windows-only
+`service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
 Manual restricted-tool smoke:
 

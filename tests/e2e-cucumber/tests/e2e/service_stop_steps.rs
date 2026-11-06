@@ -166,9 +166,113 @@ fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key:
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to start the process to record");
+    let ticks = start_ticks(process.id());
+    plant_server_record(world, host, with_key, process, Some(ticks));
+}
+
+/// Where the parent the Windows scenario records writes the PID of the process
+/// it started, for the scenario to read.
+fn descendant_pid_path(world: &E2eWorld) -> PathBuf {
+    services_dir(world).join("descendant.pid")
+}
+
+/// A ready, publicly bound server whose recorded supervisor is a parent process
+/// that has started a child of its own, recorded the way Windows records it:
+/// the PID alone, with no start-time token (there is none to read there).
+///
+/// The parent is PowerShell, the child `ping` for five minutes: both ship with
+/// Windows, need nothing installed, and are disposable. PowerShell starts the
+/// child itself, so the child's parent is the recorded PID, which is the
+/// relationship `taskkill /T` follows; it writes the child's PID where the
+/// scenario can read it and then stays alive. Both outlive the scenario only if
+/// the stop fails to take them, and the World's teardown reaps the parent.
+#[given("a managed server whose recorded process has started another process")]
+async fn managed_server_whose_process_started_another(world: &mut E2eWorld) {
+    let services = services_dir(world);
+    std::fs::create_dir_all(&services).expect("failed to create services dir");
+    let pid_file = descendant_pid_path(world);
+    let process = spawn_parent_with_descendant(&pid_file);
+    let pid = process.id();
+    plant_server_record(world, "0.0.0.0", true, process, None);
+
+    // The premise, so the Then step cannot pass for the wrong reason: the
+    // descendant exists and is running, and so is the parent.
+    let descendant = wait_for_descendant_pid(&pid_file);
+    assert_ne!(descendant, pid, "the child must be a different process");
+    assert!(
+        windows_process_is_running(descendant),
+        "premise: the process the recorded one started must be running"
+    );
+    assert!(
+        world
+            .recorded_process
+            .as_mut()
+            .expect("scenario recorded no process")
+            .try_wait()
+            .expect("failed to check the recorded process")
+            .is_none(),
+        "premise: the recorded process must be running"
+    );
+}
+
+fn spawn_parent_with_descendant(pid_file: &std::path::Path) -> std::process::Child {
+    // A single-quoted PowerShell string: an apostrophe in the path is doubled.
+    let pid_file = pid_file.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath ping.exe -ArgumentList '-n','300','127.0.0.1' \
+         -WindowStyle Hidden -PassThru; \
+         Set-Content -LiteralPath '{pid_file}' -Value $child.Id; \
+         Start-Sleep -Seconds 300"
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process to record")
+}
+
+/// The child's PID, once the parent has written it.
+fn wait_for_descendant_pid(pid_file: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorded process never wrote the PID of the process it started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Whether Windows has a process `pid`, by `tasklist`: a match prints a CSV
+/// row naming it, and no match prints an INFO line without one.
+fn windows_process_is_running(pid: u32) -> bool {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("failed to run tasklist");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Write the record for a ready server whose supervisor is `process`, with
+/// `ticks` as its start-time token when there is one, and take `process` into
+/// the World so the scenario (and its teardown) can check and reap it.
+fn plant_server_record(
+    world: &mut E2eWorld,
+    host: &str,
+    with_key: bool,
+    process: std::process::Child,
+    ticks: Option<u64>,
+) {
     let pid = process.id();
     world.recorded_process = Some(process);
-    let ticks = start_ticks(pid);
 
     let services = services_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");
@@ -313,6 +417,40 @@ async fn tool_reports_stopped(world: &mut E2eWorld) {
 
 #[then("the recorded process is no longer running")]
 async fn recorded_process_gone(world: &mut E2eWorld) {
+    assert_recorded_process_exited(world);
+}
+
+/// The Windows tree kill, observed: the recorded process AND the one it started
+/// are gone after the stop. Without the `taskkill /T` step the stop ends only
+/// the recorded process (`TerminateProcess` on the root), and the child keeps
+/// running, which is what the second check catches.
+#[then("the recorded process and the process it started are no longer running")]
+async fn recorded_process_and_its_child_gone(world: &mut E2eWorld) {
+    assert_recorded_process_exited(world);
+    let pid = wait_for_descendant_pid(&descendant_pid_path(world));
+    // `taskkill` returns once it has asked for the termination; give the exit
+    // a moment to land before calling the process a survivor.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while windows_process_is_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop took the recorded process down but left the process it \
+             started (PID {pid}) running: the tree kill did not reach it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// The report says one process was stopped (the recorded one: a tree kill that
+/// already took the root is reported as forced, so it counts), checked next to
+/// the processes themselves rather than instead of them.
+#[then("the report counts one stopped process")]
+async fn report_counts_one_stopped_process(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(combined.contains("stopped processes: 1"), "{combined}");
+}
+
+fn assert_recorded_process_exited(world: &mut E2eWorld) {
     let process = world
         .recorded_process
         .as_mut()
