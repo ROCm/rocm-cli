@@ -696,4 +696,56 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    /// The `beside` loop of [`WSL_REMOTE_PROBE`], with its two root globs pointed
+    /// at `roots`, run under `/bin/sh`: a typo in the loop or in the key the
+    /// parser reads would otherwise make `--distro` quietly report `false`.
+    #[cfg(target_os = "linux")]
+    fn run_beside_probe(roots: &str) -> String {
+        let start = WSL_REMOTE_PROBE
+            .find("beside=0")
+            .expect("probe has the beside loop");
+        let end_marker = "echo librocdxg_beside_runtime=$beside";
+        let end = WSL_REMOTE_PROBE
+            .find(end_marker)
+            .expect("probe emits the beside key")
+            + end_marker.len();
+        let script =
+            WSL_REMOTE_PROBE[start..end].replace("/opt/rocm*/lib /usr/local/rocm*/lib", roots);
+        assert!(script.contains(roots), "the root globs moved: {script}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run sh");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_remote_probe_reports_a_library_beside_the_runtime_under_the_key_the_parser_reads() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let lib = dir.path().join("rocm-7/lib");
+        std::fs::create_dir_all(&lib).expect("create lib dir");
+        let roots = lib.to_str().expect("utf-8 temp path");
+        std::fs::write(lib.join("librocdxg.so"), "").expect("plant librocdxg.so");
+
+        // The library alone, with no runtime beside it, does not count.
+        let alone = run_beside_probe(roots);
+        assert_eq!(alone, "librocdxg_beside_runtime=0");
+
+        for runtime in ["libhsa-runtime64.so.1", "libhsa-runtime64.so"] {
+            std::fs::write(lib.join(runtime), "").expect("plant runtime");
+            let out = run_beside_probe(roots);
+            assert_eq!(out, "librocdxg_beside_runtime=1", "with {runtime}");
+            // The parser reads exactly the key the probe printed.
+            let fields: BTreeMap<String, String> = out
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            assert!(parse_remote_flag(&fields, "librocdxg_beside_runtime"));
+            std::fs::remove_file(lib.join(runtime)).expect("remove runtime");
+        }
+    }
 }

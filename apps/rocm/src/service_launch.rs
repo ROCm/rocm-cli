@@ -393,7 +393,8 @@ fn no_usable_gpu_refusal_text(policy: &str, on_wsl: bool) -> String {
         format!(
             "WSL reaches the GPU through /dev/dxg and ROCDXG rather than /dev/kfd: run \
              `rocm examine` and check that `driver_status` is `{ready}` (`rocm diagnose` \
-             names what is missing), and ensure HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES \
+             names what is missing; a ROCDXG library the loader reaches only through \
+             LD_LIBRARY_PATH needs that variable exported in this shell, see docs/wsl.md), and ensure HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES \
              are not masking every device.",
             ready = rocm_core::WSL_ROCDXG_READY
         )
@@ -1655,6 +1656,10 @@ mod tests {
         assert!(!text.contains("/dev/kfd is present"), "{text}");
         assert!(text.contains("rocm examine"), "{text}");
         assert!(text.contains("rocm diagnose"), "{text}");
+        // The advice is true only because `rocdxg_ready` counts a library on
+        // LD_LIBRARY_PATH; `a_rocdxg_only_on_the_loader_path_is_ready` in
+        // `rocm-core`'s host_gpu/wsl.rs proves that behavior.
+        assert!(text.contains("LD_LIBRARY_PATH"), "{text}");
         assert!(
             text.contains(&format!("`{}`", rocm_core::WSL_ROCDXG_READY)),
             "{text}"

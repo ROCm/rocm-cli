@@ -159,6 +159,15 @@ pub struct WslFacts {
 }
 
 impl WslFacts {
+    /// `librocdxg.so` exists somewhere the probe looked: under a ROCm install, or
+    /// in a directory on `LD_LIBRARY_PATH`. A library reached only through the
+    /// variable (a source build in a home directory) is on disk even though no
+    /// ROCm root holds it.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
+
     /// The linker cache positively lacks ROCDXG and neither `LD_LIBRARY_PATH` nor
     /// the runtime's own directory supplies it. `None` from the cache (ldconfig
     /// could not run) is not evidence, so it is not "unloadable".

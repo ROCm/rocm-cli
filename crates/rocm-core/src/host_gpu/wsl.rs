@@ -313,6 +313,40 @@ fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
     proc_version.contains("microsoft") || proc_version.contains("wsl")
 }
 
+/// The entries of the `missing ...` detail, separated from reading the machine so
+/// the list can be tested against each combination of sources.
+///
+/// `librocdxg_found` is the file existing under a ROCm install or in a directory
+/// on `LD_LIBRARY_PATH`; `loadable` is [`librocdxg_loadable`]. The cache entry is
+/// named only when no source resolves the library: one on `LD_LIBRARY_PATH` or
+/// beside the runtime that opens it loads without a cache entry, so naming the
+/// cache would send the user after a registration the workload does not need.
+#[allow(clippy::fn_params_excessive_bools)] // four independent probe answers, named at the one call site
+fn missing_plumbing(
+    dxg_device: bool,
+    dxcore: bool,
+    librocdxg_found: bool,
+    loadable: bool,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !dxg_device {
+        missing.push("/dev/dxg");
+    }
+    if !dxcore {
+        missing.push("/usr/lib/wsl/lib/libdxcore.so");
+    }
+    if !librocdxg_found {
+        // Named without a directory: the file is looked up across every ROCm
+        // install and `LD_LIBRARY_PATH`, so quoting one root would misreport where
+        // it was not found.
+        missing.push("librocdxg.so");
+    }
+    if !loadable {
+        missing.push("ldconfig:librocdxg.so");
+    }
+    missing
+}
+
 pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     if !runtime_is_linux() || !is_wsl_host() {
         return None;
@@ -340,28 +374,16 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     let librocdxg_beside_runtime = librocdxg_beside_runtime(&roots, Path::exists);
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
-    let mut missing = Vec::new();
-    if !dxg_device {
-        missing.push("/dev/dxg");
-    }
-    if !dxcore {
-        missing.push("/usr/lib/wsl/lib/libdxcore.so");
-    }
-    if !librocdxg {
-        // Named without a directory: the file is looked up across every ROCm
-        // install, so quoting one root would misreport where it was not found.
-        missing.push("librocdxg.so");
-    }
-    // Only when no source resolves it: a library on `LD_LIBRARY_PATH`, or beside
-    // the runtime that opens it, loads without a cache entry, so naming the cache
-    // would send the user after a registration the workload does not need.
-    if !librocdxg_loadable(
-        ldconfig_librocdxg,
-        librocdxg_on_ld_library_path,
-        librocdxg_beside_runtime,
-    ) {
-        missing.push("ldconfig:librocdxg.so");
-    }
+    let missing = missing_plumbing(
+        dxg_device,
+        dxcore,
+        librocdxg || librocdxg_on_ld_library_path,
+        librocdxg_loadable(
+            ldconfig_librocdxg,
+            librocdxg_on_ld_library_path,
+            librocdxg_beside_runtime,
+        ),
+    );
     let detail = if missing.is_empty() {
         Some("WSL DXCore and ROCDXG plumbing detected".to_owned())
     } else {
@@ -394,7 +416,7 @@ impl WslSummary {
     pub const fn rocdxg_ready(&self) -> bool {
         self.dxg_device
             && self.dxcore
-            && self.librocdxg
+            && self.librocdxg_present()
             && librocdxg_loadable(
                 self.ldconfig_librocdxg,
                 self.librocdxg_on_ld_library_path,
@@ -719,6 +741,54 @@ mod tests {
         summary.librocdxg_beside_runtime = false;
         assert!(!summary.rocdxg_ready());
         assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_missing");
+    }
+
+    #[test]
+    fn a_rocdxg_only_on_the_loader_path_is_ready() {
+        // A source build in a non-ROCm directory: no ROCm root holds it, so
+        // `librocdxg` is false, and the cache does not list it. The variable alone
+        // reaches it, which is what docs/wsl.md tells the user to arrange.
+        let mut summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: false,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: true,
+            librocdxg_beside_runtime: false,
+            rocminfo: true,
+            cargo: false,
+            detail: None,
+        };
+        assert!(summary.librocdxg_present());
+        assert!(summary.rocdxg_ready());
+        let driver = wsl_driver_summary(&summary);
+        assert_eq!(driver.status, "wsl_rocdxg_ready");
+        // Not ready without the variable: the library is then nowhere.
+        summary.librocdxg_on_ld_library_path = false;
+        assert!(!summary.librocdxg_present());
+        assert!(!summary.rocdxg_ready());
+    }
+
+    #[test]
+    fn a_rocdxg_on_the_loader_path_is_not_listed_as_missing() {
+        // found via LD_LIBRARY_PATH only: loadable, so neither entry appears.
+        assert!(missing_plumbing(true, true, true, true).is_empty());
+        // Nowhere: both the file and the way to load it are named.
+        assert_eq!(
+            missing_plumbing(true, true, false, false),
+            ["librocdxg.so", "ldconfig:librocdxg.so"]
+        );
+        // On disk under a root but reached by nothing: only the loader entry.
+        assert_eq!(
+            missing_plumbing(true, true, true, false),
+            ["ldconfig:librocdxg.so"]
+        );
+        assert_eq!(
+            missing_plumbing(false, false, true, true),
+            ["/dev/dxg", "/usr/lib/wsl/lib/libdxcore.so"]
+        );
     }
 
     #[test]

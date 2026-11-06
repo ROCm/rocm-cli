@@ -697,7 +697,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-wsl-4-rocdxg-not-linked",
         title: "Refresh the linker cache so ROCDXG is loadable",
-        rationale: "librocdxg is installed but absent from the linker cache and from the LD_LIBRARY_PATH of the shell running the check, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
+        rationale: "librocdxg is installed but absent from the linker cache, not beside a libhsa-runtime64, and (when the check runs inside the distro) not in a directory on LD_LIBRARY_PATH, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
         commands: &["sudo ldconfig"],
         needs_sudo: true,
         needs_reboot: false,
@@ -706,6 +706,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         verify_linux: None,
         notes: &[
             "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
+            "Without root, export the library's `lib` directory in the shell that runs `rocm`, for example `export LD_LIBRARY_PATH=<dir>:$LD_LIBRARY_PATH`; the loader then finds it with no cache entry. `rocm diagnose --distro` cannot see that variable, so run `rocm diagnose` inside the distro to confirm.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_WSL,

@@ -177,6 +177,16 @@ pub struct WslSummary {
     pub detail: Option<String>,
 }
 
+impl WslSummary {
+    /// `librocdxg.so` exists under a ROCm install or in a directory on
+    /// `LD_LIBRARY_PATH`. The variable is the only source for a library that sits
+    /// outside every ROCm root, such as a source build in a home directory.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostGpuSummary {
     pub name: Option<String>,
