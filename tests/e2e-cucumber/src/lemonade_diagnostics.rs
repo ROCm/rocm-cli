@@ -236,9 +236,11 @@ fn scan_runtime(manifest_path: &Path, limits: SearchLimits, expired: &dyn Fn() -
         }
     }
     let discovery = discover_candidates(runtime, limits, expired);
-    let empty_note = (discovery.candidates.is_empty()
-        && !matches!(discovery.stop, Some(Stop::Deadline)))
-    .then(|| empty_search_note(runtime));
+    // "Nothing found" is only a finding when the search looked everywhere; one cut
+    // short by the clock or a limit reports that instead (see `take_inventory_with`).
+    // A candidate-cap stop has candidates by definition, so it never gets here.
+    let empty_note = (discovery.candidates.is_empty() && discovery.stop.is_none())
+        .then(|| empty_search_note(runtime));
     Scan::Found {
         report,
         discovery,
@@ -1028,39 +1030,61 @@ mod tests {
         );
     }
 
+    /// A search that did not finish must not say it found nothing. The tree is the
+    /// one a reviewer described: an empty `a`, and a real build under `b`, with the
+    /// cap reached before `b` is entered. Each way a search can stop early reports
+    /// its own reason and never the completed-empty-search text, which is asserted
+    /// absent; a search that did finish and found nothing still gets it. (The
+    /// candidate cap has no row: it stops a search that already has candidates.)
     #[tokio::test]
-    async fn a_search_cut_short_by_a_limit_says_so_and_does_not_claim_an_empty_result() {
+    async fn a_search_cut_short_says_why_and_never_claims_an_empty_result() {
+        const EMPTY_CLAIM: &str = "no llama-server candidates found";
         let root = tempfile::tempdir().unwrap();
-        for build in ["a", "b", "c"] {
-            std::fs::create_dir_all(root.path().join("bin/llamacpp/rocm-stable").join(build))
-                .unwrap();
+        let backend = root.path().join("bin/llamacpp/rocm-stable");
+        std::fs::create_dir_all(backend.join("a")).unwrap();
+        touch_server(&backend.join("b"));
+        let manifest = write_manifest(root.path());
+        let far = Instant::now() + INVENTORY_BUDGET;
+        let never: Expired = std::sync::Arc::new(|| false);
+        let always: Expired = std::sync::Arc::new(|| true);
+
+        for (stop, search_limits, clock, stop_line) in [
+            (
+                Stop::Directories,
+                limits(2, 100),
+                never.clone(),
+                "candidate search stopped: 2 directories visited (limit)",
+            ),
+            (
+                Stop::Entries,
+                limits(100, 1),
+                never.clone(),
+                "candidate search stopped: 1 directory entries read (limit)",
+            ),
+            (
+                Stop::Deadline,
+                SEARCH_LIMITS,
+                always,
+                "remaining evidence skipped: evidence budget exhausted",
+            ),
+        ] {
+            let inventory = take_inventory_with(&manifest, far, search_limits, clock).await;
+            let report = &inventory.report;
+            assert!(report.contains(stop_line), "{stop:?}: {report}");
+            assert!(!report.contains(EMPTY_CLAIM), "{stop:?}: {report}");
+            assert!(
+                !report.contains("candidate (not proof"),
+                "{stop:?}: {report}"
+            );
         }
-        let inventory = take_inventory_with(
-            &write_manifest(root.path()),
-            Instant::now() + INVENTORY_BUDGET,
-            limits(2, 100),
-            std::sync::Arc::new(|| false),
-        )
-        .await;
+
+        let finished = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(finished.path().join("bin/llamacpp/rocm-stable/a")).unwrap();
+        let inventory =
+            take_inventory_with(&write_manifest(finished.path()), far, SEARCH_LIMITS, never).await;
         assert!(
-            inventory
-                .report
-                .contains("candidate search stopped: 2 directories visited (limit)"),
-            "{}",
-            inventory.report
-        );
-        let inventory = take_inventory_with(
-            &write_manifest(root.path()),
-            Instant::now() + INVENTORY_BUDGET,
-            limits(100, 2),
-            std::sync::Arc::new(|| false),
-        )
-        .await;
-        assert!(
-            inventory
-                .report
-                .contains("candidate search stopped: 2 directory entries read (limit)"),
-            "{}",
+            inventory.report.contains(EMPTY_CLAIM),
+            "a search that finished and found nothing says so: {}",
             inventory.report
         );
     }
