@@ -174,6 +174,13 @@ Expected result:
   `uv` to resolve the package versions, so on a clean host it can download the
   managed `uv` and create the `tools` folder, although it prepares no Python and
   saves no Python path.
+- On the same host, with a wheel runtime registered whose manifest records no
+  usable Python, `rocm update` (also `--json`, `--dry-run`, and the check the
+  CLI runs at startup) still reports. The text report gives the runtime's
+  verdict and a `python_note:` line saying an update would use `uv` to install
+  the managed Python, which the check did not do. Afterwards the data folder has
+  no `tools` folder and the config folder has no `config.json`. `rocm update
+  --apply` on the same host does prepare the Python, since the install needs it.
 - With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
   `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
   (such as `3.13` for the canonical layout), on the same host the preview fails

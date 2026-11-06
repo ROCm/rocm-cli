@@ -254,6 +254,18 @@ pub(crate) const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -
     apply || dry_run
 }
 
+/// The plan an update works from. A `--dry-run` only previews, so it takes the
+/// check, which prepares nothing; a real apply takes the plan, which prepares the
+/// Python the install that follows needs. A function of the two so a test runs it
+/// on every platform without a host that has no Python.
+fn plan_for_update<T>(
+    dry_run: bool,
+    check: impl FnOnce() -> T,
+    apply_plan: impl FnOnce() -> T,
+) -> T {
+    if dry_run { check() } else { apply_plan() }
+}
+
 pub(crate) fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -263,7 +275,11 @@ pub(crate) fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
+    let plan = plan_for_update(
+        dry_run,
+        || therock::runtime_update_check(paths, source, &manifests, None),
+        || therock::runtime_update_plan(paths, source, &manifests, None),
+    )?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -439,6 +455,34 @@ mod tests {
     use super::*;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{test_paths, test_runtime_manifest_for_update};
+
+    /// A `--dry-run` takes its plan from the check and an apply from the plan,
+    /// and calls only that one: the check must never be the one that prepares a
+    /// Python, and an apply must still get the plan that does. This pins the
+    /// choice on every platform; `the_update_checks_prepare_no_python_and_the_apply_plan_does`
+    /// in `therock/update.rs` drives the real `apply_runtime_update` on a host
+    /// with no Python, and scenario `update-10` drives the built binary.
+    #[test]
+    fn a_dry_run_takes_the_check_and_an_apply_takes_the_plan() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let take = |dry_run: bool| {
+            calls.borrow_mut().clear();
+            let taken = plan_for_update(
+                dry_run,
+                || {
+                    calls.borrow_mut().push("check");
+                    "check"
+                },
+                || {
+                    calls.borrow_mut().push("plan");
+                    "plan"
+                },
+            );
+            (taken, calls.borrow().clone())
+        };
+        assert_eq!(take(true), ("check", vec!["check"]));
+        assert_eq!(take(false), ("plan", vec!["plan"]));
+    }
 
     #[test]
     fn render_update_text_reports_all_update_surfaces() -> Result<()> {

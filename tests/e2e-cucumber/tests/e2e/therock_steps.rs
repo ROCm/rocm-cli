@@ -478,6 +478,100 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
     .expect("failed to write runtime manifest");
 }
 
+/// Registry key for the planted canonical wheel runtime below.
+const OLDER_WHEEL_RUNTIME_KEY: &str = "release-wheel-gfx1200-7-9-0";
+
+/// Plants a canonical-layout wheel runtime older than the release index the
+/// fixture serves, whose manifest records no Python (a runtime registered before
+/// the field was written, or whose recorded interpreter is gone). The update
+/// check then has to find an interpreter for itself, which on the host the
+/// recording-uv Given builds means preparing one. No `source_layout_generation`
+/// is recorded, so the manifest reads as the canonical stream, as an old one does.
+#[given("a registered wheel runtime older than the index with no recorded Python")]
+async fn registered_older_wheel_runtime_without_python(world: &mut E2eWorld) {
+    let install_root = root(world).join("runtime-older-wheel");
+    std::fs::create_dir_all(&install_root).expect("failed to create install root");
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    std::fs::create_dir_all(&registry).expect("failed to create registry dir");
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "runtime_key": OLDER_WHEEL_RUNTIME_KEY,
+        "runtime_id": format!("therock-release:{RAW_ARCH}"),
+        "channel": "release",
+        "format": "wheel",
+        "family": RAW_ARCH,
+        "family_source": "manual",
+        "version": "7.9.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/rocm",
+        "read_only": false,
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    }))
+    .expect("failed to serialize runtime manifest");
+    std::fs::write(
+        registry.join(format!("{OLDER_WHEEL_RUNTIME_KEY}.json")),
+        manifest,
+    )
+    .expect("failed to write runtime manifest");
+}
+
+#[when("the user checks for updates against the pip index")]
+async fn check_updates_against_pip_index(world: &mut E2eWorld) {
+    preview_ok(world, &["update"]);
+}
+
+#[when("the user previews applying the update to that wheel runtime")]
+async fn preview_apply_update_to_older_wheel_runtime(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "update",
+            "--apply",
+            "--dry-run",
+            "--runtime",
+            OLDER_WHEEL_RUNTIME_KEY,
+        ],
+    );
+}
+
+/// The report reached a verdict (the runtime is behind the index) and says what
+/// the update would do about Python, without a path that would be a guess.
+#[then("the report offers the newer runtime and says it would prepare a managed Python")]
+async fn report_offers_update_and_names_the_python_it_would_prepare(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("runtime {OLDER_WHEEL_RUNTIME_KEY} format=wheel"),
+        "the runtime line",
+    );
+    assert_contains(world, "status=update_available", "the runtime's verdict");
+    assert_contains(
+        world,
+        &format!("latest={CURRENT_ROCM_VERSION}"),
+        "the version the index publishes",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "python_note: no usable Python was found; updating would use uv to install managed \
+             Python {CANONICAL_MANAGED_PYTHON}"
+        ),
+        "the note about the Python an update would prepare",
+    );
+}
+
+/// The check says it prepared no Python, and the state it left agrees. Claim and
+/// filesystem are checked together: the note alone would pass with the bug
+/// present, and so would empty folders alone if the check had stopped before it
+/// got to Python.
+#[then("the update check prepared no Python, as it says")]
+async fn update_check_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this check did not do",
+        "the note about what the check skipped",
+    );
+    assert_no_python_prepared(world);
+}
+
 /// Makes the planted ROCm 10 runtime the active default, so a real install
 /// without consent reaches the non-interactive refusal: past every point where
 /// the plan is chosen and announced, but before `uv`, any download or any

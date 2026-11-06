@@ -525,8 +525,8 @@ pub(super) fn python_for_install(
     Ok(python)
 }
 
-/// The interpreter a *preview* of the install reports, found without preparing
-/// one.
+/// The interpreter a *preview* of the install, or an update check, reports,
+/// found without preparing one.
 ///
 /// [`resolve_python_launcher`] ends by downloading a managed `uv`, having it
 /// install Python, and saving that Python's path in the configuration when no
@@ -538,7 +538,10 @@ pub(super) fn python_for_install(
 /// resolution raises before that step (an unusable `ROCM_CLI_PYTHON`, a
 /// disabled managed bootstrap) is raised here too, so a preview never succeeds
 /// on a host where the install would refuse.
-fn plan_python_launcher(paths: &AppPaths, requirement: PythonRequirement) -> Result<PlannedPython> {
+pub(super) fn plan_python_launcher(
+    paths: &AppPaths,
+    requirement: PythonRequirement,
+) -> Result<PlannedPython> {
     let env = python_resolver_env_override().unwrap_or_else(PythonResolverEnv::from_process_env);
     plan_python_launcher_in(paths, &env, requirement)
 }
@@ -652,6 +655,28 @@ impl PlannedPython {
                 "no usable Python was found; a real install would use uv to install managed Python {version}{} and save its path in the configuration, which this preview did not do",
                 unchecked_tag_caveat(*tag_check, *requirement)
             )),
+        }
+    }
+
+    /// The `python_note:` line of an update check, in the same terms as
+    /// [`Self::note`] but for the step an update would take. An update check
+    /// needs the interpreter's wheel tag to read the index, and a host with no
+    /// interpreter gets it from the one the layout requires, so this line is how
+    /// the check says it did not go and prepare one. Built from the decision, as
+    /// the preview's is.
+    pub(super) fn update_note(&self) -> Option<String> {
+        match self {
+            Self::Ready(_) => None,
+            Self::WouldPrepareManaged {
+                version,
+                requirement,
+                tag_check,
+            } => {
+                let unchecked = unchecked_tag_caveat(*tag_check, *requirement);
+                Some(format!(
+                    "no usable Python was found; updating would use uv to install managed Python {version}{unchecked} and save its path in the configuration, which this check did not do"
+                ))
+            }
         }
     }
 
@@ -988,7 +1013,7 @@ fn python_venv_probe_temp_root() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
-    use crate::therock::test_support::test_paths;
+    use crate::therock::test_support::{RestoredEnv, test_paths};
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
@@ -1410,43 +1435,6 @@ exit 1
 
     // ---- a dry run prepares no Python ----------------------------------------
 
-    /// Process environment variables set for one test and restored on drop.
-    /// Every caller holds `PROCESS_ENV_TEST_LOCK` for as long as it holds this.
-    struct RestoredEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl RestoredEnv {
-        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-        fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(key, _)| (*key, std::env::var_os(key)))
-                .collect();
-            for (key, value) in vars {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for RestoredEnv {
-        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-        fn drop(&mut self) {
-            for (key, value) in self.0.drain(..) {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
-
     /// A `uv` that records its arguments in `marker` and then fails. A host that
     /// reaches it has gone on to prepare a managed Python; failing keeps a test
     /// that does reach it from going on to the network.
@@ -1539,6 +1527,16 @@ exit 1
                 python_requirement(SourceLayout::Canonical),
                 dry_run,
             )
+        }
+
+        /// What an update check goes on with, searching only this host's folder.
+        fn plan_for_update_check(&self) -> Result<PlannedPython> {
+            let _resolver = OverridePythonResolverEnv::new(PythonResolverEnv {
+                python_override: None,
+                search_dirs: vec![self.search_dir.clone()],
+                ..PythonResolverEnv::from_process_env()
+            });
+            plan_python_launcher(&self.paths, python_requirement(SourceLayout::Canonical))
         }
 
         fn uv_was_run(&self) -> bool {
@@ -2297,6 +2295,81 @@ exit 1
         );
         assert!(!host.uv_was_run());
         assert_eq!(snapshot(&host.paths), Vec::<PathBuf>::new());
+        Ok(())
+    }
+
+    /// An update check reads the index by the interpreter's wheel tag. On a host
+    /// with no interpreter that tag is the one the layout requires, which a real
+    /// update would prepare an interpreter to match, so the check needs nothing
+    /// prepared. The note it prints says so, and the folders agree; the same host
+    /// DOES reach `uv` for the install, so an unrun stand-in means the check
+    /// stayed out of it. The Gherkin scenario `update-09` drives the same case
+    /// through the built binary.
+    #[cfg(unix)]
+    #[test]
+    fn an_update_check_with_no_usable_python_reads_the_required_tag_and_prepares_nothing()
+    -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let host = PythonHost::new("python-update-check-none")?;
+        let requirement = python_requirement(SourceLayout::Canonical);
+
+        let planned = host.plan_for_update_check()?;
+
+        let compatibility = planned.wheel_compatibility()?;
+        assert_eq!(compatibility.python_tag, requirement.tag);
+        assert!(!compatibility.platform_tags.is_empty());
+        assert_eq!(
+            planned.update_note().as_deref(),
+            Some(
+                "no usable Python was found; updating would use uv to install managed Python 3.12 and save its path in the configuration, which this check did not do"
+            )
+        );
+        assert!(!host.uv_was_run(), "the update check ran uv");
+        assert_eq!(
+            snapshot(&host.paths),
+            Vec::<PathBuf>::new(),
+            "the update check created files or folders under the config, data or cache folder"
+        );
+
+        // Control: the install on the same host does reach `uv`.
+        assert!(host.python_for_install(false).is_err());
+        assert!(
+            host.uv_was_run(),
+            "the stand-in uv is not reachable, so the checks above prove nothing"
+        );
+        Ok(())
+    }
+
+    /// A usable interpreter needs no note, and a managed Python whose tag cannot
+    /// be read off its version says so in the update note as in the preview's.
+    #[cfg(unix)]
+    #[test]
+    fn an_update_note_is_absent_for_a_usable_python_and_flags_an_unreadable_tag() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let host = PythonHost::new("python-update-note")?;
+        {
+            let _unreadable = RestoredEnv::set(&[(
+                "ROCM_CLI_MANAGED_PYTHON_VERSION",
+                Some(Path::new("pypy@3.10")),
+            )]);
+            let planned = host.plan_for_update_check()?;
+            let note = planned.update_note().expect("nothing was prepared");
+            assert!(
+                note.contains("managed Python pypy@3.10 (its wheel tag cannot be checked until it is installed; cp312 is required)")
+                    && note.ends_with("which this check did not do"),
+                "{note}"
+            );
+        }
+
+        write_fake_python_with_venv(&host.search_dir, "python3")?;
+        let planned = host.plan_for_update_check()?;
+        assert!(matches!(planned, PlannedPython::Ready(_)), "{planned:?}");
+        assert_eq!(planned.update_note(), None);
+        assert!(!host.uv_was_run());
         Ok(())
     }
 
