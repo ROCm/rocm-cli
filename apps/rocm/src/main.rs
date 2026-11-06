@@ -109,10 +109,11 @@ mod update_cmd;
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`.
 // `therock_install_version_selector` (from `install_cmd.rs`) is re-imported for
-// the same reason: `chat.rs` reaches it as `crate::therock_install_version_selector`.
+// the same reason: `chat/mcp_bridge.rs` reaches it as
+// `crate::therock_install_version_selector`.
 // `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
-// (from `bridge_snapshot.rs`) are re-imported only so `chat.rs` keeps reaching
-// them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
+// (from `bridge_snapshot.rs`) are re-imported only so `chat/mcp_bridge.rs` keeps
+// reaching them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
 // `dispatch()` as well.
 // The clap command tree and its value enums (from `cli.rs`) are re-imported so
 // every module keeps reaching them as `crate::Command`, `crate::Provider` and so

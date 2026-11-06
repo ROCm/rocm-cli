@@ -28,7 +28,8 @@
 //! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
 //! `load_managed_services` for the codex-bridge snapshot;
 //! `services_text.rs` reads the sidebar helpers for the local-servers view;
-//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `chat.rs` and `chat/mcp_bridge.rs` call into it for the services tool and
+//! its summary;
 //! `runtime_services.rs` calls into it when reconciling live servers against a
 //! runtime activation; `service_launch.rs` is the only caller of the
 //! `existing_live_managed_service` duplicate-launch guard it runs before

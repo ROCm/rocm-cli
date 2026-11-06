@@ -15,7 +15,7 @@
 //! `DeterministicServiceRow`, `DeterministicEngineRow`) and
 //! `managed_service_running_state`, the mapping from a managed service's status
 //! to `running`, `starting`, `not_running` or `unknown`, live here too. The
-//! services tool text itself is rendered by `chat.rs`
+//! services tool text itself is rendered by `chat/mcp_bridge.rs`
 //! (`render_services_tool_result_text`), which reads
 //! `managed_service_running_state` from this module.
 //!

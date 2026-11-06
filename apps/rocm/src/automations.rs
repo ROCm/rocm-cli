@@ -28,8 +28,8 @@
 //! `watcher_plain_trigger`, `watcher_plain_action`, `watcher_policy_note`),
 //! and `render_daemon_text`. `render_automations_text` and
 //! `render_daemon_text` are `pub(crate)`: `main.rs`'s `dispatch()` calls
-//! `render_daemon_text` directly (via the re-import above), and `chat.rs`'s
-//! deterministic tool summaries call both. Everything else here has no
+//! `render_daemon_text` directly (via the re-import above), and `chat/mcp_bridge.rs`'s
+//! read-only command runner calls both. Everything else here has no
 //! caller outside this module (including `watcher_policy_note`, which the
 //! `automations()` handler and `render_automations_text` both reach locally
 //! rather than through a crate-root re-import) and stays private.

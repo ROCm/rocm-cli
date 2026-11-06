@@ -86,7 +86,7 @@ pub(crate) fn freeform_plan_next_action(
 /// Builds the freeform plan exactly once, returning both the rendered plan
 /// text and the next action derived from that same plan.
 ///
-/// Used by `chat.rs`'s `natural_language_plan` MCP tool, which used to call
+/// Used by `chat/mcp_bridge.rs`'s `natural_language_plan` MCP tool, which used to call
 /// `render_freeform_plan` and (the now-removed)
 /// `freeform_plan_next_action_with_context` independently — each building its
 /// own `StructuredRequestPlan`. When the request is ambiguous and a cloud

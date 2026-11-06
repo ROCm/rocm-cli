@@ -14,7 +14,7 @@
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. `dispatch()`'s `InternalBridgeSnapshot` arm calls
 //! `build_codex_bridge_snapshot` through a re-import in `main.rs`, and
-//! `chat.rs`'s internal MCP tools (`bridge_snapshot`, `gpu_snapshot` and
+//! `chat/mcp_bridge.rs`'s internal MCP tools (`bridge_snapshot`, `gpu_snapshot` and
 //! `engines`) reach `build_codex_bridge_snapshot`,
 //! `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
 //! as `crate::<name>` through the same re-import, so those three are

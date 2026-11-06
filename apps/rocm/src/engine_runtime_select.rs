@@ -63,7 +63,7 @@
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
 //! `app_path_env_vars`/`apply_app_path_env` are `pub(crate)`, read from
-//! `engine_ipc.rs`, `app_path_env_vars` is also read from `chat.rs`, and
+//! `engine_ipc.rs`, `app_path_env_vars` is also read from `chat/mcp_bridge.rs`, and
 //! `apply_app_path_env` is also read from `engines_cmd.rs`,
 //! `service_launch.rs`, and `service_control.rs`'s
 //! `restart_internal_managed_service_with`; `app_path_env_var_values`/

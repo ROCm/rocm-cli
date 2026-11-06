@@ -1189,7 +1189,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/mcp_bridge.rs",
         "rocm command requires at least one argument",
         "validation error naming the chat `rocm` tool",
     ),

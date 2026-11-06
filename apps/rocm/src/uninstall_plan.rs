@@ -33,7 +33,7 @@
 //! `render_uninstall_plan`; `storage.rs` calls into it for
 //! `UninstallPlan`/`UninstallPlanEntry`/`confirm_uninstall`; `runtimes_cmd.rs`
 //! calls into it for `confirm_uninstall` (the same `[y/N]` prompt, reused for
-//! `rocm runtimes uninstall`); `chat.rs` calls into it for
+//! `rocm runtimes uninstall`); `chat/mcp_bridge.rs` calls into it for
 //! `render_uninstall_dry_run` (the deterministic uninstall-preview tool
 //! result); `deletion_properties.rs`'s recursive-deletion property tests call
 //! into it for `UninstallOptions`/`build_uninstall_plan`/`remove_path`/
