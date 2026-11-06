@@ -165,8 +165,11 @@ Expected result:
   and a `python_note:` line says a real install would use `uv` to install the
   managed Python. Afterwards the data folder has no `tools` folder and the
   config folder has no `config.json`: the preview downloaded no `uv` or Python
-  and saved no Python path. A real install on the same host does both. This
-  holds for the canonical layout. A preview pinned to ROCm 10 or newer
+  and saved no Python path. A real install on the same host does both. The
+  plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
+  interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
+  resolves `3.12` itself and may pick a different Python 3.12 than the managed
+  one a real install prepares. This holds for the canonical layout. A preview pinned to ROCm 10 or newer
   (`--version 10.0.0 --family gfx1200`) still needs `uv` to resolve the package
   versions, so on a clean host it can download the managed `uv` and create the
   `tools` folder, although it prepares no Python and saves no Python path.

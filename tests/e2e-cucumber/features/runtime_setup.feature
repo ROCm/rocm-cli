@@ -497,10 +497,11 @@ Feature: Runtime configuration
   # prepares no Python; this scenario is not that case and does not claim it.
   #
   # Linux only: the empty-`PATH` host is built for the Linux search order. The
-  # decision itself is unit-tested on Unix hosts against an injected search path
-  # (`a_dry_run_with_no_usable_python_prepares_nothing` in
-  # `apps/rocm/src/therock/python.rs`); the Windows search order and a Windows
-  # run of this preview are not covered by a test.
+  # decision itself is unit-tested against an injected resolver environment on
+  # every platform, the Windows CI job included
+  # (`a_dry_run_decides_from_an_injected_environment_on_every_platform` in
+  # `apps/rocm/src/therock/python.rs`, which needs no interpreter); the Windows
+  # search order and a Windows run of this preview are not covered by a test.
   #
   # Technical details: the fixture serves one canonical release index, `PATH` is a
   # single empty folder, `ROCM_CLI_UV_BINARY` names a stand-in that appends its
