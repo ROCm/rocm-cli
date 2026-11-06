@@ -838,8 +838,9 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
-`update_check` and `rocm update --check` are not previews in this sense: they
-resolve with `uv` and can fetch it, and prepare a managed Python too.
+The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
+previews in this sense: they resolve with `uv` and can fetch it, and prepare a
+managed Python too.
 
 Then it verifies:
 
