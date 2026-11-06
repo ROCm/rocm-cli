@@ -144,6 +144,11 @@ jobs:
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
+              # A proptest saved-failure file is read by the seed guard in xtask
+              # (`cargo xtask affected` adds xtask when one changes). Renaming or
+              # deleting one moves no *.rs file, so without this entry a seed-only
+              # change would skip every rust-gated job.
+              - '**/proptest-regressions/**'
               # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
               # this file's hawkeye/cargo-about pins. This entry only gates
               # whether the rust-flagged jobs run at all; `cargo xtask affected`
@@ -165,6 +170,10 @@ jobs:
               # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
               - 'tests/e2e-cucumber/README.md'
+              # `cargo xtask check-architecture-doc` (clippy job) compares this
+              # module map with the source tree; deleting or rewording an entry
+              # can break it though no *.rs file moved.
+              - 'docs/architecture.md'
               # license_headers_hook_has_no_file_type_filter (xtask) reads this
               # file's license-headers hook config; an edit here that reopens the
               # file-type-filter gap must still run that test on the PR.
@@ -1420,6 +1429,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask check-crate-edges
 
+      - name: Every production source file has an entry in docs/architecture.md
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask check-architecture-doc
+
       - name: Published Doctor catalog is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask catalog --check
@@ -1624,7 +1637,7 @@ jobs:
   # fires, so this job is not a substitute for them.
   #
   # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
-  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # is not a published skill: apps/rocm/src/chat/turn.rs embeds it verbatim into the
   # chat assistant's system prompt with include_str!, so giving it the YAML
   # frontmatter this check requires would inject that frontmatter into a live
   # prompt.

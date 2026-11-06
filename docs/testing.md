@@ -51,6 +51,22 @@ The counting rules are unit-tested in `xtask/src/module_size.rs`:
 cargo test -p xtask module_size
 ```
 
+### Module map check
+
+Every production source file must have an entry in [architecture.md](architecture.md). The
+check runs in the `clippy` CI job and in the `architecture-doc` prek hook, and you can run it
+on its own:
+
+```bash
+cargo xtask check-architecture-doc
+```
+
+It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
+does not link, and on a stale entry in the `EXEMPT` list in
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+`lychee` check is complementary, not redundant: it confirms that links already in the doc
+resolve, and says nothing about a file the doc never mentions.
+
 ### Tests that touch the environment
 
 `std::env::set_var` / `remove_var` change state shared by every thread in the
@@ -136,6 +152,44 @@ all of which the scan reports nothing for:
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
+
+### The freeform planner never imports `chat`
+
+`chat.rs` calls the freeform planner, so a planner that imported `chat` back
+would be a module cycle. The cycle is broken by three leaf modules
+([`prompt_text.rs`](../apps/rocm/src/prompt_text.rs),
+[`rocm_argv.rs`](../apps/rocm/src/rocm_argv.rs) and
+[`tool_policy.rs`](../apps/rocm/src/tool_policy.rs)) that the planner and `chat`
+both call into. `cargo xtask check-crate-edges` compares crates and cannot see
+a rule between modules of one crate, so, as with the environment rule above, a
+test enforces it rather than an `xtask` subcommand:
+`the_freeform_planner_and_its_leaf_modules_never_import_chat` in `xtask`
+([`chat_import_contract.rs`](../xtask/src/chat_import_contract.rs)) reads
+[`freeform_planner.rs`](../apps/rocm/src/freeform_planner.rs) and those three
+files and **fails the build** if any of them reaches `chat` in non-test code,
+naming each as `file:line`. Run it on its own with:
+
+```bash
+cargo test -p xtask chat_import_contract
+```
+
+It flags `crate::chat`, `super::chat` and `self::chat` as a path, `chat` as a
+member of a `use crate::{..}` group, and `mod chat`, and a raw identifier
+(`r#chat`) counts as `chat`. The one thing it skips is a
+`#[cfg(test)] mod name { .. }` block, so a `mod tests` may use `chat`; a
+`#[cfg(test)]` on anything else (a `use`, a function, a field, an expression)
+skips nothing, and a test that needs `chat` belongs in the test module. A route
+that never writes the `crate::chat` path is not seen: an alias
+(`use crate as root; root::chat::f()`), a glob (`use crate::*;` then
+`chat::f()`) or a `#[path = ".."] mod` that points at `chat.rs`; and
+`#[cfg(all(test, ..))]` is read as production code, so it can only cause a false
+alarm. It does not flag the
+identifiers and prose that merely contain the word, such as
+`chat_cli_arg_value`. It reads the four listed files only, not the modules they
+import. If one of them moves or is renamed, update `GUARDED` in the test; the
+test fails on a path that no longer exists rather than dropping it from the
+guard. When the planner needs something that lives in `chat.rs`, move it into
+a leaf module and import it from there.
 
 ### Tests that run a fake executable
 
@@ -272,6 +326,63 @@ share of cases and would pass with it present on a short run. The uninstall prop
 knob instead, `ROCM_DELETION_PROP_CASES`, described under Uninstall And
 Download Removal below; it follows the same rule.
 
+When a property fails, proptest saves the shrunk case as a `cc <hash> # shrinks
+to ...` line in a file named after the source file the `proptest!` block is
+written in, and replays it before any new case on every later run: a block in
+`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`, where
+`src/` is the nearest ancestor directory holding a `main.rs` or `lib.rs` (it is
+`src/` for every crate in this tree). Moving
+the test to another file therefore leaves its saved cases behind, and proptest
+does not warn: they just stop being replayed. **Carry the saved cases to the
+test's new file in the same commit**; what that takes depends on how much moved:
+
+- When every property test of the source file moves, and the new file has no
+  regression file yet, `git mv` the regression file to the name the new file
+  needs.
+- When only some of them move (a split), the tests left behind still read the
+  old regression file, and proptest does not record which test a saved case
+  belongs to: all the `proptest!` blocks of a file share one. Keep the old file
+  where it is and copy the `cc` lines to the new file's regression file. If that
+  file already exists, append to it so its own cases stay; do not overwrite it
+  and do not `git mv` onto it. A case copied to a test it did not come from is
+  only one more input for that test to run.
+
+This is enforced in part by a test, not by an `xtask` subcommand:
+`every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
+`xtask` walks the tree and **fails the build** on a file under any
+`proptest-regressions/` directory whose `<crate>/src/<path>.rs` (`src/` being the
+directory with `main.rs` or `lib.rs`) is missing or
+holds no `proptest!` block in code (a mention in a comment or a string literal
+does not count; whitespace or a comment between `proptest` and the `!`, as in
+`proptest ! { .. }`, still does), naming the file and the source file it expected. It cannot see
+the opposite mistake, a split that `git mv`d the regression file away from tests
+that still need it: no file is orphaned then, one is just missing, so read the
+diff of a split for it. Two more things it does not check: a crate with a
+`src/bin/<x>/main.rs` that has a property test would be reported as an orphan by
+mistake, because proptest then keeps its seeds in `src/bin/proptest-regressions/`
+(nothing in this tree has one); and a property test under a crate's `tests/`
+directory is invisible to it, since proptest cannot find a `main.rs` or `lib.rs`
+above such a file and writes the seed next to the test file instead. Run the
+check on its own with:
+
+```bash
+cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
+```
+
+The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
+adds `xtask` when a changed file is under a `proptest-regressions` directory or
+when the diff of a changed Rust file adds or removes a line containing
+`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
+check on the pull request, whether or not its seed moved with it. The other
+source-scan contracts do not have this rule; they still meet a change confined to
+a crate that `xtask` does not depend on in the merge queue, which runs the whole
+workspace. To prove a moved seed is read,
+append a deliberately unparsable line to it, run the test with `--nocapture`
+(`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
+`unparsable line, ignoring` warning naming that path, and remove the line.
+The check does not tell a seed that still reproduces from one that no longer
+does; it only confirms that something reads the file.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
@@ -396,7 +507,10 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). On `main`
+`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
+the proptest seed guard and which no other crate depends on: a changed file under
+a `proptest-regressions` directory, and a changed Rust file whose diff adds or
+removes a line containing `proptest!` (found with `git diff -G`). On `main`
 and in the merge queue the full workspace always runs. For a full local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
 narrows the local pre-push hooks (next section).
@@ -448,14 +562,61 @@ Known limits, unchanged by the narrowing: the steps check the working tree rathe
 commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
 builds can resolve Cargo features differently from `--workspace` ones.
 
-Preview what a push would check without compiling:
+### Pass stamps
+
+A step that already passed on this exact content is skipped. After a step's cargo command exits 0,
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs) records a stamp, and the next run of the same step
+looks for it first. The stamp stands for:
+
+- the step and its exact cargo arguments, so a pass recorded for `-p xtask` never lets a later run
+  over `--workspace` skip (the selection is part of the key, not a separate check);
+- the git *tree* hash of `HEAD`, not the commit hash, so an amend that only rewords the message, or
+  the same content pushed to a second remote, still hits;
+- the compiler and cargo identity (`rustc -vV`, `cargo -vV`) and a digest of the `CARGO_*` and
+  `RUST*` environment (never the values), minus a short list of per-run variables such as
+  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable
+  whose value is not valid Unicode never stops the hook: an unrelated one is ignored and a
+  relevant one is hashed as the bytes it is.
+
+The working tree has to be clean for a stamp to be used or written, because cargo checks the working
+tree, not the pushed commit: with uncommitted changes the step runs and says why, and an untracked
+file counts because it can hide a missing `git add`. The tree is probed again after the step, and
+nothing is recorded if cargo changed it (a rewritten `Cargo.lock`, for example). A pass is only
+written after cargo succeeded, per step, so a failed `test` does not erase the `clippy` pass that
+the retry then skips.
+
+Stamps live in `rocm-cli-prepush-passes` under the git common directory, so every worktree of a
+clone shares them, nothing lands in the work tree and `cargo clean` does not erase them. Each write
+drops stamps older than seven days and keeps at most 64. A write goes through a scratch file and a
+rename, and removes the scratch file itself when the rename fails; a process killed mid-write
+leaves its scratch file behind until a later write prunes it, once it is more than an hour old (a
+younger one may belong to a concurrent writer). Any error locating, reading or verifying a
+stamp means the step runs (git is run for an explicit directory with `GIT_DIR` and the other
+repository-selecting variables removed, which git and prek export to a hook run from a linked
+worktree); a stamp that does not match its key exactly, is dated in the future or is
+unreadable is ignored (the step names it); a failed write is reported and never fails the hook.
+
+The skip message says what a stamp does not cover: user-level cargo configuration, installed
+tools, files git ignores (the one thing a clean `git status` cannot see) and flaky tests. Force
+a run with `--rerun` or `ROCM_PRE_PUSH_RERUN=1` (the hook has no flags, so use the variable
+there), or delete the directory the message names. `SKIP=<hook id>` still skips a hook outright,
+and `verify-commits` is a separate hook that checks commit signatures on every push. A skip
+proves that this tree passed these checks earlier, not that they ran during this push; for a
+fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it
+drops this step's earlier pass before running, so if the rerun fails the next ordinary run runs
+the step instead of skipping on the pass it was meant to double-check, and a successful rerun
+records a fresh one. Other steps' and other selections' passes are left alone, and `--dry-run`
+never touches a stamp.
+
+Preview what a push would check without compiling (a dry run also says when a real run would skip):
 
 ```bash
 cargo xtask pre-push-check test --dry-run --base origin/main
 ```
 
 `--base` replaces the range's base; `clippy` and `clippy-e2e` take the same flags. The selection
-logic is unit-tested in [prepush.rs](../xtask/src/prepush.rs); as dev tooling, with no change to
+logic and the stamps are unit-tested in [prepush.rs](../xtask/src/prepush.rs) and
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs); as dev tooling, with no change to
 what the `rocm` binary does, it has no Gherkin scenario.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
@@ -915,6 +1076,34 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
+when none is chosen: it recovers the runtime `rocm setup` created before
+counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
+was lost is found. The real run (`comfyui-16`, against an existing checkout that
+needs no dependencies) writes the entry back; the `--dry-run` preview
+(`comfyui-15`) names the same runtime but writes nothing, because a preview
+promises not to change files. The preview prints the install command with that
+runtime's `--runtime-id`, and `comfyui-17` runs that command as printed from the
+state the preview left: an explicit `--runtime-id`, like an active or default
+runtime, finds the runtime setup created when the registry alone cannot answer,
+so the command works and writes the entry back. `comfyui-18` runs the same
+printed command when the registry cannot take that entry back (a plain file
+stands where its directory should be, which also stops `root`; a read-only
+directory would not): the preview still succeeds, and the real run fails naming
+the runtime whose entry it could not restore, rather than saying "Install ROCm
+first", and leaves the registry as it was. The variant with a read-only registry
+directory that holds other runtimes is a unit test, because a read-only
+directory is writable to `root`. `comfyui-19` covers the other way a setup folder
+can matter: when its runtime is no longer usable (its interpreter is gone) and one
+ready runtime is registered, the preview uses the registered one and does not
+register the unusable one, because an unusable runtime is not a ready runtime and
+cannot change the count; its own error is reported only when no registered
+runtime is ready, which a unit test covers. All five run with no GPU:
+
+```bash
+cargo xtask e2e -- -n "comfyui-1[5-9]"
+```
+
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed
 runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
 added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
@@ -1042,12 +1231,46 @@ rocm runtimes adopt \
   --runtime-key adopted-release-pip-gfx120x-all-7-13-0
 ```
 
+Neither writes into the folder it registers: the registry entry is the only
+file created. The `.rocm-cli-runtime.json` that `rocm install sdk` leaves in an
+install root is ROCm CLI's proof that it owns the folder, so an imported or
+adopted runtime does not get one, and uninstall and prune never delete such a
+folder. A second import or adopt of the same runtime key is refused until
+`--replace` is given. `@id:runtime-lifecycle-import-rejects-duplicate-unless-replacing`
+(`runtime-lifecycle-06`) checks the import half end to end: the registry entry
+exists, the imported folder gains no manifest file, and the duplicate is refused
+until `--replace` (the unit tests also check the refused entry is left as it
+was). Adopting needs a Python environment to probe and the
+recovery of the runtime `rocm setup` created (which restores a missing registry
+entry from the manifest already in the setup folder) needs a setup, so neither
+has a scenario; the unit tests below assert each path's file set instead, and
+`write_runtime_manifest` is the one routine all four paths write through. It writes the registry entry last, after the install-root file, so a write that fails leaves no new entry and an error that says a runtime could not be registered or restored matches the registry; recovery in particular never rewrites the file it restores from, whatever shape that file has.
+A source-reading test, `only_the_shared_routine_writes_a_registry_entry`, fails
+if production code in the `rocm` app, `rocmd`, `rocm-core` or the engines both
+names the registry directory (through the two path helpers, or by spelling the
+`runtimes` and `registry` segments) and writes a file, or if a file not on its
+reviewed list starts calling the path helpers;
+`registry_writer_detector_sees_every_way_of_building_the_path` pins what the
+detector sees. It does not catch a writer that is handed the registry path by a
+function in another file, a write call that is not in its list of write
+primitives, or code outside those source roots.
+
+`--root` may be left out when `--python` sits directly in the environment's `bin`
+(or `Scripts`) folder; an interpreter anywhere else is refused until `--root` is
+given (scenario `runtime-26`).
+
 Focused unit coverage:
 
 ```bash
 cargo test -p rocm --bin rocm runtime_activation
 cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
+cargo test -p rocm --bin rocm runtime_install_writes
+cargo test -p rocm --bin rocm setup_recovery
+cargo test -p rocm --bin rocm write_runtime_manifest
+cargo test -p rocm --bin rocm a_failed_manifest_write
+cargo test -p rocm --bin rocm only_the_shared_routine_writes
+cargo test -p rocm --bin rocm registry_writer_detector
 cargo test -p rocm --bin rocm runtime_key_includes_version_for_side_by_side_installs
 cargo test -p rocm --bin rocm engine_plugin
 cargo test -p rocm --bin rocm model_registry
@@ -1186,10 +1409,28 @@ provider-assisted plan before dispatching it, so it never runs the plan's
 command and shows only the plan text; for that surface the reuse of the
 rendered plan is covered by the unit tests below.
 
+A `serve` the provider proposes must also pass the four serve safety rules the
+chat assistant's `rocm_command` is held to (no CPU device, no public bind, a
+loopback host, managed serving), which one shared check in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) applies to both. Four more
+mock-lane scenarios in the same feature file run `rocm "serve a model"` against
+a provider whose plan breaks one rule each: `chat-13`
+(`chat-planning-assistant-cpu-serve-refused`), `chat-14`
+(`chat-planning-assistant-public-bind-serve-refused`), `chat-15`
+(`chat-planning-assistant-non-local-host-serve-refused`) and `chat-16`
+(`chat-planning-assistant-unmanaged-serve-refused`). Each asks the provider
+exactly once, prints the CLI's own plan rather than the provider's, runs
+nothing, and says why the provider's plan was not used. The two unit suites
+that run one shared table of refused and accepted `serve` argvs are
+`chat_refuses_each_unsafe_serve_and_proposes_nothing` and
+`planner_refuses_each_unsafe_serve_and_plans_nothing`; deleting a rule from the
+shared check fails both.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
+cargo test -p rocm --bin rocm unsafe_serve
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
 cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
 cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
@@ -1275,8 +1516,25 @@ cargo test -p rocmd recovery_respawn_fails_closed
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
+Collision-safe port selection, focused tests:
+
+```bash
+cargo test -p rocm --bin rocm -- serve_port::
+cargo test -p rocm --bin rocm automatic_selects_against_real_loopback_listeners
+cargo test -p rocm --bin rocm concurrent_auto_transactions_publish_distinct_ports
+cargo test -p rocm --bin rocm concurrent_equivalent_transactions_converge_on_one_record
+cargo test -p rocmd recovery_waits_for_the_allocation_lock_and_refuses_an_occupied_port
+```
+
+Omitting `--port` on the default loopback host scans `11435..=11535` for a
+candidate neither reserved by a live managed-service record nor occupied on the
+OS ([`serve_port.rs`](../apps/rocm/src/serve_port.rs)), under the same `services/launch.lock` that serializes
+every other managed launch and `rocmd` recovery attempt. An explicit `--port`
+on a non-default `--host` is still required: automatic selection only probes
+`127.0.0.1` and refuses to guess elsewhere.
+
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
-credential-free. A public bind (`--host 0.0.0.0 --allow-public-bind`) requires an
+credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
 variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
@@ -1839,7 +2097,8 @@ compaction keeping every pending proposal, the
 newest reviewed ones, and legacy proposal ids. The rotation tests in
 `jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests in `automation::tests` go through the public
+rotation policy and a record type of their own, so the engine's tests do not
+depend on `automation.rs`; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
@@ -2768,8 +3027,8 @@ rather than the real host. The `a_fallback_read_plans*`/
 `an_unreadable_file*`/`distro_name_names_an_unreadable_file` tests in
 `rocm-core` and `rocm` construct an `OsRelease` directly — bypassing the real
 read entirely, since the production functions that do it
-(`openmpi::real_os_release`, `system_packages::real_os_release`)
-read the real machine
+(`hardware_root::real_os_release`, which every caller goes through)
+reads the real machine
 unconditionally and cannot honour a simulated root — to pin that a
 fallback-sourced read plans and hints identically to a primary-sourced one
 with the same text, and that a file which exists but cannot be read is named
@@ -2789,6 +3048,19 @@ same failure mode: a genuinely permission-denied primary aborts the whole
 shell probe instead of merely leaving `$ID` unset, which this test does not
 exercise — see its own doc comment for why, and for the known limitation
 this leaves.
+
+The package-manager side reads the real host through one function,
+`hardware_root::real_os_release`. In the `rocm` binary's tests,
+`system_packages::tests::real_os_release_ignores_a_simulated_host_root`
+(`--features e2e-test-hooks`, Linux) plants a root naming another distribution
+and expects the real file back, and
+`system_packages::tests::the_install_hints_read_the_real_host_and_ignore_a_simulated_root`
+holds the three install hints to the same rule. Both live in that process
+rather than in `rocm-core`'s, so the environment variable they set cannot
+overlap a `rocm-core` test that reads host paths.
+`system_packages::tests::no_caller_in_this_binary_reads_the_real_os_release_by_hand`
+fails when a source file of the `rocm` binary reads the file with its own
+resolver instead of calling it.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios

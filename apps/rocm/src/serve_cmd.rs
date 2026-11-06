@@ -66,6 +66,7 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_port;
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
@@ -73,6 +74,7 @@ use crate::serve_recipe::{
     parse_gpu_memory_utilization, protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
 };
 use crate::serve_summary;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
@@ -81,8 +83,8 @@ use crate::service_launch::{
     wait_begin_client_config,
 };
 use crate::{
-    GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
-    ensure_engine_allowed_on_platform,
+    GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
+    ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -480,7 +482,7 @@ pub(crate) struct ServeArgs {
     pub(crate) runtime_id: Option<String>,
     pub(crate) env_id: Option<String>,
     pub(crate) host: String,
-    pub(crate) port: u16,
+    pub(crate) port: Option<u16>,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
     pub(crate) wait: bool,
@@ -522,8 +524,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         api_key,
         engine_env,
     } = args;
+    let port_request = serve_port::PortRequest::from_flag(port);
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    serve_port::validate_port_request(&host, port_request)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
     // (or generate) the endpoint key now so every downstream path — engine spawn,
     // readiness probe, smoke test, and the client-config we print — shares one value.
@@ -1039,7 +1043,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
-        println!("  port: {port}");
+        match port {
+            Some(port) => println!("  port: {port}"),
+            None => println!("  {}", serve_port::AUTOMATIC_PORT_DISCLOSURE),
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -1125,12 +1132,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         // printed. It is then not repeated in the summary below.
         let key_shown_before_wait = std::cell::Cell::new(false);
         let launched = start_managed_service(
+            &paths,
             &selected_engine,
             &service_id,
             &model,
             &resolve,
             &host,
-            port,
+            port_request,
             &resolve.device_policy,
             &gpu_indices,
             managed_runtime_id.as_deref(),
@@ -1144,7 +1152,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Named with the id the launch resolved to: an already-starting
             // server keeps its own, not the one generated above. The spinner
             // has no id on it, and a non-TTY stderr gets no spinner at all.
-            &mut |waiting_on| {
+            &mut |waiting_on, waiting_port| {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
@@ -1154,7 +1162,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     waiting_on,
                     &service_id,
                     &host,
-                    port,
+                    waiting_port,
                     endpoint_auth.as_deref(),
                 ) {
                     key_shown_before_wait.set(true);
@@ -1293,12 +1301,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     run_attached_service(
+        &paths,
         &selected_engine,
         &service_id,
         &model,
         &resolve,
         &host,
-        port,
+        port_request,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
@@ -1306,6 +1315,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         launch_lock,
         require_api_key,
         gpu_refusal_waived_for_reuse,
+        |paths, service_id| {
+            run_internal_sandbox_tool(
+                paths,
+                SandboxToolArg::StopServer,
+                Some(service_id.to_owned()),
+                true,
+            )
+        },
     )
 }
 

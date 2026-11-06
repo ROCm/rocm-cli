@@ -30,4 +30,14 @@ pub use metrics::{
 pub use observation::{GenerationObservationTracker, observation_validity, rate_window};
 pub use partition::{ComputePartitionMode, MemoryPartitionMode};
 pub use protocol::{Command, Event};
+
+/// The phrase for a serve port that is not yet resolved.
+///
+/// The dash approval card and the `rocm serve` plan output both print it, so the
+/// two surfaces cannot drift apart in wording.
+///
+/// The wizard cannot truthfully promise a concrete port before the CLI leases
+/// one, so it says exactly this and the launch output prints the resolved
+/// endpoint.
+pub const AUTO_PORT_NOTE: &str = "Port: automatic; endpoint shown after launch";
 pub use state::{SideEffect, State, StateEvent};

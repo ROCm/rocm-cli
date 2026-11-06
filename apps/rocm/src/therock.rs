@@ -71,7 +71,8 @@ pub(crate) use crate::runtime_registry::{
     validate_rocm_sdk_runtime_probe,
 };
 use crate::runtime_registry::{
-    runtime_manifest_path, save_runtime_manifest, wheel_composition_includes_devel,
+    ManifestOverwrite, runtime_manifest_path, wheel_composition_includes_devel,
+    write_runtime_manifest,
 };
 use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
@@ -730,7 +731,7 @@ fn install_wheel_runtime(
         devel: include_devel,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(
         output,
@@ -955,12 +956,7 @@ fn install_tarball_runtime(
 
     fs::create_dir_all(paths.cache_dir.join("therock"))?;
     fs::create_dir_all(&install_root)?;
-    if has_nontrivial_directory_contents(&install_root)? {
-        bail!(
-            "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
-            install_root.display()
-        );
-    }
+    ensure_tarball_install_target_is_clean(&install_root)?;
 
     if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
         let _ = writeln!(output, "  {warning}");
@@ -1007,7 +1003,7 @@ fn install_tarball_runtime(
         devel: true,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(output, "  extracted: {}", install_root.display());
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
@@ -1109,21 +1105,18 @@ fn resolved_install_root(
     rocm_core::resolve_path_through_symlinks(&requested)
 }
 
-fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
+/// Refuses to extract a tarball into a root that already holds a payload.
+///
+/// "Holds a payload" is [`rocm_core::install_root_has_payload`]: dot-entries (the
+/// runtime marker) do not count, so a root that has only been prepared passes.
+fn ensure_tarball_install_target_is_clean(install_root: &Path) -> Result<()> {
+    if rocm_core::install_root_has_payload(install_root)? {
+        bail!(
+            "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
+            install_root.display()
+        );
     }
-    let entries =
-        fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
-        }
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(())
 }
 
 fn venv_python_path(install_root: &Path) -> PathBuf {
@@ -1701,6 +1694,43 @@ mod tests {
         assert_eq!(
             warning,
             "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
+        );
+    }
+
+    /// The extraction guard refuses a root that holds a payload and says so, and
+    /// it follows `rocm_core::install_root_has_payload` for what that means: a
+    /// root that does not exist yet (the case `install_tarball_runtime` hits when
+    /// `--prefix` names a new folder) and one holding only dot-entries pass.
+    /// Refusing must leave the existing files where they were.
+    #[test]
+    fn the_tarball_install_guard_follows_the_shared_payload_rule() {
+        let base = tempfile::tempdir().expect("scratch dir");
+
+        ensure_tarball_install_target_is_clean(&base.path().join("not-created-yet"))
+            .expect("a missing root is clean");
+
+        let marker_only = base.path().join("marker-only");
+        fs::create_dir_all(&marker_only).unwrap();
+        fs::write(marker_only.join(".rocm-cli-runtime.json"), b"{}").unwrap();
+        ensure_tarball_install_target_is_clean(&marker_only)
+            .expect("a root with only the dot-marker is clean");
+
+        let populated = base.path().join("populated");
+        fs::create_dir_all(populated.join("bin")).unwrap();
+        fs::write(populated.join("bin").join("tool"), b"x").unwrap();
+        let error = ensure_tarball_install_target_is_clean(&populated)
+            .expect_err("a root with a payload is refused")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
+                populated.display()
+            )
+        );
+        assert!(
+            populated.join("bin").join("tool").is_file(),
+            "the refusal must not touch what is already there"
         );
     }
 }

@@ -12,8 +12,10 @@
 
 mod affected;
 mod amd_smi_launch_contract;
+mod architecture_doc;
 mod ascii_output_contract;
 mod catalog;
+mod chat_import_contract;
 mod coverage;
 mod crate_edges;
 mod demos;
@@ -29,10 +31,14 @@ mod package;
 mod paths;
 mod powershell;
 mod prepush;
+mod prepush_stamp;
+mod proptest_regressions_contract;
 mod release_readiness;
 mod report_mailbox;
 mod report_rollup;
 mod rocm_releases;
+#[cfg(test)]
+mod rust_source;
 mod signing;
 mod tpn;
 mod verify_commits;
@@ -42,7 +48,7 @@ mod workflow_contract;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -118,6 +124,10 @@ pub(crate) enum Command {
     /// cannot be determined, and prints why. It is skipped only when the
     /// selection is known and has nothing for the step to check. CI always
     /// checks the whole workspace.
+    ///
+    /// A step that already passed on this exact tree (same cargo command,
+    /// toolchain and environment, clean working tree) is skipped, and a pass is
+    /// recorded after a green run; see `xtask/src/prepush_stamp.rs`.
     PrePushCheck {
         /// Which step to run.
         #[arg(value_enum)]
@@ -129,6 +139,10 @@ pub(crate) enum Command {
         /// Print the scope and the cargo command without running it.
         #[arg(long)]
         dry_run: bool,
+        /// Run the step even when this tree already passed it, and record the
+        /// new result. `ROCM_PRE_PUSH_RERUN=1` does the same, for the hook.
+        #[arg(long)]
+        rerun: bool,
     },
     /// Fail if any first-party crate has gained a normal/build dependency
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
@@ -147,6 +161,10 @@ pub(crate) enum Command {
     /// non-zero before this code runs. The local pre-commit hook runs this until
     /// the limit is enforced.
     CheckModuleSizeAdvisory,
+    /// Fail if a production source file (a `.rs` file under `apps/*/src`,
+    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`,
+    /// or the exemption list in `xtask/src/architecture_doc.rs` has gone stale.
+    CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
@@ -402,14 +420,11 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
-        Command::PrePushCheck {
-            check,
-            base,
-            dry_run,
-        } => prepush::run(check, base, dry_run)?,
+        command @ Command::PrePushCheck { .. } => run_pre_push_check(command, prepush::run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckModuleSize => module_size::run()?,
         Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
+        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
@@ -487,6 +502,25 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// The `pre-push-check` arm of [`run`]: hand each argument to `run` as parsed.
+/// `run` is a parameter so a test sees exactly what arrives, in particular that
+/// `--rerun` is not dropped on the way to the stamp logic.
+fn run_pre_push_check(
+    command: Command,
+    run: impl FnOnce(prepush::Check, Option<String>, bool, bool) -> Result<()>,
+) -> Result<()> {
+    let Command::PrePushCheck {
+        check,
+        base,
+        dry_run,
+        rerun,
+    } = command
+    else {
+        bail!("not a pre-push-check command");
+    };
+    run(check, base, dry_run, rerun)
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -494,5 +528,69 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    fn rerun(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let Command::PrePushCheck { rerun, .. } = cli.command else {
+            panic!("expected pre-push-check");
+        };
+        rerun
+    }
+
+    /// What the dispatch hands to `prepush::run` for these arguments: the real
+    /// clap parse, then the `pre-push-check` arm, with `run` recording its input.
+    fn handed_to_run(args: &[&str]) -> (String, Option<String>, bool, bool) {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        let mut seen = None;
+        super::run_pre_push_check(cli.command, |check, base, dry_run, rerun| {
+            seen = Some((format!("{check:?}"), base, dry_run, rerun));
+            Ok(())
+        })
+        .expect("the dispatch succeeds");
+        seen.expect("the arm calls run")
+    }
+
+    #[test]
+    fn the_dispatch_hands_every_flag_to_run_unchanged() {
+        assert_eq!(
+            handed_to_run(&["xtask", "pre-push-check", "test"]),
+            ("Test".to_string(), None, false, false)
+        );
+        assert_eq!(
+            handed_to_run(&[
+                "xtask",
+                "pre-push-check",
+                "clippy",
+                "--base",
+                "origin/main",
+                "--dry-run",
+                "--rerun",
+            ]),
+            (
+                "Clippy".to_string(),
+                Some("origin/main".to_string()),
+                true,
+                true
+            )
+        );
+        // `--rerun` alone, and `--dry-run` alone, are not mixed up with each other.
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).3);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--rerun"]).2);
+        assert!(handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).2);
+        assert!(!handed_to_run(&["xtask", "pre-push-check", "test", "--dry-run"]).3);
+    }
+
+    #[test]
+    fn pre_push_check_takes_rerun_and_defaults_to_off() {
+        assert!(rerun(&["xtask", "pre-push-check", "test", "--rerun"]));
+        assert!(!rerun(&["xtask", "pre-push-check", "test"]));
     }
 }
