@@ -1257,6 +1257,44 @@ mod tests {
         Ok(())
     }
 
+    /// Recovering the setup runtime restores the registry entry and writes no
+    /// install-root file, whatever shape that file has: the manifest it restores
+    /// is the one read from that very file, so it is always what would be
+    /// written. A hand-edited file (compact, an extra key, no final newline) is
+    /// therefore left byte for byte as it was, and recovery cannot fail on a
+    /// setup folder that is read-only. Asserted on the bytes, so it holds when
+    /// the process can write anyway. The restored entry is what the file says.
+    #[test]
+    fn setup_recovery_restores_the_entry_and_leaves_a_hand_edited_install_root_file_alone()
+    -> Result<()> {
+        let (root, paths) = test_paths("setup-recovery-hand-edited-file");
+        let lost = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "runtime-s",
+        )?;
+        let file = lost.install_root.join(".rocm-cli-runtime.json");
+        let mut document = serde_json::to_value(&lost)?;
+        document["a_key_a_future_release_adds"] = serde_json::json!(true);
+        let hand_edited = serde_json::to_vec(&document)?;
+        fs::write(&file, &hand_edited)?;
+        let config = RocmCliConfig::load(&paths)?;
+
+        let recovered = recover_setup_runtime_registration(&paths, &config)?;
+
+        assert_eq!(recovered.as_deref(), Some("runtime-s"));
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec!["runtime-s.json".to_owned()]
+        );
+        assert_eq!(
+            fs::read(&file)?,
+            hand_edited,
+            "recovery must not rewrite the install-root file it restored from"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     /// A setup runtime that is no longer usable is not a ready runtime, so it
     /// does not change what the registry alone answers: one registered ready
     /// runtime is picked, two are refused as ambiguous with exactly those two

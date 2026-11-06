@@ -948,7 +948,7 @@ was). Adopting needs a Python environment to probe and the
 recovery of the runtime `rocm setup` created (which restores a missing registry
 entry from the manifest already in the setup folder) needs a setup, so neither
 has a scenario; the unit tests below assert each path's file set instead, and
-`write_runtime_manifest` is the one routine all four paths write through.
+`write_runtime_manifest` is the one routine all four paths write through. It writes the registry entry last, after the install-root file, so a write that fails leaves no new entry and an error that says a runtime could not be registered or restored matches the registry; recovery in particular never rewrites the file it restores from, whatever shape that file has.
 
 `--root` may be left out when `--python` sits directly in the environment's `bin`
 (or `Scripts`) folder; an interpreter anywhere else is refused until `--root` is
@@ -963,6 +963,7 @@ cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_install_writes
 cargo test -p rocm --bin rocm setup_recovery
 cargo test -p rocm --bin rocm write_runtime_manifest
+cargo test -p rocm --bin rocm a_failed_manifest_write
 cargo test -p rocm --bin rocm only_the_shared_routine_writes
 cargo test -p rocm --bin rocm runtime_key_includes_version_for_side_by_side_installs
 cargo test -p rocm --bin rocm engine_plugin

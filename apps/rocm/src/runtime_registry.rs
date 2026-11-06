@@ -381,6 +381,14 @@ impl ManifestOverwrite {
 /// gets none: a root the user may not be able to write to must not make
 /// registering it fail, and an import's source manifest may be that very file
 /// in another install.
+///
+/// The registry entry is written last, after the install-root file. A failed
+/// install-root write therefore leaves the registry exactly as it was, and a
+/// failed registry write leaves no new entry, so an error that says a runtime
+/// could not be registered or restored never describes one whose entry exists.
+/// The install-root file may be left behind by a failed registry write; it holds
+/// what a retry writes.
+///
 /// The file is not rewritten when it already holds what would be written, so
 /// recovering a runtime from its own manifest leaves it alone. "Holds" is judged
 /// on the decoded manifest, not the bytes ([`install_root_manifest_is_current`]):
@@ -410,8 +418,6 @@ pub(crate) fn write_runtime_manifest(
     )?;
     let encoded =
         serde_json::to_vec_pretty(&manifest).context("failed to serialize runtime manifest")?;
-    fs::write(&registry_path, &encoded)
-        .with_context(|| format!("failed to write {}", registry_path.display()))?;
 
     if manifest.owns_install_root() {
         let local_manifest_path = manifest.install_root.join(".rocm-cli-runtime.json");
@@ -422,6 +428,10 @@ pub(crate) fn write_runtime_manifest(
                 .with_context(|| format!("failed to write {}", local_manifest_path.display()))?;
         }
     }
+    // Last, because the registry entry is what registering a runtime means; see
+    // the doc comment.
+    fs::write(&registry_path, &encoded)
+        .with_context(|| format!("failed to write {}", registry_path.display()))?;
     Ok(())
 }
 
@@ -1009,6 +1019,58 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The registry entry is what registers a runtime, so it is written last and
+    /// each failing write is asserted as the error and the state together. When
+    /// the install-root file cannot be written (a directory stands where the file
+    /// should be, which stops an administrator as well) the error names that file
+    /// and the registry is exactly as it was: no entry, so a caller's "could not
+    /// register" or "could not restore" is true, under either policy. When the
+    /// registry entry cannot be written (a directory stands where it should be)
+    /// the error names the entry and there is still no entry that reads as a
+    /// runtime.
+    #[test]
+    fn a_failed_manifest_write_never_leaves_a_registered_runtime_behind() -> Result<()> {
+        for overwrite in [ManifestOverwrite::Replace, ManifestOverwrite::Refuse] {
+            let (root, paths) = test_paths("manifest-write-fails");
+            let manifest = manifest_in(&root, "release-wheel-gfx120X-all-7.13.0", false, None)?;
+            let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+            let local = manifest.install_root.join(".rocm-cli-runtime.json");
+
+            fs::create_dir_all(&local)?;
+            let error = format!(
+                "{:#}",
+                write_runtime_manifest(&paths, &manifest, overwrite)
+                    .expect_err("the install-root manifest cannot be written")
+            );
+            assert!(
+                error.contains("failed to write") && error.contains(".rocm-cli-runtime.json"),
+                "{overwrite:?}: {error}"
+            );
+            assert!(
+                !entry.exists() && load_runtime_manifests(&paths)?.is_empty(),
+                "{overwrite:?}: a failed install-root write leaves no registry entry"
+            );
+
+            fs::remove_dir(&local)?;
+            fs::create_dir_all(&entry)?;
+            let error = format!(
+                "{:#}",
+                write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)
+                    .expect_err("the registry entry cannot be written")
+            );
+            assert!(
+                error.contains("failed to write") && error.contains(&entry.display().to_string()),
+                "{overwrite:?}: {error}"
+            );
+            assert!(
+                !entry.is_file(),
+                "{overwrite:?}: a failed registry write leaves no entry"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
         Ok(())
     }
 
