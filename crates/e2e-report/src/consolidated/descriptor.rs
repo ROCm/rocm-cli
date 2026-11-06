@@ -4,8 +4,8 @@
 
 //! Artifact-name identity: parses a report's artifact/directory name (e.g.
 //! `e2e-gpu-strix-windows-nightly-report`) into the platform, OS, legacy
-//! known-bugs flag and channel it stands for, and builds the platform labels
-//! derived from it.
+//! known-bugs flag and channel it stands for, and owns the platform-label rule
+//! ([`full_platform_label`]) every report surface derives its lane name from.
 
 /// The platform/OS a report belongs to, parsed from its artifact name.
 ///
@@ -92,21 +92,10 @@ pub(super) fn parse_descriptor(name: &str) -> Descriptor {
     };
 
     Descriptor {
-        platform: labeled_platform(platform, release_label),
+        platform: with_paren_suffix(platform, release_label),
         os: os.to_string(),
         known_bugs,
         channel_from_name,
-    }
-}
-
-/// Append the sdk_version matrix leg (`n-1`/`n-2`) to a platform label so two
-/// legs of the same platform don't render as identical rows/columns. `None`
-/// (the `current` leg) is left alone — its artifact name is unchanged from
-/// before the matrix existed, so that leg's label is too.
-fn labeled_platform(platform: &str, release_label: Option<&str>) -> String {
-    match release_label {
-        Some(label) => format!("{platform} ({label})"),
-        None => platform.to_string(),
     }
 }
 
@@ -133,40 +122,49 @@ fn fallback_descriptor(
         platform
     };
     Descriptor {
-        platform: labeled_platform(&platform, release_label),
+        platform: with_paren_suffix(&platform, release_label),
         os: "Linux".to_string(),
         known_bugs,
         channel_from_name,
     }
 }
 
-/// Append a "(channel)" suffix to `base` when known.
-pub(super) fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
-    match channel {
-        Some(c) => format!("{base} ({c})"),
+/// Append a "(suffix)" to `base` when `suffix` is known. The one place the
+/// parenthesised-suffix shape lives: [`parse_descriptor`] uses it for the
+/// sdk_version matrix leg (`n-1`/`n-2`) so two legs of the same platform don't
+/// render as identical rows/columns (`None`, the `current` leg, is left alone
+/// because its artifact name is unchanged from before the matrix existed), and
+/// the labels below use it for the channel.
+pub(super) fn with_paren_suffix(base: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("{base} ({s})"),
         None => base.to_string(),
     }
 }
 
-/// Full label (platform AND OS) for a platform excluded from the expectation
-/// grid because its artifact has no usable `platform.json` (see
-/// [`Grid::excluded`](super::Grid::excluded)). Takes the already-computed `PlatformReport::desc`
-/// rather than re-deriving one from the raw artifact name.
-/// Deliberately mirrors [`PlatformReport::load`](super::PlatformReport::load)'s `label` field and
-/// [`GridColumn::label`](super::GridColumn::label) (same shape, no `versions.channel` to prefer since
-/// there is no manifest, so this falls back to the artifact-name channel
-/// directly) rather than the OS-less [`platform_cell`](super::platform_cell): two real lanes of the
-/// same silicon family (e.g. "Strix Halo" Ubuntu vs. Windows, see
-/// `parse_descriptor`) must stay distinguishable here, or an excluded Windows
-/// lane would read as the identical string to an included Ubuntu column of
-/// the same platform — an outright contradiction in the rendered report — and
+/// The one full platform label: platform AND OS, plus the channel when known
+/// (e.g. `Strix Halo Windows (nightly)`).
+///
+/// Every surface that names a whole platform lane builds it here:
+/// `PlatformReport::label` (built by [`PlatformReport::load`](super::PlatformReport::load); per-platform detail
+/// sections, XPASS notes and the command-coverage column key),
+/// [`GridColumn::label`](super::GridColumn::label) (grid headings and the
+/// needs-attention list) and the excluded-platform caption
+/// ([`Grid::excluded`](super::Grid::excluded)). The callers differ only in where
+/// `channel` comes from (the manifest preferred over the artifact name for the
+/// report label, the manifest alone for the grid heading, the artifact name
+/// alone when there is no manifest), never in the shape of the label.
+///
+/// Deliberately not the OS-less [`platform_cell`](super::platform_cell), which is
+/// only safe where the OS has its own table column: two real lanes of the same
+/// silicon family (e.g. "Strix Halo" Ubuntu vs. Windows, see
+/// `parse_descriptor`) must stay distinguishable everywhere else, or an excluded
+/// Windows lane would read as the identical string to an included Ubuntu column
+/// of the same platform — an outright contradiction in the rendered report — and
 /// two such excluded lanes would silently collapse into one `BTreeSet` entry,
 /// undercounting how many artifacts are actually missing.
-pub(super) fn excluded_platform_label(desc: &Descriptor) -> String {
-    with_channel_suffix(
-        &format!("{} {}", desc.platform, desc.os),
-        desc.channel_from_name,
-    )
+pub(super) fn full_platform_label(platform: &str, os: &str, channel: Option<&str>) -> String {
+    with_paren_suffix(&format!("{platform} {os}"), channel)
 }
 
 #[cfg(test)]
@@ -249,6 +247,25 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn full_platform_label_is_platform_os_and_optional_channel() {
+        assert_eq!(
+            full_platform_label("Strix Halo", "Windows", Some("nightly")),
+            "Strix Halo Windows (nightly)"
+        );
+        assert_eq!(
+            full_platform_label("Strix Halo", "Ubuntu", None),
+            "Strix Halo Ubuntu"
+        );
+        // The label a parsed artifact yields keeps the sdk_version leg inside the
+        // platform part, before the OS.
+        let d = parse_descriptor("e2e-gpu-strix-wsl-n-1-report");
+        assert_eq!(
+            full_platform_label(&d.platform, &d.os, d.channel_from_name),
+            "Strix Halo (n-1) WSL2"
+        );
     }
 
     #[test]
