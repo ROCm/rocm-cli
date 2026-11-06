@@ -22,10 +22,13 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
+use anyhow::{Context, Result};
+use rocm_core::{
+    AppPaths, RocmCliConfig, require_yes_or_interactive, runtime_install_root_is_protected,
+};
 use serde::Serialize;
 
+use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::runtimes_cmd::{
     ActiveRuntimeMarker, InstallRootDecision, active_runtime_marker_path,
     should_remove_runtime_install_root,
@@ -618,6 +621,12 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
     output
 }
 
+impl JsonOrText for StorageReport {
+    fn render_text(&self) -> String {
+        render_report(self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prune plan
 // ---------------------------------------------------------------------------
@@ -877,11 +886,8 @@ pub(crate) fn render_downloads_plan(plan: &UninstallPlan, dry_run: bool) -> Stri
 /// nobody to answer the prompt, so `--yes` is required (same rule as
 /// `rocm uninstall`).
 fn approved(action: &str, yes: bool) -> Result<bool> {
-    if yes {
+    if require_yes_or_interactive(yes, action)? {
         return Ok(true);
-    }
-    if !interactive_terminal() {
-        bail!("{action} requires --yes outside an interactive terminal");
     }
     confirm_uninstall()
 }
@@ -898,11 +904,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     match command.unwrap_or(StorageCommand::Report { json: false }) {
         StorageCommand::Report { json } => {
             let report = build_report(&paths, &config)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", render_report(&report));
-            }
+            print_json_or_text(json, &report)?;
         }
         StorageCommand::RemoveOldInstalls { keep, dry_run, yes } => {
             let plan = build_prune_plan(&paths, &config, keep)?;
@@ -1014,6 +1016,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_core::interactive_terminal;
 
     fn manifest(
         runtime_key: &str,
@@ -1504,6 +1507,45 @@ mod tests {
             rendered.contains("reclaim the space with `rocm services prune`"),
             "{rendered}"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `rocm storage report` prints through `print_json_or_text`, which writes
+    /// `render_text()` verbatim for the text form and `Serialize` for `--json`.
+    /// Pin both halves of the `JsonOrText` impl against the report they come
+    /// from, so the text form cannot drift from `render_report` and the JSON
+    /// form cannot lose a field. The text form is asserted to be the real
+    /// report (it names the shared-folders section), not merely equal to
+    /// itself. The call site (`StorageCommand::Report` handing `json` to
+    /// `print_json_or_text`) writes to the process stdout, so its text form is
+    /// pinned black-box by `server-records-01` and `uninstall-05` in
+    /// `tests/e2e-cucumber/features/`; no scenario passes `--json`.
+    #[test]
+    fn json_or_text_impl_renders_the_report_and_serializes_it() -> Result<()> {
+        let (root, paths) = test_paths("report-json-or-text");
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        let text = report.render_text();
+        assert_eq!(text, render_report(&report));
+        assert!(
+            text.contains("Shared with other tools (never removed by ROCm CLI):"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&report)?;
+        let object = json
+            .as_object()
+            .expect("the report serializes as an object");
+        for key in [
+            "runtimes",
+            "runtimes_total_bytes",
+            "rocm_cli",
+            "shared_with_other_tools",
+        ] {
+            assert!(object.contains_key(key), "missing `{key}` in {json}");
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
