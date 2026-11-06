@@ -24,6 +24,7 @@ mod env_mutation_contract;
 mod eval_fixtures;
 mod lychee;
 mod manifest;
+mod module_size;
 mod package;
 mod paths;
 mod powershell;
@@ -133,6 +134,19 @@ pub(crate) enum Command {
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
+    /// Fail if any source file has more than 1,500 production lines, naming
+    /// each offender with its count. Production lines exclude test-gated items
+    /// (inline `#[cfg(test)]` modules and the like) and test-only files. There
+    /// is one limit for every file and no way to exempt one; the definition is
+    /// in `xtask/src/module_size.rs`.
+    CheckModuleSize,
+    /// The same check as `check-module-size`, but it only reports: it prints the
+    /// offenders and exits successfully, including when the check itself cannot
+    /// run (`cargo metadata` fails, a file does not parse). That holds once xtask
+    /// has built: if xtask or `rocm-core` fails to compile, `cargo xtask` exits
+    /// non-zero before this code runs. The local pre-commit hook runs this until
+    /// the limit is enforced.
+    CheckModuleSizeAdvisory,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
@@ -394,6 +408,8 @@ fn run() -> Result<()> {
             dry_run,
         } => prepush::run(check, base, dry_run)?,
         Command::CheckCrateEdges => crate_edges::run()?,
+        Command::CheckModuleSize => module_size::run()?,
+        Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,

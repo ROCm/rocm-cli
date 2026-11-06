@@ -430,6 +430,8 @@ After a managed or foreground serve attempt, inspect local server records:
 rocm services
 rocm services list --all
 rocm services logs <service-id>
+rocm services logs <service-id> --follow
+rocm serve <model> --wait   # waits past 45s and returns once the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -447,6 +449,21 @@ Expected result:
   block at all.
 - `rocm services list --all` shows saved history, including the failed or
   stopped attempts the default view hides.
+- `rocm services logs <service-id> --follow` prints the recent output, then new
+  output as it arrives (a download bar redraws on one terminal row), and returns
+  by itself with `Service <id> is <status>; stopped following.` once the server
+  stops (exit non-zero if it ended `failed`), with a `Service <id> is ready.`
+  line when it finishes starting; Ctrl-C ends the follow and the server keeps running.
+  On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>` line stays on the
+  row directly under the newest output (and under the download bar) as the log
+  grows; piped, stdout carries only the log text and the hint (once), ready and
+  stopped-following lines go to stderr. A server already `failed` when the follow
+  starts also exits non-zero.
+- `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
+  server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
+  with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
+  with `the server exited before it became ready` and a `rocm logs --service`
+  pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the

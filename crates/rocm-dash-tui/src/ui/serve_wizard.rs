@@ -1873,7 +1873,7 @@ mod tests {
 
     // This only pins the shared constant into the approval body; the CLI's own
     // plan output proves the phrase actually appears before the resolved
-    // endpoint, in `serve-auto-port-skips-occupied` (serve-46).
+    // endpoint, in `serve-auto-port-skips-occupied` (serve-47).
     #[test]
     fn approval_shows_exact_argv_and_the_automatic_port_phrase() {
         let mut w = ServeWizardState {

@@ -842,7 +842,7 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
-                   [--verbose] [--foreground | --managed]
+                   [--verbose] [--foreground | --managed] [--wait]
                    [--no-smoke-test]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
@@ -942,6 +942,17 @@ can:
   directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
+`--wait` keeps `rocm serve` waiting until the server answers requests or its
+engine gives up (vLLM and AIM after 5 minutes by default; raise it with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
+of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`rocm services stop`), it fails with an error that points at the server's logs
+instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+in the background; a generated API key (public bind) is printed when the wait
+begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
+when the model is already being served and still starting, it waits on that
+server instead (an already-serving one is reported at once). Watch the download with
+`rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
@@ -1112,7 +1123,7 @@ Manage background servers started with `--managed`:
 
 ```
 rocm services list [--all] [--json]
-rocm services logs <service-id>
+rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
@@ -1421,12 +1432,22 @@ provider settings are left untouched.
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
+rocm logs [--service <service-id> [--follow]] [--search TERM ...] [QUERY ...]
+rocm services logs <service-id> [--follow]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
                [--force-dev-binaries]
 ```
+
+`--follow` (`-f`) keeps printing a server's new log output, such as a model
+download's progress, until the server stops (a server that ends `failed` makes the command exit
+non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
+ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
+line stays on the row under the newest output. Piped or redirected output keeps
+stdout to the log text alone: the hint (once), `is ready.` and `stopped following.`
+lines go to stderr. A server that is already `failed` when the follow starts exits
+non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will

@@ -27,6 +27,30 @@ Run clippy with warnings as errors:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Source file size
+
+No source file may exceed 1,500 production lines. Production lines leave out test-gated
+items (inline `#[cfg(test)]` modules and the like) and test-only files, so adding the
+tests a fix needs never counts against a file. Check it with:
+
+```bash
+cargo xtask check-module-size
+```
+
+It exits non-zero and names each offending file with its count. There is one limit for
+every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
+CI job and in the `cargo-module-size` pre-commit hook, which run
+`cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
+offenders without failing (in CI the step shows red in the job's step list while the job
+stays green); the second is the same check that exits successfully even
+when the check itself cannot run. That holds once xtask has built: a commit that leaves
+xtask or `rocm-core` not compiling still fails the hook.
+The counting rules are unit-tested in `xtask/src/module_size.rs`:
+
+```bash
+cargo test -p xtask module_size
+```
+
 ### Tests that touch the environment
 
 `std::env::set_var` / `remove_var` change state shared by every thread in the
@@ -1122,7 +1146,15 @@ Log browser smoke:
 rocm logs
 rocm logs --search server
 rocm logs --service <service-id>
+rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
+
+While a first-time model download is running, `rocm serve <model> --wait` keeps
+waiting past the usual 45 seconds until the server answers or its engine gives up
+(vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
+and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
+by the argument parser, covered by a unit test. Run the log follow above from a
+second terminal to watch the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.

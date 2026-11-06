@@ -16,11 +16,13 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 e2e-report = { path = "../crates/e2e-report" }
+proc-macro2.workspace = true
 rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+syn.workspace = true
 toml = "1.1"
 
 # `cargo xtask package` builds `.tar.gz` on Unix and `.zip` on Windows, so each

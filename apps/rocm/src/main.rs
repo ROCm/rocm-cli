@@ -170,7 +170,7 @@ use crate::service_control::run_internal_sandbox_tool;
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    render_internal_status_text, render_logs_browser_text, render_logs_text,
+    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
@@ -823,6 +823,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -845,6 +846,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -864,6 +866,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
+            follow,
             search,
             query,
         }) => {
@@ -879,7 +882,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
             if let Some(service_id) = service {
-                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                if follow {
+                    follow_service_logs(&paths, &service_id)?;
+                } else {
+                    print!("{}", render_service_logs_text(&paths, &service_id)?);
+                }
             } else {
                 let query = if search.is_empty() {
                     (!query.is_empty()).then(|| query.join(" "))

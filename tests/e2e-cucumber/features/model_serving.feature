@@ -662,6 +662,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -673,7 +674,6 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
-
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -721,13 +721,22 @@ Feature: Model serving
     And the refusal points the user at the WSL driver status instead of /dev/kfd
     And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
 
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags
 
   # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
   # 65536 and non-numeric values share the same parser and message) is rejected
   # before any engine or GPU work, so it needs no GPU and gates every PR
   # (ungated), like its sibling serve-14.
   @id:serve-invalid-port-rejected
-  Scenario: serve-43 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-44 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -744,7 +753,7 @@ Feature: Model serving
   # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-44 - Serving on a port another managed service already holds is refused
+  Scenario: serve-45 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port
@@ -752,17 +761,17 @@ Feature: Model serving
     And the user is told to stop the service holding that port
 
   # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
-  # sibling of serve-44). No managed-service record exists here, so
+  # sibling of serve-45). No managed-service record exists here, so
   # `resolve_serve_port` never reaches the "reserved by managed service" branch
   # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
   # routing to `explicit_bind_error`'s "already in use by another process"
-  # message. Needs the same `@requires-gpu` as serve-44 for the same reason:
+  # message. Needs the same `@requires-gpu` as serve-45 for the same reason:
   # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
   # completed model/GPU resolution in hand (GPU indices are selected earlier in
   # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
   # `serve` has no CPU fallback that gets there.
   @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
-  Scenario: serve-45 - Serving on a port an untracked process already holds is refused
+  Scenario: serve-46 - Serving on a port an untracked process already holds is refused
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model explicitly on the occupied port
@@ -774,7 +783,7 @@ Feature: Model serving
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: serve-46 - Automatic serving skips an occupied default port
+  Scenario: serve-47 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection
@@ -784,7 +793,7 @@ Feature: Model serving
   # model) is already live on a different port, serve refuses instead of
   # reporting success on the old port. Same planted record and lane as serve-24.
   @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
-  Scenario: serve-47 - An explicit port that differs from a running equivalent service is refused
+  Scenario: serve-48 - An explicit port that differs from a running equivalent service is refused
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
     When the user serves that same model again on an explicit port other than the running one
@@ -795,7 +804,7 @@ Feature: Model serving
   # live managed service now holds, before it spawns anything. No GPU: the
   # refusal comes from the on-disk records.
   @id:serve-restart-refused-when-port-claimed @requires-os:linux
-  Scenario: serve-48 - Restarting a service whose port another service holds is refused
+  Scenario: serve-49 - Restarting a service whose port another service holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     And a stopped managed service is recorded on the default serve port

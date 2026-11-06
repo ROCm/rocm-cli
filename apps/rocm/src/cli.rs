@@ -460,6 +460,15 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Keep waiting until the server answers requests or its engine gives up
+        /// (vLLM and AIM after 5 minutes by default, raised with
+        /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
+        /// instead of returning `starting` after 45 seconds.
+        /// Also waits on a matching server that is already starting. Fails with a
+        /// pointer to the logs if the server exits first. Cannot be
+        /// combined with --foreground or --verbose, which already stay attached.
+        #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
+        wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
@@ -559,11 +568,16 @@ rocm serve qwen --verbose --device gpu_required")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm logs\n  \
 rocm logs --service <service-id>\n  \
+rocm logs --service <service-id> --follow\n  \
 rocm logs --search error timeout")]
     Logs {
         /// Show logs for a managed service id.
         #[arg(long)]
         service: Option<String>,
+        /// Keep printing new output for --service until the server stops (Ctrl-C ends the
+        /// follow and leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f', requires = "service")]
+        follow: bool,
         /// Search recent logs for one or more words.
         #[arg(long, num_args = 1.., value_name = "QUERY")]
         search: Vec<String>,
@@ -1047,6 +1061,10 @@ pub(crate) enum ServicesCommand {
     Logs {
         /// Service id from `rocm services list`.
         service_id: String,
+        /// Keep printing new output until the server stops (Ctrl-C ends the follow and
+        /// leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Stop a local model server.
     ///
@@ -1929,6 +1947,22 @@ mod tests {
         let mut argv = vec!["rocm", "serve", "qwen"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn serve_wait_parses_and_conflicts_with_attached_modes() {
+        let cli = parse_serve(&["--wait"]).expect("--wait parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: true, .. })
+        ));
+        let cli = parse_serve(&[]).expect("default parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: false, .. })
+        ));
+        assert!(parse_serve(&["--wait", "--verbose"]).is_err());
+        assert!(parse_serve(&["--wait", "--foreground"]).is_err());
     }
 
     #[test]
