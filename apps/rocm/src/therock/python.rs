@@ -274,18 +274,22 @@ pub(super) const fn python_requirement(layout: SourceLayout) -> PythonRequiremen
     }
 }
 
+fn managed_python_version_override() -> Option<String> {
+    std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION").ok()
+}
+
+/// The managed Python version a bootstrap prepares under the process
+/// environment. A decision made from an injected [`PythonResolverEnv`] asks
+/// [`PythonResolverEnv::managed_python_version`] instead.
 pub(super) fn managed_python_version(requirement: PythonRequirement) -> String {
-    std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| requirement.version.to_owned())
+    PythonResolverEnv::from_process_env().managed_python_version(requirement)
 }
 
 fn ensure_managed_python(
     paths: &AppPaths,
     requirement: PythonRequirement,
+    version: String,
 ) -> Result<PythonLauncher> {
-    let version = managed_python_version(requirement);
     progress_line(format!("Preparing Python {version}..."));
 
     let uv = ensure_uv_binary(paths)?;
@@ -402,16 +406,32 @@ pub(super) struct PythonResolverEnv {
     pub(super) python_override: Option<String>,
     /// The directories to search for an interpreter, in `PATH` order.
     pub(super) search_dirs: Vec<PathBuf>,
+    /// `ROCM_CLI_MANAGED_PYTHON_VERSION`: the version a managed bootstrap
+    /// prepares in place of the layout's own, when set and not blank.
+    pub(super) managed_python_version: Option<String>,
+    /// `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`: whether a host with no usable
+    /// interpreter is refused instead of bootstrapped.
+    pub(super) managed_bootstrap_disabled: bool,
 }
 
 impl PythonResolverEnv {
-    fn from_process_env() -> Self {
+    pub(super) fn from_process_env() -> Self {
         Self {
             python_override: std::env::var("ROCM_CLI_PYTHON").ok(),
             search_dirs: std::env::var_os("PATH")
                 .map(|value| split_runtime_path(&value))
                 .unwrap_or_default(),
+            managed_python_version: managed_python_version_override(),
+            managed_bootstrap_disabled: managed_python_bootstrap_disabled(),
         }
+    }
+
+    /// The managed Python version a bootstrap under this environment prepares.
+    fn managed_python_version(&self, requirement: PythonRequirement) -> String {
+        self.managed_python_version
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| requirement.version.to_owned())
     }
 }
 
@@ -532,7 +552,7 @@ fn plan_python_launcher_in(
     Ok(match lookup {
         PythonLookup::Found(launcher) => PlannedPython::Ready(launcher),
         PythonLookup::NeedsManagedBootstrap => {
-            let version = managed_python_version(requirement);
+            let version = env.managed_python_version(requirement);
             // `ROCM_CLI_MANAGED_PYTHON_VERSION` can name a version other than the
             // one the wheels need. A real install prepares it, finds it reports
             // the wrong tag and refuses (see `ensure_managed_python`), so the
@@ -723,7 +743,9 @@ fn resolve_python_launcher_in(
 ) -> Result<PythonLauncher> {
     match find_python_launcher_in(paths, env, requirement, LookupPurpose::Install)? {
         PythonLookup::Found(launcher) => Ok(launcher),
-        PythonLookup::NeedsManagedBootstrap => ensure_managed_python(paths, requirement),
+        PythonLookup::NeedsManagedBootstrap => {
+            ensure_managed_python(paths, requirement, env.managed_python_version(requirement))
+        }
     }
 }
 
@@ -797,7 +819,7 @@ fn find_python_launcher_in(
         });
     }
 
-    if managed_python_bootstrap_disabled() {
+    if env.managed_bootstrap_disabled {
         bail!(
             "unable to locate Python, and managed Python bootstrap is disabled by ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"
         );
@@ -1124,6 +1146,7 @@ exit 1
             &PythonResolverEnv {
                 python_override: None,
                 search_dirs: vec![bin_dir],
+                ..PythonResolverEnv::from_process_env()
             },
             python_requirement(SourceLayout::Canonical),
         )?;
@@ -1226,6 +1249,7 @@ exit 1
             &PythonResolverEnv {
                 python_override: None,
                 search_dirs: vec![bin_dir],
+                ..PythonResolverEnv::from_process_env()
             },
             python_requirement(SourceLayout::Canonical),
         )?;
@@ -1292,6 +1316,7 @@ exit 1
             let _guard = OverridePythonResolverEnv::new(PythonResolverEnv {
                 python_override: None,
                 search_dirs: vec![bin_dir.clone()],
+                ..PythonResolverEnv::from_process_env()
             });
             resolve_python_launcher(&paths, python_requirement(SourceLayout::Canonical))?
         };
@@ -1319,6 +1344,7 @@ exit 1
             let _outer = OverridePythonResolverEnv::new(PythonResolverEnv {
                 python_override: Some("outer".to_owned()),
                 search_dirs: vec![],
+                ..PythonResolverEnv::from_process_env()
             });
             assert_eq!(
                 python_resolver_env_override()
@@ -1331,6 +1357,7 @@ exit 1
                 let _inner = OverridePythonResolverEnv::new(PythonResolverEnv {
                     python_override: Some("inner".to_owned()),
                     search_dirs: vec![],
+                    ..PythonResolverEnv::from_process_env()
                 });
                 assert_eq!(
                     python_resolver_env_override()
@@ -1483,6 +1510,7 @@ exit 1
             let _resolver = OverridePythonResolverEnv::new(PythonResolverEnv {
                 python_override: None,
                 search_dirs: vec![self.search_dir.clone()],
+                ..PythonResolverEnv::from_process_env()
             });
             python_for_install(
                 &self.paths,

@@ -775,6 +775,7 @@ mod tests {
         let resolver_env_guard = OverridePythonResolverEnv::new(PythonResolverEnv {
             python_override: None,
             search_dirs: vec![bin_dir],
+            ..PythonResolverEnv::from_process_env()
         });
 
         PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
