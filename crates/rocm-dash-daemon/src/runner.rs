@@ -16,13 +16,18 @@ use crate::snapshot_ring::SnapshotRing;
 
 use chrono::{DateTime, Utc};
 use rocm_dash_collectors::amd_smi::AmdSmiCollector;
+/// The real `/dev/kfd`, re-exported so callers without a direct
+/// `rocm-dash-collectors` dependency can resolve their host-root view of it.
+pub use rocm_dash_collectors::amd_smi::KFD_DEVICE;
 use rocm_dash_collectors::bench_tail::CsvBenchTailer;
 use rocm_dash_collectors::docker::DockerDiscovery;
 use rocm_dash_collectors::host::HostCollector;
 use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
 use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
-use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
+use rocm_dash_core::metrics::{
+    GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationMetadata, Snapshot,
+};
 use rocm_dash_core::observation::GenerationObservationTracker;
 use rocm_dash_core::protocol::Event;
 use rocm_dash_core::state::{State, StateEvent};
@@ -85,11 +90,23 @@ pub struct RunnerOptions {
     /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
     /// that lets the amd-smi device pre-flight pass without a readable
     /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
-    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
-    /// deliberately don't depend on `rocm-core` to compute this themselves;
-    /// the caller (`apps/rocm`) does and passes the answer through. `false`
-    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    /// and `examine` already act on. This crate has no `rocm-core` dependency
+    /// to compute it with; `rocm-dash-collectors`, which does have one since
+    /// EAI-8457, still takes it threaded through rather than recomputing it, so
+    /// the dashboard cannot reach a different verdict about the same host than
+    /// `serve` and `examine` did. The caller (`apps/rocm`) computes it once and
+    /// passes the answer through both. `false` (the default) preserves the
+    /// bare-metal-only `/dev/kfd` check.
     pub amd_smi_gpu_reachable: bool,
+    /// Where the caller's hardware probes put `/dev/kfd`.
+    ///
+    /// This is `rocm_core::host_path`'s answer, threaded in like
+    /// `amd_smi_gpu_reachable`. The amd-smi pre-flight needs both this and
+    /// the real `/dev/kfd` to be readable, so a simulated host root can hide
+    /// the runner's GPU but never start `amd-smi` on a host without one.
+    /// Defaults to the real [`KFD_DEVICE`], and equals it in every build
+    /// without a simulated root, which leaves the pre-flight unchanged.
+    pub amd_smi_host_kfd_device: PathBuf,
     /// **Test-only.** When set, cycle timestamps come from the logical clock
     /// this file controls instead of `Utc::now()` — see [`TestClockDirective`]
     /// for the file's grammar. Production callers leave this unset; E2E
@@ -117,6 +134,7 @@ impl Default for RunnerOptions {
             amd_smi_binary: None,
             amd_smi_skip_device_preflight: false,
             amd_smi_gpu_reachable: false,
+            amd_smi_host_kfd_device: PathBuf::from(KFD_DEVICE),
             test_clock_offset_path: None,
         }
     }
@@ -245,21 +263,24 @@ fn parse_test_clock_directive(value: &str) -> Option<TestClockDirective> {
 /// test can assert on without spawning the task or touching a real binary.
 enum AmdSmiDetectPlan {
     SkipDevicePreflight(OsString),
-    Detect(OsString, bool),
+    /// Binary, `gpu_reachable` verdict, host-root view of `/dev/kfd`.
+    Detect(OsString, bool, PathBuf),
 }
 
 /// `amd_smi_binary: None` means "no override", not "no detection" — it still
 /// runs the real pre-flight against the literal `amd-smi` command name, with
-/// the same threaded `gpu_reachable` verdict as an explicit binary.
+/// the same threaded `gpu_reachable` verdict and `host_kfd_device` as an
+/// explicit binary.
 fn amd_smi_detect_plan(
     binary: Option<OsString>,
     skip_device_preflight: bool,
     gpu_reachable: bool,
+    host_kfd_device: PathBuf,
 ) -> AmdSmiDetectPlan {
     match binary {
         Some(binary) if skip_device_preflight => AmdSmiDetectPlan::SkipDevicePreflight(binary),
-        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable),
-        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable),
+        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device),
+        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable, host_kfd_device),
     }
 }
 
@@ -299,7 +320,7 @@ pub async fn run_loop(
 
     // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
     // configured). Distinct from Docker/vLLM discovery — a local server, not a
-    // container — so it is tracked separately from `known_instances`.
+    // container — so it is tracked separately from the Docker known set.
     let lemonade = if opts.enable_lemonade {
         info!(
             host = %opts.lemonade_host,
@@ -314,9 +335,6 @@ pub async fn run_loop(
     } else {
         None
     };
-    // The id of the currently-live Lemonade instance, if any.
-    let mut lemonade_id: Option<String> = None;
-
     let mut bench = opts.bench_csv.as_ref().map(|p| {
         info!(path = %p.display(), "tailing benchmark CSV");
         CsvBenchTailer::new(p.clone())
@@ -333,20 +351,8 @@ pub async fn run_loop(
     } else {
         None
     };
-    let mut known_instances: HashSet<String> = HashSet::new();
-    // Managed-service registry: ids surfaced from the rocm-cli
-    // `serve` registry, and the subset whose engine is NOT vLLM (excluded from
-    // the vLLM Prometheus scrape so they aren't mis-parsed).
-    let mut known_services: HashSet<String> = HashSet::new();
-    let mut managed_non_vllm: HashSet<String> = HashSet::new();
-    // Per-instance generation-throughput tracker. Keyed by container_id.
-    // Constructed lazily from opts.instance_tick; survives scrape failures so
-    // the last-observed rate is held for the validity window before clearing.
-    let mut gen_trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-    // Previous TTFT / TPOT histogram readings (sum_s, count, at) per instance,
-    // for the windowed avg-ms derivation (mirrors `prev_gen_tokens`).
-    let mut prev_ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-    let mut prev_tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+    let mut discovery = DiscoveryState::default();
+    let mut telemetry = TelemetryState::default();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
     // on the instance cadence and reused every tick so the attributed value is
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
@@ -365,6 +371,7 @@ pub async fn run_loop(
         opts.amd_smi_binary.clone(),
         opts.amd_smi_skip_device_preflight,
         opts.amd_smi_gpu_reachable,
+        opts.amd_smi_host_kfd_device.clone(),
     );
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
@@ -373,8 +380,8 @@ pub async fn run_loop(
             AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
                 AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
-                AmdSmiCollector::detect_with_binary(binary, gpu_reachable).await
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device) => {
+                AmdSmiCollector::detect_with_binary(binary, gpu_reachable, &host_kfd_device).await
             }
         };
         let info = match &gpu {
@@ -389,10 +396,16 @@ pub async fn run_loop(
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
+    // Static per-GPU power caps (`amd-smi static`), refreshed on the sysinfo
+    // cadence and stamped onto each tick's metrics. `None` until first fetched.
+    let mut power_limits: HashMap<String, f32> = HashMap::new();
+    let mut last_power_limit_refresh: Option<u64> = None;
+    let mut warned_no_power_limits = false;
     // Discovery/scrape warnings are produced on their own (slower) cadences, so
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
     let mut docker_warn: Option<String> = None;
+    let mut registry_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
 
     loop {
@@ -448,8 +461,42 @@ pub async fn run_loop(
         }
 
         let mut warnings = Vec::new();
-        let gpus = if let Some(g) = &gpu {
-            match g.metrics().await {
+        // Power caps are static, so they refresh on the sysinfo cadence. Fetch
+        // them alongside this tick's metrics instead of ahead of it, so the
+        // refresh tick pays one amd-smi round trip, not two in a row.
+        let refresh_limits = gpu.is_some()
+            && last_power_limit_refresh
+                .is_none_or(|at| tick_count.saturating_sub(at) >= sysinfo_refresh_ticks);
+        let mut gpus = if let Some(g) = &gpu {
+            let (limits, metrics) = tokio::join!(
+                async {
+                    if refresh_limits {
+                        Some(g.power_limits().await)
+                    } else {
+                        None
+                    }
+                },
+                g.metrics()
+            );
+            if let Some(res) = limits {
+                match res {
+                    // An empty map (a schema the parser no longer matches) must
+                    // not wipe caps we already hold, and is worth saying once.
+                    Ok(l) if l.is_empty() => {
+                        if power_limits.is_empty() && !warned_no_power_limits {
+                            warn!(
+                                "amd-smi static reported no readable power cap; power stays uncolored"
+                            );
+                            warned_no_power_limits = true;
+                        }
+                    }
+                    Ok(l) => power_limits = l,
+                    // A failed fetch keeps the previous caps; retry next interval.
+                    Err(_) => {}
+                }
+                last_power_limit_refresh = Some(tick_count);
+            }
+            match metrics {
                 Ok(v) => v,
                 Err(e) => {
                     warnings.push(format!("amd-smi metric: {e}"));
@@ -470,7 +517,7 @@ pub async fn run_loop(
             // both causes are named since either is possible here.
             warnings.push(if opts.amd_smi_gpu_reachable {
                 "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
-                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 detected by other means (WSL ROCDXG bridge) - if it is installed, this GPU \
                  model may not be supported by the installed amd-smi/ROCm, or not supported on \
                  WSL yet"
                     .into()
@@ -488,6 +535,10 @@ pub async fn run_loop(
             Vec::new()
         };
 
+        for g in &mut gpus {
+            g.power_limit_w = power_limits.get(&g.device_id).copied();
+        }
+
         if gpu.is_some()
             && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks
             && let Some(g) = &gpu
@@ -496,76 +547,30 @@ pub async fn run_loop(
             last_sysinfo_refresh = tick_count;
         }
 
-        // Service discovery — every DISCOVERY_TICKS ticks, diff vs known set,
-        // emit Discovered/Gone events, and update reducer state.
+        // Service discovery — every `discovery_ticks` ticks, reconcile each
+        // source against what it had live before, emit Discovered/Gone events,
+        // and update reducer state.
+        let discovery_due = tick_count == 1 || tick_count.is_multiple_of(discovery_ticks);
+        let mut reconcile = Reconcile {
+            state: &mut runner.state,
+            telemetry: &mut telemetry,
+            tx: &tx,
+            persist: persist.as_ref(),
+        };
         if let Some(d) = docker.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
             match d.discover_async().await {
                 Ok(svcs) => {
                     let seen: HashSet<String> =
                         svcs.iter().map(|s| s.container_id.clone()).collect();
-                    for svc in &svcs {
-                        let existing = runner.state.instances.get(&svc.container_id).cloned();
-                        // Endpoint change: same container-id, new port → new logical service.
-                        // Invalidate the rate baseline and latency windows so the new
-                        // scrape address starts fresh.
-                        let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                        if !same_endpoint {
-                            invalidate_on_endpoint_change(
-                                &svc.container_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                        let inst = merge_discovery_refresh(
-                            svc,
-                            if same_endpoint {
-                                existing.as_ref()
-                            } else {
-                                None
-                            },
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceUpserted(inst.clone()));
-                        if !known_instances.contains(&svc.container_id) {
-                            info!(
-                                id = %svc.container_id,
-                                name = %svc.container_name,
-                                model = %svc.model_name,
-                                "instance discovered"
-                            );
-                            // InstanceDiscovered is a discovery-metadata event; broadcast
-                            // a clean instance (no prior collector-owned telemetry).
-                            broadcast_and_persist(
-                                &tx,
-                                persist.as_ref(),
-                                Event::InstanceDiscovered(instance_from_discovered(svc)),
-                            );
-                        }
-                    }
-                    for gone in known_instances.difference(&seen) {
-                        info!(id = %gone, "instance gone");
-                        purge_telemetry_state(
-                            gone,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner
-                            .state
-                            .apply(StateEvent::InstanceRemoved(gone.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone {
-                                container_id: gone.clone(),
-                            },
-                        );
-                    }
-                    known_instances = seen;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Docker,
+                        &svcs,
+                        &discovery.known_instances,
+                        &seen,
+                    );
+                    discovery.known_instances = seen;
                     docker_warn = None;
                 }
                 Err(e) => docker_warn = Some(format!("docker discover: {e}")),
@@ -575,70 +580,11 @@ pub async fn run_loop(
         // Lemonade discovery — probe the endpoint on the discovery cadence; add a
         // Lemonade Instance when reachable, emit Gone when it disappears, and stay
         // a clean no-op (no warning/panic) when no endpoint is configured.
-        //
-        // The Lemonade `container_id` encodes the host and port
-        // (`<host>:<port>`), so a port or host change produces a new id string
-        // and is treated as a full identity change (old gone, new discovered).
         if let Some(l) = lemonade.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
-            match l.discover().await {
-                Some(svc) => {
-                    let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
-                    if is_new_id {
-                        // New identity: purge all telemetry state for the old id so
-                        // stale rate baseline, TTFT, and TPOT do not bleed across.
-                        if let Some(old_id) = lemonade_id.as_deref() {
-                            purge_telemetry_state(
-                                old_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                    }
-                    let existing = runner.state.instances.get(&svc.container_id).cloned();
-                    let inst = merge_discovery_refresh(
-                        &svc,
-                        if is_new_id { None } else { existing.as_ref() },
-                    );
-                    runner
-                        .state
-                        .apply(StateEvent::InstanceUpserted(inst.clone()));
-                    if is_new_id {
-                        info!(
-                            id = %svc.container_id,
-                            model = %svc.model_name,
-                            "lemonade instance discovered"
-                        );
-                        // InstanceDiscovered is a discovery-metadata event; broadcast
-                        // a clean instance (no prior collector-owned telemetry).
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceDiscovered(instance_from_discovered(&svc)),
-                        );
-                        lemonade_id = Some(svc.container_id.clone());
-                    }
-                }
-                None => {
-                    if let Some(id) = lemonade_id.take() {
-                        info!(id = %id, "lemonade instance gone");
-                        purge_telemetry_state(
-                            &id,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone { container_id: id },
-                        );
-                    }
-                }
-            }
+            let probed = l.discover().await;
+            reconcile.reconcile_lemonade(probed, &mut discovery.lemonade_id);
         }
 
         // Managed-service registry discovery — read the rocm-cli
@@ -646,64 +592,47 @@ pub async fn run_loop(
         // the registry's authority; non-vLLM engines are tracked so the vLLM
         // scrape below skips them. A model served via `rocm serve` thus appears
         // in the dashboard and is scraped for `gen_tps` without Docker.
+        //
+        // A pass that could not read the registry in full retires nothing, as
+        // with the Docker source above: what is known stays known (no `Gone`),
+        // and the instances keep the data they hold. Unlike Docker, whose listing
+        // is all or nothing, a registry can fail on one record while the rest
+        // read, so the readable records still add and refresh their services
+        // (announced once, as ever). Only a registry that was read in full, even
+        // an empty one, retires what it lacks.
         if let Some(services_dir) = opts.services_dir.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
+            && discovery_due
         {
-            let records = crate::registry::load_service_records(services_dir);
-            let disc = crate::registry::discover_managed_services(&records);
-            managed_non_vllm = disc.non_vllm;
-            for svc in disc.svcs {
-                let id = svc.container_id.clone();
-                let is_new = !known_services.contains(&id);
-                let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; reset rate baseline and
-                // latency windows so the new port starts fresh.
-                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                if !same_endpoint {
-                    invalidate_on_endpoint_change(
-                        &id,
-                        &mut gen_trackers,
-                        &mut prev_ttft,
-                        &mut prev_tpot,
+            let read = crate::registry::read_service_records(services_dir);
+            let change = discovery.registry_health.observe(&read);
+            change.log();
+            match read {
+                Ok(read) => {
+                    let disc = crate::registry::discover_managed_services(&read.records);
+                    discovery.managed_non_vllm = disc.non_vllm;
+                    reconcile.reconcile_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
+                        &disc.seen,
                     );
+                    discovery.known_services = disc.seen;
+                    registry_warn = None;
                 }
-                let inst = merge_discovery_refresh(
-                    &svc,
-                    if same_endpoint {
-                        existing.as_ref()
-                    } else {
-                        None
-                    },
-                );
-                runner
-                    .state
-                    .apply(StateEvent::InstanceUpserted(inst.clone()));
-                if is_new {
-                    info!(id = %id, "managed service discovered");
-                    // InstanceDiscovered is a discovery-metadata event; broadcast
-                    // a clean instance (no prior collector-owned telemetry).
-                    broadcast_and_persist(
-                        &tx,
-                        persist.as_ref(),
-                        Event::InstanceDiscovered(instance_from_discovered(&svc)),
+                Err(e) => {
+                    // The records that did read still add and refresh their
+                    // services; nothing is retired, because the one that did
+                    // not read could be any of the known ones.
+                    let disc = crate::registry::discover_managed_services(&e.partial.records);
+                    reconcile.upsert_set(
+                        DiscoverySource::Managed,
+                        &disc.svcs,
+                        &discovery.known_services,
                     );
+                    discovery.keep_through_partial_registry(disc);
+                    registry_warn = Some(registry_read_warning(&e));
                 }
             }
-            for gone in known_services.difference(&disc.seen) {
-                info!(id = %gone, "managed service gone");
-                purge_telemetry_state(gone, &mut gen_trackers, &mut prev_ttft, &mut prev_tpot);
-                runner
-                    .state
-                    .apply(StateEvent::InstanceRemoved(gone.clone()));
-                broadcast_and_persist(
-                    &tx,
-                    persist.as_ref(),
-                    Event::InstanceGone {
-                        container_id: gone.clone(),
-                    },
-                );
-            }
-            known_services = disc.seen;
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
@@ -717,14 +646,11 @@ pub async fn run_loop(
             && !runner.state.instances.is_empty()
             && tick_count.is_multiple_of(instance_ticks)
         {
-            let targets: Vec<(String, u16)> = runner
-                .state
-                .instances
-                .values()
-                .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
-                .filter(|i| !managed_non_vllm.contains(&i.container_id))
-                .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
-                .collect();
+            let targets = vllm_scrape_targets(
+                &runner.state.instances,
+                discovery.lemonade_id.as_deref(),
+                &discovery.managed_non_vllm,
+            );
             let prom = prom.clone();
             let results = parallel_scrape(targets, move |(id, port)| {
                 let prom = prom.clone();
@@ -747,7 +673,8 @@ pub async fn run_loop(
                         // cumulative counter when present; omitted counter leaves
                         // the tracker (and its held value) untouched.
                         if let Some(cur) = sample.gen_tokens_total {
-                            gen_trackers
+                            telemetry
+                                .gen_trackers
                                 .entry(id.clone())
                                 .or_insert_with(|| {
                                     GenerationObservationTracker::new(opts.instance_tick)
@@ -758,17 +685,21 @@ pub async fn run_loop(
                         // assembly below (tracker.snapshot per cycle_at).
                         //
                         // Windowed avg latency (ms) from the cumulative TTFT/TPOT
-                        // histograms; cumulative-average fallback on first scrape.
-                        let ttft_ms = avg_ms_from_histogram(
-                            &mut prev_ttft,
+                        // histograms. Only a window with new requests produces a
+                        // value; the tracker holds it, then expires it, in the
+                        // snapshot assembly below.
+                        observe_latency(
+                            &mut telemetry.prev_ttft,
                             &id,
+                            opts.instance_tick,
                             sample.ttft_sum_s,
                             sample.ttft_count,
                             cycle_at,
                         );
-                        let tpot_ms = avg_ms_from_histogram(
-                            &mut prev_tpot,
+                        observe_latency(
+                            &mut telemetry.prev_tpot,
                             &id,
+                            opts.instance_tick,
                             sample.tpot_sum_s,
                             sample.tpot_count,
                             cycle_at,
@@ -777,8 +708,6 @@ pub async fn run_loop(
                             inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                             inst.running_reqs = sample.running_reqs;
                             inst.waiting_reqs = sample.waiting_reqs;
-                            inst.ttft_ms = ttft_ms;
-                            inst.tpot_ms = tpot_ms;
                             // Docker-discovered instances have no
                             // `ManagedServiceRecord` to promote their status, so
                             // they start life as `Starting`. A successful vLLM
@@ -801,18 +730,11 @@ pub async fn run_loop(
                         // window (clamp(3×instance_tick, 6s, 30s)) and only clears
                         // it after expiry — satisfying the "held" contract.
                         //
-                        // Clear TTFT/TPOT baselines so recovery re-baselines from
-                        // the next successful scrape (latency clearing semantics
-                        // are unchanged; freshness generalization is out of scope).
-                        prev_ttft.remove(&id);
-                        prev_tpot.remove(&id);
-                        if let Some(mut inst) = runner.state.instances.get(&id).cloned()
-                            && (inst.ttft_ms.is_some() || inst.tpot_ms.is_some())
-                        {
-                            inst.ttft_ms = None;
-                            inst.tpot_ms = None;
-                            runner.state.apply(StateEvent::InstanceUpserted(inst));
-                        }
+                        // Drop the TTFT/TPOT baselines so recovery re-baselines
+                        // from the next successful scrape; the trackers keep the
+                        // last windowed value Held until its validity lapses.
+                        rebaseline_latency(&mut telemetry.prev_ttft, &id);
+                        rebaseline_latency(&mut telemetry.prev_tpot, &id);
                     }
                 }
             }
@@ -827,7 +749,7 @@ pub async fn run_loop(
         // Lemonade per-instance scrape — reports an instantaneous rate directly
         // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
         // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone())
+        if let (Some(l), Some(id)) = (lemonade.as_ref(), discovery.lemonade_id.clone())
             && tick_count.is_multiple_of(instance_ticks)
         {
             match l.fetch_stats().await {
@@ -837,7 +759,8 @@ pub async fn run_loop(
                     // erase or refresh the tracker; the held value stays valid until
                     // the validity window expires.
                     if let Some(rate) = sample.gen_tps {
-                        gen_trackers
+                        telemetry
+                            .gen_trackers
                             .entry(id.clone())
                             .or_insert_with(|| {
                                 GenerationObservationTracker::new(opts.instance_tick)
@@ -899,11 +822,16 @@ pub async fn run_loop(
         // metadata) before computing tokens_per_watt so the efficiency field
         // always derives from the current cycle's valid/held/expired rate.
         for inst in &mut instances {
-            let (gen_tps, meta) = gen_trackers
+            let (gen_tps, meta) = telemetry
+                .gen_trackers
                 .get_mut(&inst.container_id)
                 .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
+            (inst.ttft_ms, inst.ttft_observation) =
+                snapshot_latency(&mut telemetry.prev_ttft, &inst.container_id, cycle_at);
+            (inst.tpot_ms, inst.tpot_observation) =
+                snapshot_latency(&mut telemetry.prev_tpot, &inst.container_id, cycle_at);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -911,9 +839,14 @@ pub async fn run_loop(
         // don't line up with any amd-smi device_id — the silent-None failure
         // mode on real hardware, surfaced via the header ⚠ badge.
         let mut id_join_misses = 0usize;
-        for inst in &mut instances {
+        // Split each GPU's power among the instances sharing it, so two
+        // instances on one board don't both claim all of it.
+        let attributed =
+            rocm_dash_core::efficiency::attribute_power_w(&instances, &gpus, &per_container_used);
+        for (inst, power_w) in instances.iter_mut().zip(attributed) {
+            inst.power_w = power_w;
             inst.tokens_per_watt =
-                rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, &inst.gpu_ids, &gpus);
+                rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, power_w);
             if inst.gen_tps.is_some()
                 && !inst.gpu_ids.is_empty()
                 && !gpus.is_empty()
@@ -935,7 +868,12 @@ pub async fn run_loop(
             if let Some(entry) = runner.state.instances.get_mut(&inst.container_id) {
                 entry.gen_tps = inst.gen_tps;
                 entry.gen_tps_observation = inst.gen_tps_observation.clone();
+                entry.ttft_ms = inst.ttft_ms;
+                entry.ttft_observation = inst.ttft_observation.clone();
+                entry.tpot_ms = inst.tpot_ms;
+                entry.tpot_observation = inst.tpot_observation.clone();
                 entry.tokens_per_watt = inst.tokens_per_watt;
+                entry.power_w = inst.power_w;
             }
         }
         // Attribute per-instance VRAM (per-process where the cgroup join hit,
@@ -944,14 +882,7 @@ pub async fn run_loop(
         // Warn only when a real process scrape happened but an instance with
         // live GPUs still fell back to device-summed (cgroup join missed).
         if procs_nonempty {
-            let vram_fallbacks = instances
-                .iter()
-                .filter(|i| {
-                    !i.gpu_ids.is_empty()
-                        && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, &gpus)
-                        && !per_container_used.contains_key(&i.container_id)
-                })
-                .count();
+            let vram_fallbacks = count_vram_join_misses(&instances, &gpus, &per_container_used);
             if vram_fallbacks > 0 {
                 scrape_warns.push(format!(
                     "vram attribution: {vram_fallbacks} instance(s) fell back to device-summed \
@@ -960,6 +891,7 @@ pub async fn run_loop(
             }
         }
         warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(registry_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1000,35 +932,27 @@ pub async fn run_loop(
     }
 }
 
-/// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
-/// baselines.  Call on explicit removal (Docker Gone, Lemonade Gone, managed
-/// Gone) and whenever an identity change requires a clean slate.
-pub(crate) fn purge_telemetry_state(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-) {
-    gen_trackers.remove(id);
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
-}
-
-/// Invalidate the generation tracker for `id` (reset baseline without
-/// removing the map entry) and clear the TTFT/TPOT latency windows.
-/// Called when an endpoint changes within the same container/service id so
-/// the new scrape address starts with a fresh rate baseline.
-pub(crate) fn invalidate_on_endpoint_change(
-    id: &str,
-    gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-) {
-    if let Some(t) = gen_trackers.get_mut(id) {
-        t.invalidate();
-    }
-    prev_ttft.remove(id);
-    prev_tpot.remove(id);
+/// Instances that *could* have joined the per-process VRAM map but did not.
+///
+/// The map is keyed by docker/containerd ids read from `/proc/<pid>/cgroup`,
+/// so only an instance whose id has that shape can ever hit it. A managed
+/// `rocm serve` service (named by its service id) falls back to device-summed
+/// VRAM by design, and counting it would raise a false "check /proc access"
+/// warning on every healthy managed instance.
+fn count_vram_join_misses<S: std::hash::BuildHasher>(
+    instances: &[Instance],
+    gpus: &[GpuMetrics],
+    per_container_used: &HashMap<String, u64, S>,
+) -> usize {
+    instances
+        .iter()
+        .filter(|i| {
+            rocm_dash_collectors::cgroup::is_container_id(&i.container_id)
+                && !i.gpu_ids.is_empty()
+                && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, gpus)
+                && !per_container_used.contains_key(&i.container_id)
+        })
+        .count()
 }
 
 /// Build an `Instance` from a `DiscoveredService` with no live KV/req sample yet.
@@ -1068,10 +992,343 @@ pub(crate) fn merge_discovery_refresh(
         inst.gen_tps = ex.gen_tps;
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
         inst.tokens_per_watt = ex.tokens_per_watt;
+        inst.power_w = ex.power_w;
         inst.ttft_ms = ex.ttft_ms;
+        inst.ttft_observation = ex.ttft_observation.clone();
         inst.tpot_ms = ex.tpot_ms;
+        inst.tpot_observation = ex.tpot_observation.clone();
     }
     inst
+}
+
+/// Per-instance telemetry the loop carries between scrapes, keyed by container id.
+#[derive(Default)]
+struct TelemetryState {
+    /// Generation-throughput trackers. Constructed lazily from
+    /// `opts.instance_tick`; they survive scrape failures so the last-observed
+    /// rate is held for the validity window before clearing.
+    gen_trackers: HashMap<String, GenerationObservationTracker>,
+    /// Previous TTFT / TPOT histogram readings plus a freshness tracker per
+    /// instance, for the windowed avg-ms derivation (mirrors `gen_trackers`).
+    prev_ttft: LatencyWindows,
+    prev_tpot: LatencyWindows,
+}
+
+impl TelemetryState {
+    /// Remove all per-service telemetry state for `id`: tracker, TTFT, and
+    /// TPOT baselines.  Call on explicit removal (Docker Gone, Lemonade Gone,
+    /// managed Gone) and whenever an identity change requires a clean slate.
+    fn purge(&mut self, id: &str) {
+        self.gen_trackers.remove(id);
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
+    }
+
+    /// Invalidate the generation tracker for `id` (reset baseline without
+    /// removing the map entry) and clear the TTFT/TPOT latency windows.
+    /// Called when an endpoint changes within the same container/service id so
+    /// the new scrape address starts with a fresh rate baseline.
+    fn invalidate_on_endpoint_change(&mut self, id: &str) {
+        if let Some(t) = self.gen_trackers.get_mut(id) {
+            t.invalidate();
+        }
+        self.prev_ttft.remove(id);
+        self.prev_tpot.remove(id);
+    }
+}
+
+/// What each discovery source currently has live, so a pass can tell a new
+/// service from a known one and a known one from one that has gone.
+#[derive(Default)]
+struct DiscoveryState {
+    /// Container ids the last Docker pass saw.
+    known_instances: HashSet<String>,
+    /// Ids the last managed-service registry pass surfaced.
+    known_services: HashSet<String>,
+    /// The subset of the registry ids whose engine is NOT vLLM, excluded from
+    /// the vLLM Prometheus scrape so they aren't mis-parsed.
+    managed_non_vllm: HashSet<String>,
+    /// The id of the currently-live Lemonade instance, if any.
+    lemonade_id: Option<String>,
+    /// How the registry reads have been going, so a condition that lasts many
+    /// passes is logged once rather than every discovery tick.
+    registry_health: RegistryHealth,
+}
+
+impl DiscoveryState {
+    /// Record what a pass that read only part of the registry found. The services
+    /// it saw join the known set, so a later complete read can retire them, and
+    /// the known ones it did not see stay; the non-vLLM marks of the services it
+    /// saw are refreshed and the others kept, so a kept non-vLLM service is still
+    /// left out of the vLLM scrape.
+    fn keep_through_partial_registry(&mut self, disc: crate::registry::ManagedDiscovery) {
+        self.managed_non_vllm.retain(|id| !disc.seen.contains(id));
+        self.managed_non_vllm.extend(disc.non_vllm);
+        self.known_services.extend(disc.seen);
+    }
+}
+
+/// What the managed-service registry's reads have reported so far. A failure
+/// that lasts is logged on its first pass only, the recovery once, and a set of
+/// malformed records each time it changes; the dashboard's warning badge, which
+/// is cheap and does not scroll, carries the failure for as long as it lasts.
+#[derive(Default)]
+struct RegistryHealth {
+    /// The previous pass could not read the registry.
+    failing: bool,
+    /// The malformed records the last successful pass reported, so an unchanged
+    /// set is not reported again.
+    reported_malformed: Vec<PathBuf>,
+}
+
+/// What a discovery pass should say about the registry, apart from the services
+/// it found. Kept as data so [`RegistryHealth::observe`] can be tested without a
+/// log subscriber.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegistryChange {
+    /// The first failed pass of a streak, with the error.
+    failed: Option<String>,
+    /// The first successful pass after a streak of failures.
+    recovered: bool,
+    /// The malformed records, when the set differs from the one last reported
+    /// and is not empty.
+    malformed: Vec<PathBuf>,
+}
+
+impl RegistryHealth {
+    fn observe(
+        &mut self,
+        read: &Result<crate::registry::RegistryRead, crate::registry::RegistryReadError>,
+    ) -> RegistryChange {
+        let mut change = RegistryChange::default();
+        match read {
+            Err(e) => {
+                if !self.failing {
+                    self.failing = true;
+                    change.failed = Some(e.to_string());
+                }
+            }
+            Ok(read) => {
+                if self.failing {
+                    self.failing = false;
+                    change.recovered = true;
+                }
+                if read.malformed != self.reported_malformed {
+                    self.reported_malformed.clone_from(&read.malformed);
+                    change.malformed.clone_from(&read.malformed);
+                }
+            }
+        }
+        change
+    }
+}
+
+impl RegistryChange {
+    fn log(&self) {
+        if let Some(error) = &self.failed {
+            warn!(
+                error = %error,
+                "managed-service registry could not be read; keeping the known services until it can be"
+            );
+        }
+        if self.recovered {
+            info!("managed-service registry is readable again");
+        }
+        if !self.malformed.is_empty() {
+            warn!(
+                files = ?self.malformed,
+                "skipping managed-service records that are not valid JSON"
+            );
+        }
+    }
+}
+
+/// The header warning for a pass that could not read the registry.
+fn registry_read_warning(error: &crate::registry::RegistryReadError) -> String {
+    format!("managed registry: {error}; keeping the last known services")
+}
+
+/// Which discovery source a service came from. It only selects the log wording
+/// in [`Reconcile::announce`] and [`Reconcile::retire`]; those two steps behave
+/// the same for every source. How a pass decides what is new, known or gone
+/// differs: Docker and the registry go through `reconcile_set`, Lemonade through
+/// `reconcile_lemonade`.
+#[derive(Clone, Copy)]
+enum DiscoverySource {
+    Docker,
+    Lemonade,
+    Managed,
+}
+
+impl DiscoverySource {
+    fn log_discovered(self, svc: &DiscoveredService) {
+        match self {
+            Self::Docker => info!(
+                id = %svc.container_id,
+                name = %svc.container_name,
+                model = %svc.model_name,
+                "instance discovered"
+            ),
+            Self::Lemonade => info!(
+                id = %svc.container_id,
+                model = %svc.model_name,
+                "lemonade instance discovered"
+            ),
+            Self::Managed => info!(id = %svc.container_id, "managed service discovered"),
+        }
+    }
+
+    fn log_gone(self, id: &str) {
+        match self {
+            Self::Docker => info!(id = %id, "instance gone"),
+            Self::Lemonade => info!(id = %id, "lemonade instance gone"),
+            Self::Managed => info!(id = %id, "managed service gone"),
+        }
+    }
+}
+
+/// The loop state a discovery pass changes, and the stream it announces on.
+struct Reconcile<'a> {
+    state: &'a mut State,
+    telemetry: &'a mut TelemetryState,
+    tx: &'a broadcast::Sender<Event>,
+    persist: Option<&'a Arc<Mutex<SessionWriter>>>,
+}
+
+impl Reconcile<'_> {
+    /// Upsert a (re)discovered service. Collector-owned fields carry over from
+    /// the instance already in state unless `carry_live` is false, which is how
+    /// a changed identity starts from a clean baseline.
+    fn upsert(&mut self, svc: &DiscoveredService, carry_live: bool) {
+        let existing = self.state.instances.get(&svc.container_id).cloned();
+        let inst = merge_discovery_refresh(svc, if carry_live { existing.as_ref() } else { None });
+        self.state.apply(StateEvent::InstanceUpserted(inst));
+    }
+
+    /// Announce a newly discovered service. InstanceDiscovered is a
+    /// discovery-metadata event: it carries a clean instance, with no prior
+    /// collector-owned telemetry.
+    fn announce(&self, source: DiscoverySource, svc: &DiscoveredService) {
+        source.log_discovered(svc);
+        broadcast_and_persist(
+            self.tx,
+            self.persist,
+            Event::InstanceDiscovered(instance_from_discovered(svc)),
+        );
+    }
+
+    /// Drop a service that has gone: purge its telemetry, remove it from state
+    /// and announce it.
+    fn retire(&mut self, source: DiscoverySource, id: &str) {
+        source.log_gone(id);
+        self.telemetry.purge(id);
+        self.state
+            .apply(StateEvent::InstanceRemoved(id.to_string()));
+        broadcast_and_persist(
+            self.tx,
+            self.persist,
+            Event::InstanceGone {
+                container_id: id.to_string(),
+            },
+        );
+    }
+
+    /// Reconcile a source that reports its whole set each pass (Docker, the
+    /// managed-service registry). `known` is what the previous pass saw and
+    /// `seen` what this one saw; the caller stores `seen` as the next `known`.
+    ///
+    /// A service whose port changed under the same id has a new scrape address:
+    /// its rate baseline and latency windows are reset and no live fields carry
+    /// over. It is still the same service, so it is not announced again.
+    fn reconcile_set(
+        &mut self,
+        source: DiscoverySource,
+        svcs: &[DiscoveredService],
+        known: &HashSet<String>,
+        seen: &HashSet<String>,
+    ) {
+        self.upsert_set(source, svcs, known);
+        for gone in known.difference(seen) {
+            self.retire(source, gone);
+        }
+    }
+
+    /// The half of [`Self::reconcile_set`] that adds and refreshes: upsert every
+    /// service in `svcs` and announce the ones `known` did not have. Retires
+    /// nothing, which is what a pass that could only see part of its source needs
+    /// (see [`DiscoveryState::keep_through_partial_registry`]).
+    fn upsert_set(
+        &mut self,
+        source: DiscoverySource,
+        svcs: &[DiscoveredService],
+        known: &HashSet<String>,
+    ) {
+        for svc in svcs {
+            let same_endpoint = self
+                .state
+                .instances
+                .get(&svc.container_id)
+                .is_none_or(|ex| ex.port == svc.port);
+            if !same_endpoint {
+                self.telemetry
+                    .invalidate_on_endpoint_change(&svc.container_id);
+            }
+            self.upsert(svc, same_endpoint);
+            if !known.contains(&svc.container_id) {
+                self.announce(source, svc);
+            }
+        }
+    }
+
+    /// Reconcile the probe-based Lemonade source, which has at most one service.
+    ///
+    /// Its `container_id` encodes the host and port, so a port or host change
+    /// yields a new id. The old id is retired first (its telemetry is purged, so
+    /// a stale rate baseline, TTFT and TPOT do not bleed across; it leaves the
+    /// state and is announced gone), then the new id is announced, so the state
+    /// and every snapshot carry one Lemonade instance and the vLLM scrape never
+    /// polls the old endpoint. `None` means the endpoint did not answer, which
+    /// retires the current one.
+    fn reconcile_lemonade(
+        &mut self,
+        probed: Option<DiscoveredService>,
+        current: &mut Option<String>,
+    ) {
+        match probed {
+            Some(svc) => {
+                let is_new_id = current.as_deref() != Some(svc.container_id.as_str());
+                if is_new_id && let Some(old_id) = current.take() {
+                    self.retire(DiscoverySource::Lemonade, &old_id);
+                }
+                self.upsert(&svc, !is_new_id);
+                if is_new_id {
+                    self.announce(DiscoverySource::Lemonade, &svc);
+                    *current = Some(svc.container_id.clone());
+                }
+            }
+            None => {
+                if let Some(id) = current.take() {
+                    self.retire(DiscoverySource::Lemonade, &id);
+                }
+            }
+        }
+    }
+}
+
+/// The `(id, port)` pairs the per-instance vLLM Prometheus scrape polls: every
+/// instance with a port except the live Lemonade instance (its own collector
+/// scrapes it) and the managed services whose engine is not vLLM.
+fn vllm_scrape_targets(
+    instances: &HashMap<String, Instance>,
+    lemonade_id: Option<&str>,
+    managed_non_vllm: &HashSet<String>,
+) -> Vec<(String, u16)> {
+    instances
+        .values()
+        .filter(|i| Some(i.container_id.as_str()) != lemonade_id)
+        .filter(|i| !managed_non_vllm.contains(&i.container_id))
+        .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
+        .collect()
 }
 
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process
@@ -1097,7 +1354,6 @@ fn enrich_instance_vram(
     }
 }
 
-/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 /// Broadcast `ev` to subscribers and, if a session writer is wired, append
 /// the same event to disk for `--replay`. Persistence is best-effort — a
 /// write failure logs at warn level but does not interrupt the loop.
@@ -1115,49 +1371,82 @@ fn broadcast_and_persist(
     let _ = tx.send(ev);
 }
 
+/// How many `tick`s fit into `period`, rounded to the nearest, minimum 1.
 fn ticks_per(period: Duration, tick: Duration) -> u64 {
     let n = (period.as_secs_f64() / tick.as_secs_f64()).round() as i64;
     n.max(1) as u64
 }
 
-/// Upper bound on the scrape interval accepted by `avg_ms_from_histogram`.
+/// Upper bound on the scrape interval accepted by [`observe_latency`].
 /// Applies to TTFT/TPOT latency histograms only; generation-counter staleness
 /// is managed by `GenerationObservationTracker` (see `rocm-dash-core`).
-/// A gap longer than this makes the windowed delta stale (outage or forward
-/// wall-clock jump / NTP / VM resume), so the histogram falls back to the
-/// cumulative average for that sample.
+/// A gap longer than this (outage, forward wall-clock jump / NTP / VM resume)
+/// makes the windowed delta meaningless, so that sample yields no value and
+/// only re-baselines.
 const MAX_RATE_INTERVAL_S: f64 = 60.0;
 
-/// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
-/// `_count` series, windowed over successive scrapes: `(Δsum / Δcount) × 1000`.
-/// Updates the per-instance baseline in `prev`. On the FIRST reading (or after a
-/// counter reset / stale interval / no new requests) it falls back to the
-/// cumulative average `sum/count × 1000`, so a single scrape already yields a
-/// value. Returns `None` when the histogram is absent (`sum`/`count` `None`) or
-/// `count == 0` — Observe then shows `—` (never a fabricated number).
-fn avg_ms_from_histogram(
-    prev: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+/// Per-instance latency state for one histogram: the previous cumulative
+/// reading and the tracker that holds and then expires the derived average.
+pub(crate) struct LatencyWindow {
+    /// Previous `(sum_s, count, at)` reading; `None` until baselined.
+    prev: Option<(f64, f64, DateTime<Utc>)>,
+    /// Holds the last windowed average for the observation validity window.
+    tracker: GenerationObservationTracker,
+}
+
+pub(crate) type LatencyWindows = HashMap<String, LatencyWindow>;
+
+/// Feed one scrape of a cumulative latency histogram (`_sum` in seconds,
+/// `_count`) into `id`'s window. A value is recorded only when the window saw
+/// new requests: `(Δsum / Δcount) × 1000` ms. The first reading, a counter
+/// reset, a stale interval, or a window with no new requests only moves the
+/// baseline; the lifetime average is never reported, so an idle server's old
+/// latency ages out instead of persisting. An absent histogram (`None`) leaves
+/// the window untouched.
+fn observe_latency(
+    windows: &mut LatencyWindows,
     id: &str,
+    instance_tick: Duration,
     sum_s: Option<f64>,
     count: Option<f64>,
     now: DateTime<Utc>,
-) -> Option<f64> {
-    let (sum_s, count) = (sum_s?, count?);
-    let last = prev.insert(id.to_string(), (sum_s, count, now));
-    if let Some((psum, pcount, pat)) = last {
+) {
+    let (Some(sum_s), Some(count)) = (sum_s, count) else {
+        return;
+    };
+    let w = windows
+        .entry(id.to_string())
+        .or_insert_with(|| LatencyWindow {
+            prev: None,
+            tracker: GenerationObservationTracker::new(instance_tick),
+        });
+    if let Some((psum, pcount, pat)) = w.prev.replace((sum_s, count, now)) {
         let dcount = count - pcount;
         let dsum = sum_s - psum;
         let dt = (now - pat).num_milliseconds() as f64 / 1000.0;
         if dcount > 0.0 && dsum >= 0.0 && dt > 0.0 && dt <= MAX_RATE_INTERVAL_S {
-            return Some(dsum / dcount * 1000.0);
+            w.tracker.observe_direct(dsum / dcount * 1000.0, now);
         }
     }
-    // Cumulative-average fallback: first scrape, no new requests, or a reset.
-    if count > 0.0 {
-        Some(sum_s / count * 1000.0)
-    } else {
-        None
+}
+
+/// Forget the previous reading after a failed scrape so recovery re-baselines,
+/// while the tracker keeps the last value held until it expires.
+fn rebaseline_latency(windows: &mut LatencyWindows, id: &str) {
+    if let Some(w) = windows.get_mut(id) {
+        w.prev = None;
     }
+}
+
+/// Current held/fresh/expired latency for `id` at `now`.
+fn snapshot_latency(
+    windows: &mut LatencyWindows,
+    id: &str,
+    now: DateTime<Utc>,
+) -> (Option<f64>, Option<ObservationMetadata>) {
+    windows
+        .get_mut(id)
+        .map_or((None, None), |w| w.tracker.snapshot(now))
 }
 
 #[cfg(test)]
@@ -1172,23 +1461,29 @@ mod tests {
     /// binary named literally `amd-smi`.
     #[test]
     fn detect_plan_threads_gpu_reachable_through_the_none_binary_arm() {
-        match amd_smi_detect_plan(None, false, true) {
-            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+        match amd_smi_detect_plan(None, false, true, PathBuf::from("/fake-root/dev/kfd")) {
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device) => {
                 assert_eq!(binary, OsString::from("amd-smi"));
                 assert!(gpu_reachable);
+                assert_eq!(host_kfd_device, PathBuf::from("/fake-root/dev/kfd"));
             }
             AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
         }
 
-        match amd_smi_detect_plan(None, false, false) {
-            AmdSmiDetectPlan::Detect(_, gpu_reachable) => assert!(!gpu_reachable),
+        match amd_smi_detect_plan(None, false, false, PathBuf::from(KFD_DEVICE)) {
+            AmdSmiDetectPlan::Detect(_, gpu_reachable, _) => assert!(!gpu_reachable),
             AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
         }
     }
 
     #[test]
     fn detect_plan_skip_preflight_takes_priority_over_an_explicit_binary() {
-        match amd_smi_detect_plan(Some("fake-amd-smi".into()), true, false) {
+        match amd_smi_detect_plan(
+            Some("fake-amd-smi".into()),
+            true,
+            false,
+            PathBuf::from(KFD_DEVICE),
+        ) {
             AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
                 assert_eq!(binary, OsString::from("fake-amd-smi"));
             }
@@ -1317,36 +1612,120 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    use rocm_dash_core::metrics::ObservationFreshness;
+
+    const TICK: Duration = Duration::from_secs(2);
+
+    fn baseline(sum_s: f64, count: f64) -> LatencyWindow {
+        LatencyWindow {
+            prev: Some((sum_s, count, at(10))),
+            tracker: GenerationObservationTracker::new(TICK),
+        }
+    }
+
+    fn snap_at(
+        w: &mut LatencyWindows,
+        id: &str,
+        secs: i64,
+    ) -> (Option<f64>, Option<ObservationFreshness>) {
+        let (v, m) = snapshot_latency(w, id, at(secs));
+        (v, m.map(|m| m.freshness))
+    }
+
+    fn inst_on(id: &str, gpu: &str) -> Instance {
+        Instance {
+            container_id: id.into(),
+            gpu_ids: vec![gpu.into()],
+            ..Instance::default()
+        }
+    }
+
     #[test]
-    fn avg_ms_first_scrape_uses_cumulative_then_windows() {
-        let mut prev = HashMap::new();
-        // First scrape: cumulative average = 2.0s / 4 × 1000 = 500 ms.
+    fn managed_instances_never_count_as_vram_join_misses() {
+        let docker_id = "ab".repeat(32);
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let insts = [
+            inst_on("vllm-qwen-qwen2-5-0-5b-instru-1793361705247", "0"),
+            inst_on(&docker_id, "0"),
+        ];
+        // A docker instance with no /proc match is a real miss; the managed
+        // service, which could never match, is not.
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(count_vram_join_misses(&insts, &gpus, &empty), 1);
+        // Once the docker instance joins, nothing is missed.
+        let joined: HashMap<String, u64> = [(docker_id, 512)].into();
+        assert_eq!(count_vram_join_misses(&insts, &gpus, &joined), 0);
+    }
+
+    #[test]
+    fn latency_first_scrape_reports_nothing_then_windows() {
+        let mut w = LatencyWindows::new();
+        // First scrape only baselines: the lifetime average is not reported.
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        assert_eq!(snap_at(&mut w, "a", 10), (None, None));
+        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms, fresh.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(2.0), Some(4.0), at(10)),
-            Some(500.0)
+            snap_at(&mut w, "a", 12),
+            (Some(100.0), Some(ObservationFreshness::Fresh))
         );
-        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms (windowed).
+    }
+
+    #[test]
+    fn latency_is_held_without_new_requests_then_expires() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        // Idle scrapes: counters unchanged → no new value, previous is held.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(14));
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(3.0), Some(14.0), at(12)),
-            Some(100.0)
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // Absent histogram → None (Observe shows `—`).
+        // Validity for a 2 s tick is the 6 s floor: still held at +6 s...
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "b", None, None, at(12)),
-            None
+            snap_at(&mut w, "a", 18),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // count == 0 (no requests yet) → None, never a divide-by-zero number.
+        // ...and gone just past it. The stale lifetime average never returns.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(19));
+        assert_eq!(snap_at(&mut w, "a", 19), (None, None));
+    }
+
+    #[test]
+    fn latency_absent_empty_reset_and_stale_interval_report_nothing() {
+        let mut w = LatencyWindows::new();
+        // Absent histogram / zero count never fabricate a number.
+        observe_latency(&mut w, "b", TICK, None, None, at(12));
+        assert_eq!(snap_at(&mut w, "b", 12), (None, None));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(12));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(14));
+        assert_eq!(snap_at(&mut w, "c", 14), (None, None));
+        // A counter reset (sum drops) only re-baselines.
+        observe_latency(&mut w, "d", TICK, Some(10.0), Some(100.0), at(10));
+        observe_latency(&mut w, "d", TICK, Some(0.2), Some(2.0), at(12));
+        assert_eq!(snap_at(&mut w, "d", 12), (None, None));
+        // A gap beyond MAX_RATE_INTERVAL_S is not a usable window.
+        observe_latency(&mut w, "e", TICK, Some(1.0), Some(10.0), at(0));
+        observe_latency(&mut w, "e", TICK, Some(2.0), Some(20.0), at(100));
+        assert_eq!(snap_at(&mut w, "e", 100), (None, None));
+    }
+
+    #[test]
+    fn failed_scrape_rebaselines_but_keeps_value_held() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        rebaseline_latency(&mut w, "a");
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "c", Some(0.0), Some(0.0), at(12)),
-            None
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // A counter reset (sum drops) re-bases to the cumulative average.
-        let mut p2 = HashMap::new();
-        avg_ms_from_histogram(&mut p2, "d", Some(10.0), Some(100.0), at(10));
+        // Recovery re-baselines: the first post-failure scrape yields nothing new.
+        observe_latency(&mut w, "a", TICK, Some(9.0), Some(50.0), at(15));
         assert_eq!(
-            avg_ms_from_histogram(&mut p2, "d", Some(0.2), Some(2.0), at(12)),
-            Some(100.0),
-            "reset falls back to cumulative 0.2/2×1000"
+            snap_at(&mut w, "a", 15),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
     }
 
@@ -1469,67 +1848,755 @@ mod tests {
         GenerationObservationTracker::new(Duration::from_secs(tick_secs))
     }
 
-    /// `purge_telemetry_state` removes the tracker entry, TTFT baseline, and
+    /// `TelemetryState::purge` removes the tracker entry, TTFT baseline, and
     /// TPOT baseline for the target id and leaves other ids untouched.
     #[test]
-    fn purge_telemetry_state_removes_all_three_maps_for_id() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+    fn telemetry_state_purge_removes_all_three_maps_for_id() {
+        let mut state = TelemetryState::default();
 
         // Populate two ids.
-        trackers.insert("a".into(), make_tracker(2));
-        trackers.insert("b".into(), make_tracker(2));
-        ttft.insert("a".into(), (1.0, 1.0, at(10)));
-        ttft.insert("b".into(), (2.0, 2.0, at(10)));
-        tpot.insert("a".into(), (3.0, 3.0, at(10)));
-        tpot.insert("b".into(), (4.0, 4.0, at(10)));
+        state.gen_trackers.insert("a".into(), make_tracker(2));
+        state.gen_trackers.insert("b".into(), make_tracker(2));
+        state.prev_ttft.insert("a".into(), baseline(1.0, 1.0));
+        state.prev_ttft.insert("b".into(), baseline(2.0, 2.0));
+        state.prev_tpot.insert("a".into(), baseline(3.0, 3.0));
+        state.prev_tpot.insert("b".into(), baseline(4.0, 4.0));
 
-        purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
+        state.purge("a");
 
         // "a" must be gone from all maps.
-        assert!(!trackers.contains_key("a"), "tracker for a must be removed");
-        assert!(!ttft.contains_key("a"), "ttft for a must be removed");
-        assert!(!tpot.contains_key("a"), "tpot for a must be removed");
+        assert!(
+            !state.gen_trackers.contains_key("a"),
+            "tracker for a must be removed"
+        );
+        assert!(
+            !state.prev_ttft.contains_key("a"),
+            "ttft for a must be removed"
+        );
+        assert!(
+            !state.prev_tpot.contains_key("a"),
+            "tpot for a must be removed"
+        );
         // "b" must be unaffected.
-        assert!(trackers.contains_key("b"), "tracker for b must survive");
-        assert!(ttft.contains_key("b"), "ttft for b must survive");
-        assert!(tpot.contains_key("b"), "tpot for b must survive");
+        assert!(
+            state.gen_trackers.contains_key("b"),
+            "tracker for b must survive"
+        );
+        assert!(state.prev_ttft.contains_key("b"), "ttft for b must survive");
+        assert!(state.prev_tpot.contains_key("b"), "tpot for b must survive");
     }
 
-    /// `invalidate_on_endpoint_change` invalidates the tracker (resets its
-    /// window so subsequent snapshots return None) and removes the latency
-    /// baselines, without removing the tracker entry itself.
+    /// `TelemetryState::invalidate_on_endpoint_change` invalidates the tracker
+    /// (resets its window so subsequent snapshots return None) and removes the
+    /// latency baselines, without removing the tracker entry itself.
     #[test]
     fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
-        let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+        let mut state = TelemetryState::default();
 
         let mut tracker = make_tracker(2);
         // Give the tracker a reading so it has a non-None baseline.
         tracker.observe_counter(100.0, at(10));
         tracker.observe_counter(200.0, at(12));
-        trackers.insert("svc".into(), tracker);
-        ttft.insert("svc".into(), (1.0, 10.0, at(10)));
-        tpot.insert("svc".into(), (0.5, 8.0, at(10)));
+        state.gen_trackers.insert("svc".into(), tracker);
+        state.prev_ttft.insert("svc".into(), baseline(1.0, 10.0));
+        state.prev_tpot.insert("svc".into(), baseline(0.5, 8.0));
 
-        invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
+        state.invalidate_on_endpoint_change("svc");
 
         // Tracker still exists but its window is reset: snapshot returns None.
-        let (rate, _meta) = trackers
+        let (rate, _meta) = state
+            .gen_trackers
             .get_mut("svc")
             .expect("tracker entry must remain")
             .snapshot(at(12));
         assert!(rate.is_none(), "invalidated tracker must yield None rate");
         // Latency baselines must be cleared.
         assert!(
-            !ttft.contains_key("svc"),
+            !state.prev_ttft.contains_key("svc"),
             "ttft baseline must be cleared on endpoint change"
         );
         assert!(
-            !tpot.contains_key("svc"),
+            !state.prev_tpot.contains_key("svc"),
             "tpot baseline must be cleared on endpoint change"
+        );
+    }
+
+    // ── Discovery reconcile ─────────────────────────────────────────────────
+    //
+    // The Docker source cannot be driven end to end without a container
+    // daemon, and `reconcile_set` is the code both it and the managed-service
+    // registry run, so these tests exercise it directly. The registry and
+    // Lemonade sources are also driven end to end in
+    // `tests/discovery_reconcile.rs`, except the registry's retirement of a
+    // vanished service and Lemonade's change of id, which only these tests
+    // cover.
+
+    fn discovered(id: &str, port: u16) -> DiscoveredService {
+        DiscoveredService {
+            container_id: id.into(),
+            container_name: format!("name-{id}"),
+            model_name: "model".into(),
+            port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    fn id_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The reducer state, telemetry and event stream a reconcile pass works on.
+    struct Pass {
+        state: State,
+        telemetry: TelemetryState,
+        tx: broadcast::Sender<Event>,
+        rx: broadcast::Receiver<Event>,
+    }
+
+    impl Pass {
+        fn new() -> Self {
+            let (tx, rx) = broadcast::channel(64);
+            Self {
+                state: State::default(),
+                telemetry: TelemetryState::default(),
+                tx,
+                rx,
+            }
+        }
+
+        fn reconcile(&mut self) -> Reconcile<'_> {
+            Reconcile {
+                state: &mut self.state,
+                telemetry: &mut self.telemetry,
+                tx: &self.tx,
+                persist: None,
+            }
+        }
+
+        /// The announcements broadcast since the last call, as `discovered <id>`
+        /// and `gone <id>` strings.
+        fn announced(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(ev) = self.rx.try_recv() {
+                match ev {
+                    Event::InstanceDiscovered(i) => {
+                        out.push(format!("discovered {}", i.container_id));
+                    }
+                    Event::InstanceGone { container_id } => {
+                        out.push(format!("gone {container_id}"));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        /// Give `id` a live KV reading and a latency baseline, as a scrape would.
+        fn scrape(&mut self, id: &str) {
+            let mut inst = self.state.instances.get(id).cloned().expect("instance");
+            inst.kv_cache_usage_pct = Some(25.0);
+            self.state.apply(StateEvent::InstanceUpserted(inst));
+            self.telemetry
+                .prev_ttft
+                .insert(id.into(), baseline(1.0, 10.0));
+            self.telemetry
+                .prev_tpot
+                .insert(id.into(), baseline(0.5, 8.0));
+        }
+
+        fn kv(&self, id: &str) -> Option<f32> {
+            self.state
+                .instances
+                .get(id)
+                .and_then(|i| i.kv_cache_usage_pct)
+        }
+    }
+
+    #[test]
+    fn reconcile_set_announces_a_new_service_once() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000)];
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        assert_eq!(pass.announced(), ["discovered a"]);
+        assert!(pass.state.instances.contains_key("a"));
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+        assert!(
+            pass.announced().is_empty(),
+            "a known service must not be announced again"
+        );
+    }
+
+    #[test]
+    fn reconcile_set_keeps_live_fields_while_the_endpoint_is_unchanged() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000)];
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        pass.scrape("a");
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &svcs,
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.kv("a"), Some(25.0));
+        assert!(pass.telemetry.prev_ttft.contains_key("a"));
+        assert!(pass.telemetry.prev_tpot.contains_key("a"));
+    }
+
+    #[test]
+    fn reconcile_set_starts_clean_when_the_port_moves_under_the_same_id() {
+        let mut pass = Pass::new();
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &[discovered("a", 8000)],
+            &id_set(&[]),
+            &id_set(&["a"]),
+        );
+        pass.scrape("a");
+        pass.announced();
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Docker,
+            &[discovered("a", 9000)],
+            &id_set(&["a"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.state.instances["a"].port, Some(9000));
+        assert_eq!(pass.kv("a"), None, "the old endpoint's reading leaked");
+        assert!(!pass.telemetry.prev_ttft.contains_key("a"));
+        assert!(!pass.telemetry.prev_tpot.contains_key("a"));
+        assert!(
+            pass.announced().is_empty(),
+            "a port change is not a new or a gone service"
+        );
+    }
+
+    #[test]
+    fn reconcile_set_retires_a_vanished_service_and_keeps_the_others() {
+        let mut pass = Pass::new();
+        let svcs = [discovered("a", 8000), discovered("b", 8001)];
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Managed,
+            &svcs,
+            &id_set(&[]),
+            &id_set(&["a", "b"]),
+        );
+        pass.scrape("a");
+        pass.scrape("b");
+        pass.announced();
+
+        pass.reconcile().reconcile_set(
+            DiscoverySource::Managed,
+            &svcs[..1],
+            &id_set(&["a", "b"]),
+            &id_set(&["a"]),
+        );
+
+        assert_eq!(pass.announced(), ["gone b"]);
+        assert!(!pass.state.instances.contains_key("b"));
+        assert!(!pass.telemetry.prev_ttft.contains_key("b"));
+        assert!(pass.state.instances.contains_key("a"));
+        assert!(pass.telemetry.prev_ttft.contains_key("a"));
+    }
+
+    // ── Lemonade state matrix ───────────────────────────────────────────────
+    //
+    // One Lemonade endpoint is probed per discovery pass. Its id encodes the host
+    // and port, so the states a probe can observe are: nothing ever answered; the
+    // first answer; the same endpoint again; the host or the port changed; the
+    // endpoint went quiet; it came back somewhere else; and the same answer
+    // arriving twice in one tick. Each row below checks the announcements, the
+    // instances a snapshot would carry, the telemetry kept per id, and the
+    // `(id, port)` pairs the vLLM scrape would poll, because a stale instance is
+    // visible on all four.
+
+    fn lemonade_svc(host: &str, port: u16) -> DiscoveredService {
+        DiscoveredService {
+            container_id: format!("lemonade-{host}-{port}"),
+            container_name: "lemonade".into(),
+            model_name: "model".into(),
+            port: Some(port),
+            ..Default::default()
+        }
+    }
+
+    impl Pass {
+        /// The ids a snapshot carries. The loop builds a snapshot's instances from
+        /// `state.instances`, so this is the dashboard's view of the pass.
+        fn instance_ids(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self.state.instances.keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+
+        /// The ids the vLLM Prometheus scrape would poll while `current` is the
+        /// live Lemonade id.
+        fn scrape_targets(&self, current: Option<&str>) -> Vec<String> {
+            let mut ids: Vec<String> =
+                vllm_scrape_targets(&self.state.instances, current, &HashSet::new())
+                    .into_iter()
+                    .map(|(id, _port)| id)
+                    .collect();
+            ids.sort();
+            ids
+        }
+
+        /// A live KV reading, latency baselines and a rate tracker for `id`.
+        fn give_live_telemetry(&mut self, id: &str) {
+            self.scrape(id);
+            self.telemetry
+                .gen_trackers
+                .insert(id.into(), make_tracker(2));
+        }
+
+        fn has_telemetry(&self, id: &str) -> bool {
+            self.telemetry.gen_trackers.contains_key(id)
+                || self.telemetry.prev_ttft.contains_key(id)
+                || self.telemetry.prev_tpot.contains_key(id)
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Discover `old`, give it live telemetry, then probe `new`. Returns the pass,
+    /// the loop's current Lemonade id and what the second probe announced.
+    fn lemonade_identity_change(
+        old: &DiscoveredService,
+        new: &DiscoveredService,
+    ) -> (Pass, Option<String>, Vec<String>) {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(old.clone()), &mut current);
+        pass.give_live_telemetry(&old.container_id);
+        pass.announced();
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(new.clone()), &mut current);
+        let announced = pass.announced();
+        (pass, current, announced)
+    }
+
+    #[test]
+    fn lemonade_that_never_answers_leaves_no_trace() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+
+        assert!(pass.announced().is_empty());
+        assert_eq!(current, None);
+        assert!(pass.instance_ids().is_empty());
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_first_answer_is_announced_once_and_left_to_its_own_collector() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(lemonade_svc("127.0.0.1", 13305)), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
+        assert_eq!(current.as_deref(), Some("lemonade-127.0.0.1-13305"));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the live Lemonade instance is not a vLLM scrape target"
+        );
+    }
+
+    #[test]
+    fn lemonade_same_endpoint_again_keeps_its_instance_and_live_fields() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let id = svc.container_id.clone();
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(svc.clone()), &mut current);
+        pass.give_live_telemetry(&id);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+
+        assert!(pass.announced().is_empty());
+        assert_eq!(pass.instance_ids(), ids(&[&id]));
+        assert_eq!(pass.kv(&id), Some(25.0));
+        assert!(pass.has_telemetry(&id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_host_change_retires_the_old_instance_and_announces_the_new_one() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("10.0.0.7", 13305);
+        let (pass, current, announced) = lemonade_identity_change(&old, &new);
+
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-10.0.0.7-13305"
+            ]
+        );
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-10.0.0.7-13305"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
+        );
+    }
+
+    #[test]
+    fn lemonade_port_change_retires_the_old_instance_and_announces_the_new_one() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("127.0.0.1", 13306);
+        let (pass, current, announced) = lemonade_identity_change(&old, &new);
+
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(
+            announced,
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
+        );
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13306"]));
+        assert!(
+            pass.scrape_targets(current.as_deref()).is_empty(),
+            "the old endpoint must not be polled as a vLLM target"
+        );
+    }
+
+    #[test]
+    fn lemonade_endpoint_going_quiet_is_announced_gone_and_leaves_no_trace() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let id = svc.container_id.clone();
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+        pass.give_live_telemetry(&id);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+
+        assert_eq!(pass.announced(), [format!("gone {id}")]);
+        assert_eq!(current, None);
+        assert!(pass.instance_ids().is_empty());
+        assert!(!pass.has_telemetry(&id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_coming_back_elsewhere_after_going_quiet_is_the_only_instance() {
+        let old = lemonade_svc("127.0.0.1", 13305);
+        let new = lemonade_svc("127.0.0.1", 13306);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(old.clone()), &mut current);
+        pass.give_live_telemetry(&old.container_id);
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert_eq!(
+            pass.announced(),
+            [
+                "discovered lemonade-127.0.0.1-13305",
+                "gone lemonade-127.0.0.1-13305"
+            ]
+        );
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(new.clone()), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13306"]);
+        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
+        assert_eq!(pass.instance_ids(), ids(&[&new.container_id]));
+        assert!(!pass.has_telemetry(&old.container_id));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_answer_repeated_within_one_tick_is_announced_once() {
+        let svc = lemonade_svc("127.0.0.1", 13305);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(svc.clone()), &mut current);
+        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
+
+        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
+        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn lemonade_endpoint_moving_away_and_back_is_retired_each_time() {
+        let a = lemonade_svc("127.0.0.1", 13305);
+        let b = lemonade_svc("127.0.0.1", 13306);
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+        pass.reconcile()
+            .reconcile_lemonade(Some(a.clone()), &mut current);
+        pass.announced();
+
+        pass.reconcile().reconcile_lemonade(Some(b), &mut current);
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13305",
+                "discovered lemonade-127.0.0.1-13306"
+            ]
+        );
+        pass.reconcile()
+            .reconcile_lemonade(Some(a.clone()), &mut current);
+
+        assert_eq!(
+            pass.announced(),
+            [
+                "gone lemonade-127.0.0.1-13306",
+                "discovered lemonade-127.0.0.1-13305"
+            ]
+        );
+        assert_eq!(current.as_deref(), Some(a.container_id.as_str()));
+        assert_eq!(pass.instance_ids(), ids(&[&a.container_id]));
+        assert!(pass.scrape_targets(current.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn reconcile_lemonade_follows_one_endpoint_through_its_lifecycle() {
+        let mut pass = Pass::new();
+        let mut current: Option<String> = None;
+
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
+        assert_eq!(pass.announced(), ["discovered l1"]);
+        assert_eq!(current.as_deref(), Some("l1"));
+
+        pass.scrape("l1");
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
+        assert!(
+            pass.announced().is_empty(),
+            "same id must not be re-announced"
+        );
+        assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
+
+        // A new id (the host or port changed) retires the old id, telemetry
+        // included, and announces the new one.
+        pass.reconcile()
+            .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
+        assert_eq!(pass.announced(), ["gone l1", "discovered l2"]);
+        assert_eq!(current.as_deref(), Some("l2"));
+        assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
+        // The superseded instance leaves the state (and so every snapshot), not
+        // only its telemetry.
+        assert!(!pass.state.instances.contains_key("l1"));
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert_eq!(pass.announced(), ["gone l2"]);
+        assert_eq!(current, None);
+        assert!(!pass.state.instances.contains_key("l2"));
+
+        pass.reconcile().reconcile_lemonade(None, &mut current);
+        assert!(pass.announced().is_empty(), "nothing left to retire");
+    }
+
+    // Registry read health: one test per row of the state matrix (first
+    // failure, repeated failure, recovery, empty, populated, malformed new,
+    // malformed unchanged, malformed cleared).
+
+    fn registry_read(
+        malformed: &[&str],
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Ok(crate::registry::RegistryRead {
+            records: Vec::new(),
+            malformed: malformed.iter().map(PathBuf::from).collect(),
+        })
+    }
+
+    fn registry_failure(
+        why: &str,
+    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
+        Err(crate::registry::RegistryReadError {
+            path: PathBuf::from("services"),
+            source: std::io::Error::other(why),
+            partial: crate::registry::RegistryRead::default(),
+        })
+    }
+
+    /// State matrix for what a partially read registry does to the discovery
+    /// state, one assertion group per row: a service it saw joins the known set
+    /// and its non-vLLM mark follows the record; one it did not see stays known
+    /// and keeps its mark; nothing leaves either set.
+    #[test]
+    fn partial_registry_read_adds_what_it_saw_and_forgets_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["old-vllm", "old-lemonade", "flips"]),
+            managed_non_vllm: id_set(&["old-lemonade", "flips"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
+            seen: id_set(&["new-lemonade", "new-vllm", "flips"]),
+            non_vllm: id_set(&["new-lemonade"]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            state.known_services,
+            id_set(&[
+                "old-vllm",
+                "old-lemonade",
+                "flips",
+                "new-lemonade",
+                "new-vllm"
+            ]),
+            "the unseen services stay known and the new ones join them"
+        );
+        assert_eq!(
+            state.managed_non_vllm,
+            id_set(&["old-lemonade", "new-lemonade"]),
+            "an unseen non-vLLM service keeps its mark, a seen one follows its record"
+        );
+    }
+
+    #[test]
+    fn partial_registry_read_that_saw_nothing_changes_nothing() {
+        let mut state = DiscoveryState {
+            known_services: id_set(&["a", "b"]),
+            managed_non_vllm: id_set(&["b"]),
+            ..DiscoveryState::default()
+        };
+
+        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
+
+        assert_eq!(state.known_services, id_set(&["a", "b"]));
+        assert_eq!(state.managed_non_vllm, id_set(&["b"]));
+    }
+
+    #[test]
+    fn registry_health_reports_the_first_failure_of_a_streak_once() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_failure("disk gone"));
+        assert_eq!(
+            first.failed.as_deref(),
+            Some("cannot read services: disk gone"),
+            "the first failed pass names the error"
+        );
+        assert!(!first.recovered);
+
+        for pass in 2..=5 {
+            assert_eq!(
+                health.observe(&registry_failure("disk gone")),
+                RegistryChange::default(),
+                "failed pass {pass} of the same streak must stay quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_recovery_once_and_a_new_streak_again() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_failure("one"));
+        health.observe(&registry_failure("one"));
+
+        let recovered = health.observe(&registry_read(&[]));
+        assert!(recovered.recovered);
+        assert!(recovered.failed.is_none());
+        assert_eq!(
+            health.observe(&registry_read(&[])),
+            RegistryChange::default(),
+            "only the first good pass after a streak is a recovery"
+        );
+
+        let again = health.observe(&registry_failure("two"));
+        assert_eq!(again.failed.as_deref(), Some("cannot read services: two"));
+    }
+
+    #[test]
+    fn registry_health_is_quiet_for_an_empty_or_populated_registry() {
+        let mut health = RegistryHealth::default();
+        // A healthy read, empty or not, says nothing: there is no failure to
+        // report and no failure to have recovered from.
+        for _ in 0..3 {
+            assert_eq!(
+                health.observe(&registry_read(&[])),
+                RegistryChange::default()
+            );
+        }
+    }
+
+    #[test]
+    fn registry_health_reports_a_malformed_set_when_it_changes() {
+        let mut health = RegistryHealth::default();
+
+        let first = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(first.malformed, [PathBuf::from("a.json")]);
+        assert_eq!(
+            health.observe(&registry_read(&["a.json"])),
+            RegistryChange::default(),
+            "an unchanged malformed set is not reported again"
+        );
+
+        let grown = health.observe(&registry_read(&["a.json", "b.json"]));
+        assert_eq!(
+            grown.malformed,
+            [PathBuf::from("a.json"), PathBuf::from("b.json")],
+            "a newly malformed record reports the whole set"
+        );
+
+        let cleared = health.observe(&registry_read(&[]));
+        assert!(
+            cleared.malformed.is_empty(),
+            "clearing the set is not a warning"
+        );
+        let back = health.observe(&registry_read(&["a.json"]));
+        assert_eq!(
+            back.malformed,
+            [PathBuf::from("a.json")],
+            "a record that goes bad again after being fixed is reported again"
+        );
+    }
+
+    #[test]
+    fn registry_health_keeps_the_malformed_set_across_a_read_failure() {
+        let mut health = RegistryHealth::default();
+        health.observe(&registry_read(&["a.json"]));
+        health.observe(&registry_failure("blip"));
+
+        let after = health.observe(&registry_read(&["a.json"]));
+        assert!(after.recovered);
+        assert!(
+            after.malformed.is_empty(),
+            "the same corrupt record is not news just because a read failed in between"
         );
     }
 }

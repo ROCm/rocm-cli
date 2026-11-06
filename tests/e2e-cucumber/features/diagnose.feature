@@ -169,14 +169,18 @@ Feature: Diagnosing failures and listing fixes
   # a test of the runner's health. Clearing the threshold comes from the keyword
   # alone and holds on every host.
   #
-  # @requires-os:linux because the checker is registered linux-only, and
-  # @requires-bare-metal because WSL2 does not run the catalog at all — the two
-  # are not interchangeable, WSL2 reports an os_family of linux.
-  @id:diagnose-recognises-the-engine-import-failure @requires-bare-metal @requires-os:linux
+  # @requires-os:linux because the vLLM engine does not run on native Windows.
+  # The checker is registered for linux and wsl, and it reads only the symptom
+  # text, so the scenario holds on the WSL lane too. It is not tagged
+  # @requires-bare-metal, which would skip it exactly where the WSL entry was
+  # added. Following the diagnosis to the fix it named proves the recipe applies
+  # on the host the report was produced on.
+  @id:diagnose-recognises-the-engine-import-failure @requires-os:linux
   Scenario: diagnose-13 - A vLLM engine-startup import failure is recognised from its error text
     Given a user who hit the vLLM engine-startup import failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI reports the engine-startup import failure as an established cause
+    And the CLI can act on the fix named for the engine-startup import failure
 
   # Every other recipe in the catalog is a flat sequence for one shell. This one
   # is not: `rocm engines shell vllm` opens an INTERACTIVE subshell, the two
@@ -187,11 +191,12 @@ Feature: Diagnosing failures and listing fixes
   # terminal stdin buffering to land each line in the right shell. What the user
   # can observe is the printed plan, so that is what is asserted.
   #
-  # Deliberately not OS-gated even though the fix is linux-only: the plan is
-  # printed before the fix's own platform gate is reached, so the text under test
-  # is identical on both lanes and the Windows lane exercises it too. The step
-  # therefore asserts the printed block and not the exit code, which does differ
-  # (0 where the fix applies, 3 where it does not).
+  # Deliberately not OS-gated even though the fix applies on Linux and WSL only:
+  # the plan is printed before the fix's own platform gate is reached, so the
+  # text under test is identical on every lane and the Windows lane exercises it
+  # too. The step therefore asserts the printed block and not the exit code,
+  # which does differ (0 on Linux and WSL, where the fix applies, and 3 on
+  # Windows, where it does not).
   @id:diagnose-fix-says-which-shell-each-step-runs-in
   Scenario: diagnose-14 - A fix whose steps span two shells says which shell each step runs in
     Given a user who has chosen the fix for the engine-startup import failure
@@ -276,16 +281,470 @@ Feature: Diagnosing failures and listing fixes
   # diagnose-05 only proves the manual/zero-optional-flags wording, because
   # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
   # sudo+re-login combination only exists on a fix gated to bare-metal Linux
-  # (fix-4-render-group), so it needs its own scenario -- but, like
-  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
-  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
-  # under test renders identically regardless of which lane runs it. The step
-  # asserts only that printed text, never the exit code -- `fix-4-render-group`
-  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
-  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
-  @id:diagnose-fix-preview-states-required-flags
-  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
+  # (fix-4-render-group), so it needs its own scenario.
+  #
+  # Unlike diagnose-14, this one IS OS-gated. `print_recipe` still runs before
+  # the fix's own platform gate (see `apply` in fix.rs), but the Flags: line it
+  # prints comes from `class_here()`, which looks up the catalog entry for the
+  # *running* host's OS. "AUTO" only renders where `fix-4-render-group` is
+  # actually `Auto` -- bare-metal Linux. Everywhere else (`applies_on` has no
+  # other member) `class_here()` falls back to PRINT-ONLY, the generic "this
+  # fix does not apply here" answer diagnose-11 already covers -- not a second,
+  # platform-specific behaviour worth asserting under this scenario's name.
+  #
+  # The step still asserts only the printed Flags: text, never the exit code --
+  # `fix-4-render-group` gates its own dry-run on host state ($USER,
+  # `usermod`/`sudo` on PATH), so unlike PREVIEW_FIX_ID its exit code is not
+  # guaranteed to be 0 even on Linux.
+  @id:diagnose-fix-preview-states-required-flags @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable here
     Given a user who has chosen a fix that needs sudo and a re-login
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
     And the preview states that the CLI can run it automatically
+  # `--model` answers the question that comes before the other two: given this
+  # machine and that model, will it run. The point is that it answers in seconds
+  # and fetches nothing, so the user is not told by a download that failed.
+  #
+  # Host-agnostic in the same way diagnose-10 is, and for the same reason. The
+  # verdict depends on what this machine can measure of its own GPU, which
+  # differs per lane, so the scenario asks the CLI what it measured and then
+  # holds it to the matching half of the contract. Each half can fail, which is
+  # the bar an assertion has to clear: a lane that could not measure its GPU --
+  # whether because there is no GPU at all, an engine this platform's gate
+  # rules out, or a GPU whose memory the CLI cannot read -- exercises the
+  # "told why, not that the model is incompatible" half, the GPU lanes the
+  # "measured and it does not fit" half. What holds everywhere is that a model
+  # no machine could serve is never called ready, and that asking costs no
+  # download.
+  @id:diagnose-model-too-large-is-refused-with-something-that-fits
+  Scenario: diagnose-21 - A model this machine cannot serve is refused before anything is downloaded
+    Given a user asking about a model no single machine could serve
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the model is never reported as ready
+    And a machine that measured its GPU is told the model will not run, and what would
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+    And the human-readable answer names what would run instead
+    And no model weights were fetched
+
+  # The other half of the verdict, and the one a user acts on: a model that does
+  # fit has to say which engine would serve it, because that is what `rocm serve`
+  # will pick and the user has no other way to know before starting it.
+  @id:diagnose-model-that-fits-is-ready-and-names-the-engine
+  Scenario: diagnose-22 - A model this machine can serve is reported ready, with the engine that would serve it
+    Given a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then a machine with enough measured GPU memory is told the model is ready
+    And the answer names the engine that would serve it
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+
+  # The failure this guards is not an error, it is a WRONG ANSWER that reads like
+  # a real one. If a recipe catalog that cannot be read is scored as though it
+  # had been, the user is told their machine cannot run a model when the truth is
+  # that the CLI never found out what the model needs — and they go looking for
+  # hardware they may already have. Deterministic on every lane: the catalog
+  # source is pointed at a path that does not exist.
+  @id:diagnose-model-unreachable-catalog-is-not-an-incompatible-model
+  Scenario: diagnose-23 - A recipe catalog that cannot be read is not reported as an incompatible model
+    Given a machine that cannot reach the model recipe catalog
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is the unreachable catalog, not the model
+    And nothing is claimed about whether the model fits this machine
+
+  # A model outside the curated catalog is not a model this CLI has judged
+  # incompatible -- it is one the CLI never had the metadata to judge at all.
+  # Folding the two together would tell a user "this will not run" about a
+  # model that might run fine, on the strength of nothing. Deterministic on
+  # every lane: the catalog is read successfully, it simply carries no recipe
+  # by this name.
+  @id:diagnose-model-not-curated-is-undetermined-not-blocked
+  Scenario: diagnose-24 - A model outside the curated catalog is undetermined, not blocked
+    Given a user asking about a model the curated catalog does not carry
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is that the model is not curated, not that it does not fit
+    And nothing is claimed about whether the model fits this machine
+
+  # `degraded` exists so a model that runs, but below what the recipe
+  # recommends, is never folded into the same answer as one that will not run
+  # at all -- a user who is about to accept slower loading deserves a different
+  # word than one being turned away. The fixture recipe needs almost no GPU
+  # memory (so it clears the fit check on any lane that measured a GPU) but
+  # recommends more system RAM than any real test host has, so the RAM
+  # softening is the only thing left to trigger. A machine with no GPU still
+  # cannot serve it at all, so that half is asserted the same way diagnose-21
+  # and diagnose-22 already do.
+  @id:diagnose-model-below-recommended-ram-is-degraded-not-blocked
+  Scenario: diagnose-25 - A model that runs below its recommended system RAM is degraded, not blocked
+    Given a user asking about a model that recommends far more system RAM than this host has
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then a machine with enough measured GPU memory to run it is told the model is degraded
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+
+  # `--model` and `--distro` together used to be refused only when the probe
+  # happened to come back looking remote, so the refusal tracked a derived
+  # examination property rather than the flag itself. Keyed on the flag now:
+  # the refusal fires before any probe runs at all, so this holds even with no
+  # `wsl.exe` on PATH and no distribution installed -- every lane proves it,
+  # not only a WSL host.
+  @id:diagnose-model-with-distro-is-refused-not-answered-for-the-local-host
+  Scenario: diagnose-26 - Asking --model with --distro is refused before answering for the wrong machine
+    Given a user who asks --model together with --distro
+    When the user asks the CLI to diagnose with both flags
+    Then the CLI refuses and says --model answers for this machine, not the one --distro names
+    And no model verdict is reported
+
+  # One entry behaves differently depending on the machine: it persists the
+  # change on Windows, and on Linux it only reports where the value is set,
+  # because the code that would write it takes no options and never does.
+  # The listing said "the CLI will run this" on both, so a user on Linux — and
+  # an agent reading the same listing — was told a change was coming that never
+  # came. Host-independent on purpose: the assertion is that the listing agrees
+  # with the machine in front of it, whichever machine that is.
+  @id:diagnose-fix-applicability-is-per-machine
+  Scenario: diagnose-27 - A fix that only explains itself here is not advertised as one the CLI will run
+    Given a fix the CLI carries out on one kind of machine and only explains on another
+    When the user asks the CLI which fixes it offers
+    Then that fix is shown as what it does on this machine
+
+  # The other half of the same defect. This entry does have a fix and the CLI
+  # will carry it out, but not until it is told which device to pin; asked
+  # plainly it prints the query that identifies one and stops. It was marked as
+  # a fix the CLI applies, so the report of a change that never happened looked
+  # like success.
+  # @requires-bare-metal because the entry under test is scoped to bare-metal
+  # Linux and Windows. On WSL it is refused at the platform gate instead, which
+  # is a different contract with its own scenario — and the right one, since the
+  # catalog does not claim this remedy applies there.
+  @id:diagnose-fix-needing-an-argument-says-so @requires-bare-metal
+  Scenario: diagnose-28 - A fix that needs more information says what it needs and changes nothing
+    Given a user who has chosen a fix that cannot run until it is told what to act on
+    When the user asks the CLI to apply it without saying what to act on
+    Then the CLI names what it still needs and reports no change
+
+  # Nothing here sends a report: the CLI only ever offers a prefilled mail that
+  # the user sends themselves. What these two prove is the part that has to be
+  # right before anything is offered: that the machine can see exactly what
+  # would be published, and that asking produces either a report or a stated
+  # refusal and never a silent send.
+  #
+  # Host-independent on purpose, and the branches land on different lanes. A
+  # lane with an AMD GPU on the compatibility matrix exercises the prepared
+  # report; a lane without one exercises the unreadable-architecture refusal,
+  # which is the case the mock lane actually has. The WSL lane reaches neither:
+  # `examine` returns before any GPU probe there, so it refuses because the
+  # platform was never inspected, whatever hardware it holds. Saying "a lane
+  # without an allowlisted GPU exercises the refusal" would be wrong for that
+  # lane, and would record the guard as firing correctly when it fired for an
+  # unrelated structural reason. Written so that whichever branch a lane
+  # reaches is a real assertion rather than a skip.
+  @id:diagnose-report-is-shown-and-not-sent
+  Scenario: diagnose-29 - Asking what a report would say shows it and sends nothing
+    When the user asks the CLI what a report would carry
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+
+  # The rule this guards is that a report is assembled field by field, never by
+  # copying a larger structure. The unit tests sweep for planted markers; this
+  # asserts the same property against whatever this real machine happens to be,
+  # which is the case a fixture cannot reproduce.
+  @id:diagnose-report-carries-no-identifying-detail
+  Scenario: diagnose-30 - What a report would carry never identifies the machine
+    When the user asks the CLI what a report would carry in machine-readable form
+    Then the answer names no user, no host, and no file path
+
+  # `--send` promises the report is always read before its form is offered.
+  # That promise only holds if asking for the form without asking to see the
+  # report first is refused outright, before anything about this machine is
+  # examined — so this is the same exit code any other argument mistake gets,
+  # not a diagnosis outcome, and it is true on every host and every lane.
+  @id:diagnose-send-without-report-is-refused
+  Scenario: diagnose-31 - Asking the CLI for a way to send a report, without asking to see it first, is refused
+    When the user asks the CLI for a way to send a report, without asking to see the report first
+    Then the CLI refuses and explains that the report must be requested too
+
+  # Forces the same headless shape a server or container presents: no display,
+  # no forwarded display, no override asking for a browser anyway. Linux-only
+  # because the CLI only reads the environment for this decision on Linux;
+  # Windows and macOS always treat a user as present, so there is no
+  # environment that forces this branch on those hosts.
+  #
+  # Host-independent beyond that, and for the same structural reason
+  # diagnose-29 and diagnose-30 are: the WSL lane refuses before any GPU
+  # probe, and most other lanes have no GPU on the compatibility matrix
+  # either, so a report is prepared on some lanes and refused on others.
+  # Written so whichever branch a lane reaches is a real assertion rather
+  # than a skip.
+  #
+  # The last step pairs the notice with its proof. The mail leaves from the
+  # user's own account, so the CLI says it carries their address, and says the
+  # report itself names no user, host, or file path. That second half is
+  # checked against this run's own output, not taken from the wording.
+  @id:diagnose-send-on-a-headless-machine-prints-instead-of-opening @requires-os:linux
+  Scenario: diagnose-32 - Asking to send on a machine with no desktop prints the address and a link instead of starting a mail client
+    When the user asks the CLI for a way to send a report, with no desktop available to open it on
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+    And the CLI prints the address to mail and a link, and starts nothing
+    And the CLI says the mail carries the user's own address, and the report names no user, host, or file path
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of. When the copy that loads belongs to a different
+  # installation than the runtime, compilation fails with an error naming
+  # neither. Both remedies — remove one stack, or reorder the search path — can
+  # break a working Python environment, and which is right depends on which
+  # stack the user means to keep. So the CLI states them and changes nothing.
+  #
+  # The conflict itself cannot be provoked here: the suite cannot install a
+  # second ROCm stack, and the detection rule is proven by unit tests that build
+  # the machine state directly. What this pins is the half that matters if the
+  # entry ever stops being advisory — that asking for it changes nothing and
+  # recommends neither option.
+  #
+  # `@requires-os:linux` because `fix-18-comgr-conflict` is registered for
+  # `["linux", "wsl"]` (comgr and LD_LIBRARY_PATH are POSIX-loader concepts, not
+  # Windows ones). Unlike diagnose-20's preview, this step applies the fix for
+  # real, so it goes through the fix's own platform gate and would be refused
+  # for the wrong reason -- "wrong OS", not "advisory" -- on a native Windows
+  # lane. `@requires-os:linux` matches WSL2 too, which is where this fix does
+  # apply.
+  @id:diagnose-fix-comgr-conflict-is-advisory-only @requires-os:linux
+  Scenario: diagnose-33 - The fix for a shadowed compilation library changes nothing and recommends nothing
+    Given a user who has chosen the fix for a shadowed compilation library
+    When the user asks the CLI to apply that fix
+    Then the CLI explains that it will not make the change itself
+    And the CLI offers both options without ranking them
+
+  # The skill that drives this CLI states, in prose, which entries exist and what
+  # the CLI does with each. Every one of those is a copy of something the binary
+  # already knows, and a copy can go stale silently. This is the machine-readable
+  # form that replaces the copying — what a tool reads instead of parsing the
+  # listing meant for people.
+  @id:diagnose-fix-catalog-is-machine-readable
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+    When a tool asks the CLI for its catalog in machine-readable form
+    Then the catalog names every entry and what the CLI does with each
+    And it gives the meaning of every exit code the CLI can return
+
+  # `--json` describes the whole catalog, so pairing it with one entry is a
+  # question with no answer. Refusing beats ignoring the flag: a caller that
+  # asked for machine-readable output and silently got something else has no way
+  # to notice.
+  @id:diagnose-fix-catalog-json-rejects-a-fix-id
+  Scenario: diagnose-35 - Asking to apply one fix in machine-readable form is refused
+    Given a user who has chosen a known fix
+    When the user asks the CLI to apply that fix in machine-readable form
+    Then the CLI refuses and explains that the two cannot be combined
+
+  # vLLM runs on Linux and WSL, but not native Windows. This scenario is
+  # GPU-independent: it supplies the captured startup error as symptom text and
+  # proves the public diagnosis output preserves both branches of the remedy.
+  @id:diagnose-vllm-oom-is-conditional @requires-os:linux
+  Scenario: diagnose-36 - A vLLM startup OOM receives conditional remediation
+    Given a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the diagnosis identifies the vLLM startup OOM
+    And the OOM remedy distinguishes a busy GPU from a model that does not fit
+    # A report that names `rocm fix <id>` and a `rocm fix` that then refuses that
+    # id leaves the user worse off than no fix path at all. The two halves are
+    # selected by separate platform lists -- the checker's, and the recipe's
+    # against the RUNNING os, where WSL2 is its own family -- so they can
+    # disagree while each looks right alone. Every Linux lane runs this step; the
+    # WSL one is where the two lists can differ.
+    And the CLI can act on the fix the diagnosis named
+
+  # `--symptom` is where a user pastes a raw terminal capture, and a terminal
+  # capture is full of line advances that are not `\n`: a progress bar repaints
+  # with `\r`, and curses- and `rich`-style progress UIs move down with `ESC E`,
+  # `ESC D` or `CSI n B` (terminfo's `nel`, `ind` and `cud1`). If those are not
+  # line boundaries the whole paste collapses into a single line, a `vllm`
+  # mention anywhere in it anchors another engine's OOM, and the user is told
+  # with high confidence that vLLM ran out of memory -- quoting the other
+  # engine's error text back as the evidence for it. A confidently wrong cause is
+  # worse than no cause, so this is pinned at the level the user sees it.
+  @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
+  Scenario: diagnose-37 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+    Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no vLLM startup OOM is reported
+
+  # Round 2 of ROCMAI-449 (`fix-6-path`): the escaped-write fix
+  # (`ps_single_quote_escape` in crates/rocm-core/src/quoting.rs) is unit-tested
+  # against the exact script string that gets built, but only a real Windows
+  # host with a real `powershell.exe` can prove the escaped script still
+  # parses and the value it carries survives the round trip. This also covers
+  # the user-observable behaviour round 1 (`cb9f748d`) introduced -- the
+  # PowerShell write in place of `setx`, and prepend- rather than
+  # append-ordering -- which had no e2e coverage of any kind before this.
+  #
+  # Real, not mocked: every other fix-recipe e2e mock in this suite (see
+  # `fake_executable::write_fake_executable` in diagnose-15/-16) stands a fake
+  # in for an external helper like `usermod`/`sudo`, never for the thing under
+  # test. There is no precedent for faking `powershell.exe`/`setx.exe` itself,
+  # so this runs the real write against the real User-scope PATH and restores
+  # it afterward via `LifecycleState`'s `Drop` -- the same mechanism
+  # lifecycle-13's `install.ps1` PATH scenario already uses for the same
+  # machine-global state.
+  @id:diagnose-fix-path-prepends-with-apostrophe-intact @requires-os:windows
+  Scenario: diagnose-38 - Fixing a missing PATH entry prepends it and survives an apostrophe already on the real PATH
+    Given a Windows host with a HIP SDK install and an apostrophe already on the real User PATH
+    When the user asks the CLI to apply the approved fix
+    Then the CLI used PowerShell's SetEnvironmentVariable, not setx, to update the User PATH
+    And the HIP SDK bin dir is prepended on the real User PATH, apostrophe intact
+
+  # The headline behaviour `cb9f748d` fixed: before it, a failed PATH read was
+  # silently treated as an empty PATH, and the write that followed replaced
+  # the user's entire real User PATH with just the SDK's bin dir. This denies
+  # the CLI's own PowerShell resolution (one of the three real causes
+  # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
+  # faking the read failing, so the abort this proves is a real one, not a
+  # simulated one, and it never touches the real User PATH at all, so no
+  # capture/restore is needed here.
+  @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
+  Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
+    Given a Windows host with a HIP SDK install and no way to resolve PowerShell
+    When the user asks the CLI to apply the approved fix
+    Then the CLI aborts the PATH fix with exit code 4 and changes nothing
+
+  # The ticket's host: a laptop whose only AMD GPU is a Vega iGPU ROCm has never
+  # shipped a runtime build for. The point of the whole change is what such a
+  # machine is told, and before it the top-ranked answer was "install the HIP
+  # SDK" -- a download that would not have helped, on a host whose default
+  # engine does not use HIP at all.
+  #
+  # The host is simulated rather than required: a KFD node planted under the
+  # scenario's own root reports gfx_target_version 90012 (gfx90c), and a
+  # stand-in `lspci` lists an empty bus so the runner's real cards are not
+  # described. The same mechanism `examine-23` uses, so this runs on every Linux
+  # lane, GPU or not -- WSL2 included, since `@requires-os:linux` matches a host
+  # whose `os_family` is `linux` and WSL2's is. Every `rocm` call in the scenario
+  # therefore has to carry the planted host root, or the WSL2 lane answers about
+  # itself instead of about the simulated machine.
+  @id:diagnose-unsupported-gpu-is-explained-not-fixed @requires-os:linux
+  Scenario: diagnose-40 - A GPU with no ROCm build is explained, and nothing is offered to install
+    Given a machine whose only GPU is one ROCm has no build for
+    When the user asks the CLI to diagnose that machine's state
+    Then the diagnosis names the architecture and says Vulkan still works
+    And that cause offers no fix to apply, and says so
+    And no cause tells this user to install the HIP SDK
+
+  # On Windows an AMD display driver dated before 27 July 2023 gets advice, not a
+  # finding: the entry scores below the match threshold. The scenario names no
+  # driver. It holds `diagnose` to what `rocm examine --json` reports on the same
+  # machine, so it passes with a current driver (no advice) and with an old one
+  # (advice present). The old-driver branch needs such a machine and is not
+  # exercised here.
+  @id:diagnose-windows-display-driver-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-41 - On Windows the diagnosis agrees with the inspection about the old display driver
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis offers the old display driver advice only when the inspection reports an old driver
+
+  # The remediation text names a command and the files to move aside, so it is
+  # checked against a simulated Ubuntu 24.04 machine (os-release and two stale
+  # repo files planted under the host root, as in diagnose-40) rather than the
+  # runner's own distro: the advice depends on the distro and the runner's is
+  # not fixed. The named command is then held to existing and accepting the
+  # flags it is advised with; its behaviour is covered by driver-install-06.
+  @id:diagnose-stale-repos-advice-names-the-driver-reinstall @requires-os:linux
+  Scenario: diagnose-42 - Stale repo advice on Ubuntu 24.04 names the planted repo files and a driver reinstall that exists
+    Given an Ubuntu 24.04 machine with two stale ROCm repo files
+    When the user diagnoses that machine with a stale repo symptom
+    Then the stale repo cause names both planted repo files and the driver reinstall command
+    And the advised driver reinstall command accepts the flags it is advised with
+
+  # The verify line of the MSVC runtime fix is shown to users of Windows
+  # PowerShell 5.1 and of cmd. `&&` and `||` are syntax errors in the first, a
+  # bare `where` is `Where-Object` there, it does not expand `%NAME%`, and in a
+  # `powershell -Command "..."` body it takes neither `\"` as an escaped quote
+  # nor `$_` (the outer shell expands it).
+  # Deliberately not OS-gated: the plan is printed before the fix's platform
+  # gate, so the text is the same on every lane, and the scenario asserts the
+  # printed lines and not the exit code. It does not run the line. The test
+  # `the_msvc_verify_runs_in_cmd_and_powershell` in
+  # crates/rocm-core/src/fix/catalog.rs does that, and only on Windows.
+  @id:diagnose-msvc-verify-line-text-is-powershell-safe
+  Scenario: diagnose-43 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
+    Given a user who has chosen the fix for the missing MSVC runtime
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed verify command is a PowerShell command that selects FileVersion
+
+  # The same check for the two other fixes whose lines are shown on Windows
+  # and were written for one shell: the override fix's verify line used
+  # `env | grep ... ||`, and the PATH fix's verify line used `rocminfo | head
+  # && ...`. The override fix's Linux line is `echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"`:
+  # it has no `||`, which the rule refuses on a line a Windows user sees, and it
+  # needs no `python`, which a stock Ubuntu lacks. The override fix also used to print `setx HSA_OVERRIDE_GFX_VERSION ""`,
+  # and Windows PowerShell 5.1 drops the empty argument, so setx failed with
+  # "Invalid syntax" and cleared nothing; the step refuses an empty-string
+  # argument too. Text only, like diagnose-43. `the_override_verify_runs_in_cmd_and_powershell`
+  # in crates/rocm-core/src/fix/catalog.rs runs the override verify line, on Windows.
+  # These three scenarios see what `rocm fix <id> --dry-run` prints from the
+  # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
+  # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
+  # in crates/rocm-core/src/diagnose/catalog.rs, and a printed line the rule passes is
+  # still not proven to run: the Windows-only tests named above do that.
+  @id:diagnose-override-fix-lines-are-powershell-safe
+  Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for the GPU override
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed Linux verify line reads the override without needing Python
+    And the printed notes say a stock Linux install has python3 and not python
+
+  @id:diagnose-path-fix-lines-are-powershell-safe
+  Scenario: diagnose-45 - The lines printed for the PATH fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for ROCm missing from PATH
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed Linux verify line shows the GPU without needing a compiler
+    And the printed notes say a runtime-only Linux install has no hipcc
+
+  # The three scenarios above see `rocm fix <id> --dry-run`, which prints the
+  # catalog's lines. `rocm diagnose` builds its own `Fix` values and prints the
+  # verify line from them, so the line a user reads after a diagnosis is checked
+  # here, on Linux, where it can be told apart from the catalog's by running
+  # the binary. The exact line is asserted, and that it names `python3`: a stock
+  # Ubuntu has no `python`. Text only: the line is run by
+  # `the_override_fix_verify_runs_where_only_python3_exists` in
+  # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
+  # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
+  # (text) and the Windows-only `*_verify_runs_*` tests in
+  # crates/rocm-core/src/fix/catalog.rs (run); there is no Windows scenario for them.
+  @id:diagnose-override-verify-line-names-python3 @requires-os:linux
+  Scenario: diagnose-46 - The verify line printed for the GPU override cause reads the override and uses python3
+    Given a Linux machine whose shell has a GPU override set
+    When the user diagnoses that machine with a page fault symptom
+    Then the override cause prints a verify line that reads the override and checks torch with python3
+
+  # The fix-6 Linux arm used to chain `hipcc --version` after `rocminfo`, which
+  # fails on a runtime-only install even with PATH fixed. The host is simulated
+  # as in diagnose-40 and the symptom is what raises the cause.
+  @id:diagnose-path-verify-line-is-rocminfo-alone @requires-os:linux
+  Scenario: diagnose-47 - The verify line printed for the PATH cause is rocminfo alone, with no hipcc
+    Given a simulated Linux machine with ROCm missing from PATH
+    When the user diagnoses that machine with a rocminfo not found symptom
+    Then the PATH cause prints a verify line that shows the GPU with rocminfo alone
+
+  # A missing system HIP SDK is a fault only when something on the machine calls
+  # into it: a HIP-built PyTorch from outside a managed runtime, or a HIP-built
+  # llama.cpp on PATH. Lemonade's bundled llama.cpp does not, and a managed
+  # TheRock runtime brings its own HIP. On v0.2.1 a healthy Windows Strix Halo
+  # serving through Lemonade was still told "install the HIP SDK" as its #1
+  # cause, before and after `rocm install sdk`. Like diagnose-41 the scenario
+  # names no host shape: it holds `diagnose` to what `rocm examine --json`
+  # reports on the same machine, so on the self-hosted Windows GPU lanes (Strix
+  # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
+  # an ambient HIP framework needs the SDK is held by the unit test
+  # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+  # in crates/rocm-core/src/diagnose/windows.rs. The oracle also counts a weak listing
+  # (below the match threshold) as present, which is what production does for
+  # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
+  # bonus wrong, so whoever changes it must update this scenario's oracle too.
+  @id:diagnose-windows-hip-sdk-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-48 - On Windows the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it

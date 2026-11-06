@@ -2,1512 +2,987 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Guard `docs/architecture.md`'s path citations against silent drift.
+//! Require every production source file to appear in `docs/architecture.md`.
 //!
-//! The doc tells contributors "verify current file and function boundaries
-//! directly ... rather than trusting this doc's wording" — that disclaimer
-//! exists because nothing previously checked that the paths it cites still
-//! exist. A renamed or removed file then rots silently in the doc until a
-//! reader notices. This check makes the doc self-policing instead: it
-//! extracts every backtick-quoted path citation and fails, naming every one
-//! not found where it's cited. Exactly where a given citation is checked
-//! depends on its shape (a slash path, a bare filename, a bare directory
-//! name) — see [`citation_exists`]'s doc comment for the one, canonical
-//! statement of that rule; nowhere else in this module, `main.rs`,
-//! `ci.yml`, `CONTRIBUTING.md`, or `docs/architecture.md` restates it, so
-//! there is exactly one place for it to drift out of sync with the code.
+//! `docs/architecture.md` is the contributor-facing module map and is meant to
+//! be "updated in the same PR as the code it documents". Nothing enforced that
+//! until now. The `lychee` link check (the `docs-links` CI job and the `lychee`
+//! prek hook) runs the other way round: it confirms that every link already in
+//! the doc still resolves, so a moved or deleted file is caught, but a file the
+//! doc never mentions has no link to check and passes silently.
 //!
-//! Same shape as [`crate::crate_edges`]: a reusable [`run`] plus
-//! `#[cfg(test)]` unit tests on the pure extraction/lookup helpers, and one
-//! test asserting the real doc passes today.
+//! This check starts from the source tree instead. Every tracked `.rs` file
+//! under `apps/*/src`, `crates/*/src` and `engines/*/src` must be cited by a
+//! relative markdown link in `docs/architecture.md` (a complete inline link,
+//! `[text](path)`, with its text on one line, that renders as a link: a path
+//! inside an HTML comment, a code block or a code span does not count, and
+//! neither does a link missing its `[` or `)`, one with an escaped bracket, an
+//! image, or the outer brackets of a link that contains another link),
+//! or be listed in [`EXEMPT`], or be a test-only helper (see
+//! [`is_test_helper`]). Out of scope: `build.rs` files at a crate's root and the
+//! `tests/` and `examples/` trees, which sit outside `<crate>/src`.
 //!
-//! ## Telling a path citation from a code snippet
+//! It reads the git index and the working tree, never a git diff, so the answer
+//! does not depend on a base ref. That is the same answer in CI and in the
+//! pre-commit hook, where prek stashes unstaged changes first. The pre-push hook
+//! runs it too, but it reads the working tree, not the commits being pushed:
+//! with a clean tree that is the same thing, and with edits that are staged or
+//! unstaged it can pass where CI fails. CI is the gate; the hook is feedback.
 //!
-//! The doc is prose, not a code listing, but it still backtick-quotes
-//! plenty of non-path Rust syntax alongside real paths: `` `crate::` ``,
-//! `` `pub(crate) fn` ``, `` `comfyui::render_status(...)` ``,
-//! `` `too_many_lines = "allow"` ``, and bare type names like
-//! `` `ActionReport` ``. [`is_path_candidate`] filters those out; see its
-//! doc comment for the exact rule and its known blind spots: a bare,
-//! non-hyphenated word like `` `xtask` `` is indistinguishable from a plain
-//! English word like `` `grep` ``, and a bare filename whose extension
-//! isn't in [`BARE_FILE_EXTENSIONS`] (e.g. `` `report.json` ``) isn't
-//! recognized as a citation shape at all — both are deliberately never
-//! checked, so they go unchecked rather than risk false-flagging prose or
-//! an arbitrary extension.
+//! The doc must use inline `[text](path)` links. Reference-style links, a
+//! `?query` suffix and a root-relative path render as working links but are not
+//! recognised, so the failure message asks for the inline form.
 //!
-//! ## Scoping bare filename citations to their section
+//! [`EXEMPT`] is the files that existed, uncited, when the check was added. It
+//! follows the pattern of `ALLOWLIST` in [`crate::crate_edges`] and is checked
+//! in both directions: a source file in neither the doc nor the list fails,
+//! and so does a list entry that is now cited or no longer exists. The list is
+//! meant to shrink as files are documented. Nothing can stop a determined edit
+//! from adding to it, so [`EXEMPT_CEILING`] pins its size in a test: growing
+//! the list means raising that constant too, a second, visible line in the diff
+//! that a reviewer has to accept.
 //!
-//! The doc cites `` `main.rs` ``/`` `lib.rs` `` bare, by design, under
-//! several different `### \`<crate>\`` headings — one per subsystem still
-//! pending modularization. The workspace has ~17 files literally named
-//! `main.rs` or `lib.rs`, so checking a bare citation against "exists
-//! anywhere in the repo" would make the check nearly a no-op for exactly
-//! the citations it most needs to catch: renaming *`apps/rocmd`'s* `lib.rs`
-//! would go undetected as long as some unrelated crate's `lib.rs` still
-//! exists. [`extract_path_citations`] records each citation's nearest
-//! preceding heading's directories, and [`citation_exists`] uses that
-//! context to check "does this specific section's file still exist"
-//! instead — see both functions' doc comments for the exact rule and its
-//! (narrower, documented) fallback.
+//! What this does not check: whether an entry's prose still describes the file,
+//! and functions that move between two files that are both already cited.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-/// Path to the guarded doc, relative to the repo root.
-const DOC_PATH: &str = "docs/architecture.md";
+use crate::paths;
 
-/// File extensions the doc cites by bare name (no directory), trusting
-/// surrounding prose — or, since [`extract_path_citations`], its nearest
-/// heading — for which subsystem the file lives in.
-///
-/// A bare citation whose extension isn't in this list is NOT a candidate
-/// (see [`is_path_candidate`]) — the same deliberate, documented blind spot
-/// as a bare non-hyphenated word (module doc comment). The doc does cite one
-/// other bare extension today (`` `report.json` ``, in the `crates/e2e-report`
-/// section) — it's silently never checked, by the same tradeoff: guessing at
-/// arbitrary extensions would risk false-flagging prose (version strings,
-/// flag names) as path citations. A future bare citation with an unlisted
-/// extension (e.g. `` `ci.yml` ``) needs a directory-qualified path
-/// (`` `.github/workflows/ci.yml` ``) to be checked, or this list extended
-/// deliberately.
-const BARE_FILE_EXTENSIONS: [&str; 3] = [".rs", ".md", ".toml"];
+/// The module map, relative to the workspace root.
+const DOC: &str = "docs/architecture.md";
 
-/// Extensions among [`BARE_FILE_EXTENSIONS`] whose bare citations get scoped
-/// to their heading's directories in [`citation_exists`]. Only `.rs`: every
-/// bare `.md`/`.toml` citation in the doc today (`` `AGENTS.md` ``,
-/// `` `Cargo.toml` ``, `` `runtime-deps.toml` ``) is a singleton file that
-/// lives at the repo root regardless of which subsystem's section mentions
-/// it — e.g. `runtime-deps.toml` is cited inside the `crates/rocm-deps`
-/// section but the doc's own prose calls it out as "workspace-root", so
-/// scoping it to that crate's directory would be wrong. `.rs` bare
-/// citations, by contrast, are always per-crate source files
-/// (`main.rs`/`lib.rs`/`agent.rs`), which is exactly the case that needs
-/// scoping (see the module doc comment).
-const SCOPED_BARE_EXTENSIONS: [&str; 1] = [".rs"];
+/// The directory `DOC` lives in. Its links are relative to this.
+const DOC_DIR: &str = "docs";
 
-/// Whether `text` ends in one of [`SCOPED_BARE_EXTENSIONS`] — shared by
-/// [`extract_path_citations`], [`citation_exists`], and
-/// [`format_stale_citation`] so the three can't drift apart the way two of
-/// them once did (see `multi_directory_citation_requires_every_directory_to_have_the_file`).
-fn is_scoped_extension(text: &str) -> bool {
-    SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext))
+/// Source roots whose `<crate>/src` trees are in scope.
+const SOURCE_ROOTS: [&str; 3] = ["apps", "crates", "engines"];
+
+/// Production files that have no entry in `docs/architecture.md` yet: everything
+/// that was uncited when this check was added, mostly the dashboard crates.
+/// Do not add to this list to make the check pass: document the file in the doc
+/// instead. Growing it is a reviewed exception and also needs
+/// [`EXEMPT_CEILING`] raised. Remove an entry when the file gets one. Keep it
+/// sorted.
+const EXEMPT: &[&str] = &[
+    "apps/rocmd/src/main.rs",
+    "crates/rocm-dash-collectors/src/amd_smi.rs",
+    "crates/rocm-dash-collectors/src/bench_load.rs",
+    "crates/rocm-dash-collectors/src/bench_tail.rs",
+    "crates/rocm-dash-collectors/src/cgroup.rs",
+    "crates/rocm-dash-collectors/src/docker.rs",
+    "crates/rocm-dash-collectors/src/engine_registry.rs",
+    "crates/rocm-dash-collectors/src/host.rs",
+    "crates/rocm-dash-collectors/src/lemonade.rs",
+    "crates/rocm-dash-collectors/src/parallel.rs",
+    "crates/rocm-dash-collectors/src/proc_scan.rs",
+    "crates/rocm-dash-collectors/src/sysfs.rs",
+    "crates/rocm-dash-collectors/src/vllm_log.rs",
+    "crates/rocm-dash-collectors/src/vllm_prom.rs",
+    "crates/rocm-dash-core/src/bench_rollup.rs",
+    "crates/rocm-dash-core/src/bench_schema.rs",
+    "crates/rocm-dash-core/src/config.rs",
+    "crates/rocm-dash-core/src/efficiency.rs",
+    "crates/rocm-dash-core/src/metrics.rs",
+    "crates/rocm-dash-core/src/observation.rs",
+    "crates/rocm-dash-core/src/partition.rs",
+    "crates/rocm-dash-core/src/persist.rs",
+    "crates/rocm-dash-core/src/protocol.rs",
+    "crates/rocm-dash-core/src/state.rs",
+    "crates/rocm-dash-core/src/traits.rs",
+    "crates/rocm-dash-core/src/vram.rs",
+    "crates/rocm-dash-daemon/src/bench_ring.rs",
+    "crates/rocm-dash-daemon/src/demo.rs",
+    "crates/rocm-dash-daemon/src/persist.rs",
+    "crates/rocm-dash-daemon/src/snapshot_ring.rs",
+    "crates/rocm-dash-daemon/src/transport.rs",
+    "crates/rocm-dash-tui/src/client.rs",
+    "crates/rocm-dash-tui/src/jobs.rs",
+    "crates/rocm-dash-tui/src/lib.rs",
+    "crates/rocm-dash-tui/src/llm.rs",
+    "crates/rocm-dash-tui/src/reconnect.rs",
+    "crates/rocm-dash-tui/src/registry_probe.rs",
+    "crates/rocm-dash-tui/src/replay.rs",
+    "crates/rocm-dash-tui/src/tool_exec.rs",
+    "crates/rocm-dash-tui/src/transport.rs",
+    "crates/rocm-dash-tui/src/ui/automations_manager.rs",
+    "crates/rocm-dash-tui/src/ui/bench.rs",
+    "crates/rocm-dash-tui/src/ui/bench_run.rs",
+    "crates/rocm-dash-tui/src/ui/command_screen.rs",
+    "crates/rocm-dash-tui/src/ui/config_manager.rs",
+    "crates/rocm-dash-tui/src/ui/core_bars.rs",
+    "crates/rocm-dash-tui/src/ui/dock.rs",
+    "crates/rocm-dash-tui/src/ui/engine_manager.rs",
+    "crates/rocm-dash-tui/src/ui/examine_manager.rs",
+    "crates/rocm-dash-tui/src/ui/folder_browser.rs",
+    "crates/rocm-dash-tui/src/ui/format.rs",
+    "crates/rocm-dash-tui/src/ui/gradient.rs",
+    "crates/rocm-dash-tui/src/ui/install_manager.rs",
+    "crates/rocm-dash-tui/src/ui/instance_list.rs",
+    "crates/rocm-dash-tui/src/ui/launcher.rs",
+    "crates/rocm-dash-tui/src/ui/logs_view.rs",
+    "crates/rocm-dash-tui/src/ui/model_picker.rs",
+    "crates/rocm-dash-tui/src/ui/onboarding.rs",
+    "crates/rocm-dash-tui/src/ui/runtime_manager.rs",
+    "crates/rocm-dash-tui/src/ui/serve_wizard.rs",
+    "crates/rocm-dash-tui/src/ui/services_manager.rs",
+    "crates/rocm-dash-tui/src/ui/sparkline.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/bench.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/chat.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/hardware.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/home.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/mod.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/observe.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/pane.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/rocm.rs",
+    "crates/rocm-dash-tui/src/ui/tabs/serving.rs",
+    "crates/rocm-dash-tui/src/ui/update_manager.rs",
+    "crates/rocm-deps/src/lib.rs",
+    "engines/aim/src/main.rs",
+    "engines/lemonade/src/main.rs",
+    "engines/vllm/src/main.rs",
+];
+
+/// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
+/// not raise it to make the check pass, since a file with no entry in the module
+/// map should get one. Raising it is the visible, reviewed way to grow the list.
+const EXEMPT_CEILING: usize = 76;
+
+/// Whether `path` is a tracked-file path this check covers: a `.rs` file under
+/// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Rust sources are always lowercase `.rs`
+fn in_scope(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    parts.len() >= 4
+        && SOURCE_ROOTS.contains(&parts[0])
+        && parts[2] == "src"
+        && path.ends_with(".rs")
 }
 
-/// The remaining [`BARE_FILE_EXTENSIONS`] — `.md`/`.toml` — matched in
-/// [`citation_exists`] against the repo root specifically, rather than by
-/// path component anywhere in the tree: the workspace has 14 nested
-/// `Cargo.toml` manifests, so an "any component" match would keep passing
-/// for a stale root `` `Cargo.toml` `` citation as long as any crate's
-/// manifest still existed, the same masking bug `.rs` scoping exists to
-/// prevent — just for a fixed location (the root) instead of a
-/// heading-derived one.
-const ROOT_LEVEL_BARE_EXTENSIONS: [&str; 2] = [".md", ".toml"];
-
-/// One path citation from the doc, paired with the directories named by its
-/// nearest preceding heading (e.g. `` ### `apps/rocmd` `` → `["apps/rocmd"]`).
-/// Empty when the citation isn't under a directory-naming heading (the top
-/// of the doc, or a heading like `## Module map` with no path in it).
-///
-/// See [`citation_exists`] for why a bare filename citation needs this
-/// context to be checked precisely.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Citation {
-    text: String,
-    section_dirs: Vec<String>,
+/// Whether `path` is a test-only helper that does not need an architecture
+/// entry: shared test support, or a property-test module. Matched on the file
+/// stem so a new helper of the same kind never needs an [`EXEMPT`] entry.
+fn is_test_helper(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = name.strip_suffix(".rs").unwrap_or(name);
+    matches!(stem, "test_support" | "test_env" | "proptests")
+        || stem.ends_with("_proptests")
+        || stem.ends_with("_props")
+        || stem.ends_with("_properties")
 }
 
-/// Run `git` with the given args (relative to `root`) and return trimmed
-/// stdout, failing on a non-zero exit. Same shape as
-/// [`crate::verify_commits`]'s private `git` helper.
-fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run `git {}`", args.join(" ")))?;
-    if !output.status.success() {
-        bail!(
-            "`git {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+/// Resolve one markdown link target found in [`DOC`] to a repo-relative `.rs`
+/// path, or `None` if it is not a link to a source file inside the repo.
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Rust sources are always lowercase `.rs`
+fn resolve_link(target: &str) -> Option<String> {
+    let target = target.split('#').next()?;
+    if target.contains("://") || !target.ends_with(".rs") {
+        return None;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Every path tracked in the git tree, as `root`-relative [`PathBuf`]s.
-/// Scoping to tracked files (rather than a raw filesystem walk) matches the
-/// issue's "still exists in the tree" wording and skips build artifacts
-/// under `target/` for free.
-///
-/// Passes `-c core.quotePath=false`: git's default quotes/escapes any
-/// non-ASCII byte in a path (e.g. `café.rs` comes back as
-/// `"caf\303\251.rs"`), which would never string-equal a citation's plain
-/// text — silently reporting an existing file as stale.
-fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
-    Ok(git(root, &["-c", "core.quotePath=false", "ls-files"])?
-        .lines()
-        .map(PathBuf::from)
-        .collect())
-}
-
-/// Whether a backtick-quoted span from the doc looks like a file or
-/// directory path citation, as opposed to a Rust type name, function call,
-/// or other code-syntax snippet also written in backticks throughout the
-/// doc.
-///
-/// A span qualifies if every character is path-safe (alphanumeric, `/`,
-/// `_`, `-`, `.`) AND one of:
-/// - it contains a `/` — an explicit relative path
-///   (`apps/rocm/src/therock.rs`) or a bare directory citation
-///   (`apps/rocm`);
-/// - it has no `/` but ends in a [`BARE_FILE_EXTENSIONS`] extension, with
-///   at least one character before it (the extension alone, e.g. `` `.rs` ``,
-///   is not itself a filename) — the doc cites many files by bare name
-///   (`main.rs`, `lib.rs`, `bootstrap.rs`), trusting surrounding prose for
-///   which subsystem directory they live in rather than repeating the full
-///   path;
-/// - it has no `/` and no extension, but is an all-lowercase hyphenated
-///   word (`rocm-dash-collectors`) — the doc's convention for citing a
-///   crate directory by its Cargo package name.
-///
-/// Two deliberate blind spots, same "safer to miss than false-flag" tradeoff:
-/// - A bare, non-hyphenated word (`xtask`) is not treated as a candidate:
-///   nothing at the lexical level distinguishes a real bare directory from
-///   a plain English word or shell command (e.g. `grep`).
-/// - A slash-path whose every component is a common English word (`read/write`,
-///   `and/or`) is accepted unconditionally; nothing at the lexical level
-///   distinguishes `apps/rocm` from `and/or`, and the doc's own prose has
-///   never contained such a pattern — spaces, which is_path_safe already
-///   rejects, have always separated prose from punctuation in practice.
-///   A future `` `and/or` `` in the doc would false-fail CI; if that ever
-///   happens, the citation should use a hyphenated form or a qualifying
-///   directory prefix.
-fn is_path_candidate(span: &str) -> bool {
-    if span.is_empty() || !is_path_safe(span) {
-        return false;
+    let mut parts: Vec<&str> = vec![DOC_DIR];
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // Climbing out of the repo root names nothing in the tree.
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
     }
-    if span.contains('/') {
-        return true;
+    Some(parts.join("/"))
+}
+
+/// The first line of `text` without its terminator, and the byte length of that
+/// line including the terminator.
+fn next_line(text: &str) -> (&str, usize) {
+    match text.find('\n') {
+        Some(end) => (&text[..end], end + 1),
+        None => (text, text.len()),
     }
-    if BARE_FILE_EXTENSIONS
-        .iter()
-        .any(|ext| span.len() > ext.len() && span.ends_with(ext))
-    {
-        return true;
+}
+
+/// A code-fence marker at the start of `line`: its character and run length.
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let first = *line.as_bytes().first()?;
+    if first != b'`' && first != b'~' {
+        return None;
     }
-    is_hyphenated_bare_word(span)
+    let run = line.bytes().take_while(|&byte| byte == first).count();
+    // A backtick fence's info string cannot contain a backtick: that line is an
+    // inline code span, not a fence.
+    if run < 3 || (first == b'`' && line[run..].contains('`')) {
+        return None;
+    }
+    Some((first, run))
 }
 
-/// Whether every character in `span` is safe to appear in a path, as
-/// opposed to prose punctuation: alphanumeric (any Unicode letter or digit,
-/// not just ASCII — a tracked file can have a non-ASCII name, e.g.
-/// `café.rs`; see [`tracked_files`]'s `core.quotePath` handling), `/`, `_`,
-/// `-`, or `.`. Shared by [`is_path_candidate`] and [`is_directory_shaped`]
-/// so a malformed span (stray punctuation from surrounding prose) is
-/// rejected the same way by both, rather than one accepting what the other
-/// would reject.
-fn is_path_safe(span: &str) -> bool {
-    span.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+/// Whether `line` closes a fence opened with `open`.
+fn closes_fence(line: &str, open: (u8, usize)) -> bool {
+    fence_marker(line).is_some_and(|(character, run)| {
+        character == open.0 && run >= open.1 && line.trim().bytes().all(|byte| byte == open.0)
+    })
 }
 
-/// A bare (no `/`, no extension), all-lowercase, hyphenated word — the
-/// doc's convention for citing a crate directory by its Cargo package name
-/// (`rocm-dash-collectors`), as opposed to a Rust type name or other
-/// PascalCase identifier also written in backticks (`ActionReport`).
-fn is_hyphenated_bare_word(span: &str) -> bool {
-    span.contains('-')
-        && span
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+/// The byte length of the code span that opens at the start of `text` (which
+/// starts with a backtick run), or `None` if no run of the same length closes
+/// it. Like a CommonMark code span it cannot cross a blank line, so a stray
+/// backtick in one paragraph does not pair with one in a later paragraph.
+fn code_span_len(text: &str) -> Option<usize> {
+    let window = &text[..text.find("\n\n").unwrap_or(text.len())];
+    let open = window.bytes().take_while(|&byte| byte == b'`').count();
+    let mut at = open;
+    while let Some(offset) = window[at..].find('`') {
+        let start = at + offset;
+        let run = window[start..]
+            .bytes()
+            .take_while(|&byte| byte == b'`')
+            .count();
+        if run == open {
+            return Some(start + run);
+        }
+        at = start + run;
+    }
+    None
 }
 
-/// Whether `span` is directory-shaped: a slash-path (`apps/rocmd`) or a
-/// bare hyphenated crate name (`rocm-dash-collectors`) — the doc's two
-/// conventions for citing a directory, shared by heading-directory
-/// collection and possessive-owner narrowing in
-/// [`extract_path_citations`]. A slash-path must also be path-safe (see
-/// [`is_path_safe`]) — otherwise a stray bit of prose punctuation next to a
-/// `/` (`` `foo/bar!`'s `main.rs` ``) would be accepted as a directory,
-/// producing an unmatchable `section_dirs` entry that fails an accurate
-/// citation — and its last component must have no extension (a `.`),
-/// otherwise a full file path (`` `crates/rocm-core/src/diagnose.rs` ``,
-/// or one ending in an extension outside [`BARE_FILE_EXTENSIONS`] like
-/// `` `.github/workflows/ci.yml` ``) would be accepted as if it were the
-/// directory containing it, which is equally unmatchable — checked
-/// generally rather than against just [`BARE_FILE_EXTENSIONS`], since a
-/// full path can end in any extension, not only the ones the doc cites
-/// bare. [`is_hyphenated_bare_word`] already excludes extensions and
-/// guarantees path-safety on its own, so only the slash branch needs the
-/// extra checks.
-fn is_directory_shaped(span: &str) -> bool {
-    let last_segment = span.rsplit('/').next().unwrap_or(span);
-    let is_directory_path = span.contains('/') && is_path_safe(span) && !last_segment.contains('.');
-    is_directory_path || is_hyphenated_bare_word(span)
-}
-
-/// Extract every backtick-quoted path citation from the doc's markdown
-/// source, paired with its section context. Powered by `pulldown-cmark`,
-/// which handles fenced code blocks (backtick and tilde), indented code
-/// blocks, multi-backtick spans, and ATX headings correctly — the cases a
-/// hand-rolled parser had to grow into over several review rounds.
+/// `doc` with everything that does not render as a link removed: HTML comments,
+/// fenced code blocks and inline code spans. A link inside any of them is not
+/// part of the rendered module map, so it must not count as a citation. Each
+/// removed span leaves a space or newline behind so link text and line
+/// structure stay in place.
 ///
-/// A heading's backtick-quoted directory names become the "section
-/// directories" for every path-candidate inline-code span cited on it AND
-/// on later lines, until the next heading resets it. All of a citation's
-/// section directories must hold for it to count as existing (see
-/// [`citation_exists`]) — correct for a heading naming several crates that
-/// each independently make the same claim. A citation that instead names one
-/// specific crate from a multi-crate heading (`` `rocm-dash-tui`\'s
-/// `agent.rs` ``) is narrowed to just that crate via the possessive-connector
-/// check: `'s` starts a possessive clause, `/` and `and` continue one.
-/// Only `.rs` citations are narrowed this way; the logic lives inline in
-/// the `Event::Code` arm below.
-fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
-    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-
-    let mut citations = BTreeSet::new();
-    let mut section_dirs: Vec<String> = Vec::new();
-    // Remembers, for the current heading section, the single owner each
-    // `SCOPED_BARE_EXTENSIONS` citation text was last narrowed to by a
-    // possessive clause — so a later, unconnected repeat of the same bare
-    // filename under the same heading keeps that narrowing. Cleared whenever
-    // a new heading starts, alongside `section_dirs`.
-    let mut narrowed_owners: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-
-    // Inline context: what sits between one Code event and the next.
-    // Used to detect possessive connectors (\'s, /, and) for narrowing.
-    let mut inter_text = String::new();
-    // The last Code span that was a directory-shaped or scoped candidate —
-    // may become a possessive owner for the next Code span.
-    let mut last_code_span: Option<String> = None;
-    // The active possessive owner within the current clause.
-    let mut possessive_owner: Option<String> = None;
-
-    // Accumulate heading directories until End(Heading) commits them.
-    let mut heading_dirs: Vec<String> = Vec::new();
-    let mut in_heading = false;
-
-    // pulldown-cmark marks inline Code inside a CodeBlock as Event::Text,
-    // not Event::Code; we only need to suppress Event::Code inside a block,
-    // but tracking in_code_block is cheap insurance.
-    let mut in_code_block = false;
-
-    // A hyphenated bare word that might be a possessive owner: we can't know
-    // until the NEXT text event whether it is followed by 's. If it is,
-    // it's a genuine directory citation (and the owner for the next span);
-    // if not, it's hyphenated prose and must be discarded.
-    let mut pending_hyphenated: Option<String> = None;
-
-    // Reset inline state on block boundaries.
-    macro_rules! reset_inline {
-        () => {
-            inter_text.clear();
-            last_code_span = None;
-            possessive_owner = None;
-            pending_hyphenated = None;
+/// It scans once, left to right, so the usual precedence holds: a backtick
+/// inside a comment is part of the comment, and `<!--` inside a code span is
+/// code. A backslash-escaped backtick or `<` opens nothing. Where it cannot tell
+/// (an unclosed backtick), it errs towards hiding a link, which can only make
+/// the check fail, never pass. Indented code blocks are not recognised.
+fn link_source_text(doc: &str) -> String {
+    let doc = doc.replace("\r\n", "\n");
+    let mut out = String::with_capacity(doc.len());
+    let mut at = 0;
+    while at < doc.len() {
+        let rest = &doc[at..];
+        let line_start = at == 0 || doc.as_bytes()[at - 1] == b'\n';
+        if line_start {
+            let (line, mut skipped) = next_line(rest);
+            if let Some(open) = fence_marker(line) {
+                while skipped < rest.len() {
+                    let (inner, length) = next_line(&rest[skipped..]);
+                    skipped += length;
+                    if closes_fence(inner, open) {
+                        break;
+                    }
+                }
+                at += skipped;
+                out.push('\n');
+                continue;
+            }
+        }
+        if escapes_next(doc.as_bytes(), at) {
+            // An escaped backtick or `<` opens nothing. Keep both characters so
+            // `link_destinations` still sees the escape.
+            out.push_str(&rest[..2]);
+            at += 2;
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            at += rest.find("-->").map_or(rest.len(), |end| end + 3);
+            out.push(' ');
+            continue;
+        }
+        if rest.starts_with('`') {
+            if let Some(length) = code_span_len(rest) {
+                at += length;
+                out.push(' ');
+            } else {
+                let run = rest.bytes().take_while(|&byte| byte == b'`').count();
+                out.push_str(&rest[..run]);
+                at += run;
+            }
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
         };
+        out.push(character);
+        at += character.len_utf8();
     }
+    out
+}
 
-    for event in Parser::new_ext(markdown, Options::empty()) {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                in_code_block = true;
-                reset_inline!();
+/// Whether the byte at `at` is a backslash that escapes the ASCII punctuation
+/// character after it.
+fn escapes_next(bytes: &[u8], at: usize) -> bool {
+    bytes[at] == b'\\' && bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation)
+}
+
+/// `text` with the backslash removed from every escaped punctuation character.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if escapes_next(bytes, at) {
+            at += 1;
+        }
+        // Every byte skipped above or copied here is ASCII, so `at` stays on a
+        // character boundary.
+        let Some(character) = text[at..].chars().next() else {
+            break;
+        };
+        out.push(character);
+        at += character.len_utf8();
+    }
+    out
+}
+
+/// Advance `at` past spaces, tabs and newlines.
+fn skip_space(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n')) {
+        at += 1;
+    }
+    at
+}
+
+/// Parse the rest of an inline link, `text` being everything after its `(`:
+/// `destination`, an optional title, and the closing `)`. Returns the
+/// destination (its `<...>` delimiters and escapes removed) and the byte length
+/// consumed through the `)`, or `None` if it is not a complete inline link.
+fn inline_destination(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut at = skip_space(bytes, 0);
+    let destination;
+    if bytes.get(at) == Some(&b'<') {
+        let start = at + 1;
+        at = start;
+        loop {
+            match *bytes.get(at)? {
+                b'>' => break,
+                b'<' | b'\n' => return None,
+                _ if escapes_next(bytes, at) => at += 2,
+                _ => at += 1,
             }
-            Event::End(TagEnd::CodeBlock) => {
-                in_code_block = false;
-                reset_inline!();
+        }
+        destination = unescape(&text[start..at]);
+        at += 1;
+    } else {
+        let start = at;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(at) {
+                None => return None,
+                Some(b' ' | b'\t' | b'\n') => break,
+                Some(b'(') => {
+                    depth += 1;
+                    at += 1;
+                }
+                Some(b')') if depth == 0 => break,
+                Some(b')') => {
+                    depth -= 1;
+                    at += 1;
+                }
+                Some(_) if escapes_next(bytes, at) => at += 2,
+                Some(_) => at += 1,
             }
-            Event::Start(Tag::Heading { .. }) => {
-                in_heading = true;
-                heading_dirs.clear();
-                narrowed_owners.clear();
-                reset_inline!();
+        }
+        destination = unescape(&text[start..at]);
+    }
+    at = skip_space(bytes, at);
+    if let Some(&opener @ (b'"' | b'\'' | b'(')) = bytes.get(at) {
+        let closer = if opener == b'(' { b')' } else { opener };
+        at += 1;
+        loop {
+            match *bytes.get(at)? {
+                byte if byte == closer => break,
+                _ if escapes_next(bytes, at) => at += 2,
+                _ => at += 1,
             }
-            Event::End(TagEnd::Heading(_)) => {
-                in_heading = false;
-                section_dirs = heading_dirs.clone();
-                reset_inline!();
-            }
-            // Soft/hard breaks and paragraph boundaries reset inline state
-            // so a possessive chain does not leak across sentences.
-            Event::Start(Tag::Paragraph)
-            | Event::End(TagEnd::Paragraph)
-            | Event::SoftBreak
-            | Event::HardBreak => {
-                reset_inline!();
-            }
-            Event::Text(text) if !in_code_block => {
-                // Resolve a pending hyphenated span now that we see what comes
-                // after it. If the text starts with 's, the span is a genuine
-                // possessive owner: emit it as a citation and set it as the
-                // active owner. Otherwise discard it silently as prose.
-                if let Some(hyph) = pending_hyphenated.take() {
-                    if text.trim_start().starts_with("'s") {
-                        let effective_dirs = if in_heading {
-                            &heading_dirs
-                        } else {
-                            &section_dirs
-                        };
-                        citations.insert(Citation {
-                            text: hyph.clone(),
-                            section_dirs: effective_dirs.clone(),
-                        });
-                        possessive_owner = Some(hyph.clone());
+        }
+        at = skip_space(bytes, at + 1);
+    }
+    (bytes.get(at) == Some(&b')')).then_some((destination, at + 1))
+}
+
+/// An unmatched `[` while scanning for links.
+struct Opener {
+    /// Preceded by an unescaped `!`: an image, whose destination is not a link.
+    image: bool,
+    /// Cleared once a link has formed inside this one: links do not nest, so the
+    /// outer brackets then render as plain text.
+    active: bool,
+}
+
+/// The destination of every complete inline link, `[text](destination)`, in
+/// `text`. A bracket or parenthesis escaped with a backslash does not count,
+/// the `[` must be on the same line as its `]`, and a link missing its `[`, its
+/// `)` or its destination is not a link: the rendered page shows it as plain
+/// text, so it must not count as a citation either. The same goes for an image,
+/// `![alt](destination)`, and for the outer brackets of a link that contains
+/// another link; an image inside a link's text is fine.
+fn link_destinations(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut openers: Vec<Opener> = Vec::new();
+    let mut last_bang = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        if escapes_next(bytes, at) {
+            at += 2;
+            continue;
+        }
+        match bytes[at] {
+            b'\n' => openers.clear(),
+            b'!' => last_bang = Some(at),
+            b'[' => openers.push(Opener {
+                image: at > 0 && last_bang == Some(at - 1),
+                active: true,
+            }),
+            b']' => {
+                if let Some(opener) = openers.pop()
+                    && opener.active
+                    && bytes.get(at + 1) == Some(&b'(')
+                    && let Some((destination, length)) = inline_destination(&text[at + 2..])
+                {
+                    if !opener.image {
+                        found.push(destination);
+                        for outer in openers.iter_mut().filter(|outer| !outer.image) {
+                            outer.active = false;
+                        }
                     }
-                    last_code_span = Some(hyph);
-                }
-                inter_text.push_str(&text);
-            }
-            Event::Code(span) if !in_code_block => {
-                // A pending hyphenated span that was never followed by 's text
-                // (two Code events in a row with no Text between them) is prose —
-                // discard it but keep it as last_code_span for chain continuity.
-                if let Some(hyph) = pending_hyphenated.take() {
-                    last_code_span = Some(hyph);
-                }
-                let span: &str = &span;
-
-                // Collect heading directories from directory-shaped spans.
-                if in_heading && is_directory_shaped(span) {
-                    heading_dirs.push(span.to_string());
-                }
-
-                if !is_path_candidate(span) {
-                    reset_inline!();
+                    at += 2 + length;
                     continue;
                 }
-
-                // Hyphenated bare word: defer emission until we see whether
-                // the next text is 's (possessive) or not (prose).
-                if is_hyphenated_bare_word(span) {
-                    pending_hyphenated = Some(span.to_string());
-                    inter_text.clear();
-                    continue;
-                }
-
-                // Resolve the possessive owner for this span — the three
-                // connectors the doc uses: 's starts a clause, / and `and`
-                // continue one.  Only scoped (.rs) citations are narrowed.
-                let trimmed = inter_text.trim();
-                let new_owner: Option<String> = if is_scoped_extension(span) {
-                    if trimmed == "'s" {
-                        last_code_span
-                            .as_deref()
-                            .filter(|s| is_directory_shaped(s))
-                            .map(str::to_string)
-                    } else if matches!(trimmed, "/" | "and") {
-                        possessive_owner.clone()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // A connector-less repeat of a citation already narrowed
-                // earlier in this heading section keeps that narrowing.
-                let remembered_owner = new_owner.clone().or_else(|| {
-                    is_scoped_extension(span)
-                        .then(|| narrowed_owners.get(span).cloned())
-                        .flatten()
-                });
-
-                let effective_dirs = if in_heading {
-                    &heading_dirs
-                } else {
-                    &section_dirs
-                };
-                citations.insert(Citation {
-                    text: span.to_string(),
-                    section_dirs: match &remembered_owner {
-                        Some(owner) => vec![owner.clone()],
-                        None => effective_dirs.clone(),
-                    },
-                });
-                if let Some(ref owner) = new_owner {
-                    narrowed_owners.insert(span.to_string(), owner.clone());
-                }
-
-                possessive_owner = new_owner;
-                last_code_span = Some(span.to_string());
-                inter_text.clear();
             }
             _ => {}
         }
+        at += 1;
     }
-    citations
+    found
 }
 
-/// Whether `path` lives under `dir`. `dir` may be a full relative path
-/// (`apps/rocmd`, checked as a component-wise prefix) or a bare crate
-/// directory name (`rocm-dash-tui`, checked as any path component) — a
-/// heading can cite either shape (`` ### `crates/rocm-dash-core`,
-/// `rocm-dash-collectors`, ... ``), matching the two shapes
-/// [`is_path_candidate`] accepts for a directory citation.
-fn path_is_under(path: &Path, dir: &str) -> bool {
-    if dir.contains('/') {
-        path.starts_with(Path::new(dir))
-    } else {
-        path.components().any(|c| c.as_os_str() == dir)
-    }
-}
-
-/// Whether `citation` still exists among `tracked` files.
-///
-/// A slash-containing citation matches immediately if some tracked file
-/// *is* that path or lives under it as a directory (`Path::starts_with`,
-/// which compares whole path components, not raw strings — this keeps
-/// `apps/rocm` from spuriously matching the unrelated `apps/rocmd/...`).
-///
-/// Otherwise it falls back to a *partial* suffix match (`Path::ends_with`)
-/// — the doc cites `` `app/mod.rs` `` (disambiguating which crate's
-/// `mod.rs`, without repeating the full
-/// `crates/rocm-dash-tui/src/app/mod.rs`). A bare suffix like this is
-/// ambiguous by itself: if the doc's own crate later moved the file away
-/// while an unrelated crate happened to have an identically-suffixed file,
-/// the stale citation would still "match". So a partial match in a
-/// [`SCOPED_BARE_EXTENSIONS`] citation is additionally constrained to the
-/// citation's own section directories (via [`path_is_under`]), the same
-/// scoping a bare citation gets below — every directory must have its own
-/// matching file. A slash-path citation with no section context (or a
-/// non-scoped extension) falls back to an unconstrained suffix match, same
-/// as before.
-///
-/// A bare citation (no `/`) with a [`SCOPED_BARE_EXTENSIONS`] extension,
-/// cited under at least one heading with known directories, is scoped to
-/// those directories via [`path_is_under`] rather than matched anywhere in
-/// the repo: the doc cites `lib.rs`/`main.rs` under several different
-/// `### <crate>` headings, and ~17 files share those two bare names
-/// workspace-wide, so an unscoped match would stay silent if the *specific*
-/// file a section is talking about were renamed away, as long as some
-/// unrelated crate's same-named file still existed. Every section
-/// directory must have the file — not just one — so a citation naming
-/// several crates at once (`` Both crates' `lib.rs` `` under a two-crate
-/// heading) is verified for each of them; a citation narrowed to one
-/// specific crate (see [`extract_path_citations`]) has only that single
-/// directory to satisfy, so this is never stricter than intended.
-///
-/// A bare citation with a [`ROOT_LEVEL_BARE_EXTENSIONS`] extension is
-/// matched only at the repo root (a single-component path equal to the
-/// citation) rather than by path component anywhere: `` `Cargo.toml` ``
-/// must mean the root manifest, not any of the workspace's 14 nested ones,
-/// which would otherwise mask the root file going stale.
-///
-/// A bare citation with no section context (mentioned outside a
-/// directory-naming heading) or a bare crate-directory name (unique
-/// repo-wide, so scoping adds nothing) falls back to matching any path
-/// component anywhere in the tree.
-fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
-    let text = citation.text.as_str();
-    let is_scoped = is_scoped_extension(text);
-    if text.contains('/') {
-        let citation_path = Path::new(text);
-        if tracked.iter().any(|p| p.starts_with(citation_path)) {
-            return true;
-        }
-        if is_scoped && !citation.section_dirs.is_empty() {
-            return citation.section_dirs.iter().all(|dir| {
-                tracked
-                    .iter()
-                    .any(|p| p.ends_with(citation_path) && path_is_under(p, dir))
-            });
-        }
-        return tracked.iter().any(|p| p.ends_with(citation_path));
-    }
-    if is_scoped && !citation.section_dirs.is_empty() {
-        return citation.section_dirs.iter().all(|dir| {
-            tracked
-                .iter()
-                .any(|p| path_is_under(p, dir) && p.file_name().is_some_and(|f| f == text))
-        });
-    }
-    if ROOT_LEVEL_BARE_EXTENSIONS
+/// Every `.rs` file [`DOC`] links to, as repo-relative paths. Only a complete
+/// inline link counts, and not one inside an HTML comment, a code block or a
+/// code span.
+fn cited_paths(doc: &str) -> BTreeSet<String> {
+    link_destinations(&link_source_text(doc))
         .iter()
-        .any(|ext| text.ends_with(ext))
-    {
-        return tracked.iter().any(|p| p == Path::new(text));
-    }
-    tracked
-        .iter()
-        .any(|p| p.components().any(|c| c.as_os_str() == text))
-}
-
-/// Fetch the doc's current path citations and fail, naming every one not
-/// found where it's cited — see [`citation_exists`]'s doc comment for
-/// exactly where each citation shape is checked.
-///
-/// This one-line delegation to [`check_doc_at`] has only its `Ok` direction
-/// exercised end-to-end, by `run_passes_against_the_real_doc`: silently
-/// discarding `check_doc_at`'s result here (e.g. `let _ =
-/// check_doc_at(...); Ok(())`) would still leave every test green.
-/// [`check_doc_at`]'s own logic is covered directly against a fabricated
-/// root (see `check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation`),
-/// but proving this specific line's `Err` direction would need
-/// `workspace_root()` itself to be swappable for a fabricated root — not
-/// worth adding just for this.
-pub fn run() -> Result<()> {
-    check_doc_at(&crate::paths::workspace_root()?)
-}
-
-/// [`run`]'s actual work, over an arbitrary `root` rather than the real
-/// workspace — split out so a reviewer-flagged gap (`run`'s one-line
-/// delegation to [`check_citations`] was itself untested; discarding its
-/// result would still leave every test green) can be closed with a test
-/// that drives this same read-doc -> tracked-files -> check pipeline
-/// against a throwaway git repo instead of the real tree.
-fn check_doc_at(root: &Path) -> Result<()> {
-    let doc_path = root.join(DOC_PATH);
-    let markdown = std::fs::read_to_string(&doc_path)
-        .with_context(|| format!("reading {}", doc_path.display()))?;
-    let tracked = tracked_files(root)?;
-    check_citations(&markdown, &tracked)
-}
-
-/// The gate itself: fail, naming every stale citation, if any path cited in
-/// `markdown` doesn't exist among `tracked`. Split out of [`run`] as a pure
-/// function over plain data (rather than inlining this into `run`'s
-/// filesystem/git IO) so the failure branch — the actual point of this
-/// gate — is directly testable without a real doc or tree to break.
-fn check_citations(markdown: &str, tracked: &[PathBuf]) -> Result<()> {
-    let citations = extract_path_citations(markdown);
-
-    // `citations` is already a `BTreeSet` of distinct `(text, section_dirs)`
-    // pairs, so this naturally reports the same bare text once per distinct
-    // section it was cited (and found stale) under, rather than collapsing
-    // them and losing which section's file is actually missing.
-    let stale: Vec<&Citation> = citations
-        .iter()
-        .filter(|citation| !citation_exists(citation, tracked))
-        .collect();
-
-    if !stale.is_empty() {
-        bail!(stale_message(&stale));
-    }
-    Ok(())
-}
-
-/// Build the failure message naming every stale citation — and, for a
-/// scoped bare citation, which section's directory it was expected under —
-/// so a contributor doesn't have to manually re-derive which of the doc's
-/// several same-named mentions (e.g. `lib.rs` under both `apps/rocmd` and
-/// `crates/rocm-core`) is the one that's actually stale.
-fn stale_message(stale: &[&Citation]) -> String {
-    let stale = dedupe_stale_for_display(stale);
-    format!(
-        "{DOC_PATH} cites {} path(s) not found where they're cited:\n{}\n\
-         update the citation to the path's new location, or remove it if the \
-         file/directory is gone for good",
-        stale.len(),
-        stale
-            .iter()
-            .map(|citation| format_stale_citation(citation))
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
-}
-
-/// Drop a bare (unscoped) stale citation when the same text is also stale
-/// under an explicit section elsewhere in `stale` — the scoped entry already
-/// names that file precisely, so keeping the bare one too would report one
-/// missing file as two. This does not touch two *scoped* entries with the
-/// same text under different sections (e.g. `lib.rs` stale under both
-/// `apps/rocmd` and `crates/rocm-core`): those are two different missing
-/// files, both worth a line, exactly as [`stale_message`] intends.
-fn dedupe_stale_for_display<'a>(stale: &[&'a Citation]) -> Vec<&'a Citation> {
-    stale
-        .iter()
-        .copied()
-        .filter(|citation| {
-            !citation.section_dirs.is_empty()
-                || !stale
-                    .iter()
-                    .any(|other| other.text == citation.text && !other.section_dirs.is_empty())
-        })
+        .filter_map(|destination| resolve_link(destination))
         .collect()
 }
 
-/// One line of [`stale_message`]'s report for a single stale citation.
-fn format_stale_citation(citation: &Citation) -> String {
-    // `citation_exists` only ever consults `section_dirs` for a
-    // `SCOPED_BARE_EXTENSIONS` (`.rs`) citation — every other shape (a
-    // `.md`/`.toml` citation, an unconstrained suffix match, a bare
-    // crate-directory name) matches independent of section, regardless of
-    // whether `section_dirs` happens to be non-empty (it's attached from
-    // whichever heading was current when the citation was extracted; see
-    // `extract_path_citations`). Hinting a section for one of those would
-    // name a location the check never actually required.
-    let is_scoped = is_scoped_extension(&citation.text);
-    // For a slash-qualified citation, `citation_exists` only ever reaches
-    // `section_dirs` after a tree-wide whole-path match already failed — the
-    // one location that match accepts is the literal cited path itself, not
-    // "under every one of this heading's directories". That conjunction is
-    // frequently unsatisfiable for a multi-segment path (the suffix already
-    // names its own crate, which can't also be "under" a sibling crate's
-    // directory), so hinting it here would send a contributor chasing a
-    // location the file could never occupy. Suppress the hint for this shape;
-    // the bare citation text (its own path) already says where it's expected.
-    let is_slash = citation.text.contains('/');
-    if citation.section_dirs.is_empty() || !is_scoped || is_slash {
-        format!("  `{}`", citation.text)
-    } else if citation.section_dirs.len() > 1 {
-        // `citation_exists` requires the file under *every* listed
-        // directory (see `multi_directory_citation_requires_every_directory_to_have_the_file`),
-        // so a bare comma list here ("expected under `a`, `b`") would read
-        // as a disjunction when the rule is a conjunction.
-        format!(
-            "  `{}` (expected under all of `{}`)",
-            citation.text,
-            citation.section_dirs.join("`, `")
-        )
-    } else {
-        format!(
-            "  `{}` (expected under `{}`)",
-            citation.text,
-            citation.section_dirs.join("`, `")
-        )
+/// Check the tracked files against the doc's citations and `exempt`, returning
+/// every violation found.
+fn check(tracked: &[String], cited: &BTreeSet<String>, exempt: &[&str]) -> Vec<String> {
+    let in_tree: BTreeSet<&str> = tracked
+        .iter()
+        .map(String::as_str)
+        .filter(|path| in_scope(path))
+        .collect();
+
+    let mut violations = Vec::new();
+
+    for path in &in_tree {
+        if !cited.contains(*path) && !exempt.contains(path) && !is_test_helper(path) {
+            violations.push(format!(
+                "`{path}` is not cited in {DOC}: add an entry for it to the module map, as an \
+                 inline `[text](path)` markdown link relative to docs/ (reference-style links, \
+                 `?query` suffixes and root-relative paths are not recognised)"
+            ));
+        }
     }
+
+    for entry in exempt {
+        if !in_tree.contains(entry) {
+            violations.push(format!(
+                "EXEMPT entry `{entry}` is stale: no tracked source file has that path any more; \
+                 remove it from EXEMPT in xtask/src/architecture_doc.rs"
+            ));
+        } else if cited.contains(*entry) {
+            violations.push(format!(
+                "EXEMPT entry `{entry}` is stale: {DOC} now cites it; remove it from EXEMPT in \
+                 xtask/src/architecture_doc.rs so a later removal from the doc is caught"
+            ));
+        } else if is_test_helper(entry) {
+            violations.push(format!(
+                "EXEMPT entry `{entry}` is redundant: test-only helpers are exempt by name; \
+                 remove it from EXEMPT in xtask/src/architecture_doc.rs"
+            ));
+        }
+    }
+
+    violations
+}
+
+/// Tracked files under the [`SOURCE_ROOTS`], as the index lists them.
+fn tracked_files(root: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--"])
+        .args(SOURCE_ROOTS)
+        .output()
+        .context("failed to run `git ls-files`")?;
+    if !output.status.success() {
+        bail!(
+            "`git ls-files` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The violation, if any, of `entries` exempt files exceeding `ceiling`.
+fn ceiling_violation(entries: usize, ceiling: usize) -> Option<String> {
+    (entries > ceiling).then(|| {
+        format!(
+            "EXEMPT holds {entries} entries but EXEMPT_CEILING is {ceiling}: a file with no entry \
+             in the module map should get one, not an EXEMPT line. Growing the list means raising \
+             EXEMPT_CEILING in xtask/src/architecture_doc.rs too, which is a reviewed exception"
+        )
+    })
+}
+
+/// Run the check against the real workspace.
+fn violations_in(root: &Path) -> Result<Vec<String>> {
+    let doc =
+        std::fs::read_to_string(root.join(DOC)).with_context(|| format!("failed to read {DOC}"))?;
+    let mut violations = check(&tracked_files(root)?, &cited_paths(&doc), EXEMPT);
+    violations.extend(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING));
+    Ok(violations)
+}
+
+/// Fail if a production source file has no entry in `docs/architecture.md`, or
+/// [`EXEMPT`] has gone stale.
+pub fn run() -> Result<()> {
+    let root = paths::workspace_root()?;
+    let violations = violations_in(&root)?;
+    if !violations.is_empty() {
+        bail!(
+            "{DOC} is out of step with the source tree ({} problem(s)):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn files(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    fn cites(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
     #[test]
-    fn slash_paths_and_extensioned_bare_files_are_candidates() {
+    fn cited_file_passes() {
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        assert!(check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]).is_empty());
+    }
+
+    #[test]
+    fn new_uncited_file_fails_and_is_named() {
+        let tracked = files(&["apps/rocm/src/cli.rs", "apps/rocm/src/brand_new.rs"]);
+        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("apps/rocm/src/brand_new.rs"));
+        assert!(violations[0].contains("is not cited"));
+    }
+
+    #[test]
+    fn a_citation_does_not_cover_the_same_name_in_another_crate() {
+        let tracked = files(&["apps/rocm/src/cli.rs", "apps/rocmd/src/cli.rs"]);
+        let violations = check(&tracked, &cites(&["apps/rocm/src/cli.rs"]), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("apps/rocmd/src/cli.rs"));
+    }
+
+    #[test]
+    fn exempt_file_passes() {
+        let tracked = files(&["crates/rocm-dash-core/src/state.rs"]);
+        let exempt = ["crates/rocm-dash-core/src/state.rs"];
+        assert!(check(&tracked, &cites(&[]), &exempt).is_empty());
+    }
+
+    #[test]
+    fn exempt_entry_for_a_missing_file_is_stale() {
+        let exempt = ["crates/rocm-dash-core/src/gone.rs"];
+        let violations = check(&files(&[]), &cites(&[]), &exempt);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("crates/rocm-dash-core/src/gone.rs"));
+        assert!(violations[0].contains("no tracked source file"));
+    }
+
+    #[test]
+    fn exempt_entry_that_is_now_cited_is_stale() {
+        let tracked = files(&["crates/rocm-dash-core/src/state.rs"]);
+        let exempt = ["crates/rocm-dash-core/src/state.rs"];
+        let cited = cites(&["crates/rocm-dash-core/src/state.rs"]);
+        let violations = check(&tracked, &cited, &exempt);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("now cites it"));
+    }
+
+    #[test]
+    fn exempt_entry_for_a_test_helper_is_redundant() {
+        let tracked = files(&["crates/rocm-core/src/test_support.rs"]);
+        let exempt = ["crates/rocm-core/src/test_support.rs"];
+        let violations = check(&tracked, &cites(&[]), &exempt);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("redundant"));
+    }
+
+    #[test]
+    fn files_outside_the_source_trees_are_ignored() {
+        let tracked = files(&[
+            "apps/rocm/tests/broken_pipe.rs",
+            "apps/rocm/build.rs",
+            "crates/rocm-dash-tui/examples/gen_cast.rs",
+            "xtask/src/anything.rs",
+            "apps/rocm/src/data.json",
+            "tests/e2e-cucumber/src/lib.rs",
+        ]);
+        assert!(check(&tracked, &cites(&[]), &[]).is_empty());
+    }
+
+    #[test]
+    fn nested_source_files_are_in_scope() {
+        let tracked = files(&["crates/rocm-dash-tui/src/ui/tabs/home.rs"]);
+        let violations = check(&tracked, &cites(&[]), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("ui/tabs/home.rs"));
+    }
+
+    #[test]
+    fn test_helpers_need_no_entry() {
+        let tracked = files(&[
+            "apps/rocm/src/test_support.rs",
+            "apps/rocm/src/therock/test_support.rs",
+            "crates/rocm-core/src/test_env.rs",
+            "crates/rocm-core/src/archive_props.rs",
+            "crates/rocm-core/src/process_tree_properties.rs",
+            "crates/rocm-core/src/examine_driver_proptests.rs",
+            "apps/rocm/src/providers/local_http/proptests.rs",
+        ]);
+        assert!(check(&tracked, &cites(&[]), &[]).is_empty());
+    }
+
+    #[test]
+    fn helper_matching_is_by_whole_file_stem() {
+        // Names that merely contain a helper word are production files.
         for path in [
-            "apps/rocm",
-            "apps/rocm/src/therock.rs",
-            "crates/rocm-dash-tui/src/ui/approval.rs",
-            "main.rs",
-            "lib.rs",
-            "Cargo.toml",
-            "AGENTS.md",
-            "runtime-deps.toml",
-        ] {
-            assert!(is_path_candidate(path), "expected {path} to be a candidate");
-        }
-    }
-
-    #[test]
-    fn hyphenated_bare_words_are_candidates() {
-        assert!(is_path_candidate("rocm-dash-collectors"));
-        assert!(is_path_candidate("rocm-dash-tui"));
-    }
-
-    #[test]
-    fn code_syntax_and_identifiers_are_not_candidates() {
-        for span in [
-            "crate::",
-            "pub(crate) fn",
-            "comfyui::render_status(...)",
-            "too_many_lines = \"allow\"",
-            "mod x;",
-            "pub mod x;",
-            "pub use x::{...};",
-            "ActionReport",
-            "AnimatedSpinner",
-            "ComfyuiCommand",
-            "comfyui()",
-            "runtimes()",
+            "apps/rocm/src/test_supporter.rs",
+            "apps/rocm/src/properties.rs",
+            "apps/rocm/src/gpu_props_view.rs",
+            "apps/rocm/src/proptests_runner.rs",
         ] {
             assert!(
-                !is_path_candidate(span),
-                "did not expect {span} to be a candidate"
+                !is_test_helper(path),
+                "{path} must not be treated as a helper"
             );
         }
     }
 
     #[test]
-    fn bare_non_hyphenated_word_is_not_a_candidate() {
-        // The documented blind spot: `xtask` is a real directory cited bare
-        // in the doc, but is lexically identical in shape to a plain word
-        // like `grep` (also cited bare, also not a path) — so neither is
-        // treated as a candidate, favoring missing a rare citation over
-        // false-flagging prose.
-        assert!(!is_path_candidate("xtask"));
-        assert!(!is_path_candidate("grep"));
-    }
-
-    #[test]
-    fn extract_path_citations_recognizes_a_double_backtick_directory_citation() {
-        let markdown = "See ``apps/rocm`` for the CLI entry point.\n";
-        let citations = extract_path_citations(markdown);
-        assert!(citations.iter().any(|c| c.text == "apps/rocm"));
-    }
-
-    fn tracked(paths: &[&str]) -> Vec<PathBuf> {
-        paths.iter().map(PathBuf::from).collect()
-    }
-
-    /// Run `git` in a throwaway test repo at `root`, asserting success.
-    /// Shared by the two tests below that each need a real git repo rather
-    /// than a fabricated `tracked` file list.
-    fn run_git(root: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .expect("git command");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    #[test]
-    fn tracked_files_does_not_git_quote_non_ascii_paths() {
-        // Regression: git's default `core.quotePath` escapes any non-ASCII
-        // byte in a path into an octal-escaped, quoted string
-        // (`"caf\303\251.rs"`), which would never string-equal a plain
-        // citation like `café.rs` — silently treating an existing file as
-        // stale. Force `core.quotePath=true` locally so this test is
-        // meaningful regardless of the ambient environment's git config,
-        // then confirm `tracked_files` overrides it.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        run_git(root, &["init", "-q"]);
-        run_git(root, &["config", "user.email", "test@example.com"]);
-        run_git(root, &["config", "user.name", "test"]);
-        run_git(root, &["config", "core.quotePath", "true"]);
-        std::fs::write(root.join("café.rs"), b"").expect("write file");
-        run_git(root, &["add", "café.rs"]);
-
-        let tracked = tracked_files(root).expect("tracked_files");
-        assert!(
-            tracked.iter().any(|p| p == Path::new("café.rs")),
-            "expected an unescaped café.rs, got: {tracked:?}"
+    fn links_resolve_relative_to_the_doc() {
+        let doc = "[cli](../apps/rocm/src/cli.rs) and [x](./../crates/a/src/b.rs#L1)";
+        assert_eq!(
+            cited_paths(doc),
+            cites(&["apps/rocm/src/cli.rs", "crates/a/src/b.rs"])
         );
     }
 
-    fn citation(text: &str, section_dirs: &[&str]) -> Citation {
-        Citation {
-            text: text.to_string(),
-            section_dirs: section_dirs.iter().map(ToString::to_string).collect(),
+    #[test]
+    fn only_in_repo_rust_links_count_as_citations() {
+        let doc = "[md](../README.md) [url](https://example.com/a/src/x.rs) \
+                   [out](../../outside/src/x.rs) [bare](apps/rocm/src/cli.rs)";
+        assert_eq!(cited_paths(doc), cites(&["docs/apps/rocm/src/cli.rs"]));
+    }
+
+    #[test]
+    fn a_link_with_a_title_is_still_a_citation() {
+        let doc = "[cli](../apps/rocm/src/cli.rs \"the command tree\")";
+        assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/cli.rs"]));
+    }
+
+    const CLI: &str = "[cli](../apps/rocm/src/cli.rs)";
+
+    fn cited_cli(doc: &str) -> bool {
+        cited_paths(doc).contains("apps/rocm/src/cli.rs")
+    }
+
+    #[test]
+    fn commenting_out_the_only_entry_leaves_the_file_uncited() {
+        let doc = format!("<!-- {CLI} -->");
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        let violations = check(&tracked, &cited_paths(&doc), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("apps/rocm/src/cli.rs"));
+    }
+
+    #[test]
+    fn a_link_in_an_html_comment_is_not_a_citation() {
+        assert!(!cited_cli(&format!("<!-- {CLI} -->")));
+        assert!(!cited_cli(&format!(
+            "before\n<!--\nold entry: {CLI}\n-->\nafter"
+        )));
+        // An unterminated comment hides everything after it, as a renderer does.
+        assert!(!cited_cli(&format!("<!-- {CLI}")));
+        assert!(cited_cli(&format!("<!-- note -->\n{CLI}")));
+    }
+
+    #[test]
+    fn a_link_in_a_fenced_code_block_is_not_a_citation() {
+        assert!(!cited_cli(&format!("```\n{CLI}\n```")));
+        assert!(!cited_cli(&format!("```md\n{CLI}\n```")));
+        assert!(!cited_cli(&format!("~~~\n{CLI}\n~~~")));
+        assert!(!cited_cli(&format!("  ```\n  {CLI}\n  ```")));
+        // A longer closing fence closes it; a shorter or different one does not.
+        assert!(!cited_cli(&format!("````\n```\n{CLI}\n```\n````")));
+        assert!(!cited_cli(&format!("~~~\n```\n{CLI}\n```\n~~~")));
+        // An unclosed fence runs to the end of the document.
+        assert!(!cited_cli(&format!("```\n{CLI}")));
+        assert!(cited_cli(&format!("```\ncode\n```\n{CLI}")));
+    }
+
+    #[test]
+    fn a_link_in_an_inline_code_span_is_not_a_citation() {
+        assert!(!cited_cli(&format!("see `{CLI}` for more")));
+        assert!(!cited_cli(&format!("see ``a ` b {CLI}`` for more")));
+        assert!(cited_cli(&format!("see `code` and {CLI}")));
+    }
+
+    #[test]
+    fn a_code_span_inside_link_text_still_cites() {
+        assert!(cited_cli("[`cli.rs`](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli(
+            "- [`cli.rs`](../apps/rocm/src/cli.rs) - the command tree"
+        ));
+    }
+
+    #[test]
+    fn a_stray_backtick_does_not_hide_a_later_paragraph() {
+        assert!(cited_cli(&format!("a ` stray\n\n{CLI}")));
+        assert!(cited_cli(&format!("a ` stray {CLI}")));
+    }
+
+    #[test]
+    fn comment_and_code_markers_take_the_usual_precedence() {
+        // `<!--` inside a code span is code, so the comment never opens.
+        assert!(cited_cli(&format!("`<!--` {CLI} `-->`")));
+        // A fence marker inside a comment does not open a fence.
+        assert!(cited_cli(&format!("<!--\n```\n-->\n{CLI}")));
+        // A backtick inside a comment does not open a code span.
+        assert!(cited_cli(&format!("<!-- ` -->\n{CLI}\n<!-- ` -->")));
+    }
+
+    #[test]
+    fn crlf_documents_are_read_the_same() {
+        assert!(!cited_cli(&format!("```\r\n{CLI}\r\n```\r\n")));
+        assert!(cited_cli(&format!("a ` stray\r\n\r\n{CLI}")));
+    }
+
+    #[test]
+    fn an_angle_bracketed_destination_is_a_citation() {
+        assert!(cited_cli("[cli](<../apps/rocm/src/cli.rs>)"));
+        assert!(cited_cli("[cli](<../apps/rocm/src/cli.rs#L10>)"));
+        assert!(cited_cli("[cli](  <../apps/rocm/src/cli.rs>  )"));
+        assert!(cited_cli(
+            "[cli](<../apps/rocm/src/cli.rs> \"the command tree\")"
+        ));
+        // The delimiters are not part of the path: a destination with a space is
+        // read whole, and an unterminated one is not a link.
+        assert_eq!(
+            cited_paths("[x](<../crates/a b/src/c.rs>)"),
+            cites(&["crates/a b/src/c.rs"])
+        );
+        assert!(!cited_cli("[cli](<../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli](<../apps/rocm/src/cli.rs\n>)"));
+    }
+
+    #[test]
+    fn a_link_missing_its_closing_parenthesis_is_not_a_citation() {
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs"));
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs and more text)"));
+        assert!(!cited_cli(
+            "[cli](../apps/rocm/src/cli.rs \"unterminated title)"
+        ));
+        assert!(!cited_cli(
+            "[cli](../apps/rocm/src/cli.rs\n\nnext paragraph)"
+        ));
+    }
+
+    #[test]
+    fn a_link_missing_its_opening_bracket_is_not_a_citation() {
+        assert!(!cited_cli("cli](../apps/rocm/src/cli.rs)"));
+        // A stray `[` on an earlier line is not this link's text.
+        assert!(!cited_cli("a [ stray\ncli](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn an_escaped_bracket_or_parenthesis_is_not_a_citation() {
+        assert!(!cited_cli("\\[cli](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli\\](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("[cli]\\(../apps/rocm/src/cli.rs)"));
+        // An escaped backslash does not escape the bracket after it.
+        assert!(cited_cli("[cli\\\\](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn breaking_the_only_entry_leaves_the_file_uncited() {
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        for broken in [
+            "[cli](../apps/rocm/src/cli.rs",
+            "cli](../apps/rocm/src/cli.rs)",
+            "\\[cli](../apps/rocm/src/cli.rs)",
+        ] {
+            let violations = check(&tracked, &cited_paths(broken), &[]);
+            assert_eq!(violations.len(), 1, "{broken:?} must not cite the file");
         }
     }
 
     #[test]
-    fn exact_file_citation_matches() {
-        let tracked = tracked(&["apps/rocm/src/therock.rs"]);
-        assert!(citation_exists(
-            &citation("apps/rocm/src/therock.rs", &[]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn directory_citation_matches_a_file_beneath_it() {
-        let tracked = tracked(&["apps/rocm/src/main.rs", "apps/rocmd/src/lib.rs"]);
-        assert!(citation_exists(&citation("apps/rocm", &[]), &tracked));
-    }
-
-    #[test]
-    fn directory_citation_does_not_match_a_sibling_with_a_shared_prefix() {
-        // `apps/rocm` must not spuriously match `apps/rocmd` via a plain
-        // string-prefix check; component-wise `starts_with` gets this right.
-        let tracked = tracked(&["apps/rocmd/src/lib.rs"]);
-        assert!(!citation_exists(&citation("apps/rocm", &[]), &tracked));
-    }
-
-    #[test]
-    fn partial_suffix_citation_matches_the_file_it_disambiguates() {
-        // Regression case: the real doc cites `app/mod.rs`, a 2-component
-        // suffix of `crates/rocm-dash-tui/src/app/mod.rs`, to disambiguate
-        // it from other crates' `mod.rs` files without repeating the full
-        // path.
-        let tracked = tracked(&["crates/rocm-dash-tui/src/app/mod.rs"]);
-        assert!(citation_exists(&citation("app/mod.rs", &[]), &tracked));
-    }
-
-    #[test]
-    fn scoped_partial_suffix_citation_does_not_match_an_unrelated_crates_file() {
-        // The precision gap a reviewer found: an unscoped partial suffix
-        // match (`app/mod.rs`) would silently pass even after the doc's own
-        // crate moved the file away, as long as some UNRELATED crate
-        // happened to have an identically-suffixed `app/mod.rs` — the doc's
-        // claim about `rocm-dash-tui` specifically would be stale but
-        // undetected. Scoped to `rocm-dash-tui`, a same-named file living
-        // only under a different crate must not satisfy it.
-        let tracked = tracked(&["crates/rocm-dash-collectors/src/app/mod.rs"]);
-        assert!(!citation_exists(
-            &citation("app/mod.rs", &["rocm-dash-tui"]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn scoped_partial_suffix_citation_matches_its_own_crates_file() {
-        let tracked = tracked(&[
-            "crates/rocm-dash-collectors/src/app/mod.rs",
-            "crates/rocm-dash-tui/src/app/mod.rs",
-        ]);
-        assert!(citation_exists(
-            &citation("app/mod.rs", &["rocm-dash-tui"]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn extract_path_citations_narrows_a_partial_slash_path_citation_joined_by_and() {
-        // The real doc's dashboard/telemetry section reads `` `rocm-dash-tui`'s
-        // `agent.rs` and `app/mod.rs` `` — naming ONE specific crate from the
-        // heading's four, not asserting the claim about all of them, via a
-        // bare citation AND a partial slash-path citation joined by the word
-        // "and" rather than a bare `/`. Both must narrow to `rocm-dash-tui`;
-        // without that, the (correct, ALL-of) multi-directory check in
-        // `citation_exists` would require each to exist under every one of
-        // the other three crates too, which they do not — a false failure
-        // on a doc that's actually accurate.
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-`rocm-dash-tui`'s `agent.rs` and `app/mod.rs` are **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        let agent_citation = citations
-            .iter()
-            .find(|c| c.text == "agent.rs")
-            .expect("expected an agent.rs citation");
-        let mod_citation = citations
-            .iter()
-            .find(|c| c.text == "app/mod.rs")
-            .expect("expected an app/mod.rs citation");
+    fn nested_brackets_and_parentheses_do_not_break_a_link() {
+        assert!(cited_cli("[a [b] c](../apps/rocm/src/cli.rs)"));
         assert_eq!(
-            agent_citation.section_dirs,
-            vec!["rocm-dash-tui".to_string()]
-        );
-        assert_eq!(mod_citation.section_dirs, vec!["rocm-dash-tui".to_string()]);
-    }
-
-    #[test]
-    fn unscoped_bare_file_name_matches_regardless_of_directory() {
-        // No section context (e.g. an "Examples:" mention outside a
-        // `### <crate>` heading) falls back to matching anywhere.
-        let tracked = tracked(&["apps/rocm/src/main.rs", "apps/rocmd/src/lib.rs"]);
-        assert!(citation_exists(&citation("main.rs", &[]), &tracked));
-        assert!(citation_exists(&citation("lib.rs", &[]), &tracked));
-    }
-
-    #[test]
-    fn scoped_bare_citation_does_not_match_an_unrelated_same_named_file() {
-        // The precision gap a reviewer found: `lib.rs` cited under the
-        // `apps/rocmd` heading must NOT be satisfied merely because some
-        // other crate's `lib.rs` still exists — it has to be *that
-        // section's* file specifically.
-        let tracked = tracked(&[
-            "crates/rocm-core/src/lib.rs",
-            "crates/rocm-dash-core/src/lib.rs",
-        ]);
-        assert!(
-            !citation_exists(&citation("lib.rs", &["apps/rocmd"]), &tracked),
-            "apps/rocmd's lib.rs was deleted; an unrelated crate's lib.rs must not mask that"
+            cited_paths("[x](../crates/a/src/b(1).rs)"),
+            cites(&["crates/a/src/b(1).rs"])
         );
     }
 
     #[test]
-    fn scoped_bare_citation_matches_its_own_sections_file() {
-        let tracked = tracked(&["apps/rocmd/src/lib.rs", "crates/rocm-core/src/lib.rs"]);
-        assert!(citation_exists(
-            &citation("lib.rs", &["apps/rocmd"]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn scoped_bare_citation_resolves_a_bare_section_directory_name() {
-        // Section dirs can themselves be bare crate names (`rocm-dash-tui`)
-        // when a heading cites them without a `crates/` prefix —
-        // `path_is_under` must resolve those the same as slash-qualified
-        // section dirs. Both listed dirs have the file, so the (ALL-of)
-        // check passes.
-        let tracked = tracked(&[
-            "crates/rocm-dash-core/src/agent.rs",
-            "crates/rocm-dash-tui/src/agent.rs",
-        ]);
-        let scoped = citation("agent.rs", &["rocm-dash-core", "rocm-dash-tui"]);
-        assert!(citation_exists(&scoped, &tracked));
-    }
-
-    #[test]
-    fn multi_directory_citation_requires_every_directory_to_have_the_file() {
-        // The precision gap a reviewer found: `` Both crates' `lib.rs` ``
-        // under the `engines/lemonade`, `engines/vllm` heading asserts the
-        // file exists in EACH of those crates, not merely in one of them —
-        // if engines/vllm's lib.rs is renamed away while
-        // engines/lemonade's is untouched, that must be caught, not masked
-        // by the surviving lemonade file.
-        let tracked = tracked(&["engines/lemonade/src/lib.rs"]);
-        let both_crates = citation("lib.rs", &["engines/lemonade", "engines/vllm"]);
-        assert!(
-            !citation_exists(&both_crates, &tracked),
-            "engines/vllm's lib.rs is gone; engines/lemonade's surviving lib.rs must not mask that"
+    fn an_image_is_not_a_citation() {
+        assert!(!cited_cli("![cli](../apps/rocm/src/cli.rs)"));
+        assert!(!cited_cli("see ![cli](../apps/rocm/src/cli.rs \"title\")"));
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        let violations = check(
+            &tracked,
+            &cited_paths("![cli](../apps/rocm/src/cli.rs)"),
+            &[],
         );
+        assert_eq!(violations.len(), 1);
     }
 
     #[test]
-    fn root_level_md_and_toml_citations_are_not_scoped_to_their_section() {
-        // Regression case: the real doc cites `` `AGENTS.md` `` inside the
-        // `crates/rocm-engine-protocol` section and `` `runtime-deps.toml` ``
-        // inside `crates/rocm-deps` (explicitly calling it out as
-        // "workspace-root" in the same sentence) — neither file lives under
-        // that section's crate directory, so `.md`/`.toml` bare citations
-        // must match at the repo root regardless of which section cites
-        // them, rather than being scoped like `.rs` citations are.
-        let tracked = tracked(&[
-            "AGENTS.md",
-            "runtime-deps.toml",
-            "crates/rocm-deps/build.rs",
-        ]);
-        assert!(citation_exists(
-            &citation("AGENTS.md", &["crates/rocm-engine-protocol"]),
-            &tracked
+    fn an_escaped_exclamation_mark_does_not_make_an_image() {
+        assert!(cited_cli("\\![cli](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli("wow! [cli](../apps/rocm/src/cli.rs)"));
+    }
+
+    #[test]
+    fn an_image_inside_a_links_text_leaves_the_link_valid() {
+        let doc = "[![icon](../apps/rocm/src/icon.rs)](../apps/rocm/src/cli.rs)";
+        assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/cli.rs"]));
+    }
+
+    #[test]
+    fn a_link_containing_a_link_cites_only_the_inner_one() {
+        // Links cannot nest: the page renders only the inner link, so the outer
+        // destination is plain text.
+        let doc = "[cli [d](../apps/rocm/src/d.rs)](../apps/rocm/src/cli.rs)";
+        assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/d.rs"]));
+        assert!(!cited_cli(
+            "[cli [details](../README.md)](../apps/rocm/src/cli.rs)"
         ));
-        assert!(citation_exists(
-            &citation("runtime-deps.toml", &["crates/rocm-deps"]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn root_level_toml_citation_is_not_masked_by_a_nested_manifest() {
-        // Regression case a reviewer found: matching a bare `.md`/`.toml`
-        // citation by "any path component anywhere" would let a stale root
-        // `Cargo.toml` citation keep passing as long as ANY of the
-        // workspace's 14 nested crate manifests still existed (each one's
-        // basename is also literally `Cargo.toml`) — the same masking bug
-        // `.rs` heading-scoping exists to prevent, just for a fixed root
-        // location instead of a heading-derived one.
-        let without_root = tracked(&["crates/rocm-core/Cargo.toml"]);
-        assert!(
-            !citation_exists(&citation("Cargo.toml", &[]), &without_root),
-            "the root Cargo.toml is gone; a nested crate's manifest must not mask that"
-        );
-
-        let with_root = tracked(&["Cargo.toml", "crates/rocm-core/Cargo.toml"]);
-        assert!(citation_exists(&citation("Cargo.toml", &[]), &with_root));
-    }
-
-    #[test]
-    fn bare_crate_directory_name_matches_a_path_component() {
-        let tracked = tracked(&["crates/rocm-dash-collectors/src/amd_smi.rs"]);
-        assert!(citation_exists(
-            &citation("rocm-dash-collectors", &[]),
-            &tracked
-        ));
-    }
-
-    #[test]
-    fn removed_path_does_not_exist() {
-        let tracked = tracked(&["apps/rocm/src/main.rs"]);
-        assert!(!citation_exists(
-            &citation("apps/rocm/src/removed.rs", &[]),
-            &tracked
-        ));
-        assert!(!citation_exists(&citation("removed.rs", &[]), &tracked));
-    }
-
-    #[test]
-    fn extract_path_citations_matches_the_real_docs_ambiguity() {
-        let markdown = "\
-See `apps/rocm/src/automations.rs` and bare `main.rs`, plus `crates/rocm-dash-core`.
-Dispatch stays in `main.rs` via `crate::` and `pub(crate) fn` helpers, using
-`ComfyuiCommand`/`comfyui()` and `too_many_lines = \"allow\"`. Check with `grep`.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
+        // Plain brackets in the text do not form a link, so the outer one stays.
+        assert!(cited_cli("[cli [note]](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli("[cli [note] x](../apps/rocm/src/cli.rs)"));
+        // Later links on the line are unaffected.
+        let doc = "[a [b](../apps/rocm/src/b.rs)](../x.rs) and [c](../apps/rocm/src/c.rs)";
         assert_eq!(
-            texts,
-            BTreeSet::from([
-                "apps/rocm/src/automations.rs",
-                "main.rs",
-                "crates/rocm-dash-core",
+            cited_paths(doc),
+            cites(&["apps/rocm/src/b.rs", "apps/rocm/src/c.rs"])
+        );
+    }
+
+    #[test]
+    fn an_escaped_backtick_does_not_open_a_code_span() {
+        assert!(cited_cli(
+            "Use \\` for a backtick; [`cli.rs`](../apps/rocm/src/cli.rs)"
+        ));
+        // An escaped backslash does not escape the backtick after it.
+        assert!(!cited_cli("\\\\`[cli](../apps/rocm/src/cli.rs)`"));
+        // An escaped `<` does not open a comment.
+        assert!(cited_cli("\\<!-- [cli](../apps/rocm/src/cli.rs) -->"));
+    }
+
+    #[test]
+    fn the_exempt_list_stays_within_its_ceiling() {
+        assert_eq!(ceiling_violation(EXEMPT.len(), EXEMPT_CEILING), None);
+        assert_eq!(ceiling_violation(77, 77), None);
+        assert_eq!(ceiling_violation(70, 77), None);
+        let violation = ceiling_violation(78, 77).expect("one over the ceiling fails");
+        assert!(violation.contains("78 entries"));
+        assert!(violation.contains("EXEMPT_CEILING is 77"));
+    }
+
+    #[test]
+    fn the_link_forms_the_failure_message_rules_out_are_not_citations() {
+        // The message tells authors these forms are not recognised; this holds it
+        // to what the parser does.
+        assert!(!cited_cli("[cli][c]\n\n[c]: ../apps/rocm/src/cli.rs"));
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs?plain=1)"));
+        assert!(!cited_cli("[cli](/apps/rocm/src/cli.rs)"));
+        let message = &check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[])[0];
+        assert!(message.contains("inline `[text](path)`"));
+        assert!(message.contains("reference-style"));
+        assert!(message.contains("`?query`"));
+        assert!(message.contains("root-relative"));
+    }
+
+    #[test]
+    fn the_failure_message_for_an_uncited_file_only_asks_for_an_entry() {
+        let violations = check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("add an entry for it to the module map"));
+        assert!(!violations[0].contains("EXEMPT"));
+    }
+
+    #[test]
+    fn several_links_on_a_line_are_all_found() {
+        let doc = "[a](../apps/rocm/src/a.rs), [b](../apps/rocm/src/b.rs) and [c](<../apps/rocm/src/c.rs>)";
+        assert_eq!(
+            cited_paths(doc),
+            cites(&[
+                "apps/rocm/src/a.rs",
+                "apps/rocm/src/b.rs",
+                "apps/rocm/src/c.rs"
             ])
         );
     }
 
     #[test]
-    fn citation_exists_checks_a_non_ascii_bare_citation_end_to_end() {
-        // Regression: `is_path_safe` used to reject any non-ASCII
-        // character, so a citation like `café.rs` was discarded before
-        // extraction ever ran — making `tracked_files`'s
-        // `core.quotePath=false` handling unreachable via the real
-        // extract -> check pipeline. Exercise both directions here: a
-        // present non-ASCII file matches, and a removed one is caught.
-        assert!(is_path_candidate("café.rs"));
-        let present = tracked(&["crates/rocm-core/src/café.rs"]);
-        assert!(citation_exists(&citation("café.rs", &[]), &present));
-        let absent = tracked(&["crates/rocm-core/src/lib.rs"]);
-        assert!(!citation_exists(&citation("café.rs", &[]), &absent));
+    fn exempt_list_is_sorted_and_unique() {
+        let mut sorted = EXEMPT.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, EXEMPT, "keep EXEMPT sorted, without duplicates");
     }
 
     #[test]
-    fn bare_extension_alone_is_not_a_candidate() {
-        // Regression case: a reviewer found `".rs".ends_with(".rs")` is
-        // trivially true, so prose like "renamed to use the `.rs`
-        // extension" would be misparsed as a citation of a file literally
-        // named `.rs`.
-        assert!(!is_path_candidate(".rs"));
-        assert!(!is_path_candidate(".md"));
-        assert!(!is_path_candidate(".toml"));
-    }
-
-    #[test]
-    fn extract_path_citations_scopes_bare_citations_to_the_preceding_heading() {
-        let markdown = "\
-### `apps/rocmd` — background daemon
-
-`lib.rs` is **not yet modularized**.
-
-### `crates/rocm-core` — core library
-
-`lib.rs` itself is **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        assert!(citations.contains(&citation("lib.rs", &["apps/rocmd"])));
-        assert!(citations.contains(&citation("lib.rs", &["crates/rocm-core"])));
-    }
-
-    #[test]
-    fn extract_path_citations_ignores_a_hyphenated_prose_word_outside_a_heading() {
-        // Regression: `is_hyphenated_bare_word` can't lexically tell a
-        // crate name (`rocm-dash-tui`) from ordinary hyphenated prose
-        // (`read-only`) — both are all-lowercase and hyphenated. Outside a
-        // heading declaration or a possessive-owner position, a bare
-        // hyphenated word must not become its own existence-checked
-        // citation, or a doc edit as innocuous as "a `read-only` mode"
-        // would false-fail CI as a stale path.
-        let markdown = "\
-### `engines/lemonade`, `engines/vllm` — inference engines
-
-This is a `read-only` mode test line.
-";
-        let citations = extract_path_citations(markdown);
+    fn current_tree_matches_the_architecture_doc() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask crate has a parent directory");
+        let violations = violations_in(root).expect("git and the doc are readable in a checkout");
         assert!(
-            !citations.iter().any(|c| c.text == "read-only"),
-            "ordinary hyphenated prose must not be extracted as a citation"
+            violations.is_empty(),
+            "docs/architecture.md is out of step with the source tree:\n{}",
+            violations.join("\n")
         );
-    }
-
-    #[test]
-    fn extract_path_citations_still_extracts_a_bare_owner_before_apostrophe_s() {
-        // The exclusion above must not swallow the doc's real possessive
-        // pattern: a bare hyphenated crate name immediately followed by
-        // `'s` is still a genuine directory citation (it narrows the
-        // citation right after it — see the next test) and should still be
-        // checked for existence itself.
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-`rocm-dash-tui`'s `agent.rs` is **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        assert!(citations.iter().any(|c| c.text == "rocm-dash-tui"));
-    }
-
-    #[test]
-    fn extract_path_citations_reuses_a_narrowed_scope_for_an_unconnected_repeat() {
-        // Regression: a bare scoped citation (`agent.rs`) narrowed by a
-        // possessive clause, then mentioned again later under the SAME
-        // heading without repeating the connector, must keep that
-        // narrowing rather than falling back to every crate the heading
-        // lists — the real `rocm-dash-*` heading names 4 crates but
-        // `agent.rs` only exists in `rocm-dash-tui`, so falling back would
-        // false-fail CI on a second, accurate sentence.
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-`rocm-dash-tui`'s `agent.rs` is **not yet modularized**.
-
-A later, unconnected sentence also mentions `agent.rs` again for context.
-";
-        let citations = extract_path_citations(markdown);
-        let mentions: Vec<&Citation> = citations.iter().filter(|c| c.text == "agent.rs").collect();
-        assert_eq!(
-            mentions.len(),
-            1,
-            "both mentions should collapse to one citation with the same narrowed scope"
-        );
-        assert_eq!(mentions[0].section_dirs, vec!["rocm-dash-tui".to_string()]);
-    }
-
-    #[test]
-    fn extract_path_citations_does_not_leak_a_narrowed_owner_into_the_next_heading() {
-        // Regression: `narrowed_owners` was cleared only AFTER a heading's
-        // own citations were processed, so a new heading that itself bare-
-        // cites the same filename a previous section narrowed (`lib.rs` to
-        // `crates/rocm-core`) inherited that stale narrowing instead of
-        // its own heading directory (`apps/rocmd`). Worse, the wrongly-
-        // scoped citation is then indistinguishable from (and collapses
-        // into, via the `BTreeSet`) the earlier one, so a missing
-        // `apps/rocmd/lib.rs` would go completely unchecked.
-        let markdown = "\
-### `crates/rocm-core` — core library
-
-`crates/rocm-core`'s `lib.rs` is not yet modularized.
-
-### `apps/rocmd`, `lib.rs` — background daemon
-";
-        let citations = extract_path_citations(markdown);
-        let lib_citations: Vec<&Citation> =
-            citations.iter().filter(|c| c.text == "lib.rs").collect();
-        assert!(
-            lib_citations
-                .iter()
-                .any(|c| c.section_dirs == vec!["apps/rocmd".to_string()]),
-            "expected a lib.rs citation scoped to the new heading's own directory, got: {lib_citations:?}"
-        );
-    }
-
-    #[test]
-    fn extract_path_citations_collects_every_heading_directory_shape() {
-        // The real doc's dashboard/telemetry heading mixes one
-        // slash-qualified directory with three bare crate names. A bare
-        // `.rs` citation with no possessive qualifier (unlike `agent.rs`
-        // just below it, see the next test) keeps the whole list.
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-Every listed crate's `mod.rs` is a placeholder example, not real doc prose.
-";
-        let citations = extract_path_citations(markdown);
-        let mod_citation = citations
-            .iter()
-            .find(|c| c.text == "mod.rs")
-            .expect("expected a mod.rs citation");
-        assert_eq!(
-            mod_citation.section_dirs,
-            vec![
-                "crates/rocm-dash-core".to_string(),
-                "rocm-dash-collectors".to_string(),
-                "rocm-dash-daemon".to_string(),
-                "rocm-dash-tui".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn extract_path_citations_narrows_a_slash_qualified_possessive_owner_too() {
-        // Same shape as the bare-owner case above, but the possessive owner
-        // is spelled as a slash-path (`` `crates/rocm-dash-tui`'s ``) rather
-        // than a bare hyphenated crate name — a shape the heading itself
-        // already mixes with bare names on this same line. This must narrow
-        // exactly like the bare-owner case, not fall back to the whole
-        // heading's directory list.
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-`crates/rocm-dash-tui`'s `agent.rs` is **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        let agent_citation = citations
-            .iter()
-            .find(|c| c.text == "agent.rs")
-            .expect("expected an agent.rs citation");
-        assert_eq!(
-            agent_citation.section_dirs,
-            vec!["crates/rocm-dash-tui".to_string()]
-        );
-    }
-
-    #[test]
-    fn extract_path_citations_narrows_every_citation_in_a_slash_chained_possessive() {
-        // The real doc's module-map prose reads `` `crates/rocm-core`'s
-        // `diagnose.rs`/`examine.rs` `` — TWO bare `.rs` citations chained
-        // by `/` after a single possessive owner, not just one. Both must
-        // narrow to that owner, not just the citation immediately after
-        // `'s` (which would otherwise leave the second one scoped to the
-        // whole heading's crate list — or, worse, a false CI failure if
-        // that second file only exists in the possessive owner's crate).
-        let markdown = "\
-### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
-
-`rocm-dash-tui`'s `agent.rs`/`app.rs` are **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        let agent_citation = citations
-            .iter()
-            .find(|c| c.text == "agent.rs")
-            .expect("expected an agent.rs citation");
-        let app_citation = citations
-            .iter()
-            .find(|c| c.text == "app.rs")
-            .expect("expected an app.rs citation");
-        assert_eq!(
-            agent_citation.section_dirs,
-            vec!["rocm-dash-tui".to_string()]
-        );
-        assert_eq!(app_citation.section_dirs, vec!["rocm-dash-tui".to_string()]);
-    }
-
-    #[test]
-    fn extract_path_citations_still_scopes_a_slash_path_citation_to_its_heading() {
-        // `citation_exists` never consults `section_dirs` for a
-        // slash-containing citation's own existence check (it matches by
-        // path component/prefix/suffix instead) — but `format_stale_citation`
-        // still reads it to print a "(expected under ...)" hint if the
-        // citation ever goes stale. A slash-path citation must keep that
-        // heading scope, same as a bare citation, even though one of its two
-        // consumers doesn't need it.
-        let markdown = "\
-### `apps/rocmd` — daemon
-
-See `apps/rocmd/src/main.rs` for the entry point.
-";
-        let citations = extract_path_citations(markdown);
-        let main_citation = citations
-            .iter()
-            .find(|c| c.text == "apps/rocmd/src/main.rs")
-            .expect("expected an apps/rocmd/src/main.rs citation");
-        assert_eq!(main_citation.section_dirs, vec!["apps/rocmd".to_string()]);
-    }
-
-    #[test]
-    fn extract_path_citations_ignores_a_malformed_possessive_owner() {
-        // A directory-shaped check based on "contains a slash" alone would
-        // accept a slash-adjacent span with stray prose punctuation
-        // (`foo/bar!`) as a possessive owner, scoping `main.rs` to a
-        // directory that can never match any real tracked path — a false
-        // stale-citation failure on a doc that's actually accurate. The
-        // malformed owner must be rejected, falling back to the (empty,
-        // this line isn't under any heading) section scope instead.
-        let markdown = "`foo/bar!`'s `main.rs` is not yet modularized.\n";
-        let citations = extract_path_citations(markdown);
-        let main_citation = citations
-            .iter()
-            .find(|c| c.text == "main.rs")
-            .expect("expected a main.rs citation");
-        assert!(main_citation.section_dirs.is_empty());
-    }
-
-    #[test]
-    fn extract_path_citations_ignores_a_full_file_path_as_a_possessive_owner() {
-        // A directory-shaped check based on "contains a slash" alone,
-        // without excluding file extensions, would accept a full file path
-        // (`` `crates/rocm-core/src/diagnose.rs`'s `` ) as if it were the
-        // directory containing it — scoping `examine.rs` to a directory
-        // that can never match any real tracked path (no file's parent is
-        // itself a file). The owner must be rejected the same way a
-        // malformed one is, falling back to the section scope instead.
-        let markdown =
-            "`crates/rocm-core/src/diagnose.rs`'s `examine.rs` is not yet modularized.\n";
-        let citations = extract_path_citations(markdown);
-        let examine_citation = citations
-            .iter()
-            .find(|c| c.text == "examine.rs")
-            .expect("expected an examine.rs citation");
-        assert!(examine_citation.section_dirs.is_empty());
-    }
-
-    #[test]
-    fn extract_path_citations_ignores_a_full_file_path_with_an_unlisted_extension_as_an_owner() {
-        // Regression: excluding only `BARE_FILE_EXTENSIONS` (`.rs`/`.md`/
-        // `.toml`) from the directory-shaped check let a full file path
-        // ending in any OTHER extension (e.g. `.github/workflows/ci.yml`)
-        // through as if it were a directory — scoping `diagnose.rs` to an
-        // unmatchable "directory" (nothing can live under a leaf file) and
-        // false-failing CI on an accurate citation.
-        let markdown = "`.github/workflows/ci.yml`'s `diagnose.rs` is not yet modularized.\n";
-        let citations = extract_path_citations(markdown);
-        let diagnose_citation = citations
-            .iter()
-            .find(|c| c.text == "diagnose.rs")
-            .expect("expected a diagnose.rs citation");
-        assert!(diagnose_citation.section_dirs.is_empty());
-    }
-
-    #[test]
-    fn extract_path_citations_ignores_a_full_file_path_as_a_heading_directory() {
-        // The same file-path-vs-directory distinction applies to heading
-        // directories: a heading that backtick-quotes a full file path
-        // (however unlikely today) must not be collected as if it were a
-        // section directory — that would scope every unscoped bare `.rs`
-        // citation under it to an unmatchable directory, false-failing
-        // every one of them.
-        let markdown = "\
-### `crates/rocm-core/src/diagnose.rs` — an unlikely heading shape
-
-`lib.rs` is **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        let lib_citation = citations
-            .iter()
-            .find(|c| c.text == "lib.rs")
-            .expect("expected a lib.rs citation");
-        assert!(lib_citation.section_dirs.is_empty());
-    }
-
-    #[test]
-    fn run_passes_against_the_real_doc() {
-        // Regression guard against the real workspace: exercises the full
-        // read-doc -> extract -> tracked-files -> existence-check path, the
-        // same path `cargo xtask check-architecture-doc` runs in CI.
-        run().expect("docs/architecture.md's path citations should all exist");
-    }
-
-    #[test]
-    fn check_citations_fails_and_names_a_stale_path() {
-        // Regression guard for the gate itself: a reviewer found that
-        // `run`'s only end-to-end test (`run_passes_against_the_real_doc`,
-        // above) exercises only the Ok direction, and would pass just as
-        // vacuously against an empty citation set — nothing in the suite
-        // would notice if the failure branch stopped being reachable. This
-        // drives `check_citations` directly against a fabricated doc and
-        // tracked-file list, asserting the Err direction by name.
-        let markdown = "`apps/rocm/src/deleted.rs` no longer exists.";
-        let tracked = vec![PathBuf::from("apps/rocm/src/providers.rs")];
-        let err = check_citations(markdown, &tracked)
-            .expect_err("a citation absent from `tracked` must fail the check");
-        assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
-    }
-
-    #[test]
-    fn check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation() {
-        // Follow-up regression guard: after `check_citations_fails_and_names_a_stale_path`
-        // (above) closed the untested failure branch a reviewer had flagged,
-        // a later round found the gap had only moved one call outward —
-        // `run`'s own delegation to `check_citations` was itself unproven
-        // (e.g. discarding its result and always returning `Ok(())` would
-        // still leave every test green). This drives the full
-        // read-doc -> tracked-files -> check pipeline `run` actually runs,
-        // over a throwaway git repo, so `run`'s own composition is proven
-        // without touching the real `docs/architecture.md`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        run_git(root, &["init", "-q"]);
-        run_git(root, &["config", "user.email", "test@example.com"]);
-        run_git(root, &["config", "user.name", "test"]);
-        std::fs::create_dir_all(root.join("docs")).expect("mkdir docs");
-        std::fs::write(
-            root.join(DOC_PATH),
-            "`apps/rocm/src/deleted.rs` no longer exists.",
-        )
-        .expect("write doc");
-        run_git(root, &["add", "docs"]);
-
-        let err = check_doc_at(root).expect_err("a stale citation in the fabricated doc must fail");
-        assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
-    }
-
-    #[test]
-    fn stale_message_does_not_hint_a_section_for_a_root_level_extension_citation() {
-        // Regression case: `citation_exists` never consults `section_dirs`
-        // for a `.toml`/`.md` citation (root-only, per
-        // `ROOT_LEVEL_BARE_EXTENSIONS`) or any other non-`.rs` shape, but
-        // `extract_path_citations` still attaches whichever heading's
-        // directories were current when it was mentioned. A reviewer found
-        // the message then hinted a location the check never actually
-        // required — e.g. a stale `runtime-deps.toml` cited inside the
-        // `crates/rocm-deps` section reported "(expected under
-        // `crates/rocm-deps`)" even though the check demands it at the repo
-        // root regardless.
-        let root_toml_under_heading = citation("runtime-deps.toml", &["crates/rocm-deps"]);
-        let message = stale_message(&[&root_toml_under_heading]);
-        assert!(message.contains("`runtime-deps.toml`"));
-        assert!(!message.contains("expected under"));
-    }
-
-    #[test]
-    fn stale_message_names_every_stale_path() {
-        let unscoped = citation("apps/rocm/src/deleted.rs", &[]);
-        let hyphenated = citation("old-crate-dir", &[]);
-        let message = stale_message(&[&unscoped, &hyphenated]);
-        assert!(message.contains("2 path(s)"));
-        assert!(message.contains("`apps/rocm/src/deleted.rs`"));
-        assert!(message.contains("`old-crate-dir`"));
-    }
-
-    #[test]
-    fn stale_message_names_the_expected_section_for_a_scoped_citation() {
-        // Regression case: a reviewer found the message collapsed `lib.rs`
-        // cited (and stale) under two different sections into one
-        // unhelpful line — a contributor shouldn't have to guess which
-        // section's file actually went missing.
-        let apps_rocmd_lib = citation("lib.rs", &["apps/rocmd"]);
-        let message = stale_message(&[&apps_rocmd_lib]);
-        assert!(message.contains("`lib.rs` (expected under `apps/rocmd`)"));
-    }
-
-    #[test]
-    fn stale_message_reads_a_multi_directory_citation_as_a_conjunction() {
-        // Regression case: a reviewer found that a citation scoped to more
-        // than one directory (e.g. `lib.rs` under the `engines/lemonade`,
-        // `engines/vllm` heading, which `citation_exists` requires in EVERY
-        // listed directory) was hinted as "(expected under `a`, `b`)" — a
-        // bare comma list that reads as "either of these", not "both of
-        // these".
-        let both_engines = citation("lib.rs", &["engines/lemonade", "engines/vllm"]);
-        let message = stale_message(&[&both_engines]);
-        assert!(
-            message.contains("`lib.rs` (expected under all of `engines/lemonade`, `engines/vllm`)")
-        );
-    }
-
-    #[test]
-    fn stale_message_does_not_offer_an_unsatisfiable_multi_directory_hint_for_a_slash_citation() {
-        // Regression case: a reviewer found that a slash-qualified citation
-        // scoped to more than one directory (e.g.
-        // `crates/rocm-dash-tui/src/ui/approval.rs` under the four-crate
-        // `rocm-dash-*` heading) was hinted as "(expected under all of
-        // `crates/rocm-dash-core`, `rocm-dash-collectors`, ...)" — a location
-        // the file could never occupy, since the cited path already names
-        // its own crate directory and can't simultaneously be "under" a
-        // sibling's. `citation_exists` only falls back to `section_dirs` for
-        // this shape after a tree-wide whole-path match has already failed,
-        // so the literal cited path is the only place it was ever checked.
-        let scoped_slash_citation = citation(
-            "crates/rocm-dash-tui/src/ui/approval.rs",
-            &[
-                "crates/rocm-dash-core",
-                "rocm-dash-collectors",
-                "rocm-dash-daemon",
-                "rocm-dash-tui",
-            ],
-        );
-        let message = stale_message(&[&scoped_slash_citation]);
-        assert!(
-            message.contains("  `crates/rocm-dash-tui/src/ui/approval.rs`\n")
-                || message.ends_with("`crates/rocm-dash-tui/src/ui/approval.rs`"),
-            "expected a bare, hint-free line, got: {message}"
-        );
-        assert!(
-            !message.contains("expected under"),
-            "a slash citation's hint names a location the whole-path check never accepted: {message}"
-        );
-    }
-
-    #[test]
-    fn stale_message_does_not_double_report_a_bare_and_scoped_citation_of_the_same_file() {
-        // Regression case: a reviewer found that a file cited both bare and
-        // under a directory heading (e.g. `providers.rs` mentioned plainly,
-        // then again as `apps/rocm`'s `providers.rs`) was listed twice when
-        // both went stale — reading as two missing paths when it's one. The
-        // scoped line is more specific, so it wins; the bare line is
-        // dropped.
-        let bare = citation("providers.rs", &[]);
-        let scoped = citation("providers.rs", &["apps/rocm"]);
-        let message = stale_message(&[&bare, &scoped]);
-        assert!(message.contains("1 path(s)"));
-        assert!(message.contains("`providers.rs` (expected under `apps/rocm`)"));
-    }
-
-    #[test]
-    fn stale_message_keeps_the_same_bare_text_stale_under_two_different_sections() {
-        // Companion to the case above: two *scoped* citations sharing text
-        // (e.g. `lib.rs` under both `apps/rocmd` and `crates/rocm-core`) are
-        // two distinct missing files, not a bare/scoped duplicate, so both
-        // must still be reported.
-        let apps_rocmd_lib = citation("lib.rs", &["apps/rocmd"]);
-        let rocm_core_lib = citation("lib.rs", &["crates/rocm-core"]);
-        let message = stale_message(&[&apps_rocmd_lib, &rocm_core_lib]);
-        assert!(message.contains("2 path(s)"));
-        assert!(message.contains("`lib.rs` (expected under `apps/rocmd`)"));
-        assert!(message.contains("`lib.rs` (expected under `crates/rocm-core`)"));
     }
 }

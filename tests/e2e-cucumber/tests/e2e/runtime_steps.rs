@@ -1061,24 +1061,12 @@ async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
 
 #[then("the managed runtime folder path is not recursively nested")]
 async fn assert_runtime_path_not_nested(world: &mut E2eWorld) {
-    // `rocm examine` prints `Folder: <install_root>` for the active runtime.
+    // `rocm examine` prints `active_runtime_root: <install_root>` for the active
+    // managed runtime; the judgement lives in the library so unit tests run it.
     let output = world.cli_output.as_ref().expect("no examine output");
-    let Some(folder) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Folder:"))
-        .map(str::trim)
-    else {
-        panic!("no 'Folder:' line in examine output:\n{output}");
-    };
-    // A healthy path contains `runtimes/wheel` at most once. Re-provisioning
-    // inside an existing runtime produces `runtimes/wheel/.../runtimes/wheel/`
-    // (dogfooding #17). Count occurrences of the marker segment.
-    let nested = folder.matches("runtimes/wheel").count() > 1
-        || folder.matches("runtimes\\wheel").count() > 1;
-    assert!(
-        !nested,
-        "managed runtime folder path is recursively nested (dogfooding #17):\n{folder}"
-    );
+    if let Err(reason) = e2e_cucumber::runtime_root::check_runtime_root_not_nested(output) {
+        panic!("{reason}\nexamine output:\n{output}");
+    }
 }
 
 #[when("the user checks for runtime updates")]
@@ -1389,5 +1377,204 @@ async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
         execution.contains("was added here from your --yes"),
         "the operator is shown a consent flag the plan above did not carry, with \
          nothing saying where it came from:\n{execution}"
+    );
+}
+
+/// Ask to install for gfx90c by name, and keep stdout, stderr and the exit code.
+///
+/// `--dry-run` is deliberate: the refusal has to come from family resolution,
+/// before anything is downloaded or written, so the scenario needs no network
+/// and leaves nothing behind. All three streams are kept because the claim
+/// under test is split across them — the message goes to stderr, while a
+/// *resolved* plan (the old behaviour) would go to stdout.
+#[when("the user dry-runs an SDK install for the gfx90c Vega iGPU")]
+async fn user_dry_runs_unsupported_family(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["install", "sdk", "--family", "gfx90c", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Everything the previous step captured, as one string to search.
+fn unsupported_family_attempt(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or_default(),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    )
+}
+
+#[then("the install is refused as having no ROCm build for that GPU")]
+async fn assert_unsupported_family_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no SDK install attempt was recorded");
+    let output = unsupported_family_attempt(world);
+    assert!(rc != 0, "the install should have failed:\n{output}");
+    assert!(
+        output.contains("no ROCm SDK build"),
+        "the refusal should say no ROCm SDK build exists:\n{output}"
+    );
+    assert!(
+        output.contains("gfx90c"),
+        "the refusal should name the GPU target that was asked for:\n{output}"
+    );
+}
+
+/// The refusal must not name a package family.
+///
+/// The weaker of the two halves, and worth keeping for the case the stronger
+/// one misses: the generic "unable to resolve a supported family" error lists
+/// every recognized family as a `--family` suggestion, and the old mapping
+/// printed a plan naming `gfx90X-dcgpu`. Either way a family name reaches the
+/// user and invites installing a build for different silicon. Only the
+/// dedicated refusal names none.
+///
+/// A regression in the gfx90c mapping itself is caught by the step above, whose
+/// "no ROCm SDK build" cannot appear once `normalize_therock_family` maps the
+/// target again — see `gfx_target_has_no_rocm_build`, which is conjoined with
+/// that mapping precisely so this scenario cannot pass without it.
+#[then("the refusal offers no package family to install instead")]
+async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
+    let output = unsupported_family_attempt(world);
+    for family in rocm_core::known_therock_families() {
+        assert!(
+            !output.contains(family),
+            "the refusal must not offer `{family}` for a GPU with no ROCm build:\n{output}"
+        );
+    }
+}
+
+/// The folder scenario runtime-22 asks for: inside the scenario's own temp
+/// root, and with a lone `'` in its name — the shape the old quoter left bare.
+fn freeform_prefix_with_quote(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("it's-here")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when("the user approves a natural-language SDK install into a folder whose name has a quote")]
+async fn user_approves_freeform_sdk_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = freeform_prefix_with_quote(world);
+    let request = format!("install the latest TheRock nightly for this GPU into {prefix}");
+    // `run_rocm`, not `run_rocm_ok`: the Given guarantees the dispatched install
+    // fails, and the exit code is not what this scenario is about.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["--yes", &request]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Read the section's `rocm install sdk` `tool_call:` line back the way a POSIX
+/// shell splits words, and require `--prefix` to be followed by exactly
+/// `prefix`. The install line specifically: the request plan lists a read-only
+/// `rocm examine` step ahead of it.
+fn assert_tool_call_has_prefix_as_one_word(section: &str, which: &str, prefix: &str) {
+    let line = section
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("tool_call: "))
+        .find(|line| line.starts_with("rocm install sdk"))
+        .unwrap_or_else(|| panic!("no install `tool_call:` line in the {which}:\n{section}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the {which} `tool_call:` line does not parse: `{line}`"));
+    let after_prefix = words
+        .iter()
+        .position(|word| word == "--prefix")
+        .and_then(|index| words.get(index + 1))
+        .unwrap_or_else(|| {
+            panic!("the {which} `tool_call:` line has no `--prefix` value: `{line}`")
+        });
+    assert_eq!(
+        after_prefix, prefix,
+        "the {which} `tool_call:` line must name the folder as one argument, got `{line}`"
+    );
+}
+
+#[then("the request plan names that folder as a single argument")]
+async fn assert_freeform_plan_prefix_is_one_word(world: &mut E2eWorld) {
+    let (plan, _) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &plan,
+        "request plan",
+        &freeform_prefix_with_quote(world),
+    );
+}
+
+#[then("the executed command names that folder as a single argument")]
+async fn assert_freeform_execution_prefix_is_one_word(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &execution,
+        "execution section",
+        &freeform_prefix_with_quote(world),
+    );
+}
+
+/// Where scenario runtime-26 plants its interpreter: inside a folder called `tools`,
+/// which is neither `bin` nor `Scripts`, so nothing about its location names an
+/// environment.
+fn interpreter_outside_a_venv(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("not-a-venv")
+        .join("tools")
+        .join("python")
+}
+
+/// A stand-in interpreter that answers the SDK probe with the smallest document the
+/// CLI parses. The refusal under test happens after the probe and before anything is
+/// read from the environment, so nothing else about the interpreter matters.
+///
+/// A POSIX shell script, so the scenario is Linux-only (`@requires-os:linux`).
+#[given("a Python interpreter that sits outside any environment's bin folder")]
+async fn setup_interpreter_outside_a_venv(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world);
+    std::fs::create_dir_all(python.parent().expect("interpreter has a folder"))
+        .expect("failed to create the interpreter's folder");
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\necho '{\"import_ok\": true}'\n",
+    )
+    .expect("failed to write the stand-in interpreter");
+}
+
+#[when("the user adopts that interpreter without naming an environment folder")]
+async fn user_adopts_interpreter_without_root(world: &mut E2eWorld) {
+    let python = interpreter_outside_a_venv(world)
+        .to_string_lossy()
+        .into_owned();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "adopt", "--python", &python]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal asks for the environment folder with --root")]
+async fn assert_adopt_refusal_asks_for_root(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("could not infer the Python environment folder")
+            && combined.contains("pass --root"),
+        "the refusal does not ask for --root:\n{combined}"
+    );
+}
+
+#[then("no runtime is registered")]
+async fn assert_no_runtime_registered(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert!(
+        stdout.contains("installed: none") || stdout.contains("managed_runtimes: 0"),
+        "the refused adoption left a runtime registered:\n{stdout}"
     );
 }

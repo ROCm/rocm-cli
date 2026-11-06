@@ -11,10 +11,10 @@
 //! reclaim the space.
 //!
 //! The removal path deliberately owns no deletion logic of its own. Runtime
-//! removal delegates to [`crate::uninstall_runtime`] per selected key so
+//! removal delegates to [`crate::runtimes_cmd::uninstall_runtime`] per selected key so
 //! config/marker cleanup stays in one place, and the guard that decides whether
 //! a folder may be touched at all is the existing
-//! [`crate::should_remove_runtime_install_root`]. What lives here is only the
+//! [`crate::runtime_uninstall::should_remove_runtime_install_root`]. What lives here is only the
 //! *selection* policy — which is exactly the part that needs to be conservative,
 //! because prune acts on a set the user never enumerated.
 
@@ -22,15 +22,19 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
+use anyhow::{Context, Result};
+use rocm_core::{
+    AppPaths, RocmCliConfig, require_yes_or_interactive, runtime_install_root_is_protected,
+};
 use serde::Serialize;
 
-use crate::{
-    ActiveRuntimeMarker, InstallRootDecision, StorageCommand, UninstallPlan, UninstallPlanEntry,
-    active_runtime_marker_path, confirm_uninstall, format_bytes, remove_path,
-    should_remove_runtime_install_root, therock,
+use crate::cli_report::{JsonOrText, print_json_or_text};
+use crate::runtimes_cmd::{
+    ActiveRuntimeMarker, InstallRootDecision, active_runtime_marker_path,
+    should_remove_runtime_install_root,
 };
+use crate::uninstall_plan::{UninstallPlan, UninstallPlanEntry, confirm_uninstall, remove_path};
+use crate::{StorageCommand, format_bytes, therock};
 
 /// Recent installs kept per retention bucket by default (see
 /// [`retention_group`]): the one in use plus one rollback target. This is the
@@ -480,7 +484,7 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         // `<service_id>.log` beside the manifest. `ManagedServiceRecord::new`
         // only *computes* that path (via `AppPaths::service_log_path`) - it
         // writes nothing. The file is created by the launch site,
-        // `spawn_managed_engine_child` here in `main.rs` for
+        // `spawn_managed_engine_child` (in `service_launch.rs`) for
         // `rocm serve --managed` and `supervise_service` in `rocmd` on the
         // supervised/recovery path. What *fills* it differs by platform, so the
         // redirect cannot be stated unqualified: `supervise_service` redirects
@@ -615,6 +619,12 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
         "To free space: rocm storage remove-old-installs --dry-run"
     );
     output
+}
+
+impl JsonOrText for StorageReport {
+    fn render_text(&self) -> String {
+        render_report(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,11 +886,8 @@ pub(crate) fn render_downloads_plan(plan: &UninstallPlan, dry_run: bool) -> Stri
 /// nobody to answer the prompt, so `--yes` is required (same rule as
 /// `rocm uninstall`).
 fn approved(action: &str, yes: bool) -> Result<bool> {
-    if yes {
+    if require_yes_or_interactive(yes, action)? {
         return Ok(true);
-    }
-    if !interactive_terminal() {
-        bail!("{action} requires --yes outside an interactive terminal");
     }
     confirm_uninstall()
 }
@@ -897,11 +904,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     match command.unwrap_or(StorageCommand::Report { json: false }) {
         StorageCommand::Report { json } => {
             let report = build_report(&paths, &config)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", render_report(&report));
-            }
+            print_json_or_text(json, &report)?;
         }
         StorageCommand::RemoveOldInstalls { keep, dry_run, yes } => {
             let plan = build_prune_plan(&paths, &config, keep)?;
@@ -939,8 +942,9 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 // only in letter case are distinct installs here, so a lookup
                 // that folded them together would delete a different runtime
                 // than the one the user just confirmed.
-                let result = crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
-                    .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
+                let result =
+                    crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
+                        .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
                 // `uninstall_runtime` re-evaluates ownership itself and can
                 // decline to delete the folder while still clearing the
                 // registry entry. Reporting the space as reclaimed then would
@@ -1012,6 +1016,7 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_core::interactive_terminal;
 
     fn manifest(
         runtime_key: &str,
@@ -1074,9 +1079,8 @@ mod tests {
             .join("tests")
             .join("storage")
             .join(format!(
-                "rocm-cli-storage-test-{name}-{}-{}",
-                std::process::id(),
-                rocm_core::unix_time_millis()
+                "rocm-cli-storage-test-{name}-{}",
+                crate::test_support::unique_suffix()
             ));
         let _ = std::fs::remove_dir_all(&root);
         (
@@ -1087,6 +1091,11 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     /// Write a manifest pair (registry + in-tree copy) plus a payload file, so
@@ -1503,6 +1512,45 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm storage report` prints through `print_json_or_text`, which writes
+    /// `render_text()` verbatim for the text form and `Serialize` for `--json`.
+    /// Pin both halves of the `JsonOrText` impl against the report they come
+    /// from, so the text form cannot drift from `render_report` and the JSON
+    /// form cannot lose a field. The text form is asserted to be the real
+    /// report (it names the shared-folders section), not merely equal to
+    /// itself. The call site (`StorageCommand::Report` handing `json` to
+    /// `print_json_or_text`) writes to the process stdout, so its text form is
+    /// pinned black-box by `server-records-01` and `uninstall-05` in
+    /// `tests/e2e-cucumber/features/`; no scenario passes `--json`.
+    #[test]
+    fn json_or_text_impl_renders_the_report_and_serializes_it() -> Result<()> {
+        let (root, paths) = test_paths("report-json-or-text");
+        let report = build_report(&paths, &RocmCliConfig::default())?;
+
+        let text = report.render_text();
+        assert_eq!(text, render_report(&report));
+        assert!(
+            text.contains("Shared with other tools (never removed by ROCm CLI):"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&report)?;
+        let object = json
+            .as_object()
+            .expect("the report serializes as an object");
+        for key in [
+            "runtimes",
+            "runtimes_total_bytes",
+            "rocm_cli",
+            "shared_with_other_tools",
+        ] {
+            assert!(object.contains_key(key), "missing `{key}` in {json}");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
     /// Rendering notes in the `ROCm CLI folders` loop was needed for the row
     /// above, and it also made the two archive rows print the note they have
     /// always carried in the data and in `--json`. That is the most actionable
@@ -1690,7 +1738,7 @@ mod tests {
         assert_eq!(planned, vec!["old"]);
 
         for entry in &plan.remove {
-            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
         }
 
         assert!(!old.install_root.exists(), "planned folder must be gone");
@@ -1788,7 +1836,7 @@ mod tests {
             {
                 continue;
             }
-            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
         }
 
         let registry = paths.data_dir.join("runtimes").join("registry");

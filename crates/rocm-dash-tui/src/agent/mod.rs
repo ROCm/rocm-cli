@@ -2,8 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The chat agent backend, built on **Rig**, plus the read-only "Skills"
-//! (Rig Tools) the agent calls over cached telemetry.
+//! The chat agent backend, built on **Rig**, plus the Rig tools it calls.
+//!
+//! The telemetry tools only read the cached in-memory snapshot. The read-only
+//! ROCm tools inspect the host and perform no action that needs operator
+//! approval (see the group B comment in `tools` for the bookkeeping writes
+//! reading can still trigger), and the mutating ROCm tools only surface an
+//! approval request.
 //!
 //! THE ONLY MODULE SUBTREE THAT NAMES `rig` TYPES — only `tools` and
 //! `clients` actually import `rig::*` (this file and `snapshot` do not); no
@@ -16,16 +21,18 @@
 //! and vendored source). The local-endpoint seam is the Chat Completions API
 //! (not the default Responses API), reached via `CompletionsClient`. Tool
 //! calling uses `agent.prompt(text).max_turns(N).with_history(history)` so the
-//! model can call read-only tools and then answer — one final reply to the UI.
+//! model can call tools and then answer — one final reply to the UI. A
+//! mutating tool never runs inside that loop: it posts its intent on the
+//! approval channel for the operator and the model is told it was surfaced.
 //!
 //! Split into submodules mirroring the crate's `app/mod.rs` → `app/chat.rs`/
 //! `slash.rs`/`summary.rs` mechanical-relocation convention: this file holds
 //! the shared `AgentClient` seam; `snapshot` holds the pure JSON telemetry
 //! helpers; `tools` holds the rig `Tool` wrappers and dispatch; `clients`
-//! holds the four backend implementations. Unlike `app/mod.rs`'s private
-//! siblings, this file re-exports the submodules' public items — this module
-//! (and its pre-split `crate::agent::*` surface) has in-crate and cross-crate
-//! consumers, so the existing paths must keep resolving.
+//! holds the four backend implementations. Like `app/mod.rs`, this file
+//! re-exports the submodules' public items — this module (and its pre-split
+//! `crate::agent::*` surface) has in-crate and cross-crate consumers, so the
+//! existing paths must keep resolving.
 
 use async_trait::async_trait;
 
@@ -49,11 +56,10 @@ pub use tools::{
     AutomationsRocmTool, BenchSummaryTool, BridgeSnapshotRocmTool, DoctorRocmTool, EnginesRocmTool,
     ExamineRocmTool, GpuSnapshotRocmTool, GpuStatusArgs, GpuStatusTool, InstallEngineRocmTool,
     InstallSdkDryRunRocmTool, InstallSdkRocmTool, LaunchServerRocmTool, ListInstancesTool,
-    ListSkillsTool, NaturalLanguagePlanRocmTool, NoArgs, PathExistsRocmTool, PortStatusRocmTool,
-    ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, RocmCommandRocmTool, SKILL_NAMES,
-    ServiceLogsRocmTool, ServicesRocmTool, SkillPlanArgs, SkillPlanTool, StopServerRocmTool,
-    TokensPerWattTool, ToolError, UpdateCheckRocmTool, WatcherDisableRocmTool,
-    WatcherEnableRocmTool,
+    NaturalLanguagePlanRocmTool, NoArgs, PathExistsRocmTool, PortStatusRocmTool,
+    ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, RocmCommandRocmTool, ServiceLogsRocmTool,
+    ServicesRocmTool, StopServerRocmTool, TELEMETRY_TOOL_NAMES, TokensPerWattTool, ToolError,
+    UpdateCheckRocmTool, WatcherDisableRocmTool, WatcherEnableRocmTool,
 };
 
 /// One-shot request budget. A hung backend becomes a timeout error turn, never

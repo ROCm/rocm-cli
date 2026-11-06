@@ -18,8 +18,6 @@
 //!
 //! Zero `std::thread::spawn`/`try_recv`: every command runs as a job-bridge job.
 
-use std::path::Path;
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -32,12 +30,12 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{adopt_args, display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::panel::{self, BoxRole};
-use crate::ui::theme::Theme;
+use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
+use crate::ui::theme::{StatusTone, Theme};
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened registered-runtime entry for the list.
 ///
@@ -59,6 +57,18 @@ pub struct RuntimeSummary {
     pub active: bool,
     /// Whether this runtime is the rollback target (`previous_runtime_key`).
     pub rollback: bool,
+}
+
+/// Tone of a runtime's list marker: the active default wins over the rollback
+/// target, and every other runtime is muted.
+const fn runtime_marker_tone(rt: &RuntimeSummary) -> StatusTone {
+    if rt.active {
+        StatusTone::Success
+    } else if rt.rollback {
+        StatusTone::Warning
+    } else {
+        StatusTone::Muted
+    }
 }
 
 /// Marker shown beside the active runtime in the list. Every place *in this
@@ -138,20 +148,6 @@ pub struct RuntimeManagerState {
     pub message: Option<String>,
 }
 
-/// Derive the conventional Python executable inside an env root, matching
-/// rocm-core's per-host layout (`Scripts\python.exe` on Windows, `bin/python`
-/// elsewhere) without taking a `rocm-core` dependency. The approval modal shows
-/// the exact argv, so the user verifies it before anything runs.
-fn derive_python_executable(root: &str) -> String {
-    let root = Path::new(root);
-    let path = if cfg!(windows) {
-        root.join("Scripts").join("python.exe")
-    } else {
-        root.join("bin").join("python")
-    };
-    path.to_string_lossy().into_owned()
-}
-
 /// Handle a key while the overlay is open. `runtimes` is the plumbed list.
 pub fn on_key(
     rm: &mut Option<RuntimeManagerState>,
@@ -168,15 +164,7 @@ pub fn on_key(
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
                 r.browser = None;
-                let root = path.to_string_lossy().into_owned();
-                let args = vec![
-                    "runtimes".to_string(),
-                    "adopt".to_string(),
-                    "--root".to_string(),
-                    root.clone(),
-                    "--python".to_string(),
-                    derive_python_executable(&root),
-                ];
+                let args = adopt_args(&path.to_string_lossy());
                 stage_approval(r, RuntimeAction::Adopt, args);
             }
             FolderOutcome::Cancelled => r.browser = None,
@@ -189,9 +177,6 @@ pub fn on_key(
     if let Some(input) = r.import_input.as_mut() {
         match key.code {
             KeyCode::Esc => r.import_input = None,
-            KeyCode::Backspace => {
-                input.pop();
-            }
             KeyCode::Enter => {
                 let path = input.trim().to_string();
                 if path.is_empty() {
@@ -203,8 +188,9 @@ pub fn on_key(
                     stage_approval(r, RuntimeAction::Import, args);
                 }
             }
-            KeyCode::Char(c) => input.push(c),
-            _ => {}
+            code => {
+                apply_char_key(input, code);
+            }
         }
         return Vec::new();
     }
@@ -294,7 +280,7 @@ fn stage_approval(r: &mut RuntimeManagerState, action: RuntimeAction, args: Vec<
     let request = ApprovalRequest::new(
         action.title().to_string(),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             action.explanation().to_string(),
         ],
@@ -393,10 +379,16 @@ pub fn draw_runtime_manager(
     if any_marked {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(ACTIVE_MARKER, Style::default().fg(theme.ok)),
+                Span::styled(
+                    ACTIVE_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Success)),
+                ),
                 Span::styled("= active", Style::default().fg(theme.muted)),
                 Span::styled(" · ", Style::default().fg(theme.muted)),
-                Span::styled(ROLLBACK_MARKER, Style::default().fg(theme.warn)),
+                Span::styled(
+                    ROLLBACK_MARKER,
+                    Style::default().fg(theme.tone_color(StatusTone::Warning)),
+                ),
                 Span::styled("= rollback target", Style::default().fg(theme.muted)),
             ])),
             rows[0],
@@ -423,13 +415,7 @@ pub fn draw_runtime_manager(
                 } else {
                     "  "
                 };
-                let marker_color = if rt.active {
-                    theme.ok
-                } else if rt.rollback {
-                    theme.warn
-                } else {
-                    theme.muted
-                };
+                let marker_color = theme.tone_color(runtime_marker_tone(rt));
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, Style::default().fg(marker_color)),
                     Span::styled(
@@ -549,11 +535,8 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     fn runtimes() -> Vec<RuntimeSummary> {
         vec![
@@ -576,6 +559,23 @@ mod tests {
                 rollback: true,
             },
         ]
+    }
+
+    #[test]
+    fn marker_color_distinguishes_active_rollback_and_other_runtimes() {
+        let theme = Theme::from_name("default-dark");
+        let rt = |active, rollback| RuntimeSummary {
+            active,
+            rollback,
+            ..RuntimeSummary::default()
+        };
+        let color = |r: &RuntimeSummary| theme.tone_color(runtime_marker_tone(r));
+        assert_eq!(color(&rt(true, false)), theme.ok);
+        assert_eq!(color(&rt(false, true)), theme.warn);
+        assert_eq!(color(&rt(false, false)), theme.muted);
+        // A runtime that is both the active default and the rollback target
+        // reads as active.
+        assert_eq!(color(&rt(true, true)), theme.ok);
     }
 
     #[test]
@@ -699,6 +699,18 @@ mod tests {
         let pending = rm.as_ref().unwrap().approval.as_ref().unwrap();
         assert_eq!(pending.action, RuntimeAction::Import);
         assert_eq!(pending.args, vec!["runtimes", "import", "/tmp/m.json"]);
+    }
+
+    #[test]
+    fn backspace_edits_the_import_path() {
+        let mut rm = Some(RuntimeManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char('i')));
+        for c in "ab".chars() {
+            on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(rm.as_ref().unwrap().import_input.as_deref(), Some("a"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-Feature: ComfyUI install reports progress and makes failures actionable
+Feature: ComfyUI install reports progress, makes failures actionable and preserves the runtime
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
   # dependencies. A failed resolve (a version conflict, a yanked release, a
@@ -10,9 +10,16 @@ Feature: ComfyUI install reports progress and makes failures actionable
   #
   # The runtime, its rocm_sdk probe, the Python interpreter and `uv` itself are
   # all planted so the scenario is hermetic: no GPU, no network, no real
-  # package resolution. Linux-only because the planted shims are POSIX shell
-  # scripts.
-  @id:comfyui-uv-install-failure-names-log @requires-os:linux
+  # package resolution.
+  #
+  # This scenario and comfyui-02/-03 below are hermetic and Windows-portable
+  # (no `@requires-os:linux`), but nothing in required CI ran them on Windows
+  # until the `windows-release` job of the required `windows-build-and-test` lane
+  # started selecting their ids explicitly via `E2E_ALSO_RUN_IDS` (see
+  # `docs/testing.md`'s "Install lifecycle" section) — before that, Windows
+  # coverage depended entirely on the optional, self-hosted
+  # `e2e-selfhosted.yml` lane.
+  @id:comfyui-uv-install-failure-names-log
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv fails
@@ -25,12 +32,22 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # nothing at all, indistinguishable from a hang. This scenario's harness
   # runs non-interactively by construction, so it can assert that streaming
   # directly, on the success path (the failure path is `comfyui-01` above).
-  @id:comfyui-uv-install-progress-streamed @requires-os:linux
+  #
+  # This scenario also runs the install through to a saved manifest (unlike
+  # comfyui-01, which fails before one is written), so it doubles as the e2e
+  # coverage for `folder:` naming the ComfyUI source checkout consistently in
+  # both `install` and `status` output -- a user-observable line that AGENTS.md
+  # requires a Gherkin scenario for, not just the unit tests that assert each
+  # command's `folder:` line in isolation.
+  @id:comfyui-uv-install-progress-streamed
   Scenario: comfyui-02 - A dependency install streams progress output
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv prints progress and succeeds
     When the user installs ComfyUI
     Then the CLI succeeds and shows the install progress
+    And the install output's folder: line names the ComfyUI source checkout
+    When the user checks ComfyUI status
+    Then status names the same ComfyUI source folder as the install
 
   # `rocm comfyui install` picks the ROCm runtime to install into. When more than
   # one managed runtime is ready and none is activated as the default, the CLI
@@ -45,14 +62,13 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # (`apps/rocm/src/dash_seam.rs`, which replays a real refusing subprocess), and
   # that such an envelope is then collapsed out of the chat, by
   # `approved_command_failure_stays_a_collapsed_envelope`
-  # (`crates/rocm-dash-tui/src/app/mod.rs`). The reasoning is written out at the
+  # (`crates/rocm-dash-tui/src/app/tool_approval.rs`). The reasoning is written out at the
   # seam that decides it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the
   # scenario plants two ready wheel runtimes and asserts the refusal names every
-  # remediation and lists both keys. Linux-only because the planted rocm_sdk stub
-  # uses `.so` library names; the selection logic it exercises is platform-agnostic.
-  @id:comfyui-ambiguous-runtime-actionable @requires-os:linux
+  # remediation and lists both keys.
+  @id:comfyui-ambiguous-runtime-actionable
   Scenario: comfyui-03 - ComfyUI install refuses an ambiguous runtime choice and names every remediation
     Given two ready ROCm runtimes and no active default
     When the user installs ComfyUI without choosing a runtime
@@ -79,6 +95,16 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # label-truncation fix in `cli_progress::assemble_status_line` — the
   # tarball scenario in `download_progress_pty.feature` is the regression
   # test for that.
+  # The fixture also switches the CLI's startup update check off. The planted
+  # runtime would otherwise make the check run first, before the install
+  # reaches its download: it fetches `uv` and a managed Python from the network
+  # and prints that progress on this terminal, and on a slow network it
+  # outlasts the 30s wait for the intermediate frame.
+  # Linux-only: this scenario drives `rocm` under a real PTY, the same
+  # suite-wide limitation `dash.feature`'s header comment documents
+  # (portable-pty compiles on Windows via ConPTY, but that path isn't yet
+  # promoted to a blocking contract) — unrelated to this file's other
+  # scenarios, whose own Linux gate is explained below.
   @id:comfyui-source-download-shows-live-progress @requires-os:linux @serial
   Scenario: comfyui-04 - The source-archive download spinner renders progress and clears on completion
     Given a paced ComfyUI source archive fixture
@@ -86,3 +112,307 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the terminal shows an intermediate ComfyUI download progress frame
     And the ComfyUI install exits cleanly
     And the final terminal screen shows no ComfyUI download spinner line
+
+  # `--reinstall` used to delete ComfyUI's whole `source/` folder before it
+  # downloaded anything. That folder is where ComfyUI keeps the user's models
+  # (the `models path:` the CLI prints), saved workflows (`user/`), generated
+  # images (`output/`), uploads (`input/`), installed custom nodes and an
+  # `extra_model_paths.yaml`, because `rocm comfyui start` runs ComfyUI from it
+  # without redirecting any of them. A reinstall now replaces only the code
+  # around those. These scenarios plant a used install, then reinstall from a
+  # loopback archive server: the success path, the path where the download
+  # fails, the dry run, a reinstall attempted while ComfyUI runs (also one
+  # started during the download), an interrupted reinstall, a user's entry set
+  # aside, a failure after the new code is in place, and a download that is
+  # not a ComfyUI release. Each asserts what the CLI prints together with what
+  # is actually on disk afterwards. Only three of these still need the POSIX
+  # shell and stay `@requires-os:linux`: comfyui-11's GPU-check failing
+  # transition plants a `#!/bin/sh` script (its passing-again half uses the
+  # Windows-portable `fake-python` stand-in, like every other scenario here),
+  # and comfyui-08/comfyui-12 each start their stand-in running ComfyUI
+  # process through `sh -c` (see `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13
+  # plant the same Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03`
+  # use and have no shell dependency of their own, so they now run on both
+  # platforms too (#697).
+  #
+  # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
+  # cannot read it either, so it must not block the reinstall; the reinstall
+  # says it could not tell.
+  @id:comfyui-reinstall-keeps-user-data
+  Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And rocm-cli's saved record of the ComfyUI it started cannot be read
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+    And the reinstall lists the code it replaced
+    And the reinstall says it could not tell whether ComfyUI was running
+
+  @id:comfyui-reinstall-failed-download-changes-nothing
+  Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the ComfyUI release download fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails
+    And the existing ComfyUI code and the user's files are untouched
+
+  @id:comfyui-reinstall-dry-run-names-kept-folders
+  Scenario: comfyui-07 - A ComfyUI reinstall dry run says what it replaces and keeps
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    When the user previews reinstalling ComfyUI
+    Then the preview says the ComfyUI code is replaced and names the kept folders
+    And the preview's install command includes --reinstall
+    And the existing ComfyUI code and the user's files are untouched
+
+  # The running ComfyUI keeps the old code loaded and keeps writing into the
+  # folder a reinstall changes, so the reinstall is refused until it is
+  # stopped. The dry run says so first. The refusal names `rocm comfyui stop`;
+  # the scenario runs exactly that and proves the same reinstall then goes
+  # through. Once it is reinstalled, a ComfyUI started from it that has not
+  # answered on its port yet is "starting" to a plain-words status question,
+  # which must not advise starting a second one. (A ComfyUI that is still
+  # starting also blocks a reinstall; the unit test
+  # `reinstall_is_refused_while_comfyui_starts_until_it_is_stopped` covers it.)
+  #
+  # Steps that set up state in the middle of a scenario are `Given`, as in
+  # comfyui-09 and comfyui-11.
+  @id:comfyui-reinstall-refused-while-running @requires-os:linux
+  Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the ComfyUI that rocm-cli started is running from that install and answering on its port
+    When the user previews reinstalling ComfyUI
+    Then the preview says the reinstall is refused until ComfyUI is stopped
+    And the existing ComfyUI code and the user's files are untouched
+    When the user reinstalls ComfyUI
+    Then the reinstall is refused and names rocm comfyui stop
+    And the reinstall was refused before it downloaded anything
+    And the existing ComfyUI code and the user's files are untouched
+    When the user stops ComfyUI
+    And the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+    Given a ComfyUI started by rocm-cli is still loading from that install
+    When the user asks in plain words for ComfyUI's status
+    Then the answer says ComfyUI is installed and starting and does not advise starting it
+
+  # A reinstall killed while it replaces the code leaves a half-replaced
+  # folder. `start` must not launch it; it names the install command that
+  # finishes the reinstall, and the scenario runs that exact command (read from
+  # the CLI's own message) and proves the condition is cleared. `status` and
+  # the answer to a natural-language status question both name that command
+  # rather than `start` until then.
+  @id:comfyui-interrupted-reinstall-blocks-start
+  Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    Given the reinstall was cut short while replacing ComfyUI's code
+    When the user starts ComfyUI
+    Then start refuses and names the command that finishes the reinstall
+    And ComfyUI status reports the interrupted reinstall
+    And the plain-words status answer names that command instead of start
+    When the user runs the command start named
+    Then ComfyUI status no longer reports an interrupted reinstall
+    And the plain-words status answer no longer reports an interrupted reinstall
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
+
+  # A newer release can start shipping a name the user already uses at the top
+  # of `source/`. The install recorded what its release shipped, so the
+  # reinstall knows that entry is the user's: it renames it and says where,
+  # instead of deleting it as old code.
+  @id:comfyui-reinstall-sets-aside-colliding-entry
+  Scenario: comfyui-10 - Reinstalling ComfyUI renames a folder of the user's that the new release also ships
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the user keeps an app folder there that the installed ComfyUI release did not ship
+    And a newer ComfyUI release that ships an app folder is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And the reinstall reports the user's app folder as set aside and it still holds the user's files
+    And ComfyUI's code is the newer release
+
+  # A reinstall can fail after the new code is in place: here the runtime's
+  # GPU check fails. The success report that would have listed what was
+  # replaced is never printed, so the error names it, together with the
+  # command that finishes the install. The scenario runs that command, read
+  # from the error, once the GPU check passes again.
+  @id:comfyui-reinstall-failing-after-swap-names-the-finish @requires-os:linux
+  Scenario: comfyui-11 - A ComfyUI reinstall that fails after replacing the code says what it replaced and how to finish
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the runtime's AMD GPU check fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails and names what it replaced and the command that finishes the install
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
+    Given the runtime's AMD GPU check passes again
+    When the user runs the command the reinstall named
+    Then ComfyUI is installed and its AMD GPU check is ready
+    And the user's own files are untouched
+
+  # The reinstall checks that no ComfyUI runs from the folder before it
+  # downloads, and again just before it replaces the code: a ComfyUI started
+  # during a long download would otherwise be running the code the swap
+  # replaces. Here it is started once the download has begun, so only the
+  # second check can catch it. `rocm comfyui stop`, which the refusal names,
+  # then lets the same reinstall through.
+  @id:comfyui-reinstall-rechecks-running-before-swap @requires-os:linux
+  Scenario: comfyui-12 - A ComfyUI started while a reinstall downloads stops the reinstall before it replaces any code
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available, and ComfyUI is started from that install while it downloads
+    When the user reinstalls ComfyUI
+    Then the reinstall is refused and names rocm comfyui stop
+    And the newer release had downloaded before the reinstall was refused
+    And the existing ComfyUI code and the user's files are untouched
+    When the user stops ComfyUI
+    And the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+
+  # A download that unpacks but has no main.py is not installed: the reinstall
+  # would otherwise remove the installed code and put nothing startable in its
+  # place. It is not kept either, so the next attempt downloads again.
+  @id:comfyui-reinstall-rejects-download-without-main-py
+  Scenario: comfyui-13 - A ComfyUI reinstall whose download is not a ComfyUI release leaves the install untouched
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the newer ComfyUI release offered for download has no main.py
+    When the user reinstalls ComfyUI
+    Then the reinstall fails saying the download is not a ComfyUI release, and does not keep it
+    And the existing ComfyUI code and the user's files are untouched
+
+  # EAI-8051: `rocm comfyui install` installs ComfyUI's dependencies INTO the
+  # machine's managed ROCm runtime. Before #298 nothing constrained the torch stack,
+  # so a transitive dependency could pull CUDA `nvidia-*` wheels into the runtime
+  # and displace its ROCm torch, leaving a CUDA build with no AMD GPU support --
+  # installing an optional app broke the base. #298 now pins the torch stack with
+  # a `uv --constraint` file; this scenario guards against that regressing.
+  #
+  # The contract: after installing an optional app, the machine's ROCm runtime must
+  # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
+  # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
+  # so the scenario also requires that. It is also the step that catches a revert
+  # of #298 (the post-install GPU probe then bails and the install exits non-zero),
+  # so do not relax it as a mere premise: a bail-out (no runtime, download failure)
+  # would otherwise leave the runtime trivially unchanged and report green having
+  # installed nothing. It further requires the runtime's package set to have GROWN,
+  # because a zero exit code alone still permits an empty filtered requirement list,
+  # which skips the dependency install outright. Together those two make the
+  # runtime-health checks the ADDITIONAL contract on top of an install that really
+  # happened, not a substitute for it.
+  #
+  # Genuinely destructive and expensive: it needs a real managed runtime (a
+  # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
+  # @nightly, against this scenario's own isolated runtime prefix (it must never
+  # share a runtime tree with other scenarios — it may corrupt it). Gated
+  # @requires-gpu @nightly, like runtime-install-sdk-active, which also does a
+  # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
+  # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
+  # combining it with @nightly would make this scenario unreachable on every lane;
+  # its Given step runs the same `install sdk --yes` as runtime-01, so it does the same
+  # host-level work: system-package consent, the torch system libraries, and the
+  # preferred-engine auto install (for vLLM families a sudo OpenMPI package install when
+  # missing, then a full vLLM engine install into the runtime), which adds nightly time;
+  # otherwise it touches only its own isolated runtime prefix.
+  #
+  # Native Linux only: @requires-os:linux keeps Windows out, and
+  # @requires-bare-metal keeps WSL2 out (it reports linux, so the first tag alone
+  # would not). WSL2 is excluded because no run of `comfyui install` there has
+  # been seen, not because the amdgpu premise is known to be absent; no ticket
+  # tracks lifting that gate. Separately, if Windows is ever admitted, note the
+  # `nvidia-*` check has no teeth there (PyPI's Windows torch wheels are CPU
+  # builds).
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
+  Scenario: comfyui-14 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
+    Given a machine with a managed ROCm runtime
+    And the runtime has torch and no CUDA packages
+    When the user installs ComfyUI without choosing a runtime
+    Then the ComfyUI install succeeds
+    And ComfyUI's dependencies were installed into the runtime
+    And the runtime's torch stack is unchanged
+    And no nvidia-* packages were added to the runtime
+
+  # With no runtime chosen, `rocm comfyui install` uses the one ready runtime,
+  # and it finds it the way `rocm serve` and `rocm engines install` do: it
+  # recovers the runtime `rocm setup` created first. A runtime whose registry
+  # entry was lost, but whose install tree still holds its own manifest and that
+  # setup names, therefore counts as the ready runtime, instead of the install
+  # refusing with "Install ROCm first" while setup has finished. The real run
+  # writes the lost registry entry back (comfyui-16); a `--dry-run` preview
+  # names the same runtime but leaves the registry as it found it, because it
+  # promises not to change files (this scenario). The preview prints the
+  # `--runtime-id` of the command it would run, which is how it shows the
+  # choice; comfyui-17 runs that command as printed. No GPU is needed: readiness
+  # is filesystem and manifest state.
+  @id:comfyui-install-finds-the-runtime-setup-created
+  Scenario: comfyui-15 - A ComfyUI install preview finds the runtime setup created without writing the registry
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    And the runtime registry still has no entry for it
+
+  # The real run of the same install: it uses the runtime setup created and
+  # writes its lost registry entry back, so the runtime it installed into is one
+  # `rocm runtimes list` shows afterwards. The ComfyUI checkout is already in
+  # place and asks for nothing beyond the torch stack the runtime provides, so
+  # the install needs no network and no package index.
+  @id:comfyui-install-restores-the-runtime-setup-created
+  Scenario: comfyui-16 - A ComfyUI install restores the registry entry of the runtime setup created
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user installs ComfyUI without choosing a runtime
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
+
+  # The preview's `install command:` line is how it shows the choice, so it has
+  # to be a command that works from the state the preview left, where the
+  # registry still has no entry for the runtime it named. Its `--runtime-id` is
+  # an explicit choice, which finds the runtime setup created the same way a
+  # missing choice does, instead of refusing with "Install ROCm first". Run as
+  # printed, the command installs into that runtime and writes the entry back.
+  @id:comfyui-install-preview-command-works-as-printed
+  Scenario: comfyui-17 - The install command a ComfyUI install preview prints works from the state the preview left
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the runtime registry still has no entry for it
+    When the user runs the install command the preview printed
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
+
+  # The same printed command, when the registry cannot take the entry back (a
+  # file stands where its directory should be, which stops an administrator as
+  # well; a read-only directory would not). The preview writes nothing, so it
+  # still succeeds and names the runtime. The real run finds that runtime the
+  # same way, fails to restore its entry, and says so, rather than answering
+  # "Install ROCm first" as if setup had left no runtime. The registry is left as
+  # it was. A read-only registry directory with other runtimes in it, the other
+  # way to reach this, is covered by a unit test: the suite can run as root, for
+  # whom a read-only directory is writable.
+  @id:comfyui-install-reports-a-registry-it-cannot-write
+  Scenario: comfyui-18 - The install command a ComfyUI install preview prints reports a registry that cannot take the runtime back
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    And the runtime registry cannot be written
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    When the user runs the install command the preview printed
+    Then the install is refused because the runtime's registry entry could not be restored
+    And the runtime registry is as it was
+
+  # With no runtime chosen, a setup folder whose runtime can no longer be used
+  # (here its interpreter is gone) is not a ready runtime and cannot change which
+  # runtimes are ready, so it does not stop an install that has exactly one ready
+  # runtime registered: the install uses that one, as a choice that names it
+  # does, and the unusable setup runtime is not written into the registry. Its
+  # own error is reported only when no registered runtime is ready (a unit
+  # test). No GPU is needed: readiness is filesystem and manifest state.
+  @id:comfyui-install-uses-the-ready-runtime-beside-an-unusable-setup-runtime
+  Scenario: comfyui-19 - A setup runtime that is no longer usable does not stop a ComfyUI install that has one ready runtime
+    Given a ready ROCm runtime in the registry
+    And a setup folder whose runtime is no longer usable
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects the registered runtime
+    And the runtime registry holds only the registered runtime

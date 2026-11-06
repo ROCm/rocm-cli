@@ -2,15 +2,26 @@
 //
 // SPDX-License-Identifier: MIT
 
+mod local_http;
+mod tool_schema;
+mod wire;
+
+#[cfg(test)]
+use self::local_http::LOCAL_STREAM_TRUNCATED;
+use self::local_http::{post_json_to_local_endpoint, stream_json_from_local_endpoint};
+use self::wire::{
+    AnthropicSseEmitter, OpenAiSseEmitter, anthropic_chat_request_body,
+    anthropic_stream_chat_request_body, openai_chat_request_body, openai_local_chat_request_body,
+    openai_local_stream_chat_request_body, openai_stream_chat_request_body,
+    parse_anthropic_chat_message, parse_openai_chat_message,
+};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
-    RocmCliConfig, append_audit_event, connect_tcp_stream, format_host_port,
-    managed_service_endpoint_readiness, read_http_response_bounded, unix_time_millis,
-    write_all_tcp_stream,
+    RocmCliConfig, append_audit_event, managed_service_endpoint_readiness, unix_time_millis,
 };
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::time::Duration;
 
 pub(crate) const ROCM_TOOL_SCHEMA_ID: &str = "rocm-tools-v0";
@@ -283,7 +294,7 @@ impl ProviderAdapter for LocalProvider<'_> {
         let builtin_ready = services.iter().any(local_service_is_builtin_assistant);
         let mut models = services
             .into_iter()
-            .map(|record| record.canonical_model_id)
+            .map(|record| record.served_model_name().to_owned())
             .collect::<Vec<_>>();
         models.sort();
         models.dedup();
@@ -303,13 +314,7 @@ impl ProviderAdapter for LocalProvider<'_> {
 
     fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let service = select_local_chat_service(self.paths, request.model.as_deref())?;
-        let body = openai_local_chat_request_body(
-            request
-                .model
-                .as_deref()
-                .unwrap_or(&service.canonical_model_id),
-            request,
-        );
+        let body = openai_local_chat_request_body(service.served_model_name(), request);
         let endpoint_api_key =
             crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         let response = post_json_to_local_endpoint(
@@ -334,14 +339,8 @@ impl ProviderAdapter for LocalProvider<'_> {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
     ) -> Result<ChatStreamSummary> {
         let service = select_local_chat_service(self.paths, request.model.as_deref())?;
-        let model = service.canonical_model_id.clone();
-        let body = openai_local_stream_chat_request_body(
-            request
-                .model
-                .as_deref()
-                .unwrap_or(&service.canonical_model_id),
-            request,
-        );
+        let model = service.served_model_name().to_owned();
+        let body = openai_local_stream_chat_request_body(service.served_model_name(), request);
         let endpoint_api_key =
             crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         stream_json_from_local_endpoint(
@@ -476,6 +475,10 @@ fn select_local_chat_service(
         services.retain(|service| {
             service.canonical_model_id.eq_ignore_ascii_case(model)
                 || service.model_ref.eq_ignore_ascii_case(model)
+                || service
+                    .served_model_id
+                    .as_deref()
+                    .is_some_and(|served| served.eq_ignore_ascii_case(model))
         });
         return services
             .into_iter()
@@ -565,334 +568,6 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
     Ok(services)
 }
 
-fn post_json_to_local_endpoint(
-    endpoint_url: &str,
-    path: &str,
-    body: &serde_json::Value,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<serde_json::Value> {
-    let body =
-        post_json_to_local_endpoint_body(endpoint_url, path, body, endpoint_api_key, timeout)?;
-    serde_json::from_str(body.trim()).context("failed to parse local provider chat JSON")
-}
-
-/// `Authorization: Bearer` request-header line for a protected local endpoint, or
-/// an empty string for an unauthenticated (loopback) one.
-fn local_bearer_header(endpoint_api_key: Option<&str>) -> String {
-    match endpoint_api_key {
-        Some(key) => format!("Authorization: Bearer {key}\r\n"),
-        None => String::new(),
-    }
-}
-
-fn post_json_to_local_endpoint_body(
-    endpoint_url: &str,
-    path: &str,
-    body: &serde_json::Value,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let (host, port) = parse_http_endpoint(endpoint_url)
-        .with_context(|| format!("unsupported local endpoint URL `{endpoint_url}`"))?;
-    let body = serde_json::to_string(body).context("failed to serialize chat request")?;
-    let deadline = std::time::Instant::now() + timeout;
-    let mut stream = connect_tcp_stream(&host, port, timeout)?;
-    let host_header = format_host_port(&host, port);
-    let auth_header = local_bearer_header(endpoint_api_key);
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    write_all_tcp_stream(&mut stream, request.as_bytes())
-        .context("failed to write local provider chat request")?;
-
-    let response = read_http_response_bounded(&mut stream, deadline)
-        .context("failed to read local provider chat response")?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .context("local provider response was missing HTTP body")?;
-    let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("local provider returned {status_line}");
-    }
-    Ok(body.to_owned())
-}
-
-fn stream_json_from_local_endpoint(
-    endpoint_url: &str,
-    path: &str,
-    body: &serde_json::Value,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-    on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
-) -> Result<()> {
-    let (host, port) = parse_http_endpoint(endpoint_url)
-        .with_context(|| format!("unsupported local endpoint URL `{endpoint_url}`"))?;
-    let body = serde_json::to_string(body).context("failed to serialize chat request")?;
-    let mut stream = connect_tcp_stream(&host, port, timeout)?;
-    let host_header = format_host_port(&host, port);
-    let auth_header = local_bearer_header(endpoint_api_key);
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    write_all_tcp_stream(&mut stream, request.as_bytes())
-        .context("failed to write local provider chat request")?;
-
-    let mut reader = BufReader::new(stream);
-    let mut headers = String::new();
-    loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .context("failed to read local provider response headers")?;
-        if read == 0 {
-            bail!("local provider response ended before headers completed");
-        }
-        headers.push_str(&line);
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-    }
-    let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("local provider returned {status_line}");
-    }
-
-    let transfer_encoding = header_value(&headers, "Transfer-Encoding");
-    let chunked = transfer_encoding
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let content_length = header_value(&headers, "Content-Length")
-        .and_then(|value| value.trim().parse::<usize>().ok());
-    let mut emitter = OpenAiSseEmitter::new(on_event);
-    if chunked {
-        read_chunked_sse_body(&mut reader, &mut emitter)?;
-    } else if let Some(length) = content_length {
-        read_fixed_sse_body(&mut reader, length, &mut emitter)?;
-    } else {
-        read_close_delimited_sse_body(&mut reader, &mut emitter)?;
-    }
-    emitter.finish()
-}
-
-fn header_value(headers: &str, name: &str) -> Option<String> {
-    headers.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case(name)
-            .then(|| value.trim().to_owned())
-    })
-}
-
-fn read_fixed_sse_body<R: Read>(
-    reader: &mut R,
-    mut remaining: usize,
-    emitter: &mut OpenAiSseEmitter<'_>,
-) -> Result<()> {
-    let mut buffer = [0_u8; 1024];
-    while remaining > 0 {
-        let read_len = remaining.min(buffer.len());
-        reader
-            .read_exact(&mut buffer[..read_len])
-            .context("failed to read local provider SSE body")?;
-        emitter.push_bytes(&buffer[..read_len])?;
-        remaining -= read_len;
-    }
-    Ok(())
-}
-
-fn read_close_delimited_sse_body<R: Read>(
-    reader: &mut R,
-    emitter: &mut OpenAiSseEmitter<'_>,
-) -> Result<()> {
-    let mut buffer = [0_u8; 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("failed to read local provider SSE body")?;
-        if read == 0 {
-            break;
-        }
-        emitter.push_bytes(&buffer[..read])?;
-    }
-    Ok(())
-}
-
-fn read_chunked_sse_body<R: BufRead>(
-    reader: &mut R,
-    emitter: &mut OpenAiSseEmitter<'_>,
-) -> Result<()> {
-    loop {
-        let mut size_line = String::new();
-        reader
-            .read_line(&mut size_line)
-            .context("failed to read local provider chunk size")?;
-        if size_line.trim().is_empty() {
-            continue;
-        }
-        let size_text = size_line
-            .trim()
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .with_context(|| format!("invalid local provider chunk size `{size_text}`"))?;
-        if size == 0 {
-            let mut trailer = String::new();
-            let _ = reader.read_line(&mut trailer);
-            break;
-        }
-        read_fixed_sse_body(reader, size, emitter)?;
-        let mut crlf = [0_u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .context("failed to read local provider chunk terminator")?;
-        if crlf != *b"\r\n" {
-            bail!("invalid local provider chunk terminator");
-        }
-    }
-    Ok(())
-}
-
-fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
-    let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
-    let authority = without_scheme.split('/').next()?.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_owned();
-        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some((host, port));
-    }
-    let (host, port) = authority.rsplit_once(':')?;
-    Some((host.to_owned(), port.parse().ok()?))
-}
-
-#[cfg(test)]
-fn parse_openai_chat_content(response: &serde_json::Value) -> Result<String> {
-    let (content, tool_calls) = parse_openai_chat_message(response)?;
-    if content.is_empty() && !tool_calls.is_empty() {
-        bail!("OpenAI-compatible response contained tool calls but no text content");
-    }
-    Ok(content)
-}
-
-fn parse_openai_chat_message(response: &serde_json::Value) -> Result<(String, Vec<ChatToolCall>)> {
-    let message = response
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .context("OpenAI-compatible response did not include choices[0].message")?;
-    let content = message
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
-    let tool_calls = parse_openai_tool_calls(message)?;
-    if content.is_empty() && tool_calls.is_empty() {
-        bail!("OpenAI-compatible response did not include message content or tool calls");
-    }
-    Ok((content, tool_calls))
-}
-
-fn parse_openai_tool_calls(message: &serde_json::Value) -> Result<Vec<ChatToolCall>> {
-    let Some(items) = message
-        .get("tool_calls")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Ok(Vec::new());
-    };
-    let mut calls = Vec::new();
-    for item in items {
-        let function = item
-            .get("function")
-            .context("OpenAI-compatible tool call was missing function")?;
-        let name = function
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .context("OpenAI-compatible tool call was missing function.name")?;
-        let arguments = match function.get("arguments") {
-            Some(serde_json::Value::String(text)) if text.trim().is_empty() => {
-                serde_json::json!({})
-            }
-            Some(serde_json::Value::String(text)) => serde_json::from_str(text)
-                .with_context(|| format!("tool call `{name}` arguments were not valid JSON"))?,
-            Some(value) => value.clone(),
-            None => serde_json::json!({}),
-        };
-        calls.push(ChatToolCall {
-            id: item
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            name,
-            arguments,
-        });
-    }
-    Ok(calls)
-}
-
-#[cfg(test)]
-fn parse_anthropic_chat_content(response: &serde_json::Value) -> Result<String> {
-    let (content, tool_calls) = parse_anthropic_chat_message(response)?;
-    if content.is_empty() && !tool_calls.is_empty() {
-        bail!("anthropic provider response contained tool calls but no text content");
-    }
-    Ok(content)
-}
-
-fn parse_anthropic_chat_message(
-    response: &serde_json::Value,
-) -> Result<(String, Vec<ChatToolCall>)> {
-    let items = response
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .context("anthropic provider response did not include content blocks")?;
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for item in items {
-        match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("text") => {
-                if let Some(chunk) = item.get("text").and_then(serde_json::Value::as_str) {
-                    text.push_str(chunk);
-                }
-            }
-            Some("tool_use") => {
-                let name = item
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .context("anthropic provider tool_use block was missing name")?;
-                let arguments = item
-                    .get("input")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                tool_calls.push(ChatToolCall {
-                    id: item
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    name,
-                    arguments,
-                });
-            }
-            _ => {}
-        }
-    }
-    if text.is_empty() && tool_calls.is_empty() {
-        bail!("anthropic provider response did not include text content or tool calls");
-    }
-    Ok((text, tool_calls))
-}
-
 fn resolve_remote_model(
     provider: &str,
     model_env: &str,
@@ -917,340 +592,6 @@ fn remote_endpoint(endpoint_env: &str, default_endpoint: &str) -> String {
         .map(|value| value.trim().trim_end_matches('/').to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| default_endpoint.to_owned())
-}
-
-fn openai_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    openai_chat_request_body_with_stream(model, request, false)
-}
-
-fn openai_stream_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    openai_chat_request_body_with_stream(model, request, true)
-}
-
-fn openai_local_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    let request = local_openai_compatible_request(request);
-    let mut body = openai_chat_request_body(model, &request);
-    apply_local_model_request_defaults(model, &mut body);
-    body
-}
-
-fn openai_local_stream_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    let request = local_openai_compatible_request(request);
-    let mut body = openai_stream_chat_request_body(model, &request);
-    apply_local_model_request_defaults(model, &mut body);
-    body
-}
-
-fn apply_local_model_request_defaults(model: &str, body: &mut serde_json::Value) {
-    if local_model_should_disable_thinking(model) {
-        body["chat_template_kwargs"] = serde_json::json!({
-            "enable_thinking": false
-        });
-    }
-}
-
-fn local_model_should_disable_thinking(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    normalized.contains("qwen3") || normalized.contains("qwen/qwen3")
-}
-
-fn local_openai_compatible_request(request: &ChatRequest) -> ChatRequest {
-    let system = request
-        .messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .map(|message| message.content.trim())
-        .filter(|content| !content.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let mut messages = request
-        .messages
-        .iter()
-        .filter(|message| message.role != "system")
-        .cloned()
-        .collect::<Vec<_>>();
-    if !system.is_empty() {
-        if let Some(first_user) = messages.iter_mut().find(|message| message.role == "user") {
-            first_user.content = format!(
-                "ROCm CLI guidance:\n{system}\n\nUser message:\n{}",
-                first_user.content
-            );
-        } else {
-            messages.insert(
-                0,
-                ChatMessage {
-                    role: "user".to_owned(),
-                    content: format!("ROCm CLI guidance:\n{system}"),
-                },
-            );
-        }
-    }
-    ChatRequest {
-        model: request.model.clone(),
-        messages,
-        max_tokens: request.max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        rocm_tools: request.rocm_tools,
-    }
-}
-
-fn openai_chat_request_body_with_stream(
-    model: &str,
-    request: &ChatRequest,
-    stream: bool,
-) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": request.messages.iter().map(|message| {
-            serde_json::json!({
-                "role": message.role,
-                "content": message.content,
-            })
-        }).collect::<Vec<_>>(),
-        "stream": stream,
-        "max_tokens": request.max_tokens.unwrap_or(512),
-    });
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(top_p) = request.top_p {
-        body["top_p"] = serde_json::json!(top_p);
-    }
-    if request.rocm_tools && !stream {
-        body["tools"] = serde_json::Value::Array(rocm_openai_tool_definitions());
-        body["tool_choice"] = serde_json::json!("auto");
-    }
-    body
-}
-
-fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
-    vec![
-        rocm_openai_tool(
-            "examine",
-            "Read the current ROCm host, GPU, runtime, driver, and engine status.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "bridge_snapshot",
-            "Read a full ROCm snapshot including examine data, engines, services, automations, and GPU telemetry.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "gpu_snapshot",
-            "Read the current local AMD GPU telemetry snapshot when available.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "engines",
-            "List available ROCm serving engines and whether each is installed.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "services",
-            "List managed local model servers and their current status.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "service_logs",
-            "Read the recent log output for a managed local model server.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "service_id": { "type": "string" },
-                    "lines": { "type": "integer", "minimum": 1, "maximum": 500 }
-                },
-                "required": ["service_id"],
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "automations",
-            "List watcher and automation status plus recent automation events.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "event_limit": { "type": "integer", "minimum": 1, "maximum": 64 }
-                },
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "natural_language_plan",
-            "Ask ROCm CLI to translate a natural-language ROCm request into a visible plan without executing it.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "request": { "type": "string" }
-                },
-                "required": ["request"],
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "path_exists",
-            "Read whether an exact local filesystem path exists and whether its parent folder exists. Use this only to check user-provided install folders before requesting a ROCm install.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "port_status",
-            "Read whether a local loopback TCP port is listening and whether a ROCm-managed service owns it. Use this for questions like whether something is running on port 8188 or the local model server port. Do not use it for non-local hosts.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "host": { "type": "string" },
-                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
-                },
-                "required": ["port"],
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "rocm_command",
-            "Run or request a supported ROCm CLI command with argv-style arguments. Known read-only inspection commands may run immediately. Commands that install, start, serve, stop, delete, or change ROCm state are paused for user review before they run. Use this tool for mutating TheRock setup, including --prefix PATH when the user gives an install folder, --build-date YYYY-MM-DD or --version VERSION, config changes, ComfyUI install/start, engine install, vLLM management, and local LLM serve actions; do not request shell commands, CPU execution, or public network binds.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "args": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 64
-                    },
-                    "reason": { "type": "string" }
-                },
-                "required": ["args"],
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "update_check",
-            "Check whether ROCm CLI knows about newer TheRock runtime versions.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        ),
-        rocm_openai_tool(
-            "install_sdk_dry_run",
-            "Preview a TheRock SDK install without changing the machine.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "channel": { "type": "string", "enum": ["release", "nightly"] },
-                    "format": { "type": "string", "enum": ["wheel", "tarball"] },
-                    "prefix": { "type": "string" },
-                    "version": { "type": "string" },
-                    "build_date": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-        ),
-    ]
-}
-
-fn rocm_openai_tool(
-    name: &str,
-    description: &str,
-    parameters: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-        }
-    })
-}
-
-fn rocm_anthropic_tool_definitions() -> Vec<serde_json::Value> {
-    rocm_openai_tool_definitions()
-        .into_iter()
-        .filter_map(|tool| {
-            let function = tool.get("function")?;
-            Some(serde_json::json!({
-                "name": function.get("name")?.clone(),
-                "description": function.get("description")?.clone(),
-                "input_schema": function.get("parameters")?.clone(),
-            }))
-        })
-        .collect()
-}
-
-fn anthropic_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    anthropic_chat_request_body_with_stream(model, request, false)
-}
-
-fn anthropic_stream_chat_request_body(model: &str, request: &ChatRequest) -> serde_json::Value {
-    anthropic_chat_request_body_with_stream(model, request, true)
-}
-
-fn anthropic_chat_request_body_with_stream(
-    model: &str,
-    request: &ChatRequest,
-    stream: bool,
-) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": request.messages.iter().filter(|message| message.role != "system").map(|message| {
-            serde_json::json!({
-                "role": if message.role == "assistant" { "assistant" } else { "user" },
-                "content": message.content,
-            })
-        }).collect::<Vec<_>>(),
-        "max_tokens": request.max_tokens.unwrap_or(512),
-        "stream": stream,
-    });
-    let system = request
-        .messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .map(|message| message.content.trim())
-        .filter(|content| !content.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !system.is_empty() {
-        body["system"] = serde_json::Value::String(system);
-    }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = serde_json::json!(temperature);
-    }
-    if let Some(top_p) = request.top_p {
-        body["top_p"] = serde_json::json!(top_p);
-    }
-    if request.rocm_tools && !stream {
-        body["tools"] = serde_json::Value::Array(rocm_anthropic_tool_definitions());
-    }
-    body
 }
 
 fn post_json_with_headers(
@@ -1331,252 +672,22 @@ fn stream_json_with_headers<E: SseBytesEmitter>(
     Ok(())
 }
 
-struct OpenAiSseEmitter<'a> {
-    pending: Vec<u8>,
-    done: bool,
-    on_event: &'a mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
-}
-
-impl<'a> OpenAiSseEmitter<'a> {
-    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent) -> Result<()>) -> Self {
-        Self {
-            pending: Vec::new(),
-            done: false,
-            on_event,
-        }
-    }
-
-    fn finish(mut self) -> Result<()> {
-        if !self.pending.is_empty() {
-            self.emit_pending_line()?;
-        }
-        if !self.done {
-            (self.on_event)(ProviderStreamEvent {
-                content: String::new(),
-                done: true,
-            })?;
-            self.done = true;
-        }
-        Ok(())
-    }
-
-    fn emit_pending_line(&mut self) -> Result<()> {
-        let line = String::from_utf8_lossy(&self.pending)
-            .trim_end_matches('\r')
-            .to_owned();
-        self.pending.clear();
-        self.emit_line(&line)
-    }
-
-    fn emit_line(&mut self, line: &str) -> Result<()> {
-        if self.done {
-            return Ok(());
-        }
-        let Some(event) = parse_openai_sse_line(line)? else {
-            return Ok(());
-        };
-        if event.done {
-            self.done = true;
-        }
-        (self.on_event)(event)
-    }
-}
-
-impl SseBytesEmitter for OpenAiSseEmitter<'_> {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        for byte in bytes {
-            if *byte == b'\n' {
-                self.emit_pending_line()?;
-            } else {
-                self.pending.push(*byte);
-            }
-        }
-        Ok(())
-    }
-}
-
-struct AnthropicSseEmitter<'a> {
-    pending: Vec<u8>,
-    done: bool,
-    on_event: &'a mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
-}
-
-impl<'a> AnthropicSseEmitter<'a> {
-    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent) -> Result<()>) -> Self {
-        Self {
-            pending: Vec::new(),
-            done: false,
-            on_event,
-        }
-    }
-
-    fn finish(mut self) -> Result<()> {
-        if !self.pending.is_empty() {
-            self.emit_pending_line()?;
-        }
-        if !self.done {
-            (self.on_event)(ProviderStreamEvent {
-                content: String::new(),
-                done: true,
-            })?;
-            self.done = true;
-        }
-        Ok(())
-    }
-
-    fn emit_pending_line(&mut self) -> Result<()> {
-        let line = String::from_utf8_lossy(&self.pending)
-            .trim_end_matches('\r')
-            .to_owned();
-        self.pending.clear();
-        self.emit_line(&line)
-    }
-
-    fn emit_line(&mut self, line: &str) -> Result<()> {
-        if self.done {
-            return Ok(());
-        }
-        let Some(event) = parse_anthropic_sse_line(line)? else {
-            return Ok(());
-        };
-        if event.done {
-            self.done = true;
-        }
-        (self.on_event)(event)
-    }
-}
-
-impl SseBytesEmitter for AnthropicSseEmitter<'_> {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        for byte in bytes {
-            if *byte == b'\n' {
-                self.emit_pending_line()?;
-            } else {
-                self.pending.push(*byte);
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-fn parse_openai_sse_chat_events(body: &str) -> Result<Vec<ProviderStreamEvent>> {
-    let mut events = Vec::new();
-    for line in body.lines() {
-        let Some(event) = parse_openai_sse_line(line)? else {
-            continue;
-        };
-        events.push(event);
-    }
-    if !events.iter().any(|event| event.done) {
-        events.push(ProviderStreamEvent {
-            content: String::new(),
-            done: true,
-        });
-    }
-    Ok(events)
-}
-
-fn parse_openai_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
-    let line = line.trim();
-    let Some(data) = line.strip_prefix("data:") else {
-        return Ok(None);
-    };
-    let data = data.trim();
-    if data == "[DONE]" {
-        return Ok(Some(ProviderStreamEvent {
-            content: String::new(),
-            done: true,
-        }));
-    }
-    let payload = serde_json::from_str::<serde_json::Value>(data)
-        .context("failed to parse local provider SSE data")?;
-    let content = payload
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("delta"))
-        .and_then(|delta| delta.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            payload
-                .get("choices")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("message"))
-                .and_then(|message| message.get("content"))
-                .and_then(serde_json::Value::as_str)
-        });
-    Ok(content.map(|content| ProviderStreamEvent {
-        content: content.to_owned(),
-        done: false,
-    }))
-}
-
-fn parse_anthropic_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
-    let line = line.trim();
-    let Some(data) = line.strip_prefix("data:") else {
-        return Ok(None);
-    };
-    let data = data.trim();
-    if data == "[DONE]" {
-        return Ok(Some(ProviderStreamEvent {
-            content: String::new(),
-            done: true,
-        }));
-    }
-    let payload = serde_json::from_str::<serde_json::Value>(data)
-        .context("failed to parse Anthropic provider SSE data")?;
-    match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("content_block_delta") => Ok(payload
-            .get("delta")
-            .and_then(|delta| delta.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .map(|content| ProviderStreamEvent {
-                content: content.to_owned(),
-                done: false,
-            })),
-        Some("content_block_start") => Ok(payload
-            .get("content_block")
-            .and_then(|block| block.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|content| !content.is_empty())
-            .map(|content| ProviderStreamEvent {
-                content: content.to_owned(),
-                done: false,
-            })),
-        Some("message_stop") => Ok(Some(ProviderStreamEvent {
-            content: String::new(),
-            done: true,
-        })),
-        Some("error") => {
-            let message = payload
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown Anthropic stream error");
-            bail!("Anthropic provider stream failed: {message}");
-        }
-        _ => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::{AppPaths, ManagedServiceRecord, RocmCliConfig, unix_time_millis};
+    use rocm_core::{AppPaths, ManagedServiceRecord, RocmCliConfig};
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread;
 
+    // The black-box e2e harness repeats this id as `BUILTIN_ASSISTANT_MODEL_ID` in
+    // `tests/e2e-cucumber/tests/e2e/planner_steps.rs`; the planted service must carry
+    // it or the CLI reports no ready service instead of calling the mock.
     #[test]
-    fn local_provider_endpoint_parser_supports_ipv6_loopback() {
-        assert_eq!(
-            parse_http_endpoint("http://[::1]:11435/v1"),
-            Some(("::1".to_owned(), 11435))
-        );
+    fn builtin_assistant_model_id_matches_the_e2e_harness() {
+        assert_eq!(BUILTIN_ASSISTANT_MODEL_ID, "Qwen3-4B-Instruct-2507-GGUF");
     }
 
     #[test]
@@ -1791,327 +902,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_openai_chat_content() -> Result<()> {
-        let payload = serde_json::json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "hello from local"
-                    }
-                }
-            ]
-        });
-        assert_eq!(parse_openai_chat_content(&payload)?, "hello from local");
-        Ok(())
-    }
-
-    #[test]
-    fn parses_openai_chat_tool_calls_without_text() -> Result<()> {
-        let payload = serde_json::json!({
-            "choices": [
-                {
-                    "message": {
-                        "tool_calls": [
-                            {
-                                "id": "call-1",
-                                "type": "function",
-                                "function": {
-                                    "name": "install_sdk_dry_run",
-                                    "arguments": "{\"channel\":\"release\",\"format\":\"pip\"}"
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        });
-        let (content, calls) = parse_openai_chat_message(&payload)?;
-        assert!(content.is_empty());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
-        assert_eq!(calls[0].name, "install_sdk_dry_run");
-        assert_eq!(calls[0].arguments["channel"], "release");
-        let error = parse_openai_chat_content(&payload).unwrap_err().to_string();
-        assert!(error.contains("tool calls but no text content"));
-        Ok(())
-    }
-
-    #[test]
-    fn parses_anthropic_chat_content() -> Result<()> {
-        let payload = serde_json::json!({
-            "content": [
-                {"type": "text", "text": "hello "},
-                {"type": "text", "text": "from anthropic"}
-            ]
-        });
-        assert_eq!(
-            parse_anthropic_chat_content(&payload)?,
-            "hello from anthropic"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn parses_anthropic_tool_use_without_text() -> Result<()> {
-        let payload = serde_json::json!({
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_1",
-                    "name": "install_sdk_dry_run",
-                    "input": {
-                        "channel": "release",
-                        "format": "wheel"
-                    }
-                }
-            ]
-        });
-
-        let (content, calls) = parse_anthropic_chat_message(&payload)?;
-
-        assert!(content.is_empty());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id.as_deref(), Some("toolu_1"));
-        assert_eq!(calls[0].name, "install_sdk_dry_run");
-        assert_eq!(calls[0].arguments["channel"], "release");
-        let error = parse_anthropic_chat_content(&payload)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("tool calls but no text content"));
-        Ok(())
-    }
-
-    #[test]
     fn remote_model_prefers_request_model() -> Result<()> {
         assert_eq!(
             resolve_remote_model("openai", "ROCM_CLI_TEST_MODEL", Some("gpt-test"))?,
             "gpt-test"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn openai_and_anthropic_request_bodies_include_model_and_messages() {
-        let request = ChatRequest {
-            model: Some("model-a".to_owned()),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "hello".to_owned(),
-            }],
-            max_tokens: Some(42),
-            rocm_tools: false,
-            ..Default::default()
-        };
-        let openai = openai_chat_request_body("model-a", &request);
-        assert_eq!(openai["model"], "model-a");
-        assert_eq!(openai["messages"][0]["content"], "hello");
-        assert_eq!(openai["stream"], false);
-        assert!(openai.get("tools").is_none());
-        let anthropic = anthropic_chat_request_body("claude-test", &request);
-        assert_eq!(anthropic["model"], "claude-test");
-        assert_eq!(anthropic["messages"][0]["role"], "user");
-        assert_eq!(anthropic["max_tokens"], 42);
-    }
-
-    #[test]
-    fn request_bodies_include_temperature_and_top_p_only_when_set() {
-        let base = ChatRequest {
-            model: Some("model-a".to_owned()),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "hello".to_owned(),
-            }],
-            max_tokens: Some(42),
-            rocm_tools: false,
-            ..Default::default()
-        };
-
-        // Omitted by default so provider/server defaults are preserved.
-        let openai_default = openai_chat_request_body("model-a", &base);
-        assert!(openai_default.get("temperature").is_none());
-        assert!(openai_default.get("top_p").is_none());
-        let anthropic_default = anthropic_chat_request_body("claude-test", &base);
-        assert!(anthropic_default.get("temperature").is_none());
-        assert!(anthropic_default.get("top_p").is_none());
-
-        let tuned = ChatRequest {
-            temperature: Some(0.25),
-            top_p: Some(0.5),
-            ..base
-        };
-        let openai = openai_chat_request_body("model-a", &tuned);
-        assert_eq!(openai["temperature"], 0.25);
-        assert_eq!(openai["top_p"], 0.5);
-        let anthropic = anthropic_chat_request_body("claude-test", &tuned);
-        assert_eq!(anthropic["temperature"], 0.25);
-        assert_eq!(anthropic["top_p"], 0.5);
-    }
-
-    #[test]
-    fn openai_local_qwen3_request_disables_thinking_for_visible_answers() {
-        let request = ChatRequest {
-            model: Some("Qwen3-0.6B-GGUF".to_owned()),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "hello".to_owned(),
-            }],
-            max_tokens: Some(16),
-            rocm_tools: false,
-            ..Default::default()
-        };
-
-        let body = openai_local_chat_request_body("Qwen3-0.6B-GGUF", &request);
-
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-    }
-
-    #[test]
-    fn openai_request_body_includes_rocm_tools_only_for_non_streaming_tool_mode() {
-        let request = ChatRequest {
-            model: Some("model-a".to_owned()),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "check this host".to_owned(),
-            }],
-            max_tokens: Some(42),
-            rocm_tools: true,
-            ..Default::default()
-        };
-        let non_streaming = openai_chat_request_body("model-a", &request);
-        assert_eq!(non_streaming["tool_choice"], "auto");
-        let tools = non_streaming["tools"]
-            .as_array()
-            .expect("tools should be set");
-        let tool_names = tools
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .collect::<Vec<_>>();
-        for name in [
-            "bridge_snapshot",
-            "service_logs",
-            "natural_language_plan",
-            "path_exists",
-            "port_status",
-            "rocm_command",
-            "update_check",
-            "install_sdk_dry_run",
-        ] {
-            assert!(
-                tool_names.contains(&name),
-                "missing ROCm chat tool `{name}`"
-            );
-        }
-        for name in [
-            "install_sdk",
-            "install_engine",
-            "launch_server",
-            "stop_server",
-            "watcher_enable",
-            "watcher_disable",
-        ] {
-            assert!(
-                !tool_names.contains(&name),
-                "mutating ROCm chat tool `{name}` should be requested through rocm_command"
-            );
-        }
-
-        let streaming = openai_stream_chat_request_body("model-a", &request);
-        assert!(streaming.get("tools").is_none());
-        assert!(streaming.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn anthropic_request_body_includes_rocm_tools_and_system_only_for_non_streaming_tool_mode() {
-        let request = ChatRequest {
-            model: Some("model-a".to_owned()),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_owned(),
-                    content: "Use ROCm tools only when useful.".to_owned(),
-                },
-                ChatMessage {
-                    role: "user".to_owned(),
-                    content: "check this host".to_owned(),
-                },
-            ],
-            max_tokens: Some(42),
-            rocm_tools: true,
-            ..Default::default()
-        };
-
-        let non_streaming = anthropic_chat_request_body("claude-test", &request);
-
-        assert_eq!(non_streaming["system"], "Use ROCm tools only when useful.");
-        assert_eq!(non_streaming["messages"][0]["role"], "user");
-        assert_eq!(non_streaming["messages"][0]["content"], "check this host");
-        assert_eq!(non_streaming["messages"].as_array().unwrap().len(), 1);
-        let tools = non_streaming["tools"]
-            .as_array()
-            .expect("tools should be set");
-        let tool_names = tools
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>();
-        for name in [
-            "bridge_snapshot",
-            "service_logs",
-            "natural_language_plan",
-            "path_exists",
-            "port_status",
-            "rocm_command",
-            "update_check",
-            "install_sdk_dry_run",
-        ] {
-            assert!(
-                tool_names.contains(&name),
-                "missing ROCm chat tool `{name}`"
-            );
-        }
-        for name in [
-            "install_sdk",
-            "install_engine",
-            "launch_server",
-            "stop_server",
-            "watcher_enable",
-            "watcher_disable",
-        ] {
-            assert!(
-                !tool_names.contains(&name),
-                "mutating ROCm chat tool `{name}` should be requested through rocm_command"
-            );
-        }
-        assert!(tools.iter().any(|tool| {
-            tool.get("name").and_then(serde_json::Value::as_str) == Some("install_sdk_dry_run")
-                && tool
-                    .get("input_schema")
-                    .and_then(|schema| schema.get("type"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("object")
-                && tool
-                    .get("input_schema")
-                    .and_then(|schema| schema.get("properties"))
-                    .and_then(|properties| properties.get("build_date"))
-                    .is_some()
-        }));
-
-        let streaming = anthropic_stream_chat_request_body("claude-test", &request);
-        assert!(streaming.get("tools").is_none());
-        assert_eq!(streaming["system"], "Use ROCm tools only when useful.");
-    }
-
-    #[test]
-    fn parses_openai_sse_chat_events() -> Result<()> {
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
-        let events = parse_openai_sse_chat_events(body)?;
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].content, "hel");
-        assert!(!events[0].done);
-        assert_eq!(events[1].content, "lo");
-        assert!(events[2].done);
         Ok(())
     }
 
@@ -2194,6 +989,264 @@ mod tests {
         assert_eq!(audit.category, "provider");
         assert_eq!(audit.actor, "provider:local");
         assert_eq!(audit.action, "chat");
+        Ok(())
+    }
+
+    /// Serves one chat response per entry in `bodies`, in order, answering
+    /// `GET /v1/models` the same way [`spawn_local_provider_test_server`] does
+    /// so the local-provider readiness probe (which lists models before ever
+    /// posting a chat request) is satisfied without consuming a response.
+    /// Exits once every response has been served, so the returned count
+    /// proves exactly how many `/v1/chat/completions` requests landed --
+    /// which is what the ROCMAI-725 regression tests below check.
+    fn spawn_sequenced_local_provider_test_server(
+        listener: TcpListener,
+        model_id: impl Into<String>,
+        bodies: Vec<String>,
+    ) -> thread::JoinHandle<Result<usize>> {
+        let model_id = model_id.into();
+        thread::spawn(move || -> Result<usize> {
+            let mut served = 0;
+            while served < bodies.len() {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let request = read_http_request(&mut stream)?;
+                if request.starts_with("GET /v1/models ") {
+                    write_models_response(&mut stream, &model_id)?;
+                    continue;
+                }
+                let body = &bodies[served];
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                served += 1;
+            }
+            Ok(served)
+        })
+    }
+
+    fn planner_chat_completion_body(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string()
+    }
+
+    fn ready_builtin_planner_service(paths: &AppPaths, port: u16) -> Result<()> {
+        let mut qwen = ManagedServiceRecord::new(
+            paths,
+            "svc-qwen-planner",
+            "lemonade",
+            BUILTIN_ASSISTANT_MODEL_ALIAS,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        qwen.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch instead
+        // of probing this stub for a completion.
+        qwen.inference_verified_at_unix_ms = Some(1);
+        qwen.write()
+    }
+
+    // ROCMAI-725: `build_freeform_plan_with_context` can call out to a
+    // configured cloud `planner_provider` when a request is ambiguous, and
+    // that call is not guaranteed deterministic. Both freeform call sites used
+    // to build the plan twice per invocation -- once to render it, once to
+    // derive the next action -- so the plan shown to the operator and the
+    // plan actually reported as "next"/dispatched could silently describe two
+    // different commands. These two tests prove the fix: a single build is
+    // reused for both, at both call sites.
+
+    #[test]
+    fn freeform_plan_dedup_prevents_provider_assisted_divergence() -> Result<()> {
+        // Regression for the `chat/mcp_bridge.rs` `natural_language_plan` call site,
+        // which used to call `render_freeform_plan` and the now-removed
+        // `freeform_plan_next_action_with_context` independently -- each
+        // calling `build_freeform_plan_with_context` on its own.
+        let (root, paths) = temp_app_paths("freeform-plan-dedup");
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // Three responses: two for the "old pattern" demonstration below
+        // (which deliberately calls the planner twice, the way the pre-fix
+        // code did), one for the single-build helper the fix uses. A real
+        // cloud LLM is exactly this unreliable across calls -- nothing here
+        // is contrived beyond "the provider's two answers differ".
+        let bodies = vec![
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+            ),
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["engines","list"]}}"#,
+            ),
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+            ),
+        ];
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
+        ready_builtin_planner_service(&paths, port)?;
+
+        let config = RocmCliConfig {
+            planner_provider: Some("local".to_owned()),
+            ..Default::default()
+        };
+
+        // "serve" alone has no model, so confidence stays `medium` and the
+        // request is routed through the configured planner provider -- the
+        // same ambiguity trigger `freeform_execution_validation_rejects_placeholder_tool_calls`
+        // (freeform_execution.rs) uses for the deterministic case.
+        //
+        // The pre-fix shape: two independent builds.
+        let shown_plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let executed_plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let shown_text =
+            crate::freeform_planner::render_structured_request_plan(&shown_plan, &paths);
+        let executed_action = crate::freeform_planner::plan_next_action(executed_plan)
+            .expect("provider-resolved plan should produce a next action");
+        let executed_tool_call =
+            crate::freeform_planner::format_structured_tool_call("rocm", &executed_action.args);
+        assert!(
+            !shown_text.contains(&executed_tool_call),
+            "two independent builds against a non-deterministic provider should \
+             diverge -- if they don't, this test's mock isn't exercising the bug \
+             it's meant to catch: shown={shown_text:?} executed={executed_tool_call:?}"
+        );
+
+        // The fix: one build, reused for both the rendered text and the next
+        // action. This is exactly what `plan_freeform_request_with_context`
+        // (what `natural_language_plan` calls today) does.
+        let (text, action) =
+            crate::freeform_planner::plan_freeform_request_with_context("serve", &paths, &config);
+        let action = action.expect("provider-resolved plan should produce a next action");
+        assert!(
+            action.provider_assisted,
+            "request should have been resolved via the configured provider"
+        );
+        let tool_call = crate::freeform_planner::format_structured_tool_call("rocm", &action.args);
+        assert!(
+            text.contains(&tool_call),
+            "the rendered plan and the next action must describe the same \
+             command: text={text:?} tool_call={tool_call:?}"
+        );
+
+        let served = server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            served, 3,
+            "exactly three provider chat calls expected: two for the old-pattern \
+             demonstration above, one for the single-build helper"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn freeform_execution_reuses_the_rendered_plan_without_rebuilding() -> Result<()> {
+        // Regression for the `main.rs` `run_freeform` call site, which used
+        // to call `execute_freeform_next_action(request, paths, config)` --
+        // rebuilding the plan from scratch via the now-removed
+        // `freeform_plan_next_action_with_context` instead of reusing the
+        // plan `run_freeform` already built and rendered.
+        let (root, paths) = temp_app_paths("freeform-execution-no-rebuild");
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // Only one response: the server's accept loop exits and drops the
+        // listener as soon as it has served that one request, so if
+        // `prepare_freeform_execution` rebuilt the plan, that second
+        // `build_freeform_plan_with_context` call would hit a closed port and
+        // fail fast with a connection error -- surfacing as a different
+        // error than the "reviewed interactively" one asserted below, not as
+        // a hang.
+        let bodies = vec![planner_chat_completion_body(
+            r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+        )];
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
+        ready_builtin_planner_service(&paths, port)?;
+
+        let config = RocmCliConfig {
+            planner_provider: Some("local".to_owned()),
+            ..Default::default()
+        };
+
+        let plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let provider_assisted = crate::freeform_planner::plan_next_action(plan.clone())
+            .expect("provider-resolved plan should produce a next action")
+            .provider_assisted;
+        assert!(
+            provider_assisted,
+            "request should have been resolved via the configured provider"
+        );
+
+        // Provider-assisted plans still can't auto-execute (reviewed
+        // interactively only) -- that validation is unrelated to this fix and
+        // must still fire. What this proves is that reaching it took no
+        // second provider call.
+        let error = crate::prepare_freeform_execution(plan)
+            .expect_err("provider-assisted plans must still be refused for unattended execution")
+            .to_string();
+        assert!(error.contains("reviewed interactively"));
+
+        let served = server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            served, 1,
+            "prepare_freeform_execution must not rebuild the plan -- only the \
+             initial build above may call the provider"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_selects_a_service_by_its_served_model_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-served-id");
+        paths.ensure()?;
+        let server = spawn_models_only_server("Org/Served")?;
+        let mut aim = ManagedServiceRecord::new(
+            &paths,
+            "svc-aim",
+            "aim",
+            "aim-qwen3.5-9b",
+            "docker.io/org/aim-image:1",
+            "127.0.0.1",
+            server.port(),
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        aim.status = "ready".to_owned();
+        aim.served_model_id = Some("Org/Served".to_owned());
+        aim.write()?;
+        let selected = select_local_chat_service(&paths, Some("org/served"))?;
+        let status = provider_status(&paths, "local")?;
+        fs::remove_dir_all(root).ok();
+        assert_eq!(selected.service_id, "svc-aim");
+        // Chat sends `served_model_name()`, so `status` must list that name too.
+        assert_eq!(status.models, vec!["Org/Served".to_owned()]);
+        assert_eq!(selected.served_model_name(), "Org/Served");
         Ok(())
     }
 
@@ -2691,6 +1744,192 @@ mod tests {
         Ok(())
     }
 
+    /// A ready local service whose engine sends one complete chunk of a chunked
+    /// streaming chat response and then closes the connection without the
+    /// terminating zero chunk — what a crashed, OOM-killed or stopped engine
+    /// leaves behind.
+    fn ready_service_that_dies_mid_chunked_stream(
+        name: &str,
+    ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
+        let (root, paths) = temp_app_paths(name);
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )?;
+                let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
+                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
+                stream.flush()?;
+                // Returning drops the stream: the client sees EOF on a chunk boundary.
+                Ok(())
+            },
+        );
+        let mut ready = ManagedServiceRecord::new(
+            &paths,
+            "svc-ready",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        ready.status = "ready".to_owned();
+        ready.inference_verified_at_unix_ms = Some(1);
+        ready.write()?;
+        Ok((root, paths, server))
+    }
+
+    /// How long a client may take to notice the closed connection. A spinning
+    /// reader never returns, so the bound keeps a regression from hanging the
+    /// test run; a fixed reader returns as soon as it reads EOF.
+    const TRUNCATED_STREAM_BOUND: Duration = Duration::from_secs(10);
+
+    /// The test server's result, waiting at most `TRUNCATED_STREAM_BOUND` for
+    /// it. The server blocks in `accept` with no timeout, so a plain `join`
+    /// hangs whenever the client returned without connecting (say, it no
+    /// longer resolved the ready service); this turns that into a failure
+    /// that names it. The bound only bites in that case: the server returns
+    /// as soon as it has written its response, before the client reads EOF.
+    fn served_request_within_bound(server: thread::JoinHandle<Result<String>>) -> Result<String> {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(server.join());
+        });
+        match receiver.recv_timeout(TRUNCATED_STREAM_BOUND) {
+            Ok(Ok(served)) => served,
+            Ok(Err(_)) => bail!("the test server thread panicked"),
+            Err(_) => bail!("the client returned without ever sending the chat request"),
+        }
+    }
+
+    /// The client thread's result, waiting at most `TRUNCATED_STREAM_BOUND`
+    /// for it, and then the server's through [`served_request_within_bound`],
+    /// but only when the client returned. A client that never returned
+    /// already fails the test, so this does not spend a second bound waiting
+    /// on a server it may never have reached.
+    fn client_then_server<T>(
+        client: &mpsc::Receiver<T>,
+        server: thread::JoinHandle<Result<String>>,
+    ) -> (Result<T, mpsc::RecvTimeoutError>, Option<Result<String>>) {
+        let outcome = client.recv_timeout(TRUNCATED_STREAM_BOUND);
+        let served = outcome.is_ok().then(|| served_request_within_bound(server));
+        (outcome, served)
+    }
+
+    #[test]
+    fn local_provider_stream_chat_fails_when_engine_dies_mid_chunked_stream() -> Result<()> {
+        let (root, paths, server) =
+            ready_service_that_dies_mid_chunked_stream("local-provider-chunked-truncated")?;
+        let client_paths = paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut received = Vec::new();
+            let result = provider_stream_chat_with_callback(
+                &client_paths,
+                "local",
+                &ChatRequest {
+                    model: Some("Qwen/Qwen3.5".to_owned()),
+                    messages: vec![ChatMessage {
+                        role: "user".to_owned(),
+                        content: "hello".to_owned(),
+                    }],
+                    max_tokens: Some(16),
+                    rocm_tools: false,
+                    ..Default::default()
+                },
+                &mut |event| {
+                    received.push(event);
+                    Ok(())
+                },
+            );
+            let _ = sender.send((result.map_err(|error| format!("{error:#}")), received));
+        });
+        let (outcome, served) = client_then_server(&receiver, server);
+        let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        fs::remove_dir_all(root).ok();
+
+        // A regressed (spinning) client thread cannot be stopped from here; it
+        // keeps spinning until the test binary exits. Under nextest, which CI
+        // uses on Linux, that is this test's own process.
+        let (result, received) = outcome.map_err(|_| {
+            anyhow::anyhow!("chat stream never returned after the engine closed the connection")
+        })?;
+        served.transpose()?;
+        let error = result.expect_err("a stream cut off before its final chunk is not a success");
+        assert!(
+            error.contains(LOCAL_STREAM_TRUNCATED),
+            "unexpected error: {error}"
+        );
+        // The text that did arrive was delivered, but the stream was never
+        // reported finished and no "completed" audit record was written.
+        assert_eq!(
+            received,
+            vec![ProviderStreamEvent {
+                content: "chunk".to_owned(),
+                done: false
+            }]
+        );
+        assert!(
+            !audit_text.contains("stream chat completed"),
+            "a truncated stream was audited as completed: {audit_text}"
+        );
+        Ok(())
+    }
+
+    /// `rocm serve`'s post-launch smoke test is the CLI's streaming consumer. An
+    /// engine that dies mid-answer must leave the deployment summary showing no
+    /// measurements (`n/a`) instead of hanging the command or reporting
+    /// throughput for an answer that never finished.
+    #[test]
+    fn serve_smoke_test_reports_no_metrics_when_engine_dies_mid_chunked_stream() -> Result<()> {
+        let (root, paths, server) =
+            ready_service_that_dies_mid_chunked_stream("serve-smoke-chunked-truncated")?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
+        });
+        let (outcome, served) = client_then_server(&receiver, server);
+        fs::remove_dir_all(root).ok();
+
+        let metrics = outcome.map_err(|_| {
+            anyhow::anyhow!(
+                "the serve smoke test never returned after the engine closed the connection"
+            )
+        })?;
+        // Empty metrics are also what a smoke test that never reached the
+        // engine returns, so this is what makes the assertion below mean
+        // "the engine died mid-answer" rather than "nothing happened".
+        served.transpose()?;
+        assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
+        let rendered =
+            crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
+                engine: "vllm".to_owned(),
+                requested_model: "Qwen/Qwen3.5".to_owned(),
+                api_model: "Qwen/Qwen3.5".to_owned(),
+                chat_endpoint: "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+                service_id: "svc-ready".to_owned(),
+                status: "ready".to_owned(),
+                already_running: false,
+                metrics,
+                api_key: None,
+                notes: Vec::new(),
+            });
+        assert!(rendered.contains("time to first token  n/a"));
+        assert!(rendered.contains("throughput (approx)  n/a"));
+        Ok(())
+    }
+
     #[test]
     fn remote_openai_stream_chat_uses_live_sse() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -3048,9 +2287,8 @@ mod tests {
             .join("tests")
             .join("providers")
             .join(format!(
-                "rocm-provider-{name}-{}-{}",
-                std::process::id(),
-                unix_time_millis()
+                "rocm-provider-{name}-{}",
+                crate::test_support::unique_suffix()
             ));
         let _ = fs::remove_dir_all(&root);
         (
@@ -3061,5 +2299,10 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_app_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
     }
 }

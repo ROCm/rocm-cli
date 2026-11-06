@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 39b997fcaeac18cdae80bee881dacd33b1a1a786ee74dd09fe44bf40011bb7c1 # shrinks to fixture = 2, every = 2, max_read = 1, offsets = []
+cc d859ef4db6533a8b3505bdb4cf788bccef0ae1e689eaf189ad6ae22d26818c85 # shrinks to fixture = 0, offsets = [], boundary = 0
+cc 1b31335473570f3579d435e5bde7dfe1482c113948acdbf7b61999442a30f246 # shrinks to fixture = 2, offsets = [2606349211332992011, 1068099130605070988, 6049234637061719837, 7017023254138901336, 13045499102410176055, 154891071163126548, 5023175951174558951, 9615367095010173474, 10924679145776118147, 1992692890554772231, 15375560740747933165, 7944671433685089176, 14195562048111576077, 4877734506449690933, 4252891559911910187, 11645822816087742608], cut = 11296820896772993154

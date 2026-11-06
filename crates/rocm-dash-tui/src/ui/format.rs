@@ -44,37 +44,50 @@ pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
     }
 }
 
+/// The unit a mebibyte count is shown in once it reaches 1024 MiB, as the
+/// divisor that converts MiB into it and its label. `None` below 1024 MiB,
+/// which is printed as a whole number of MiB.
+///
+/// Promotes while the value AS PRINTED would reach 1024, not merely while the
+/// raw value does: 1_048_575 MiB is 1023.999… GiB, which `{:.1}` renders as
+/// "1024.0 GiB". Comparing the rounded tenths, as `rocm_core::format_bytes`
+/// does, keeps every size in the unit it belongs to.
+fn promoted_mib_unit(value: u64) -> Option<(f64, &'static str)> {
+    const UNITS: [&str; 2] = ["GiB", "TiB"];
+    if value < 1024 {
+        return None;
+    }
+    let mut divisor = 1024.0;
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && (value as f64 / divisor * 10.0).round() >= 10_240.0 {
+        divisor *= 1024.0;
+        unit += 1;
+    }
+    Some((divisor, UNITS[unit]))
+}
+
 /// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
-/// Promotes to GiB at 1024, TiB at 1024², with one decimal.
+///
+/// Promotes to GiB at 1024, TiB at 1024², with one decimal — and as soon as the
+/// printed value would read 1024.0, so it never shows "1024.0 GiB".
 pub fn mib(value: u64) -> String {
-    if value >= 1024 * 1024 {
-        format!("{:.1} TiB", value as f64 / (1024.0 * 1024.0))
-    } else if value >= 1024 {
-        format!("{:.1} GiB", value as f64 / 1024.0)
-    } else {
-        format!("{value} MiB")
+    match promoted_mib_unit(value) {
+        Some((divisor, unit)) => format!("{:.1} {unit}", value as f64 / divisor),
+        None => format!("{value} MiB"),
     }
 }
 
 /// Pair of (used_mib, total_mib) → "used / total" with promotion. Both promoted
-/// to the same unit (driven by total) so they compare visually.
+/// to the same unit (driven by total, exactly as [`mib`] would pick it) so they
+/// compare visually.
 pub fn mib_pair(used: u64, total: u64) -> String {
-    if total >= 1024 * 1024 {
-        let scale = 1024.0 * 1024.0;
-        format!(
-            "{:.1} / {:.1} TiB",
-            used as f64 / scale,
-            total as f64 / scale
-        )
-    } else if total >= 1024 {
-        let scale = 1024.0;
-        format!(
-            "{:.1} / {:.1} GiB",
-            used as f64 / scale,
-            total as f64 / scale
-        )
-    } else {
-        format!("{used} / {total} MiB")
+    match promoted_mib_unit(total) {
+        Some((divisor, unit)) => format!(
+            "{:.1} / {:.1} {unit}",
+            used as f64 / divisor,
+            total as f64 / divisor
+        ),
+        None => format!("{used} / {total} MiB"),
     }
 }
 
@@ -84,14 +97,6 @@ pub fn pct(value: f32) -> String {
         format!("{value:.2}%")
     } else {
         format!("{value:.1}%")
-    }
-}
-
-/// `Option<f32>` percentage → `-` when None.
-pub fn pct_opt(value: Option<f32>) -> String {
-    match value {
-        Some(v) => pct(v),
-        None => "-".to_string(),
     }
 }
 
@@ -134,6 +139,13 @@ pub fn tps_opt(value: Option<f64>) -> String {
         Some(v) => format!("{v:.1} tok/s"),
         None => "-".to_string(),
     }
+}
+
+/// Latency in milliseconds (TTFT/TPOT). `123ms`. `—` when None or non-finite.
+pub fn ms_opt(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map_or_else(|| "—".to_string(), |v| format!("{v:.0}ms"))
 }
 
 /// Energy efficiency: generation throughput per watt. `0.42 tok/W`. `-` when
@@ -185,15 +197,6 @@ pub fn duration(seconds: f64) -> String {
         format!("{m}m {s}s")
     } else {
         format!("{s}s")
-    }
-}
-
-/// Request counter rendered with SI suffix for big numbers and `-` for None.
-pub fn reqs_opt(value: Option<u32>) -> String {
-    match value {
-        Some(v) if v >= 1_000 => si(f64::from(v)),
-        Some(v) => v.to_string(),
-        None => "-".to_string(),
     }
 }
 
@@ -249,7 +252,26 @@ pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> Stri
     }
 }
 
-/// Full-unit gen_tps for cards, pane rows, and services views.
+/// Latency (TTFT/TPOT) for narrow table cells.
+///
+/// - `None` / non-finite → `"—"`
+/// - `Some(v)`, Held → `"{v:.0}ms*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.0}ms"`
+pub fn latency_cell(ms: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match ms.filter(|v| v.is_finite()) {
+        None => "—".to_string(),
+        Some(v) => {
+            let base = format!("{v:.0}ms");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Full-unit gen_tps for pane rows and services views.
 /// Mirrors [`tps_opt`] format and appends [`HELD_MARKER`] when metadata is Held.
 ///
 /// - `None` → `"-"`
@@ -324,6 +346,47 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
     }
 }
 
+/// Instances that belong in a "running" listing: serving or still starting.
+///
+/// Serving ones come first, with a stable order within each group (model name,
+/// then container id) so rows do not reshuffle with `HashMap` iteration order.
+#[must_use]
+pub fn running_instances(state: &crate::app::AppState) -> Vec<&rocm_dash_core::metrics::Instance> {
+    let mut running: Vec<_> = state
+        .instances
+        .values()
+        .filter(|i| i.status.counts_as_running())
+        .collect();
+    running.sort_by(|a, b| {
+        (!a.status.is_serving(), &a.model_name, &a.container_id).cmp(&(
+            !b.status.is_serving(),
+            &b.model_name,
+            &b.container_id,
+        ))
+    });
+    running
+}
+
+/// Lowercase stage text for a starting instance (`loading`, `starting`, ...).
+#[must_use]
+pub fn stage_text(status: rocm_dash_core::metrics::InstanceStatus) -> String {
+    status.label().to_lowercase()
+}
+
+/// The "…and N more" summary line for a list capped to its first `cap`
+/// items, or `None` when `len` doesn't exceed `cap`.
+///
+/// Shared by every capped list (`tabs::pane::live_lines`'s
+/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm::quit_confirm_body_with`) so
+/// the overflow wording and arithmetic stay identical across them. Each call
+/// site still passes its own `cap` literal alongside its own separate
+/// `.take(N)` — this does not keep the two in sync if one changes without
+/// the other; it only keeps what "N more" means, and how it's phrased, from
+/// drifting between call sites.
+pub fn overflow_line(len: usize, cap: usize) -> Option<String> {
+    (len > cap).then(|| format!("  …and {} more", len - cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,18 +415,139 @@ mod tests {
         assert_eq!(mib_pair(1024, 1024 * 1024), "0.0 / 1.0 TiB");
     }
 
+    /// Just below 1 TiB the value rounds up to a full 1024 GiB, which has to be
+    /// reported as 1.0 TiB — the same defect `rocm_core::format_bytes` had.
+    /// 1_048_524 MiB is the last input that still belongs to GiB; 1_048_525 is
+    /// the first that `{:.1}` rounds up to 1024.0 of it and used to print
+    /// "1024.0 GiB".
+    #[test]
+    fn mib_promotes_a_value_that_rounds_up_to_a_full_unit() {
+        assert_eq!(mib(1023), "1023 MiB");
+        assert_eq!(mib(1_048_524), "1023.9 GiB");
+        assert_eq!(mib(1_048_525), "1.0 TiB");
+        assert_eq!(mib(1_048_575), "1.0 TiB");
+    }
+
+    /// `mib_pair` picks the unit from the total, so the total is the value that
+    /// must not print as "1024.0 GiB".
+    #[test]
+    fn mib_pair_promotes_a_total_that_rounds_up_to_a_full_unit() {
+        assert_eq!(mib_pair(512, 1_048_524), "0.5 / 1023.9 GiB");
+        assert_eq!(mib_pair(0, 1_048_525), "0.0 / 1.0 TiB");
+        assert_eq!(mib_pair(1_048_575, 1_048_575), "1.0 / 1.0 TiB");
+    }
+
+    // ── Properties ─────────────────────────────────────────────────
+
+    /// The units `mib` and `mib_pair` print, smallest first.
+    const MIB_UNITS: [&str; 3] = ["MiB", "GiB", "TiB"];
+
+    /// Check that `value`, printed as `printed` in `unit`, is in the unit it
+    /// belongs to. Two edges, both on the mantissa as printed, in tenths:
+    ///
+    /// Upper: below the top unit, the mantissa is under 1024.0 — otherwise the
+    /// size is shown in a unit it has outgrown.
+    ///
+    /// Lower: above `MiB`, the mantissa is at least 1.0, and the next smaller
+    /// unit would have printed 1024.0 or more — otherwise the size was
+    /// promoted before it reached a whole unit.
+    fn own_unit_violation(value_mib: u64, printed: f64, unit: &str) -> Option<String> {
+        let tenths = (printed * 10.0).round();
+        let exponent = MIB_UNITS
+            .iter()
+            .position(|name| *name == unit)
+            .expect("rendered unit is one of the known units");
+        if exponent + 1 < MIB_UNITS.len() && tenths >= 10_240.0 {
+            return Some(format!(
+                "{value_mib} MiB printed as {printed:.1} {unit}, which should have \
+                 been promoted to the next unit"
+            ));
+        }
+        if exponent > 0 {
+            if tenths < 10.0 {
+                return Some(format!(
+                    "{value_mib} MiB printed as {printed:.1} {unit}, which was \
+                     promoted before it reached a whole unit"
+                ));
+            }
+            // Dividing by a power of two is exact, so this is the value the
+            // smaller unit would have printed, not an approximation of it.
+            let smaller = (1..exponent).fold(value_mib as f64, |value, _| value / 1024.0);
+            if (smaller * 10.0).round() < 10_240.0 {
+                return Some(format!(
+                    "{value_mib} MiB printed as {printed:.1} {unit}, but still fits \
+                     the smaller unit as {smaller:.1} {}",
+                    MIB_UNITS[exponent - 1]
+                ));
+            }
+        }
+        None
+    }
+
+    /// MiB counts that actually visit the unit boundaries. A uniform `u64`
+    /// almost always lands far above the top unit, so on its own it never
+    /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
+    /// draw uniformly within one unit's range, and from a window just below the
+    /// GiB→TiB boundary that scales with it, as the band does — see
+    /// `rocm_core::disk_space`'s generator for the full reasoning. The
+    /// MiB→GiB boundary has no band: MiB prints a whole number.
+    fn mib_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        const TIB_BOUNDARY: u64 = 1024 * 1024;
+        prop_oneof![
+            any::<u64>(),
+            (0u32..=2).prop_flat_map(|exponent| {
+                let low = if exponent == 0 {
+                    0
+                } else {
+                    1024u64.pow(exponent)
+                };
+                low..1024u64.pow(exponent + 1)
+            }),
+            (TIB_BOUNDARY - TIB_BOUNDARY / 16384)..=(TIB_BOUNDARY + 1),
+        ]
+    }
+
+    /// Split `"<number> <unit>"` into its parts.
+    fn split_rendered(rendered: &str) -> (f64, &str) {
+        let (value, unit) = rendered
+            .split_once(' ')
+            .expect("rendered size is `<number> <unit>`");
+        (value.parse().expect("numeric part parses"), unit)
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn mib_renders_a_size_in_its_own_unit(value in mib_count_strategy()) {
+            let rendered = mib(value);
+            let (printed, unit) = split_rendered(&rendered);
+            let violation = own_unit_violation(value, printed, unit);
+            proptest::prop_assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+        }
+
+        /// The pair takes its unit from the total, so the total obeys the same
+        /// contract as `mib` does on its own; the used half just shares it.
+        #[test]
+        fn mib_pair_renders_the_total_in_its_own_unit(
+            total in mib_count_strategy(),
+            used in mib_count_strategy(),
+        ) {
+            let rendered = mib_pair(used, total);
+            let (_used, total_part) = rendered
+                .split_once(" / ")
+                .expect("rendered pair is `<used> / <total> <unit>`");
+            let (printed, unit) = split_rendered(total_part);
+            let violation = own_unit_violation(total, printed, unit);
+            proptest::prop_assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+        }
+    }
+
     #[test]
     fn pct_uses_two_decimals_for_tiny_values() {
         assert_eq!(pct(0.0), "0.0%");
         assert_eq!(pct(0.05), "0.05%");
         assert_eq!(pct(42.3), "42.3%");
         assert_eq!(pct(100.0), "100.0%");
-    }
-
-    #[test]
-    fn pct_opt_handles_none() {
-        assert_eq!(pct_opt(None), "-");
-        assert_eq!(pct_opt(Some(75.0)), "75.0%");
     }
 
     #[test]
@@ -433,13 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn reqs_opt_collapses_big_counts() {
-        assert_eq!(reqs_opt(None), "-");
-        assert_eq!(reqs_opt(Some(5)), "5");
-        assert_eq!(reqs_opt(Some(12_000)), "12.00 k");
-    }
-
-    #[test]
     fn watts_and_celsius_and_mhz() {
         assert_eq!(watts(123.4), "123.4 W");
         assert_eq!(celsius(67.0), "67.0°C");
@@ -456,6 +633,16 @@ mod tests {
             observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             freshness: ObservationFreshness::Fresh,
         }
+    }
+
+    #[test]
+    fn latency_cell_marks_held_and_never_prints_non_finite() {
+        assert_eq!(latency_cell(None, None), "—");
+        assert_eq!(latency_cell(Some(f64::NAN), Some(&held_obs())), "—");
+        assert_eq!(latency_cell(Some(150.4), Some(&held_obs())), "150ms*");
+        assert_eq!(latency_cell(Some(150.4), Some(&fresh_obs())), "150ms");
+        // Unknown freshness (legacy snapshot) is never shown as held.
+        assert_eq!(latency_cell(Some(150.4), None), "150ms");
     }
 
     fn held_obs() -> ObservationMetadata {
@@ -651,5 +838,16 @@ mod tests {
     fn gen_tps_detail_freshness_legacy_says_unknown() {
         let out = gen_tps_detail_freshness(None, None);
         assert_eq!(out, "unknown");
+    }
+
+    #[test]
+    fn overflow_line_none_when_not_exceeding_cap() {
+        assert_eq!(overflow_line(0, 5), None);
+        assert_eq!(overflow_line(5, 5), None);
+    }
+
+    #[test]
+    fn overflow_line_reports_the_remainder() {
+        assert_eq!(overflow_line(7, 5), Some("  …and 2 more".to_string()));
     }
 }

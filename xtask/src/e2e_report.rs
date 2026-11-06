@@ -44,11 +44,15 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
         event: std::env::var("GITHUB_EVENT_NAME").ok(),
     };
 
-    e2e_report::generate_consolidated(&inputs, html_out, &meta)
+    // Builds the shared `PlatformReports` bundle once for both outputs below;
+    // they render from it without re-reading the artifacts.
+    let bundle = e2e_report::load_platform_reports(&inputs);
+
+    e2e_report::generate_consolidated(&bundle, html_out, &meta)
         .with_context(|| format!("writing consolidated report to {}", html_out.display()))?;
 
     // Printed to stdout so CI can redirect it into $GITHUB_STEP_SUMMARY.
-    print!("{}", e2e_report::consolidated_summary_markdown(&inputs));
+    print!("{}", e2e_report::consolidated_summary_markdown(&bundle));
 
     eprintln!(
         "Consolidated {} platform report(s) -> {}",
@@ -128,30 +132,21 @@ fn label_for_root_report(dir: &Path) -> String {
                 .and_then(|s| s.as_str())
                 .map(str::to_owned)
         });
-    match slug.as_deref() {
-        Some("mock") => "e2e-report".to_owned(),
-        Some("mi300x") => "e2e-gpu-report".to_owned(),
-        Some("gfx1201") => "e2e-gpu-rad3-report".to_owned(),
-        Some("mi350p") => "e2e-gpu-mi350p-report".to_owned(),
-        Some("strix-halo-linux") => "e2e-gpu-strix-ubuntu-report".to_owned(),
-        Some("strix-halo-windows") => "e2e-gpu-strix-windows-report".to_owned(),
-        // This workflow is statically pinned to the Strix WSL runner. A bare
-        // `wsl` slug means the probe could not recover a gfx target; map it to
-        // the same identity the workflow's artifact directory carries so a
-        // flattened single-artifact download cannot change the report column.
-        Some("wsl" | "strix-halo-wsl") => "e2e-gpu-strix-wsl-report".to_owned(),
-        // Missing sidecar (e.g. a GPU run that errored before writing it) or an
-        // unrecognized slug → neutral identity, never a false "Mock".
-        _ => "e2e-unknown-report".to_owned(),
-    }
+    // The slug → artifact-name table lives beside `parse_descriptor`'s
+    // artifact-name → platform table, in the one `KNOWN_PLATFORMS` list, so the
+    // two directions cannot drift. A missing sidecar (e.g. a GPU run that
+    // errored before writing it) or an unrecognized slug → neutral
+    // `e2e-unknown-report`, never a false "Mock".
+    e2e_report::artifact_name_for_platform_slug(slug.as_deref()).to_owned()
 }
 
-/// Strips the literal `${{ matrix.channel }}` template segment nightly's
-/// per-lane matrix inserts into its artifact names, so a name like
-/// `e2e-gpu-${{ matrix.channel }}-report` compares as its canonical
-/// `e2e-gpu-report` base. This scan is text-based over the raw workflow
-/// source and does not simulate matrix expansion, so the template text
-/// would otherwise appear verbatim and never match anything.
+/// Strips the literal `${{ matrix.channel }}` template segment a channel
+/// matrix inserts into its artifact names — nightly's six GPU lanes and, per
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
+/// canonical `e2e-gpu-report` base. This scan is text-based over the raw
+/// workflow source and does not simulate matrix expansion, so the template
+/// text would otherwise appear verbatim and never match anything.
 #[cfg(test)]
 pub(crate) fn without_channel_matrix_segment(name: &str) -> String {
     name.replace("-${{ matrix.channel }}-", "-")
@@ -196,14 +191,33 @@ mod tests {
     /// `parse_descriptor` maps it to Unknown/Unknown precisely so it escapes the
     /// Linux default. No workflow can name it, so a workflow that did would be
     /// claiming an identity it has no business asserting.
+    ///
+    /// The `-n-1`/`-n-2` entries are the non-`current` legs of the self-hosted
+    /// `sdk_version` matrix (ROCMAI-430): each per-PR GPU job in
+    /// `e2e-selfhosted.yml` uploads those legs under a distinct name so they
+    /// don't collide with the `current` leg, whose name is left exactly as it
+    /// was before the matrix existed. `rad3`/`mi350p` are nightly-only lanes
+    /// (ROCMAI-125) and don't run the matrix, so they have no `-n-1`/`-n-2`
+    /// entries.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
         "e2e-gpu-report",
+        "e2e-gpu-n-1-report",
+        "e2e-gpu-n-2-report",
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
+        "e2e-gpu-w7900-report",
+        "e2e-gpu-w7900-n-1-report",
+        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
+        "e2e-gpu-strix-ubuntu-n-1-report",
+        "e2e-gpu-strix-ubuntu-n-2-report",
         "e2e-gpu-strix-windows-report",
+        "e2e-gpu-strix-windows-n-1-report",
+        "e2e-gpu-strix-windows-n-2-report",
         "e2e-gpu-strix-wsl-report",
+        "e2e-gpu-strix-wsl-n-1-report",
+        "e2e-gpu-strix-wsl-n-2-report",
     ];
 
     /// Every workflow in `.github/workflows`, so a new one cannot upload under a
@@ -260,9 +274,16 @@ mod tests {
 
     #[test]
     fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
-        // The nightly workflow exists to run *more* scenarios on the *same*
-        // platforms. If the two ever diverge, the nightly grid is comparing
-        // different hardware than the PR grid without saying so.
+        // The nightly workflow exists to run *more* scenarios on *at least*
+        // the per-PR platforms, plus lanes the per-PR smoke gate deliberately
+        // skips (e.g. rad3, mi350p -- ROCMAI-125). If a per-PR platform ever
+        // stopped running nightly, the nightly grid would be silently
+        // comparing different hardware than the PR grid.
+        //
+        // Nightly doesn't run the sdk_version matrix (ROCMAI-430) — it has its
+        // own breadth-over-versions tradeoff — so strip the `-n-1`/`-n-2` legs
+        // before comparing; the `current` leg's name is unaffected by the matrix
+        // and must still match nightly's.
         let lanes = |file: &str| {
             let names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -276,6 +297,17 @@ mod tests {
                 .filter(|n| !n.starts_with("e2e-consolidated-report"))
                 .map(|n| without_channel_matrix_segment(&n))
                 .collect();
+            // Nightly doesn't run the sdk_version matrix (ROCMAI-430) -- it has
+            // its own breadth-over-versions tradeoff -- so strip the `-n-1`/
+            // `-n-2` legs before comparing; the `current` leg's name is
+            // unaffected by the matrix and must still match nightly's.
+            for suffix in ["-n-1-report", "-n-2-report"] {
+                for name in &mut names {
+                    if let Some(rest) = name.strip_suffix(suffix) {
+                        *name = format!("{rest}-report");
+                    }
+                }
+            }
             names.sort();
             // Each lane's `name:` line appears once in the workflow source with
             // the literal `${{ matrix.channel }}` template (this scan does not
@@ -286,7 +318,16 @@ mod tests {
             names.dedup();
             names
         };
-        assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
+        let nightly = lanes("nightly.yml");
+        let per_pr = lanes("e2e-selfhosted.yml");
+        assert!(
+            !per_pr.is_empty(),
+            "per-PR lane scan found nothing to check"
+        );
+        assert!(
+            per_pr.iter().all(|p| nightly.contains(p)),
+            "every per-PR platform must also run nightly: per_pr={per_pr:?} nightly={nightly:?}"
+        );
     }
 
     #[test]
@@ -326,6 +367,7 @@ mod tests {
             ("mi300x", "e2e-gpu-report"),
             ("gfx1201", "e2e-gpu-rad3-report"),
             ("mi350p", "e2e-gpu-mi350p-report"),
+            ("gfx1100", "e2e-gpu-w7900-report"),
             ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
             ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),

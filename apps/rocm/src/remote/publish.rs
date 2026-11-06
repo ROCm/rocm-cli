@@ -377,13 +377,13 @@ pub(crate) fn publish(
         PublishState::Absent | PublishState::Published => {}
         PublishState::Foreign { forwards_to } => bail!(
             "port {tailnet_port} on the remote already forwards to {forwards_to}.\n\
-             Refusing to take it over — publishing here would silently break whatever \
+             Refusing to take it over - publishing here would silently break whatever \
              is using it. Choose another port with `--tailnet-port`."
         ),
         PublishState::FunnelAllowed => bail!(
             "port {tailnet_port} on the remote has Tailscale Funnel allowed, which exposes it \
              to the public internet rather than just the tailnet.\n\
-             Refusing to publish over it — turn Funnel off first: \
+             Refusing to publish over it - turn Funnel off first: \
              `tailscale funnel --tcp={tailnet_port} off`."
         ),
         PublishState::Unreadable => bail!(
@@ -462,7 +462,7 @@ pub(crate) fn withdraw(
         PublishState::Foreign { forwards_to } => bail!(
             "port {tailnet_port} on the remote now forwards to {forwards_to}, not to this \
              session's model server.\n\
-             Refusing to turn it off — it belongs to something else."
+             Refusing to turn it off - it belongs to something else."
         ),
         PublishState::FunnelAllowed => bail!(
             "port {tailnet_port} on the remote has Tailscale Funnel allowed. Withdrawing our \

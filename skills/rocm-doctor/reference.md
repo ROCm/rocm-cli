@@ -16,48 +16,83 @@ tooling.
 - It's a general system inspector, so it **always exits 0**. The verdict is the
   `status` field: `ok` · `no-amd-gpu` · `wsl` · `unsupported-os` · `degraded`.
 
-### `rocm diagnose [--symptom "<text>"] [--top N] [--json]`
+### `rocm diagnose [--symptom "<text>"] [--top N] [--json] [--distro [NAME]] [--model REF]`
 
 Match the host + symptom against the closed catalog. **Always exits 0**; read
 the result from `--json`:
 
 - `matched[]` — ranked `{ id, title, score, evidence[], fix }`. Tiers:
   `>= 75` high confidence, `50–74` likely, `< 50` weak.
+  **Check `fix.class` before proposing anything.** `diagnose-only` means the
+  cause is explained and has no remedy — currently only
+  `info-20-gpu-no-rocm-support`, which carries an `info-` id rather than a
+  `fix-N` / `fix-wsl-N` one for that reason. It is a catalog entry like any
+  other: `rocm fix info-20-gpu-no-rocm-support` names the problem, says there
+  is no reliable fix and exits 0 without touching the machine. Report its
+  `evidence`; do not go looking for something to apply instead.
 - `has_match` — whether any entry cleared `min_score_for_match`. **This is the
   gate, not whether `matched` is empty.** Several checkers open with a nonzero
   base score for a merely *potentially* relevant situation (running in a
   container, an APU alongside a discrete GPU), so a healthy host produces a
   non-empty `matched` full of sub-threshold entries. Gating on emptiness
   proposes a fix for a machine with nothing wrong and never routes upstream.
+  The exception is an **advice-only** entry (today `fix-22-display-driver-old`):
+  it scores below the threshold on purpose, so it never sets `has_match`, yet it
+  is advice worth giving. Relay the entry's `title` and `evidence` to the user as
+  advice and never apply it automatically. It does not answer the symptom, so route
+  upstream as usual when `has_match` is false.
 - `min_score_for_match` (50), `high_confidence_threshold` (75).
 - `out_of_scope` — set when the host's platform family has **no catalog entries
   at all**, in which case `matched` is empty. Linux, Windows and WSL2 are all
   covered, so this now fires only for a platform outside those three. It means
   nothing was checked — not a clean bill of health.
 - `route_when_no_match` — `{ target, url }` upstream tracker to use when `has_match` is false.
+- `model` — set only when `--model <ref>` was passed; otherwise not set. Answers
+  "will this curated model run here" from the recipe catalog and this host's
+  GPU/RAM, without downloading anything: `{ verdict, evidence[], engine,
+  required_gpu_memory_gib, available_gpu_memory_gib, alternatives[],
+  undetermined_reason, fix }`. `verdict` is one of `ready`, `degraded`,
+  `blocked`, `undetermined` — treat `undetermined` as "the CLI could not find
+  out", never as evidence the model is incompatible. `--model` is refused
+  together with `--distro`: the verdict is about the machine running the
+  command, not the one `--distro` names.
 
-### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N]`
+### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N] [--json]`
 
-Apply a fix by id (run with no id to list). Exit codes:
+Apply a fix by id (run with no id to list). `rocm fix --json` with no id prints
+the catalog manifest instead: `contract_version`, one entry per fix, and the
+exit-code map. It applies no fix and exits 0. The skill reads
+`contract_version` before it diagnoses (Phase 0 in [SKILL.md](SKILL.md)). `--json` with an
+id is refused, and the refusal exits 1 (see the table). Exit codes:
 
 | code | meaning |
 | --- | --- |
 | 0 | applied / dry-run / print-only plan / list |
-| 1 | internal error |
+| 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
 | 4 | attempted but the command failed |
 | 5 | user declined at the prompt |
 
-Only four fixes are auto-applicable — `fix-2-unset-override`,
-`fix-4-render-group`, `fix-6-path`, `fix-9-igpu-dgpu` — and the rest print their
-plan for the user to run. Pass the **full** id (`rocm fix fix-2-unset-override`,
-not `rocm fix fix-2`; a short id returns exit 2, unknown fix-id).
+Three ids are ever auto-applicable — never four, and `fix-9-igpu-dgpu` is not
+one of them (see below) — and which of the three depends on the **host**,
+because `rocm fix`'s listing marks each entry for the machine you run it on,
+never for every machine the id applies to:
 
-**Auto-fix** in the catalog below means only what the CLI reports in
-`rocm fix`'s listing: the CLI has a runner for it and will carry it out itself,
-rather than printing a plan for the user. It is not a promise that the runner
-mutates anything.
+- **linux** — auto-applicable: `fix-4-render-group`, `fix-6-path`.
+- **windows** — auto-applicable: `fix-2-unset-override`, `fix-6-path`.
+- **wsl** — auto-applicable: `fix-6-path`.
+
+The rest print their plan for the user to run. Pass the **full** id
+(`rocm fix fix-2-unset-override`, not `rocm fix fix-2`; a short id returns
+exit 2, unknown fix-id).
+
+**Marker** in the catalog below is what `rocm fix`'s listing reports **on
+bare-metal Linux** — AUTO means the CLI has a runner for the entry and will
+carry it out itself there, rather than printing a plan for the user. It is not
+a promise that the runner mutates anything, and — per the per-host list above — it is
+not the same claim on Windows or WSL2 for the one entry whose behaviour
+depends on more than the host alone.
 
 The ones that do mutate print the exact command, honor `--dry-run`, refuse on a
 non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
@@ -67,14 +102,14 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   not edit your dotfiles. So on Linux it never prompts, `--dry-run` has nothing
   to preview, and `--yes` is never read. Do not tell a Linux user a dry run
   previewed a change that was never going to happen.
-- **`fix-9-igpu-dgpu` mutates only when you pass `--device-index N`.** Without
-  it — on Linux and Windows alike — the runner just prints the
-  `rocminfo`/`hipInfo` query that identifies which index is the discrete GPU
-  and returns 0: no prompt, nothing for `--dry-run` to preview, nothing
+- **`fix-9-igpu-dgpu` needs `--device-index N` wherever it applies (Linux and
+  Windows) and is never marked AUTO.** Without the flag the runner just prints
+  the `rocminfo`/`hipInfo` query that identifies which index is the discrete
+  GPU and returns 0: no prompt, nothing for `--dry-run` to preview, nothing
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (24 failure modes)
+## Closed catalog (29 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -82,41 +117,51 @@ by naming `wsl`, so the bare-metal Linux entries (the `amdgpu` module,
 `/dev/kfd`, the render group) stop applying there automatically rather than
 reporting confident nonsense.
 
-| id | OS | Failure mode | Typical signal | Auto-fix |
+| id | OS | Failure mode | Typical signal | Marker (bare-metal Linux) |
 | --- | --- | --- | --- | --- |
-| `fix-1-arch` | linux/windows/wsl | GPU gfx target not in the framework's build arch list | `hipErrorNoBinaryForGpu`, `HSA_STATUS_ERROR_INVALID_ISA`, "invalid device function" | no |
-| `fix-2-unset-override` | linux/windows/wsl | `HSA_OVERRIDE_GFX_VERSION` set on a GPU that now has a native wheel | page faults / `OUT_OF_REGISTERS`, override set in env | yes |
-| `fix-3-rocm-kernel` | linux | ROCm + distro/kernel form an unsupported triple | ROCm installed but `amdgpu` not loaded; DKMS build failure | no |
-| `fix-4-render-group` | linux | User not in `render`/`video` group (or `/dev/kfd` owned by the other group) | cannot open `/dev/kfd`, permission denied | yes |
-| `fix-5-amdgpu-load` | linux | `amdgpu` module not loaded (or blacklisted) | "ROCk module is NOT loaded", blacklist entry, Secure Boot | no |
-| `fix-6-path` | linux/windows/wsl | ROCm/HIP binaries not on PATH after install | `rocminfo: command not found`, `hipInfo` missing from PATH | yes |
-| `fix-7-stale-repos` | linux | Stale/conflicting APT/DNF repos from prior installer runs | apt 404 `repo.radeon.com`, unmet deps, ≥2 ROCm repo files | no |
-| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm major than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | no |
-| `fix-9-igpu-dgpu` | linux/windows | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | yes |
-| `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | no |
-| `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | no |
-| `fix-12-installer` | linux | `amdgpu-install` left a broken DKMS / repo state | dpkg half-configured, DKMS failed, `--accept-eula` | no |
-| `fix-13-hip-sdk-missing` | windows | HIP SDK not installed | no HIP SDK under Program Files, `hipInfo` not recognized | no |
-| `fix-14-adrenalin-too-old` | windows | Adrenalin / kernel-mode driver too old for the HIP SDK | `hipInfo` can't enumerate, "driver too old", HSA "no agents found" | no |
-| `fix-15-msvc-redist` | windows | MSVC runtime missing (HIP DLLs can't load) | `vcruntime140.dll` / `vcruntime140_1.dll` missing | no |
-| `fix-17-torch-dlpack` | linux | `torch-c-dlpack-ext` loads its CUDA prebuilt on a ROCm torch, aborting vLLM's engine start at import time | vLLM engine start fails on import; error names `torch_c_dlpack_ext` or tvm_ffi's `_optional_torch_c_dlpack` | no |
-| `fix-19-shm-too-small` | linux/wsl | `/dev/shm` too small for a serving workload, which needs gigabytes where a container and WSL2 both default to 64 MB | reported under 1 GiB; a data-loader worker killed by a bus error, or a failed write to a temporary file, with nothing naming shared memory | no |
-| `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | no |
-| `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | no |
-| `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | no |
-| `fix-wsl-4-rocdxg-not-linked` | wsl | `librocdxg` installed but not in the linker cache, so it is unloadable | `librocdxg` present on disk yet absent from `ldconfig -p` | no |
-| `fix-wsl-5-distro-too-old` | wsl | Distro release below the floor the WSL path requires | distro release under the supported floor (e.g. Ubuntu 22.04, whose glibc 2.35 is below the 2.38 / `GLIBCXX_3.4.32` the engines need) | no |
-| `fix-wsl-6-host-driver-too-old` | wsl | Windows host driver too old or absent, with the distro side already complete | the Windows host reports no AMD display adapter | no |
-| `fix-wsl-7-wsl1` | wsl | Distro running under WSL 1, which exposes no GPU device at all | the running kernel is a WSL 1 kernel | no |
+| `fix-1-arch` | linux/windows/wsl | GPU gfx target not in the framework's build arch list | `hipErrorNoBinaryForGpu`, `HSA_STATUS_ERROR_INVALID_ISA`, "invalid device function" | print-only |
+| `fix-2-unset-override` | linux/windows/wsl | `HSA_OVERRIDE_GFX_VERSION` set on a GPU that now has a native wheel | page faults / `OUT_OF_REGISTERS`, override set in env | print-only (auto on windows) |
+| `fix-3-rocm-kernel` | linux | ROCm + distro/kernel form an unsupported triple | ROCm installed but `amdgpu` not loaded; DKMS build failure | print-only |
+| `fix-4-render-group` | linux | User not in `render`/`video` group (or `/dev/kfd` owned by the other group) | cannot open `/dev/kfd`, permission denied | auto |
+| `fix-5-amdgpu-load` | linux | `amdgpu` module not loaded (or blacklisted) | "ROCk module is NOT loaded", blacklist entry, Secure Boot | print-only |
+| `fix-6-path` | linux/windows/wsl | ROCm/HIP binaries not on PATH after install | `rocminfo: command not found`, `hipInfo` missing from PATH | auto |
+| `fix-7-stale-repos` | linux | Stale/conflicting APT/DNF/zypper repos from prior installer runs | apt 404 `repo.radeon.com`, unmet deps, ≥2 ROCm repo files | print-only |
+| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm major than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
+| `fix-9-igpu-dgpu` | linux/windows | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | needs-arg |
+| `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | print-only |
+| `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | print-only |
+| `fix-12-installer` | linux | Repo-native package-manager install left a broken DKMS / repo state | dpkg half-configured, DKMS build failure, dpkg/apt error | print-only |
+| `fix-13-hip-sdk-missing` | windows | HIP SDK not installed | **something on the host actually calls into HIP** — an ambient (non-managed-runtime) PyTorch HIP build, or a `GGML_HIP=ON` llama.cpp, either way with a detected AMD GPU — **and** no HIP SDK under Program Files, or `hipInfo.exe` missing from its `bin`. A paste naming any of `amdhip64` not found, "could not find HIP", `HIP_PATH` not set, or `hipInfo` not recognized counts as calling into HIP on its own, with no GPU required. A Vulkan-backed engine (the Lemonade default) or a managed-runtime wheel needs no system SDK, so its absence is not evidence there | print-only |
+| `fix-14-adrenalin-too-old` | windows | Adrenalin / kernel-mode driver too old for the HIP SDK | `hipInfo` can't enumerate, "driver too old", HSA "no agents found" | print-only |
+| `fix-15-msvc-redist` | windows | MSVC runtime missing (programs that link it, such as the HIP SDK DLLs and the llama.cpp server, can't load) | `vcruntime140.dll` / `vcruntime140_1.dll` missing | print-only |
+| `fix-16-vllm-oom` | linux/wsl | vLLM reserved ~90% of the GPU's TOTAL VRAM for its KV cache and ran out at startup | vLLM engine start fails with an out-of-memory error; the GPU is shared/busy, or the model does not fit | print-only |
+| `fix-17-torch-dlpack` | linux/wsl | `torch-c-dlpack-ext` loads its CUDA prebuilt on a ROCm torch, aborting vLLM's engine start at import time | vLLM engine start fails on import; error names `libtorch_cuda.so` (enough on its own), or both `torch_c_dlpack_ext` and tvm_ffi's `_optional_torch_c_dlpack` | print-only |
+| `fix-18-comgr-conflict` | linux/wsl | The code object manager library (`libamd_comgr`) that would load belongs to a different installation than the HIP runtime that would load, so device code compilation fails with an error naming neither | compilation error naming neither library; `rocm examine --json`'s `comgr_selected`/`hip_selected` resolve to two different `install_root`s | print-only |
+| `fix-19-shm-too-small` | linux/wsl | `/dev/shm` too small for a serving workload, which needs gigabytes where a container and WSL2 both default to 64 MB | reported under 1 GiB; a data-loader worker killed by a bus error, or a failed write to a temporary file, with nothing naming shared memory | print-only |
+| `info-20-gpu-no-rocm-support` | linux/windows | Every AMD GPU on the host is a part ROCm has never shipped a runtime build for (today: gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo). Vulkan-based engines still work | every detected AMD GPU identifies as an unsupported target, and none is unidentified; scores a flat 60 | diagnose-only |
+| `fix-21-msvc-redist-outdated` | windows | MSVC runtime present but older than 14.40, so programs built with a recent toolset (such as the llama.cpp server that Lemonade installs) crash | `rocm examine --json` shows `msvc_redist_version` below 14.40; an access violation (`0xC0000005`, `-1073741819`) with `msvcp140.dll` as the faulting module | print-only |
+| `fix-22-display-driver-old` | windows | The AMD display driver is dated before the first HIP SDK for Windows (27 July 2023). Advice only: AMD publishes no minimum driver version for the HIP SDK or the Lemonade Vulkan backend, so the minimum is not established and the entry never claims the driver is broken. The date is only a floor and cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers | `rocm examine` shows `driver_age: older than the first HIP SDK for Windows`; the entry scores below the match threshold (WEAK) | print-only |
+| `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
+| `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
+| `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | print-only |
+| `fix-wsl-4-rocdxg-not-linked` | wsl | `librocdxg` installed but not in the linker cache, so it is unloadable | `librocdxg` present on disk yet absent from `ldconfig -p` and from the `LD_LIBRARY_PATH` of the shell running the check, and not beside a `libhsa-runtime64` | print-only |
+| `fix-wsl-5-distro-too-old` | wsl | Distro release below the floor the WSL path requires | distro release under the supported floor (e.g. Ubuntu 22.04, whose glibc 2.35 is below the 2.38 / `GLIBCXX_3.4.32` the engines need) | print-only |
+| `fix-wsl-6-host-driver-too-old` | wsl | Windows host driver too old or absent, with the distro side already complete | the Windows host reports no AMD display adapter | print-only |
+| `fix-wsl-7-wsl1` | wsl | Distro running under WSL 1, which exposes no GPU device at all | the running kernel is a WSL 1 kernel | print-only |
 
-Two things the numbering does not tell you. `fix-16` is a reserved handle, not a
-missing row — ids are stable handles rather than positions. And the `fix-wsl-N`
-entries are a parallel series, not a continuation of the numeric one, because
-they answer for a different platform family.
+One thing the numbering does not tell you: the `fix-wsl-N` entries are a parallel
+series, not a continuation of the numeric one, because they answer for a
+different platform family. The numeric series itself runs `fix-1` through
+`fix-19`, then `fix-21` and `fix-22`. The ids are stable handles rather than positions, so
+the number `fix-20` is simply not used here: slot 20 belongs to
+`info-20-gpu-no-rocm-support`, which is in the table above but under an `info-`
+prefix because it has no fix to offer. A gap is not an error, and a retired
+entry would leave a hole rather than renumber the ones after it.
 
-Linux-only: fix-3, -4, -5, -7, -10, -11, -12, -17. Windows-only: fix-13, -14, -15.
+Linux-only: fix-3, -4, -5, -7, -10, -11, -12. Windows-only: fix-13, -14, -15, -21, -22.
+Linux + Windows: info-20 (diagnose-only).
 WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
-Linux + WSL: fix-19. Linux + Windows + WSL: fix-1, -2, -6, -8.
+Linux + WSL: fix-16, -17, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
 
 ## Framework routing
 

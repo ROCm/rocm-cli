@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -9,11 +10,46 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
+use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
+/// Model id of the live managed service the reuse scenarios plant.
+///
+/// Distinct from every other e2e serve model so its service records can never
+/// collide with another scenario's.
+const LIVE_REUSE_MODEL: &str = "e2e/reuse-model";
+
+/// How long to wait for an interactive (PTY) serve summary to render and exit.
+///
+/// Routed through the suite-wide [`default_timeout`] rather than a fixed literal
+/// so an operator can raise it with `E2E_TUI_TIMEOUT_SECS` on a contended
+/// self-hosted lane without a code change — the same reason every other PTY wait
+/// uses it.
+fn interactive_summary_timeout() -> Duration {
+    default_timeout()
+}
+/// Model id of the live managed service planted by
+/// `@id:serve-unrelated-live-service-still-fails-fast`.
+///
+/// Must not be relatable to [`LEMONADE_SERVE_TARGET`] by the CLI's lenient
+/// service-name matcher (case-insensitive equality, or either name containing
+/// the other once extensions are stripped) — otherwise the pre-gate would open
+/// on a legitimate match and the scenario would stop testing the model keying.
+const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
+/// The GGUF model the Lemonade-pinned serve steps request. Same checkpoint
+/// `serve-lemonade-preparation-recovery` uses, so no new download is implied on
+/// any lane that ever does reach a real install — which is also why
+/// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
+/// repeating the literal.
+const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
+/// Model id for the OOM-launch scenario, kept distinct from every other e2e
+/// serve model so its service records can never collide with another
+/// scenario's.
+const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -34,7 +70,7 @@ fn serve_timeout_secs() -> u64 {
 /// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
 /// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
 /// it fails fast).
-fn serve_timeout_for(world: &E2eWorld) -> u64 {
+pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
         .unwrap_or_else(serve_timeout_secs)
@@ -47,7 +83,11 @@ fn serve_timeout_for(world: &E2eWorld) -> u64 {
 /// scenario A's `rocm` has no record of scenario B's managed service and can't
 /// stop it; a plain 200 check would then proceed against the WRONG model. Wait
 /// for the expected model so the readiness signal reflects this scenario's serve.
-async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) -> bool {
+pub(crate) async fn model_is_ready(
+    models_url: &str,
+    expect_model: Option<&str>,
+    timeout_secs: u64,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(models_url).await
@@ -138,14 +178,21 @@ fn serve_failure_evidence(
 /// dropped before the panic, which is why #260 could not be root-caused from a
 /// CI artifact. A non-zero exit is reported the same way rather than through
 /// `run_rocm_ok`, since the engine log explains those launches too.
-async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_substr: &str) {
+///
+/// Returns the serve command's stdout, for a scenario that checks what it printed.
+async fn serve_and_wait(
+    world: &mut E2eWorld,
+    args: &[&str],
+    model: &str,
+    ready_substr: &str,
+) -> String {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
     let (stdout, stderr, rc) = crate::run_rocm(world, args);
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
-        return;
+        return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
     let headline = if rc == 0 {
@@ -393,6 +440,55 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
     world.mock = Some(mock);
 }
 
+#[given("the default serve port is occupied")]
+async fn occupy_default_serve_port(world: &mut E2eWorld) {
+    let _ = ensure_serve_port_free().await;
+    // A stale listener from a prior scenario (not just an unrelated process)
+    // is the realistic way this probe finds the next port taken; clear it the
+    // same way `ensure_serve_port_free` clears the default port instead of
+    // panicking the whole run over leftover state.
+    kill_listeners_on_port(SERVE_PORT + 1);
+    let next = std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT + 1))
+        .expect("the next automatic port must be free before this scenario starts");
+    drop(next);
+    world.automatic_port_guard = Some(
+        std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT))
+            .expect("failed to occupy the default serve port"),
+    );
+}
+
+/// Plant a live managed-service record on the default serve port, backed by a
+/// real mock listener on that exact port.
+///
+/// `ServiceRecordOptions::default()`'s `supervisor_pid: 0` means the CLI's
+/// liveness refresh finds no tracked pid to check; without a real listener
+/// behind the record, the endpoint probe would then come back `Unreachable`
+/// and the record gets demoted to `"stopped"` *before* the explicit-port
+/// collision check ever sees it (`refresh_managed_service_runtime_liveness`
+/// in `apps/rocm/src/managed_service_status.rs`). Backing the record with a `MockServer` on
+/// `SERVE_PORT` makes `/v1/models` list `other-model`, so the probe reports
+/// `Listing`/`Serving` and the record is left `"ready"` instead — the
+/// scenario needs the collision detected, so the port has to be reserved for
+/// real, not just on paper. `supervisor_pid: 0` still keeps this safe for the
+/// World's teardown, which runs `rocm services stop <id> --yes` on every
+/// record left in the isolated tree: a real PID here would point that stop at
+/// the test process itself (see `plant_unauthenticated_lemonade_service`'s
+/// doc comment for the same hazard).
+#[given("another managed service already reserves the default serve port")]
+async fn reserve_default_serve_port(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    let mock = MockServer::start_on_port("other-model", SERVE_PORT).await;
+    write_service_record_with(
+        &services,
+        "other-model",
+        SERVE_PORT,
+        ServiceRecordOptions::default(),
+    );
+    world.mock = Some(mock);
+}
+
 /// The (model, engine, ready-substring) this host should serve for an
 /// engine-agnostic "serve a real model" precondition.
 ///
@@ -611,6 +707,62 @@ async fn setup_lemonade_model(world: &mut E2eWorld) {
     .await;
 }
 
+/// ROCMAI-827: serve the same small GGUF model as `setup_lemonade_model`, from
+/// the scenario's fresh config (every automation watcher off), keeping what the
+/// serve printed so the Then can check it against the helper's runtime state.
+#[when("the user serves a GGUF model on lemonade with no automation enabled")]
+async fn serve_lemonade_without_automations(world: &mut E2eWorld) {
+    let stdout = serve_and_wait(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+        "Qwen3-0.6B-GGUF",
+        "Qwen3-0.6B",
+    )
+    .await;
+    world.cli_output = Some(stdout);
+}
+
+#[then("serving started no background helper")]
+async fn serving_started_no_background_helper(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        !out.contains("background automation daemon"),
+        "with no watcher enabled, serve must not start (or try to start) the helper, got:
+{out}"
+    );
+    // The printed line is checked together with the state: the helper never
+    // published a runtime state, and its status reports it not running.
+    // A helper spawned a moment ago may not have published its runtime state
+    // yet, so the state alone can pass vacuously. The spawn records its
+    // autostart claim synchronously, before the CLI returns, so a claim file is
+    // proof a helper was started.
+    let claim = world.app_paths().automation_autostart_claim_path();
+    assert!(
+        !claim.exists(),
+        "serve spawned a background helper (autostart claim {} exists: {:?})",
+        claim.display(),
+        std::fs::read_to_string(&claim)
+    );
+    let state = rocm_core::AutomationRuntimeState::load(&world.app_paths())
+        .expect("failed to read the helper's runtime state");
+    assert!(
+        state.as_ref().is_none_or(|state| !state.running),
+        "serve left a background helper recorded running: {state:?}"
+    );
+    let status = crate::run_rocm_ok(world, &["daemon", "--status"]);
+    assert!(
+        status.contains("Status: not running"),
+        "expected `rocm daemon --status` to report no helper, got:
+{status}"
+    );
+}
+
 #[given("a canonical Hugging Face GGUF checkpoint is being served on lemonade")]
 async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     // Forces the `owner/repo:variant` direct-serve path (`serve_hf_checkpoint`,
@@ -632,15 +784,90 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+#[given("a model is being served on aim")]
+async fn setup_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
+/// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
+/// Factored out so the lifecycle-parity scenario can call it a second time,
+/// after stopping the service, without duplicating the image/profile pin.
+async fn serve_aim_canary(world: &mut E2eWorld) {
+    // Serves via the raw AIM Docker image reference rather than the catalog
+    // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
+    // canary pinned to one exact image/profile, not a catalog-discovery test.
+    //
+    // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
+    // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
+    // profiles — confirmed via its container logs to report "Found 0
+    // compatible profiles" on Strix Halo/gfx1151, the only runner this
+    // scenario executes on. `aim-radeon-qwen-qwen3-5-9b` is a Radeon-targeted
+    // image, hardware-verified serving real inference on Strix Halo; its
+    // profile still needs an explicit pick via `--engine-env` because
+    // auto-selection isn't reliable for Radeon targets yet.
+    let image = "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview";
+    // The container bundles vLLM, which echoes the model's baked-in HF id
+    // (not the Docker image reference) as `model` — confirmed live on Strix
+    // Halo.
+    let model = "Qwen/Qwen3.5-9B";
+    serve_and_wait(
+        world,
+        &[
+            "serve",
+            image,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency",
+            "--managed",
+        ],
+        model,
+        "Qwen3.5-9B",
+    )
+    .await;
+}
+
+/// Stops the AIM service this scenario started and asserts the stop actually
+/// took: reuses [`stop_scenario_services`] (itself `crate::stop_managed_services`,
+/// the same real-record stop the serve-retry path and scenario teardown use),
+/// rather than a hardcoded service id — the AIM canary's id comes from a real
+/// `--managed` launch, not a planted record, so there is no fixed id to match.
+#[when("the user stops the AIM service")]
+async fn stop_aim_service(world: &mut E2eWorld) {
+    let status = stop_scenario_services(world);
+    assert!(
+        status.contains(": stopped"),
+        "expected the AIM service to stop cleanly, got: {status}"
+    );
+    // A stop that leaves the container running would let the next serve reuse
+    // it and still pass inference, so check the container is actually gone.
+    let remaining = std::process::Command::new("docker")
+        .args(["ps", "-q", "--filter", "name=rocm-aim-"])
+        .output()
+        .expect("docker ps should run on an AIM host");
+    let remaining = String::from_utf8_lossy(&remaining.stdout);
+    assert!(
+        remaining.trim().is_empty(),
+        "an AIM container is still running after the stop: {remaining}"
+    );
+}
+
+/// Serves the same AIM canary again, proving the engine can be launched a
+/// second time after a stop — the restart half of lifecycle parity.
+#[when("the user serves that same model on aim again")]
+async fn reserve_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
-    // Large-model nightly coverage follows the host's serving path. MI300X uses
-    // the dense BF16 model through vLLM; Strix Halo uses the hardware-verified
-    // UD-Q4_K_XL GGUF checkpoint through Lemonade. The scenario's @serve-timeout
-    // tag widens both the readiness poll and heavy-model inference timeout. For
-    // vLLM it also raises ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd),
-    // preventing the CLI's default readiness cap from terminating the server
-    // mid-load.
+    // Large-model nightly coverage follows the host's serving path. vLLM hosts
+    // (MI300X, MI350P) use the dense BF16 model; Lemonade hosts (Strix Halo,
+    // R9700, W7900) use the UD-Q4_K_XL GGUF checkpoint, hardware-verified on
+    // Strix Halo. The scenario's @serve-timeout tag widens both the readiness
+    // poll and heavy-model inference timeout. For vLLM it also raises
+    // ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd), preventing the CLI's
+    // default readiness cap from terminating the server mid-load.
     let (model, engine, ready_substr) =
         if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
             // ready_substr is the base name WITHOUT the quant. lemonade serves
@@ -713,19 +940,11 @@ async fn setup_failed_local_server(world: &mut E2eWorld) {
 async fn setup_vllm_startup_exit(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let script = root.path().join("fake-vllm-exit.sh");
-    std::fs::write(
+    rocm_core::fake_executable::write_fake_executable(
         &script,
-        format!(
-            "#!/bin/sh\nsleep 3\nprintf '%s\\n' '{FAKE_VLLM_ERROR}' >&2\nexit 1\n"
-        ),
+        format!("#!/bin/sh\nsleep 3\nprintf '%s\\n' '{FAKE_VLLM_ERROR}' >&2\nexit 1\n"),
     )
     .unwrap_or_else(|e| panic!("failed to write {}: {e}", script.display()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("failed to mark {} executable: {e}", script.display()));
-    }
     assert!(
         script.is_absolute(),
         "ROCM_CLI_VLLM_COMMAND requires an absolute path: {}",
@@ -755,23 +974,43 @@ async fn setup_model_detected(world: &mut E2eWorld) {
 
 #[when("the user serves a model using its short name")]
 async fn user_serves_short_name(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", "vllm"]);
-    world.cli_output = Some(stdout);
+    let engine = "vllm";
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+    // stderr and the exit code ride along so a run that stopped on a refusal reads
+    // as one in the Then step, instead of as "the name was not expanded".
+    world.serve_runs = Some(vec![ServeRun {
+        engine: engine.to_owned(),
+        stdout,
+        stderr,
+        rc,
+    }]);
 }
 
 #[when("the user serves the same short name with different engines")]
 async fn user_serves_multiple_engines(world: &mut E2eWorld) {
-    let mut outputs = Vec::new();
+    let mut runs = Vec::new();
     for engine in ["lemonade", "vllm"] {
-        let (stdout, _, _) = crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
-        outputs.push(stdout);
+        let (stdout, stderr, rc) =
+            crate::run_rocm(world, &["serve", "qwen2.5", "--engine", engine]);
+        runs.push(ServeRun {
+            engine: engine.to_owned(),
+            stdout,
+            stderr,
+            rc,
+        });
     }
-    world.cli_outputs = Some(outputs);
+    world.serve_runs = Some(runs);
 }
 
 #[when("the user lists running services")]
 async fn user_lists_services(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+    world.cli_output = Some(stdout);
+}
+
+#[when("the user lists recommended models")]
+async fn user_lists_recommended_models(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["model"]);
     world.cli_output = Some(stdout);
 }
 
@@ -883,9 +1122,118 @@ async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user serves a model with automatic port selection")]
+async fn user_serves_with_automatic_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
+    world.automatic_port_guard.take();
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user sends a chat completion request")]
 async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
+}
+
+/// Arm the debug/test VRAM hook so the *selected* GPU is reported nearly full.
+/// The GPU lane's real cards are comfortably free, so the serve-plan low-VRAM
+/// OOM warning is otherwise unreachable in E2E; this makes it deterministic
+/// without touching the device the engine actually launches on. Consumed by the
+/// following serve via `run_rocm_with_scenario_env`.
+#[given("the selected GPU is reported nearly out of VRAM")]
+async fn selected_gpu_nearly_out_of_vram(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_LOW_VRAM", "0".into()));
+}
+
+/// Preview a vLLM serve plan pinned to the nearly-full GPU. `--managed`
+/// backgrounds the supervisor (teardown stops it), so this returns once the plan
+/// has printed and the service has launched — the plan text is what the scenario
+/// inspects. The engine still launches against the real, free device.
+#[when("the user previews a vLLM serve plan pinned to that GPU")]
+async fn user_previews_vllm_low_vram_serve_plan(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--engine",
+            "vllm",
+            "--gpu",
+            "0",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The serve must have actually launched, not just printed a plausible plan: a
+/// non-zero rc after a good plan-print would otherwise go undetected since this
+/// scenario only inspects the plan lines (mirrors `assert_vllm_default`).
+///
+/// This step states the scenario's *premise*, not its verdict: the low-VRAM
+/// warning itself is long-standing behaviour, so the warning text alone proves
+/// nothing about the vLLM guidance this scenario exists for — that is
+/// `assert_serve_plan_names_memory_knob`'s job. What it does pin is that the
+/// warning names the GPU the serve was *pinned to* (`--gpu 0`), so a warning
+/// raised for some other device cannot stand in for the premise.
+#[then("the serve plan warns the GPU is low on VRAM")]
+async fn assert_serve_plan_low_vram_warning(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &[
+                "serve",
+                "<vllm model>",
+                "--engine",
+                "vllm",
+                "--gpu",
+                "0",
+                "--managed",
+            ],
+            rc,
+            output,
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
+    assert!(
+        output.contains("serving may fail on VRAM"),
+        "expected a low-VRAM serve-plan warning, got:\n{output}"
+    );
+    assert!(
+        output.contains("GPU 0 has only"),
+        "the low-VRAM warning must be about the pinned GPU 0, got:\n{output}"
+    );
+}
+
+/// The scenario's discriminating assertion — the behaviour added for EAI-8058.
+///
+/// Matching the flag name alone would be too weak to be that: `rocm serve` echoes
+/// engine recipe flags in the same plan, so a `--gpu-memory-utilization` the user
+/// passed themselves would satisfy it. Require the note's own explanation of *why*
+/// a busy GPU OOMs (vLLM's fixed total-VRAM reservation) alongside the flag, so
+/// only the pre-launch hint can satisfy this step.
+#[then("the serve plan explains how to lower vLLM's memory reservation")]
+async fn assert_serve_plan_names_memory_knob(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    assert!(
+        output.contains("--gpu-memory-utilization"),
+        "expected the vLLM memory-utilization note in the serve plan, got:\n{output}"
+    );
+    assert!(
+        output.contains("vLLM reserves ~90%"),
+        "the note must explain vLLM's total-VRAM reservation, not merely name the flag, got:\n{output}"
+    );
 }
 
 /// Serve under the GPU-required default (no `--device`), pinning the engine to the
@@ -913,6 +1261,123 @@ async fn user_serves_negative_temperature(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// A gated AIM catalog entry (`requires_hf_token`), with a profile for a Radeon
+/// PRO W7900 (`gfx110X-all`). The token check runs before GPU detection and
+/// Docker, so no engine or GPU is needed to reach it.
+const GATED_AIM_MODEL: &str = "meta-llama/Llama-3.1-8B-Instruct";
+
+/// An AIM image with profiles for Radeon (`gfx110X-all`, `gfx120X-all`) only.
+const RADEON_AIM_MODEL: &str = "Qwen/Qwen3.5-9B";
+
+/// An AIM image that needs 8 GPUs on an Instinct MI300X.
+const EIGHT_GPU_AIM_MODEL: &str = "deepseek-ai/DeepSeek-R1";
+
+/// Put a `docker` that always fails first on `PATH` and have it log every call to
+/// a file in the scenario root, so a refused serve can be shown never to have
+/// reached Docker (not even `docker info`).
+#[given("Docker is watched for any call")]
+async fn docker_is_watched(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+    let bin_dir = root.join("watched-docker-bin");
+    crate::install_fixture_binary(
+        "fake-docker",
+        &bin_dir.join(e2e_cucumber::fixture_binary::fixture_target_name("docker")),
+    );
+    let mut path = std::ffi::OsString::from(&bin_dir);
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("FAKE_DOCKER_LOG", docker_call_log(world).into_os_string()));
+}
+
+fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("docker-calls.log")
+}
+
+/// Plant one GPU in the simulated kernel topology (`ROCM_CLI_TEST_HOST_ROOT`, honoured
+/// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
+/// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
+fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root");
+    let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+/// gfx942, TheRock family `gfx94X-dcgpu`.
+#[given("a host whose only GPU is an AMD Instinct MI300X")]
+async fn host_with_an_mi300x(world: &mut E2eWorld) {
+    plant_single_gpu(world, 90402);
+}
+
+/// gfx1100, TheRock family `gfx110X-all`.
+#[given("a host whose only GPU is an AMD Radeon PRO W7900")]
+async fn host_with_a_w7900(world: &mut E2eWorld) {
+    plant_single_gpu(world, 110_000);
+}
+
+fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {
+    let mut full = vec!["serve"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--engine", "aim"]);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &full);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a gated AIM model without passing a Hugging Face token")]
+async fn user_serves_gated_aim_without_token(world: &mut E2eWorld) {
+    run_serve_aim(world, &[GATED_AIM_MODEL]);
+}
+
+#[when(
+    "the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked"
+)]
+async fn user_serves_gated_aim_with_token(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("HF_TOKEN", "hf_e2e_placeholder".into()));
+    // An empty mask hides every device, so a GPU host presents as having none usable.
+    world.command_env.push(("HIP_VISIBLE_DEVICES", "".into()));
+    run_serve_aim(world, &[GATED_AIM_MODEL, "--engine-env", "HF_TOKEN"]);
+}
+
+#[when("the user serves a Radeon-only AIM image")]
+async fn user_serves_radeon_only_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[RADEON_AIM_MODEL]);
+}
+
+#[when("the user serves an AIM image that needs eight GPUs")]
+async fn user_serves_eight_gpu_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[EIGHT_GPU_AIM_MODEL]);
 }
 
 /// Serve with every GPU hidden from the CLI and engine via an empty
@@ -955,8 +1420,78 @@ async fn user_serves_public_bind_no_optin(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// `localhost` is loopback (`is_public_bind_host` returns false, so no
+/// `--allow-public-bind` opt-in is required) but is not the canonical
+/// `127.0.0.1` `validate_port_request` requires for automatic port selection.
+/// This isolates the host-vs-port-explicitness check from the separate
+/// public-bind-opt-in check `networking-03` already covers.
+#[when("the user serves a model bound to a non-canonical host without an explicit port")]
+async fn user_serves_non_canonical_host_no_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", "some-model", "--host", "localhost"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `--port 0` is rejected by `serve_port::parse_serve_port`'s own range check,
+/// which also covers 65536 and non-numeric values via the same message.
+#[when("the user serves a model with an out-of-range port")]
+async fn user_serves_invalid_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "some-model", "--port", "0"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a model explicitly on the reserved port")]
+async fn user_serves_explicit_reserved_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let port = SERVE_PORT.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Same CLI invocation as [`user_serves_explicit_reserved_port`]; the two
+/// scenarios differ only in what is holding the port (a plain listener here,
+/// vs. a live managed-service record there), which `resolve_serve_port`
+/// routes to two different refusal messages.
+#[when("the user serves a model explicitly on the occupied port")]
+async fn user_serves_explicit_occupied_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let port = SERVE_PORT.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// Serve naming both a runtime and an environment. These are mutually exclusive
-/// selectors, rejected during argument parsing before any engine or GPU work — so
+/// selectors, rejected during argument parsing before any engine or GPU work, so
 /// the refusal is observable with no GPU (mock lane).
 #[when("the user serves a model selecting both a runtime and an environment")]
 async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
@@ -1079,6 +1614,45 @@ async fn assert_public_bind_message(world: &mut E2eWorld) {
     );
 }
 
+#[then("the user is told to pass an explicit port for that host")]
+async fn assert_custom_host_needs_port_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs an explicit `--port"),
+        "expected a message asking for an explicit --port, got:\n{output}"
+    );
+}
+
+#[then("the user is told the port must be between 1 and 65535")]
+async fn assert_invalid_port_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("port must be a number between 1 and 65535"),
+        "expected the port range message, got:\n{output}"
+    );
+}
+
+#[then("the user is told to stop the service holding that port")]
+async fn assert_port_reserved_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("is already reserved by managed service e2e-mock")
+            && output.contains("rocm services stop e2e-mock --yes"),
+        "expected the port-reserved message naming e2e-mock, got:\n{output}"
+    );
+}
+
+#[then("the user is told the port is already in use by another process")]
+async fn assert_port_in_use_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "127.0.0.1:{SERVE_PORT} is already in use by another process"
+        )) && output.contains("Choose a free `--port`"),
+        "expected the port-in-use message, got:\n{output}"
+    );
+}
+
 #[then("the user is told the two selectors cannot be combined")]
 async fn assert_selector_conflict_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1087,6 +1661,468 @@ async fn assert_selector_conflict_message(world: &mut E2eWorld) {
     assert!(
         output.contains("--runtime-id") && output.contains("--env-id"),
         "expected a conflict naming --runtime-id and --env-id, got:\n{output}"
+    );
+}
+
+/// Plant a live managed **vLLM** service for the model the serve under test will
+/// ask for.
+///
+/// `starting` plus this test process's pid keeps the record live through the
+/// CLI's liveness overlay, so the reuse pre-gate's live-service term is
+/// satisfied and only the terms each scenario is actually testing decide the
+/// outcome.
+#[given("a live managed vLLM serve is already running")]
+async fn plant_live_managed_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        LIVE_REUSE_MODEL,
+        65_534,
+        ServiceRecordOptions {
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+            ..ServiceRecordOptions::default()
+        },
+    );
+}
+
+/// Plant a live managed **Lemonade** service for a model the serve under test
+/// will not ask for.
+///
+/// Lemonade because it is the engine that manages its own runtime: the reuse
+/// pre-gate's body calls `ensure_self_managed_engine_ready`, which prints
+/// "Preparing lemonade for GPU serving..." and installs. That print is the
+/// user-visible evidence that engine work ran, and it is what
+/// `assert_no_engine_preparation` looks for.
+///
+/// The record names the same engine the serve will pass, so the ENGINE is not
+/// what holds the pre-gate shut — only [`UNRELATED_LIVE_MODEL`] differing from
+/// the served model is. `starting` plus this test process's pid keeps the record
+/// live through the CLI's liveness overlay, exactly as the reuse scenario's
+/// record does.
+#[given("a live managed Lemonade serve for an unrelated model")]
+async fn plant_unrelated_live_lemonade_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        UNRELATED_LIVE_MODEL,
+        65_533,
+        ServiceRecordOptions {
+            engine: "lemonade",
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+            ..ServiceRecordOptions::default()
+        },
+    );
+}
+
+/// The install tree whose manifest `recover_setup_runtime_registration` would
+/// re-file into the registry, and the registry directory it would write it to.
+fn setup_runtime_fixture_paths(world: &E2eWorld) -> (PathBuf, PathBuf) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    (
+        root.join("setup-runtime"),
+        root.join("data").join("runtimes").join("registry"),
+    )
+}
+
+/// Makes the refusal's *ordering* observable, which no assertion in serve-28/30/31
+/// could do before.
+///
+/// `rocm serve` resolves its runtime selection with
+/// `validate_engine_selection_runtime`, and on the default path (no `--runtime-id`
+/// / `--env-id`) that reaches `recover_setup_runtime_registration`, which
+/// `create_dir_all`s and writes a runtime registry manifest — and can fail with a
+/// manifest error that has nothing to do with the GPU. `serve_cmd.rs`'s comment
+/// says in so many words that the call must therefore stay *below* the no-GPU
+/// bail. Nothing enforced it: `recover_setup_runtime_registration` returns early
+/// when no setup venv is configured, the e2e roots carry none, so moving the call
+/// above the bail left every refusal scenario green.
+///
+/// This plants the one state that makes the write reachable — a configured setup
+/// venv holding its own `.rocm-cli-runtime.json` — so the paired `Then` can assert
+/// the registry is still empty after the refusal. Move the call above the bail and
+/// the manifest appears and that assertion fails.
+#[given("setup names an unregistered runtime folder")]
+async fn plant_unregistered_setup_runtime(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let (install_root, registry) = setup_runtime_fixture_paths(world);
+    std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    // Black-box: plain JSON matching the CLI's on-disk schemas, not a typed
+    // import. The manifest has to pass `validate_runtime_manifest_for_activation`
+    // or recovery bails before the write and the scenario proves nothing.
+    let manifest = serde_json::json!({
+        "runtime_key": "therock-release-gfx942-1.0.0",
+        "runtime_id": "therock-release:gfx942",
+        "channel": "release",
+        "format": "tarball",
+        "family": "gfx942",
+        "family_source": "manual",
+        "version": "1.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/release-tarball-gfx942.tar.gz",
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write local runtime manifest");
+    std::fs::write(
+        root.join("config").join("config.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "setup": { "therock_venv": install_root },
+        }))
+        .expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+    // The registry starts empty, and that IS the state under test — assert it
+    // rather than assume it, so a fixture that pre-populated it could not make
+    // the paired `Then` vacuous in the other direction.
+    assert!(
+        !registry.is_dir() || std::fs::read_dir(&registry).into_iter().flatten().count() == 0,
+        "the runtime registry must start empty for this scenario to mean anything"
+    );
+}
+
+#[then("no runtime registry manifest was written")]
+async fn assert_no_runtime_manifest_written(world: &mut E2eWorld) {
+    let (_, registry) = setup_runtime_fixture_paths(world);
+    let entries: Vec<String> = std::fs::read_dir(&registry)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "a serve refused for want of a GPU must not have resolved its runtime selection \
+         first: `recover_setup_runtime_registration` re-filed {entries:?} into {}. That call \
+         belongs below the no-GPU bail — it writes to disk and can fail with a \
+         runtime-manifest error in place of the no-GPU message.\n{}",
+        registry.display(),
+        serve_output(world)
+    );
+}
+
+/// Serve a Lemonade model under the GPU-required default while the unrelated
+/// live service planted above exists. No fault-injection env var: the scripted
+/// Lemonade backend failure would waive the very GPU pre-flight this scenario
+/// asserts.
+#[when("the user serves a different model with Lemonade under the GPU-required default")]
+async fn user_serves_other_model_with_unrelated_service_live(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", LEMONADE_SERVE_TARGET, "--engine", "lemonade"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user opens its interactive serve summary")]
+async fn open_reuse_serve_summary(world: &mut E2eWorld) {
+    // The synthetic env selection satisfies resolution without installing a
+    // runtime. The planted live service is reused rather than launched, so
+    // `rocm serve` bypasses the GPU-required pre-flight (a reuse pins no GPU) and
+    // reaches the reuse short-circuit on the no-GPU mock host, allocating no GPU
+    // memory.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            LIVE_REUSE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-reuse",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+/// Serve the *same* model the live planted record names, but ask for an API key
+/// the running service never had.
+///
+/// Liveness, engine and canonical model id all match, so the reuse pre-gate's
+/// outer condition holds and the record is a candidate — but
+/// `managed_service_reuse_refusal` answers `MissingApiKey`, so this invocation
+/// cannot actually reuse it and must not be granted the bypass of the
+/// no-usable-GPU refusal that a real reuse earns. `--env-id` satisfies model
+/// resolution without installing a runtime, the same way the reuse scenario
+/// does; captured pipe output rather than a PTY, because the expected outcome
+/// is a refusal on stderr and not a deployment summary.
+#[when("the user serves that same model with --require-api-key under the GPU-required default")]
+async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            LIVE_REUSE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-reuse",
+            "--require-api-key",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve the *same* model the live planted record names, asking for a vLLM
+/// tool-call parser the running service was not started with.
+///
+/// The discriminating step of serve-32. Liveness, engine and canonical model id
+/// all match, so the pre-gate's outer condition holds, and `--tool-call-parser`
+/// is what makes the *requested* recipe non-null: on vLLM
+/// `engine_recipe_with_tool_call_override` synthesizes a hint even for a model
+/// that has no catalog recipe. The planted record carries
+/// `engine_recipe_json: null`, so `managed_service_reuse_refusal` answers
+/// `RecipeMismatch`, this invocation cannot actually reuse the service, and it
+/// must not be granted the bypass of the no-usable-GPU refusal.
+///
+/// Stop `serve()` passing `requested_recipe_json` and the comparison becomes
+/// null against null: the bypass is granted, the run reaches
+/// `spawn_managed_engine_child`, and that caller's own recipe-mismatch refusal
+/// replaces the no-GPU one — which `the user is told no AMD GPU was detected`
+/// sees. Every other scenario plants a null recipe against a serve that
+/// requests none, so none of them can tell the two apart. `--env-id` satisfies
+/// model resolution without installing a runtime, the same way serve-28 and
+/// serve-30 do; captured pipe output rather than a PTY, because the expected
+/// outcome is a refusal on stderr.
+#[when("the user serves that same model with a tool-call parser under the GPU-required default")]
+async fn user_serves_live_model_with_a_tool_call_parser(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            LIVE_REUSE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-reuse",
+            "--tool-call-parser",
+            "hermes",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve the *same* model the live planted record names, pinned to a GPU ordinal
+/// the host does not have.
+///
+/// The discriminating step of serve-31, and it only means anything on a host
+/// that has a usable GPU. There the reuse pre-gate must stay shut on
+/// `host_has_no_usable_gpu` alone — every other term is satisfied, since the
+/// planted record matches on liveness, engine and canonical model id — so
+/// `validate_pinned_gpu_index` runs first and refuses ordinal 99 before any
+/// engine or registry work. Open the gate (for instance by dropping the host
+/// predicate at `serve()`'s call site) and `validate_engine_selection_runtime`
+/// runs first instead, re-filing the planted setup manifest into the registry on
+/// the way; the paired `no runtime registry manifest was written` is what sees
+/// that.
+///
+/// No `--env-id`, unlike serve-28/30/32: `validate_engine_selection_runtime`
+/// only reaches `recover_setup_runtime_registration` when neither
+/// `--runtime-id` nor `--env-id` is given, so naming one would make that
+/// assertion unfalsifiable. Captured pipe output rather than a PTY, because the
+/// expected outcome is a refusal on stderr and not a deployment summary.
+#[when("the user serves that same model pinned to a GPU index that does not exist")]
+async fn user_serves_live_model_on_absent_gpu_index(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", LIVE_REUSE_MODEL, "--engine", "vllm", "--gpu", "99"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with an explicit `--engine vllm`. Only run on native Windows
+/// (`@requires-os:windows`), where the platform gate refuses it before any
+/// runtime resolution or launch; the model name is arbitrary because the
+/// refusal comes first.
+#[when("the user serves a model with the vLLM engine")]
+async fn user_serves_with_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", "nonexistent-model-xyz", "--engine", "vllm"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `rocm engines install vllm --yes`. Runs with the scenario's fixture env, so
+/// the recording `uv` of serve-35 is the one an unrefused install would reach.
+#[when("the user installs the vLLM engine")]
+async fn user_installs_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["engines", "install", "vllm", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the install is refused")]
+async fn assert_install_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no install rc recorded");
+    assert!(
+        rc != 0,
+        "expected the install to be refused, but it exited 0:\n{}",
+        serve_output(world)
+    );
+}
+
+/// The native-Windows vLLM refusal, for the action that was attempted. It must
+/// be the platform reason, not the "no active ROCm runtime" error that used to
+/// pre-empt it, and must name the way out for that action. The paired steps
+/// (`serving is refused before any engine starts` / `the install is refused`,
+/// and the no-record / no-environment checks) prove the behavior it describes.
+#[then(expr = "the user is told vLLM needs WSL or Linux, or the Lemonade engine to {word}")]
+async fn assert_vllm_native_windows_refusal(world: &mut E2eWorld, action: String) {
+    let output = serve_output(world);
+    let remedy = match action.as_str() {
+        "serve" => "`--engine lemonade`",
+        "install" => "`rocm engines install lemonade`",
+        other => panic!("unknown action {other:?}"),
+    };
+    assert!(
+        output.contains("vLLM is not supported on native Windows")
+            && output.contains("WSL or Linux")
+            && output.contains(remedy),
+        "expected the native-Windows vLLM refusal naming WSL/Linux and {remedy}, got:\n{output}"
+    );
+    assert!(
+        !output.contains("no active ROCm runtime"),
+        "the platform refusal must come before runtime resolution, got:\n{output}"
+    );
+}
+
+/// The refused serve left nothing behind: a launch always writes a
+/// managed-service record under `<data>/services/`, and `services list --all`
+/// reads exactly those records.
+#[then("no local server was recorded")]
+async fn assert_no_service_recorded(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records: Vec<_> = std::fs::read_dir(&services)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        records.is_empty(),
+        "a refused serve must not record a service, found: {records:?}"
+    );
+    let listed = crate::run_rocm_ok(world, &["services", "list", "--all"]);
+    assert!(
+        !listed.contains("vllm-"),
+        "a refused serve must not appear in `services list --all`:\n{listed}"
+    );
+}
+
+/// Give the planted runtime what a real vLLM install needs to get going, and
+/// stand a recording `uv` in for the real one. The runtime then resolves as a
+/// managed Python environment, so an install that is NOT refused runs
+/// `uv pip install vllm`, which the stand-in records instead of fetching.
+/// Without this the planted runtime is rejected by the vLLM adapter before it
+/// writes anything, and "nothing was installed" could not fail.
+#[given("the runtime has a Python interpreter and uv is a recording stand-in")]
+async fn runtime_with_recording_uv(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let python = install_root.join("python.exe");
+    std::fs::write(&python, "not a real interpreter").expect("failed to write python stand-in");
+
+    let registry = root.join("data").join("runtimes").join("registry");
+    let manifest_path = registry.join("release-tarball-gfx942.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .expect("runtime manifest is not JSON");
+    manifest["python_executable"] = serde_json::json!(python);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize manifest"),
+    )
+    .expect("failed to rewrite runtime manifest");
+
+    let marker = root.join(UV_MARKER);
+    let uv = root.join("recording-uv.cmd");
+    std::fs::write(
+        &uv,
+        format!(
+            "@echo off
+echo %* > \"{}\"
+exit /b 1
+",
+            marker.display()
+        ),
+    )
+    .expect("failed to write recording uv");
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+}
+
+/// File the recording `uv` writes when it is invoked.
+const UV_MARKER: &str = "uv-was-run.txt";
+
+/// The refused install never started: the recording `uv` was not invoked and
+/// nothing exists under the runtime's `<install_root>/engines`, the folder a
+/// real install is rooted at (`env_root_for_runtime`). Both can fail: with the
+/// platform gate removed the install runs `uv pip install vllm`.
+#[then("no vLLM install was started")]
+async fn assert_no_vllm_install_started(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let marker = root.path().join(UV_MARKER);
+    assert!(
+        !marker.exists(),
+        "a refused vLLM install must not run uv, but it was invoked with: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let engines = install_root.join("engines");
+    assert!(
+        !engines.exists(),
+        "a refused vLLM install must not create {}",
+        engines.display()
     );
 }
 
@@ -1201,13 +2237,20 @@ async fn assert_failed_launch_returns_promptly(world: &mut E2eWorld) {
 async fn assert_failed_launch_service_state(world: &mut E2eWorld) {
     let listed = crate::run_rocm_ok(world, &["services", "list", "--all"]);
     let expected_model = format!("  model: {FAILING_VLLM_MODEL}");
-    let failed_record = listed.split("\n- ").any(|record| {
+    let failed_record = listed.split("\n- ").find(|record| {
         record.lines().any(|line| line == expected_model)
             && record.lines().any(|line| line == "  status: failed")
     });
+    let failed_record = failed_record
+        .unwrap_or_else(|| panic!("expected the failed launch in service state:\n{listed}"));
+    let service_id = failed_record
+        .lines()
+        .next()
+        .expect("failed service record has no id");
+    let logs = crate::run_rocm_ok(world, &["services", "logs", service_id]);
     assert!(
-        failed_record,
-        "expected the failed launch and service record to agree:\n{listed}"
+        logs.contains(FAKE_VLLM_ERROR),
+        "failed service log does not contain the fixture's terminal output:\n{logs}"
     );
 }
 
@@ -1230,6 +2273,128 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     assert!(
         output.to_lowercase().contains("no usable amd gpu"),
         "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+/// The discriminating assertion for the reuse pre-gate's acceptance term.
+///
+/// `spawn_managed_engine_child`'s reuse refusal is the only thing in `serve`
+/// that prints `rocm services stop`, and it is reachable only once the no-GPU
+/// bail has been bypassed. So its absence says the bypass was *not* granted —
+/// which is the whole point, since that advice cannot clear a no-GPU condition
+/// and stopping the service only removes the thing the re-run would have
+/// reused. Matched on the command token the CLI owns rather than the sentence
+/// around it. Captured pipe output, so a plain `contains` is right.
+#[then("the user is not told to stop the running server")]
+async fn assert_no_stop_the_running_server_advice(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("rocm services stop"),
+        "a live service this invocation cannot reuse must refuse on the GPU, not send the \
+         user to stop it and re-run into the same refusal:\n{output}"
+    );
+}
+
+/// serve-32's counterpart to `the user is not told to stop the running server`.
+///
+/// The recipe-mismatch refusal `spawn_managed_engine_child` raises does not
+/// print `rocm services stop` — it says to stop the service and run `rocm
+/// serve` again "to apply the requested options" — so the other step's token
+/// cannot see it. `different serve options` is the phrase that refusal owns,
+/// and it is reachable only once the no-GPU bail has been bypassed, so its
+/// absence says the bypass was not granted. Stopping the server would not clear
+/// a no-GPU condition either: the re-run would have nothing left to reuse and
+/// would hit the same refusal.
+#[then("the user is not told to relaunch the server with different options")]
+async fn assert_no_relaunch_with_different_options_advice(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("different serve options"),
+        "a live service this invocation cannot reuse must refuse on the GPU, not send the \
+         user to relaunch it with the requested options and back into the same refusal:\n{output}"
+    );
+}
+
+#[then("no engine was prepared for GPU serving")]
+async fn assert_no_engine_preparation(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // `ensure_self_managed_engine_ready` announces itself with exactly this line
+    // (`apps/rocm/src/main.rs`) immediately before it downloads and installs, so
+    // its absence is the observable "no engine work ran". Matched on the
+    // "Preparing " prefix rather than the whole sentence: that is the token the
+    // CLI owns, and it stays true if the rest of the sentence is reworded.
+    //
+    // Nothing here wraps — this is captured pipe output, not a PTY grid — so a
+    // plain `contains` is the right check.
+    assert!(
+        !output.contains("Preparing "),
+        "a live managed service for an unrelated model must not drag engine \
+         preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
+#[then("the CLI explains that the model needs a Hugging Face token")]
+async fn assert_hf_token_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs a Hugging Face token") && output.contains("--engine-env HF_TOKEN"),
+        "expected the gated-model refusal naming the remedy, got:\n{output}"
+    );
+}
+
+#[then("no service was started")]
+async fn assert_no_service_started(world: &mut E2eWorld) {
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records = std::fs::read_dir(&services_dir).map_or(0, Iterator::count);
+    assert_eq!(records, 0, "a refused serve left service records behind");
+}
+
+#[then("the refusal is that no usable GPU is visible")]
+async fn assert_refusal_is_no_usable_gpu(world: &mut E2eWorld) {
+    // The token gate and the GPU-family gate were both passed: the serve got as
+    // far as the GPU-required pre-flight, which the empty mask fails.
+    let output = serve_output(world);
+    assert!(
+        output.contains("no usable AMD GPU") && !output.contains("needs a Hugging Face token"),
+        "expected the exported token to clear its gate and the serve to stop at the \
+         GPU pre-flight, got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image has no profile for this GPU and names the GPUs it supports")]
+async fn assert_no_profile_for_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("has no profile for this GPU (gfx94X-dcgpu)")
+            && output.contains("it supports: gfx110X-all, gfx120X-all"),
+        "expected the unsupported-GPU refusal naming the detected and supported families, \
+         got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image needs eight GPUs and multi-GPU serving is not supported")]
+async fn assert_needs_eight_gpus(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs 8 GPUs") && output.contains("does not support multi-GPU serving"),
+        "expected the multi-GPU refusal, got:\n{output}"
+    );
+}
+
+#[then("Docker was never called")]
+async fn assert_docker_never_called(world: &mut E2eWorld) {
+    let log = docker_call_log(world);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "a refused serve reached Docker ({}):\n{calls}",
+        log.display()
     );
 }
 
@@ -1258,6 +2423,8 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
     //   - CLI, a mask is active on the runner — refused against the visible set.
     //   - CLI, no visible set could be enumerated — falls back to the raw detected
     //     count.
+    //   On native Windows the CLI's set is the AMD adapters Windows lists
+    //   (ROCMAI-824), so the first two shapes are what that lane prints.
     //   - ENGINE, on a host where neither the visible set nor the count could be
     //     probed: `--gpu` validation takes its permissive fallback and the engine's
     //     own probe makes the late rejection. Accepted deliberately, unlike in the
@@ -1275,6 +2442,152 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
+}
+
+#[given("a managed vLLM launch will run out of GPU memory")]
+async fn plant_oom_launch(world: &mut E2eWorld) {
+    // Nothing to plant on disk: unlike the reuse case, this scenario drives a
+    // real `rocm serve` launch. The launch's failed-with-OOM state (an owned log
+    // carrying a real allocator signature, status "starting", nothing reused) is
+    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook.
+    //
+    // Arming that hook is what this `Given` does, via the World's `command_env`
+    // fixture channel — the premise belongs to the premise step, and the `When`
+    // below stays a plain user action with no mechanism in it. It previously sat
+    // in the `When`, which left this step a no-op whose deletion changed nothing.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // through `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails loudly
+    // rather than silently skipping: the fault injection would not arm, the real
+    // GPU pre-flight would bail, and the `Then` steps would fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1".into()));
+}
+
+#[when("the user opens the interactive serve summary for that launch")]
+async fn open_oom_launch_summary(world: &mut E2eWorld) {
+    // A plain user action. The fault injection the premise arms (see the `Given`
+    // above) rides along on the World's `command_env`, which `TuiSession::spawn`
+    // applies per-child. With it armed, the GPU-required pre-flight is bypassed
+    // for the simulated launch, so no GPU is touched; the launch resolves the
+    // model, "spawns", writes an OOM log it owns, and reports `starting` —
+    // exactly the state the memory-guidance note keys on.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom-launch",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+#[then("the summary reflects the reused already-running service")]
+async fn assert_reused_running_service(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // Whitespace-insensitive: the heading is rendered onto an 80-column PTY
+    // grid, so a soft wrap falling between "already" and "running" would break a
+    // literal `contains`.
+    assert!(
+        screen_without_whitespace(&screen).contains("alreadyrunning"),
+        "expected the summary to reflect the reused live service:\n{screen}"
+    );
+}
+
+#[then("the deployment summary blames this launch for GPU memory")]
+async fn assert_oom_launch_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The note is a long line the 80-column PTY wraps across grid rows, so match
+    // whitespace-insensitively — otherwise a soft wrap between "GPU" and "memory"
+    // would break a literal `contains` and mask a rendered note.
+    assert!(
+        screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
+        "a managed launch that OOM'd must be blamed for GPU memory in its own \
+         deployment summary:\n{screen}"
+    );
+}
+
+#[then("the deployment summary names the GPU memory knobs")]
+async fn assert_oom_launch_names_knobs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The actionable fix: lower the reservation or move to a less-busy device.
+    // Assert on the flag names (whitespace-insensitive, since an 80-column wrap
+    // can split a token across rows) so a reworded preamble does not mask a
+    // dropped remediation. Both knobs the step promises are checked — the step
+    // passed while only `--gpu-memory-utilization` was asserted, so dropping
+    // `--gpu <index>` from the guidance would not have failed anything.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("--gpu-memory-utilization"),
+        "the OOM summary must name the memory knob `--gpu-memory-utilization`:\n{screen}"
+    );
+    assert!(
+        flattened.contains("--gpu<index>"),
+        "the OOM summary must also name the other knob it advertises, `--gpu <index>`:\n{screen}"
+    );
+}
+
+#[then("the deployment summary quotes the engine's own failing line")]
+async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The only assertion in this scenario that can fail on the symptom
+    // *selection*. The other two Then steps match text `oom_memory_note` emits
+    // unconditionally, so deleting the `is_rocm_authored_log_line` filter — or
+    // dropping the `rocm diagnose` sentence altogether — left serve-41 green
+    // while the note silently fell back to the canonical symptom. That is the
+    // bug the fixture's engine-error block was added to expose, and nothing
+    // asserted it.
+    //
+    // `Tried to allocate 7.21 GiB.` is what discriminates: the fixture's real
+    // line carries it and `VLLM_OOM_CANONICAL_SYMPTOM` does not, so a fallback
+    // fails here rather than passing as a near-match. Whitespace-collapsed for
+    // the same reason as its siblings — the command is long and the 80-column
+    // PTY wraps it across grid rows.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains(
+            "--symptom'vllm:torch.OutOfMemoryError:HIPoutofmemory.Triedtoallocate7.21GiB.'"
+        ),
+        "the summary must print `rocm diagnose --symptom` quoting the engine's own failing \
+         line, not rocm-cli's own hint and not the canonical fallback:\n{screen}"
+    );
+}
+
+/// Collapse a rendered PTY screen to its non-whitespace characters, so an
+/// assertion survives the terminal soft-wrapping a long line across grid rows
+/// (which inserts row breaks mid-phrase / mid-token). Only meaningful for
+/// needles that themselves contain no whitespace once collapsed.
+fn screen_without_whitespace(screen: &str) -> String {
+    screen.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 #[then("the user is told the pinned GPU is unavailable")]
@@ -1302,30 +2615,44 @@ async fn assert_masked_index_message(world: &mut E2eWorld) {
 
 #[then("the output shows the full model name")]
 async fn assert_full_model_name(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no CLI output");
-    let resolved = resolved_model(output)
-        .unwrap_or_else(|| panic!("no 'resolved model' in output:\n{output}"));
+    let runs = world.serve_runs.as_ref().expect("no serve run");
+    let run = runs.first().expect("no serve run");
+    let resolved = run
+        .resolved_model()
+        .unwrap_or_else(|| panic!("{}", run.missing_plan_message()));
     assert!(
         resolved.contains('/'),
-        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+        "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{}",
+        run.stdout
+    );
+}
+
+#[then("the model list output contains only ASCII characters")]
+async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no CLI output");
+    assert!(
+        output.contains("Recommended models"),
+        "expected the `rocm model` header to be present, got:\n{output}"
+    );
+    assert!(
+        output.is_ascii(),
+        "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+         mojibake on a Windows console using the OEM code page (ROCMAI-543): {output}"
     );
 }
 
 #[then("all engines expand to the same full model name")]
 async fn assert_consistent_expansion(world: &mut E2eWorld) {
-    let outputs = world.cli_outputs.as_ref().expect("no CLI outputs");
-    assert!(
-        outputs.len() >= 2,
-        "need at least 2 serve outputs to compare"
-    );
+    let runs = world.serve_runs.as_ref().expect("no serve runs");
+    assert!(runs.len() >= 2, "need at least 2 serve outputs to compare");
     let mut resolved: Vec<String> = Vec::new();
-    for (i, output) in outputs.iter().enumerate() {
+    for (i, run) in runs.iter().enumerate() {
         // A missing `resolved model:` line means the engine never got far enough
         // to expand the name (e.g. it errored before serving). Fail loudly rather
         // than defaulting to an empty string — otherwise two engines that both
         // fail would produce equal ("") values and pass this check vacuously.
-        let Some(model) = resolved_model(output).map(str::to_string) else {
-            panic!("engine #{i} produced no 'resolved model' line:\n{output}");
+        let Some(model) = run.resolved_model().map(str::to_string) else {
+            panic!("engine #{i}: {}", run.missing_plan_message());
         };
         resolved.push(model);
     }
@@ -1400,6 +2727,36 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
     );
 }
 
+#[then("the service uses the next automatic port")]
+async fn assert_next_automatic_port(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let rc = world.cli_rc.expect("no serve command was run");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["serve", "<model>", "--engine", "<engine>", "--managed"],
+            rc,
+            stdout,
+            stderr,
+        )
+    );
+    let expected = format!("endpoint: http://127.0.0.1:{}/v1", SERVE_PORT + 1);
+    let disclosure_line = stdout
+        .lines()
+        .position(|line| line.trim() == "Port: automatic; endpoint shown after launch");
+    let endpoint_line = stdout.lines().position(|line| line.trim() == expected);
+    assert!(
+        endpoint_line.is_some(),
+        "expected `{expected}` in real serve output:\n{stdout}"
+    );
+    assert!(
+        disclosure_line.is_some_and(|d| d < endpoint_line.unwrap()),
+        "the automatic-port disclosure must print before the resolved endpoint:\n{stdout}"
+    );
+}
+
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
     let Some(engine) = output
@@ -1412,24 +2769,13 @@ fn selected_engine(output: &str) -> &str {
     engine
 }
 
-/// The model a serve plan actually resolved to (`resolved model: <id>`), which
-/// can differ from the requested id — `rocm serve <model>` with no `--engine`
-/// picks the recipe's preferred model+engine. `None` if the plan has no such line
-/// (e.g. the serve errored before resolving).
-fn resolved_model(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("resolved model:"))
-        .map(str::trim)
-}
-
 /// A distinctive substring of a model id that appears in the served endpoint's
 /// `/v1/models` response, for [`model_is_ready`]'s containment check. Strips the
 /// `org/` prefix and the `-GGUF` catalog marker so a resolved catalog id
 /// (`Qwen3-4B-Instruct-2507-GGUF`) matches the concrete artifact the endpoint
 /// reports (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) — both share the base
 /// `Qwen3-4B-Instruct-2507`.
-fn ready_substr_for(model_id: &str) -> &str {
+pub(crate) fn ready_substr_for(model_id: &str) -> &str {
     let base = model_id.rsplit('/').next().unwrap_or(model_id);
     base.strip_suffix("-GGUF")
         .or_else(|| base.strip_suffix("-gguf"))
@@ -1552,4 +2898,323 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 /// match in either direction.
 fn model_ids_match(resp_model: &str, expected: &str) -> bool {
     e2e_cucumber::model_id::model_ids_match(resp_model, expected)
+}
+
+// ── `--require-api-key` reuse refusal (#604) ──────────────────────────
+
+/// Catalog id of the built-in Lemonade smoke-test recipe (`model_catalog.json`).
+/// Its `engine_recipes` list is empty, so a plain serve of this model on
+/// `lemonade` with no extra flags resolves `engine_recipe: None` — the planted
+/// record below omits `engine_recipe_json` (defaults to `null`) to match, so
+/// the idempotency guard's recipe-mismatch check never fires and the scenario
+/// reaches the `--require-api-key` check it exists to exercise.
+const REUSE_REFUSAL_MODEL: &str = "Qwen3-0.6B-GGUF";
+const REUSE_REFUSAL_ENGINE: &str = "lemonade";
+const REUSE_REFUSAL_SERVICE_ID: &str = "lemonade-e2e-reuse";
+
+/// Plants a live, unauthenticated managed-service record for
+/// [`REUSE_REFUSAL_MODEL`]/[`REUSE_REFUSAL_ENGINE`] — matching the idempotency
+/// guard's key of `(engine, canonical_model_id)` only, not a real listening
+/// port or process, so no actual Lemonade load is needed. `supervisor_pid: 0`
+/// is the documented placeholder for "no process recorded yet", so the
+/// liveness overlay reads `status` at face value instead of checking a PID —
+/// the same trick `service_stop_steps.rs` uses, and for the same reason: a
+/// *real* PID here would be actively harmful, since the World's teardown runs
+/// `rocm services stop <id> --yes` for every record left in the isolated tree.
+#[given("an unauthenticated Lemonade service is already running for that model")]
+async fn plant_unauthenticated_lemonade_service(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let services_dir = root.join("data").join("services");
+    let states_dir = root
+        .join("data")
+        .join("engines")
+        .join(REUSE_REFUSAL_ENGINE)
+        .join("state");
+    std::fs::create_dir_all(&services_dir).expect("failed to create services dir");
+    std::fs::create_dir_all(&states_dir).expect("failed to create engine state dir");
+
+    let manifest = services_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json"));
+    let record = serde_json::json!({
+        "service_id": REUSE_REFUSAL_SERVICE_ID,
+        "engine": REUSE_REFUSAL_ENGINE,
+        "model_ref": REUSE_REFUSAL_MODEL,
+        "canonical_model_id": REUSE_REFUSAL_MODEL,
+        "host": "127.0.0.1",
+        // Discard port: nothing here depends on a real server answering on it —
+        // the idempotency guard matches on engine + canonical model id only.
+        "port": 9,
+        "endpoint_url": "http://127.0.0.1:9/v1",
+        "mode": "managed",
+        "status": "starting",
+        "supervisor_pid": 0,
+        "engine_pid": null,
+        "requires_api_key": false,
+        "engine_recipe_json": null,
+        "manifest_path": manifest,
+        "log_path": services_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.log")),
+        "engine_state_path": states_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json")),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to write service record");
+    std::fs::write(
+        states_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json")),
+        serde_json::json!({ "status": "starting" }).to_string(),
+    )
+    .expect("failed to write engine state");
+}
+
+#[when("the user serves that same model again with --require-api-key")]
+async fn user_serves_requiring_api_key(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            REUSE_REFUSAL_MODEL,
+            "--engine",
+            REUSE_REFUSAL_ENGINE,
+            "--managed",
+            "--require-api-key",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves that same model again on an explicit port other than the running one")]
+async fn user_serves_other_explicit_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            REUSE_REFUSAL_MODEL,
+            "--engine",
+            REUSE_REFUSAL_ENGINE,
+            "--managed",
+            "--port",
+            "11500",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the port the running service uses")]
+async fn assert_refused_naming_running_port(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "an explicit port the running service does not use must be refused:\n{output}"
+    );
+    assert!(
+        output.contains(REUSE_REFUSAL_SERVICE_ID)
+            && output.contains("on port 9,")
+            && output.contains("port 11500 would not be used"),
+        "the refusal must name the running service and both ports:\n{output}"
+    );
+}
+
+#[then("the CLI names the exact command to stop the existing service")]
+async fn assert_names_stop_command(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
+        "the refusal must name the way out, directly runnable with --yes: {output}"
+    );
+}
+
+/// A second record, `e2e-stopped`, on the default serve port: the service the
+/// restart scenario tries to bring back. Cloned from the `e2e-mock` record
+/// `reserve_default_serve_port` planted, so its shape is the one the CLI reads.
+#[given("a stopped managed service is recorded on the default serve port")]
+async fn plant_stopped_service_on_default_port(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(services.join("e2e-mock.json")).expect("read e2e-mock record"),
+    )
+    .expect("parse e2e-mock record");
+    record["service_id"] = "e2e-stopped".into();
+    record["status"] = "stopped".into();
+    record["manifest_path"] = services.join("e2e-stopped.json").to_string_lossy().into();
+    record["log_path"] = services.join("e2e-stopped.log").to_string_lossy().into();
+    record["engine_state_path"] = services
+        .join("e2e-stopped.state.json")
+        .to_string_lossy()
+        .into();
+    std::fs::write(
+        services.join("e2e-stopped.json"),
+        serde_json::to_vec_pretty(&record).expect("serialize record"),
+    )
+    .expect("write stopped record");
+}
+
+#[when("the user restarts the stopped service")]
+async fn user_restarts_stopped_service(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["services", "restart", "e2e-stopped", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the restart is refused naming the service that holds the port")]
+async fn assert_restart_refused_naming_holder(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no restart rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "the restart must be refused, but exited 0:\n{output}"
+    );
+    assert!(
+        output.contains("e2e-mock") && output.contains("recorded on that port"),
+        "the refusal must name the service holding the port:\n{output}"
+    );
+    // Nothing was spawned: the stopped record is still stopped.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("data").join("services").join("e2e-stopped.json"))
+            .expect("read stopped record"),
+    )
+    .expect("parse stopped record");
+    assert_eq!(record["status"], "stopped", "{record}");
+}
+
+#[then("the CLI refuses and names the exact command to stop the existing service")]
+async fn assert_refused_with_stop_hint(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "reusing an unauthenticated service must not satisfy --require-api-key, but serve exited 0:\n{output}"
+    );
+    assert!(
+        output.contains("without authentication"),
+        "the refusal must say why it refused: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
+        "the refusal must name the way out, directly runnable with --yes: {output}"
+    );
+}
+
+#[then("running that command actually stops the service")]
+async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &["services", "stop", REUSE_REFUSAL_SERVICE_ID, "--yes"],
+    );
+    assert!(
+        stdout.contains("stopped"),
+        "stopping the planted service must report success:\n{stdout}"
+    );
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let manifest = root
+        .join("data")
+        .join("services")
+        .join(format!("{REUSE_REFUSAL_SERVICE_ID}.json"));
+    let bytes = std::fs::read(&manifest).expect("failed to read service record");
+    let record: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("failed to parse service record");
+    assert_eq!(
+        record.get("status").and_then(serde_json::Value::as_str),
+        Some("stopped"),
+        "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+#[when("the user serves a model with both --wait and --verbose")]
+async fn serve_wait_and_verbose(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen", "--wait", "--verbose"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the conflicting flags")]
+async fn serve_wait_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let text = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected refusal, got rc=0:\n{text}");
+    assert!(
+        text.contains("--wait") && text.contains("--verbose"),
+        "expected both flags named, got:\n{text}"
+    );
+}
+
+/// The discriminating assertion for the fabricated-launch daemon suppression.
+///
+/// `simulate_oom_managed_launch` writes a `starting` record for a process that
+/// never existed, so `ensure_background_helper_running_quiet` would leave a
+/// `rocm daemon` supervising a pid that will never appear — and nothing in this
+/// scenario's teardown stops it. Observed in the wild as daemons outliving their
+/// e2e checkout by days.
+///
+/// Without this step the suppression was untested: deleting the
+/// `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs` left serve-41 green,
+/// because every other assertion here is about the summary text. Both artefacts
+/// the autostart path can leave are checked, since the daemon publishes its
+/// runtime-state only after it is up — a spawn caught in the window before that
+/// shows up as a claim and nothing else.
+#[then("no background automation daemon was left behind")]
+async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("automations");
+
+    let state_path = root.join("runtime-state.json");
+    if let Ok(text) = std::fs::read_to_string(&state_path) {
+        let state: serde_json::Value =
+            serde_json::from_str(&text).expect("automation runtime-state is not valid JSON");
+        assert_ne!(
+            state.get("running").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a fabricated OOM launch must not start the automation daemon, but \
+             {} says one is running:\n{text}",
+            state_path.display()
+        );
+    }
+
+    let claim_path = root.join("autostart.claim");
+    assert!(
+        !claim_path.is_file(),
+        "a fabricated OOM launch must not even claim a daemon autostart, but {} exists: {:?}",
+        claim_path.display(),
+        std::fs::read_to_string(&claim_path).ok()
+    );
 }

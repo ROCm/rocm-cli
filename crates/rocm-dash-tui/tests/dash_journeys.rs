@@ -14,8 +14,8 @@
 //! characterization in `dash_characterization.rs`.
 //!
 //! Note: the key→action reducer (`handle_key`/`apply_action`) is module-private,
-//! so its keystroke-level tests live in-module (`src/app/mod.rs`); here we drive
-//! the equivalent public state mutations an integration crate can reach.
+//! so its keystroke-level tests live in-module (`src/app/actions.rs`); here we
+//! drive the equivalent public state mutations an integration crate can reach.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -39,6 +39,7 @@ fn synthetic_snapshot() -> Snapshot {
             gpu_utilization_pct: 66.0,
             temperature_c: 61.0,
             power_w: 410.0,
+            power_limit_w: None,
             clock_mhz: Some(2050.0),
         }],
         gpu_system_info: Some(GpuSystemInfo {

@@ -109,10 +109,13 @@ SELFTEST_SCOPE="${RECLAIM_SELFTEST_SCOPE:-}"
 
 usage() {
   cat <<'EOF'
-Usage: reclaim-gpu.sh [--dry-run | --report-holders | --self-test]
+Usage: reclaim-gpu.sh [--dry-run | --assert-clear | --report-holders | --self-test]
 
   (no flags)        Terminate leaked E2E engine processes and report what was killed.
   --dry-run         List what would be terminated; kill nothing.
+  --assert-clear    Exit non-zero when any leaked E2E engine process is still
+                    running, naming each one. Kills nothing. The GPU preflight's
+                    process-based gate (#446).
   --report-holders  Print current GPU holders and candidate processes, for
                     diagnosing a preflight failure. Kills nothing, never fails.
   --self-test       Verify the matching rules against decoy processes. No GPU needed.
@@ -404,16 +407,84 @@ report_holders() {
   select_leaked || true
 }
 
+# Fail when any leaked E2E engine process is still running. The process-based
+# half of the GPU preflight (#446); kills nothing.
+#
+# WHY IT EXISTS ALONGSIDE THE FREE-MEMORY FLOOR, and does not replace it. That
+# floor is a fixed 8 GiB (APU lanes) or 16 GiB (discrete) applied to whatever
+# pool rocm-smi reports, so its sensitivity is set by the POOL's size and not by
+# what a serve holds: against a ~62 GiB Strix GTT aperture it trips only past
+# ~54 GiB held, and against a 192 GiB MI300X only past ~176 GiB. A leftover
+# llama-server holding 10-20 GiB — the exact thing the step exists to catch —
+# clears every lane's floor. This mode catches that process directly, by name.
+#
+# The floor stays because the converse is just as real and this cannot see it: a
+# non-E2E tenant on a shared self-hosted host can exhaust the pool while running
+# nothing the rule below matches. The two are complementary gates, not
+# alternatives, and each is the only one that catches its own case.
+#
+# Reuses select_leaked, so the rule, the SELFTEST_SCOPE filter and the
+# E2E_ROOTS / ENGINE_MARKERS lists are the SAME ones the reclaim acts on. A
+# second matcher written against the same intent is precisely how the inline
+# `pkill -f` patterns drifted out of agreement with what a serve looks like.
+#
+# The inherited exposure is inherited whole: a process selected here is one
+# `reclaim` would have SIGKILLed, so anything the anchoring over-matches (see
+# WHAT THE ANCHORING DOES AND DOES NOT BUY) fails a lane here rather than
+# merely dying. That is the quieter failure of the two, and it names the pid.
+assert_clear() {
+  local selected pid cmdline
+  selected="$(select_leaked)"
+  if [[ -z "${selected}" ]]; then
+    echo "assert-clear: no leaked E2E engine processes are running"
+    return 0
+  fi
+  # stderr, so a lane that pipes stdout somewhere still surfaces this, and the
+  # pids are listed rather than counted: "1 survivor" tells the next reader
+  # nothing they can act on, which is the complaint this whole script answers.
+  echo "assert-clear: leaked E2E engine process(es) still holding the GPU:" >&2
+  while IFS=$'\t' read -r pid cmdline; do
+    [[ -n "${pid}" ]] || continue
+    echo "  pid=${pid} cmd=${cmdline}" >&2
+  done <<<"${selected}"
+  return 1
+}
+
 # Spawn a decoy whose argv[0] is a real-shaped path, so the match is tested
 # against the same string a live engine process would present.
+#
+# The bash running this script, started under that argv[0] with `exec -a`, so
+# no binary is copied and nothing depends on how coreutils is built. Not sleep:
+# where coreutils is a multicall binary (uutils, the default since Ubuntu 25.10),
+# /bin/sleep picks the tool to run from the name it was started under, so a copy
+# named llama-server prints "unknown program" and exits before the self-test can
+# see it, and uutils reads that name from argv[0] on some targets and from the
+# executed path on others. bash ignores its argv[0] unless it is `sh`.
+#
+# The body is the `read` builtin on a FIFO the shell holds open for reading AND
+# writing, so the read never sees end of file. Being a builtin, it forks
+# nothing: the decoy is this one pid, a TERM ends it like the engine it stands
+# in for, and killing it leaves no child behind.
 spawn_decoy() {
   local path="$1"
   mkdir -p "$(dirname "${path}")"
-  cp /bin/sleep "${path}"
-  # Detach stdio: this runs inside a command substitution, and a background
-  # child holding the capture pipe open would block the caller until it exits.
-  "${path}" 300 >/dev/null 2>&1 &
+  mkfifo "${path}.hold"
+  # Detach stdout/stderr: this runs inside a command substitution, and a
+  # background child holding the capture pipe open would block the caller until
+  # it exits.
+  (exec -a "${path}" "${BASH}" -c 'read -r _' <>"${path}.hold" >/dev/null 2>&1) &
   echo $!
+}
+
+# Fail, naming the decoy, when one is no longer running. A decoy that died at
+# spawn otherwise surfaces later as a selection or containment FAIL that blames
+# the rules — which is how ubuntu-26.04's multicall `sleep` first showed up.
+selftest_require_alive() {
+  local pid="$1"
+  local what="$2"
+  process_alive "${pid}" && return 0
+  echo "FAIL: ${what} decoy (pid=${pid}) is not running; it exited at spawn, so the checks that read it test nothing"
+  return 1
 }
 
 # Spawn a process that becomes a ZOMBIE and stays one, plus the keeper holding
@@ -458,7 +529,7 @@ spawn_zombie() {
 }
 
 # Spawn a decoy that IGNORES SIGTERM, so the TERM -> grace -> KILL escalation is
-# exercised. A plain `cp /bin/sleep` decoy dies on the first TERM and leaves the
+# exercised. A plain spawn_decoy decoy dies on the first TERM and leaves the
 # escalation branch unreached, which is how it went untested.
 spawn_stubborn_decoy() {
   local path="$1"
@@ -478,9 +549,8 @@ DECOY
 # Spawn a decoy carrying the record delimiters INSIDE one argument — a newline
 # and a tab, as a `--chat-template` or `--prompt` value does.
 #
-# Not spawn_decoy with an extra argument: that decoy is `cp /bin/sleep`, and
-# sleep rejects a non-numeric argument and exits before it can be observed. This
-# needs something that ignores what it is handed and stays alive.
+# A helper of its own because spawn_decoy passes no arguments through. Like that
+# decoy, it ignores what it is handed and stays alive.
 #
 # Ordinary in every other respect — it must die on SIGTERM, so it is the stubborn
 # decoy's body without the trap. Its `sleep 1` children name no E2E root, so they
@@ -619,6 +689,7 @@ self_test() {
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
   local holders_out holders_engines tmp_case
+  local assert_clear_out assert_clear_rc late_decoy late_pid
   local decoy_pids
   local superseded_hit=0
   local probe_failures=0
@@ -694,8 +765,9 @@ self_test() {
   # here — including one a later edit adds, which is the case this guards.
   #
   # The flip side is worth knowing: because a broken spawn does not abort, it
-  # yields a live-looking pid for a process that died immediately, and surfaces
-  # later as a confusing assertion failure rather than as "the spawn failed".
+  # yields a live-looking pid for a process that died immediately. The
+  # selftest_require_alive calls after the spawns turn that into a FAIL naming
+  # the decoy, rather than a confusing assertion failure further down.
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   selftest_track_decoy "${prewarm_pid}"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
@@ -719,8 +791,9 @@ self_test() {
   # `selftest_track_decoy` call is silent AND leaks for real: both the EXIT trap
   # and the final kill read this same list, so an untracked decoy is signalled
   # by nothing. It survives even a GREEN run — measured, the `/workload` fixture
-  # outlives the suite by its full 300s, because `reclaim` is supposed to spare
-  # that one and the tracked list is the only other thing that would kill it.
+  # outlived the suite (spawn_decoy's decoys never exit on their own), because
+  # `reclaim` is supposed to spare that one and the tracked list is the only
+  # other thing that would kill it.
   # (An earlier version of this comment claimed such a decoy "is still killed at
   # the end". It is not, and it is only incidentally true for the three fixtures
   # `reclaim` itself signals.)
@@ -738,6 +811,12 @@ self_test() {
   fi
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
+  selftest_require_alive "${prewarm_pid}" 'pre-warm' || failures=$((failures + 1))
+  selftest_require_alive "${workload_pid}" '/workload' || failures=$((failures + 1))
+  selftest_require_alive "${harness_pid}" 'harness' || failures=$((failures + 1))
+  selftest_require_alive "${stubborn_pid}" 'stubborn' || failures=$((failures + 1))
+  selftest_require_alive "${outside_pid}" 'bystander' || failures=$((failures + 1))
+  selftest_require_alive "${delimiter_pid}" 'delimiter' || failures=$((failures + 1))
 
   # 1. Regression guard: the patterns this script replaced could not see a
   #    pre-warm engine process. If this ever matches, the decoy stopped being
@@ -1210,9 +1289,74 @@ self_test() {
     failures=$((failures + 1))
   fi
 
+  # 14. --assert-clear, BOTH directions. A gate that cannot fail is worth
+  #     nothing, and this one gates every self-hosted lane: asserting only the
+  #     clear case would pass against `assert_clear() { return 0; }`.
+  #
+  #     The clear case runs HERE rather than before check 10 because this is the
+  #     only point where the scope is genuinely empty: reclaim has taken the
+  #     three in-scope leaks, and the three survivors are survivors precisely
+  #     because the rule does not select them — the manual serve (no E2E root),
+  #     the harness binary (no engine marker) and the out-of-scope bystander
+  #     (which matches the rule IN FULL and is excluded only by
+  #     SELFTEST_SCOPE). So this also pins that assert_clear reads the same
+  #     three exclusions the reclaim does, rather than an emptier world.
+  if assert_clear_out="$(assert_clear 2>&1)"; then
+    echo "ok: --assert-clear passes when nothing matching is running"
+  else
+    echo "FAIL: --assert-clear failed with no leaked engine process: ${assert_clear_out}"
+    failures=$((failures + 1))
+  fi
+  if grep -q 'no leaked E2E engine processes are running' <<<"${assert_clear_out}"; then
+    echo "ok: --assert-clear says so when it finds nothing"
+  else
+    echo "FAIL: --assert-clear passed without reporting what it found"
+    failures=$((failures + 1))
+  fi
+  #     A FRESH leak, spawned after the reclaim, rather than reusing a decoy
+  #     from before it: the processes this mode exists to catch are the ones
+  #     that survived a reclaim, and a check driven from a pre-reclaim pid
+  #     would pass against an assert_clear that merely replayed check 10's
+  #     selection instead of taking its own.
+  late_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9755/llama-server"
+  late_pid="$(spawn_decoy "${late_decoy}")"
+  selftest_track_decoy "${late_pid}"
+  decoy_pids+=("${late_pid}")
+  # Same beat the spawns above are given: /proc carries the pid before it
+  # carries the full argv, and a read that lands in between sees a command line
+  # that matches nothing — which would report this check as a pass.
+  sleep 1
+  selftest_require_alive "${late_pid}" 'late leak' || failures=$((failures + 1))
+  assert_clear_rc=0
+  assert_clear_out="$(assert_clear 2>&1)" || assert_clear_rc=$?
+  if [[ "${assert_clear_rc}" -ne 0 ]]; then
+    echo "ok: --assert-clear fails while a leaked engine process is alive (exit ${assert_clear_rc})"
+  else
+    echo "FAIL: --assert-clear passed with a leaked engine process alive; the gate cannot fail"
+    failures=$((failures + 1))
+  fi
+  #     The pid, not just a non-zero exit: an operator reading a red preflight
+  #     has to be able to go and look at the process, and a bare "found
+  #     something" is the report this script was written to stop producing.
+  if grep -q "pid=${late_pid} " <<<"${assert_clear_out}"; then
+    echo "ok: --assert-clear names the surviving process"
+  else
+    echo "FAIL: --assert-clear did not name pid=${late_pid}: ${assert_clear_out}"
+    failures=$((failures + 1))
+  fi
+  #     And it must not have killed it — the preflight calls this to decide,
+  #     not to act, and a mode that reclaimed silently would make a red lane
+  #     green on the retry with nothing to explain either run.
+  if process_alive "${late_pid}"; then
+    echo "ok: --assert-clear reports without signalling"
+  else
+    echo "FAIL: --assert-clear killed the process it was asked only to report"
+    failures=$((failures + 1))
+  fi
+
   # Includes prewarm_pid: on a GREEN run reclaim has already killed it, but on a
   # FAILED run it was not selected, and it would otherwise outlive the scratch
-  # tree for its full 300s as an orphan. Killing the zombie's keeper lets init
+  # tree as an orphan that never exits on its own. Killing the zombie's keeper lets init
   # reap the zombie itself.
   kill -KILL "${decoy_pids[@]}" 2>/dev/null || true
 
@@ -1255,6 +1399,7 @@ main() {
       rm -rf "$(scenario_tmp_root)"/rocm-e2e-* /tmp/rocm-e2e-* 2>/dev/null || true
       ;;
     --dry-run) reclaim 1 ;;
+    --assert-clear) assert_clear ;;
     --report-holders) report_holders ;;
     --self-test) self_test ;;
     -h | --help) usage ;;

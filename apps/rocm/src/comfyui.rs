@@ -2,26 +2,31 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::cli_progress::AnimatedSpinner;
-use crate::{format_structured_tool_call, runtime_usability_status, therock};
+use crate::cli::ComfyuiCommand;
+use crate::cli_audit::record_cli_audit_event;
+use crate::therock;
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
+use process::{comfyui_run_state_cli_label, endpoint_is_reachable, evaluate_running_state};
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
-    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
-    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
-    uv_command_env, uv_pip_install_base,
+    AppPaths, RocmCliConfig, format_http_base_url, runtime_is_windows,
+    runtime_path_for_windows_child, unix_time_millis,
 };
+use runtime_env::apply_runtime_environment;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write as IoWrite};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+
+mod install;
+mod process;
+mod runtime_env;
+mod source_swap;
+
+pub(crate) use install::install;
+pub(crate) use process::{start, stop};
 
 const APP_ID: &str = "comfyui";
 const APP_NAME: &str = "ComfyUI";
@@ -55,6 +60,169 @@ pub(crate) struct ComfyUiStartOptions {
     pub host: String,
     pub port: u16,
     pub no_open_browser: bool,
+}
+
+pub(crate) fn run(command: Option<ComfyuiCommand>) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    match command.unwrap_or(ComfyuiCommand::Status) {
+        ComfyuiCommand::Status => {
+            print!("{}", render_status(&paths, &config)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_status",
+                "info",
+                "rendered ComfyUI status",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::ModelsPath => {
+            print!("{}", render_models_path(&paths)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_models_path",
+                "info",
+                "rendered ComfyUI models path",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::Logs { lines } => {
+            print!("{}", render_logs(&paths, lines)?);
+            record_cli_audit_event(
+                &paths,
+                "app",
+                "comfyui_logs",
+                "info",
+                "rendered ComfyUI logs",
+                None,
+            );
+            Ok(())
+        }
+        ComfyuiCommand::Install {
+            runtime_id,
+            reinstall,
+            dry_run,
+            yes: _,
+        } => {
+            match install(
+                &paths,
+                &config,
+                ComfyUiInstallOptions {
+                    runtime_id: runtime_id.clone(),
+                    reinstall,
+                    dry_run,
+                },
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    record_cli_audit_event(
+                        &paths,
+                        "app",
+                        if dry_run {
+                            "comfyui_install_dry_run"
+                        } else {
+                            "comfyui_install"
+                        },
+                        "info",
+                        format!(
+                            "ComfyUI install completed runtime={} reinstall={} dry_run={}",
+                            runtime_id.as_deref().unwrap_or("<selected>"),
+                            reinstall,
+                            dry_run
+                        ),
+                        None,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    record_cli_audit_event(
+                        &paths,
+                        "app",
+                        if dry_run {
+                            "comfyui_install_dry_run"
+                        } else {
+                            "comfyui_install"
+                        },
+                        "error",
+                        format!(
+                            "ComfyUI install failed runtime={} reinstall={} dry_run={}: {error}",
+                            runtime_id.as_deref().unwrap_or("<selected>"),
+                            reinstall,
+                            dry_run
+                        ),
+                        None,
+                    );
+                    Err(error)
+                }
+            }
+        }
+        ComfyuiCommand::Start {
+            host,
+            port,
+            no_open_browser,
+            yes: _,
+        } => match start(
+            &paths,
+            ComfyUiStartOptions {
+                host,
+                port,
+                no_open_browser,
+            },
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_start",
+                    "info",
+                    "ComfyUI start requested",
+                    None,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_start",
+                    "error",
+                    format!("ComfyUI start failed: {error}"),
+                    None,
+                );
+                Err(error)
+            }
+        },
+        ComfyuiCommand::Stop { yes: _ } => match stop(&paths) {
+            Ok(text) => {
+                print!("{text}");
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "info",
+                    "ComfyUI stop requested",
+                    None,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                record_cli_audit_event(
+                    &paths,
+                    "app",
+                    "comfyui_stop",
+                    "error",
+                    format!("ComfyUI stop failed: {error}"),
+                    None,
+                );
+                Err(error)
+            }
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,11 +300,88 @@ pub(crate) const fn default_port() -> u16 {
     COMFYUI_DEFAULT_PORT
 }
 
+/// The facts the chat's ComfyUI status answer is built from, read the way
+/// [`render_status`] reads them rather than scraped from its text.
+struct StatusSummary {
+    installed: bool,
+    /// The URL of a ComfyUI that answers, whether or not rocm-cli started it.
+    running_url: Option<String>,
+    starting: bool,
+    /// What `status` and `start` say about a reinstall that stopped part-way.
+    interrupted_reinstall: Option<String>,
+}
+
+fn status_summary(paths: &AppPaths) -> Result<StatusSummary> {
+    let manifest = load_manifest(paths)?;
+    let interrupted_reinstall = manifest
+        .as_ref()
+        .filter(|manifest| source_swap::swap_interrupted(&manifest.source_path))
+        .map(|manifest| interrupted_reinstall_advice(&manifest.runtime_key));
+    let (running_url, starting) = match load_state(paths)? {
+        Some(state) => match evaluate_running_state(&state).state {
+            ComfyUiRunState::Running => (Some(state.url), false),
+            ComfyUiRunState::Starting => (None, true),
+            ComfyUiRunState::Stopped => (None, false),
+        },
+        None => (default_unmanaged_running_url(), false),
+    };
+    Ok(StatusSummary {
+        installed: manifest.is_some(),
+        running_url,
+        starting,
+        interrupted_reinstall,
+    })
+}
+
+/// The chat's answer to "what is ComfyUI's status". It advises `start` only
+/// when nothing is running or starting and `start` would not refuse; it passes
+/// on the interrupted-reinstall note, which names the command to run instead.
+pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
+    let summary = status_summary(paths)?;
+    let mut output = String::new();
+    writeln!(output, "ComfyUI status")?;
+    writeln!(output)?;
+    if summary.installed {
+        writeln!(output, "ComfyUI: installed")?;
+    } else {
+        writeln!(output, "ComfyUI: not installed yet")?;
+    }
+    if let Some(url) = &summary.running_url {
+        writeln!(output, "Running: yes")?;
+        writeln!(output, "URL: {url}")?;
+    } else if summary.starting {
+        writeln!(output, "Running: starting")?;
+    } else {
+        writeln!(output, "Running: no")?;
+    }
+    if let Some(note) = &summary.interrupted_reinstall {
+        writeln!(output, "Note: {note}.")?;
+    }
+    if !summary.installed {
+        writeln!(
+            output,
+            "To install it, ask `can you setup ComfyUI for me` or run `rocm comfyui install`."
+        )?;
+    } else if summary.running_url.is_none()
+        && !summary.starting
+        && summary.interrupted_reinstall.is_none()
+    {
+        writeln!(
+            output,
+            "To open it, ask `can you start ComfyUI` or run `rocm comfyui start`."
+        )?;
+    }
+    writeln!(output)?;
+    writeln!(output, "Nothing was changed.")?;
+    Ok(output)
+}
+
 pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
     writeln!(output)?;
 
+    let mut interrupted = false;
     if let Some(manifest) = load_manifest(paths)? {
         writeln!(output, "  installed: yes")?;
         writeln!(
@@ -144,7 +389,7 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
             "  ROCm runtime: {}",
             therock::runtime_version_display(&manifest.runtime_version)
         )?;
-        writeln!(output, "  folder: {}", manifest.runtime_root.display())?;
+        writeln!(output, "  folder: {}", manifest.source_path.display())?;
         writeln!(
             output,
             "  models path: {}",
@@ -159,6 +404,14 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
                 "failed"
             }
         )?;
+        if source_swap::swap_interrupted(&manifest.source_path) {
+            interrupted = true;
+            writeln!(
+                output,
+                "  note: {}",
+                interrupted_reinstall_advice(&manifest.runtime_key)
+            )?;
+        }
     } else {
         writeln!(output, "  installed: no")?;
         writeln!(output, "  next step: rocm comfyui install")?;
@@ -179,9 +432,12 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
             ComfyUiRunState::Starting => {
                 writeln!(output, "  note: starting")?;
             }
-            ComfyUiRunState::Stopped => {
+            // `start` refuses an interrupted reinstall; the note above names
+            // the command to run first.
+            ComfyUiRunState::Stopped if !interrupted => {
                 writeln!(output, "  next step: rocm comfyui start")?;
             }
+            ComfyUiRunState::Stopped => {}
         }
     } else {
         writeln!(output)?;
@@ -277,407 +533,37 @@ fn render_logs_with_options(
     Ok(output)
 }
 
-pub(crate) fn install(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    options: ComfyUiInstallOptions,
-) -> Result<String> {
-    paths.ensure()?;
-    let runtime = select_runtime(paths, config, options.runtime_id.as_deref())?;
-    let app_root = runtime_app_root(&runtime.manifest);
-    let source_path = source_path_from_app_root(&app_root);
-    let log_path = install_log_path_from_app_root(&app_root);
-    let requirements_path = source_path.join("requirements.txt");
-    let models_folder = models_folder_for_source(&source_path);
-    let runtime_env = runtime_environment_from_runtime(&runtime.manifest, &runtime.python);
-
-    let mut output = String::new();
-    writeln!(output, "{APP_NAME}")?;
-    writeln!(output, "  action: install")?;
-    writeln!(
-        output,
-        "  ROCm runtime: {}",
-        therock::runtime_version_display(&runtime.manifest.version)
-    )?;
-    writeln!(output, "  folder: {}", app_root.display())?;
-    writeln!(output, "  models path: {}", models_folder.display())?;
-
-    if options.dry_run {
-        writeln!(output, "  mode: dry-run")?;
-        writeln!(
-            output,
-            "  install command: {}",
-            format_structured_tool_call(
-                "rocm",
-                &[
-                    "comfyui".to_owned(),
-                    "install".to_owned(),
-                    "--runtime-id".to_owned(),
-                    runtime.manifest.runtime_key,
-                ],
-            )
-        )?;
-        return Ok(output);
-    }
-
-    fs::create_dir_all(
-        log_path
-            .parent()
-            .context("ComfyUI install log path has no parent directory")?,
-    )?;
-    let mut log = fs::File::create(&log_path)
-        .with_context(|| format!("failed to create {}", log_path.display()))?;
-    writeln!(log, "{APP_NAME} install")?;
-    writeln!(log, "runtime_key={}", runtime.manifest.runtime_key)?;
-    writeln!(log, "python={}", runtime.python.display())?;
-
-    if options.reinstall && source_path.exists() {
-        writeln!(log, "Removing existing ComfyUI folder.")?;
-        fs::remove_dir_all(&source_path)
-            .with_context(|| format!("failed to remove {}", source_path.display()))?;
-    }
-    let source_url = if source_path.exists() {
-        println!("Using existing ComfyUI source folder...");
-        let _ = io::stdout().flush();
-        writeln!(
-            log,
-            "Using existing ComfyUI folder at {}.",
-            source_path.display()
-        )?;
-        reused_source_url(paths)
-    } else {
-        println!("Downloading ComfyUI source...");
-        let _ = io::stdout().flush();
-        download_and_extract_source(&app_root, &source_path, &mut log)?
-    };
-    fs::create_dir_all(&models_folder)
-        .with_context(|| format!("failed to create {}", models_folder.display()))?;
-
-    let packages = filtered_requirement_specs(&requirements_path)?;
-    writeln!(
-        log,
-        "Installing {} ComfyUI dependency specs.",
-        packages.len()
-    )?;
-    if !packages.is_empty() {
-        println!("Installing ComfyUI dependencies...");
-        let _ = io::stdout().flush();
-        let uv = ensure_uv_binary(paths)
-            .context("failed to acquire uv binary for ComfyUI dependency install")?;
-        // Pin the managed runtime's ROCm torch stack to its exact installed
-        // versions so a transitive ComfyUI dependency cannot resolve `torch` (and
-        // its `nvidia-*` CUDA deps) from PyPI and clobber it (EAI-8051). Filtering
-        // torch out of the direct specs is not enough — the resolver reaches it
-        // transitively. A constraint fails loudly on a genuine version conflict,
-        // which leaves the runtime intact rather than silently corrupting it.
-        let constraints = torch_stack_constraints(&runtime.python, Some(&runtime_env), &mut log)?;
-        let constraints_path = write_torch_constraints(&app_root, &constraints, &mut log)?;
-        run_uv_logged_command(
-            paths,
-            &uv,
-            uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
-            Some(&runtime_env),
-            &mut log,
-            &log_path,
-            "install ComfyUI dependencies",
-            "Resolving and installing packages with uv…",
-        )?;
-    }
-
-    println!("Checking AMD GPU access for ComfyUI...");
-    let _ = io::stdout().flush();
-    let probe = probe_comfyui(&runtime.python, &source_path, Some(&runtime_env))?;
-    if !probe.torch_cuda_available {
-        bail!("ComfyUI install finished, but the AMD GPU check failed. No CPU mode was used.");
-    }
-    let manifest = ComfyUiManifest {
-        app_id: APP_ID.to_owned(),
-        runtime_key: runtime.manifest.runtime_key.clone(),
-        runtime_id: runtime.manifest.runtime_id.clone(),
-        runtime_version: runtime.manifest.version.clone(),
-        runtime_root: runtime.manifest.install_root.clone(),
-        python_executable: runtime.python.clone(),
-        source_url,
-        source_path: source_path.clone(),
-        requirements_path,
-        pip_cache_dir: None,
-        log_path,
-        torch_version: probe.torch_version.clone(),
-        torch_cuda_available: probe.torch_cuda_available,
-        installed_at_unix_ms: unix_time_millis(),
-    };
-    save_manifest(paths, &manifest)?;
-
-    writeln!(output, "  installed: yes")?;
-    writeln!(
-        output,
-        "  AMD GPU: ready ({} device{})",
-        probe.device_count,
-        if probe.device_count == 1 { "" } else { "s" }
-    )?;
-    if !probe.devices.is_empty() {
-        writeln!(output, "  GPU: {}", probe.devices.join(", "))?;
-    }
-    writeln!(output, "  next step: rocm comfyui start")?;
-    Ok(output)
+/// What `start` and `status` say about a reinstall that stopped part-way. The
+/// command names the runtime the install belongs to, so it finishes that
+/// install rather than one in whichever runtime is the default now; an install
+/// started there finds the swap's marker and completes it.
+fn interrupted_reinstall_advice(runtime_key: &str) -> String {
+    format!(
+        "a reinstall was interrupted; run `{}` to finish it",
+        finishing_install_command(runtime_key)
+    )
 }
 
-pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<String> {
-    let manifest = load_manifest(paths)?.context("ComfyUI is not installed yet")?;
-    if !manifest.source_path.join("main.py").is_file() {
-        bail!(
-            "ComfyUI main.py is missing from {}; reinstall ComfyUI",
-            manifest.source_path.display()
-        );
-    }
-    let runtime_env = runtime_environment_for_manifest(paths, &manifest)?;
-    let models_folder = models_folder_for_manifest(&manifest);
-    fs::create_dir_all(&models_folder)
-        .with_context(|| format!("failed to create {}", models_folder.display()))?;
-    let probe = probe_comfyui(
-        &manifest.python_executable,
-        &manifest.source_path,
-        Some(&runtime_env),
-    )?;
-    if !probe.torch_cuda_available {
-        bail!("ComfyUI cannot start because the AMD GPU check failed. No CPU mode was used.");
-    }
-    let url = format_http_base_url(&options.host, options.port);
-    let log_path = start_log_path_for_manifest(&manifest);
-    fs::create_dir_all(
-        log_path
-            .parent()
-            .context("ComfyUI start log path has no parent directory")?,
-    )?;
-    fs::File::create(&log_path)
-        .with_context(|| format!("failed to create {}", log_path.display()))?;
-    let pid = spawn_comfyui_background(paths, &manifest, &options, &runtime_env, &log_path)?;
-    let state = ComfyUiState {
-        app_id: APP_ID.to_owned(),
-        url: url.clone(),
-        host: options.host.clone(),
-        port: options.port,
-        pid,
-        source_path: manifest.source_path.clone(),
-        python_executable: manifest.python_executable,
-        log_path: log_path.clone(),
-        started_at_unix_ms: unix_time_millis(),
-    };
-    save_state(paths, &state)?;
-    let run_report = wait_for_running_state(&state, Duration::from_mins(3));
-    if run_report.state == ComfyUiRunState::Stopped {
-        bail!(
-            "ComfyUI stopped before the local URL was ready. Check the log at {}",
-            log_path.display()
-        );
-    }
-    let browser_status = if options.no_open_browser {
-        "not opened (--no-open-browser)".to_owned()
-    } else {
-        match open_browser(&url) {
-            Ok(()) => "opened".to_owned(),
-            Err(error) => format!("not opened ({error})"),
-        }
-    };
-
-    let mut output = String::new();
-    writeln!(output, "{APP_NAME}")?;
-    writeln!(
-        output,
-        "  status: {}",
-        comfyui_run_state_cli_label(run_report.state)
-    )?;
-    writeln!(
-        output,
-        "  AMD GPU check: ready ({} device{})",
-        probe.device_count,
-        if probe.device_count == 1 { "" } else { "s" }
-    )?;
-    if !probe.devices.is_empty() {
-        writeln!(output, "  GPU: {}", probe.devices.join(", "))?;
-    }
-    writeln!(output, "  URL: {url}")?;
-    writeln!(output, "  models path: {}", models_folder.display())?;
-    writeln!(output, "  browser: {browser_status}")?;
-    if run_report.state == ComfyUiRunState::Starting {
-        writeln!(output, "  note: still loading")?;
-    }
-    Ok(output)
+/// What a failure after the swap says: the new code is in place, what it
+/// changed (`changes`, already rendered with its leading space, or empty), and
+/// the install that finishes it.
+fn unfinished_install_advice(changes: &str, runtime_key: &str) -> String {
+    format!(
+        "the new ComfyUI code is in place{changes}, but the install did not finish; once the \
+         cause below is fixed, run `{}` to finish it",
+        finishing_install_command(runtime_key)
+    )
 }
 
-pub(crate) fn stop(paths: &AppPaths) -> Result<String> {
-    let Some(state) = load_state(paths)? else {
-        return Ok(format!(
-            "{APP_NAME}\n  status: stopped\n  note: ComfyUI was not running\n"
-        ));
-    };
-    let report = evaluate_running_state(&state);
-    if report.process_running {
-        terminate_process_tree(state.pid)?;
-        wait_until_stopped(state.pid);
-    }
-    let _ = fs::remove_file(state_path(paths));
-
-    let mut output = String::new();
-    writeln!(output, "{APP_NAME}")?;
-    writeln!(output, "  status: stopped")?;
-    writeln!(output, "  url: {}", state.url)?;
-    Ok(output)
-}
-
-fn spawn_comfyui_background(
-    paths: &AppPaths,
-    manifest: &ComfyUiManifest,
-    options: &ComfyUiStartOptions,
-    runtime_env: &ComfyUiRuntimeEnvironment,
-    log_path: &Path,
-) -> Result<u32> {
-    if runtime_is_windows() {
-        return spawn_comfyui_background_windows(paths, manifest, options, runtime_env, log_path);
-    }
-    spawn_comfyui_background_unix(manifest, options, runtime_env, log_path)
-}
-
-fn spawn_comfyui_background_unix(
-    manifest: &ComfyUiManifest,
-    options: &ComfyUiStartOptions,
-    runtime_env: &ComfyUiRuntimeEnvironment,
-    log_path: &Path,
-) -> Result<u32> {
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(log_path)
-        .with_context(|| format!("failed to open {}", log_path.display()))?;
-    let stdout = log
-        .try_clone()
-        .context("failed to clone ComfyUI log file")?;
-    let stderr = log
-        .try_clone()
-        .context("failed to clone ComfyUI log file")?;
-    let mut command = Command::new(&manifest.python_executable);
-    command
-        .current_dir(&manifest.source_path)
-        .arg("main.py")
-        .arg("--listen")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    apply_runtime_environment(&mut command, runtime_env)?;
-    let child = command.spawn().with_context(|| {
-        format!(
-            "failed to start ComfyUI with {}",
-            manifest.python_executable.display()
-        )
-    })?;
-    Ok(child.id())
-}
-
-fn spawn_comfyui_background_windows(
-    paths: &AppPaths,
-    manifest: &ComfyUiManifest,
-    options: &ComfyUiStartOptions,
-    runtime_env: &ComfyUiRuntimeEnvironment,
-    log_path: &Path,
-) -> Result<u32> {
-    let state_dir = app_root(paths).join("state");
-    fs::create_dir_all(&state_dir)
-        .with_context(|| format!("failed to create {}", state_dir.display()))?;
-    let runner_path = state_dir.join("run-comfyui.ps1");
-    let launcher_path = state_dir.join("launch-comfyui.ps1");
-    let pid_path = state_dir.join("comfyui-launch.pid");
-
-    let mut runner = String::new();
-    writeln!(runner, "$ErrorActionPreference = 'Continue'")?;
-    writeln!(
-        runner,
-        "Set-Location -LiteralPath {}",
-        powershell_quote(&child_path_string(&manifest.source_path))
-    )?;
-    for (key, value) in runtime_environment_assignments(runtime_env)? {
-        if key == "PATH" {
-            continue;
-        }
-        writeln!(
-            runner,
-            "$env:{} = {}",
-            key,
-            powershell_quote(&value.to_string_lossy())
-        )?;
-    }
-    let mut path_prefix_entries = runtime_env.path_entries.clone();
-    path_prefix_entries.extend(runtime_env.library_entries.iter().cloned());
-    let path_prefix = path_prefix_entries
-        .iter()
-        .map(|path| child_path_string(path))
-        .collect::<Vec<_>>()
-        .join(";");
-    if !path_prefix.is_empty() {
-        writeln!(
-            runner,
-            "$env:PATH = {} + ';' + $env:PATH",
-            powershell_quote(&path_prefix)
-        )?;
-    }
-    let mut command_line = powershell_quote(&child_path_string(&manifest.python_executable));
-    for arg in [
-        "main.py",
-        "--listen",
-        options.host.as_str(),
-        "--port",
-        &options.port.to_string(),
-    ] {
-        write!(command_line, " {}", powershell_quote(arg))?;
-    }
-    writeln!(
-        runner,
-        "& {} *>> {}",
-        command_line,
-        powershell_quote(&child_path_string(log_path))
-    )?;
-    fs::write(&runner_path, runner)
-        .with_context(|| format!("failed to write {}", runner_path.display()))?;
-
-    let launcher = format!(
-        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -WindowStyle Hidden -PassThru\nSet-Content -LiteralPath {} -Value $p.Id -Encoding ASCII\n",
-        powershell_quote(&child_path_string(&runner_path)),
-        powershell_quote(&child_path_string(&pid_path))
-    );
-    fs::write(&launcher_path, launcher)
-        .with_context(|| format!("failed to write {}", launcher_path.display()))?;
-
-    let mut command = Command::new("powershell.exe");
-    command
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&launcher_path);
-    let output = capture_configured_command(
-        command,
-        &format!("run ComfyUI launcher {}", launcher_path.display()),
-    )?;
-    let pid_text = fs::read_to_string(&pid_path).unwrap_or_default();
-    let _ = fs::remove_file(&pid_path);
-    if !output.status.success() && pid_text.trim().is_empty() {
-        bail!(
-            "failed to launch ComfyUI in the background: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let pid = pid_text
-        .split_whitespace()
-        .next()
-        .context("PowerShell launcher did not return a process id")?
-        .parse::<u32>()
-        .context("PowerShell launcher returned an invalid process id")?;
-    Ok(pid)
-}
-
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// The `rocm comfyui install` line both pieces of advice above tell the user
+/// to run. The key is quoted like every other value in a line the CLI offers
+/// to be copied (see [`crate::shell_quote`]), so the line names exactly the
+/// argv that finishes the install.
+fn finishing_install_command(runtime_key: &str) -> String {
+    format!(
+        "rocm comfyui install --runtime-id {}",
+        crate::shell_quote::shell_quote(runtime_key)
+    )
 }
 
 fn app_root(paths: &AppPaths) -> PathBuf {
@@ -844,144 +730,6 @@ fn strip_ansi_sequences(text: &str) -> String {
     cleaned
 }
 
-fn evaluate_running_state(state: &ComfyUiState) -> ComfyUiRunReport {
-    let process_running = process_is_running(state.pid);
-    let endpoint_reachable = endpoint_is_reachable(&state.host, state.port);
-    let state = if endpoint_reachable {
-        ComfyUiRunState::Running
-    } else if process_running {
-        ComfyUiRunState::Starting
-    } else {
-        ComfyUiRunState::Stopped
-    };
-    ComfyUiRunReport {
-        state,
-        process_running,
-        endpoint_reachable,
-    }
-}
-
-fn wait_for_running_state(state: &ComfyUiState, timeout: Duration) -> ComfyUiRunReport {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut last_report = evaluate_running_state(state);
-    while std::time::Instant::now() < deadline {
-        if last_report.state == ComfyUiRunState::Running {
-            return last_report;
-        }
-        thread::sleep(Duration::from_millis(500));
-        last_report = evaluate_running_state(state);
-    }
-    last_report
-}
-
-const fn comfyui_run_state_cli_label(state: ComfyUiRunState) -> &'static str {
-    match state {
-        ComfyUiRunState::Running => "running",
-        ComfyUiRunState::Starting => "starting",
-        ComfyUiRunState::Stopped => "stopped",
-    }
-}
-
-fn endpoint_is_reachable(host: &str, port: u16) -> bool {
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addresses
-        .into_iter()
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
-}
-
-fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    if runtime_is_windows() {
-        return windows_process_is_running(pid);
-    }
-    if runtime_is_linux() {
-        return unix_process_is_running(pid);
-    }
-    true
-}
-
-fn windows_process_is_running(pid: u32) -> bool {
-    let filter = format!("PID eq {pid}");
-    let mut command = Command::new("tasklist");
-    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
-    let Ok(output) = capture_configured_command(command, "check ComfyUI process") else {
-        return false;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains(&format!("\"{pid}\"")) {
-        return true;
-    }
-    if !output.status.success() {
-        return false;
-    }
-    false
-}
-
-fn unix_process_is_running(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn wait_until_stopped(pid: u32) {
-    for _ in 0..20 {
-        if !process_is_running(pid) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn terminate_process_tree(pid: u32) -> Result<()> {
-    if !process_is_running(pid) {
-        return Ok(());
-    }
-    if runtime_is_windows() {
-        return terminate_windows_process_tree(pid);
-    }
-    if runtime_is_linux() {
-        return terminate_unix_process(pid);
-    }
-    Ok(())
-}
-
-fn terminate_windows_process_tree(pid: u32) -> Result<()> {
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("failed to run taskkill for ComfyUI")?;
-    if !status.success() && process_is_running(pid) {
-        bail!("failed to stop ComfyUI process {pid}");
-    }
-    Ok(())
-}
-
-fn terminate_unix_process(pid: u32) -> Result<()> {
-    let status = Command::new("kill")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("failed to run kill for ComfyUI")?;
-    if !status.success() && process_is_running(pid) {
-        bail!("failed to stop ComfyUI process {pid}");
-    }
-    Ok(())
-}
-
 fn load_manifest(paths: &AppPaths) -> Result<Option<ComfyUiManifest>> {
     let path = manifest_path(paths);
     if !path.is_file() {
@@ -1043,757 +791,6 @@ fn save_state(paths: &AppPaths, state: &ComfyUiState) -> Result<()> {
         serde_json::to_vec_pretty(state).context("failed to serialize ComfyUI state")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn select_runtime(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    selector: Option<&str>,
-) -> Result<SelectedRuntime> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    if manifests.is_empty() {
-        bail!(
-            "Install ROCm first: run `rocm` and pick \"Set up this system\", then install ComfyUI."
-        );
-    }
-    let manifest = match selector.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(selector) => select_runtime_by_selector(&manifests, selector)?.clone(),
-        None => select_default_runtime(config, &manifests)?.clone(),
-    };
-    if runtime_usability_status(&manifest) != "ready" {
-        bail!(
-            "The selected ROCm runtime is not ready: {}",
-            runtime_usability_status(&manifest)
-        );
-    }
-    if manifest.format != "wheel" {
-        bail!("ComfyUI installs require a rocm-cli managed Python ROCm runtime.");
-    }
-    // Defence in depth, not a reachable branch on a settled filesystem: the
-    // `ready` check above ran `validate_wheel_runtime_manifest`, which already
-    // proved `python_executable` is `Some` and `is_file()`. This re-check only
-    // fires if the interpreter disappears in the window between the two calls,
-    // so keep it (a missing interpreter must not reach the installer) and do
-    // not spend further polish on its wording.
-    let python = manifest
-        .python_executable
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .with_context(|| {
-            "The selected ROCm runtime has no Python executable. Pick another in `/runtimes` or pass `--runtime-id <key>`. See `rocm runtimes list`."
-                .to_string()
-        })?;
-    Ok(SelectedRuntime { manifest, python })
-}
-
-/// Render a bare `key, key` list. Sound only where the caller has already
-/// filtered `manifests` by `runtime_usability_status(...) == "ready"`, because
-/// that is the only filter that makes every listed key a valid answer to the
-/// `rocm runtimes activate <key>` advice these messages carry; a per-key status
-/// would then be noise. Matching a selector is *not* such a filter: two
-/// manifests can share a `runtime_id` with one of them unusable, so an
-/// id-matched set can contain a key that cannot be activated. Every branch
-/// whose set is not ready-filtered — the whole-registry ones and the two
-/// id-ambiguity ones — uses `format_runtime_statuses` instead; see its doc
-/// comment for why the two labels differ.
-fn format_available_runtime_keys<'a>(
-    manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
-) -> String {
-    manifests
-        .into_iter()
-        .map(|manifest| manifest.runtime_key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Render each known runtime as `` `key` (status) ``, surfacing the per-manifest
-/// reason `runtime_usability_status` already computed (e.g.
-/// `unusable (install root is missing: …)`) instead of dropping it.
-///
-/// Used by every branch whose set is not ready-filtered: the whole-registry
-/// ones ("none ready" and the two not-found branches) and the two branches that
-/// report an ambiguous `runtime_id`. None of them can promise the listed
-/// runtimes are pickable — a shared `runtime_id` says nothing about readiness —
-/// so printing bare keys under `Available:` would invite the user to
-/// `rocm runtimes activate` an unusable one and land on a second error. The
-/// label split is deliberate and load-bearing: `Available:` means "any of these
-/// works", `Runtimes found:` means "here is everything registered, with why",
-/// and `Runtimes matched:` means "here is what the selector matched, with why".
-fn format_runtime_statuses<'a>(
-    manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
-) -> String {
-    manifests
-        .into_iter()
-        .map(|manifest| {
-            format!(
-                "`{}` ({})",
-                manifest.runtime_key,
-                runtime_usability_status(manifest)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn select_default_runtime<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    if let Some(active_key) = config.active_runtime_key.as_deref() {
-        return select_runtime_by_selector(manifests, active_key);
-    }
-    let Some(default_runtime_id) = config.default_runtime_id.as_deref() else {
-        return select_single_ready_runtime(manifests);
-    };
-    let matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [manifest] => Ok(*manifest),
-        [] => {
-            // Whole-registry list, so it carries statuses: a not-found default
-            // is no evidence the survivors are usable, and advising `activate`
-            // on an unusable one just produces a second error.
-            let statuses = format_runtime_statuses(manifests);
-            bail!(
-                "The configured default ROCm runtime was not found. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Runtimes found: {statuses}. See `rocm runtimes list`."
-            )
-        }
-        _ => {
-            // `matches` is filtered by `runtime_id` alone, so it can hold an
-            // unusable runtime next to a ready one. Statuses, not bare keys:
-            // `rocm runtimes activate` on the unusable match is a second error.
-            let statuses = format_runtime_statuses(matches.iter().copied());
-            bail!(
-                "More than one ROCm runtime matches the configured default. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Runtimes matched: {statuses}. See `rocm runtimes list`."
-            )
-        }
-    }
-}
-
-fn select_single_ready_runtime(
-    manifests: &[therock::InstalledRuntimeManifest],
-) -> Result<&therock::InstalledRuntimeManifest> {
-    let ready = manifests
-        .iter()
-        .filter(|manifest| runtime_usability_status(manifest) == "ready")
-        .collect::<Vec<_>>();
-    match ready.as_slice() {
-        [manifest] => Ok(*manifest),
-        [] => {
-            let statuses = format_runtime_statuses(manifests);
-            bail!(
-                "No ROCm runtime is ready. Fix one or install another: run `rocm` and pick \"Set up this system\" (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
-            )
-        }
-        _ => {
-            let available = format_available_runtime_keys(ready.iter().copied());
-            bail!(
-                "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
-            )
-        }
-    }
-}
-
-fn select_runtime_by_selector<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    selector: &str,
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    if let Some(manifest) = manifests
-        .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-    {
-        return Ok(manifest);
-    }
-    let matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [manifest] => Ok(*manifest),
-        [] => {
-            // Same reasoning as the configured-default not-found branch: this
-            // enumerates every registered runtime, so each entry carries its
-            // status rather than implying all of them are pickable.
-            let statuses = format_runtime_statuses(manifests);
-            bail!(
-                "ROCm runtime not found: `{selector}`. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Runtimes found: {statuses}. See `rocm runtimes list`."
-            )
-        }
-        _ => {
-            // Same reasoning as the ambiguous configured-default branch: an
-            // id match is not a readiness check, so each entry carries its
-            // status rather than reading as pickable.
-            let statuses = format_runtime_statuses(matches.iter().copied());
-            bail!(
-                "More than one ROCm runtime matches `{selector}`. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Runtimes matched: {statuses}. See `rocm runtimes list`."
-            )
-        }
-    }
-}
-
-fn runtime_environment_for_manifest(
-    paths: &AppPaths,
-    manifest: &ComfyUiManifest,
-) -> Result<ComfyUiRuntimeEnvironment> {
-    let runtimes = therock::load_runtime_manifests(paths)?;
-    if let Some(runtime) = runtimes.iter().find(|runtime| {
-        runtime
-            .runtime_key
-            .eq_ignore_ascii_case(&manifest.runtime_key)
-            || runtime
-                .runtime_id
-                .eq_ignore_ascii_case(&manifest.runtime_id)
-    }) {
-        return Ok(runtime_environment_from_runtime(
-            runtime,
-            &manifest.python_executable,
-        ));
-    }
-
-    let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(&manifest.python_executable),
-        rocm_root: Some(manifest.runtime_root.clone()),
-        path_entries: Vec::new(),
-        library_entries: Vec::new(),
-    };
-    if let Some(bin_dir) = manifest.python_executable.parent() {
-        push_existing_path(&mut env.path_entries, bin_dir.to_path_buf());
-    }
-    collect_rocm_runtime_paths(&manifest.runtime_root, &mut env);
-    Ok(env)
-}
-
-fn runtime_environment_from_runtime(
-    manifest: &therock::InstalledRuntimeManifest,
-    python: &Path,
-) -> ComfyUiRuntimeEnvironment {
-    let mut env = ComfyUiRuntimeEnvironment {
-        venv_root: infer_python_env_root(python),
-        rocm_root: manifest
-            .rocm_sdk
-            .as_ref()
-            .and_then(|sdk| sdk.root_path.clone())
-            .or_else(|| Some(manifest.install_root.clone())),
-        path_entries: Vec::new(),
-        library_entries: Vec::new(),
-    };
-    if let Some(bin_dir) = python.parent() {
-        push_existing_path(&mut env.path_entries, bin_dir.to_path_buf());
-    }
-    if let Some(sdk) = manifest.rocm_sdk.as_ref() {
-        if let Some(bin_path) = sdk.bin_path.as_ref() {
-            push_existing_path(&mut env.path_entries, bin_path.clone());
-        }
-        for bin_path in &sdk.bin_paths {
-            push_existing_path(&mut env.path_entries, bin_path.clone());
-        }
-        for library_path in &sdk.library_paths {
-            push_existing_path(&mut env.library_entries, library_path.clone());
-        }
-        if let Some(root_path) = sdk.root_path.as_ref() {
-            collect_rocm_runtime_paths(root_path, &mut env);
-        }
-        for root_path in &sdk.runtime_roots {
-            collect_rocm_runtime_paths(root_path, &mut env);
-        }
-    }
-    collect_rocm_runtime_paths(&manifest.install_root, &mut env);
-    if runtime_is_linux() {
-        push_existing_path(&mut env.library_entries, PathBuf::from("/usr/lib/wsl/lib"));
-    }
-    env
-}
-
-fn collect_rocm_runtime_paths(root: &Path, env: &mut ComfyUiRuntimeEnvironment) {
-    for path in [
-        root.join("bin"),
-        root.join("lib"),
-        root.join("lib64"),
-        root.join("lib").join("rocm_sysdeps").join("lib"),
-    ] {
-        if !path.is_dir() {
-            continue;
-        }
-        if path.file_name().and_then(|value| value.to_str()) == Some("bin") {
-            push_existing_path(&mut env.path_entries, path.clone());
-        }
-        push_existing_path(&mut env.library_entries, path);
-    }
-}
-
-fn infer_python_env_root(python: &Path) -> Option<PathBuf> {
-    let bin_dir = python.parent()?;
-    let name = bin_dir.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if matches!(name.as_str(), "scripts" | "bin") {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    None
-}
-
-fn apply_runtime_environment(command: &mut Command, env: &ComfyUiRuntimeEnvironment) -> Result<()> {
-    for (key, value) in runtime_environment_assignments(env)? {
-        command.env(key, value);
-    }
-    Ok(())
-}
-
-fn runtime_environment_assignments(
-    env: &ComfyUiRuntimeEnvironment,
-) -> Result<Vec<(&'static str, OsString)>> {
-    let mut values = Vec::new();
-    if let Some(venv_root) = env.venv_root.as_ref() {
-        values.push(("VIRTUAL_ENV", venv_root.as_os_str().to_owned()));
-    }
-    if let Some(rocm_root) = env.rocm_root.as_ref() {
-        values.push(("ROCM_PATH", rocm_root.as_os_str().to_owned()));
-    }
-    let mut path_entries = env.path_entries.clone();
-    if runtime_is_windows() {
-        path_entries.extend(env.library_entries.iter().cloned());
-    }
-    if let Some(path) = prepend_env_paths(&path_entries, std::env::var_os("PATH"))? {
-        values.push(("PATH", path));
-    }
-    if runtime_is_linux()
-        && let Some(ld_library_path) =
-            prepend_env_paths(&env.library_entries, std::env::var_os("LD_LIBRARY_PATH"))?
-    {
-        values.push(("LD_LIBRARY_PATH", ld_library_path));
-    }
-    Ok(values)
-}
-
-fn prepend_env_paths(entries: &[PathBuf], current: Option<OsString>) -> Result<Option<OsString>> {
-    let mut parts = Vec::new();
-    for entry in entries {
-        push_existing_path(&mut parts, entry.clone());
-    }
-    if let Some(current) = current
-        && !current.is_empty()
-    {
-        for entry in split_runtime_paths(&current) {
-            push_existing_path(&mut parts, entry);
-        }
-    }
-    if parts.is_empty() {
-        Ok(None)
-    } else {
-        join_runtime_paths(parts)
-    }
-}
-
-fn split_runtime_paths(paths: &OsString) -> Vec<PathBuf> {
-    runtime_path_list_split(paths)
-}
-
-fn join_runtime_paths(paths: Vec<PathBuf>) -> Result<Option<OsString>> {
-    runtime_path_list_join(paths).map(Some)
-}
-
-fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !path.is_dir() {
-        return;
-    }
-    if !paths.iter().any(|seen| same_path_text(seen, &path)) {
-        paths.push(path);
-    }
-}
-
-fn same_path_text(left: &Path, right: &Path) -> bool {
-    runtime_paths_equivalent(left, right)
-}
-
-/// Downloads (if not already cached) and extracts the ComfyUI source
-/// archive, returning the source URL it resolved — so the caller can record
-/// it on the install manifest without re-resolving
-/// [`comfyui_source_archive_url`] a second time.
-fn download_and_extract_source(
-    app_root: &Path,
-    source_path: &Path,
-    log: &mut fs::File,
-) -> Result<String> {
-    let source_url = comfyui_source_archive_url();
-    let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
-    fs::create_dir_all(
-        archive_path
-            .parent()
-            .context("ComfyUI archive path has no parent directory")?,
-    )?;
-    if archive_path.is_file() {
-        writeln!(
-            log,
-            "Using downloaded source archive {}.",
-            archive_path.display()
-        )?;
-    } else {
-        writeln!(log, "Downloading {source_url}.")?;
-        let download_label = "Fetching ComfyUI source archive…";
-        let spinner = AnimatedSpinner::start(download_label);
-        let download_result = download_file(&source_url, &archive_path, &mut |bytes, total| {
-            spinner.set_progress(download_label, bytes, total);
-        });
-        drop(spinner);
-        download_result?;
-    }
-    let extract_root = app_root
-        .join("extract")
-        .join(format!("source-{}", unix_time_millis()));
-    fs::create_dir_all(&extract_root)
-        .with_context(|| format!("failed to create {}", extract_root.display()))?;
-    let archive = fs::File::open(&archive_path)
-        .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(archive);
-    let mut tar = tar::Archive::new(decoder);
-    tar.unpack(&extract_root)
-        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
-    let extracted = first_child_dir(&extract_root)?;
-    if source_path.exists() {
-        fs::remove_dir_all(source_path)
-            .with_context(|| format!("failed to remove {}", source_path.display()))?;
-    }
-    fs::create_dir_all(
-        source_path
-            .parent()
-            .context("ComfyUI source path has no parent directory")?,
-    )?;
-    fs::rename(&extracted, source_path).or_else(|_| {
-        copy_dir_all(&extracted, source_path)?;
-        fs::remove_dir_all(&extracted)?;
-        Ok::<(), anyhow::Error>(())
-    })?;
-    fs::remove_dir_all(&extract_root).ok();
-    writeln!(log, "Installed source at {}.", source_path.display())?;
-    Ok(source_url)
-}
-
-fn first_child_dir(root: &Path) -> Result<PathBuf> {
-    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            return Ok(path);
-        }
-    }
-    bail!("ComfyUI source archive did not contain a directory")
-}
-
-fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to).with_context(|| format!("failed to create {}", to.display()))?;
-    for entry in fs::read_dir(from).with_context(|| format!("failed to read {}", from.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = to.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_all(&path, &target)?;
-        } else {
-            fs::copy(&path, &target).with_context(|| {
-                format!("failed to copy {} to {}", path.display(), target.display())
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn download_file(
-    url: &str,
-    destination: &Path,
-    on_progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<()> {
-    download_file_to_path_with_progress(url, destination, Duration::from_mins(2), on_progress)
-}
-
-fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
-    let text = fs::read_to_string(requirements_path)
-        .with_context(|| format!("failed to read {}", requirements_path.display()))?;
-    let mut output = Vec::new();
-    for token in requirement_tokens(&text) {
-        if requirement_package_name(&token)
-            .is_some_and(|name| matches!(name.as_str(), "torch" | "torchvision" | "torchaudio"))
-        {
-            continue;
-        }
-        output.push(token);
-    }
-    Ok(output)
-}
-
-fn requirement_tokens(text: &str) -> Vec<String> {
-    text.lines()
-        .flat_map(|line| {
-            line.split('#')
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .filter(|token| !token.trim().is_empty())
-        .collect()
-}
-
-fn requirement_package_name(spec: &str) -> Option<String> {
-    let trimmed = spec.trim();
-    if trimmed.starts_with('-') || trimmed.contains("://") {
-        return None;
-    }
-    let end = trimmed
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
-        .unwrap_or(trimmed.len());
-    (end > 0).then(|| trimmed[..end].replace('_', "-").to_ascii_lowercase())
-}
-
-fn uv_install_args(
-    venv_python: &Path,
-    packages: &[String],
-    constraints_path: Option<&Path>,
-) -> Vec<String> {
-    let mut args = uv_pip_install_base(venv_python);
-    args.push("--upgrade".to_owned());
-    if let Some(path) = constraints_path {
-        args.push("--constraint".to_owned());
-        args.push(path.to_string_lossy().into_owned());
-    }
-    args.extend(packages.iter().cloned());
-    args
-}
-
-/// The torch-stack packages whose managed ROCm versions must be preserved across
-/// a ComfyUI dependency install.
-const TORCH_STACK_PACKAGES: [&str; 3] = ["torch", "torchvision", "torchaudio"];
-
-/// Probe of an installed distribution's version, read from metadata WITHOUT
-/// importing the package (importing torch needs the runtime's native env). Emits
-/// JSON: a map from package name to version string for the ones present.
-const TORCH_STACK_VERSION_PROBE: &str = "import json,sys\n\
-     from importlib import metadata\n\
-     out={}\n\
-     for name in ('torch','torchvision','torchaudio'):\n\
-     \x20 try:\n\
-     \x20   out[name]=metadata.version(name)\n\
-     \x20 except Exception:\n\
-     \x20   pass\n\
-     sys.stdout.write(json.dumps(out))\n";
-
-/// Read the exact installed versions of the managed runtime's torch stack via
-/// dist metadata (no native import). Returns constraint lines (`torch==X`) for
-/// each package currently present, so the ComfyUI dependency resolution is pinned
-/// to them and cannot pull a CUDA build. An absent package yields no line — we
-/// only constrain what the runtime actually ships.
-///
-/// Constraining only the installed packages is safe here because the full
-/// torch/torchvision/torchaudio trio is an invariant of a managed runtime:
-/// `therock` installs all three atomically and refuses to install unless it finds
-/// a mutually-compatible set (see `select_matching_pip_package_versions` — it
-/// bails with "no mutually compatible ... torch, torchvision, and torchaudio
-/// versions"), and
-/// ComfyUI install only ever targets such a runtime (`select_runtime` requires a
-/// managed wheel install). So there is no "torch present, torchvision/torchaudio
-/// absent" runtime in which an unpinned CUDA `torchvision` could resolve against
-/// the release part of the pinned ROCm torch and install a mixed CUDA/ROCm stack.
-fn torch_stack_constraints(
-    python: &Path,
-    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
-    log: &mut fs::File,
-) -> Result<Vec<String>> {
-    let versions = probe_torch_stack_versions(python, runtime_env)?;
-    let constraints = torch_constraint_lines(&versions);
-    writeln!(
-        log,
-        "Pinning managed torch stack: {}",
-        if constraints.is_empty() {
-            "none found".to_owned()
-        } else {
-            constraints.join(", ")
-        }
-    )?;
-    Ok(constraints)
-}
-
-fn probe_torch_stack_versions(
-    python: &Path,
-    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
-) -> Result<Vec<(String, String)>> {
-    let mut command = Command::new(python);
-    command.arg("-c").arg(TORCH_STACK_VERSION_PROBE);
-    if let Some(runtime_env) = runtime_env {
-        apply_runtime_environment(&mut command, runtime_env)?;
-    }
-    let output = capture_configured_command(
-        command,
-        &format!("probe managed torch stack with {}", python.display()),
-    )?;
-    if !output.status.success() {
-        bail!(
-            "failed to read the managed runtime's torch versions (status {}).\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: std::collections::BTreeMap<String, String> = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("failed to parse torch stack version probe output: {stdout}"))?;
-    Ok(parsed.into_iter().collect())
-}
-
-/// Build `name==version` constraint lines for the torch-stack packages that were
-/// found, in a stable order. Pure and side-effect free for unit testing.
-fn torch_constraint_lines(versions: &[(String, String)]) -> Vec<String> {
-    TORCH_STACK_PACKAGES
-        .iter()
-        .filter_map(|package| {
-            versions
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(package))
-                .map(|(_, version)| format!("{package}=={version}"))
-        })
-        .collect()
-}
-
-/// Write the torch-stack constraints to a file uv can read via `--constraint`.
-/// Returns `None` when there is nothing to pin (no constraint file is needed).
-fn write_torch_constraints(
-    app_root: &Path,
-    constraints: &[String],
-    log: &mut fs::File,
-) -> Result<Option<PathBuf>> {
-    if constraints.is_empty() {
-        return Ok(None);
-    }
-    let path = app_root.join("torch-constraints.txt");
-    fs::create_dir_all(
-        path.parent()
-            .context("ComfyUI constraints path has no parent directory")?,
-    )?;
-    let mut contents = constraints.join("\n");
-    contents.push('\n');
-    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
-    writeln!(log, "Wrote torch constraints to {}.", path.display())?;
-    Ok(Some(path))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_uv_logged_command(
-    paths: &AppPaths,
-    uv: &Path,
-    args: Vec<String>,
-    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
-    log: &mut fs::File,
-    log_path: &Path,
-    context_text: &str,
-    spinner_label: &str,
-) -> Result<()> {
-    writeln!(
-        log,
-        "command: {} {}",
-        uv.display(),
-        args.iter()
-            .map(|arg| quote_log_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ")
-    )?;
-    let mut command = Command::new(uv);
-    command
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in uv_command_env(paths) {
-        command.env(key, value);
-    }
-    if let Some(runtime_env) = runtime_env {
-        apply_runtime_environment(&mut command, runtime_env)?;
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("{context_text}: failed to run {}", uv.display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("child stdout was not captured")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("child stderr was not captured")?;
-    let stdout_log = log
-        .try_clone()
-        .context("failed to clone ComfyUI install log for stdout")?;
-    let stderr_log = log
-        .try_clone()
-        .context("failed to clone ComfyUI install log for stderr")?;
-    // `AnimatedSpinner` (see cli_progress.rs) is TTY-gated and a hard no-op off
-    // a terminal, so on its own a piped/CI install would print nothing for the
-    // entire uv resolve, indistinguishable from a hang. `stream_logged_output`
-    // below is the off-TTY fallback: it tees the child's stdout/stderr through
-    // to our real stdout/stderr whenever stderr isn't a terminal, so a
-    // non-interactive install still shows live progress.
-    let spinner = AnimatedSpinner::start(spinner_label);
-    let stdout_thread =
-        thread::spawn(move || stream_logged_output(stdout, stdout_log, OutputTarget::Stdout));
-    let stderr_thread =
-        thread::spawn(move || stream_logged_output(stderr, stderr_log, OutputTarget::Stderr));
-    let status = child
-        .wait()
-        .with_context(|| format!("{context_text}: failed waiting for {}", uv.display()))?;
-    stdout_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("{context_text}: stdout reader failed"))?
-        .context("failed to stream command stdout")?;
-    stderr_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("{context_text}: stderr reader failed"))?
-        .context("failed to stream command stderr")?;
-    drop(spinner);
-    if status.success() {
-        return Ok(());
-    }
-    bail!(
-        "{context_text}: uv exited with {status}; see {} for details",
-        log_path.display()
-    );
-}
-
-/// Which real stream a `stream_logged_output` reader mirrors to when not
-/// attached to a terminal.
-enum OutputTarget {
-    Stdout,
-    Stderr,
-}
-
-fn stream_logged_output<R: Read>(
-    mut reader: R,
-    mut log: fs::File,
-    target: OutputTarget,
-) -> io::Result<()> {
-    // When stderr is a terminal, the `AnimatedSpinner` is the progress signal
-    // and raw uv output would visually clash with it, so only tee through
-    // when we're not attached to one (piped output, CI, etc).
-    let tee = !io::stderr().is_terminal();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let len = reader.read(&mut buffer)?;
-        if len == 0 {
-            break;
-        }
-        log.write_all(&buffer[..len])?;
-        if tee {
-            match target {
-                OutputTarget::Stdout => {
-                    let mut stdout = io::stdout().lock();
-                    stdout.write_all(&buffer[..len])?;
-                    stdout.flush()?;
-                }
-                OutputTarget::Stderr => {
-                    let mut stderr = io::stderr().lock();
-                    stderr.write_all(&buffer[..len])?;
-                    stderr.flush()?;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn probe_comfyui(
@@ -1919,6 +916,10 @@ fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
     bail!("failed to allocate a temporary command capture directory")
 }
 
+/// Quotes `value` for log text only, using Rust's own `{value:?}`
+/// Debug-format escaping; the real args passed to `Command::args` alongside
+/// this are unquoted. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_log_arg(value: &str) -> String {
     if value
         .chars()
@@ -1938,154 +939,20 @@ fn child_path_string(path: &Path) -> String {
     }
 }
 
-fn open_browser(url: &str) -> Result<()> {
-    let status = if runtime_is_windows() {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else if cfg!(target_os = "macos") && !runtime_is_linux() {
-        Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else {
-        Command::new("xdg-open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    }
-    .context("failed to open browser")?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("browser opener exited with status {status}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::process::ensure_source_is_startable;
     use super::*;
+    #[cfg(unix)]
+    use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unused_local_port() -> Result<u16> {
+    pub(super) fn unused_local_port() -> Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         Ok(listener.local_addr()?.port())
-    }
-
-    #[test]
-    fn requirements_filter_preserves_therock_torch_stack() {
-        let text = "torch torchvision>=1 torchaudio\nnumpy>=1.25\n# comment\naiohttp\n";
-        assert_eq!(
-            requirement_tokens(text),
-            vec![
-                "torch".to_owned(),
-                "torchvision>=1".to_owned(),
-                "torchaudio".to_owned(),
-                "numpy>=1.25".to_owned(),
-                "aiohttp".to_owned()
-            ]
-        );
-        let kept = requirement_tokens(text)
-            .into_iter()
-            .filter(|token| {
-                !requirement_package_name(token).is_some_and(|name| {
-                    matches!(name.as_str(), "torch" | "torchvision" | "torchaudio")
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(kept, vec!["numpy>=1.25".to_owned(), "aiohttp".to_owned()]);
-    }
-
-    #[test]
-    fn torch_constraint_lines_pin_present_stack_in_stable_order() {
-        // Probe output arrives unordered and case-mixed; constraints come out in
-        // the canonical torch/torchvision/torchaudio order, one per present pkg.
-        let versions = vec![
-            ("torchvision".to_owned(), "0.22.0+gitabc".to_owned()),
-            ("Torch".to_owned(), "2.11.0+gitd0c8b1f".to_owned()),
-        ];
-        assert_eq!(
-            torch_constraint_lines(&versions),
-            vec![
-                "torch==2.11.0+gitd0c8b1f".to_owned(),
-                "torchvision==0.22.0+gitabc".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn torch_constraint_lines_empty_when_stack_absent() {
-        assert!(torch_constraint_lines(&[]).is_empty());
-        assert!(torch_constraint_lines(&[("numpy".to_owned(), "1.25.0".to_owned())]).is_empty());
-    }
-
-    #[test]
-    fn uv_install_args_include_constraint_flag_when_pinned() {
-        let python = Path::new("/runtime/bin/python");
-        let packages = vec!["numpy".to_owned()];
-        let constraints = PathBuf::from("/tmp/torch-constraints.txt");
-
-        let with_pin = uv_install_args(python, &packages, Some(&constraints));
-        assert!(
-            with_pin
-                .windows(2)
-                .any(|pair| pair == ["--constraint".to_owned(), constraints.display().to_string()]),
-            "expected --constraint <path> in {with_pin:?}"
-        );
-
-        let without_pin = uv_install_args(python, &packages, None);
-        assert!(
-            !without_pin.iter().any(|arg| arg == "--constraint"),
-            "no --constraint expected when nothing to pin: {without_pin:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_uv_logged_command_reports_concrete_log_path_on_failure() -> Result<()> {
-        // `rocm comfyui logs` can still find this run's log via a directory
-        // scan even without a saved manifest, but naming the path directly
-        // in the error is more precise and needs no second command.
-        use std::os::unix::fs::PermissionsExt;
-
-        let paths = test_paths("comfyui-uv-failure");
-        fs::create_dir_all(&paths.cache_dir)?;
-        let uv_path = paths.cache_dir.join("fake-uv");
-        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
-        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
-
-        let log_path = paths.cache_dir.join("install.log");
-        let mut log = fs::File::create(&log_path)?;
-
-        let error = run_uv_logged_command(
-            &paths,
-            &uv_path,
-            vec!["pip".to_owned(), "install".to_owned()],
-            None,
-            &mut log,
-            &log_path,
-            "install ComfyUI dependencies",
-            "Resolving and installing packages with uv…",
-        )
-        .expect_err("uv exiting non-zero should fail");
-
-        let message = error.to_string();
-        assert!(
-            message.contains(&log_path.display().to_string()),
-            "error should name the concrete log path so a failed install's log stays discoverable: {message}"
-        );
-
-        fs::remove_dir_all(&paths.cache_dir).ok();
-        Ok(())
     }
 
     #[test]
@@ -2107,6 +974,12 @@ mod tests {
         let paths = test_paths("comfyui-status-runtime-label");
         let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
         write_runtime_manifest(&paths, &runtime)?;
+        // Built from `runtime_app_root`, the same helper `install()` uses, rather
+        // than the test-only `source_path(&paths)` (which hangs off a different,
+        // data-dir-rooted `app_root`): this way the planted manifest's
+        // `source_path` is the layout a real install actually produces, so this
+        // test can show status's `folder:` line agrees with install's.
+        let managed_source_path = source_path_from_app_root(&runtime_app_root(&runtime));
         save_manifest(
             &paths,
             &ComfyUiManifest {
@@ -2117,8 +990,8 @@ mod tests {
                 runtime_root: runtime.install_root.clone(),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
                 source_url: comfyui_source_archive_url(),
-                source_path: source_path(&paths),
-                requirements_path: source_path(&paths).join("requirements.txt"),
+                source_path: managed_source_path.clone(),
+                requirements_path: managed_source_path.join("requirements.txt"),
                 pip_cache_dir: None,
                 log_path: app_root(&paths).join("logs").join("install-100.log"),
                 torch_version: Some("2.10.0".to_owned()),
@@ -2144,6 +1017,14 @@ mod tests {
         assert!(
             !rendered.contains("ROCm install"),
             "status must not reintroduce the `ROCm install` label, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("  folder: {}\n", managed_source_path.display())),
+            "status `folder:` should report the ComfyUI source checkout, not the runtime root, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("  folder: {}\n", runtime.install_root.display())),
+            "status `folder:` must not report the bare runtime root, got: {rendered}"
         );
         Ok(())
     }
@@ -2201,43 +1082,6 @@ mod tests {
         let url = reused_source_url(&paths);
 
         assert_eq!(url, comfyui_source_archive_url());
-        Ok(())
-    }
-
-    #[test]
-    fn install_dry_run_uses_selected_runtime_folder() -> Result<()> {
-        let paths = test_paths("comfyui-selected-runtime-folder");
-        let runtime = ready_runtime_manifest(&paths, "selected-runtime")?;
-        write_runtime_manifest(&paths, &runtime)?;
-        let config = RocmCliConfig {
-            active_runtime_key: Some(runtime.runtime_key.clone()),
-            ..Default::default()
-        };
-
-        let rendered = install(
-            &paths,
-            &config,
-            ComfyUiInstallOptions {
-                runtime_id: None,
-                reinstall: false,
-                dry_run: true,
-            },
-        )?;
-
-        let runtime_app = runtime_app_root(&runtime);
-        assert!(rendered.contains(&runtime_app.display().to_string()));
-        assert!(!rendered.contains(&app_root(&paths).display().to_string()));
-        // The runtime is labelled "ROCm runtime" to match the noun used by the
-        // `select_runtime` error messages this command can also emit; the stale
-        // "ROCm install:" label must not come back.
-        assert!(
-            rendered.contains("ROCm runtime:"),
-            "install output should label the runtime as `ROCm runtime:`, got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("ROCm install:"),
-            "install output must not reintroduce the `ROCm install:` label, got: {rendered}"
-        );
         Ok(())
     }
 
@@ -2319,30 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn running_state_requires_saved_process_and_reachable_port() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let state = ComfyUiState {
-            app_id: APP_ID.to_owned(),
-            url: format!("http://127.0.0.1:{port}"),
-            host: "127.0.0.1".to_owned(),
-            port,
-            pid: std::process::id(),
-            source_path: PathBuf::from("source"),
-            python_executable: PathBuf::from("python"),
-            log_path: PathBuf::from("start.log"),
-            started_at_unix_ms: 200,
-        };
-
-        let report = evaluate_running_state(&state);
-
-        assert_eq!(report.state, ComfyUiRunState::Running);
-        assert!(report.process_running);
-        assert!(report.endpoint_reachable);
-        Ok(())
-    }
-
-    #[test]
     fn unmanaged_running_url_reports_reachable_loopback_endpoint() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -2382,572 +1202,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn default_runtime_selection_uses_single_ready_runtime() -> Result<()> {
-        let paths = test_paths("comfyui-single-ready-runtime");
-        let runtime_root = paths.data_dir.join("runtimes").join("default");
-        let python = runtime_python_executable_in_env(&runtime_root);
-        let python_bin = python
-            .parent()
-            .context("runtime Python path has no parent")?
-            .to_path_buf();
-        let sdk_root = runtime_root.join("sdk");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&python_bin)?;
-        fs::create_dir_all(&sdk_bin)?;
-        fs::write(runtime_root.join(".rocm-cli-runtime.json"), "{}")?;
-        fs::write(&python, "python")?;
-        let amdhip = sdk_bin.join(runtime_rocm_library_filename("amdhip64"));
-        let hipblas = sdk_bin.join(runtime_rocm_library_filename("hipblas"));
-        fs::write(&amdhip, "amdhip")?;
-        fs::write(&hipblas, "hipblas")?;
-
-        let manifest = therock::InstalledRuntimeManifest {
-            runtime_key: "release-pip-gfx120x-all-7-13-0a20260511".to_owned(),
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            channel: "release".to_owned(),
-            format: "wheel".to_owned(),
-            family: "gfx120X-all".to_owned(),
-            family_source: "test".to_owned(),
-            version: "7.13.0a20260511".to_owned(),
-            install_root: runtime_root,
-            selected_artifact_url: "https://example.invalid/simple".to_owned(),
-            source_layout_generation: None,
-            index_url: None,
-            tarball_file_name: None,
-            python_launcher: None,
-            python_executable: Some(python.display().to_string()),
-            pip_cache_dir: None,
-            rocm_sdk: Some(therock::RocmSdkPythonProbe {
-                import_ok: true,
-                root_path: Some(sdk_root),
-                bin_path: Some(sdk_bin),
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                ..therock::RocmSdkPythonProbe::default()
-            }),
-            sdk_torch: None,
-            wheel_composition: None,
-            read_only: false,
-            imported_from: None,
-            devel: true,
-            installed_at_unix_ms: 100,
-        };
-
-        let manifests = [manifest];
-        let selected = select_default_runtime(&RocmCliConfig::default(), &manifests)?;
-        assert_eq!(
-            selected.runtime_key,
-            "release-pip-gfx120x-all-7-13-0a20260511"
-        );
-        Ok(())
-    }
-
-    /// Every ambiguity / not-found remediation message must steer the user to a
-    /// concrete next step: the TUI picker, the durable activate command, the
-    /// per-invocation flag, and the discovery command. Asserted centrally so a
-    /// future reworded branch that silently drops one is caught.
-    fn assert_actionable(message: &str) {
-        for needle in [
-            "/runtimes",
-            "rocm runtimes activate",
-            "--runtime-id <key>",
-            "rocm runtimes list",
-        ] {
-            assert!(
-                message.contains(needle),
-                "actionable error must mention {needle:?}, got: {message}"
-            );
-        }
-    }
-
-    /// Build a runtime that registers but is not usable, so the "no ready
-    /// runtime" path has a per-manifest reason to surface. A missing install
-    /// root fails `validate_runtime_manifest_for_activation`'s first on-disk
-    /// check, yielding `unusable (install root is missing: …)`.
-    fn unusable_runtime_manifest(
-        paths: &AppPaths,
-        runtime_key: &str,
-    ) -> Result<therock::InstalledRuntimeManifest> {
-        let mut manifest = ready_runtime_manifest(paths, runtime_key)?;
-        manifest.install_root = paths
-            .data_dir
-            .join("missing-runtime-root")
-            .join(runtime_key);
-        Ok(manifest)
-    }
-
-    #[test]
-    fn ambiguous_ready_runtimes_name_flag_and_list_keys() -> Result<()> {
-        let paths = test_paths("comfyui-ambiguous-ready-runtimes");
-        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-
-        let manifests = [release, nightly];
-        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
-            .expect_err("two ready runtimes should be ambiguous");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("Multiple ROCm runtimes are ready"),
-            "error should be the multi-ready branch, got: {message}"
-        );
-        assert!(
-            message.contains("release-wheel-gfx94x-dcgpu-7-13-0")
-                && message.contains("nightly-wheel-gfx94x-dcgpu-7-14-0"),
-            "error should list the available runtime keys, got: {message}"
-        );
-        // This set is ready-filtered, so `format_available_runtime_keys`' bare
-        // `key, key` is the deliberate rendering (see its doc comment): a
-        // per-key status here would annotate every entry `(ready)` and say
-        // nothing. Without this, swapping in `format_runtime_statuses` would
-        // still pass the key assertions above.
-        assert!(
-            !message.contains("(ready)"),
-            "a ready-filtered list must stay bare keys, not per-key statuses, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn no_ready_runtime_lists_each_key_and_reason() -> Result<()> {
-        // The "none ready" branch used to duplicate the zero-runtime advice and
-        // drop the reason each runtime is unusable. It must now name the key and
-        // surface the reason `runtime_usability_status` already computed.
-        let paths = test_paths("comfyui-no-ready-runtime");
-        let unusable = unusable_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-
-        let manifests = [unusable];
-        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
-            .expect_err("an unusable runtime is not ready");
-        let message = error.to_string();
-
-        assert!(
-            message.contains("release-wheel-gfx94x-dcgpu-7-13-0"),
-            "error should name the unusable runtime key, got: {message}"
-        );
-        assert!(
-            message.contains("install root is missing"),
-            "error should surface the per-manifest unusable reason, got: {message}"
-        );
-        assert!(
-            message.contains("rocm runtimes list"),
-            "error should point to `rocm runtimes list`, got: {message}"
-        );
-        // The setup pointer must name a destination that actually exists. The
-        // only ROCm-setup entry point a user can see is the bare-`rocm`
-        // launcher row labelled "Set up this system"
-        // (`crates/rocm-dash-tui/src/ui/launcher.rs`, rendered verbatim from
-        // `ROWS`); there has never been a screen called "Set Up ROCm".
-        //
-        // The positive assertion already catches a plain revert to either wrong
-        // wording on its own: neither the invented label this branch emitted
-        // until now ("install another from Set Up ROCm") nor the superseded
-        // pre-`31957ed` wording ("Set up ROCm first from Set Up ROCm") contains
-        // `pick "Set up this system"`, so under either revert the positive
-        // needle stops matching and reddens. Measured, not assumed: reverting
-        // the production string to the invented label fails the positive
-        // assertion, and fails the negative one too once the positive is
-        // neutralized.
-        //
-        // The negative assertion is therefore not redundant, but its value is
-        // the case the positive one cannot see: a message carrying *both*
-        // labels. Re-adding "Set Up ROCm" alongside the real row still
-        // satisfies the positive needle, so only the negative one reddens —
-        // measured the same way. That is the drift worth guarding here, since
-        // the invented screen name is likelier to creep back as an "extra"
-        // pointer than as a wholesale revert.
-        //
-        // Nor can `assert_actionable` cover this branch — it is deliberately
-        // excluded, since the none-ready message carries only one of its four
-        // needles (`rocm runtimes list`); the other three are remedies for
-        // choosing between runtimes, which do not apply when none is usable.
-        assert!(
-            message.contains("pick \"Set up this system\""),
-            "error should still point at the launcher's \"Set up this system\" row, got: {message}"
-        );
-        assert!(
-            !message.contains("Set Up ROCm"),
-            "the setup pointer must not name the nonexistent `Set Up ROCm` screen, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn zero_runtime_setup_pointers_name_the_real_launcher_row() -> Result<()> {
-        // The none-ready pointer above is one of three siblings that send a
-        // user off to install ROCm; the other two fire when the registry is
-        // empty rather than merely unusable. Until now only the none-ready one
-        // was pinned, so these two could drift back to the invented `Set Up
-        // ROCm` screen name without reddening anything. Same needles, same
-        // reasoning as `no_ready_runtime_lists_each_key_and_reason`: the
-        // positive one catches a wholesale revert, the negative one catches the
-        // invented label creeping back *alongside* the real row.
-        //
-        // `test_paths` never creates the runtime registry directory, so
-        // `load_runtime_manifests` returns empty and both zero-runtime branches
-        // are the ones under test.
-        let paths = test_paths("comfyui-zero-runtime-setup-pointers");
-
-        // `render_status`' "ROCm" note (the zero-runtime arm of `render_status`).
-        let status = render_status(&paths, &RocmCliConfig::default())?;
-        assert!(
-            status.contains("pick \"Set up this system\""),
-            "status should point at the launcher's \"Set up this system\" row, got: {status}"
-        );
-        assert!(
-            !status.contains("Set Up ROCm"),
-            "status must not name the nonexistent `Set Up ROCm` screen, got: {status}"
-        );
-
-        // `select_runtime`'s bail when nothing is registered at all.
-        let error = select_runtime(&paths, &RocmCliConfig::default(), None)
-            .expect_err("no registered runtime means no selection");
-        let message = error.to_string();
-        assert!(
-            message.contains("pick \"Set up this system\""),
-            "the zero-runtime refusal should point at the launcher's \"Set up this system\" row, got: {message}"
-        );
-        assert!(
-            !message.contains("Set Up ROCm"),
-            "the zero-runtime refusal must not name the nonexistent `Set Up ROCm` screen, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn configured_default_not_found_is_actionable() -> Result<()> {
-        // This branch enumerates the WHOLE registry, so it is planted with one
-        // ready and one unusable runtime: a bare key list here would advise
-        // `rocm runtimes activate` on the unusable one and land the user on a
-        // second error, so each entry must carry its status.
-        let paths = test_paths("comfyui-default-not-found");
-        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-
-        let manifests = [ready, unusable];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("no-such-runtime-id".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
-            .expect_err("configured default id matches nothing");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("The configured default ROCm runtime was not found"),
-            "error should be the configured-default-not-found branch, got: {message}"
-        );
-        assert!(
-            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
-            "the usable runtime must be listed as ready, got: {message}"
-        );
-        assert!(
-            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
-                && message.contains("install root is missing"),
-            "the unusable runtime must carry its reason, not read as pickable, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn multiple_configured_default_matches_is_actionable() -> Result<()> {
-        // `ready_runtime_manifest` hardcodes the same runtime_id for every key,
-        // so a configured default resolving to that id matches both entries and
-        // exercises `select_default_runtime`'s own ambiguity arm (distinct from
-        // the single-ready arm the other test hits).
-        let paths = test_paths("comfyui-default-ambiguous");
-        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-
-        let manifests = [release, nightly];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
-            .expect_err("two manifests share the configured default id");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("More than one ROCm runtime matches the configured default"),
-            "error should be the ambiguous-configured-default branch, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ambiguous_configured_default_marks_the_unusable_match() -> Result<()> {
-        // The ambiguity set is filtered by `runtime_id` alone, and a shared
-        // runtime_id says nothing about readiness: one of the two matches here
-        // has a missing install root. A bare key list would tell the user to
-        // `rocm runtimes activate` it and land them on a second error, so each
-        // match must carry the status `runtime_usability_status` computes.
-        let paths = test_paths("comfyui-default-ambiguous-unusable");
-        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-        assert_eq!(
-            ready.runtime_id, unusable.runtime_id,
-            "the two manifests must share a runtime_id to reach the ambiguity arm"
-        );
-
-        let manifests = [ready, unusable];
-        let config = RocmCliConfig {
-            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
-            ..Default::default()
-        };
-        let error = select_default_runtime(&config, &manifests)
-            .expect_err("two manifests share the configured default id");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("More than one ROCm runtime matches the configured default"),
-            "error should be the ambiguous-configured-default branch, got: {message}"
-        );
-        assert!(
-            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
-            "the usable match must be listed as ready, got: {message}"
-        );
-        assert!(
-            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
-                && message.contains("install root is missing"),
-            "the unusable match must carry its reason, not read as pickable, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_selector_is_actionable() -> Result<()> {
-        // Whole-registry list again — see `configured_default_not_found_is_actionable`.
-        let paths = test_paths("comfyui-selector-not-found");
-        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-
-        let manifests = [ready, unusable];
-        let error = select_runtime_by_selector(&manifests, "no-such-key")
-            .expect_err("selector matches no runtime");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("ROCm runtime not found: `no-such-key`"),
-            "error should be the unknown-selector branch, got: {message}"
-        );
-        assert!(
-            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
-            "the usable runtime must be listed as ready, got: {message}"
-        );
-        assert!(
-            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
-                && message.contains("install root is missing"),
-            "the unusable runtime must carry its reason, not read as pickable, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ambiguous_selector_is_actionable() -> Result<()> {
-        // Both manifests share runtime_id `therock-release:gfx120X-all`; neither
-        // runtime_key equals it, so selection falls through to the id filter and
-        // matches both, hitting `select_runtime_by_selector`'s ambiguity arm.
-        let paths = test_paths("comfyui-selector-ambiguous");
-        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-
-        let manifests = [release, nightly];
-        let error = select_runtime_by_selector(&manifests, "therock-release:gfx120X-all")
-            .expect_err("selector id matches two runtimes");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("More than one ROCm runtime matches `therock-release:gfx120X-all`"),
-            "error should be the ambiguous-selector branch, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ambiguous_selector_marks_the_unusable_match() -> Result<()> {
-        // Selector twin of `ambiguous_configured_default_marks_the_unusable_match`:
-        // the selector falls through to the `runtime_id` filter, which is not a
-        // readiness check, so the unusable match must be rendered with its
-        // reason rather than as a bare activatable key.
-        let paths = test_paths("comfyui-selector-ambiguous-unusable");
-        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
-        assert_eq!(
-            ready.runtime_id, unusable.runtime_id,
-            "the two manifests must share a runtime_id to reach the ambiguity arm"
-        );
-
-        let manifests = [ready, unusable];
-        let error = select_runtime_by_selector(&manifests, "therock-release:gfx120X-all")
-            .expect_err("selector id matches two runtimes");
-        let message = error.to_string();
-
-        assert_actionable(&message);
-        assert!(
-            message.contains("More than one ROCm runtime matches `therock-release:gfx120X-all`"),
-            "error should be the ambiguous-selector branch, got: {message}"
-        );
-        assert!(
-            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
-            "the usable match must be listed as ready, got: {message}"
-        );
-        assert!(
-            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
-                && message.contains("install root is missing"),
-            "the unusable match must carry its reason, not read as pickable, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn selected_unusable_runtime_reports_not_ready_reason() -> Result<()> {
-        // Naming a runtime explicitly by selector bypasses the readiness filter
-        // in `select_default_runtime` / `select_single_ready_runtime`, so
-        // `select_runtime` re-checks it and bails with the reworked
-        // "The selected ROCm runtime is not ready: <reason>" message. This is
-        // also why the sibling "has no Python executable" arm is unreachable:
-        // `validate_wheel_runtime_manifest` already rejects a ready wheel runtime
-        // whose python is missing, so any such runtime lands on this not-ready
-        // arm — carrying the reason — rather than on the no-python arm.
-        let paths = test_paths("comfyui-selected-unusable");
-        let unusable = unusable_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
-        write_runtime_manifest(&paths, &unusable)?;
-
-        let error = select_runtime(
-            &paths,
-            &RocmCliConfig::default(),
-            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
-        )
-        .expect_err("an explicitly selected unusable runtime is not ready");
-        let message = error.to_string();
-
-        assert!(
-            message.contains("The selected ROCm runtime is not ready"),
-            "error should use the reworked `ROCm runtime` noun, got: {message}"
-        );
-        assert!(
-            message.contains("install root is missing"),
-            "error should surface the per-manifest unusable reason, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_environment_preloads_managed_rocm_paths() -> Result<()> {
-        let paths = test_paths("comfyui-runtime-env");
-        let env_root = paths.data_dir.join("envs").join("therock");
-        let python = runtime_python_executable_in_env(&env_root);
-        let python_bin = python
-            .parent()
-            .context("runtime Python path has no parent")?
-            .to_path_buf();
-        let sdk_root = paths.data_dir.join("runtimes").join("sdk");
-        let sdk_bin = sdk_root.join("bin");
-        let sdk_lib = sdk_root.join("lib");
-        let runtime_root = paths.data_dir.join("runtimes").join("default");
-        let runtime_bin = runtime_root.join("bin");
-        let runtime_lib = runtime_root.join("lib");
-        let runtime_sysdeps = runtime_root.join("lib").join("rocm_sysdeps").join("lib");
-        for dir in [
-            &python_bin,
-            &sdk_bin,
-            &sdk_lib,
-            &runtime_bin,
-            &runtime_lib,
-            &runtime_sysdeps,
-        ] {
-            fs::create_dir_all(dir)?;
-        }
-
-        let manifest = therock::InstalledRuntimeManifest {
-            runtime_key: "therock-release-gfx120x-all".to_owned(),
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            channel: "release".to_owned(),
-            format: "wheel".to_owned(),
-            family: "gfx120X-all".to_owned(),
-            family_source: "test".to_owned(),
-            version: "7.13.0a20260511".to_owned(),
-            install_root: runtime_root.clone(),
-            selected_artifact_url: "https://example.invalid/simple".to_owned(),
-            source_layout_generation: None,
-            index_url: None,
-            tarball_file_name: None,
-            python_launcher: None,
-            python_executable: Some(python.display().to_string()),
-            pip_cache_dir: None,
-            rocm_sdk: Some(therock::RocmSdkPythonProbe {
-                import_ok: true,
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![runtime_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_lib.clone()],
-                ..Default::default()
-            }),
-            sdk_torch: None,
-            wheel_composition: None,
-            read_only: false,
-            imported_from: None,
-            devel: true,
-            installed_at_unix_ms: 100,
-        };
-
-        let env = runtime_environment_from_runtime(&manifest, &python);
-        let mut command = Command::new(&python);
-        apply_runtime_environment(&mut command, &env)?;
-
-        assert_eq!(
-            command_env_value(&command, "VIRTUAL_ENV").as_deref(),
-            Some(env_root.as_os_str())
-        );
-        assert_eq!(
-            command_env_value(&command, "ROCM_PATH").as_deref(),
-            Some(sdk_root.as_os_str())
-        );
-        let path = command_env_value(&command, "PATH").context("PATH should be set")?;
-        let path_entries = split_runtime_paths(&path);
-        assert!(path_entries.contains(&python_bin));
-        assert!(path_entries.contains(&sdk_bin));
-        assert!(path_entries.contains(&runtime_bin));
-
-        if runtime_is_windows() {
-            assert!(path_entries.contains(&sdk_lib));
-            assert!(path_entries.contains(&runtime_lib));
-        } else if runtime_is_linux() {
-            let ld_library_path =
-                command_env_value(&command, "LD_LIBRARY_PATH").context("LD_LIBRARY_PATH")?;
-            let library_entries = split_runtime_paths(&ld_library_path);
-            assert!(library_entries.contains(&sdk_lib));
-            assert!(library_entries.contains(&runtime_lib));
-            assert!(library_entries.contains(&runtime_sysdeps));
-        }
-        Ok(())
-    }
-
-    fn command_env_value(command: &Command, key: &str) -> Option<OsString> {
-        command
-            .get_envs()
-            .find(|(name, _)| name.to_string_lossy() == key)
-            .and_then(|(_, value)| value.map(OsString::from))
-    }
-
-    fn ready_runtime_manifest(
+    pub(super) fn ready_runtime_manifest(
         paths: &AppPaths,
         runtime_key: &str,
     ) -> Result<therock::InstalledRuntimeManifest> {
@@ -3009,7 +1264,7 @@ mod tests {
         })
     }
 
-    fn write_runtime_manifest(
+    pub(super) fn write_runtime_manifest(
         paths: &AppPaths,
         manifest: &therock::InstalledRuntimeManifest,
     ) -> Result<()> {
@@ -3022,7 +1277,7 @@ mod tests {
         Ok(())
     }
 
-    fn test_paths(name: &str) -> AppPaths {
+    pub(super) fn test_paths(name: &str) -> AppPaths {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3035,72 +1290,402 @@ mod tests {
         }
     }
 
-    #[test]
-    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
-        // A multi-chunk body (the streaming downloader reads in 64 KiB
-        // chunks) so a single callback firing wouldn't already satisfy the
-        // "monotonically increasing" assertion below.
-        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+    /// User content an existing ComfyUI folder holds, keyed by path relative to
+    /// `source/`. Every kept top-level entry appears at least once, so dropping
+    /// any of them from the preserved list turns a reinstall test red.
+    const USER_FILES: [(&str, &str); 10] = [
+        ("models/checkpoints/my-model.safetensors", "user model"),
+        ("user/default/workflows/my-workflow.json", "user workflow"),
+        ("output/ComfyUI_00001_.png", "user image"),
+        ("input/my-upload.png", "user upload"),
+        ("custom_nodes/my-node/__init__.py", "user node"),
+        ("datasets/my-set/0001.png", "user dataset"),
+        ("extra_model_paths.yaml", "user model paths"),
+        // The user's copy of a file the new release also ships wins.
+        ("custom_nodes/websocket_image_save.py", "old sample node"),
+        // No release ships these: left in place.
+        ("styles.csv", "user styles"),
+        ("temp/scratch.png", "scratch"),
+    ];
 
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let served = body.clone();
-        let server = thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                served.len()
-            )?;
-            stream.write_all(&served)?;
-            stream.flush()?;
-            Ok(())
-        });
-
-        let url = format!("http://127.0.0.1:{port}/archive.tar.gz");
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cli-comfyui-download-progress-{}",
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root)?;
-        let destination = root.join("archive.tar.gz");
-
-        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
-        download_file(&url, &destination, &mut |bytes, total| {
-            calls.push((bytes, total));
-        })?;
-        assert_eq!(fs::read(&destination)?, body);
-
-        server.join().expect("localhost server thread panicked")?;
-        let _ = fs::remove_dir_all(&root);
-
-        let total = Some(body.len() as u64);
-        assert!(
-            calls.len() >= 2,
-            "expected at least a pre-transfer and a final callback: {calls:?}"
-        );
-        assert!(
-            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "byte counts must never regress: {calls:?}"
-        );
-        assert_eq!(
-            calls.last(),
-            Some(&(body.len() as u64, total)),
-            "the last callback must report the complete transfer: {calls:?}"
-        );
+    /// A ComfyUI install that has been used: release code plus user content.
+    fn plant_used_comfyui_source(source: &Path) -> Result<()> {
+        for (relative, contents) in [
+            ("main.py", "old main"),
+            ("requirements.txt", "torch\n"),
+            ("comfy/removed_upstream.py", "old code"),
+        ]
+        .into_iter()
+        .chain(USER_FILES)
+        {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().context("fixture path has no parent")?)?;
+            fs::write(&path, contents)?;
+        }
         Ok(())
+    }
+
+    pub(super) fn assert_user_files_intact(source: &Path) {
+        for (relative, contents) in USER_FILES {
+            let path = source.join(relative);
+            assert_eq!(
+                fs::read_to_string(&path).ok().as_deref(),
+                Some(contents),
+                "a reinstall must keep {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Writes the archive `download_and_extract_source` would otherwise
+    /// download, so a reinstall runs offline. Its top-level folder mirrors
+    /// GitHub's `ComfyUI-master/`. Only the unix-only install tests use it.
+    #[cfg(unix)]
+    pub(super) fn plant_cached_source_archive(
+        app_root: &Path,
+        files: &[(&str, &str)],
+    ) -> Result<()> {
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        for (relative, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(
+                &mut header,
+                format!("ComfyUI-master/{relative}"),
+                contents.as_bytes(),
+            )?;
+        }
+        builder.into_inner()?.finish()?;
+        Ok(())
+    }
+
+    pub(super) fn reinstall_fixture(name: &str) -> Result<(AppPaths, RocmCliConfig, PathBuf)> {
+        let paths = test_paths(name);
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        write_runtime_manifest(&paths, &runtime)?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(runtime.runtime_key.clone()),
+            ..Default::default()
+        };
+        let app_root = runtime_app_root(&runtime);
+        plant_used_comfyui_source(&source_path_from_app_root(&app_root))?;
+        Ok((paths, config, app_root))
+    }
+
+    pub(super) fn reinstall_options(dry_run: bool) -> ComfyUiInstallOptions {
+        ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: true,
+            dry_run,
+        }
+    }
+
+    pub(super) fn remove_test_root(paths: &AppPaths) {
+        if let Some(root) = paths.data_dir.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// A cached release archive and a runtime Python that passes the GPU
+    /// check, so `install` runs to completion offline.
+    #[cfg(unix)]
+    pub(super) fn plant_installable_release(paths: &AppPaths, app_root: &Path) -> Result<()> {
+        plant_cached_source_archive(
+            app_root,
+            &[
+                ("main.py", "new main"),
+                ("requirements.txt", "torch\n"),
+                ("comfy/added_upstream.py", "new code"),
+            ],
+        )?;
+        let runtime = ready_runtime_manifest(paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
+        )?;
+        Ok(())
+    }
+
+    /// `start` refuses a folder whose reinstall was interrupted, and `status`
+    /// says so. The command both name is then run exactly as printed and
+    /// clears it: the marker is gone and `start`'s checks pass.
+    #[cfg(unix)]
+    #[test]
+    fn start_refuses_an_interrupted_reinstall_until_install_finishes_it() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-start-mid-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        // As an interrupted reinstall leaves it.
+        fs::write(source.join(source_swap::SWAP_MARKER), "models\n")?;
+        fs::remove_file(source.join("main.py"))?;
+        let advice = "a reinstall was interrupted; run `rocm comfyui install --runtime-id reinstall-runtime` to finish it";
+
+        let refused = start(
+            &paths,
+            ComfyUiStartOptions {
+                host: "127.0.0.1".to_owned(),
+                port: unused_local_port()?,
+                no_open_browser: true,
+            },
+        )
+        .expect_err("start must refuse a half-replaced folder");
+        assert!(format!("{refused:#}").contains(advice), "{refused:#}");
+        let status = render_status(&paths, &config)?;
+        assert!(status.contains(&format!("  note: {advice}\n")), "{status}");
+
+        // `rocm comfyui install --runtime-id reinstall-runtime`, as printed.
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        assert!(!source.join(source_swap::SWAP_MARKER).exists());
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        ensure_source_is_startable(&manifest)?;
+        assert!(!render_status(&paths, &config)?.contains("interrupted"));
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A long-lived process standing in for a running ComfyUI.
+    pub(super) fn spawn_stand_in_process() -> Result<std::process::Child> {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn a stand-in process")
+    }
+
+    /// The chat's status answer passes on the interrupted-reinstall note and
+    /// does not advise `start`, which would refuse; `status` drops its
+    /// `start` next step too. Once the named install finishes the swap, both
+    /// advise `start` again.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_names_the_install_that_finishes_an_interrupted_reinstall() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-chat-status-mid-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        // A saved state for a ComfyUI that has exited: status reports it
+        // stopped.
+        let mut exited = spawn_stand_in_process()?;
+        let dead_pid = exited.id();
+        exited.kill()?;
+        exited.wait()?;
+        let port = unused_local_port()?;
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: format!("http://127.0.0.1:{port}"),
+                host: "127.0.0.1".to_owned(),
+                port,
+                pid: dead_pid,
+                source_path: source.clone(),
+                python_executable: paths.data_dir.join("python"),
+                log_path: paths.data_dir.join("start.log"),
+                started_at_unix_ms: 1,
+            },
+        )?;
+        // As an interrupted reinstall leaves it.
+        fs::write(source.join(source_swap::SWAP_MARKER), "models\n")?;
+        fs::remove_file(source.join("main.py"))?;
+        let advice = "a reinstall was interrupted; run `rocm comfyui install --runtime-id reinstall-runtime` to finish it";
+
+        let answer = render_chat_status_answer(&paths)?;
+        assert!(answer.contains("Running: no\n"), "{answer}");
+        assert!(answer.contains(&format!("Note: {advice}.\n")), "{answer}");
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        let status = render_status(&paths, &config)?;
+        assert!(!status.contains("comfyui start"), "{status}");
+        // The summary the assistant answers with after a status tool call
+        // passes the note on too.
+        // Another tool's output ahead of it in the same text keeps its notes.
+        let summary = chat::deterministic_comfyui_tool_summary(&format!(
+            "Engines\n  note: another tool's note\n\n{status}"
+        ))
+        .context("a status summary")?;
+        assert!(summary.contains(&format!("  Note: {advice}.")), "{summary}");
+        assert!(!summary.contains("another tool"), "{summary}");
+        // What the note claims: start refuses until that install runs.
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        assert!(ensure_source_is_startable(&manifest).is_err());
+
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        let answer = render_chat_status_answer(&paths)?;
+        assert!(!answer.contains("interrupted"), "{answer}");
+        assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
+        let summary = chat::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
+            .context("a status summary")?;
+        assert!(!summary.contains("Note:"), "{summary}");
+        assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
+        ensure_source_is_startable(&load_manifest(&paths)?.context("manifest")?)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// An installed ComfyUI with a saved state for the given process and
+    /// port, as `start` leaves it.
+    #[cfg(unix)]
+    fn installed_with_state(name: &str, pid: u32, port: u16) -> Result<(AppPaths, String)> {
+        let (paths, config, app_root) = reinstall_fixture(name)?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        let url = format_http_base_url("127.0.0.1", port);
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: url.clone(),
+                host: "127.0.0.1".to_owned(),
+                port,
+                pid,
+                source_path: source,
+                python_executable: paths.data_dir.join("python"),
+                log_path: paths.data_dir.join("start.log"),
+                started_at_unix_ms: 1,
+            },
+        )?;
+        Ok((paths, url))
+    }
+
+    /// A ComfyUI that answers on its port is reported running, with its URL,
+    /// and `start` is not advised.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_reports_a_running_comfyui_with_its_url() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let (paths, url) =
+            installed_with_state("comfyui-chat-status-running", std::process::id(), port)?;
+
+        let answer = render_chat_status_answer(&paths)?;
+
+        assert!(
+            answer.contains(&format!("Running: yes\nURL: {url}\n")),
+            "{answer}"
+        );
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        // What the answer claims: the URL answers.
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        drop(listener);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A ComfyUI whose process is up but whose port does not answer yet is
+    /// reported starting, and `start`, which would launch a second one, is
+    /// not advised.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_reports_a_starting_comfyui() -> Result<()> {
+        let mut child = spawn_stand_in_process()?;
+        let port = unused_local_port()?;
+        let result = installed_with_state("comfyui-chat-status-starting", child.id(), port)
+            .and_then(|(paths, _)| {
+                let status = render_status(&paths, &RocmCliConfig::default())?;
+                Ok((render_chat_status_answer(&paths)?, status, paths))
+            });
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let (answer, status, paths) = result?;
+        assert!(answer.contains("Running: starting\n"), "{answer}");
+        // `status` says `note: starting` under `Running`; the tool summary
+        // sums that up as its running state, not as a note.
+        assert!(status.contains("  note: starting\n"), "{status}");
+        let summary =
+            chat::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+        assert!(summary.contains("  Running: starting."), "{summary}");
+        assert!(!summary.contains("Note:"), "{summary}");
+        assert!(!answer.contains("URL:"), "{answer}");
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// Both pieces of advice name an install to run as printed, so the line
+    /// must split back to exactly that argv whatever the runtime key holds.
+    /// The key is read back by stripping the fixed text around it rather than
+    /// splitting on the backticks, which a hostile key may itself contain.
+    /// Mutation: interpolating the key bare in `finishing_install_command`
+    /// fails this for both.
+    #[test]
+    fn finishing_advice_names_the_install_as_its_argv() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            ..Config::default()
+        });
+        runner
+            .run(&crate::shell_quote::hostile::arg(), |runtime_key| {
+                let expected = ["rocm", "comfyui", "install", "--runtime-id", &runtime_key]
+                    .map(str::to_owned)
+                    .to_vec();
+                for (message, prefix, suffix) in [
+                    (
+                        interrupted_reinstall_advice(&runtime_key),
+                        "a reinstall was interrupted; run `",
+                        "` to finish it",
+                    ),
+                    (
+                        unfinished_install_advice(" (replaced: comfy)", &runtime_key),
+                        "the new ComfyUI code is in place (replaced: comfy), but the install \
+                         did not finish; once the cause below is fixed, run `",
+                        "` to finish it",
+                    ),
+                ] {
+                    let command = message
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .unwrap_or_else(|| panic!("unexpected advice: {message}"));
+                    prop_assert_eq!(shlex::split(command), Some(expected.clone()), "{}", message);
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }

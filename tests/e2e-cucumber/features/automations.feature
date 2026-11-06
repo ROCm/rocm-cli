@@ -1,10 +1,18 @@
 Feature: Automation watchers
 
   # `rocm automations enable/disable <watcher> --mode <mode>` toggles a built-in
-  # automation watcher in the CLI config and prints a confirmation. This feature
-  # pins only the enable/disable/mode-confirmation slice verified during the
-  # walkthrough; the broader automation behaviour is covered elsewhere. Config-only
-  # (no GPU, no network), so it runs on the mock lane every PR.
+  # automation watcher in the CLI config and prints a confirmation; bare `rocm
+  # automations` lists the most recent review requests (any status — only the
+  # per-entry approve/reject controls are gated on "pending"). This feature
+  # pins the enable/disable/mode-confirmation slice, the proposal-history
+  # listing's unit formatting, the bare listing's tolerance of a torn
+  # audit-log tail, how the next write repairs one, and how the audit log
+  # and proposal history are kept
+  # bounded, and that a repeated GPU thermal alert does not queue a second stop
+  # request; the rest of the watcher/daemon trigger behaviour is covered
+  # elsewhere. No GPU and no network (the one daemon-driven scenario takes its
+  # alerts from the daemon's loopback webhook), so it runs on the mock lane
+  # every PR.
 
   @id:automations-enable-confirms-mode
   Scenario: automations-01 - Enabling a watcher confirms its mode
@@ -43,3 +51,149 @@ Feature: Automation watchers
     Given a daemon spawn is already in flight
     When the user enables an automation watcher in observe mode
     Then the CLI does not start a second background daemon
+
+  # format_bytes_for_user (the only formatter behind this line) mislabeled
+  # binary (base-1024) sizes as KB/MB/GB instead of KiB/MiB/GiB (#190).
+  @id:automations-proposal-size-uses-binary-units
+  Scenario: automations-05 - A pending artifact-download proposal shows its approved cap in binary units
+    Given a pending artifact-download proposal approved for a size just under 1 MiB
+    When the user lists automations
+    Then the CLI reports the approved size in binary units
+
+  # Readers of the audit/events/proposals stores take no lock, so one can
+  # catch a write mid-append; the cut-off last line that leaves is skipped
+  # instead of failing the whole read.
+  # `render_automations_text` already swallows any read error from these
+  # stores via `.unwrap_or_default()`, so `rocm automations` never exits
+  # non-zero either way — what this scenario actually pins is that the clean
+  # record ahead of the torn one still shows up, rather than the torn line's
+  # read error wiping out the whole audit section the way it would without
+  # this skip.
+  # `render_automations_text` is the production reader of the audit store
+  # specifically (the one this scenario seeds). The two places a person
+  # reads its raw text directly are the `rocm automations` CLI subcommand
+  # itself, and the TUI's automations-manager screen, which shells out to
+  # `rocm automations list` as a subprocess — so that's where the audit
+  # store's tolerance is directly user-observable. It's also reachable
+  # through other paths that don't show the raw text the same way —
+  # `rocm chat`'s and the TUI's slash-command `rocm_command` tool in-process
+  # (the model sees it, or the TUI shrinks it to field counts first), and
+  # rocmd's own MCP `rocm_command` tool via a further `rocm automations list`
+  # subprocess — this isn't meant as an exhaustive map of every caller, just
+  # context for why the CLI subcommand is the right level to pin this at.
+  @id:automations-tolerates-torn-audit-tail
+  Scenario: automations-06 - Listing automations tolerates a torn audit-log tail
+    Given a fresh CLI configuration
+    And the audit event log ends in a torn, unterminated line
+    When the user lists automations
+    Then the CLI still lists the record before the torn tail
+
+  # The automation event log and the audit log are size-capped (ROCMAI-729):
+  # the write that finds the live log at its cap first renames it aside to
+  # `events.jsonl.1`, keeping a fixed number of such generations. This seeds the
+  # audit log at the cap, makes one change the CLI audits, and checks both the
+  # files and that the automations listing still shows activity from before the
+  # rollover, which it can only read from the rotated generation.
+  @id:automations-audit-log-rotates-at-cap
+  Scenario: automations-07 - A full audit log is set aside and its recent history stays visible
+    Given an audit log that has reached its size cap
+    When the user selects a permissions mode
+    Then the full audit log is kept aside as its first rotated generation
+    And the permissions change starts a fresh audit log
+    When the user lists automations
+    Then the recent background activity still includes entries from before the rotation
+
+  # The proposal history is compacted, not rotated (ROCMAI-729): a pending
+  # proposal must stay findable by id until it is reviewed, so reviewing one
+  # rewrites the history keeping every pending proposal but only the most
+  # recently reviewed ones. Approves through `rocm mcp-call proposal_action`, the
+  # hidden entry point the dashboard and chat review controls use.
+  @id:automations-review-compaction-keeps-pending
+  Scenario: automations-08 - Approving a proposal trims old review history but keeps older pending proposals
+    Given a pending proposal queued before a long history of reviewed proposals
+    When the user approves the newest pending proposal
+    Then the CLI confirms the approval
+    And only the most recently reviewed proposals are kept
+    When the user looks up the older pending proposal
+    Then the CLI shows it still pending
+
+  # automations-07 only exercises a single rollover: a live file at the cap
+  # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
+  # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
+  # pinned only by unit tests in `jsonl_store.rs`. This seeds a full chain of
+  # four already-rotated generations plus a live file at the cap, forces one
+  # more rotation, and checks the whole chain shifted down by one and the
+  # oldest generation's content is gone, not just that `.1` exists.
+  @id:automations-rotation-chain-shifts-and-drops-oldest
+  Scenario: automations-09 - A further rotation shifts the whole chain and drops the oldest generation
+    Given an audit log already holding a full chain of four rotated generations
+    When the user selects a permissions mode
+    Then each rotated generation holds what the previous one held
+    And the oldest previous generation is gone
+
+  # A write that was cut off leaves a torn last line, and the next append
+  # repairs it by writing a clean copy of the audit log beside it and renaming
+  # that over the original. When the copy cannot be made — a full disk, or on
+  # Windows another program holding the log open without delete sharing — the
+  # repair used to give up: the debris stayed, the CLI warned that it failed to
+  # write the audit event on every command that records one, and the event was
+  # lost. The repair now falls back to cutting the debris in place. A directory
+  # that takes no new files is the same failure without filling a disk, so this
+  # drives it through `rocm config set-permissions`, a command the CLI audits.
+  # The fault is a directory permission, which does not bind root (the
+  # self-hosted WSL2 guest runs the suite as root), so `@requires-dir-permissions`
+  # skips it there rather than let it pass without testing anything. The unit
+  # tests in `jsonl_store.rs` cover the other triggers (an injected failure of
+  # each step, and on Windows a handle without delete sharing).
+  @id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced @requires-os:linux @requires-dir-permissions
+  Scenario: automations-10 - A command still records its audit event when the torn audit log cannot be replaced
+    Given the audit event log ends in a torn, unterminated line
+    And the audit log's directory takes no new files
+    When the user selects a permissions mode
+    Then the CLI confirms the permissions mode
+    And the CLI prints no warning about the audit log
+    And the audit log keeps its earlier record, drops the torn line and records the permissions change
+
+  # The background helper's lifecycle (ROCMAI-827). Enabling a watcher starts a
+  # detached `rocm daemon`; it used to run forever after that, so a helper
+  # started by `serve` or `automations enable` outlived every service and every
+  # watcher. It now exits on its own once no watcher is enabled. This drives the
+  # real spawn — no suppression marker — and checks the `helper:` line the
+  # enable prints together with the process it claims to have started, then
+  # that disabling the only watcher makes that process exit. The other half,
+  # that `serve` with no watcher enabled starts no helper at all, needs a real
+  # serve and is `serve-stop-leaves-no-background-helper` on the GPU lane.
+  # Config-only — no GPU or network — so it runs on the mock lane every PR.
+  @id:automations-helper-stops-when-no-watcher-is-enabled
+  Scenario: automations-11 - The background helper stops on its own once no watcher is enabled
+    Given no automation watcher is enabled
+    When the user enables an automation watcher in observe mode
+    Then the CLI reports starting the background helper and it is running
+    When the user disables the watcher
+    Then the CLI confirms the watcher is disabled
+    And the background helper stops on its own
+
+  # The gpu-thermal-protect watcher queues a request to stop the hot server and
+  # waits for a person to review it. While that request is waiting, the same
+  # alert arriving again must not queue another, or the review list fills with
+  # copies of one request. The check for a waiting request once read only the
+  # most recent proposals, so a stop request with enough newer proposals queued
+  # behind it was missed and a second one was queued. This drives the real
+  # daemon: the alerts reach it through its loopback webhook (`rocmd run
+  # --local-webhook-port`), the same dispatch a telemetry alert takes, and the
+  # proposals are read back from the store `rocm automations` lists. The
+  # newer proposals are seeded directly, one more than the store keeps of
+  # reviewed ones, so they sit beyond a recent-window read of that size.
+  @id:automations-thermal-stop-not-requeued-behind-newer-proposals
+  @requires-os:linux
+  Scenario: automations-12 - A repeated thermal alert queues no second stop request while the first waits behind newer proposals
+    Given a fresh CLI configuration
+    And the GPU thermal-protection watcher is enabled in propose mode
+    And a ready managed model server
+    And the automation daemon is running with its local webhook
+    When a GPU thermal alert for the server reaches the daemon
+    Then one stop request for the server is waiting for review
+    When more proposals for other servers are queued after it than the history keeps
+    And a GPU thermal alert for the server reaches the daemon again
+    Then the daemon records that a stop request is already waiting for the server
+    And only one stop request for the server is waiting for review

@@ -14,6 +14,24 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+  # aws-lc-sys 0.46 and later auto-detect an AWS-LC already installed on the
+  # build host and link it when found. Release binaries must not depend on
+  # what the runner or build container happens to have, so always build the
+  # vendored copy.
+  AWS_LC_SYS_USE_SYSTEM: "0"
+  # REQUIRED, not dormant: every readiness step below runs --require-signatures,
+  # which now means signatures must actually verify, so this is the public key
+  # the release is verified against. Removing or blanking the secret fails every
+  # release run — GitHub expands an unset secret to the empty string, which the
+  # gate treats as "no key" and rejects. It is the public half only; the private
+  # signing key stays step-scoped.
+  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   # Production trust gate — dormant until the owner sets the repository variable
   # ROCM_CLI_REQUIRE_PRODUCTION_TRUST (e.g. "1") and provides the trust inputs
   # below. While the variable is unset/falsy, release_readiness.py skips
@@ -22,7 +40,6 @@ env:
   # enabling the gate, the recipe-index inputs also require a step that
   # materializes the hosted index + its .sig into the workspace.
   ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
-  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PATH }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH }}
@@ -30,13 +47,17 @@ env:
 jobs:
   release:
     name: Build Linux release assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -114,6 +135,7 @@ jobs:
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
             -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
+            -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -205,7 +227,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - name: Verify pinned keys match the signing key
         shell: pwsh
@@ -257,7 +279,7 @@ jobs:
 
   publish-release:
     name: Publish release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
       - release
       - windows-release

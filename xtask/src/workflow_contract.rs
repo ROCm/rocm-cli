@@ -267,8 +267,7 @@ mod tests {
     }
 
     /// Every lane that pre-builds `rocm` and hands it to the suite via
-    /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
-    /// enables when it builds for itself.
+    /// `ROCM_CLI_BINARY` must enable `rocm/e2e-test-hooks`.
     ///
     /// The suite's deterministic failure seams (e.g. the scripted Lemonade
     /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
@@ -277,6 +276,14 @@ mod tests {
     /// regressions — but only on whichever lane happens to select them, which is
     /// what made this divergence so hard to read the first time. Pin it here so a
     /// new lane copying an existing block cannot silently reintroduce it.
+    ///
+    /// `cargo xtask e2e` builds a *superset* for itself
+    /// (`rocm/e2e-test-hooks rocm/e2e-oom-fault-injection`), so this asserts the
+    /// shared floor rather than an exact match. The extra
+    /// `e2e-oom-fault-injection` hook is deliberately absent from the prebuilt
+    /// lanes: the scenarios needing it carry `@requires-oom-fault-injection` and
+    /// the harness skips them when `xtask` did not build the binary itself, so a
+    /// missing hook is a reported skip rather than a silent green.
     fn assert_prebuilt_e2e_lanes_enable_test_hooks(workflow: &str, text: &str) {
         let blocks: Vec<_> = multiline_run_blocks(text)
             .into_iter()
@@ -292,9 +299,9 @@ mod tests {
                     "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks"
                 ),
                 "{workflow} prebuilt E2E lane must build with \
-                 `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                 `--features rocm/e2e-test-hooks`, the hook floor `cargo xtask e2e` \
+                 also builds for itself; without it the suite's scripted failure \
+                 seams are compiled out:\n{block}"
             );
         }
     }
@@ -325,17 +332,11 @@ mod tests {
     /// This is what lets the docs guard assert against the workflow instead of
     /// against a list copied into the test source: add a lane and the derived
     /// list grows, so the documentation assertions fail until the docs follow.
-    ///
-    /// The job-id scan is scoped to the `jobs:` block, because top-level keys
-    /// like `push:` (under `on:`) and `group:` (under `concurrency:`) sit at the
-    /// same indent and would otherwise read as job ids.
     fn self_hosted_e2e_jobs(text: &str) -> Vec<(String, String)> {
-        let jobs = top_level_block(text, "jobs");
-        jobs.lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
+        job_ids(text)
+            .into_iter()
             .filter_map(|job| {
-                let mut values = runs_on_values(job_block(text, job));
+                let mut values = runs_on_values(job_block(text, &job));
                 assert!(
                     values.len() <= 1,
                     "job `{job}` declares more than one runs-on"
@@ -347,9 +348,35 @@ mod tests {
                 SELF_HOSTED_LABELS
                     .iter()
                     .any(|self_hosted| labels.iter().any(|label| label == self_hosted))
-                    .then_some((job.to_owned(), runs_on))
+                    .then_some((job, runs_on))
             })
             .collect()
+    }
+
+    /// Every job id in `text`'s `jobs:` block, in file order.
+    ///
+    /// Scoped to the `jobs:` block, because top-level keys like `push:` (under
+    /// `on:`) and `group:` (under `concurrency:`) sit at the same indent and
+    /// would otherwise read as job ids.
+    fn job_ids(text: &str) -> Vec<String> {
+        top_level_block(text, "jobs")
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_column_zero_comment_does_not_end_the_jobs_block() {
+        let text = "on: push\njobs:\n  first:\n    runs-on: x\n# ---- later lanes ----\n  second:\n    runs-on: y\nenv:\n  A: b\n";
+        assert_eq!(job_ids(text), ["first", "second"]);
+
+        // A comment directly above the next top-level key belongs to that key.
+        let text = "jobs:\n  only:\n    runs-on: x\n\n# shared settings\nenv:\n  A: b\n";
+        let jobs = top_level_block(text, "jobs");
+        assert!(!jobs.contains("shared settings"), "{jobs:?}");
+        assert!(jobs.trim_end().ends_with("runs-on: x"), "{jobs:?}");
     }
 
     /// Extract the direct scalar entries from a named job-level mapping such as
@@ -456,7 +483,9 @@ mod tests {
     }
 
     /// Extract a top-level YAML value/block, stopping at the next column-zero
-    /// key or comment. This is deliberately small: workflow contract tests
+    /// key. Column-zero comments inside the block do not end it, and comment
+    /// and blank lines directly above the next key are left out. This is
+    /// deliberately small: workflow contract tests
     /// inspect only checked-in files with the repository's established layout.
     fn top_level_block(text: &str, key: &str) -> String {
         let marker = format!("{key}:");
@@ -467,8 +496,18 @@ mod tests {
             .unwrap_or_else(|| panic!("workflow declares a top-level {marker}"));
         let end = lines[start + 1..]
             .iter()
-            .position(|line| !line.is_empty() && !line.starts_with(char::is_whitespace))
+            // A column-0 `#` comment is not a key: it must not end the block,
+            // or every job after a section-divider comment would drop out.
+            .position(|line| {
+                !line.is_empty() && !line.starts_with(char::is_whitespace) && !line.starts_with('#')
+            })
             .map_or(lines.len(), |offset| start + 1 + offset);
+        // A comment just above the next key belongs to that key, not to this
+        // block, so trailing comment and blank lines are left out.
+        let mut end = end;
+        while end > start + 1 && (lines[end - 1].is_empty() || lines[end - 1].starts_with('#')) {
+            end -= 1;
+        }
         let mut block = lines[start]
             .strip_prefix(&marker)
             .expect("top-level key prefix was just matched")
@@ -707,17 +746,298 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
 
-    #[test]
-    fn every_ci_job_declares_a_timeout() {
-        let ci = read_workflow("ci.yml");
-        let jobs = top_level_block(&ci, "jobs");
+    /// `step` without its full-line comments, so prose that quotes a command
+    /// cannot stand in for the command.
+    fn without_comments(step: &str) -> String {
+        step.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `line` runs `cargo build` with `--release` or `-r`, in any flag
+    /// order and quoted or not. A command wrapped over several lines is not seen.
+    fn is_release_cargo_build(line: &str) -> bool {
+        let tokens: Vec<&str> = line
+            .split_whitespace()
+            .map(|token| token.trim_matches(|c| c == '\'' || c == '"'))
+            .collect();
+        tokens.windows(2).any(|pair| pair == ["cargo", "build"])
+            && tokens
+                .iter()
+                .any(|token| matches!(*token, "--release" | "-r"))
+    }
+
+    /// Every step in `text` that builds shipped release binaries: a release
+    /// `cargo build` that is not the `e2e-test-hooks` harness build.
+    /// Named and unnamed (`- run:`) steps both count.
+    fn shipped_release_build_steps(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let item = line.trim_start();
+                item.starts_with("- name:") || item.starts_with("- run:")
+            })
+            .map(|(i, _)| step_block(&lines, i))
+            .filter(|step| {
+                let code = without_comments(step);
+                code.lines().any(is_release_cargo_build) && !code.contains("e2e-test-hooks")
+            })
+            .collect()
+    }
+
+    /// The `docker run` flag tokens before the image name (the first token
+    /// naming `manylinux`) of the invocation that runs the release build,
+    /// comments excluded.
+    fn container_build_flags(step: &str) -> Option<Vec<String>> {
+        let code = without_comments(step);
+        let invocation = code
+            .split("docker run")
+            .skip(1)
+            .find(|part| part.lines().any(is_release_cargo_build))?;
+        Some(
+            invocation
+                .split_whitespace()
+                .take_while(|token| !token.contains("manylinux"))
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    /// Where each shipped release build in a workflow gets `AWS_LC_SYS_USE_SYSTEM`
+    /// from, as one message per way it can fail to be `0`.
+    ///
+    /// `aws-lc-sys` 0.46+ links an AWS-LC it detects on the build host
+    /// (`OPENSSL_DIR` or pkg-config) unless the variable is `0`, so a shipped
+    /// binary could depend on whatever that host provides. GitHub resolves the
+    /// value step, then job, then workflow, so each build step is judged on its
+    /// own against that order. A manylinux container inherits none of them: a
+    /// dropped `-e AWS_LC_SYS_USE_SYSTEM` reverts that build to host detection
+    /// with no other symptom.
+    fn aws_lc_opt_out_violations(workflow: &str, text: &str, expected_steps: usize) -> Vec<String> {
+        const VAR: &str = "AWS_LC_SYS_USE_SYSTEM";
+        let entry = |line: &str| {
+            line.trim()
+                .strip_prefix("AWS_LC_SYS_USE_SYSTEM:")
+                .map(|value| strip_quotes(strip_comment(value).trim()))
+        };
+        let workflow_value = text
+            .lines()
+            .filter(|line| indent_of(line) == 2)
+            .find_map(entry);
+        let jobs = top_level_block(text, "jobs");
         let job_ids: Vec<&str> = jobs
             .lines()
             .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
             .filter_map(|line| line.trim().strip_suffix(':'))
             .collect();
-        assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
+
+        let mut violations = Vec::new();
+        let mut shipped_steps = 0;
         for job in job_ids {
+            let block = job_block(text, job);
+            // Entries of a job-level `env:` sit at indent 6; a step's own keys
+            // are two columns deeper, so they cannot match here.
+            let job_value = block
+                .lines()
+                .filter(|line| indent_of(line) == 6)
+                .find_map(entry);
+            for step in shipped_release_build_steps(block) {
+                shipped_steps += 1;
+                let value = step_env(&step)
+                    .get(VAR)
+                    .cloned()
+                    .or_else(|| job_value.clone())
+                    .or_else(|| workflow_value.clone());
+                if value.as_deref() != Some("0") {
+                    violations.push(format!(
+                        "{workflow}: a shipped release build resolves `{VAR}` to {value:?} from \
+                         its step, job and workflow env, not \"0\":\n{step}"
+                    ));
+                }
+                let Some(flags) = container_build_flags(&step) else {
+                    continue;
+                };
+                let forwarded = flags.windows(2).any(|pair| {
+                    matches!(pair[0].as_str(), "-e" | "--env")
+                        && (pair[1] == VAR || pair[1] == format!("{VAR}=0"))
+                });
+                if !forwarded {
+                    violations.push(format!(
+                        "{workflow}: the manylinux container build does not forward `{VAR}` \
+                         (`-e {VAR}`), so it builds against whatever AWS-LC the host \
+                         provides:\n{step}"
+                    ));
+                }
+            }
+        }
+        if shipped_steps != expected_steps {
+            violations.push(format!(
+                "{workflow}: expected {expected_steps} shipped release build steps, found \
+                 {shipped_steps}. A step is counted when a line runs `cargo build` with \
+                 `--release` or `-r`; if a build was added or removed, update the count and \
+                 make sure it pins `{VAR}`, and if one was reshaped so it is no longer \
+                 recognised, teach `is_release_cargo_build` its spelling instead"
+            ));
+        }
+        violations
+    }
+
+    #[test]
+    fn shipped_release_builds_pin_the_vendored_aws_lc_opt_out() {
+        // The Linux and the Windows bundle build of each workflow.
+        for (workflow, expected_steps) in [("release.yml", 2), ("nightly.yml", 2), ("ci.yml", 2)] {
+            let violations =
+                aws_lc_opt_out_violations(workflow, &read_workflow(workflow), expected_steps);
+            assert!(violations.is_empty(), "{}", violations.join("\n\n"));
+        }
+    }
+
+    #[test]
+    fn aws_lc_opt_out_check_resolves_every_env_layer_and_spelling() {
+        const OFF: &str = "AWS_LC_SYS_USE_SYSTEM: \"0\"";
+        const ON: &str = "AWS_LC_SYS_USE_SYSTEM: \"1\"";
+        let workflow = |workflow_env: &str, job_env: &str, steps: &str| {
+            let job_env = if job_env.is_empty() {
+                String::new()
+            } else {
+                format!("    env:\n      {job_env}\n")
+            };
+            format!(
+                "env:\n  {workflow_env}\njobs:\n  build:\n    runs-on: ubuntu-latest\n{job_env}    steps:\n{steps}"
+            )
+        };
+        let native = |step_env: &str| {
+            let env = if step_env.is_empty() {
+                String::new()
+            } else {
+                format!("        env:\n          {step_env}\n")
+            };
+            format!("      - name: Build\n{env}        run: cargo build --release -p rocm\n")
+        };
+        let container = |flag: &str| {
+            r"      - name: Build
+        run: |
+          docker run --rm \
+            FLAG \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc 'cargo build --release -p rocm'
+"
+            .replace("FLAG", flag)
+        };
+        let check =
+            |text: &str, expected: usize| aws_lc_opt_out_violations("t.yml", text, expected);
+
+        assert!(check(&workflow(OFF, "", &native("")), 1).is_empty());
+        assert!(
+            check(&workflow(OFF, ON, &native("")), 1).len() == 1,
+            "job env overrides the workflow's"
+        );
+        assert!(
+            check(&workflow(OFF, ON, &native(OFF)), 1).is_empty(),
+            "step env overrides the job's"
+        );
+        assert!(
+            check(&workflow(OFF, "", &native(ON)), 1).len() == 1,
+            "step env overrides the workflow's"
+        );
+        assert!(
+            check(&workflow("", "", &native("")), 1).len() == 1,
+            "an unset variable is not 0"
+        );
+
+        for flag in [
+            "-e AWS_LC_SYS_USE_SYSTEM",
+            "--env AWS_LC_SYS_USE_SYSTEM",
+            "-e AWS_LC_SYS_USE_SYSTEM=0",
+        ] {
+            assert!(
+                check(&workflow(OFF, "", &container(flag)), 1).is_empty(),
+                "{flag}"
+            );
+        }
+        for flag in [
+            "-e CARGO_HOME=/c",
+            "-e AWS_LC_SYS_USE_SYSTEM=1",
+            "# -e AWS_LC_SYS_USE_SYSTEM",
+        ] {
+            assert!(
+                check(&workflow(OFF, "", &container(flag)), 1).len() == 1,
+                "{flag}"
+            );
+        }
+
+        let unnamed = "      - run: cargo build --release -p rocm\n";
+        assert!(check(&workflow(OFF, "", unnamed), 1).is_empty());
+        assert_eq!(
+            check(&workflow(OFF, "", unnamed), 0).len(),
+            1,
+            "unnamed steps are counted"
+        );
+        assert_eq!(
+            check(&workflow("", "", unnamed), 1).len(),
+            1,
+            "unnamed steps are checked"
+        );
+        let harness = "      - name: Harness\n        run: cargo build --release -p rocm --features rocm/e2e-test-hooks\n";
+        assert!(
+            check(&workflow("", "", harness), 0).is_empty(),
+            "the e2e harness build is not shipped"
+        );
+        for spelling in [
+            "cargo build --locked --release -p rocm",
+            "cargo build -p rocm -r",
+        ] {
+            let step = format!("      - run: {spelling}\n");
+            assert_eq!(check(&workflow("", "", &step), 1).len(), 1, "{spelling}");
+            assert!(check(&workflow(OFF, "", &step), 1).is_empty(), "{spelling}");
+        }
+        assert!(
+            check(&workflow("", "", "      - run: cargo build -p rocm\n"), 0).is_empty(),
+            "a debug build is not shipped"
+        );
+        let quoting_the_harness = "      - name: Build\n        # unlike the e2e-test-hooks build\n        run: cargo build --release -p rocm\n";
+        assert_eq!(
+            check(&workflow("", "", quoting_the_harness), 1).len(),
+            1,
+            "a comment cannot exempt a shipped build"
+        );
+
+        assert_eq!(
+            check(&workflow(OFF, "", &native("")), 2).len(),
+            1,
+            "a missing shipped build is reported"
+        );
+        let commented = "AWS_LC_SYS_USE_SYSTEM: \"0\"  # vendored";
+        assert!(
+            check(&workflow(commented, "", &native("")), 1).is_empty(),
+            "workflow value with a trailing comment"
+        );
+        assert!(
+            check(&workflow("", commented, &native("")), 1).is_empty(),
+            "job value with a trailing comment"
+        );
+        let after_image = "      - name: Build\n        run: |\n          docker run --rm quay.io/pypa/manylinux2014_x86_64 \\\n            -e AWS_LC_SYS_USE_SYSTEM \\\n            /bin/bash -lc 'cargo build --release -p rocm'\n";
+        assert_eq!(
+            check(&workflow(OFF, "", after_image), 1).len(),
+            1,
+            "a flag after the image is not a docker flag"
+        );
+        let comment_key = workflow(OFF, "", &native("")).replace("jobs:\n", "jobs:\n  # note:\n");
+        assert!(
+            check(&comment_key, 1).is_empty(),
+            "a comment ending in a colon is not a job"
+        );
+    }
+
+    #[test]
+    fn every_ci_job_declares_a_timeout() {
+        let ci = read_workflow("ci.yml");
+        let job_ids = job_ids(&ci);
+        assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
+        for job in &job_ids {
             let block = job_block(&ci, job);
             assert!(
                 block
@@ -749,6 +1069,426 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 );
             }
         }
+    }
+
+    /// Every workflow file as `(file name, text)`, read from the directory
+    /// rather than from a list, so a workflow added later is covered too.
+    fn all_workflows() -> Vec<(String, String)> {
+        let dir = repo_root().join(".github/workflows");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("workflow dir entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| {
+                Path::new(name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let text = read_workflow(&name);
+                (name, text)
+            })
+            .collect()
+    }
+
+    /// `(line number, line)` for every line naming `ubuntu-latest` outside a
+    /// comment, wherever it sits: a `runs-on`, a matrix list, an `include`.
+    fn moving_ubuntu_label_lines(text: &str) -> Vec<(usize, String)> {
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with('#'))
+            .filter(|(_, line)| strip_comment(line).contains("ubuntu-latest"))
+            .map(|(i, line)| (i + 1, line.trim().to_owned()))
+            .collect()
+    }
+
+    /// No hosted job may run on `ubuntu-latest`.
+    ///
+    /// The label moves. When GitHub repointed it from ubuntu-24.04 to
+    /// ubuntu-26.04, every merge-group run went red overnight on a change
+    /// nobody in this repository made: 26.04's uutils coreutils broke the
+    /// reclaim decoys. Linux jobs name their images instead — the test and build
+    /// jobs run on both LTS releases, the rest on one — so a new release is
+    /// adopted by an edit to this repository, which CI then exercises.
+    #[test]
+    fn no_workflow_runs_on_the_moving_ubuntu_latest_label() {
+        let workflows = all_workflows();
+        assert!(
+            workflows.iter().any(|(name, _)| name == "ci.yml"),
+            "expected ci.yml among the workflows (directory scan sanity check)"
+        );
+        for (name, text) in workflows {
+            let hits = moving_ubuntu_label_lines(&text);
+            assert!(
+                hits.is_empty(),
+                "{name} names `ubuntu-latest`, which GitHub repoints to each new Ubuntu \
+                 release without notice; name `ubuntu-24.04` and/or `ubuntu-26.04` instead \
+                 (lines: {hits:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_ubuntu_label_detector_flags_values_but_not_comments() {
+        let yaml = "\
+jobs:
+  # ubuntu-latest moved under us once; see the contract test.
+  a:
+    runs-on: ubuntu-24.04 # not ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  c:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
+";
+        let hits = moving_ubuntu_label_lines(yaml);
+        assert_eq!(
+            hits,
+            vec![
+                (6, "runs-on: ubuntu-latest".to_owned()),
+                (10, "os: [ubuntu-24.04, ubuntu-latest]".to_owned()),
+            ]
+        );
+    }
+
+    /// The `ci.yml` jobs that run on both Ubuntu LTS images, with the name each
+    /// reported before the split. Branch protection requires the first three
+    /// names verbatim, so the 24.04 leg must keep reporting them; the
+    /// `remote-ssh` check is not required, and keeps its name so that it can
+    /// be made required without a rename.
+    const LTS_SPLIT_JOBS: [(&str, &str); 4] = [
+        ("build-and-test", "build-and-test"),
+        ("test", "Test (affected crates)"),
+        ("e2e", "E2E tests"),
+        ("remote-ssh", "remote control channel (containerised)"),
+    ];
+
+    /// A split job keeps its required check, and also runs on 26.04.
+    ///
+    /// A plain matrix renames every leg to `<name> (<os>)`, so the bare name
+    /// branch protection waits for would never report and every pull request
+    /// would sit on a missing required check. The 24.04 leg therefore keeps the
+    /// bare name and only the 26.04 leg gets a suffix.
+    #[test]
+    fn lts_split_jobs_keep_their_required_name_on_24_04() {
+        let ci = read_workflow("ci.yml");
+        for (job, context) in LTS_SPLIT_JOBS {
+            let block = job_block(&ci, job);
+            let expected = format!(
+                "name: ${{{{ matrix.os == 'ubuntu-24.04' && '{context}' || \
+                 format('{context} ({{0}})', matrix.os) }}}}"
+            );
+            assert!(
+                block.lines().any(|line| line.trim() == expected),
+                "ci.yml job `{job}` must report as `{context}` on ubuntu-24.04 — the name \
+                 branch protection requires — and with an image suffix on ubuntu-26.04; \
+                 expected the line `{expected}`"
+            );
+            assert_eq!(
+                runs_on_values(block),
+                vec!["${{ matrix.os }}".to_owned()],
+                "ci.yml job `{job}` must run on its matrix image"
+            );
+            let os = flattened_values(block, "os");
+            assert_eq!(
+                os.len(),
+                1,
+                "ci.yml job `{job}` declares one `os` matrix axis"
+            );
+            assert_eq!(
+                flattened_list_items(&os[0]),
+                vec!["ubuntu-24.04".to_owned(), "ubuntu-26.04".to_owned()],
+                "ci.yml job `{job}` must run on both Ubuntu LTS images"
+            );
+            assert!(
+                block.lines().any(|line| line.trim() == "fail-fast: false"),
+                "ci.yml job `{job}`: one image failing must not cancel the other's leg"
+            );
+        }
+    }
+
+    /// What the E2E gate step produced: the `run=` value it wrote to
+    /// `$GITHUB_OUTPUT` and everything it printed to stdout (where a
+    /// `::notice::` annotation goes).
+    #[cfg(unix)]
+    struct E2eGateOutcome {
+        run: String,
+        stdout: String,
+    }
+
+    /// Run `ci.yml`'s E2E "Decide whether to run" step under bash, as a `run:`
+    /// step does, with each `${{ … }}` expression replaced by the value given
+    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT` together
+    /// with what it printed to stdout (where a `::notice::` annotation goes).
+    ///
+    /// An expression the table does not name fails the test rather than
+    /// expanding to nothing, so the gate cannot start reading a new context
+    /// that this test silently feeds as empty.
+    #[cfg(unix)]
+    fn run_e2e_gate(
+        event: &str,
+        clippy: &str,
+        build_and_test: &str,
+        heavy: &str,
+    ) -> E2eGateOutcome {
+        let ci = read_workflow("ci.yml");
+        let step = job_steps(job_block(&ci, "e2e"))
+            .expect("ci.yml's `e2e` job has a `steps:` list")
+            .into_iter()
+            .find_map(|(name, step)| (name == "Decide whether to run").then_some(step))
+            .expect("ci.yml's `e2e` job has a \"Decide whether to run\" step");
+        let mut script = dedent(&run_block(&step).expect(
+            "the E2E gate step has no block-scalar `run:`; `run_block` reads `run: |`, \
+             `run: |-`, `run: >` and the like, but not a one-line `run:`",
+        ))
+        .expect("the gate step's script is not empty");
+        let values = [
+            ("github.event_name", event),
+            ("needs.clippy.result", clippy),
+            ("needs.build-and-test.result", build_and_test),
+            ("needs.changes.outputs.heavy", heavy),
+        ];
+        while let Some(open) = script.find("${{") {
+            let close = open
+                + script[open..]
+                    .find("}}")
+                    .expect("every `${{` in the gate step is closed");
+            let expr = script[open + 3..close].trim().to_owned();
+            let value = values
+                .iter()
+                .find(|(name, _)| *name == expr)
+                .unwrap_or_else(|| {
+                    panic!("the E2E gate reads `{expr}`, which this test does not feed")
+                })
+                .1;
+            script.replace_range(open..close + 2, value);
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("github_output");
+        std::fs::write(&output, "").expect("write GITHUB_OUTPUT");
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(&script)
+            .env("GITHUB_OUTPUT", &output)
+            .output()
+            .expect("running the gate script");
+        assert!(
+            out.status.success(),
+            "the E2E gate script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = std::fs::read_to_string(&output).expect("read GITHUB_OUTPUT");
+        let runs: Vec<&str> = written
+            .lines()
+            .filter_map(|line| line.strip_prefix("run="))
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the E2E gate writes `run=` exactly once; wrote {written:?}"
+        );
+        E2eGateOutcome {
+            run: runs[0].to_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        }
+    }
+
+    /// Assert the gate's two observable effects together: the `run=` it wrote
+    /// and whether it printed a `::notice::`. `notice_for` is `Some(result)`
+    /// when the notice must be printed and must name that clippy result, and
+    /// `None` when no notice may be printed at all.
+    #[cfg(unix)]
+    fn assert_e2e_gate(
+        event: &str,
+        clippy: &str,
+        build_and_test: &str,
+        heavy: &str,
+        expected_run: &str,
+        notice_for: Option<&str>,
+    ) {
+        let E2eGateOutcome { run, stdout } = run_e2e_gate(event, clippy, build_and_test, heavy);
+        let context = format!(
+            "ci.yml E2E gate with event={event}, clippy={clippy}, \
+             build-and-test={build_and_test}, heavy={heavy:?}"
+        );
+        assert_eq!(run, expected_run, "{context}: wrong `run=`");
+        match notice_for {
+            Some(result) => {
+                assert!(
+                    stdout.contains("::notice") && stdout.contains(&format!("result: {result}")),
+                    "{context}: must print a notice naming clippy's result, got {stdout:?}"
+                );
+                // The notice is printed for every non-success result, including
+                // `cancelled`, where nothing is red and nothing is blocked. So it
+                // may tell the reader what to re-run but must not claim the merge
+                // is blocked; `run=false` above is what makes "no scenario ran" true.
+                // Re-running only this job would reuse the clippy result recorded
+                // by the earlier attempt, so the advice is to re-run the workflow,
+                // which runs clippy again and then this job.
+                assert!(
+                    stdout.contains("re-run the workflow")
+                        && !stdout.contains("re-run this job")
+                        && !stdout.contains("blocks the merge"),
+                    "{context}: the notice must say to re-run the workflow, must not say to \
+                     re-run only this job (it would reuse the old clippy result) and must not \
+                     assert a merge block that a `cancelled` clippy does not cause, got {stdout:?}"
+                );
+            }
+            None => assert!(
+                !stdout.contains("::notice"),
+                "{context}: must not print the clippy skip notice, got {stdout:?}"
+            ),
+        }
+    }
+
+    /// The E2E scenarios run whenever `build-and-test` reached a verdict, not
+    /// only when it succeeded.
+    ///
+    /// `build-and-test` is a matrix over both LTS images and `needs` sees only
+    /// its aggregate result, so a failure on ubuntu-26.04 alone reads as
+    /// `failure` here. Gating on `success` alone would then skip the scenarios
+    /// on the required 24.04 leg, which would report green without having run
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_gate_runs_scenarios_whenever_build_and_test_reached_a_verdict() {
+        // (event, build-and-test result, heavy, expected run=); clippy passed
+        // in every case, which `e2e_gate_skips_scenarios_unless_clippy_passed`
+        // varies.
+        let cases = [
+            ("pull_request", "success", "true", "true"),
+            ("pull_request", "failure", "true", "true"),
+            ("merge_group", "failure", "true", "true"),
+            ("pull_request", "cancelled", "true", "false"),
+            ("pull_request", "skipped", "true", "false"),
+            ("pull_request", "success", "false", "false"),
+            ("pull_request", "failure", "false", "false"),
+            ("workflow_dispatch", "skipped", "", "true"),
+        ];
+        for (event, result, heavy, expected) in cases {
+            assert_eq!(
+                run_e2e_gate(event, "success", result, heavy).run,
+                expected,
+                "ci.yml E2E gate with event={event}, build-and-test={result}, heavy={heavy:?}"
+            );
+        }
+    }
+
+    /// A lint-red run spends no E2E runner time: the scenarios run only when
+    /// `clippy` succeeded, whatever `build-and-test` did, and the skip says why.
+    ///
+    /// `clippy` is a required check of its own, so a red one blocks the merge
+    /// regardless of E2E. The skipped E2E check then reports green without
+    /// having run a scenario, which is the same shape as a skipped build; the
+    /// `::notice::` the gate prints is what keeps that from being silent. The
+    /// notice's claim that no scenario ran is the `run=false` asserted next to
+    /// it, and `ci_e2e_steps_after_the_gate_follow_its_decision` is what makes
+    /// every later step honour that decision. A `cancelled` clippy reaches the
+    /// same branch with nothing red, so the notice must hold for it too: it says
+    /// to re-run the workflow (not just this job, which would reuse the old
+    /// clippy result), and does not say the merge is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_gate_skips_scenarios_unless_clippy_passed() {
+        for event in ["push", "pull_request", "merge_group"] {
+            for build in ["success", "failure"] {
+                for clippy in ["failure", "cancelled", "skipped"] {
+                    assert_e2e_gate(event, clippy, build, "true", "false", Some(clippy));
+                }
+                assert_e2e_gate(event, "success", build, "true", "true", None);
+            }
+            // A change with no heavy work has no E2E work to skip, so the clippy
+            // notice would be noise: it is for the run that would have run.
+            for clippy in ["success", "failure"] {
+                assert_e2e_gate(event, clippy, "success", "false", "false", None);
+            }
+        }
+        // `clippy` skips itself on a dispatch, which opens the gate regardless.
+        assert_e2e_gate("workflow_dispatch", "skipped", "skipped", "", "true", None);
+    }
+
+    /// The runner image a hosted Linux job's caches must be keyed by, as it
+    /// appears in a key: the literal image, or `matrix.os` for a split job.
+    /// `None` for a job that is not a hosted Linux job.
+    fn hosted_linux_image_token(job_block_text: &str) -> Option<String> {
+        let runs_on = runs_on_values(job_block_text);
+        let value = runs_on.first()?;
+        if value == "${{ matrix.os }}" {
+            Some("matrix.os".to_owned())
+        } else if value.starts_with("ubuntu-") {
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Every compiled-artifact cache on a hosted Linux job is keyed by the
+    /// runner image.
+    ///
+    /// rust-cache keys on the OS family and architecture only ("Linux-x64"),
+    /// and sccache on the compiler binary, which is the same rustup download on
+    /// every image. Without the image in the key, a target dir or a proc macro
+    /// linked against 26.04's glibc is restored on 24.04, where it cannot load.
+    /// Covers `setup-rust-toolchain`'s `cache-key` (unless caching is off), the
+    /// sccache key prefix, and `actions/cache` keys over cargo output; the
+    /// manylinux release caches are exempt, as those builds run in a container.
+    #[test]
+    fn hosted_linux_compile_caches_are_keyed_by_runner_image() {
+        let mut checked = 0;
+        for (name, text) in all_workflows() {
+            for job in job_ids(&text) {
+                let block = job_block(&text, &job);
+                let Some(image) = hosted_linux_image_token(block) else {
+                    continue;
+                };
+                for (at, _) in block.match_indices("actions-rust-lang/setup-rust-toolchain@") {
+                    let step = &block[at..];
+                    let step = step.find("\n      - ").map_or(step, |end| &step[..end]);
+                    if step.lines().any(|line| line.trim() == "cache: false") {
+                        continue;
+                    }
+                    checked += 1;
+                    let keys = flattened_values(step, "cache-key");
+                    assert!(
+                        keys.iter().any(|key| key.contains(&image)),
+                        "{name} job `{job}`: setup-rust-toolchain's rust-cache must carry \
+                         `cache-key` naming the runner image ({image}); its own key is only \
+                         \"Linux-x64\", so a target dir built on another Ubuntu release \
+                         would be restored here. Found: {keys:?}"
+                    );
+                }
+                for prefix in flattened_values(block, "SCCACHE_AZURE_KEY_PREFIX") {
+                    checked += 1;
+                    assert!(
+                        prefix.contains(&image),
+                        "{name} job `{job}`: SCCACHE_AZURE_KEY_PREFIX `{prefix}` must name \
+                         the runner image ({image})"
+                    );
+                }
+                for key in flattened_values(block, "key") {
+                    if !key.contains("cargo") || key.contains("manylinux") {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        key.contains(&image),
+                        "{name} job `{job}`: cache key `{key}` holds cargo output and must \
+                         name the runner image ({image})"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no hosted Linux compile cache found (extractor sanity check)"
+        );
     }
 
     #[test]
@@ -866,32 +1606,35 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
-    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
-    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
-    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
-    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
-    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
-    /// runs-on; `native` never applied to this job, only to the two
-    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
-    /// this file green while the doc and the comment both quietly went false
-    /// again.
+    /// Each nightly DevLab Dispatch lane's `runs-on` must track its per-PR
+    /// counterpart's, byte for byte: both jobs in each pair claim to run on
+    /// the same pool host (the nightly job's header comment,
+    /// docs/ci-hardware-testing.md), and nothing else pins that claim --
+    /// reverting a nightly job to its old static `native`/`wsl` labels would
+    /// leave every other assertion in this file green while the doc and the
+    /// comment both quietly went false again.
     #[test]
-    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+    fn nightly_devlab_dispatch_lanes_share_the_per_pr_pool_labels() {
         let sh = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
-        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
-        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
-        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
-        assert!(
-            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
-            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
-             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
-        );
-        assert_eq!(
-            per_pr, nightly_wsl,
-            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
-             the same DevLab Dispatch pool"
-        );
+        for (per_pr_job, nightly_job) in [
+            ("e2e-wsl", "e2e-wsl-nightly"),
+            ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+        ] {
+            let per_pr = runs_on_values(job_block(&sh, per_pr_job));
+            let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
+            assert!(!per_pr.is_empty(), "{per_pr_job} declares a runs-on");
+            assert!(
+                per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+                "{per_pr_job} must actually be on the DevLab Dispatch pool, not just equal to \
+                 {nightly_job}'s (equal-and-empty would pass the assertion below): {per_pr:?}"
+            );
+            assert_eq!(
+                per_pr, nightly_values,
+                "{nightly_job}'s runs-on must match {per_pr_job}'s exactly -- both are \
+                 documented as the same DevLab Dispatch pool"
+            );
+        }
     }
 
     #[test]
@@ -931,51 +1674,927 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // day it lands. Any lane that genuinely should not wait for a GPU needs
         // an exemption added here with the reason — which is the point: it
         // becomes a decision someone makes, not one a copy-paste makes for them.
+        //
+        // The step is looked up by NAME among the job's own `steps:` items, not
+        // found as a substring of the job: the comments around these steps talk
+        // about the preflight at length, and a comment — or another step's
+        // script — that happened to carry the old `- name:` text would keep a
+        // substring match satisfied after the step itself was gone. Presence
+        // only: nothing here pins where in the job it runs.
         for (workflow, text) in self_hosted_workflows() {
             for (job, _) in self_hosted_e2e_jobs(&text) {
+                let steps = job_steps(job_block(&text, &job))
+                    .unwrap_or_else(|| panic!("{workflow} job `{job}` has no `steps:` list"));
+                let Some((_, step)) = steps
+                    .iter()
+                    .find(|(name, _)| name.starts_with("GPU preflight"))
+                else {
+                    let names: Vec<&str> = steps
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    panic!(
+                        "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
+                         step named `GPU preflight …`: on a wedged or occupied GPU it hangs \
+                         to the job timeout instead of failing fast with a reason. Its named \
+                         steps are: {names:?}"
+                    );
+                };
                 assert!(
-                    job_block(&text, &job).contains("- name: GPU preflight"),
-                    "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
-                     GPU preflight step: on a wedged or occupied GPU it hangs to the job \
-                     timeout instead of failing fast with a reason"
+                    run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
+                    "{workflow} job `{job}` names a GPU preflight step but no non-empty \
+                     block-scalar `run:` was found in it, so as far as this check can tell \
+                     it waits for nothing. Only a block-scalar `run:` (`|`, `|-`, `>`, …) \
+                     is read: a one-line `run:` script reads as missing here"
                 );
             }
         }
     }
 
-    /// Every `GPU preflight` step block in `text`, in file order.
-    fn gpu_preflight_steps(text: &str) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
+    /// A job's `steps:` items as `(name, whole step)` pairs, in file order;
+    /// `None` when the job has no `steps:` list. `block` is what `job_block`
+    /// returns.
+    ///
+    /// Only the list's own items count — lines at exactly the item indent that
+    /// open with `- ` — so a comment, or a `- name:` line inside some step's
+    /// script, can never pass for a step. A step without a `name:` key is
+    /// listed with an empty name.
+    fn job_steps(block: &str) -> Option<Vec<(String, String)>> {
+        let lines: Vec<&str> = block.lines().collect();
+        let steps_at = lines
+            .iter()
+            .position(|l| strip_comment(l).trim() == "steps:")?;
+        let steps_indent = indent_of(lines[steps_at]);
+        let item_indent = lines[steps_at + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter(|l| l.trim_start().starts_with("- "))
+            .map(|l| indent_of(l))?;
         let mut steps = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("- name: GPU preflight") {
+        for (i, line) in lines.iter().enumerate().skip(steps_at + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            let step_indent = indent_of(line);
-            let mut step = format!("{line}\n");
-            for body in &lines[i + 1..] {
-                if !body.trim().is_empty() && indent_of(body) <= step_indent {
-                    break;
-                }
-                step.push_str(body);
-                step.push('\n');
+            if indent_of(line) <= steps_indent {
+                break;
             }
-            steps.push(step);
+            if indent_of(line) != item_indent || !trimmed.starts_with("- ") {
+                continue;
+            }
+            let step = step_block(&lines, i);
+            steps.push((step_name(&step), step));
         }
-        steps
+        Some(steps)
     }
 
-    /// The lines of a step's `run: |` block, still indented.
+    /// The non-empty lines of the `key: |` block scalar in `block`, trimmed.
+    fn block_scalar_lines(block: &str, key: &str) -> Vec<String> {
+        let marker = format!("{key}: |");
+        let mut lines = block.lines().skip_while(|line| line.trim() != marker);
+        let head = lines
+            .next()
+            .unwrap_or_else(|| panic!("block defines `{marker}`"));
+        let indent = indent_of(head);
+        lines
+            .take_while(|line| line.trim().is_empty() || indent_of(line) > indent)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    const REPORT_CHECK_STEP: &str = "- name: Check every lane that ran uploaded its report";
+
+    /// A step block, found by its exact `- name:` line, including that line.
+    fn named_step(block: &str, name_line: &str) -> String {
+        let lines: Vec<&str> = block.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == name_line)
+            .unwrap_or_else(|| panic!("block has a step `{name_line}`"));
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
+            }
+            step.push_str(body);
+            step.push('\n');
+        }
+        step
+    }
+
+    /// The consolidated report job of each self-hosted workflow, with its
+    /// missing-report check step.
+    fn report_check_steps() -> Vec<(&'static str, String, &'static str, String)> {
+        self_hosted_workflows()
+            .into_iter()
+            .map(|(workflow, text)| {
+                let report_job = match workflow {
+                    "e2e-selfhosted.yml" => "e2e-report",
+                    "nightly.yml" => "e2e-report-nightly",
+                    other => panic!("no consolidated report job known for {other}"),
+                };
+                let step = named_step(job_block(&text, report_job), REPORT_CHECK_STEP);
+                (workflow, text, report_job, step)
+            })
+            .collect()
+    }
+
+    /// The report artifact(s) a lane's upload step names (`name:
+    /// e2e-*-report`), comma-separated when the lane carries a `channel`
+    /// axis: both the `release` and `nightly` leg must have uploaded, since
+    /// either can independently die before writing its own report.
+    fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
+        // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
+        // per leg, each behind its own mutually exclusive `if:` — pair every
+        // artifact name with the `if:` directly above it in the same step, then
+        // pick the `current` leg to stand for the whole lane. (A channel axis,
+        // unlike this `sdk_version` axis, is checked by requiring both its
+        // `release` and `nightly` legs — see the doc comment above.)
+        let mut last_if: Option<&str> = None;
+        let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+        for line in job_block(text, job).lines() {
+            let trimmed = line.trim();
+            if let Some(cond) = trimmed.strip_prefix("if: ") {
+                last_if = Some(cond);
+            } else if let Some(name) = trimmed.strip_prefix("name: ")
+                && name.starts_with("e2e-")
+                && name.ends_with("-report")
+            {
+                candidates.push((name, last_if));
+            }
+        }
+        let chosen = match candidates.as_slice() {
+            [(name, _)] => *name,
+            _ => {
+                candidates
+                    .iter()
+                    .find(|(_, cond)| {
+                        cond.is_some_and(|c| c.contains("matrix.sdk_version == 'current'"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow} job `{job}` should upload exactly one `e2e-*-report` \
+                             artifact, or one `current`-leg one among an sdk_version matrix, \
+                             found {candidates:?}"
+                        )
+                    })
+                    .0
+            }
+        };
+        // The report job has no `matrix` context, so a lane with a channel
+        // axis is checked through each of its legs explicitly, read from the
+        // lane's own `channel: [..]` list rather than assumed.
+        if chosen.contains("${{ matrix.channel }}") {
+            let channels = job_block(text, job)
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("channel: ["))
+                .and_then(|rest| rest.split_once(']'))
+                .unwrap_or_else(|| {
+                    panic!("{workflow} job `{job}` uses matrix.channel but has no `channel: [..]`")
+                })
+                .0;
+            channels
+                .split(',')
+                .map(|c| chosen.replace("${{ matrix.channel }}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            chosen.to_string()
+        }
+    }
+
+    #[test]
+    fn every_lane_that_runs_is_checked_for_its_report_artifact() {
+        // A lane that dies before writing report.json uploads nothing, and the
+        // consolidated grid can only render reports that arrived, so the lane
+        // drops out with no row and no FAIL — and on a `continue-on-error` lane
+        // nothing else is red either. The report job's missing-report check is
+        // what catches that, and it only knows a lane through LANE_REPORTS.
+        //
+        // Derived from the lanes, like its siblings: a new lane fails here until
+        // it is added to the map under the exact artifact name its upload step
+        // uses — a misspelt name would flag the lane missing on every run, and
+        // an absent one would leave it uncovered.
+        let steps = report_check_steps();
+        for (workflow, text, report_job, step) in &steps {
+            let (workflow, report_job) = (*workflow, *report_job);
+            let block = job_block(text, report_job);
+            let lanes = self_hosted_e2e_jobs(text);
+            let expected: Vec<String> = lanes
+                .iter()
+                .map(|(job, _)| format!("{job}={}", uploaded_report_artifact(workflow, text, job)))
+                .collect();
+            // Read from the step itself, so a LANE_REPORTS left elsewhere in the
+            // job after the step is deleted cannot satisfy this.
+            assert_eq!(
+                block_scalar_lines(step, "LANE_REPORTS"),
+                expected,
+                "{workflow} `{report_job}`: LANE_REPORTS must map every self-hosted lane, \
+                 in workflow order, to the artifact its upload step names"
+            );
+            for (job, _) in &lanes {
+                assert!(
+                    block.lines().any(|line| line.trim() == format!("- {job}")),
+                    "{workflow} `{report_job}` must list `{job}` under needs, or the \
+                     missing-report check cannot see whether it ran"
+                );
+            }
+            assert!(
+                block.lines().any(|line| line.trim() == "actions: read"),
+                "{workflow} `{report_job}` needs `actions: read` to list the run's artifacts"
+            );
+            // `!cancelled()` rather than the implicit `success()`: the check has
+            // to run precisely when an earlier step or a lane has failed.
+            let step_lines: Vec<&str> = step.lines().map(str::trim).collect();
+            for required in [
+                "if: ${{ !cancelled() }}",
+                "GH_TOKEN: ${{ github.token }}",
+                "NEEDS: ${{ toJSON(needs) }}",
+            ] {
+                assert!(
+                    step_lines.contains(&required),
+                    "{workflow} `{report_job}`'s missing-report check must carry `{required}`"
+                );
+            }
+        }
+        // The script is copied into both workflows; a fix applied to one twin
+        // must not silently miss the other.
+        let bodies: Vec<String> = steps
+            .iter()
+            .map(|(_, _, _, step)| {
+                dedent(&run_block(step).expect("the check step has a `run: |` block"))
+                    .expect("the check step's script is not empty")
+            })
+            .collect();
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the missing-report check scripts in e2e-selfhosted.yml and nightly.yml have drifted"
+        );
+    }
+
+    /// Plant the stub `gh` the missing-report check calls: it prints the file
+    /// `$LISTING` when `lists_artifacts`, and otherwise fails the way an API
+    /// outage does.
+    #[cfg(unix)]
+    fn write_gh_stub(stub: &std::path::Path, lists_artifacts: bool) {
+        let body = if lists_artifacts {
+            "#!/bin/sh\ncat \"$LISTING\"\n"
+        } else {
+            "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n"
+        };
+        // Not `std::fs::write` plus a chmod: the stub is run straight away, which
+        // races other threads' spawns (see `rocm_core::fake_executable`; its own
+        // tests cover the helper, and the report-check tests run this stub).
+        rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
+    }
+
+    /// Run a report job's missing-report check script under `bash -e`, as a
+    /// `run:` step does, with a stub `gh` that lists `uploaded` (or fails when
+    /// `uploaded` is `None`) and a `needs` context of `results`.
+    #[cfg(unix)]
+    fn run_report_check(
+        step: &str,
+        results: &[(&str, &str)],
+        uploaded: Option<&[&str]>,
+    ) -> (i32, String, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("check.sh");
+        let listing = dir.path().join("artifacts.txt");
+        let summary = dir.path().join("summary.md");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &script,
+            dedent(&run_block(step).expect("the check step has a `run: |` block"))
+                .expect("the check step's script is not empty"),
+        )
+        .expect("write script");
+        std::fs::write(&summary, "").expect("write summary");
+        if let Some(names) = uploaded {
+            std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
+        }
+        write_gh_stub(&stub, uploaded.is_some());
+
+        let needs: serde_json::Map<String, serde_json::Value> = results
+            .iter()
+            .map(|(job, result)| ((*job).to_owned(), serde_json::json!({ "result": result })))
+            .collect();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script)
+            .env("PATH", path)
+            .env("LISTING", &listing)
+            .env("NEEDS", serde_json::Value::Object(needs).to_string())
+            // A `|` block scalar ends in a newline, as GitHub passes it, so the
+            // script's read loop sees a trailing empty line it must skip.
+            .env(
+                "LANE_REPORTS",
+                block_scalar_lines(step, "LANE_REPORTS").join("\n") + "\n",
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("running the check script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status.code().expect("check exited with a status code"),
+            log,
+            std::fs::read_to_string(&summary).expect("read summary"),
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_report_check_flags_only_lanes_that_ran_without_a_report() {
+        // The contract test above pins the check's inputs; this runs its logic,
+        // so a check that never fails (or always does) cannot pass for one.
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            // A skip reads as a pass, so on CI a missing `jq` must fail loudly
+            // rather than leave the check's logic silently untested.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so the missing-report check's logic cannot be \
+                 exercised; install it on this runner"
+            );
+            eprintln!("skipping: no `jq` on PATH");
+            return;
+        }
+        let (.., step) = report_check_steps()
+            .into_iter()
+            .find(|(workflow, ..)| *workflow == "e2e-selfhosted.yml")
+            .expect("the per-PR workflow has a report check");
+        let lanes: Vec<(String, String)> = block_scalar_lines(&step, "LANE_REPORTS")
+            .iter()
+            .map(|line| {
+                let (job, artifact) = line.split_once('=').expect("`job=artifact`");
+                (job.to_owned(), artifact.to_owned())
+            })
+            .collect();
+        let jobs: Vec<&str> = lanes.iter().map(|(job, _)| job.as_str()).collect();
+        // A channel-axis lane's value is comma-joined (its `release` and
+        // `nightly` legs); flatten to the individual artifact names the real
+        // upload steps would produce, matching what `gh api` would list.
+        let every_artifact: Vec<&str> = lanes.iter().flat_map(|(_, a)| a.split(',')).collect();
+        let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
+        let all = |result: &'static str| -> Vec<(&str, &str)> {
+            jobs.iter().map(|job| (*job, result)).collect()
+        };
+        let without_victim: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| a != victim_artifact)
+            .collect();
+        let mut with_changes = all("success");
+        with_changes.push(("changes", "success"));
+
+        let (code, log, summary) = run_report_check(&step, &with_changes, Some(&every_artifact));
+        assert_eq!(
+            code, 0,
+            "every lane reported, so nothing is missing:\n{log}"
+        );
+        assert!(
+            summary.is_empty(),
+            "nothing missing, nothing summarised: {summary}"
+        );
+
+        let mut failed = all("success");
+        failed[0].1 = "failure";
+        let (code, log, summary) = run_report_check(&step, &failed, Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a lane that ran and uploaded nothing must fail:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {victim} ran")) && log.contains(victim_artifact),
+            "the annotation must name the lane and its artifact:\n{log}"
+        );
+        assert!(
+            summary.contains(victim.as_str()),
+            "the summary must name the lane: {summary}"
+        );
+
+        // A continue-on-error lane may present as `success`; the missing
+        // artifact alone has to be enough.
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a missing report fails whatever the needs result:\n{log}"
+        );
+
+        let mut skipped = all("success");
+        skipped[0].1 = "skipped";
+        let (code, log, _) = run_report_check(&step, &skipped, Some(&without_victim));
+        assert_eq!(
+            code, 0,
+            "a skipped lane uploads nothing and is not missing:\n{log}"
+        );
+
+        // A single-platform dispatch skips most lanes. Skipping one must move
+        // on to the next lane, not stop checking: skip a middle lane while the
+        // last one is missing.
+        assert!(
+            lanes.len() >= 3,
+            "these cases need a first, middle and last lane"
+        );
+        let (middle_artifact, (last, last_artifact)) = (&lanes[1].1, lanes.last().unwrap());
+        let mut skip_middle = all("success");
+        skip_middle[1].1 = "skipped";
+        // A lane's value may be comma-joined (channel legs), so match each name.
+        let belongs_to = |lane_artifacts: &str, a: &str| lane_artifacts.split(',').any(|m| m == a);
+        let after_skip: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| !belongs_to(middle_artifact, a) && !belongs_to(last_artifact, a))
+            .collect();
+        let (code, log, _) = run_report_check(&step, &skip_middle, Some(&after_skip));
+        assert_eq!(
+            code, 1,
+            "lanes after a skipped one must still be checked:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {last} ran")),
+            "the missing lane after the skipped one must be named:\n{log}"
+        );
+
+        // Every missing lane is reported, not just the first one found.
+        let two_missing: Vec<&str> = without_victim
+            .iter()
+            .copied()
+            .filter(|a| !belongs_to(last_artifact, a))
+            .collect();
+        let (code, log, summary) = run_report_check(&step, &all("success"), Some(&two_missing));
+        assert_eq!(code, 1, "two lanes missing must fail:\n{log}");
+        for lane in [victim, last] {
+            assert!(
+                log.contains(&format!("::error::lane {lane} ran"))
+                    && summary.contains(lane.as_str()),
+                "every missing lane must be named, including `{lane}`:\n{log}\n{summary}"
+            );
+        }
+
+        // A channel-axis lane's legs are checked independently: missing any one
+        // of them must still fail, naming only that leg, not the lane's other
+        // (present) ones. Each leg takes a turn as the missing one, so a loop
+        // that silently stops checking one of them is caught.
+        let (channel_job, channel_artifacts) = lanes
+            .iter()
+            .find(|(_, a)| a.contains(','))
+            .expect("e2e-selfhosted.yml has a channel-matrixed lane");
+        let legs: Vec<&str> = channel_artifacts.split(',').collect();
+        for missing_leg in &legs {
+            let one_leg_missing: Vec<&str> = every_artifact
+                .iter()
+                .copied()
+                .filter(|a| a != missing_leg)
+                .collect();
+            let (code, log, _) = run_report_check(&step, &all("success"), Some(&one_leg_missing));
+            assert_eq!(
+                code, 1,
+                "a channel lane missing `{missing_leg}` must still fail:\n{log}"
+            );
+            assert!(
+                log.contains(&format!("::error::lane {channel_job} ran"))
+                    && log.contains(&format!("uploaded no {missing_leg}")),
+                "the annotation must name the missing leg `{missing_leg}`:\n{log}"
+            );
+            for present_leg in legs.iter().filter(|l| *l != missing_leg) {
+                assert!(
+                    !log.contains(&format!("uploaded no {present_leg}")),
+                    "the present leg `{present_leg}` must not be flagged as missing:\n{log}"
+                );
+            }
+        }
+
+        // A lane absent from `needs` has no result to say it was skipped, so
+        // it is checked rather than waved through.
+        let (code, log, _) = run_report_check(&step, &all("success")[1..], Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a lane missing from `needs` must not pass unchecked:\n{log}"
+        );
+        assert!(
+            log.contains("needs result: absent"),
+            "the annotation must show the lane had no `needs` entry:\n{log}"
+        );
+
+        // `cancelled` is what a lane cut off by its timeout reports: it is
+        // checked like any lane that ran, and passes only if it still uploaded.
+        let mut timed_out = all("success");
+        timed_out[0].1 = "cancelled";
+        let (code, log, _) = run_report_check(&step, &timed_out, Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a timed-out lane that uploaded nothing is missing:\n{log}"
+        );
+        let (code, log, _) = run_report_check(&step, &timed_out, Some(&every_artifact));
+        assert_eq!(
+            code, 0,
+            "a timed-out lane that still uploaded is not missing:\n{log}"
+        );
+
+        let mut near_miss = without_victim.clone();
+        let stale = format!("{victim_artifact}-old");
+        near_miss.push(&stale);
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&near_miss));
+        assert_eq!(
+            code, 1,
+            "only the exact artifact name satisfies the check:\n{log}"
+        );
+
+        let (code, log, _) = run_report_check(&step, &all("success"), None);
+        assert_eq!(code, 1, "an unlistable run must not pass unchecked:\n{log}");
+        assert!(
+            log.contains("could not list this run's artifacts"),
+            "an API failure must say so rather than fail silently:\n{log}"
+        );
+    }
+
+    /// The `name:` of `step`, a block as `step_block` returns it (its first
+    /// line is the step's `- ` item line); empty when the step has none.
+    ///
+    /// A block scalar (`name: >`, `name: |-`, …) is read from the
+    /// more-indented lines that follow, joined with single spaces, so a
+    /// wrapped name is not mistaken for the indicator.
+    /// That only approximates YAML, which keeps a `|` name's line breaks and
+    /// folds a blank line in a `>` one to a newline; callers only match a
+    /// name's prefix or print it.
+    fn step_name(step: &str) -> String {
+        let Some((at, value)) = step_key_line(step, "name") else {
+            return String::new();
+        };
+        let value = strip_comment(value).trim();
+        if !value.starts_with(['>', '|']) {
+            return strip_quotes(value);
+        }
+        let key_indent = step.lines().next().map_or(0, indent_of) + 2;
+        step.lines()
+            .skip(at + 1)
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > key_indent)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The one-line value of `step`'s own `{key}:`, unquoted and without a
+    /// trailing comment; empty when the step has no such key.
+    fn step_key(step: &str, key: &str) -> String {
+        step_key_line(step, key)
+            .map(|(_, value)| strip_quotes(strip_comment(value).trim()))
+            .unwrap_or_default()
+    }
+
+    /// Where `step`'s own `{key}:` is: the index of its line within `step`,
+    /// and the raw text after the colon.
+    ///
+    /// The key is either the item's own first key (`- name: …`) or one of
+    /// its sibling keys, two columns in from the dash. Keys any deeper — a
+    /// `with:` input called `name`, a `name:` line inside the step's script —
+    /// are not the step's.
+    fn step_key_line<'a>(step: &'a str, key: &str) -> Option<(usize, &'a str)> {
+        let marker = format!("{key}:");
+        let item_indent = step.lines().next().map_or(0, indent_of);
+        step.lines().enumerate().find_map(|(at, l)| {
+            let key_line = if indent_of(l) == item_indent {
+                l.trim_start().strip_prefix("- ")?
+            } else if indent_of(l) == item_indent + 2 {
+                l.trim_start()
+            } else {
+                return None;
+            };
+            Some((at, key_line.strip_prefix(&marker)?))
+        })
+    }
+
+    /// Every `GPU preflight` step block in `text`, in file order: each job's
+    /// `steps:` items whose name starts `GPU preflight`, jobs in file order.
+    ///
+    /// Found through `job_steps`/`step_name`, the parser the preflight presence
+    /// check uses, so the two cannot disagree about what a step is: a name
+    /// wrapped into a block scalar (`name: >-`) is found exactly like a one-line
+    /// one, and a `- name: GPU preflight` line in a comment or some step's
+    /// script is not a step. A job with no `steps:` list contributes nothing.
+    fn gpu_preflight_steps(text: &str) -> Vec<String> {
+        job_ids(text)
+            .into_iter()
+            .flat_map(|job| job_steps(job_block(text, &job)).unwrap_or_default())
+            .filter(|(name, _)| name.starts_with("GPU preflight"))
+            .map(|(_, step)| step)
+            .collect()
+    }
+
+    /// The whole step whose `- name:` line is `lines[at]`: that line and every
+    /// line below it until a non-blank one is indented no deeper than it.
+    ///
+    /// Blank lines never end a block, however they are indented — a `run: |`
+    /// body can contain them — so the blank separator before the next step is
+    /// carried along too. `run_block` drops it again.
+    fn step_block(lines: &[&str], at: usize) -> String {
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
+            }
+            step.push_str(body);
+            step.push('\n');
+        }
+        step
+    }
+
+    /// The lines of a step's block-scalar `run:` (`run: |`, `|-`, `>`, `>-`,
+    /// …), still indented and, for a folded `>` block, not yet folded: see
+    /// [`run_script`] for the script the shell is handed.
+    ///
+    /// Every block-scalar header is recognised (see [`run_block_header`]), but a
+    /// one-line `run: cmd` reads as no block, so a check that asserts a step
+    /// *has* a script relies on every such step in this repo using a block
+    /// scalar, and has to say so in its failure message rather than claim the
+    /// step is empty.
+    ///
+    /// Trailing blank lines are dropped: they are the separator `step_block`
+    /// lets through, not part of the script, and keeping them would make two
+    /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
+        let (run_at, run_indent, _, _) = run_block_header(&lines)?;
+        let mut body: Vec<&str> = lines[run_at + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+            .copied()
+            .collect();
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        Some(body)
+    }
+
+    /// Where a step's block-scalar `run:` opens: the index of its `run:` line
+    /// in `lines`, the column of the `run` key, whether the block is folded
+    /// (`>`) rather than literal (`|`), and its indentation indicator, if it
+    /// has one. The key may be the step's first (`- run: |`), two columns in
+    /// from the dash.
+    ///
+    /// Any block-scalar header counts — `|` or `>`, with or without a
+    /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
+    /// without a trailing comment — since every one of them hands the step a
+    /// multi-line script.
+    ///
+    /// The first `run:` key at any depth is taken, so a `run:` nested under
+    /// some other key (an action's `with:` input) would be read as the
+    /// step's script. No workflow here has one; a step that does would need
+    /// this to match only at the step's own key column.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool, Option<usize>)> {
+        lines.iter().enumerate().find_map(|(at, line)| {
+            let code = strip_comment(line).trim();
+            let (key, key_column) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), indent_of(line) + 2),
+                None => (code, indent_of(line)),
+            };
+            let indicator = key.strip_prefix("run:")?.trim();
+            let folded = match indicator.chars().next()? {
+                '|' => false,
+                '>' => true,
+                _ => return None,
+            };
+            let modifiers = &indicator[1..];
+            if !modifiers
+                .chars()
+                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+            {
+                return None;
+            }
+            let indent = modifiers
+                .chars()
+                .find_map(|c| c.to_digit(10))
+                .map(|digit| digit as usize);
+            Some((at, key_column, folded, indent))
+        })
+    }
+
+    /// The script a step's block-scalar `run:` hands its shell, one entry per
+    /// line: [`run_block`]'s lines, folded the way YAML folds a `>` block.
+    ///
+    /// In a folded block a line break between two lines at the block's own
+    /// indent becomes a space, so two such lines are ONE line of script; a
+    /// blank line ends the line, and a more-indented line keeps the breaks
+    /// around it. A literal `|` block is the script as written.
+    ///
+    /// The block's indent is the `run` key's column plus its indentation
+    /// indicator (`>2`) when it has one, as YAML reads it; otherwise the
+    /// indent of its first non-blank line.
+    fn run_script(step: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let (_, run_indent, folded, indicator) = run_block_header(&lines)?;
+        let body = run_block(step)?;
+        if !folded {
+            return Some(body.iter().map(|line| (*line).to_owned()).collect());
+        }
+        let indent = indicator.map_or_else(
+            || {
+                body.iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or(0, |line| indent_of(line))
+            },
+            |digit| run_indent + digit,
+        );
+        let mut script: Vec<String> = Vec::new();
+        let mut folds_onto_last = false;
+        for line in body {
+            if line.trim().is_empty() {
+                script.push(String::new());
+                folds_onto_last = false;
+                continue;
+            }
+            let at_block_indent = indent_of(line) == indent;
+            match script.last_mut() {
+                Some(last) if at_block_indent && folds_onto_last => {
+                    last.push(' ');
+                    last.push_str(line.trim_start());
+                }
+                _ => script.push(line.to_owned()),
+            }
+            folds_onto_last = at_block_indent;
+        }
+        Some(script)
+    }
+
+    /// The non-comment lines of a step's block-scalar `run:`, joined.
+    ///
+    /// A preflight step's body is the only place a lane can still spell its own
+    /// floor (the WSL `${…:-8}` default, the PowerShell `else { 8 }`), and a
+    /// substring search over the raw body matches those spellings inside a
+    /// comment that merely discusses them. `#` opens a comment in both bash and
+    /// PowerShell, so one filter serves every shape here.
+    fn preflight_body_code(step: &str) -> String {
+        run_block(step)
+            .map(|body| {
+                body.iter()
+                    .filter(|l| !l.trim_start().starts_with('#'))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A step's `env:` mapping, parsed as KEY AND VALUE rather than searched
+    /// for as a substring.
+    ///
+    /// Both halves matter and both were wrong when this was a `contains`:
+    /// `GPU_PREFLIGHT_MIN_FREE_GIB: 16` is a substring of `…: 160`, so a floor
+    /// ten times too high satisfied a test asserting the floor; and the search
+    /// ran over the whole step, so commenting the key out — `# GPU_PREFLIGHT_
+    /// MIN_FREE_GIB: 8`, which leaves the lane running at the script's 16 GiB
+    /// default — satisfied it too. That default on an APU lane is verbatim the
+    /// thing the assertion message says it prevents.
+    ///
+    /// Comment and blank lines are skipped, and only scalar `key: value`
+    /// entries are returned; our workflows spell step `env:` no other way.
+    fn step_env(step: &str) -> BTreeMap<String, String> {
+        let lines: Vec<&str> = step.lines().collect();
+        let mut env = BTreeMap::new();
+        let Some(env_at) = lines.iter().position(|l| l.trim() == "env:") else {
+            return env;
+        };
+        let env_indent = indent_of(lines[env_at]);
+        for line in &lines[env_at + 1..] {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if indent_of(line) <= env_indent {
+                break;
+            }
+            let entry = line.trim_start();
+            if entry.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = entry.split_once(':') else {
+                continue;
+            };
+            env.insert(
+                key.trim().to_string(),
+                strip_quotes(strip_comment(value).trim()),
+            );
+        }
+        env
+    }
+
+    /// The floor a step sets through its `env:` mapping, if it sets one.
+    fn preflight_floor(step: &str) -> Option<String> {
+        step_env(step).get("GPU_PREFLIGHT_MIN_FREE_GIB").cloned()
+    }
+
+    /// A step's top-level keys, in file order — `name`, `env`, `run` and
+    /// anything a lane has grown beyond them.
+    ///
+    /// `continue-on-error: true` on one preflight turns a required gate into an
+    /// advisory one; `if: false` removes it outright. Neither touches the `run:`
+    /// body, so neither is visible to a test that compares bodies.
+    fn step_keys(step: &str) -> Vec<String> {
+        let lines: Vec<&str> = step.lines().collect();
+        let Some(first) = lines.first() else {
+            return Vec::new();
+        };
+        // Past the `- ` that opens the list item: the step's keys all sit at
+        // that column, including the `name:` sharing the first line.
+        let key_indent = indent_of(first) + 2;
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let entry = if i == 0 {
+                    line.trim_start().strip_prefix("- ")?
+                } else if indent_of(line) == key_indent && !line.trim_start().starts_with('#') {
+                    line.trim_start()
+                } else {
+                    return None;
+                };
+                entry.split_once(':').map(|(key, _)| key.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// Everything in a step EXCEPT its `run:` body: the shape the body travels
+    /// in, dedented so two lanes in differently-indented files compare.
+    ///
+    /// The per-lane floor's VALUE is replaced rather than dropped, because 8 and
+    /// 16 are the one difference between these steps that is intended — while
+    /// losing the key altogether is not, and still shows up as a difference.
+    fn preflight_step_shape(step: &str) -> String {
+        let lines: Vec<&str> = step.lines().collect();
+        let Some(first) = lines.first() else {
+            return String::new();
+        };
+        let pad = indent_of(first);
+        let run_at = lines.iter().position(|l| l.trim() == "run: |");
+        let run_indent = run_at.map(|at| indent_of(lines[at]));
+        let mut shape = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            // Drop the body, keep the `run: |` key that introduces it: the
+            // bodies are compared to each other separately.
+            if let (Some(at), Some(run_indent)) = (run_at, run_indent)
+                && i > at
+                && indent_of(line) > run_indent
+            {
+                continue;
+            }
+            let line = if line.len() > pad {
+                &line[pad..]
+            } else {
+                line.trim_start()
+            };
+            match line.split_once(':') {
+                Some((key, _)) if key.trim() == "GPU_PREFLIGHT_MIN_FREE_GIB" => {
+                    shape.push(format!("{key}: <per-lane floor>"));
+                }
+                _ => shape.push(line.to_string()),
+            }
+        }
+        shape.join("\n")
+    }
+
+    /// Where two line-oriented texts first differ, phrased for a failure
+    /// message and naming which file each side came from; `None` when they
+    /// are equal.
+    fn first_line_difference(a_name: &str, a: &str, b_name: &str, b: &str) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let a_lines: Vec<&str> = a.lines().collect();
+        let b_lines: Vec<&str> = b.lines().collect();
         Some(
-            lines[run_at + 1..]
-                .iter()
-                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
-                .copied()
-                .collect(),
+            match a_lines.iter().zip(&b_lines).position(|(x, y)| x != y) {
+                Some(i) => format!(
+                    "first difference at body line {}:\n  {a_name}: {:?}\n  {b_name}: {:?}",
+                    i + 1,
+                    a_lines[i],
+                    b_lines[i]
+                ),
+                None if a_lines.len() != b_lines.len() => format!(
+                    "every shared line matches, but {a_name} has {} lines and {b_name} has {}",
+                    a_lines.len(),
+                    b_lines.len()
+                ),
+                None => "the bodies differ only in line endings".to_string(),
+            },
         )
     }
 
@@ -996,7 +2615,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     ///
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
-    /// to end yields `None`; `preflight_powershell_script` carries those.
+    /// to end yields `None`; `preflight_powershell_script` carries those. Like
+    /// every caller of [`run_block`], only a block-scalar `run:` is read, and a
+    /// folded `>` one line by line, without folding.
     fn preflight_shell_script(step: &str) -> Option<String> {
         let body = run_block(step)?;
         let body = match body
@@ -1043,10 +2664,35 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         WslBareBash,
     }
 
+    /// The shared bash preflight every native Linux lane delegates to (#446,
+    /// #294), as the workflows name it.
+    const SHARED_PREFLIGHT: &str = ".github/scripts/gpu-preflight.sh";
+
+    /// That script's source.
+    fn shared_preflight_script() -> String {
+        let p = repo_root().join(SHARED_PREFLIGHT);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+    }
+
     /// Whether this preflight guards an APU lane (the 8 GiB floor) rather than a
     /// discrete card (16 GiB).
+    ///
+    /// Three spellings, because the floor reaches the three surviving block
+    /// shapes differently: a step-level `env:` key on the lanes that delegate to
+    /// the shared script, a `${…:-8}` default in the WSL advisory bodies, and a
+    /// PowerShell `else { 8 }` on the Windows-native ones.
+    ///
+    /// None of the three is a substring search over the raw step any more. The
+    /// `env:` one is a parsed lookup compared EXACTLY, and the other two run
+    /// over the body with comments stripped — a step whose floor is commented
+    /// out is not an APU lane that set 8, it is a lane running the script's
+    /// discrete 16 GiB default on hardware that can never clear it.
     fn is_apu_preflight(step: &str) -> bool {
-        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || step.contains("else { 8 }")
+        if let Some(floor) = preflight_floor(step) {
+            return floor == "8";
+        }
+        let body = preflight_body_code(step);
+        body.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || body.contains("else { 8 }")
     }
 
     #[test]
@@ -1057,24 +2703,289 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // lane fails on every healthy host. Six blocks guard that hardware class
         // and one was missed when the other five were converted; this is what
         // makes the next copy-paste fail loudly rather than months later.
+        //
+        // A block satisfies this either by querying both pools itself or by
+        // delegating to the shared script, which is then asserted to query them.
+        // Delegation is accepted rather than waived: the one-line lanes carry no
+        // query to inspect, and demanding the literal there would have forced
+        // the shared script's extraction to leave the text behind as a comment —
+        // a string this test would then happily match in a lane that does
+        // nothing.
         let mut checked = 0;
+        let mut delegating = 0;
         for (workflow, text) in self_hosted_workflows() {
             for step in gpu_preflight_steps(&text)
                 .iter()
                 .filter(|s| is_apu_preflight(s))
             {
-                assert!(
-                    step.contains("showmeminfo vram gtt"),
-                    "{workflow}: an APU-class GPU preflight still queries VRAM only; on a \
-                     small-carveout gfx1151 host it can never clear its own floor"
-                );
+                if step.contains(SHARED_PREFLIGHT) {
+                    delegating += 1;
+                } else {
+                    assert!(
+                        step.contains("showmeminfo vram gtt"),
+                        "{workflow}: an APU-class GPU preflight neither queries both pools \
+                         nor delegates to {SHARED_PREFLIGHT}; on a small-carveout gfx1151 \
+                         host it can never clear its own floor"
+                    );
+                }
                 checked += 1;
             }
         }
         assert!(
+            delegating >= 2,
+            "no APU lane delegates to {SHARED_PREFLIGHT} any more ({delegating} found) — if \
+             that was deliberate this test is now checking a shape nothing uses"
+        );
+        assert!(
+            shared_preflight_script().contains("showmeminfo vram gtt"),
+            "{SHARED_PREFLIGHT} no longer queries the GTT pool, so every lane delegating to \
+             it fails on a small-carveout gfx1151 host"
+        );
+        assert!(
             checked >= 6,
             "expected at least six APU-class preflight blocks, found {checked} — if a lane \
              was removed update this floor, otherwise the extractor has stopped matching"
+        );
+    }
+
+    #[test]
+    fn every_native_linux_preflight_delegates_to_the_shared_script() {
+        // What the deduplication (#294) actually bought, and the only thing
+        // keeping the next #446 from landing eight times: the eight native Linux
+        // preflights are now one script plus a floor. The drift test below can no
+        // longer catch a block left behind, because a block left behind would
+        // carry its own body and simply not be compared against anything.
+        //
+        // Derived from the lanes rather than listed, so a new one is covered the
+        // day it lands. The two WSL advisory bodies are excluded by name: they
+        // warn where these fail, which is a different contract, not a copy. The
+        // two Windows-native blocks are PowerShell and have no bash to run.
+        let mut delegating = 0;
+        for (workflow, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text) {
+                if preflight_powershell_script(&step).is_some() || step.contains("-Script @'") {
+                    continue;
+                }
+                assert!(
+                    step.contains(SHARED_PREFLIGHT),
+                    "{workflow} has a native Linux GPU preflight with its own inline body \
+                     instead of delegating to {SHARED_PREFLIGHT}; that is the duplication \
+                     #294 removed, and a fix to the gate will now miss this lane"
+                );
+                // Compared as a PARSED VALUE, not found as a substring. `16` is
+                // a substring of `160`, and a search over the whole step is
+                // satisfied by `# GPU_PREFLIGHT_MIN_FREE_GIB: 8` — a commented
+                // key, which leaves the lane on the script's 16 GiB default.
+                // Both mutations passed this assertion while producing exactly
+                // the state its message says cannot happen.
+                let floor = preflight_floor(&step);
+                assert!(
+                    matches!(floor.as_deref(), Some("8" | "16")),
+                    "{workflow} delegates to {SHARED_PREFLIGHT} without naming its own \
+                     floor in `env:` (found {floor:?}, expected the APU's 8 or a \
+                     discrete card's 16); the lane would then silently inherit the \
+                     script's default rather than the value its hardware was sized for"
+                );
+                delegating += 1;
+            }
+        }
+        assert_eq!(
+            delegating, 8,
+            "expected the eight native Linux preflight lanes to delegate to \
+             {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
+        );
+    }
+
+    #[test]
+    fn every_native_linux_preflight_delegates_in_the_same_shape() {
+        // The test above asks whether each lane MENTIONS the shared script; this
+        // asks whether that is all it does. The gap between the two is exactly
+        // where re-inlining drift grows back: a lane that keeps the delegation
+        // and adds a line of its own above it — one more `pkill -f`, a lane-local
+        // retry, a second floor — satisfies `step.contains(SHARED_PREFLIGHT)`
+        // and the floor check and leaves that test green, while the eight bodies
+        // are no longer one body. That is how the original six inline copies
+        // diverged from their PowerShell mirrors: nothing compared them to each
+        // other, only to a substring.
+        //
+        // So compare the bodies to EACH OTHER, the way `apu_preflight_twins_do_
+        // not_drift` and `both_wsl_lanes_settle_the_clock_before_running_the_
+        // suite` pin their pairs, and then pin the shape they agree on: a single
+        // `bash <script>` line and nothing else. Equality alone would be
+        // satisfied by eight identically re-inlined copies; the shape assertion
+        // alone would not notice seven of eight.
+        //
+        // The per-lane floor's VALUE is deliberately not part of this
+        // comparison — 8 and 16 are the one intended difference — but
+        // everything else outside the body IS. Comparing only the `run:` body
+        // leaves the whole rest of the step free to drift, and the drift that
+        // fits there is worse than the drift that fits in the body: measured,
+        // each of `continue-on-error: true`, `if: false` and a second
+        // `GPU_PREFLIGHT_CEILING_SECS: 1` env key on ONE lane left the
+        // body-only comparison green. The first turns a required gate into an
+        // advisory one — the gate still runs, still goes red, and the job
+        // carries on — which is indistinguishable from deleting it.
+        let mut bodies: Vec<(String, String)> = Vec::new();
+        let mut shapes: Vec<(String, String)> = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
+                if preflight_powershell_script(step).is_some() || step.contains("-Script @'") {
+                    continue;
+                }
+                let name = format!("{workflow} GPU preflight #{i}");
+                let body = preflight_shell_script(step)
+                    .unwrap_or_else(|| panic!("{name} carries no `run: |` body"));
+                // Pinned per lane as well as compared across them: eight lanes
+                // that ALL grew `continue-on-error: true` would still agree
+                // with each other.
+                assert_eq!(
+                    step_keys(step),
+                    ["name", "env", "run"],
+                    "{name} is no longer just a named, floor-carrying delegation: a \
+                     preflight that also sets `if:` or `continue-on-error:` is a gate \
+                     the job can skip or survive, which is the one failure mode a \
+                     required gate has"
+                );
+                assert_eq!(
+                    step_env(step).keys().collect::<Vec<_>>(),
+                    ["GPU_PREFLIGHT_MIN_FREE_GIB"],
+                    "{name} sets step environment beyond its floor; a lane-local \
+                     ceiling or marker is a second gate configured where the shared \
+                     script cannot see it, and the next fix to it lands eight times again"
+                );
+                shapes.push((name.clone(), preflight_step_shape(step)));
+                bodies.push((name, body));
+            }
+        }
+        assert_eq!(
+            bodies.len(),
+            8,
+            "expected eight native Linux preflight bodies to compare, found {} — \
+             if a lane was added or removed, update this count",
+            bodies.len()
+        );
+        let (first_name, first) = bodies
+            .first()
+            .expect("at least one native preflight")
+            .clone();
+        for (name, body) in &bodies[1..] {
+            if let Some(diff) = first_line_difference(&first_name, &first, name, body) {
+                panic!(
+                    "the native Linux GPU preflights no longer invoke \
+                     {SHARED_PREFLIGHT} identically — a lane has grown a body of its \
+                     own again, which is the duplication #294 removed and the drift \
+                     #446 was caused by; {diff}"
+                );
+            }
+        }
+        assert_eq!(
+            first.trim_end(),
+            format!("bash {SHARED_PREFLIGHT}"),
+            "the native Linux GPU preflight bodies agree with each other but are no \
+             longer a lone delegation to {SHARED_PREFLIGHT}; whatever they now also \
+             do is a second gate living in the workflows, where the next fix to it \
+             has to land eight times again"
+        );
+        let (first_name, first) = shapes
+            .first()
+            .expect("at least one native preflight")
+            .clone();
+        for (name, shape) in &shapes[1..] {
+            if let Some(diff) = first_line_difference(&first_name, &first, name, shape) {
+                panic!(
+                    "the native Linux GPU preflights agree on their bodies but no longer \
+                     on the step AROUND the body — one lane runs {SHARED_PREFLIGHT} under \
+                     conditions, error handling or environment the other seven do not, so \
+                     the eight are one gate in name only; {diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_preflight_asserts_no_leaked_engine_process_survives() {
+        // #446: the free-memory floor is a fixed 8/16 GiB against pools of ~62
+        // and 192 GiB, so it only trips near exhaustion — a leftover
+        // llama-server holding 10-20 GiB clears every lane. The process
+        // assertion is what actually catches that, and it is one line in one
+        // file: deleting it leaves every other test here green, because they all
+        // drive memory readings.
+        //
+        // The shape is pinned here; `apu_preflight_gates_on_the_pool_the_engine
+        // _uses` drives it against a reclaim stub that reports survivors, which
+        // is what proves it can fail.
+        //
+        // MATCHED ON THE CALL, not on the flag's name anywhere in the file, and
+        // this is the second time round on exactly that distinction. Filtering
+        // comments was the first fix: the script's header explains the mode by
+        // name, so a whole-file `contains("--assert-clear")` stayed satisfied
+        // after the call was gone. Then the timeout fix added a NON-comment
+        // `echo "::error::… (reclaim-gpu.sh --assert-clear) did not finish…"`,
+        // which contains the flag too — and the filtered search could not fail
+        // again. Prose about a call is not a call; the only thing worth
+        // asserting is the invocation, so that is what is matched.
+        let script = shared_preflight_script();
+        let code_lines: Vec<&str> = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        let calls: Vec<&str> = code_lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| l.contains(r#"bash "${RECLAIM_SCRIPT}" --assert-clear"#))
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "{SHARED_PREFLIGHT} no longer RUNS `reclaim-gpu.sh --assert-clear` (it may still \
+             describe it, and its own error message quotes the flag); the gate is back to a \
+             fixed free-memory floor, which on these pools only trips near exhaustion (#446)"
+        );
+        let code: String = code_lines.join("\n");
+        // The floor is a BACKSTOP, not a thing the process check replaced: it is
+        // the only one of the two that can see a non-E2E tenant exhausting a
+        // shared host. Losing it silently would be the opposite half of #446.
+        assert!(
+            code.contains("never dropped below the floor"),
+            "{SHARED_PREFLIGHT} no longer applies a free-memory floor; the process \
+             assertion cannot see a non-E2E tenant exhausting a shared host (#446)"
+        );
+        // The gate must be BOUNDED, like every rocm-smi call in this script. Its
+        // scan reads /proc/<pid>/cmdline for every process, and a holder wedged
+        // in uninterruptible sleep can block that read — the same condition the
+        // gate fires on, so the hang risk is correlated with the detection.
+        // Unbounded, the one step added to stop a job hanging to its cap is the
+        // step that hangs to it. `preflight_bounds_the_leaked_process_scan`
+        // drives this for real; this names the loss immediately rather than by
+        // a case that takes a minute to go red.
+        assert!(
+            calls.iter().all(|l| l.starts_with("timeout 15 bash")),
+            "{SHARED_PREFLIGHT} does not invoke `reclaim-gpu.sh --assert-clear` as a plain, \
+             `timeout 15`-bounded command — it is either unbounded, in which case a stalled \
+             /proc scan rides to the job's own cap instead of failing fast, or guarded by \
+             something that can skip it. Found: {calls:?}"
+        );
+        // …and the bound must FAIL the gate. `timeout` reports expiry as 124,
+        // and a scan that could not finish is not evidence of a clear host.
+        // Without this, `|| true`-ing the call away would still satisfy the
+        // check above while turning every hang into a silent pass.
+        assert!(
+            code.contains(r#""${assert_rc}" -eq 124"#),
+            "{SHARED_PREFLIGHT} bounds the leaked-process scan but does not handle \
+             `timeout`'s expiry code (124) distinctly; a scan that never finished must \
+             fail the gate with its own reason, not pass or be reported as a survivor"
+        );
+        // …and so must every OTHER non-zero code. 1 is the only one that means
+        // the scan ran and named somebody; 127 (no such script) and 2 (a flag
+        // reclaim-gpu.sh does not dispatch — what deleting its `--assert-clear`
+        // arm produces) are not survivors and must not be reported as one.
+        // `preflight_distinguishes_a_scan_that_never_ran_from_a_survivor` drives
+        // both for real.
+        assert!(
+            code.contains(r#""${assert_rc}" -eq 1"#),
+            "{SHARED_PREFLIGHT} treats every non-124 failure of the leaked-process scan as \
+             a surviving process; a missing script or an undispatched flag then fails the \
+             lane with 'a leaked E2E engine process is still holding it (listed above)' \
+             and nothing listed above"
         );
     }
 
@@ -1087,13 +2998,21 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// nightly lane job-level `continue-on-error: true` means a regression would
     /// not even turn the run red.
     ///
-    /// Matching the step NAME rather than a substring of the job is deliberate —
-    /// the surrounding comments discuss the clock at length, so a bare substring
-    /// would stay satisfied by prose after the step itself was deleted, which is
-    /// exactly the failure this pins.
+    /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
+    /// surrounding comments discuss the clock at length, and a comment line that
+    /// happened to embed the step's text would otherwise keep this satisfied after
+    /// the step itself was deleted — exactly the failure this pins.
+    ///
+    /// The two copies' `run:` bodies are also compared byte for byte, after
+    /// dedenting. They are kept in sync by hand until the lanes are deduplicated
+    /// (#294), and presence and order say nothing about what each copy runs —
+    /// the same drift `apu_preflight_twins_do_not_drift` once caught too late.
+    /// Equality pins only that the two lanes agree, not that either body still
+    /// does the work: both gutted to an identical `echo hi` would pass.
     #[test]
     fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
         const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        let mut bodies = Vec::new();
         for (workflow, job, suite_step) in [
             (
                 "e2e-selfhosted.yml",
@@ -1107,20 +3026,42 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             ),
         ] {
             let job_block = nested_block(&read_workflow(workflow), job);
-            let settle = job_block.find(STEP).unwrap_or_else(|| {
+            let lines: Vec<&str> = job_block.lines().collect();
+            let settle = lines.iter().position(|l| *l == STEP).unwrap_or_else(|| {
                 panic!(
                     "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
                      steps its clock backwards mid-run and cucumber subtracts SystemTime \
                      stamps, so the durations that lane reports become fiction"
                 )
             });
-            let suite = job_block
-                .find(suite_step)
+            let suite = lines
+                .iter()
+                .position(|l| *l == suite_step)
                 .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
             assert!(
                 settle < suite,
                 "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
                  correction has to land while nothing is being timed"
+            );
+            let step = step_block(&lines, settle);
+            let body = run_block(&step)
+                .and_then(|block| dedent(&block))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{workflow}'s clock-settling step has no block-scalar `run:` body \
+                         (`run: |`, `run: >` and the like are read; a one-line `run:` is not)"
+                    )
+                });
+            bodies.push((workflow, body));
+        }
+        let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
+            unreachable!("exactly two lanes are checked above");
+        };
+        if let Some(difference) = first_line_difference(first, first_body, second, second_body) {
+            panic!(
+                "the clock-settling step has drifted between {first} and {second} — the \
+                 copies are kept in sync by hand until the lanes are deduplicated (#294); \
+                 {difference}"
             );
         }
     }
@@ -1131,6 +3072,15 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // pre-GTT script while the other five were converted and nothing failed,
         // because every contract test here asserts step names, env keys and
         // labels — never the script body.
+        //
+        // What this still buys after #446 extracted the native bodies into
+        // `.github/scripts/gpu-preflight.sh`: the PowerShell pair, which is
+        // genuinely two hand-maintained copies, and the WSL advisory pair, which
+        // is another. The native pair now compares two identical one-line
+        // delegations, so equality there is trivially true and proves nothing —
+        // `every_native_linux_preflight_delegates_to_the_shared_script` is what
+        // carries that case, by asserting the delegation rather than the
+        // agreement.
         type Extract = fn(&str) -> Option<String>;
         let scripts = |name: &str, extract: Extract| -> Vec<String> {
             gpu_preflight_steps(&read_workflow(name))
@@ -1159,11 +3109,14 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{language} APU preflight count differs"
             );
             for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
-                assert_eq!(
-                    a, b,
-                    "{language} APU preflight script #{i} has drifted between \
-                     e2e-selfhosted.yml and nightly.yml"
-                );
+                if let Some(difference) =
+                    first_line_difference("e2e-selfhosted.yml", a, "nightly.yml", b)
+                {
+                    panic!(
+                        "{language} APU preflight script #{i} has drifted between \
+                         e2e-selfhosted.yml and nightly.yml; {difference}"
+                    );
+                }
             }
         }
     }
@@ -1210,6 +3163,64 @@ case "$*" in
 esac
 "#;
 
+    /// Stands in for `scripts/reclaim-gpu.sh`, which a native lane runs with
+    /// `--report-holders` when it gives up, and with `--assert-clear` when the
+    /// memory floor is satisfied. Without it the call resolves against whatever
+    /// directory the test runs from, fails, and neither path is exercised.
+    ///
+    /// `RECLAIM_ASSERT_FAILS` makes `--assert-clear` report a survivor, the way
+    /// the real script does when a leaked engine process outlived the reclaim.
+    /// A gate that cannot be driven into its failing state is not tested by any
+    /// number of passing cases: without this the preflight's process assertion
+    /// could be deleted outright with every case below still green.
+    ///
+    /// `RECLAIM_ASSERT_HANGS` makes the scan never return, which is the case the
+    /// `timeout` bound on that call exists for: `select_leaked` reads
+    /// /proc/<pid>/cmdline for every process, and a holder wedged in
+    /// uninterruptible sleep can block that read — the very state this gate
+    /// fires on.
+    ///
+    /// `exec`, not a plain `sleep`: the bound's SIGTERM must land on the sleep
+    /// itself. Forked, it would be orphaned still holding the captured stdout
+    /// pipe, and the harness would block reading it for the full 60s no matter
+    /// when the preflight exited — timing the stub instead of the bound.
+    #[cfg(unix)]
+    const RECLAIM_STUB: &str = r#"#!/bin/sh
+echo "reclaim-gpu.sh stub called: $*"
+if [ "$1" = "--report-holders" ] && [ "${RECLAIM_HOLDERS_HANGS:-0}" = 1 ]; then
+  exec sleep 60
+fi
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_HANGS:-0}" = 1 ]; then
+  exec sleep 60
+fi
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_RC:-0}" != 0 ]; then
+  exit "${RECLAIM_ASSERT_RC}"
+fi
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
+  echo "assert-clear: leaked E2E engine process(es) still holding the GPU:" >&2
+  echo "  pid=4242 cmd=/e2e-prewarm/bin/llama-server" >&2
+  exit 1
+fi
+"#;
+
+    /// What a lane logs when it reached the step that names what holds the GPU.
+    #[cfg(unix)]
+    const REPORTED_HOLDERS: &str = "reclaim-gpu.sh stub called: --report-holders";
+
+    /// A preflight's exit code, or a panic naming the signal that killed it:
+    /// `code()` is `None` exactly when there is no code to report.
+    #[cfg(unix)]
+    fn exit_code(status: std::process::ExitStatus, what: &str) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+
+        status.code().unwrap_or_else(|| {
+            panic!(
+                "{what} exited with no status code: killed by signal {:?}",
+                status.signal()
+            )
+        })
+    }
+
     /// Run a preflight script against fixture `rocm-smi` output, returning its
     /// exit code and everything it logged. `rocm-smi` is stubbed on `PATH`;
     /// nothing touches a real GPU.
@@ -1223,7 +3234,26 @@ esac
         fixture: &str,
         env: &[(&str, &str)],
     ) -> (i32, String) {
-        use std::os::unix::fs::PermissionsExt;
+        run_preflight_with_reclaim(script, shell, fixture, env, RECLAIM_STUB)
+    }
+
+    /// As `run_preflight`, but with the `scripts/reclaim-gpu.sh` the preflight
+    /// finds supplied by the caller.
+    ///
+    /// Every case but one plants `RECLAIM_STUB`, which is what makes the gate's
+    /// outcomes drivable. `preflight_runs_the_real_reclaim_assert_clear` plants
+    /// the REAL script instead, because a stub cannot show that the two agree
+    /// about how the mode is spelled, what it exits, or that the dispatch arm
+    /// for it exists at all.
+    #[cfg(unix)]
+    fn run_preflight_with_reclaim(
+        script: &str,
+        shell: PreflightShell,
+        fixture: &str,
+        env: &[(&str, &str)],
+        reclaim: &str,
+    ) -> (i32, String) {
+        use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let fixture_path = dir.path().join("smi.txt");
@@ -1231,9 +3261,13 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_fake_executable(&stub, SMI_STUB)
+            .expect("plant the fake rocm-smi for the bash/sh preflight");
+        // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
+        // run from a directory that has one.
+        std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
+        std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), reclaim)
+            .expect("write reclaim-gpu.sh");
 
         let path = format!(
             "{}:{}",
@@ -1246,34 +3280,41 @@ esac
         }
         let out = cmd
             .arg(&script_path)
+            .current_dir(dir.path())
             .env("PATH", path)
             .env("FIXTURE", &fixture_path)
             .env("COUNTER", dir.path().join("calls"))
             // One poll, then the script's own 5s backoff ends the loop. Cases
             // that need a second poll raise this.
             .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            // The APU floor, which the two advisory bodies default to and the
+            // shared script does not: it defaults to the discrete 16 and the APU
+            // lanes set this. Supplied here so all three are driven at the same
+            // floor and a case's expectations mean one thing; a case needing the
+            // discrete floor overrides it through `env`.
+            .env("GPU_PREFLIGHT_MIN_FREE_GIB", "8")
             .envs(env.iter().copied())
             .output()
             .expect("running the preflight script");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "preflight"), log)
     }
 
-    /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
+    /// The two hard-failing shell bodies an APU lane can run: the shared script
+    /// every native Linux lane delegates to, and `e2e-selfhosted.yml`'s advisory
+    /// WSL body.
+    ///
+    /// The native side is read from the FILE rather than extracted from the
+    /// workflow, because since #446 the step's own body is one line that runs
+    /// it. Driving that line from a scratch tree would test the delegation and
+    /// nothing else;
+    /// `every_native_linux_preflight_delegates_to_the_shared_script` pins the
+    /// delegation, and this pins what it delegates to.
     #[cfg(unix)]
     fn apu_lanes() -> (String, String) {
         let steps = gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"));
-        let native = steps
-            .iter()
-            .filter(|s| is_apu_preflight(s) && !s.contains("advisory"))
-            .find_map(|s| preflight_shell_script(s))
-            .expect("native APU preflight shell script");
+        let native = shared_preflight_script();
         let advisory = steps
             .iter()
             .filter(|s| s.contains("advisory"))
@@ -1318,7 +3359,7 @@ esac
     /// GitHub's Ubuntu images, so this normally runs rather than skips.
     #[cfg(unix)]
     fn run_preflight_pwsh(script: &str, fixture: &str, env: &[(&str, &str)]) -> (i32, String) {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let fixture_path = dir.path().join("smi.txt");
@@ -1326,9 +3367,8 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_fake_executable(&stub, SMI_STUB)
+            .expect("plant the fake rocm-smi for the pwsh preflight");
 
         let path = format!(
             "{}:{}",
@@ -1347,12 +3387,7 @@ esac
             .expect("running the preflight script under pwsh");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "pwsh preflight"), log)
     }
 
     /// One host reading, and what each lane must make of it.
@@ -1365,6 +3400,15 @@ esac
         native: (i32, &'static [&'static str]),
         /// …and for the advisory one.
         advisory: (i32, &'static [&'static str]),
+        /// The Windows-native block's verdict, when it differs from `native`.
+        ///
+        /// `None` means "the same as `native`", which is the usual case: it
+        /// guards the same hardware class with the same floor. It is set only
+        /// where the two blocks genuinely diverge — the process assertion #446
+        /// added, which the PowerShell copy has no bash to run. Stated as an
+        /// expectation rather than skipped, so the gap is pinned: if that block
+        /// ever grows an equivalent, this case fails and names the reason.
+        windows: Option<(i32, &'static [&'static str])>,
     }
 
     #[cfg(unix)]
@@ -1415,6 +3459,7 @@ esac
                 env: vec![],
                 native: (0, &["GPU ready: 61 GiB GTT free"]),
                 advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+                windows: None,
             },
             // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
             // single-pool fallback carries no GTT rows, so without a dedicated
@@ -1441,6 +3486,7 @@ esac
                         "GPU ready: 61 GiB GTT free",
                     ],
                 ),
+                windows: None,
             },
             GateCase {
                 label: "carveout with the aperture pinned by a leftover serve",
@@ -1448,6 +3494,7 @@ esac
                 env: vec![],
                 native: (1, &["GTT never dropped below the floor"]),
                 advisory: (1, &["GTT never dropped below the floor"]),
+                windows: None,
             },
             GateCase {
                 label: "discrete card with VRAM free",
@@ -1455,6 +3502,7 @@ esac
                 env: vec![],
                 native: (0, &["GPU ready: 182 GiB VRAM free"]),
                 advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+                windows: None,
             },
             GateCase {
                 label: "discrete card with VRAM held",
@@ -1462,6 +3510,70 @@ esac
                 env: vec![],
                 native: (1, &["VRAM never dropped below the floor"]),
                 advisory: (1, &["VRAM never dropped below the floor"]),
+                windows: None,
+            },
+            // The simplification #446's extraction rests on: ONE script serves
+            // both the discrete and the APU lanes because the APU body is a
+            // strict superset — a discrete card's VRAM total is far above any
+            // floor, so the carveout branch is never entered, and the two-pool
+            // query it opens with degrades to the single-pool call the discrete
+            // lanes always made. The two cases above cover a rocm-smi that
+            // ACCEPTS the two-pool form on a discrete card; this covers one that
+            // rejects it, which is the arm that has to fall back. Without it,
+            // the degradation is only ever exercised on a carveout fixture and
+            // an fallback that mishandled a full-size pool would ship green.
+            GateCase {
+                label: "discrete card where rocm-smi rejects the two-pool query",
+                fixture: smi_fixture(192 * GIB, 10 * GIB, None),
+                env: vec![("REJECT_COMBINED", "1")],
+                native: (0, &["GPU ready: 182 GiB VRAM free"]),
+                advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+                windows: None,
+            },
+            // The discrete lanes' 16 GiB floor, driven across its own boundary
+            // rather than only asserted as a string in the workflow YAML.
+            //
+            // Every other discrete fixture here clears or misses the floor by
+            // well over a hundred GiB, so the NUMBER never decides anything:
+            // change the lanes' `GPU_PREFLIGHT_MIN_FREE_GIB: 16` to 8, or to 64,
+            // and all of them keep their verdicts. This pair is the only place
+            // the value is load-bearing — at 15 GiB free the lane must fail and
+            // at 8 it would pass, so a floor that quietly shrank is caught here
+            // and nowhere else.
+            //
+            // Run at the DISCRETE floor, which `run_preflight` does not default
+            // to: it supplies the APU's 8 so the three lanes are driven alike,
+            // and a case wanting 16 overrides it, as here.
+            GateCase {
+                label: "discrete card one GiB under the 16 GiB floor",
+                fixture: smi_fixture(192 * GIB, 177 * GIB, None),
+                env: vec![("GPU_PREFLIGHT_MIN_FREE_GIB", "16")],
+                native: (
+                    1,
+                    &["VRAM never dropped below the floor: only 15 GiB free (< 16 GiB)"],
+                ),
+                advisory: (
+                    1,
+                    &[
+                        "waiting: 15 GiB VRAM free (< 16 GiB)",
+                        "VRAM never dropped below the floor",
+                    ],
+                ),
+                windows: None,
+            },
+            // The other side of the same boundary, one GiB up. Pins the
+            // comparison as `>=` rather than `>`: a card holding exactly the
+            // floor satisfies it. Off by that one step the lanes would burn the
+            // full ceiling and fail a GPU that is, by their own stated rule,
+            // ready — and no fixture above would notice, because none of them
+            // land on the number.
+            GateCase {
+                label: "discrete card exactly at the 16 GiB floor",
+                fixture: smi_fixture(192 * GIB, 176 * GIB, None),
+                env: vec![("GPU_PREFLIGHT_MIN_FREE_GIB", "16")],
+                native: (0, &["GPU ready: 16 GiB VRAM free (>= 16 GiB)"]),
+                advisory: (0, &["GPU ready: 16 GiB VRAM free (>= 16 GiB)"]),
+                windows: None,
             },
             // A wedged driver must not be read as "this is an APU" and waved
             // through on whatever the other pool reports.
@@ -1471,6 +3583,7 @@ esac
                 env: vec![],
                 native: (1, &["reported a VRAM total of 0"]),
                 advisory: (0, &["no VRAM figures under WSL"]),
+                windows: None,
             },
             // The same defect one pool over: a GTT total that parses as zero is
             // a failed reading, not an exhausted aperture. Unguarded it produced
@@ -1483,6 +3596,7 @@ esac
                 env: vec![],
                 native: (1, &["reported a GTT total of 0"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
             },
             // Nothing measurable: the native lane fails, the advisory lane warns.
             GateCase {
@@ -1491,6 +3605,7 @@ esac
                 env: vec![],
                 native: (1, &["reported no GTT pool"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
             },
             // A query that failed is not a host without the pool. The aperture
             // is right there in the fixture; only the call for it broke, and
@@ -1501,6 +3616,39 @@ esac
                 env: vec![("REJECT_COMBINED", "1"), ("FAIL_GTT", "1")],
                 native: (1, &["the GTT query itself failed"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
+            },
+            // #446. A healthy, nearly-empty aperture — every memory reading in
+            // this case says the GPU is free, and the floor passes on the first
+            // poll. What is NOT free is the card: a leftover llama-server
+            // survived the reclaim step. A fixed 8 GiB floor against 62 GiB
+            // cannot express that, and a 10-20 GiB serve clears it on every
+            // lane; the process assertion is the only thing here that fails,
+            // which is the whole point of adding it.
+            //
+            // This is also the only case that drives the reclaim stub into its
+            // failing state. Delete the `--assert-clear` call from the shared
+            // script and every other case below stays green.
+            GateCase {
+                label: "free aperture but a leaked engine process survived the reclaim",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("RECLAIM_ASSERT_FAILS", "1")],
+                native: (
+                    1,
+                    &[
+                        // The floor WAS satisfied, so this failure cannot be
+                        // mistaken for the memory gate firing.
+                        "GPU ready: 61 GiB GTT free",
+                        "a leaked E2E engine process is still holding it",
+                        "pid=4242",
+                    ],
+                ),
+                // The advisory WSL body has no process assertion either, and is
+                // specified never to hard-fail; it passes on the reading.
+                advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+                // The documented Windows gap: memory-only, so it clears a card
+                // that is still held. Pinned, not hidden — see the field's doc.
+                windows: Some((0, &["GPU ready: 61 GiB GTT free"])),
             },
         ];
 
@@ -1535,13 +3683,434 @@ esac
             for handle in handles {
                 let (case, native, advisory, windows) =
                     handle.join().expect("preflight case thread");
+                // A native lane that gives up must also say what holds the card.
+                if case.native.0 == 1 {
+                    assert!(
+                        native.1.contains(REPORTED_HOLDERS),
+                        "native preflight, {}: failed without reporting the GPU's \
+                         holders, logged:\n{}",
+                        case.label,
+                        native.1
+                    );
+                }
                 assert_gate("native", case.label, native, case.native);
                 assert_gate("advisory", case.label, advisory, case.advisory);
                 // The Windows block guards the same hardware class with the
-                // same floor, so it owes the same verdicts as the native lane.
+                // same floor, so it owes the same verdicts as the native lane —
+                // except where it has been stated not to.
                 if let Some(windows) = windows {
-                    assert_gate("Windows", case.label, windows, case.native);
+                    assert_gate(
+                        "Windows",
+                        case.label,
+                        windows,
+                        case.windows.unwrap_or(case.native),
+                    );
                 }
+            }
+        });
+    }
+
+    /// A scan that never finishes must fail the gate AT THE BOUND.
+    ///
+    /// The shape test pins that the `timeout` and its 124 branch are present;
+    /// only running it shows the bound actually fires, with the reason it is
+    /// supposed to give. A timeout nobody has exercised is a timeout nobody
+    /// knows works — and this one can never be exercised on live hardware from
+    /// per-PR CI, since the lanes that run `--assert-clear` for real are
+    /// self-hosted and nightly.
+    ///
+    /// The stub sleeps 60s against a 15s bound, so the elapsed time separates
+    /// "the bound cut it short" from "the scan happened to return": unbounded,
+    /// this case takes a full minute AND passes the gate, because the stub then
+    /// exits 0. Both halves are asserted.
+    ///
+    /// Only the native lane is driven. The advisory WSL body and the Windows
+    /// block have no process assertion to bound — a gap
+    /// `apu_preflight_gates_on_the_pool_the_engine_uses` already pins.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_the_leaked_process_scan() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        // A healthy, nearly-empty aperture: the memory floor passes on the
+        // first poll, so the only thing that can decide this run is the gate.
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let started = std::time::Instant::now();
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[("RECLAIM_ASSERT_HANGS", "1")],
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            code, 1,
+            "a leaked-process scan that never returned must FAIL the preflight: it is not \
+             evidence the host is clear. Logged:\n{log}"
+        );
+        assert!(
+            log.contains("GPU ready: 61 GiB GTT free"),
+            "the memory floor should have passed before the gate ran, so this failure \
+             cannot be confused with the floor firing; logged:\n{log}"
+        );
+        assert!(
+            log.contains("did not finish within 15s"),
+            "the preflight failed on a stalled scan but did not say so — a timeout \
+             reported as a survivor, or as a generic failure, sends the next reader \
+             hunting for a process that was never named. Logged:\n{log}"
+        );
+        assert!(
+            log.contains(REPORTED_HOLDERS),
+            "a bounded-out scan still has to name what it could see holding the card; \
+             logged:\n{log}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(45),
+            "the preflight took {elapsed:?} against a 15s bound and a stub that sleeps \
+             60s: the bound did not cut the scan short"
+        );
+    }
+
+    /// Whether this host has the procfs `--assert-clear` walks.
+    ///
+    /// macOS is a `cfg(unix)` target with no `/proc`, where the scan's glob
+    /// expands to nothing and every host looks clear. A case driving the real
+    /// script has to know the difference between "found no survivor" and "could
+    /// not have found one".
+    #[cfg(unix)]
+    fn has_procfs() -> bool {
+        Path::new("/proc/self/cmdline").exists()
+    }
+
+    /// Starts a stand-in engine process whose command line begins with
+    /// `argv0`, and returns it only once it is seen alive under that name.
+    ///
+    /// The rule `--assert-clear` applies reads `/proc/<pid>/cmdline`, so the
+    /// decoy only has to present the path there. It is `/bin/sh` run under that
+    /// argv[0], parked in the `read` builtin on a pipe this test holds.
+    ///
+    /// Nothing is copied, so nothing depends on how coreutils is built. A copy
+    /// of `/bin/sleep` named `llama-server` exits at once on ubuntu-26.04, whose
+    /// `/bin/sleep` is the uutils multicall binary (`coreutils: unknown program
+    /// 'llama-server'`); and `CommandExt::arg0` on the real `sleep` is no way
+    /// out, because uutils dispatches on argv[0] on some targets and on the
+    /// executed path on others. Ubuntu's `/bin/sh` is dash, which ignores its
+    /// argv[0].
+    ///
+    /// `read` is a builtin, so the shell forks nothing and killing this one
+    /// pid leaves no orphan. If the test dies before killing it, dropping the
+    /// `Child` closes the pipe, `read` sees end of file, and the shell exits on
+    /// its own.
+    #[cfg(unix)]
+    fn spawn_decoy_engine(argv0: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .arg0(argv0)
+            .args(["-c", "read -r _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the decoy engine process");
+        // Long enough for a decoy that cannot run under this name to have
+        // exited: the multicall `sleep` above is gone in a few milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let pid = child.id();
+        let mut exited = child.try_wait().expect("poll the decoy engine process");
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let named = cmdline
+            .split(|&b| b == 0)
+            .next()
+            .is_some_and(|first| first == argv0.as_os_str().as_encoded_bytes());
+        // Polled again when the name is wrong: a decoy that exited between the
+        // poll above and the read has an empty command line, and must be
+        // reported as having exited rather than as running under another name.
+        if exited.is_none() && !named {
+            exited = child.try_wait().expect("poll the decoy engine process");
+        }
+        if exited.is_some() || !named {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(status) = exited {
+            panic!(
+                "the decoy engine process (pid={pid}) exited at spawn ({status}), so there \
+                 is nothing for --assert-clear to find; the runner's `/bin/sh` cannot run \
+                 under argv[0] {}. This is the fixture failing, not the gate",
+                argv0.display()
+            );
+        }
+        assert!(
+            named,
+            "the decoy engine process (pid={pid}) is alive but its command line does not \
+             start with {}, so the rule cannot match it; read: {:?}",
+            argv0.display(),
+            String::from_utf8_lossy(&cmdline)
+        );
+        child
+    }
+
+    /// The preflight must run the REAL `reclaim-gpu.sh --assert-clear`, the way
+    /// it runs it in CI, in both directions.
+    ///
+    /// Everything else here plants a stub, and the script's own self-test calls
+    /// `assert_clear` as a bash function — so between them nothing crossed the
+    /// process boundary the lane actually crosses. Measured: with the
+    /// `--assert-clear` arm DELETED from `reclaim-gpu.sh`'s `main`, the entire
+    /// suite and the whole self-test stayed green. The script then falls through
+    /// to its `unknown argument` arm and exits 2, which the preflight reported
+    /// as "a leaked E2E engine process is still holding it (listed above)" with
+    /// nothing listed above — a gate that fails every lane, for a reason that is
+    /// not true, naming a process that does not exist.
+    ///
+    /// `RECLAIM_SELFTEST_SCOPE` confines the scan to a decoy under a temp dir,
+    /// exactly as the script's own self-test confines its decoys, so this can
+    /// run on a shared machine without seeing anybody else's processes — and,
+    /// in the clear direction, cannot be satisfied by a host that merely has no
+    /// engine running.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_runs_the_real_reclaim_assert_clear() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        if !has_procfs() {
+            eprintln!("skipping: no /proc, so `--assert-clear` cannot see any process here");
+            return;
+        }
+        let reclaim_path = repo_root().join("scripts/reclaim-gpu.sh");
+        let reclaim = std::fs::read_to_string(&reclaim_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", reclaim_path.display()));
+        // A healthy, nearly-empty aperture: the floor passes on the first poll,
+        // so the gate is the only thing that can decide either run.
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let scope = tempfile::tempdir().expect("decoy scope dir");
+        let scope_arg = scope.path().to_str().expect("utf-8 temp path").to_owned();
+        let env = [("RECLAIM_SELFTEST_SCOPE", scope_arg.as_str())];
+
+        let (code, log) = run_preflight_with_reclaim(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &env,
+            &reclaim,
+        );
+        // The scan forks once per /proc entry, so a heavily loaded host can
+        // genuinely exceed the 15s bound (measured: ~4s at 2400 pids). That is
+        // the bound doing its job, not this contract failing; say so and stop
+        // rather than report a slow machine as a broken gate.
+        if log.contains("did not finish within 15s") {
+            eprintln!("skipping: the real /proc scan did not finish inside the gate's 15s bound");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "the preflight ran the real `reclaim-gpu.sh --assert-clear` against a scope \
+             holding nothing and still failed; logged:\n{log}"
+        );
+        assert!(
+            log.contains("assert-clear: no leaked E2E engine processes are running"),
+            "the preflight passed without the real script reporting a clear scan — the \
+             two disagree about how this mode is spelled or what it prints; logged:\n{log}"
+        );
+
+        // argv[0] names an E2E root and an engine marker, which is what the
+        // rule matches, and sits under the scope so nothing else can.
+        let decoy = scope.path().join("e2e-prewarm/bin/llama-server");
+        let mut child = spawn_decoy_engine(&decoy);
+        let decoy_pid = child.id();
+        let got = run_preflight_with_reclaim(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &env,
+            &reclaim,
+        );
+        // Asked before the kill: a decoy that died during the scan would make
+        // a clear verdict correct, and the assertion below would blame the gate.
+        let alive_after_scan = matches!(child.try_wait(), Ok(None));
+        // Reaped before any assertion: a panic here must not leave the decoy
+        // behind on a self-hosted runner, of all things.
+        let _ = child.kill();
+        let _ = child.wait();
+        let (code, log) = got;
+        if log.contains("did not finish within 15s") {
+            eprintln!("skipping: the real /proc scan did not finish inside the gate's 15s bound");
+            return;
+        }
+        assert!(
+            alive_after_scan,
+            "the decoy engine process (pid={decoy_pid}) exited while the preflight was \
+             scanning, so its verdict says nothing about the gate; logged:\n{log}"
+        );
+        assert_eq!(
+            code, 1,
+            "a real leaked engine process was running and the preflight passed; logged:\n{log}"
+        );
+        assert!(
+            log.contains("a leaked E2E engine process is still holding it"),
+            "the preflight failed with a survivor present but did not report it as one — \
+             which is what any non-zero exit from a script that never ran this mode looks \
+             like; logged:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("pid={decoy_pid} ")),
+            "the preflight did not name the surviving process (pid={decoy_pid}); an \
+             unnamed survivor is the report this gate exists to replace; logged:\n{log}"
+        );
+    }
+
+    /// An `--assert-clear` that never ran must not be reported as one that
+    /// found somebody.
+    ///
+    /// `timeout` passes the command's own status through, so the preflight sees
+    /// 127 for a missing or unreadable `reclaim-gpu.sh` and 2 for a flag the two
+    /// scripts disagree about — both of which it used to report as "a leaked
+    /// E2E engine process is still holding it (listed above)", with nothing
+    /// listed above. Deleting the `--assert-clear` arm from `reclaim-gpu.sh`
+    /// produces exactly the 2.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_distinguishes_a_scan_that_never_ran_from_a_survivor() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        for rc in ["2", "127"] {
+            let (code, log) = run_preflight(
+                &shared_preflight_script(),
+                PreflightShell::DefaultRunStep,
+                &fixture,
+                &[("RECLAIM_ASSERT_RC", rc)],
+            );
+            assert_eq!(
+                code, 1,
+                "a scan that could not be run is not evidence of a clear host, so the \
+                 preflight must fail (reclaim exited {rc}); logged:\n{log}"
+            );
+            assert!(
+                log.contains("could not be run") && log.contains(&format!("exited {rc}")),
+                "reclaim exited {rc} — neither clear, nor a survivor, nor the bound — and \
+                 the preflight did not say so; logged:\n{log}"
+            );
+            assert!(
+                !log.contains("is still holding it"),
+                "reclaim exited {rc} without naming anybody, and the preflight claimed a \
+                 leaked process was holding the GPU and 'listed above'; nothing is listed \
+                 above, so the lane fails pointing at a process that was never found. \
+                 Logged:\n{log}"
+            );
+        }
+    }
+
+    /// One path into a holder report, and the reason the preflight still owes
+    /// after that report has been bounded out.
+    #[cfg(unix)]
+    struct HolderCase {
+        label: &'static str,
+        fixture: String,
+        env: Vec<(&'static str, &'static str)>,
+        phrase: &'static str,
+    }
+
+    /// The holder report is a DIAGNOSTIC, and must not outlive the failure it
+    /// is explaining.
+    ///
+    /// Both `--report-holders` calls were bounded by the same commit that
+    /// bounded the gate, and the comments at both call sites argue the bound is
+    /// load-bearing — but every other case here stubs reclaim to return
+    /// instantly, so removing either `timeout 15` left the whole suite green.
+    /// `--report-holders` walks /proc too, and it is reached precisely when
+    /// something is wedged, so the hang risk is the same one the gate's bound
+    /// exists for: an unbounded diagnostic spends the ceiling the fast failure
+    /// just saved.
+    ///
+    /// Both call sites are driven, because they are separate lines reached by
+    /// separate paths: the gate's failure, and the ceiling expiring.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_the_holder_report() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        // First: the gate fires with a survivor, which reports holders and then
+        // exits 1. Second: the floor is never met, so the ceiling expires and
+        // the report at the end of the script runs instead.
+        let paths = [
+            HolderCase {
+                label: "after the leaked-process gate fails",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![
+                    ("RECLAIM_ASSERT_FAILS", "1"),
+                    ("RECLAIM_HOLDERS_HANGS", "1"),
+                ],
+                phrase: "a leaked E2E engine process is still holding it",
+            },
+            HolderCase {
+                label: "after the ceiling expires",
+                fixture: smi_fixture(192 * GIB, 191 * GIB, None),
+                env: vec![
+                    ("GPU_PREFLIGHT_MIN_FREE_GIB", "16"),
+                    ("RECLAIM_HOLDERS_HANGS", "1"),
+                ],
+                phrase: "never dropped below the floor",
+            },
+        ];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|case| {
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let got = run_preflight(
+                            &shared_preflight_script(),
+                            PreflightShell::DefaultRunStep,
+                            &case.fixture,
+                            &case.env,
+                        );
+                        (case, got, started.elapsed())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (case, (code, log), elapsed) =
+                    handle.join().expect("holder-report case thread");
+                let label = case.label;
+                assert_eq!(
+                    code, 1,
+                    "{label}: a hanging holder report must not change the verdict; \
+                     logged:\n{log}"
+                );
+                assert!(
+                    log.contains(case.phrase),
+                    "{label}: the preflight lost its own reason while reporting holders; \
+                     logged:\n{log}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(45),
+                    "{label}: the preflight took {elapsed:?} against a 15s bound and a \
+                     holder report that sleeps 60s — the report is unbounded, so a wedged \
+                     host pays for the diagnostic with the fast failure it was printing"
+                );
             }
         });
     }
@@ -1569,7 +4138,12 @@ esac
         // Two polls: one at t=0, one after the script's own 5s backoff. The
         // first spends two calls (combined, then GTT alone); everything after
         // that fails, so the second poll reads nothing.
-        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "6")];
+        //
+        // The ceiling is counted in bash's whole-second `$SECONDS`, so a
+        // ceiling of N buys between N-1 and N real seconds. 7 keeps the second
+        // check, at just over 5s, inside the budget; 6 left it a coin toss, and
+        // a skipped second poll passes this test without exercising it.
+        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "7")];
         let fixture = smi_fixture(512 * MIB, 200 * MIB, None);
         let (native, advisory) = apu_lanes();
 
@@ -1587,6 +4161,114 @@ esac
             run_preflight(&native, PreflightShell::DefaultRunStep, &fixture, &env),
             (1, &["reported no GTT pool"]),
         );
+    }
+
+    /// A `BASH_ENV` file that stalls the script once, for just over a second,
+    /// as soon as its `deadline` is set — before anything else runs.
+    ///
+    /// That is the descheduling a loaded host can impose at the same spot.
+    /// `$SECONDS` ticks on whole wall-clock seconds, so with a 1s ceiling the
+    /// deadline is already past when the script resumes.
+    #[cfg(unix)]
+    const STALL_AFTER_DEADLINE: &str = "trap '[ -z \"${__stalled:-}\" ] && [ -n \"${deadline:-}\" ] \
+         && { __stalled=1; sleep 1.05; } || true' DEBUG\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn every_shell_preflight_polls_at_least_once_whatever_the_ceiling() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // A lane whose deadline expires before its first poll reports a verdict
+        // no reading produced: the native lanes "rocm-smi never returned within
+        // its timeout", the advisory ones "no VRAM figures under WSL". This
+        // flaked the gate test above whenever the second boundary passed
+        // between computing the deadline and the loop's first check. Every
+        // shell copy in both workflows is driven, not just the APU twins the
+        // drift test pins, because each was written with the same loop.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let trap_dir = tempfile::tempdir().expect("temp dir");
+        let bash_env = trap_dir.path().join("stall.sh");
+        std::fs::write(&bash_env, STALL_AFTER_DEADLINE).expect("write BASH_ENV");
+        let bash_env = bash_env.to_str().expect("utf-8 temp path");
+
+        let mut lanes = Vec::new();
+        let mut delegating = 0;
+        for (workflow, text) in self_hosted_workflows() {
+            for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
+                let Some(script) = preflight_shell_script(step) else {
+                    continue;
+                };
+                // A lane that delegates carries one line that runs the shared
+                // script; the loop is in the script, so driving the line would
+                // assert nothing. Counted rather than skipped, so a lane whose
+                // body quietly came BACK is not silently exempted from the
+                // check below by never being driven.
+                if script.contains(SHARED_PREFLIGHT) {
+                    delegating += 1;
+                    continue;
+                }
+                let shell = if step.contains("-Script @'") {
+                    PreflightShell::WslBareBash
+                } else {
+                    PreflightShell::DefaultRunStep
+                };
+                lanes.push((format!("{workflow} shell lane #{i}"), script, shell));
+            }
+        }
+        assert_eq!(
+            delegating, 8,
+            "expected the 8 native Linux preflight lanes to delegate to \
+             {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
+        );
+        assert_eq!(
+            lanes.len(),
+            2,
+            "expected the 2 WSL advisory preflight bodies to be the only shell blocks \
+             left inline across both workflows — if a lane was added or removed, update \
+             this count"
+        );
+        // The shared script once, standing in for all eight delegating lanes: they
+        // run the same bytes, and its loop is the one that has to poll.
+        lanes.push((
+            format!("shared {SHARED_PREFLIGHT}"),
+            shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+        ));
+
+        // A card held by a leftover serve: every lane, native or advisory,
+        // discrete or APU, must take a reading and fail on it.
+        let fixture = smi_fixture(192 * GIB, 191 * GIB, None);
+        let env = [("BASH_ENV", bash_env), ("GPU_PREFLIGHT_CEILING_SECS", "1")];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = lanes
+                .iter()
+                .map(|(label, script, shell)| {
+                    let (fixture, env) = (&fixture, &env);
+                    scope.spawn(move || (label, shell, run_preflight(script, *shell, fixture, env)))
+                })
+                .collect();
+            for handle in handles {
+                let (label, shell, got) = handle.join().expect("preflight lane thread");
+                // The advisory lanes `cd` to the runner's absolute checkout
+                // path first, so only the native ones reach the stub here.
+                if matches!(shell, PreflightShell::DefaultRunStep) {
+                    assert!(
+                        got.1.contains(REPORTED_HOLDERS),
+                        "{label}: failed without reporting the GPU's holders, logged:\n{}",
+                        got.1
+                    );
+                }
+                assert_gate(
+                    label,
+                    "deadline already past at the first check",
+                    got,
+                    (1, &["VRAM never dropped below the floor"]),
+                );
+            }
+        });
     }
 
     #[test]
@@ -1633,6 +4315,647 @@ esac
                 );
             }
         }
+    }
+
+    #[test]
+    fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
+        let nightly = read_workflow("nightly.yml");
+        let report = normalized_whitespace(job_block(&nightly, "e2e-report-nightly"));
+        assert!(
+            report.contains("--html-out consolidated/index.html > consolidated/support-matrix.md"),
+            "the consolidated report job must redirect the markdown matrix into \
+             consolidated/support-matrix.md for the wiki job"
+        );
+        assert!(
+            report.contains("cat consolidated/support-matrix.md >> \"$GITHUB_STEP_SUMMARY\""),
+            "the nightly step summary must still receive the matrix"
+        );
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        assert_eq!(
+            job_scalar(publish, "needs"),
+            "e2e-report-nightly",
+            "the wiki job must publish the consolidated report, so it must wait for it"
+        );
+        let condition = job_scalar(publish, "if");
+        for required in [
+            "!cancelled()",
+            "needs.e2e-report-nightly.result == 'success'",
+            "github.repository == 'ROCm/rocm-cli'",
+            "github.ref == 'refs/heads/main'",
+        ] {
+            assert!(
+                condition.contains(required),
+                "the wiki job's `if:` must require `{required}`: {condition}"
+            );
+        }
+        assert!(
+            !condition.contains("always()"),
+            "always() would publish from a cancelled run: {condition}"
+        );
+        let permissions = job_mapping(publish, "permissions");
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("write"),
+            "pushing to the wiki needs contents: write on this job"
+        );
+        let script = normalized_whitespace(publish);
+        assert!(
+            script.contains("name: e2e-consolidated-report-nightly")
+                && script.contains(".wiki.git"),
+            "the wiki job must download the nightly consolidated artifact and push to the wiki repo"
+        );
+        assert!(
+            script.contains("git push origin HEAD"),
+            "the wiki job must push the page"
+        );
+        assert!(
+            script.contains("if ! git clone --depth 1 \"$wiki\" wiki; then")
+                && script.contains("exit 1 fi"),
+            "a failed wiki clone must fail the job with the prerequisite, not be ignored"
+        );
+        assert!(
+            script
+                .contains("if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then")
+                && script.contains("leaving the wiki page unchanged"),
+            "an empty consolidation must leave the last good page in place"
+        );
+        assert!(
+            !publish.contains("git init"),
+            "no `git init` fallback: it cannot create a remote wiki"
+        );
+    }
+
+    /// Runs the publish job's real empty-report guard against the generator's
+    /// real empty output, so rewording either side (or breaking the guard's
+    /// exit) is caught by behavior rather than by pinning strings.
+    #[cfg(unix)]
+    #[test]
+    fn wiki_publish_guard_stops_on_the_generators_empty_output() {
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if ! grep -q '^| Platform | OS |'")
+            })
+            .expect("publish job has the empty-report guard");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.trim() == "fi")
+                .expect("guard is closed by fi");
+        let guard = lines[start..=end].join("\n");
+
+        let run = |matrix: &str| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("consolidated")).unwrap();
+            std::fs::write(dir.join("consolidated/support-matrix.md"), matrix).unwrap();
+            let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir)
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let empty =
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&[]));
+        assert!(
+            !run(&empty).contains("REACHED_PUBLISH"),
+            "the generator's empty output must stop the publish"
+        );
+        assert!(
+            !run("").contains("REACHED_PUBLISH"),
+            "a zero-byte matrix must not be published"
+        );
+        assert!(
+            run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),
+            "a matrix with platforms must reach the publish step"
+        );
+    }
+
+    /// Mirrors `wiki_publish_guard_stops_on_the_generators_empty_output`, but
+    /// for the release-readiness wiki job: runs its real three-way guard
+    /// (missing table.md / degenerate table.md / well-formed table.md)
+    /// against `render_table`'s actual output, so a regression in the guard
+    /// or the renderer's degenerate case is caught by behavior rather than a
+    /// pinned string.
+    ///
+    /// A missing table.md means release-readiness-nightly failed outright
+    /// (bad `git describe`, `gh issue list` auth failure, xtask crash)
+    /// before writing anything -- this must still reach the publish step, but
+    /// with an explicit "evidence unavailable" notice instead of the real
+    /// table, so the wiki never silently keeps a stale verdict with no sign
+    /// it's stale.
+    ///
+    /// Unreadable E2E evidence is itself a NO-GO signal, not a reason to hide
+    /// the page: `render_table` always emits the status-table header, so
+    /// this case reaches the publish step the same as a well-formed table.
+    /// Only a present-but-degenerate table (no status-table header at all)
+    /// trips the guard and leaves the last good page in place.
+    #[cfg(unix)]
+    #[test]
+    fn release_readiness_wiki_publish_guard_handles_missing_degenerate_and_well_formed_tables() {
+        use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
+
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-release-readiness-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if [ ! -f release-readiness/table.md ]")
+            })
+            .expect("publish job has the missing-table guard");
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if t.starts_with("if ") {
+                depth += 1;
+            } else if t == "fi" {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i;
+                    break;
+                }
+            }
+        }
+        assert!(end > start, "guard block must close with a matching fi");
+        let guard = lines[start..=end].join("\n");
+
+        // table: None simulates release-readiness-nightly failing before
+        // writing anything at all; Some(s) simulates a table.md with
+        // content `s`. Returns (stdout, published page content).
+        let run = |table: Option<&str>| -> (String, String) {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("release-readiness")).unwrap();
+            if let Some(s) = table {
+                std::fs::write(dir.join("release-readiness/table.md"), s).unwrap();
+            }
+            let page = format!(
+                "release-readiness-wiki-guard-test-{}.md",
+                dir.file_name().unwrap().to_string_lossy()
+            );
+            let script = format!("set -euo pipefail\npage={page}\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(dir)
+                .env("GITHUB_RUN_NUMBER", "42")
+                .env("RUN_URL", "https://example.invalid/run/42")
+                .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+                .env("COMMIT_URL", "https://example.invalid/commit/0123456789ab")
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            let page_path = format!("/tmp/{page}");
+            let page_content = std::fs::read_to_string(&page_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&page_path);
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                page_content,
+            )
+        };
+
+        let (missing_stdout, missing_page) = run(None);
+        assert!(
+            missing_stdout.contains("REACHED_PUBLISH"),
+            "a missing table.md (nightly job failed outright) must still reach the publish step"
+        );
+        assert!(
+            missing_page.contains("EVIDENCE UNAVAILABLE"),
+            "a missing table.md must publish an explicit stale-evidence notice, not silently keep the old page"
+        );
+
+        let (degenerate_stdout, _) = run(Some(""));
+        assert!(
+            !degenerate_stdout.contains("REACHED_PUBLISH"),
+            "a present-but-degenerate table.md (no status-table header) must still stop the publish and leave the last good page in place"
+        );
+
+        let unreadable = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::NoGo,
+            failing_gates: vec!["E2E (report unreadable)".to_string()],
+            e2e_fail_total: None,
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (unreadable_stdout, unreadable_page) = run(Some(&unreadable));
+        assert!(
+            unreadable_stdout.contains("REACHED_PUBLISH"),
+            "unreadable E2E evidence is a NO-GO verdict, not a reason to hide the wiki page"
+        );
+        assert!(
+            !unreadable_page.contains("EVIDENCE UNAVAILABLE"),
+            "a readable (if NO-GO) table must publish the real table, not the missing-table notice"
+        );
+
+        let well_formed = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::Go,
+            failing_gates: vec![],
+            e2e_fail_total: Some(0),
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (well_formed_stdout, well_formed_page) = run(Some(&well_formed));
+        assert!(
+            well_formed_stdout.contains("REACHED_PUBLISH"),
+            "a well-formed table must reach the publish step"
+        );
+        assert!(
+            well_formed_page.contains("Area | Evidence | Status"),
+            "a well-formed table's content must actually make it into the published page"
+        );
+    }
+
+    /// The narrative published to the wiki is LLM-drafted from untrusted
+    /// issue/commit text, so it can contain copied markdown links, images,
+    /// reference-style links, or raw HTML. Runs the job's real escaping
+    /// command (not a copy of its regex) against the three bypasses an
+    /// earlier link-stripping regex let through unchanged, so a regression
+    /// back to naive link-stripping is caught by behavior.
+    #[cfg(unix)]
+    #[test]
+    fn publish_release_readiness_wiki_escapes_markdown_link_and_html_syntax() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+
+        let run = |input: &str| -> String {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            std::fs::create_dir(dir.path().join("release-readiness"))
+                .expect("create release-readiness dir");
+            std::fs::write(dir.path().join("release-readiness/narrative.md"), input)
+                .expect("write narrative.md");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line)
+                .current_dir(dir.path())
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "sed command failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(
+            run(r#"<img src="https://example.com/p.png">"#),
+            r#"> &lt;img src="https://example.com/p.png"&gt;"#,
+            "a raw <img> tag must render as inert text, not a live image"
+        );
+        assert_eq!(
+            run("[a][1]\n[1]: https://example.com/x"),
+            "> \\[a\\]\\[1\\]\n> \\[1\\]: https://example.com/x",
+            "a reference-style link must render as inert text, not a live link"
+        );
+        assert_eq!(
+            run("[outer [inner](https://a.example)](https://b.example)"),
+            r"> \[outer \[inner\](https://a.example)\](https://b.example)",
+            "every bracket in a nested link must be escaped, leaving no live link"
+        );
+        assert_eq!(
+            run(r"\[click\](https://evil.example)"),
+            r"> \\\[click\\\](https://evil.example)",
+            "a narrative pre-escaping its own brackets must not produce a live link: \
+             the literal backslash must itself be escaped before `[`/`]` are"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_release_readiness_wiki_quotes_the_narrative_so_it_cannot_forge_a_top_level_verdict()
+    {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("release-readiness")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("release-readiness/narrative.md"),
+            "## Release Readiness \u{2014} GO\n| E2E | 0 failure(s) |\n**All gates passed**\n",
+        )
+        .expect("write narrative.md");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(line)
+            .current_dir(dir.path())
+            .output()
+            .expect("run bash");
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            assert!(
+                l.starts_with("> "),
+                "every narrative line must be block-quoted, got `{l}`"
+            );
+        }
+        assert!(
+            job.contains("## Narrative (drafted by an LLM"),
+            "the narrative heading must say it is LLM-drafted and not the verdict: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_prompt_never_receives_the_verdict() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains(
+                "jq 'del(.verdict) | .known_issues |= .[:100]' release-readiness/facts.json"
+            ),
+            "the prompt input must be facts.json with `.verdict` removed: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_artifact_hand_offs_use_matching_names() {
+        let nightly = read_workflow("nightly.yml");
+        for (uploader, consumers, name) in [
+            (
+                "release-readiness-nightly",
+                &[
+                    "release-readiness-narrative",
+                    "publish-release-readiness-wiki",
+                ][..],
+                "release-readiness-nightly",
+            ),
+            (
+                "release-readiness-narrative",
+                &["publish-release-readiness-wiki"][..],
+                "release-readiness-narrative",
+            ),
+        ] {
+            let needle = format!("name: {name}\n");
+            assert!(
+                job_block(&nightly, uploader).contains(&needle),
+                "`{uploader}` must upload an artifact named `{name}`"
+            );
+            for consumer in consumers {
+                assert!(
+                    job_block(&nightly, consumer).contains(&needle),
+                    "`{consumer}` must download the artifact named `{name}`"
+                );
+            }
+        }
+        // The consolidated report `release-readiness-nightly` reads must be
+        // the one `e2e-report-nightly` uploads.
+        let report_upload = job_block(&nightly, "e2e-report-nightly");
+        let report_name = report_upload
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("name: "))
+            .find(|n| n.starts_with("e2e-consolidated-report"))
+            .expect("e2e-report-nightly uploads a consolidated report artifact");
+        assert!(
+            job_block(&nightly, "release-readiness-nightly").contains(report_name),
+            "release-readiness-nightly must download `{report_name}`"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_can_push_to_the_wiki() {
+        let nightly = read_workflow("nightly.yml");
+        assert!(
+            job_block(&nightly, "publish-release-readiness-wiki").contains("contents: write"),
+            "pushing to the wiki repo needs `contents: write`"
+        );
+    }
+
+    /// `release-readiness-nightly` must gate E2E lane coverage through
+    /// `e2e-report-nightly`'s own result, not through each lane job's own
+    /// `continue-on-error: true`-masked result (which is always `success`
+    /// regardless of what actually happened). Ties the gate to the one place
+    /// that already fails correctly when a lane silently drops out — see
+    /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
+    /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
+    /// covers every lane, including ones added later, without this job
+    /// needing its own copy of the lane list.
+    #[test]
+    fn release_readiness_nightly_gates_on_the_e2e_report_job_not_individual_lanes() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        assert!(
+            needs.contains(&"e2e-report-nightly".to_string()),
+            "release-readiness-nightly must depend on e2e-report-nightly's result; needs: {needs:?}"
+        );
+        // The `needs.<job>.result` expressions below read an empty string for a
+        // job that is not listed here, which every night would read as a failed
+        // build.
+        for build in ["nightly", "windows-nightly"] {
+            assert!(
+                needs.contains(&build.to_string()),
+                "release-readiness-nightly must list `{build}` in needs, or its result \
+                 reads empty; needs: {needs:?}"
+            );
+        }
+        for lane in [
+            "e2e-gpu-nightly",
+            "e2e-gpu-nightly-rad3",
+            "e2e-gpu-nightly-mi350p",
+            "e2e-gpu-nightly-strix",
+            "e2e-gpu-nightly-strix-windows",
+            "e2e-gpu-nightly-w7900",
+            "e2e-wsl-nightly",
+        ] {
+            assert!(
+                !needs.contains(&lane.to_string()),
+                "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
+                 directly: continue-on-error on that job means its own `result` is always \
+                 `success`, so gating on it can never fire"
+            );
+        }
+
+        assert!(
+            job.contains("--e2e-report-job-result \"${{ needs.e2e-report-nightly.result }}\""),
+            "release-readiness-nightly's xtask invocation must pass e2e-report-nightly's result \
+             as --e2e-report-job-result"
+        );
+        assert!(
+            job.contains("--nightly-result \"${{ needs.nightly.result }}\""),
+            "release-readiness-nightly must read --nightly-result from needs.nightly.result, \
+             not a hard-coded value -- otherwise a failed Linux nightly build never fails the \
+             gate: {job}"
+        );
+        assert!(
+            job.contains("--windows-result \"${{ needs.windows-nightly.result }}\""),
+            "release-readiness-nightly must read --windows-result from \
+             needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
+             result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_runs_even_if_an_upstream_job_failed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("if: ${{ !cancelled() }}"),
+            "release-readiness-nightly must still run when e2e-report-nightly or a build job \
+             failed (the default `if` would skip it instead, leaving the wiki showing a stale \
+             GO from the last run that did succeed): {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_guard_is_exact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            job.contains(
+                "if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' \
+                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}"
+            ),
+            "publish-release-readiness-wiki's guard must stay exactly this: `!cancelled()` so \
+             it still runs (and publishes the stale-evidence notice) when release-readiness-\
+             nightly failed outright, `!= 'skipped'` rather than `== 'success'` so that failure \
+             still publishes rather than being skipped, and the repo/main-branch guards: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_jobs_checkout_without_persisting_credentials() {
+        let nightly = read_workflow("nightly.yml");
+        for job_name in ["release-readiness-nightly", "release-readiness-narrative"] {
+            let job = job_block(&nightly, job_name);
+            assert!(
+                job.contains("persist-credentials: false"),
+                "{job_name}'s checkout must not persist credentials: these jobs shell out over \
+                 untrusted issue/commit text, and a persisted, readable GITHUB_TOKEN would be \
+                 reachable by anything injected into that text in a later step (both jobs hold \
+                 only `contents: read`, so the exposure is token readability, not write access)"
+            );
+        }
+    }
+
+    #[test]
+    fn release_readiness_narrative_delimiter_is_random_not_fixed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("delimiter=\"$(openssl rand -hex 8)\"")
+                && job.contains("echo \"json<<${delimiter}\"")
+                && job.contains("echo \"${delimiter}\""),
+            "the GITHUB_OUTPUT heredoc delimiter must stay randomly generated: facts.json \
+             embeds untrusted GitHub issue titles, and a fixed delimiter (e.g. `EOF`) would let \
+             one that happens to contain that token terminate the heredoc early and inject \
+             further GITHUB_OUTPUT assignments: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_reaches_the_shell_only_through_env() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("NARRATIVE: ${{ steps.draft.outputs.response }}")
+                && job.contains("run: printf '%s\\n' \"$NARRATIVE\""),
+            "the LLM-drafted narrative must reach the shell only through the $NARRATIVE env \
+             var, never inlined as `${{ steps.draft.outputs.response }}` directly in `run:` -- \
+             that would let the narrative's own text execute as shell: {job}"
+        );
+
+        // The two assertions above only check that the safe lines exist; they
+        // can't fail on a *second*, unsafe occurrence added elsewhere (e.g. a
+        // later step inlining `${{ steps.draft.outputs.response }}` straight
+        // into its own `run:`). Pin every occurrence in the job to the two
+        // known-safe spots: the "Save narrative" step's `if:` guard, and the
+        // `NARRATIVE:` env line feeding it to the shell.
+        let offending: Vec<&str> = job
+            .lines()
+            .filter(|l| l.contains("steps.draft.outputs.response"))
+            .filter(|l| {
+                let t = l.trim();
+                t != "if: always() && steps.draft.outputs.response"
+                    && t != "NARRATIVE: ${{ steps.draft.outputs.response }}"
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "steps.draft.outputs.response must appear nowhere in the job except the \"Save \
+             narrative\" step's `if:` guard and its NARRATIVE env line: found it in {offending:?}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_checkout_fetches_full_history() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("fetch-depth: 0"),
+            "release-readiness-nightly's checkout must fetch full history (fetch-depth: 0): \
+             `git describe --tags` and the commit range since the last release tag both need \
+             it, and the default shallow clone would make `git describe` fail every night: {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_needs_both_upstream_jobs() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        for required in ["release-readiness-nightly", "release-readiness-narrative"] {
+            assert!(
+                needs.contains(&required.to_string()),
+                "publish-release-readiness-wiki must depend on `{required}`: dropping \
+                 `release-readiness-narrative` from `needs` would let the publish job race the \
+                 narrative download instead of waiting for it; needs: {needs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_artifact_downloads_tolerate_a_missing_artifact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert_eq!(
+            job.matches("continue-on-error: true").count(),
+            2,
+            "both artifact-download steps in publish-release-readiness-wiki (the \
+             release-readiness table and the narrative) must set `continue-on-error: true`: \
+             without it, a missing artifact (no table because release-readiness-nightly failed \
+             outright, or no narrative because COPILOT_PAT doesn't exist yet) would fail \
+             download-artifact and make this job's own fallback handling unreachable: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_wiki_page_does_not_collide_with_the_e2e_matrix_page() {
+        let nightly = read_workflow("nightly.yml");
+        let publish_e2e = job_block(&nightly, "publish-e2e-wiki");
+        let publish_readiness = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            publish_e2e.contains("page=E2E-Support-Matrix.md"),
+            "publish-e2e-wiki's page name changed out from under this test; update it: {publish_e2e}"
+        );
+        assert!(
+            publish_readiness.contains("page=Release-Readiness.md"),
+            "publish-release-readiness-wiki must keep publishing to a distinct wiki page name; \
+             renaming it to collide with E2E-Support-Matrix.md would silently overwrite the E2E \
+             support matrix page instead: {publish_readiness}"
+        );
     }
 
     #[test]
@@ -1733,16 +5056,17 @@ esac
         );
 
         // ponytail: brittle literal-text match, not a YAML matrix parse — it exists only
-        // to keep this hardcoded literal in sync with `consolidated::parse_descriptor`'s
-        // hardcoded "release"/"nightly" suffixes. If nightly.yml's channel matrix ever
-        // changes, update both it and `parse_descriptor` together.
+        // to keep this hardcoded literal in sync with
+        // `consolidated::descriptor::parse_descriptor`'s hardcoded "release"/"nightly"
+        // suffixes. If nightly.yml's channel matrix ever changes, update both it and
+        // `parse_descriptor` together.
         let nightly = std::fs::read_to_string(repo_root().join(".github/workflows/nightly.yml"))
             .expect("read nightly.yml");
         assert!(
             nightly.contains("channel: [release, nightly]"),
             "nightly.yml's channel matrix must declare exactly the channel values \
-             `consolidated::parse_descriptor` strips as artifact-name suffixes; if this \
-             literal ever changes, `parse_descriptor` must change with it"
+             `consolidated::descriptor::parse_descriptor` strips as artifact-name suffixes; \
+             if this literal ever changes, `parse_descriptor` must change with it"
         );
 
         let platform_input = nested_block(
@@ -1838,9 +5162,54 @@ esac
         for row in &self_hosted_rows {
             assert_eq!(
                 row[3], "no",
-                "self-hosted lane `{}` is continue-on-error, so the README must not \
-                 document it as blocking",
+                "self-hosted lane `{}` is not a required status check, so the README \
+                 must not document it as blocking (continue-on-error does not decide \
+                 this; see the header of e2e-selfhosted.yml)",
                 row[0]
+            );
+        }
+    }
+
+    /// Extract the literal glob entries from ci.yml's pull-request `rust:`
+    /// paths-filter bucket, stopping at the next sibling filter key. Scoped to
+    /// an exact `rust:` line (not a prefix match) so this doesn't also pick up
+    /// the unrelated `rust: ${{ … }}` job output a few lines above it.
+    fn rust_paths_filter_entries(ci: &str) -> Vec<String> {
+        let lines: Vec<&str> = ci.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == "rust:")
+            .unwrap_or_else(|| panic!("ci.yml declares a `rust:` paths-filter bucket"));
+        let key_indent = indent_of(lines[start]);
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indent_of(line) <= key_indent)
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines[start + 1..end]
+            .iter()
+            .filter_map(|line| strip_comment(line).trim().strip_prefix("- "))
+            .map(|item| strip_quotes(item.trim()))
+            .collect()
+    }
+
+    /// `forces_full_workspace` (xtask/src/affected.rs) names the doc paths
+    /// that fall back to a full-workspace run because an xtask test reads
+    /// them directly ([`crate::affected::XTASK_READ_DOCS`]). If one of them
+    /// isn't ALSO in ci.yml's `rust` paths-filter bucket,
+    /// `needs.changes.outputs.rust` stays false for a PR that touches only
+    /// that doc, and the `test` job's every step — including `cargo nextest
+    /// run`, which is what would have caught the drift — never runs at all.
+    #[test]
+    fn forces_full_workspace_docs_are_in_the_rust_filter() {
+        let ci = read_workflow("ci.yml");
+        let rust_filter = rust_paths_filter_entries(&ci);
+        for doc in crate::affected::XTASK_READ_DOCS {
+            assert!(
+                rust_filter.iter().any(|entry| entry == doc),
+                "`{doc}` is in `forces_full_workspace` (xtask/src/affected.rs) but \
+                 missing from ci.yml's `rust` paths-filter bucket, so an edit to it \
+                 alone skips the rust-gated jobs entirely instead of running the \
+                 test that reads it"
             );
         }
     }
@@ -1848,29 +5217,29 @@ esac
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
-        // actual concurrency.group value from each and assert (a) both keep
-        // supersession, (b) both key on github.workflow, and (c) the two group
-        // expressions and workflow names differ — so at runtime the groups are
+        // actual concurrency.group value from each and assert (a) ci.yml keeps
+        // supersession (e2e-selfhosted.yml scopes it to pull_request, see
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on
+        // github.workflow, and (c) the two group expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
         let sh = read_workflow("e2e-selfhosted.yml");
         let ci_group = concurrency_group(&ci);
         let sh_group = concurrency_group(&sh);
 
-        for (label, group, text) in [
-            ("ci.yml", &ci_group, &ci),
-            ("e2e-selfhosted.yml", &sh_group, &sh),
-        ] {
+        for (label, group) in [("ci.yml", &ci_group), ("e2e-selfhosted.yml", &sh_group)] {
             assert!(
                 group.contains("github.workflow"),
                 "{label} concurrency.group must be namespaced by github.workflow \
                  (got `{group}`) (EAI-7548)"
             );
-            assert!(
-                text.contains("cancel-in-progress: true"),
-                "{label} must keep cancel-in-progress: true (EAI-7548)"
-            );
         }
+        // Both keep supersession; e2e-selfhosted.yml narrows it to pull_request
+        // (see `self_hosted_supersession_is_scoped_to_pull_requests`).
+        assert!(
+            ci.contains("cancel-in-progress: true"),
+            "ci.yml must keep cancel-in-progress: true"
+        );
         // The github.workflow-keyed groups resolve via the workflow `name:`; those
         // names must differ for the runtime groups to be distinct.
         assert_ne!(
@@ -2001,8 +5370,8 @@ esac
     /// Without `ROCM_CLI_BINARY`, `cargo xtask e2e` builds `rocm`/`rocmd` for
     /// itself WITH `--features rocm/e2e-test-hooks`. That is a different feature
     /// resolution than the Build step's, so cargo rebuilds the entire release
-    /// graph instead of reusing it — a second 3-4 minute release build on the one
-    /// job that alone determines total CI wall clock.
+    /// graph instead of reusing it — a second 3-4 minute release build on a job
+    /// that sits on the critical path of CI wall clock.
     ///
     /// Note this is the mirror image of
     /// [`assert_prebuilt_e2e_lanes_enable_test_hooks`]: lanes running the FULL
@@ -2013,7 +5382,7 @@ esac
     #[test]
     fn ci_windows_lifecycle_lane_reuses_the_binaries_it_built() {
         let ci = read_workflow("ci.yml");
-        let windows = job_block(&ci, "windows-build-and-test");
+        let windows = job_block(&ci, "windows-release");
 
         assert!(
             windows.contains("cargo build --release -p rocm -p rocmd"),
@@ -2076,8 +5445,1659 @@ esac
         );
     }
 
-    // Extractor guards: prove the helpers actually parse multiline forms, so the
-    // contract tests above can't silently false-pass on a shape they don't handle.
+    /// The hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM
+    /// refusal scenarios serve-33/34/35 (no GPU, no network, no
+    /// `release.yml` must build the shipped binaries with no feature flags, so a
+    /// test-only feature cannot reach a release artefact.
+    ///
+    /// Scoped to `release.yml` deliberately, and that scope is narrower than
+    /// "nothing shipped" — stated here rather than implied, so this guard is not
+    /// read as a guarantee it does not make. `nightly.yml` also builds
+    /// `-p rocm -p rocmd` and publishes the result (`gh release create
+    /// --prerelease`), and nothing here checks those builds. They carry no
+    /// features today. A wholesale scan of `nightly.yml` cannot be the fix:
+    /// that file legitimately builds `--features rocm/e2e-test-hooks` for its
+    /// E2E lanes, so covering it needs a check aimed at the publishing jobs
+    /// alone.
+    ///
+    /// Shape-based rather than a deny-list of feature names: a deny-list only
+    /// catches the features that existed when it was written. The pre-existing
+    /// guard spells `e2e-test-hooks` literally, which does not match the
+    /// substring `e2e-oom-fault-injection`, so a release build carrying only
+    /// the new one would have passed.
+    ///
+    /// Matches `--features`, `--all-features` and `-F` in both its spellings,
+    /// because `--features` alone misses the rest: `--all-features` does not
+    /// contain the substring `--features` and would compile in every test-only
+    /// feature at once, and cargo accepts the short flag detached (`-F name`)
+    /// or compact (`-Fname`). It joins `\` continuations first, because a
+    /// release build is wrapped across lines and matching physical lines would
+    /// see the `cargo build` and the `--features` on its continuation as two
+    /// unrelated lines — counting the build while finding no offender. Asserts
+    /// a build was actually found, so a renamed or deleted build step fails
+    /// loudly instead of passing vacuously.
+    #[test]
+    fn the_release_workflow_builds_no_feature_gated_binaries() {
+        let release = read_workflow("release.yml");
+        let (builds, offenders) = release_feature_offenders(&release);
+        assert!(
+            builds > 0,
+            "release.yml has no `cargo build` step for this guard to check; if the build moved, \
+             point this test at it rather than letting it pass vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "release.yml must build the shipped binaries with no feature flags, so a test-only \
+             feature cannot reach a release artefact; found:\n{offenders:#?}"
+        );
+    }
+
+    /// Join `\` continuations so each entry is one shell command.
+    ///
+    /// A build wrapped across lines is one command to the shell but several to
+    /// `str::lines`, and a guard reading physical lines sees the `cargo build`
+    /// without the flags that follow it.
+    fn logical_commands(block: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut current = String::new();
+        for line in block.lines().map(str::trim) {
+            if let Some(head) = line.strip_suffix('\\') {
+                current.push_str(head.trim_end());
+                current.push(' ');
+                continue;
+            }
+            current.push_str(line);
+            commands.push(std::mem::take(&mut current));
+        }
+        if !current.trim().is_empty() {
+            commands.push(current);
+        }
+        commands
+    }
+
+    /// Whether a cargo invocation turns any feature on.
+    ///
+    /// `-F` has two spellings: detached (`-F name`) and compact (`-Fname`).
+    /// Comparing whole tokens to `-F` only catches the first, so the compact
+    /// form -- which is what someone squeezing a flag onto a wrapped line is
+    /// most likely to write -- would pass.
+    fn command_enables_a_feature(command: &str) -> bool {
+        command.contains("--features")
+            || command.contains("--all-features")
+            || command
+                .split_whitespace()
+                .any(|word| word == "-F" || (word.starts_with("-F") && word.len() > 2))
+    }
+
+    /// Every `cargo build` in `source`, and which of them turn a feature on.
+    ///
+    /// This is *the* guard: `the_release_workflow_builds_no_feature_gated_binaries`
+    /// runs it over `release.yml`, and
+    /// `the_release_feature_guard_catches_every_spelling` runs the same function
+    /// over one-line fixtures. Sharing the body is the point rather than tidiness.
+    /// The spelling test used to re-state the predicate in its own closure, so it
+    /// was testing a copy: breaking the real loop (making the `offenders.push`
+    /// below a no-op) left both tests green while a feature-carrying release
+    /// build sailed through. With one function there is nothing left to drift.
+    ///
+    /// A bare command string is a valid `source`: `multiline_run_blocks` finds no
+    /// `run: |` block in it, and the `chain` below feeds the whole input through
+    /// `logical_commands` anyway — the same path that lets the workflow-level
+    /// check see builds written outside a multiline block.
+    fn release_feature_offenders(source: &str) -> (usize, Vec<String>) {
+        let mut builds = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for block in multiline_run_blocks(source)
+            .into_iter()
+            .chain(std::iter::once(source.to_owned()))
+        {
+            for command in logical_commands(&block) {
+                if !command.contains("cargo build") {
+                    continue;
+                }
+                builds += 1;
+                if command_enables_a_feature(&command) {
+                    offenders.push(command);
+                }
+            }
+        }
+        (builds, offenders)
+    }
+
+    /// The guard must catch every spelling that enables a feature, and must not
+    /// fire on a clean release build. Each case is a shape that previously
+    /// slipped through: a flag on a `\` continuation, and a compact `-Fname`.
+    ///
+    /// `caught` calls [`release_feature_offenders`] — the function the
+    /// `release.yml` check itself runs — so breaking that loop fails this test
+    /// too.
+    #[test]
+    fn the_release_feature_guard_catches_every_spelling() {
+        let caught = |command: &str| !release_feature_offenders(command).1.is_empty();
+        // The fixtures below are all builds, so the guard must also see them as
+        // builds; otherwise `caught` could return false for the wrong reason and
+        // the negative cases would pass vacuously.
+        assert!(
+            release_feature_offenders("cargo build --release -p rocm").0 > 0,
+            "the shared guard must count a plain `cargo build` fixture as a build"
+        );
+
+        assert!(caught(
+            "cargo build --release -p rocm --features rocm/e2e-test-hooks"
+        ));
+        assert!(caught("cargo build --release -p rocm --all-features"));
+        assert!(caught(
+            "cargo build --release -p rocm -F rocm/e2e-test-hooks"
+        ));
+        // Compact short flag: one token, so a whole-token `== "-F"` test misses it.
+        assert!(
+            caught("cargo build --release -p rocm -Frocm/e2e-oom-fault-injection"),
+            "a compact -Fname must count as enabling a feature"
+        );
+        // Wrapped across a `\` continuation, which is how the real release
+        // build is written: the flag is not on the `cargo build` line at all.
+        assert!(
+            caught(
+                "cargo build --release -p rocm -p rocmd \\\n  --features rocm/e2e-oom-fault-injection"
+            ),
+            "a feature flag on a continuation line must still be attributed to its build"
+        );
+        // ...and the shape the release workflow actually uses stays clean, so
+        // the guard is not simply matching everything.
+        assert!(!caught("cargo build --release -p rocm -p rocmd"));
+        assert!(!caught(
+            "cargo build --release -p rocm -p rocmd \\\n  --locked"
+        ));
+        // `-F` must not be confused with other short flags.
+        assert!(!caught("cargo build --release -p rocm --frozen"));
+    }
+
+    /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
+    /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
+    /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane
+    /// (#689) — it is required CI, unlike the self-hosted lane that otherwise
+    /// runs them. This checks the whole step (not just the `run: |` body, since
+    /// the selection lives in `env:`), so dropping the env var — or narrowing
+    /// its id list — fails here rather than silently reopening the coverage gap.
+    #[test]
+    fn ci_windows_lifecycle_lane_also_selects_the_hermetic_comfyui_and_vllm_refusal_scenarios() {
+        let ci = read_workflow("ci.yml");
+        let windows = job_block(&ci, "windows-release");
+        let lines: Vec<&str> = windows.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start() == "- name: Acceptance install lifecycle")
+            .expect("windows-release must have an Acceptance install lifecycle step");
+        let step = step_block(&lines, at);
+
+        // `flattened_values` strips comments before matching the key, so a
+        // mention of `E2E_ALSO_RUN_IDS` in the explanatory comment above the
+        // `env:` block (there to say why these ids are selected here) cannot
+        // satisfy this on its own — only the real `env:` entry can.
+        let also_run_ids = flattened_values(&step, "E2E_ALSO_RUN_IDS");
+        assert_eq!(
+            also_run_ids.len(),
+            1,
+            "the Windows lifecycle lane must set env.E2E_ALSO_RUN_IDS exactly \
+             once to additionally select the hermetic comfyui and vLLM-refusal scenarios, so \
+             they get required-CI Windows coverage (#689):\n{step}"
+        );
+        for id in [
+            "comfyui-uv-install-failure-names-log",
+            "comfyui-uv-install-progress-streamed",
+            "comfyui-ambiguous-runtime-actionable",
+            // The native-Windows vLLM refusal (serve-33/34/35) is
+            // `@requires-os:windows` and hermetic, so this is its required lane.
+            "serve-vllm-refused-on-native-windows",
+            "serve-vllm-install-refused-on-native-windows",
+            "serve-vllm-install-with-runtime-refused-on-native-windows",
+        ] {
+            assert!(
+                also_run_ids[0].contains(id),
+                "the Windows lifecycle lane must select {id} via env.E2E_ALSO_RUN_IDS:\n{step}"
+            );
+        }
+    }
+
+    /// Every job in `ci.yml` as `(id, block)`, in file order. Unlike [`job_block`]
+    /// it tolerates a trailing comment on the id line. The comment block and
+    /// blank lines between two jobs describe the job that follows, so they are
+    /// dropped rather than left on the end of the job before it.
+    fn ci_jobs(ci: &str) -> Vec<(String, String)> {
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        let mut between = String::new();
+        for line in top_level_block(ci, "jobs").lines() {
+            let job_level_comment = indent_of(line) == 2 && line.trim_start().starts_with('#');
+            if line.trim().is_empty() || job_level_comment {
+                between.push_str(line);
+                between.push('\n');
+                continue;
+            }
+            if indent_of(line) == 2
+                && let Some(id) = strip_comment(line).trim().strip_suffix(':')
+            {
+                between.clear();
+                jobs.push((id.to_owned(), String::new()));
+                continue;
+            }
+            if let Some((_, block)) = jobs.last_mut() {
+                block.push_str(&between);
+                block.push_str(line);
+                block.push('\n');
+            }
+            between.clear();
+        }
+        jobs
+    }
+
+    fn ci_job(ci: &str, id: &str) -> String {
+        ci_jobs(ci)
+            .into_iter()
+            .find_map(|(job, block)| (job == id).then_some(block))
+            .unwrap_or_else(|| panic!("ci.yml defines job `{id}`"))
+    }
+
+    /// A comment above a job describes the job that follows, not the one before
+    /// it, so it is left out of the previous job's block (as [`job_block`] does)
+    /// instead of being read as that job's own content. Comments nested inside a
+    /// job stay, including one that is the last line of its block.
+    #[test]
+    fn ci_jobs_drops_the_comment_between_jobs_instead_of_keeping_it_on_the_job_before() {
+        let ci = "name: x\n\
+                  jobs:\n\
+                  \x20 first:\n\
+                  \x20   runs-on: ubuntu-latest\n\
+                  \x20   steps:\n\
+                  \x20     - run: a\n\
+                  \n\
+                  \x20     # inside first\n\
+                  \x20     - run: b\n\
+                  \n\
+                  \x20     # last of first\n\
+                  \n\
+                  \x20 # About second: mentions always() and continue-on-error.\n\
+                  \x20 #\n\
+                  \x20 second: # trailing\n\
+                  \x20   runs-on: windows-latest\n";
+        let jobs = ci_jobs(ci);
+        let ids: Vec<&str> = jobs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["first", "second"]);
+        assert_eq!(
+            jobs[0].1,
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: a\n\n      # inside first\n      - run: b\n\n      # last of first\n",
+            "first keeps its own comments and blank line and nothing from second"
+        );
+        assert_eq!(jobs[1].1, "    runs-on: windows-latest\n");
+    }
+
+    /// Jobs that are NOT part of the Windows build-and-test lane even though they
+    /// are not on a Linux runner: each is a check of its own, so the aggregator
+    /// does not (and must not have to) wait on it.
+    const JOBS_OUTSIDE_THE_WINDOWS_LANE: &[&str] = &["powershell-lint"];
+
+    /// Every job in the Windows lane, other than the `windows-build-and-test`
+    /// aggregator: any job not shown to run on `ubuntu-*` runners only, bar the
+    /// ones listed above. A job is presumed to be Windows unless it is shown to be
+    /// Linux, so a self-hosted label list, a matrix expression over anything but
+    /// a plain list of `ubuntu-*` images, or anything else cannot slip past the
+    /// aggregator tests. A new such job fails them until it is either awaited by
+    /// the aggregator or listed above on purpose.
+    fn windows_work_jobs(ci: &str) -> Vec<(String, String)> {
+        ci_jobs(ci)
+            .into_iter()
+            .filter(|(id, block)| {
+                id != "windows-build-and-test"
+                    && !JOBS_OUTSIDE_THE_WINDOWS_LANE.contains(&id.as_str())
+                    && !runs_only_on_ubuntu(block)
+            })
+            .collect()
+    }
+
+    /// Whether a job is shown to run on hosted Ubuntu only: a literal `ubuntu-*`
+    /// runner, or `runs-on: ${{ matrix.os }}` over a single `os` axis whose every
+    /// image is `ubuntu-*` (the LTS split jobs). A matrix `include:`, which can
+    /// add images of its own, or a second `os` key makes it unproven.
+    fn runs_only_on_ubuntu(block: &str) -> bool {
+        let Some(runner) = yaml_value_at(block, 4, "runs-on") else {
+            return false;
+        };
+        if runner.starts_with("ubuntu-") {
+            return true;
+        }
+        if runner.trim() != "${{ matrix.os }}" {
+            return false;
+        }
+        if block
+            .lines()
+            .any(|line| strip_comment(line).trim_start().starts_with("include:"))
+        {
+            return false;
+        }
+        let os = flattened_values(block, "os");
+        let [axis] = os.as_slice() else {
+            return false;
+        };
+        let images = flattened_list_items(axis);
+        !images.is_empty() && images.iter().all(|image| image.starts_with("ubuntu-"))
+    }
+
+    /// `text` with every YAML or shell comment removed, one output line per input
+    /// line (a comment-only line becomes blank), so callers can still split it.
+    fn code_only(text: &str) -> String {
+        text.lines()
+            .map(strip_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The value of the `{key}:` that sits exactly `indent` columns in, with any
+    /// continuation lines folded in and a leading block-scalar marker (`>-`, `|`)
+    /// dropped; `None` when there is no such key. Job-level keys sit at 4, and a
+    /// step's own keys at the step's dash column plus 2.
+    fn yaml_value_at(block: &str, indent: usize, key: &str) -> Option<String> {
+        let marker = format!("{key}:");
+        let lines: Vec<&str> = block.lines().collect();
+        let at = lines.iter().position(|line| {
+            let code = strip_comment(line);
+            indent_of(code) == indent && code.trim_start().starts_with(&marker)
+        })?;
+        let mut value = strip_comment(lines[at]).trim_start()[marker.len()..]
+            .trim()
+            .to_owned();
+        for cont in &lines[at + 1..] {
+            let code = strip_comment(cont);
+            if code.trim().is_empty() {
+                continue;
+            }
+            if indent_of(code) <= indent {
+                break;
+            }
+            value.push(' ');
+            value.push_str(code.trim());
+        }
+        Some(
+            value
+                .trim_start_matches(">-")
+                .trim_start_matches('|')
+                .trim()
+                .to_owned(),
+        )
+    }
+
+    /// The aggregator's one step, as a step block. Panics unless it is the only
+    /// step, so no other step can fail the job or let it pass.
+    fn aggregator_step(aggregator: &str) -> String {
+        let steps = job_steps(aggregator).expect("the aggregator has steps");
+        assert_eq!(
+            steps.len(),
+            1,
+            "the aggregator is exactly one step, so no other step can fail it or skip it"
+        );
+        steps.into_iter().next().expect("one step").1
+    }
+
+    /// The one variable the aggregator's step binds to `expr` in its `env:`;
+    /// panics unless it is exactly one.
+    fn aggregator_var(step: &str, expr: &str) -> String {
+        let env = step_env(step);
+        let vars: Vec<&str> = env
+            .iter()
+            .filter(|(_, value)| value.as_str() == expr)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(
+            vars.len(),
+            1,
+            "the aggregator must bind exactly one env variable to `{expr}`, found {vars:?} in {env:?}"
+        );
+        vars[0].to_owned()
+    }
+
+    // The next five tests cover `code_only` (used by the share-setup and
+    // gating-step tests), `aggregator_step` and `aggregator_var` (used by the
+    // aggregator tests), so that weakening one cannot hide a break in `ci.yml`.
+    #[test]
+    fn code_only_drops_a_command_that_only_a_comment_mentions() {
+        let step =
+            "      - name: s\n        # cargo xtask e2e\n        run: echo hi # cargo xtask e2e\n";
+        let code = code_only(step);
+        assert!(!code.contains("cargo xtask e2e"), "{code}");
+        assert!(code.contains("echo hi"), "{code}");
+        assert_eq!(code.lines().count(), 3, "one output line per input line");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one step")]
+    fn aggregator_step_rejects_a_second_step() {
+        aggregator_step(
+            "    steps:\n      - name: a\n        run: x\n      - name: b\n        run: y\n",
+        );
+    }
+
+    #[test]
+    fn aggregator_var_finds_the_one_variable_bound_to_an_expression() {
+        // `C` is a decoy whose value merely contains the expression.
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.y.result }}\n          C: ${{ needs.y.result }} == 'x'\n        run: true\n";
+        assert_eq!(aggregator_var(step, "${{ needs.y.result }}"), "B");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one env variable")]
+    fn aggregator_var_rejects_two_variables_bound_to_one_expression() {
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.x.result }}\n        run: true\n";
+        aggregator_var(step, "${{ needs.x.result }}");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one env variable")]
+    fn aggregator_var_rejects_an_expression_nothing_is_bound_to() {
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n        run: true\n";
+        aggregator_var(step, "${{ needs.y.result }}");
+    }
+
+    /// `windows-build-and-test` is the one Windows check branch protection knows
+    /// by name. The work is split across other jobs, which are NOT required checks
+    /// themselves, so a work job the aggregator does not wait on can fail and still
+    /// let a merge through. Every job in the Windows lane must therefore be named in
+    /// the aggregator's `needs:`, bound to a variable by its own `needs.<job>.result`,
+    /// and have that variable checked by the script. The job and its one step carry
+    /// nothing that could skip it or hide a failure.
+    #[test]
+    fn ci_windows_aggregator_requires_every_windows_job() {
+        let ci = read_workflow("ci.yml");
+        let workers = windows_work_jobs(&ci);
+        assert!(
+            workers.len() >= 2,
+            "expected the Windows lane split into at least two jobs, found {:?}",
+            workers.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+
+        let aggregator = ci_job(&ci, "windows-build-and-test");
+        let needs = yaml_value_at(&aggregator, 4, "needs")
+            .expect("windows-build-and-test declares `needs:`");
+        let needed = flattened_list_items(&needs);
+        let step = aggregator_step(&aggregator);
+        let script = preflight_body_code(&step);
+        for (job, _) in &workers {
+            assert!(
+                needed.iter().any(|n| n == job),
+                "windows-build-and-test must `need` {job}, or {job} can fail without \
+                 failing the required check (needs: {needed:?})"
+            );
+            let var = aggregator_var(&step, &format!("${{{{ needs.{job}.result }}}}"));
+            assert!(
+                script.contains(&format!("check {job} \"${var}\" ")),
+                "the aggregator script must check {job}'s result through ${var}:\n{script}"
+            );
+        }
+        assert!(
+            needed.iter().any(|n| n == "changes"),
+            "the aggregator must also need `changes`: a failed `changes` skips every \
+             work job, and a skipped required check reads as passing"
+        );
+        let changes_var = aggregator_var(&step, "${{ needs.changes.result }}");
+        assert!(
+            script.contains(&format!("check changes \"${changes_var}\" success")),
+            "the aggregator script must require `changes` to have succeeded through \
+             ${changes_var}:\n{script}"
+        );
+
+        assert_eq!(
+            yaml_value_at(&aggregator, 4, "if").as_deref(),
+            Some("${{ !cancelled() }}"),
+            "the aggregator runs unless the run is cancelled, so a run superseded by a \
+             new commit still cancels it, and no other condition can skip it: a skipped \
+             required check reads as passing"
+        );
+        assert_eq!(
+            yaml_value_at(&aggregator, 4, "runs-on").as_deref(),
+            Some("ubuntu-24.04"),
+            "the aggregator must run on a Linux runner so the script's `bash` is the one \
+             the script test executes"
+        );
+
+        // Exact key lists, so a key spelled in any position is seen, including on
+        // the step's `- ` line.
+        let job_keys: Vec<&str> = aggregator
+            .lines()
+            .filter(|line| {
+                indent_of(line) == 4 && !line.trim().is_empty() && !line.trim().starts_with('#')
+            })
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key.trim()))
+            .collect();
+        assert_eq!(
+            job_keys,
+            ["runs-on", "timeout-minutes", "needs", "if", "steps"],
+            "the aggregator job sets exactly these keys. A `name:` would rename the \
+             check context branch protection matches, so the required check would never \
+             report; `continue-on-error`, `strategy` or `permissions` would change \
+             whether it can fail. Change this list only with the ruleset"
+        );
+        assert_eq!(
+            step_keys(&step),
+            ["name", "env", "run"],
+            "the aggregator's step sets exactly these keys: an `if`, `continue-on-error` \
+             or `shell` would change when it runs or whether its failure counts:\n{step}"
+        );
+    }
+
+    /// The jobs the aggregator must wait on are found by runner, with anything not
+    /// shown to be Linux presumed Windows, so a `runs-on` the helper cannot read
+    /// cannot slip a job past the aggregator tests.
+    #[test]
+    fn windows_work_jobs_presumes_windows_unless_shown_to_be_linux() {
+        let ci = "jobs:\n\
+                  \x20 lint:\n\
+                  \x20   runs-on: ubuntu-latest\n\
+                  \x20 pinned:\n\
+                  \x20   runs-on: ubuntu-24.04\n\
+                  \x20 matrix:\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 lts:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04, ubuntu-26.04]\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 mixed:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04, windows-latest]\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 included:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04]\n\
+                  \x20       include:\n\
+                  \x20         - os: windows-latest\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 selfhosted:\n\
+                  \x20   runs-on: [self-hosted, linux]\n\
+                  \x20 windows:\n\
+                  \x20   runs-on: windows-latest\n\
+                  \x20 powershell-lint:\n\
+                  \x20   runs-on: windows-latest\n\
+                  \x20 windows-build-and-test:\n\
+                  \x20   runs-on: ubuntu-latest\n";
+        let ids: Vec<String> = windows_work_jobs(ci)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["matrix", "mixed", "included", "selfhosted", "windows"]
+        );
+    }
+
+    /// Whether the Windows jobs run is decided once, as the `changes` job's
+    /// `windows` output. Both work jobs gate on it and the aggregator's
+    /// `EXPECT_SKIPPED` is derived from it, so the aggregator cannot expect a skip
+    /// the jobs did not make, nor accept one they did by accident. Each of those
+    /// spellings is pinned exactly, together with the decision itself: a change to
+    /// any of them is a change to when the Windows gate runs, and should be read as
+    /// one.
+    ///
+    /// Also pinned, because nothing else reads them: each work job needs only
+    /// `changes` (`clippy` and `prek` skip themselves on a manual dispatch, so
+    /// waiting on them would skip the job there even when binaries were requested),
+    /// runs on a Windows runner, and — like the aggregator — has no job-level
+    /// `continue-on-error`, which would let a failing job read as `success` to the
+    /// jobs that need it.
+    #[test]
+    fn ci_windows_work_jobs_run_exactly_when_the_aggregator_expects() {
+        let ci = read_workflow("ci.yml");
+        let changes = ci_job(&ci, "changes");
+        let aggregator = ci_job(&ci, "windows-build-and-test");
+
+        let decision = yaml_value_at(&changes, 6, "windows")
+            .expect("the `changes` job exports a `windows` output");
+        assert_eq!(
+            normalized_whitespace(&decision),
+            "${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}",
+            "the Windows jobs run on every event except a manual dispatch that did not \
+             ask for binaries"
+        );
+
+        let expect_skipped = flattened_values(&aggregator, "EXPECT_SKIPPED");
+        assert_eq!(
+            expect_skipped
+                .iter()
+                .map(|value| normalized_whitespace(value))
+                .collect::<Vec<_>>(),
+            ["${{ needs.changes.outputs.windows != 'true' }}"],
+            "the aggregator must derive its expected skip from the `windows` output"
+        );
+        assert!(
+            yaml_value_at(&aggregator, 4, "continue-on-error").is_none(),
+            "the aggregator must not set continue-on-error"
+        );
+
+        for (job, block) in windows_work_jobs(&ci) {
+            assert_eq!(
+                yaml_value_at(&block, 4, "needs").as_deref(),
+                Some("changes"),
+                "{job} must need `changes` and nothing else"
+            );
+            assert_eq!(
+                yaml_value_at(&block, 4, "runs-on").as_deref(),
+                Some("windows-latest"),
+                "{job} must run on a Windows runner"
+            );
+            assert_eq!(
+                yaml_value_at(&block, 4, "if").as_deref(),
+                Some("needs.changes.outputs.windows == 'true'"),
+                "{job} must gate on the `windows` output and nothing else"
+            );
+            assert!(
+                yaml_value_at(&block, 4, "continue-on-error").is_none(),
+                "{job} must not set continue-on-error"
+            );
+        }
+    }
+
+    /// `build-and-test` heads the Linux critical path (build, then the mock E2E
+    /// lane that needs it), so it waits for `prek`, the cheap hygiene gate, but not
+    /// for `clippy`: the two run in parallel and `clippy` stays a required check of
+    /// its own. Putting `clippy` back in `needs:` would silently add its whole
+    /// runtime to every run, so the list is pinned exactly. The `clippy` job must
+    /// still exist, otherwise dropping it from `needs:` would have dropped the check.
+    #[test]
+    fn ci_build_and_test_waits_for_prek_but_not_clippy() {
+        let ci = read_workflow("ci.yml");
+        let needs = yaml_value_at(&ci_job(&ci, "build-and-test"), 4, "needs")
+            .expect("build-and-test declares `needs:`");
+        assert_eq!(
+            flattened_list_items(&needs),
+            ["changes", "prek"],
+            "build-and-test must need `changes` and `prek` and not `clippy`, which runs \
+             alongside it; a lint failure is still caught by the required `clippy` check"
+        );
+        ci_job(&ci, "clippy");
+    }
+
+    /// The other half of the ordering above: with `clippy` no longer ahead of
+    /// `build-and-test`, a clippy-red run reaches the E2E job, so what keeps a
+    /// lint-red, failed or skipped run from being read as a pass is the E2E job's
+    /// own gate. The job must need `clippy` and `build-and-test`, the two results
+    /// the gate reads, and every step after the gate step must follow the gate's
+    /// decision. What the gate decides is checked by
+    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict` and
+    /// `e2e_gate_skips_scenarios_unless_clippy_passed`.
+    #[test]
+    fn ci_e2e_steps_after_the_gate_follow_its_decision() {
+        let ci = read_workflow("ci.yml");
+        let e2e = ci_job(&ci, "e2e");
+        let needs = yaml_value_at(&e2e, 4, "needs").expect("e2e declares `needs:`");
+        assert_eq!(
+            flattened_list_items(&needs),
+            ["changes", "clippy", "build-and-test"],
+            "the e2e job must need `clippy` and `build-and-test`, which its gate reads; \
+             without `clippy` in `needs:` the gate's clippy result is empty and a lint-red \
+             run would be skipped, or run, by accident"
+        );
+        let steps = job_steps(&e2e).expect("e2e has steps");
+        let gate_at = steps
+            .iter()
+            .position(|(name, _)| name == "Decide whether to run")
+            .expect("e2e has a gate step named `Decide whether to run`");
+        assert!(
+            steps.len() > gate_at + 1,
+            "the e2e job has steps after its gate"
+        );
+        for (name, step) in &steps[gate_at + 1..] {
+            assert!(
+                step_key(step, "if").contains("steps.gate.outputs.run == 'true'"),
+                "the e2e step `{name}` must follow the gate's decision, or a failed \
+                 build-and-test would still run it"
+            );
+        }
+    }
+
+    /// Run the e2e gate's own script through `run_e2e_gate`, the way GitHub runs
+    /// a step with no `shell:` (`bash -e`), over every event and every
+    /// `build-and-test` result. The gate
+    /// opens once `build-and-test` ran to a verdict, `success` or `failure`: it is
+    /// a matrix over both images and its result is the aggregate, so a failure on
+    /// one image must not skip the other's E2E. A `skipped` or `cancelled` build
+    /// never ran to a verdict, so it must not open the work on a push, a pull
+    /// request or a merge group; only a manual dispatch, which skips
+    /// `build-and-test` on purpose, opens it without one.
+    #[cfg(unix)]
+    #[test]
+    fn ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict() {
+        // The gate is driven through `run_e2e_gate`, which owns the `${{ }}`
+        // substitution, so a context the gate starts reading is added there once.
+        // `clippy` passed throughout, so the clippy notice must never print;
+        // `e2e_gate_skips_scenarios_unless_clippy_passed` varies it.
+        for event in ["push", "pull_request", "merge_group"] {
+            for ran in ["success", "failure"] {
+                // A build that ran to a verdict opens the E2E work.
+                assert_e2e_gate(event, "success", ran, "true", "true", None);
+                // ... but with no heavy change there is no E2E work.
+                assert_e2e_gate(event, "success", ran, "false", "false", None);
+            }
+            // A build that never ran to a verdict must not open the E2E work.
+            for bad in ["skipped", "cancelled"] {
+                assert_e2e_gate(event, "success", bad, "true", "false", None);
+            }
+        }
+        // build-and-test and clippy are both skipped on a dispatch, so the
+        // dispatch opens the gate without them; the job-level platform gate
+        // decides whether the job runs.
+        for build in ["success", "skipped", "failure"] {
+            assert_e2e_gate("workflow_dispatch", "skipped", build, "", "true", None);
+        }
+    }
+
+    /// Drive the aggregator's script the way GitHub runs a step with no `shell:`
+    /// (`bash -e`) over every result a work job can finish with. A skipped
+    /// required check counts as passing, so the dangerous outcomes are the ones
+    /// that look like a pass: `skipped`, and `cancelled`.
+    #[cfg(unix)]
+    #[test]
+    fn ci_windows_aggregator_passes_only_when_every_job_succeeded() {
+        let ci = read_workflow("ci.yml");
+        let step = aggregator_step(&ci_job(&ci, "windows-build-and-test"));
+        let script = preflight_body_code(&step);
+        // The variable names come from the workflow's own bindings, so a binding
+        // that feeds the script the wrong job's result is run as written.
+        let changes_var = aggregator_var(&step, "${{ needs.changes.result }}");
+        let debug_var = aggregator_var(&step, "${{ needs.windows-debug.result }}");
+        let release_var = aggregator_var(&step, "${{ needs.windows-release.result }}");
+
+        let run = |changes: &str, debug: &str, release: &str, expect_skipped: &str| -> i32 {
+            let out = std::process::Command::new("bash")
+                .args(["-e", "-c", &script])
+                .env(&changes_var, changes)
+                .env(&debug_var, debug)
+                .env(&release_var, release)
+                .env("EXPECT_SKIPPED", expect_skipped)
+                .output()
+                .expect("running the aggregator script");
+            exit_code(out.status, "the Windows aggregator script")
+        };
+
+        // Every result a job reports, against both expectations.
+        assert_eq!(run("success", "success", "success", "false"), 0);
+        for bad in ["failure", "cancelled", "skipped"] {
+            assert_eq!(
+                run("success", bad, "success", "false"),
+                1,
+                "a {bad} windows-debug must fail the required check"
+            );
+            assert_eq!(
+                run("success", "success", bad, "false"),
+                1,
+                "a {bad} windows-release must fail the required check"
+            );
+            assert_eq!(
+                run(bad, "skipped", "skipped", "false"),
+                1,
+                "a {bad} `changes` (which skips both work jobs) must fail the required check"
+            );
+        }
+        assert_eq!(run("success", "failure", "failure", "false"), 1);
+
+        // A dispatch that did not ask for binaries skips both jobs on purpose, and
+        // each job is held to that expectation on its own.
+        assert_eq!(run("success", "skipped", "skipped", "true"), 0);
+        for bad in ["failure", "cancelled", "success"] {
+            assert_eq!(
+                run("success", bad, "skipped", "true"),
+                1,
+                "{bad} windows-debug is not the expected skip"
+            );
+            assert_eq!(
+                run("success", "skipped", bad, "true"),
+                1,
+                "{bad} windows-release is not the expected skip"
+            );
+        }
+        // Where the expected skip would otherwise hide a broken `changes`: both
+        // work jobs look exactly as intended, so only the `changes` check can fail it.
+        for bad in ["failure", "cancelled", "skipped"] {
+            assert_eq!(
+                run(bad, "skipped", "skipped", "true"),
+                1,
+                "a {bad} `changes` must fail the required check even when the work jobs are meant to skip"
+            );
+        }
+    }
+
+    /// The work jobs reach the same cache and toolchain through the same steps. A
+    /// drift between them is silent: one job would cold-start, or compile with a
+    /// different toolchain than the one that gates the merge, while the other still
+    /// looked fine. Compared are the job's whole `env:` mapping and every step up
+    /// to and including the one that installs the toolchain, each with its
+    /// comments removed (they change no behaviour).
+    #[test]
+    fn ci_windows_jobs_share_one_cache_and_toolchain_setup() {
+        let ci = read_workflow("ci.yml");
+        let workers = windows_work_jobs(&ci);
+        assert!(
+            workers.len() >= 2,
+            "expected at least two Windows work jobs to compare"
+        );
+        let region = |job: &str, block: &str| {
+            let env = job_mapping(block, "env");
+            let steps = job_steps(block).unwrap_or_else(|| panic!("{job} has steps"));
+            let through_toolchain = steps
+                .iter()
+                .position(|(_, step)| {
+                    step_key(step, "uses").starts_with("actions-rust-lang/setup-rust-toolchain@")
+                })
+                .unwrap_or_else(|| panic!("{job} sets up the Rust toolchain"));
+            let setup = steps[..=through_toolchain]
+                .iter()
+                .flat_map(|(_, step)| {
+                    code_only(step)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{env:#?}\n--- setup ---\n{setup}")
+        };
+        let (first, first_block) = &workers[0];
+        let reference = region(first, first_block);
+        for (job, block) in &workers[1..] {
+            if let Some(diff) = first_line_difference(first, &reference, job, &region(job, block)) {
+                panic!("{job}'s env/setup drifted from {first}: {diff}");
+            }
+        }
+    }
+
+    /// Splitting the lane moved steps between jobs, so each step the Windows gate
+    /// depends on is pinned by name: it must still exist exactly once, still
+    /// contain its command, carry an exact `if:` (no weaker than the `heavy` gate,
+    /// and never an extra `||`), and set no `continue-on-error`.
+    ///
+    /// What this does NOT check: the command is matched as a substring, so a flag
+    /// or a trailing `|| true` added to it passes; the `NOT_GATING` steps are
+    /// exempt by name with their content unchecked; and an unnamed step is
+    /// accepted if it `uses` the checkout or setup-rust-toolchain action, has no
+    /// key beyond `uses`, `with` and `if`, and has an `if` that is absent or the
+    /// `heavy` gate, in any number and at any position in the job. It catches a
+    /// step being dropped, renamed, moved to the other job, skipped, or made
+    /// advisory with `continue-on-error`, and a new named step, or unnamed step
+    /// using another action or a `run:`, appearing in either job.
+    #[test]
+    fn ci_windows_jobs_keep_every_gating_step_enabled() {
+        const HEAVY: &str = "needs.changes.outputs.heavy == 'true'";
+        // The PR-bundle steps additionally skip on push and in the merge queue.
+        const BUNDLE: &str = "needs.changes.outputs.heavy == 'true' && (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')";
+        // (job, step name, text the step must contain, text it must not, exact `if:`)
+        type Gating = (
+            &'static str,
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static str,
+        );
+        const GATING: &[Gating] = &[
+            (
+                "windows-debug",
+                "Clippy (Windows targets)",
+                &["cargo clippy --locked --workspace --all-targets -- -D warnings"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Clippy (Windows, e2e harness + steps)",
+                &["cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Build",
+                &["cargo build --workspace --all-targets"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Test",
+                &["cargo test --workspace --all-targets"],
+                &["--no-run"],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Local no-fallback smoke",
+                &["smoke_local.py --skip-build"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Acceptance harness self-test (ComfyUI)",
+                &["comfyui_therock_gpu_test.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Acceptance harness self-test (local assistant)",
+                &["local_assistant_therock_gpu_test.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-debug",
+                "Acceptance harness self-test (vLLM)",
+                &["vllm_therock_gpu_test.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Build (release)",
+                &["cargo build --release -p rocm -p rocmd"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Release readiness self-test",
+                &["release_readiness.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Pinned key consistency check",
+                &["cargo xtask verify-pinned-keys"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Check PowerShell installer syntax",
+                &["[scriptblock]::Create"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Acceptance install lifecycle",
+                &["cargo xtask e2e"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
+                "Package PR bundle",
+                &["cargo xtask package rocm-cli-pr-windows-amd64"],
+                &[],
+                BUNDLE,
+            ),
+            (
+                "windows-release",
+                "Add install instructions to job summary",
+                &["GITHUB_STEP_SUMMARY"],
+                &[],
+                BUNDLE,
+            ),
+            (
+                "windows-release",
+                "Upload PR bundle",
+                &["actions/upload-artifact@", "if-no-files-found: error"],
+                &[],
+                BUNDLE,
+            ),
+        ];
+        // Setup and reporting steps that do not check the change itself. Only
+        // their names are checked.
+        const NOT_GATING: &[&str] = &[
+            "Set up sccache",
+            "Probe sccache cache backend",
+            "sccache stats",
+        ];
+
+        let ci = read_workflow("ci.yml");
+        for &(job, name, required, forbidden, expected_if) in GATING {
+            let block = ci_job(&ci, job);
+            let steps = job_steps(&block).unwrap_or_else(|| panic!("{job} has steps"));
+            let matching: Vec<&String> = steps
+                .iter()
+                .filter(|(step_name, _)| step_name == name)
+                .map(|(_, step)| step)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{job} must have exactly one step named `{name}`"
+            );
+            let step = matching[0];
+            let code = code_only(step);
+            for needle in required {
+                assert!(
+                    code.contains(needle),
+                    "{job} step `{name}` must still contain `{needle}`:\n{step}"
+                );
+            }
+            for needle in forbidden {
+                assert!(
+                    !code.contains(needle),
+                    "{job} step `{name}` must not contain `{needle}`:\n{step}"
+                );
+            }
+            assert!(
+                !step_keys(step).iter().any(|key| key == "continue-on-error"),
+                "{job} step `{name}` must not set continue-on-error, or it cannot fail the job"
+            );
+            let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
+            assert_eq!(
+                yaml_value_at(step, item_indent + 2, "if").as_deref(),
+                Some(expected_if),
+                "{job} step `{name}` must keep its exact `if:`"
+            );
+        }
+
+        // A step added to either job later is not pinned by the table above, so
+        // every step must be either in it or in `NOT_GATING`. An unnamed step must
+        // `use` the checkout or setup-rust-toolchain action, with no key beyond
+        // `uses`, `with` and an `if:` that is absent or the `heavy` gate; how many
+        // there are and where they sit is not checked. Which commit they pin and
+        // what `with` passes are not checked here either;
+        // `ci_windows_jobs_share_one_cache_and_toolchain_setup` only keeps the two
+        // jobs identical to each other, up to the first toolchain step.
+        for job in ["windows-debug", "windows-release"] {
+            let steps = job_steps(&ci_job(&ci, job)).unwrap_or_else(|| panic!("{job} has steps"));
+            for (name, step) in &steps {
+                let accounted_for = if name.is_empty() {
+                    let uses = step_key(step, "uses");
+                    [
+                        "actions/checkout@",
+                        "actions-rust-lang/setup-rust-toolchain@",
+                    ]
+                    .iter()
+                    .any(|action| uses.starts_with(action))
+                        && step_keys(step)
+                            .iter()
+                            .all(|key| matches!(key.as_str(), "uses" | "with" | "if"))
+                        && matches!(step_key(step, "if").as_str(), "" | HEAVY)
+                } else {
+                    NOT_GATING.contains(&name.as_str())
+                        || GATING.iter().any(|&(j, n, ..)| j == job && n == name)
+                };
+                assert!(
+                    accounted_for,
+                    "{job} has a step this test does not pin:\n{step}\nAdd it to GATING \
+                     (with its command and exact `if:`) or, if it cannot fail the job, to \
+                     NOT_GATING"
+                );
+            }
+        }
+    }
+
+    /// Extract the version token right after `marker` in `line`, up to the
+    /// next whitespace (trailing sentence punctuation is trimmed too, so a
+    /// doc sentence ending right after the version with no space, e.g.
+    /// `cargo-about@0.9.1.`, doesn't glue the period onto the token). With
+    /// marker `"hawkeye@"`, `cargo install hawkeye@7.0.0 --locked` yields
+    /// `7.0.0`.
+    ///
+    /// `strip_comments` must be true only for YAML lines: there, a pin
+    /// mentioned only inside a trailing `# ...` comment must not satisfy a
+    /// check meant for the real line beside it. It must be false for
+    /// Markdown prose, where `strip_comment`'s `" #"` delimiter also matches
+    /// an issue reference (`see #474, install hawkeye@7.0.1`) that is not a
+    /// comment at all — stripping there would silently drop that line's pin
+    /// from the check, which is the exact stale-duplicate case this helper
+    /// exists to catch. Compared for exact equality (not `contains`) so
+    /// neither a stale duplicate pin nor a version sharing a prefix
+    /// (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
+    fn pin_token<'a>(line: &'a str, marker: &str, strip_comments: bool) -> Option<&'a str> {
+        let line = if strip_comments {
+            strip_comment(line)
+        } else {
+            line
+        };
+        let (_, rest) = line.split_once(marker)?;
+        let token = rest.split_whitespace().next().unwrap_or(rest);
+        Some(token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']))
+    }
+
+    /// Every `marker` occurrence on its own line — not just the first line
+    /// that has one — must pin exactly `expected`: a stale duplicate left
+    /// behind by a previous bump must not go unnoticed. (`pin_token` itself
+    /// only reads the first occurrence within a single line; today's pins
+    /// are each one per line, so this doesn't miss anything in practice.)
+    ///
+    /// Comment-stripping (see `pin_token`'s doc) is scoped by `path`'s
+    /// extension: on for `.yml`/`.yaml`, off for everything else (our
+    /// Markdown callers).
+    fn assert_pins_match(marker: &str, expected: &str, path: &Path, text: &str) {
+        let strip_comments = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+        let mut found = false;
+        for line in text.lines() {
+            let Some(token) = pin_token(line, marker, strip_comments) else {
+                continue;
+            };
+            found = true;
+            assert_eq!(
+                token,
+                expected,
+                "{} pins `{marker}{token}`, which does not match the pinned version \
+                 `{expected}`:\n{line}",
+                path.display()
+            );
+        }
+        assert!(
+            found,
+            "{} has no `{marker}` pin; expected `{marker}{expected}`",
+            path.display()
+        );
+    }
+
+    /// The hawkeye and cargo-about versions pinned across CI, CONTRIBUTING.md
+    /// and (for cargo-about) MANIFEST.md must never drift from each other: a
+    /// mismatch lets a contributor's local tool accept or reject something CI
+    /// disagrees with, silently leaving CI as the only real gate.
+    ///
+    /// hawkeye's canonical version lives in `ci.yml`'s `license-headers`
+    /// job's `env:` mapping, read with the extractors this file already has
+    /// fixture tests for (`job_block`, `job_mapping`) rather than duplicated
+    /// into a constant — scoped to that one job so a nested step `env` or an
+    /// unrelated job can't leak in. A bump needs three edits: this test
+    /// guards two of them (ci.yml's `HAWKEYE_VERSION` and CONTRIBUTING.md);
+    /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
+    /// here — see the comment at its definition. cargo-about's canonical
+    /// version is the `ABOUT_VERSION` constant in `tpn.rs`, which is what
+    /// `cargo xtask tpn` itself builds against. A cargo-about bump needs
+    /// seven edits across five files: `ABOUT_VERSION` itself, plus six
+    /// mirror pins — the four `cargo-about@` install lines (CONTRIBUTING.md,
+    /// MANIFEST.md, ci.yml, dependabot-manifests.yml) and the two
+    /// `${{ runner.os }}-cargo-about-<version>` cache keys in ci.yml and
+    /// dependabot-manifests.yml — and this test guards all six mirrors
+    /// against the `ABOUT_VERSION` canonical: the cache keys use a `-`
+    /// instead of `@`, so they need their own marker row rather than the
+    /// `cargo-about@` one. A forgotten cache-key bump would otherwise
+    /// cache-hit the OLD binary while `tpn --check` enforces the NEW
+    /// version, failing loudly but in a confusing place.
+    ///
+    /// One table, one check: a new pinned tool, or a new file that mentions
+    /// an existing one, costs a row here rather than another ~30-line test.
+    #[test]
+    fn pinned_tool_versions_match_across_docs_and_workflows() {
+        let ci = read_workflow("ci.yml");
+        let hawkeye_env = job_mapping(job_block(&ci, "license-headers"), "env");
+        let hawkeye_installed = hawkeye_env
+            .get("HAWKEYE_VERSION")
+            .unwrap_or_else(|| panic!("license-headers job has no HAWKEYE_VERSION entry"));
+        // ci.yml's env var is `v`-prefixed (`v7.0.0`); CONTRIBUTING.md's prose
+        // is not (`hawkeye@7.0.0`).
+        let hawkeye_version = hawkeye_installed
+            .strip_prefix('v')
+            .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{hawkeye_installed}` must be `v`-prefixed"))
+            .to_owned();
+        let about_version = crate::tpn::ABOUT_VERSION.to_owned();
+
+        let root = repo_root();
+        let read = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        };
+        // Each file below is read once here rather than once per table row
+        // that names it: CONTRIBUTING.md and dependabot-manifests.yml each
+        // appear in two rows, and ci.yml appears in a row on top of the read
+        // already done above for HAWKEYE_VERSION.
+        let contributing = read("CONTRIBUTING.md");
+        let manifest = read("MANIFEST.md");
+        let dependabot = read(".github/workflows/dependabot-manifests.yml");
+        let file_text = |rel: &str| -> &str {
+            match rel {
+                "CONTRIBUTING.md" => &contributing,
+                "MANIFEST.md" => &manifest,
+                ".github/workflows/ci.yml" => &ci,
+                ".github/workflows/dependabot-manifests.yml" => &dependabot,
+                other => panic!(
+                    "pinned_tool_versions_match_across_docs_and_workflows: unexpected file `{other}`"
+                ),
+            }
+        };
+
+        let table: [(&str, String, &[&str]); 3] = [
+            ("hawkeye@", hawkeye_version, &["CONTRIBUTING.md"]),
+            (
+                "cargo-about@",
+                about_version.clone(),
+                &[
+                    "CONTRIBUTING.md",
+                    "MANIFEST.md",
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
+            (
+                "cargo-about-",
+                about_version,
+                &[
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
+        ];
+
+        for (marker, expected, files) in table {
+            for file in files {
+                assert_pins_match(marker, &expected, &root.join(file), file_text(file));
+            }
+        }
+    }
+
+    /// Extract one prek hook's complete YAML block by its `- id:` value, up
+    /// to the next line at or above this hook's own `- id:` indent — the
+    /// same indent-based termination `job_block` and `nested_block` already
+    /// use, rather than two needles hardcoded to the exact text that
+    /// happens to follow today (`- id:`/`- repo:`). Hooks inside one
+    /// `repo:` block sit back to back with no blank line between them (see
+    /// `.pre-commit-config.yaml`'s `cargo-fmt`/`cargo-clippy`/... run), so a
+    /// blank-line-anchored end would silently fold a following sibling
+    /// hook's lines into this one's block whenever this hook is not the
+    /// last in its `repo:` block — and a needle that fails to match (e.g. a
+    /// reformat, or this hook ending up last with only a trailing comment
+    /// after it) would silently run the block to the end of the file
+    /// instead of failing loudly. A comment line at or below the hook's own
+    /// indent doesn't end the block by itself: it only does when it turns
+    /// out to head the next sibling, i.e. nothing deeper follows it before
+    /// the next such line — a comment with real indent-8 content still
+    /// after it (`hook_block_does_not_end_at_a_comment_only_line`) is just
+    /// an annotation inside this hook's own mapping, not a boundary, while
+    /// one immediately followed by the next `- id:`/`- repo:` (as
+    /// `.pre-commit-config.yaml` has between `license-headers` and the
+    /// `cargo-fmt` repo block today) is the next block's header comment and
+    /// must not be folded into this one's.
+    fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
+        let marker = format!("- id: {id}\n");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!(".pre-commit-config.yaml defines hook `{id}`"));
+        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let marker_indent = indent_of(&text[line_start..start]);
+        let rest = &text[start + marker.len()..];
+
+        let mut offset = 0usize;
+        let mut pending_comment: Option<usize> = None;
+        for line in rest.split_inclusive('\n') {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let trimmed = content.trim_start();
+            if trimmed.is_empty() {
+                offset += line.len();
+                continue;
+            }
+            if indent_of(content) > marker_indent {
+                // Real content deeper than the hook's own indent proves any
+                // dedented comment seen so far was just an annotation inside
+                // this hook's mapping, not a sibling's header.
+                pending_comment = None;
+                offset += line.len();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                pending_comment.get_or_insert(offset);
+                offset += line.len();
+                continue;
+            }
+            return &rest[..pending_comment.unwrap_or(offset)];
+        }
+        rest
+    }
+
+    /// True if `block` has a line that, after stripping any trailing `#`
+    /// comment, is exactly `flag` once trimmed — so `flag` mentioned only
+    /// inside a comment, or commented out with the real line changed to
+    /// something else, can't satisfy the check.
+    fn hook_block_sets(block: &str, flag: &str) -> bool {
+        block.lines().any(|line| strip_comment(line).trim() == flag)
+    }
+
+    /// Regression guard: the `license-headers` hook once had a `types_or`
+    /// filter (`types_or: [rust, python, shell]`) that let a
+    /// `licenserc.toml`- or Markdown-only commit skip it entirely, while
+    /// CI's hawkeye check still enforced it. `always_run: true` is what
+    /// actually closes that gap: it fires the hook on every commit/push
+    /// regardless of any file-type filter, and hawkeye then scans the
+    /// whole repo per `licenserc.toml` (`pass_filenames: false`) however
+    /// it was triggered. The filter-key checks below guard the next step:
+    /// `always_run: true` already makes any of them inert, so none of
+    /// these alone can reopen the gap, but leaving one in place is
+    /// misleading maintenance debt that could let a later edit drop
+    /// `always_run` while assuming the filter still gates correctly.
+    #[test]
+    fn license_headers_hook_has_no_file_type_filter() {
+        // CRLF-normalize: `.pre-commit-config.yaml` isn't forced to `eol=lf` in
+        // .gitattributes, so a Windows checkout can give `\r\n` line endings,
+        // which `hook_block`'s `\n`-anchored marker would otherwise miss.
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "license-headers");
+        assert!(
+            hook_block_sets(block, "always_run: true"),
+            "license-headers hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "license-headers hook must set `pass_filenames: false` — hawkeye scans \
+             the whole repo per `licenserc.toml` regardless of trigger only because \
+             of this flag; without it, pre-commit would narrow the scan to changed \
+             files instead:\n{block}"
+        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "license-headers hook must not have a file-type filter (`{filter_key}`) — \
+                 `always_run: true` above already makes it inert, but leaving one in place \
+                 is misleading maintenance debt that could let a later edit drop \
+                 `always_run` while assuming the filter still gates correctly:\n{block}"
+            );
+        }
+    }
+
+    /// `cargo xtask check-architecture-doc` is only a gate if all three places
+    /// that can fail a change actually run it: the pre-commit hook, the pre-push
+    /// hook (which reads the working tree, so it catches a commit made with
+    /// `--no-verify` only when the tree is clean) and a `rust`-gated
+    /// step in the `clippy` CI job. The hook must also see every commit: the
+    /// answer depends on the whole tree, so a `files:` filter would let a
+    /// delete-only or doc-only commit skip it. CI's `rust` path filter must
+    /// include the doc itself, because deleting an entry changes the answer
+    /// though no `*.rs` file moved.
+    #[test]
+    fn architecture_doc_check_runs_in_hooks_and_ci() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "architecture-doc");
+        assert!(
+            hook_block_sets(block, "entry: cargo xtask check-architecture-doc"),
+            "architecture-doc hook must run `cargo xtask check-architecture-doc`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "stages: [pre-commit, pre-push]"),
+            "architecture-doc hook must run at both pre-commit and pre-push:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "always_run: true"),
+            "architecture-doc hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "architecture-doc hook must set `pass_filenames: false`:\n{block}"
+        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "architecture-doc hook must not have a file filter (`{filter_key}`): the check \
+                 reads the whole tree, so narrowing it would let a commit skip it:\n{block}"
+            );
+        }
+
+        let ci = read_workflow("ci.yml");
+        let command = "run: cargo xtask check-architecture-doc";
+        let at = ci
+            .find(command)
+            .unwrap_or_else(|| panic!("ci.yml must run `{command}`"));
+        let gate = ci[..at]
+            .lines()
+            .rev()
+            .take(2)
+            .any(|line| line.trim() == "if: needs.changes.outputs.rust == 'true'");
+        assert!(
+            gate,
+            "the `{command}` step must be gated on `needs.changes.outputs.rust == 'true'`, \
+             like the other xtask checks in the clippy job"
+        );
+
+        let start = ci
+            .find("            rust:\n")
+            .expect("ci.yml defines the `rust` path filter");
+        let end = start
+            + ci[start..]
+                .find("            heavy:\n")
+                .expect("ci.yml defines the `heavy` path filter after `rust`");
+        assert!(
+            ci[start..end].contains("- 'docs/architecture.md'"),
+            "the `rust` path filter must include docs/architecture.md, so a doc-only edit \
+             re-runs `{command}`"
+        );
+    }
+
+    // Extractor guards: prove the helpers above actually parse the shapes they
+    // claim to — multiline hook blocks, comment-stripping, and single-line pin
+    // tokens alike — so the contract tests above can't silently false-pass on a
+    // shape they don't handle.
+    #[test]
+    fn hook_block_stops_at_next_hook_in_the_same_repo_block() {
+        // license-headers is NOT last in its `hooks:` list here, unlike in the
+        // real file today — this is exactly the shape that let a sibling
+        // hook's `always_run: true` leak into license-headers' block.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_the_next_repo_entry() {
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next repo block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_does_not_end_at_a_comment_only_line() {
+        // The comment sits at the hook's own `- id:` indent — exactly the
+        // indent that used to end the block — with a real filter key after
+        // it. A reformat could leave a repo looking like this; the filter
+        // key must still be visible to the contract test above.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+      # a comment at the hook's own indent must not end the block
+        types_or: [rust]
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            block.contains("types_or:"),
+            "hook_block ended at a comment-only line, hiding a types_or filter that \
+             comes after it:\n{block}"
+        );
+        assert!(
+            !block.contains("cargo-fmt") && !block.contains("always_run"),
+            "hook_block still must not leak into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_a_dedented_comment_heading_the_next_repo_block() {
+        // Unlike the comment in the test above, this one sits right before the
+        // next `repo:` entry with nothing deeper in between — it heads that
+        // entry rather than annotating `license-headers`' own mapping, exactly
+        // the shape `.pre-commit-config.yaml` has between `license-headers`
+        // and the `cargo-fmt` repo block today.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # Rust + PowerShell: mirror the CI checks using the local toolchain.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("Rust + PowerShell") && !block.contains("always_run"),
+            "hook_block folded the next repo block's header comment into this hook's \
+             block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_the_first_of_several_header_comment_lines() {
+        // A multi-line header comment, still heading the next repo block (nothing
+        // deeper follows before it). The boundary must be the FIRST of these
+        // lines, not the last: `pending_comment` has to keep the earliest offset
+        // it saw, because every line in the run belongs to the next sibling's
+        // header, not to `license-headers`' own block. Keeping the last offset
+        // instead would fold every comment line but the last into this block —
+        // undetectable with only one header-comment line, which is why this test
+        // needs at least two.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # First header line: types_or: [rust]
+  # Second header line, right before the next repo entry.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("First header line") && !block.contains("Second header line"),
+            "hook_block folded a multi-line header comment into this hook's block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_sets_rejects_comment_only_and_falsified_mentions() {
+        assert!(hook_block_sets(
+            "        always_run: true",
+            "always_run: true"
+        ));
+        // Trailing comment after the real value is still read.
+        assert!(hook_block_sets(
+            "        always_run: true  # hawkeye ignores pass_filenames",
+            "always_run: true"
+        ));
+        // The flag mentioned only inside a comment, with the real line
+        // changed to something else, must not satisfy the check.
+        assert!(!hook_block_sets(
+            "        # always_run: true\n        always_run: false",
+            "always_run: true"
+        ));
+    }
+
+    #[test]
+    fn pin_token_rejects_prefixes_and_comment_only_mentions() {
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about@0.9.1 --locked",
+                "cargo-about@",
+                true
+            ),
+            Some("0.9.1")
+        );
+        // A version sharing a prefix must not compare equal to the one it shares
+        // a prefix with — `contains` would wrongly let this satisfy `"0.9.1"`.
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about@0.9.10 --locked",
+                "cargo-about@",
+                true
+            ),
+            Some("0.9.10")
+        );
+        // A pin mentioned only after a trailing ` #` comment (the real line
+        // changed to something else) must not be seen, when comment-stripping
+        // is on (the YAML case).
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about --version 0.9.0  # was cargo-about@0.9.1",
+                "cargo-about@",
+                true,
+            ),
+            None
+        );
+        // Prose that ends the sentence right after the version, with no
+        // separating whitespace, must not glue the punctuation onto the token.
+        assert_eq!(
+            pin_token("pinned to cargo-about@0.9.1.", "cargo-about@", true),
+            Some("0.9.1")
+        );
+        // With comment-stripping off (the Markdown case), an issue reference
+        // like `#474` must not be mistaken for a `# ...` comment that hides the
+        // real pin after it — the exact shape CONTRIBUTING.md/MANIFEST.md prose
+        // can take.
+        assert_eq!(
+            pin_token("see #474, install hawkeye@7.0.1", "hawkeye@", false),
+            Some("7.0.1")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.8.0`")]
+    fn assert_pins_match_flags_a_stale_duplicate_pin() {
+        let text = "cargo install cargo-about@0.9.1 --locked\n\
+                     cargo install cargo-about@0.8.0 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.9.10`, which does not match")]
+    fn assert_pins_match_flags_a_version_sharing_a_prefix() {
+        // The property `pin_token` guarantees — `0.9.10` must not satisfy a
+        // check for `0.9.1` — proven end to end through the real comparison
+        // path, not just through extraction.
+        let text = "cargo install cargo-about@0.9.10 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no `cargo-about@` pin")]
+    fn assert_pins_match_flags_a_marker_with_no_pin_at_all() {
+        // A file whose pin was reworded out of the marker's shape (e.g. split
+        // onto `--version` instead of `cargo-about@<version>`) must not
+        // silently drop out of the drift guard — deleting the `found` check
+        // this fixture pins would otherwise leave every other test green.
+        let text = "cargo install cargo-about --version 0.9.1 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
     #[test]
     fn runs_on_extractor_flattens_multiline_forms() {
         let yaml = "\
@@ -2148,6 +7168,114 @@ jobs:
             flattened_list_items("[self-hosted, windows, strix-halo]"),
             "the two sequence spellings must compare equal"
         );
+    }
+
+    /// Extract the top-level `concurrency.cancel-in-progress` value.
+    fn concurrency_cancel_in_progress(text: &str) -> String {
+        top_level_block(text, "concurrency")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("cancel-in-progress:"))
+            .map(|value| value.trim().to_owned())
+            .expect("concurrency block has a cancel-in-progress: key")
+    }
+
+    #[test]
+    fn self_hosted_supersession_is_scoped_to_pull_requests() {
+        // With one runner per GPU class, a superseded PR run left in the queue
+        // delays every run behind it, so a new push must cancel the PR's older
+        // run. The same must NOT hold for the other triggers: a push or a
+        // merge_group run records a commit that landed, and a dispatch is
+        // deliberate, so none may cancel another or share a group with a PR run.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let group = concurrency_group(&sh);
+        assert!(
+            group.contains("${{ github.workflow }}-${{ github.event_name }}-"),
+            "the group must carry the event name so runs of different triggers never \
+             share a group (got `{group}`)"
+        );
+        // The key is an `A && x || B && y || z` chain, so the ORDER of the arms
+        // decides behaviour (`format()` is always truthy: moved first, it would
+        // give every PR run a unique group and silently stop supersession).
+        // Pin the whole expression, not each arm, so a reorder fails.
+        // PR number: a new push to the PR supersedes its older run. Dispatch:
+        // unique per run. Ref AND commit for everything else: GitHub replaces a
+        // still-pending run in a shared group even with cancel-in-progress off,
+        // so a ref-only key would let a second push to `main` drop the first.
+        assert_eq!(
+            normalized_whitespace(&group).trim_start_matches(">- "),
+            "${{ github.workflow }}-${{ github.event_name }}-${{ \
+             github.event_name == 'pull_request' && github.event.pull_request.number \
+             || github.event_name == 'workflow_dispatch' && github.run_id \
+             || format('{0}-{1}', github.ref, github.sha) }}",
+            "the concurrency group must be exactly: event name, then PR number \
+             (pull_request), run id (workflow_dispatch), ref and commit (all else), \
+             in that order"
+        );
+        assert_eq!(
+            concurrency_cancel_in_progress(&sh),
+            "${{ github.event_name == 'pull_request' }}",
+            "only pull_request runs may be cancelled by a newer run"
+        );
+    }
+
+    #[test]
+    fn mi300x_lane_is_skipped_in_the_merge_queue() {
+        // The MI300X check is not required for merging, so a merge_group run's
+        // job is never waited for and, behind a single runner, outlives the PR it
+        // was queued for. The other lanes are unaffected.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        // The sibling lanes' "keep running in the queue" check below is vacuous
+        // if the workflow stops triggering on merge_group at all.
+        let triggers = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            triggers.contains("merge_group: branches: [main] types: [checks_requested]"),
+            "e2e-selfhosted.yml must still trigger on merge_group (checks_requested on main) \
+             so the lanes that stay in the merge queue actually run (got `{triggers}`)"
+        );
+        let gate = |job: &str| {
+            let block = job_block(&sh, job);
+            let start = block
+                .find("    if: >-\n")
+                .unwrap_or_else(|| panic!("`{job}` has a folded `if:` gate"));
+            block[start..]
+                .lines()
+                .skip(1)
+                .take_while(|line| indent_of(line) > 4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            normalized_whitespace(&gate("e2e-gpu")).starts_with(
+                "always() && needs.changes.result == 'success' \
+                 && github.event_name != 'merge_group' && ("
+            ),
+            "e2e-gpu (MI300X) must not run on merge_group events"
+        );
+        assert!(
+            !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
+            "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
+        for job in [
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-w7900",
+        ] {
+            // Only the dispatch split may look at the event: any other event
+            // condition could silently keep the lane out of the merge queue.
+            let gate = normalized_whitespace(&gate(job));
+            assert!(
+                !gate.contains("merge_group") && !gate.contains("'pull_request'"),
+                "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+        }
     }
 
     #[test]
@@ -2581,5 +7709,997 @@ permissions:
                  is now dead code (EAI-8751)"
             );
         }
+    }
+
+    /// Every `shell: pwsh` step in `text` as `(name, step block)`.
+    ///
+    /// The step is found from its `shell: pwsh` line: that line itself when
+    /// `shell:` is the step's first key (`- shell: pwsh`), and otherwise by
+    /// walking up to the nearest `- ` item shallower than it, so the key order
+    /// inside the step does not matter.
+    fn pwsh_steps(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut steps = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            let code = strip_comment(line).trim();
+            let (key, is_item) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (code, false),
+            };
+            if key
+                .strip_prefix("shell:")
+                .is_none_or(|shell| strip_quotes(shell.trim()) != "pwsh")
+            {
+                continue;
+            }
+            let shell_indent = indent_of(line);
+            let start = if is_item {
+                Some(at)
+            } else {
+                (0..at).rev().find(|&i| {
+                    indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+                })
+            };
+            let Some(start) = start else {
+                continue;
+            };
+            let step = step_block(&lines, start);
+            steps.push((step_name(&step), step));
+        }
+        steps
+    }
+
+    /// PowerShell words that open a statement but are not a program to run.
+    ///
+    /// Every entry is a keyword to pwsh's own tokenizer
+    /// (`TokenTraits::HasTrait(kind, TokenFlags::Keyword)`), so none can name
+    /// a program at the start of a statement.
+    const PWSH_KEYWORDS: [&str; 22] = [
+        "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
+        "catch", "finally", "throw", "exit", "return", "break", "continue", "begin", "process",
+        "end", "param", "trap",
+    ];
+
+    /// Whether a trimmed, comment-free pwsh statement runs an external
+    /// program: `python …`, `cargo …`, `gh …`, `.\tool.exe`, `& $exe …`.
+    ///
+    /// Deliberately rough, and erring towards "native": assignments and
+    /// variables (`$x = …`), keywords, braces, string literals piped
+    /// somewhere (`"k=v" | Out-File …`) and cmdlets (`Verb-Noun`, which start
+    /// upper-case) are not; a lower-case first word that is not a keyword is.
+    fn is_native_command_line(line: &str) -> bool {
+        let line = line.trim();
+        if line.starts_with('&') {
+            return true;
+        }
+        let first = line
+            .split(|c: char| c.is_whitespace() || c == '(' || c == '{')
+            .next()
+            .unwrap_or_default();
+        let Some(lead) = first.chars().next() else {
+            return false;
+        };
+        (lead.is_ascii_lowercase() || lead == '.')
+            && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
+    }
+
+    /// The statements of a pwsh `run:` script, in order.
+    ///
+    /// A line is split at its top-level `;`s (see
+    /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
+    /// --start-server` is two statements. A backtick continuation is joined
+    /// onto the line it continues. A here-string (`@'`/`@"` … `'@`/`"@`)
+    /// stands in as `@'…'@` for the statement it opens, and whatever follows
+    /// the closing marker on its line is analysed as the rest of that
+    /// statement: `'@ | Out-File x; cargo build` still yields `cargo build`.
+    /// Comments and blank lines are dropped.
+    fn pwsh_statements(body: &[&str]) -> Vec<String> {
+        let mut statements = Vec::new();
+        // The logical line built so far: a line plus any continuation and
+        // here-string it carries on into.
+        let mut pending = String::new();
+        let mut here_string_close: Option<&str> = None;
+        for raw in body {
+            let line = raw.trim();
+            if let Some(close) = here_string_close {
+                // Only a line that starts with the opener's own closing
+                // marker ends a here-string; anything else is its text.
+                let Some(rest) = line.strip_prefix(close) else {
+                    continue;
+                };
+                here_string_close = None;
+                pending.push('…');
+                pending.push_str(close);
+                pending.push_str(rest);
+            } else {
+                if pending.is_empty() && (line.is_empty() || line.starts_with('#')) {
+                    continue;
+                }
+                if !pending.is_empty() {
+                    pending.push(' ');
+                }
+                pending.push_str(line);
+            }
+            if let Some(continued) = pending.strip_suffix('`') {
+                pending = continued.trim_end().to_owned();
+                continue;
+            }
+            if pending.ends_with("@'") {
+                here_string_close = Some("'@");
+                continue;
+            }
+            if pending.ends_with("@\"") {
+                here_string_close = Some("\"@");
+                continue;
+            }
+            statements.extend(split_top_level_statements(&pending));
+            pending.clear();
+        }
+        statements.extend(split_top_level_statements(&pending));
+        statements
+    }
+
+    /// One logical pwsh line split at each `;` that ends a statement: those
+    /// outside quotes, outside `(…)`/`{…}` (script blocks, hashtables,
+    /// subexpressions — `@{ a = 1; b = 2 }` is one statement), not escaped
+    /// with a backtick, and before any `#` comment, which is dropped. Each
+    /// statement comes back trimmed; empty ones are skipped.
+    fn split_top_level_statements(line: &str) -> Vec<String> {
+        let mut statements = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        // A `#` opens a comment only where a token can start.
+        let mut at_token_start = true;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                // Inside '…' nothing is special; `''` is two adjacent strings
+                // as far as splitting is concerned, which is the same thing.
+                (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+                (Some('"') | None, '`') => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    at_token_start = false;
+                    continue;
+                }
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '#') if at_token_start => break,
+                (None, '(' | '{') => depth += 1,
+                (None, ')' | '}') => depth = depth.saturating_sub(1),
+                (None, ';') if depth == 0 => {
+                    statements.push(std::mem::take(&mut current));
+                    at_token_start = true;
+                    continue;
+                }
+                (None, _) => {}
+            }
+            current.push(c);
+            at_token_start = quote.is_none() && (c.is_whitespace() || "({;|".contains(c));
+        }
+        statements.push(current);
+        statements
+            .into_iter()
+            .map(|statement| statement.trim().to_owned())
+            .filter(|statement| !statement.is_empty())
+            .collect()
+    }
+
+    /// The native-command statements in a pwsh body whose exit status
+    /// nothing reads (see [`exit_status_is_read`]).
+    fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
+        let statements = pwsh_statements(body);
+        statements
+            .iter()
+            .enumerate()
+            .filter(|(i, line)| {
+                is_native_command_line(line) && !exit_status_is_read(&statements[i + 1..])
+            })
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    /// Whether a native command's exit status is still in `$LASTEXITCODE`
+    /// when something reads it, given the statements that follow it.
+    ///
+    /// The statements are walked in order:
+    ///
+    /// - one that assigns `$LASTEXITCODE` overwrites the status: unread;
+    /// - one that otherwise mentions `$LASTEXITCODE` reads it: read;
+    /// - one that [leaves it alone](leaves_last_exit_code_alone) is passed
+    ///   over;
+    /// - anything else might run another program, or leave the script, before
+    ///   the status is read: unread.
+    ///
+    /// Running off the end is a read: GitHub's pwsh wrapper appends
+    /// `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+    /// so the step itself exits with the status.
+    fn exit_status_is_read(after: &[String]) -> bool {
+        for statement in after {
+            if assigns_last_exit_code(statement) {
+                return false;
+            }
+            if reads_last_exit_code(statement) {
+                return true;
+            }
+            if !leaves_last_exit_code_alone(statement) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a pwsh statement assigns `$LASTEXITCODE` (`= 0`, `+= 1`, with
+    /// or without a `global:`/`script:`/`local:` scope), so the status it
+    /// held is gone.
+    fn assigns_last_exit_code(statement: &str) -> bool {
+        let lower = statement.trim().to_ascii_lowercase();
+        let Some(variable) = lower.strip_prefix('$') else {
+            return false;
+        };
+        let variable = ["global:", "script:", "local:"]
+            .iter()
+            .find_map(|scope| variable.strip_prefix(scope))
+            .unwrap_or(variable);
+        variable.strip_prefix("lastexitcode").is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
+                .iter()
+                .any(|operator| rest.starts_with(operator))
+        })
+    }
+
+    /// Cmdlets that only write output, a stream or a file: none of them runs
+    /// a program or sets `$LASTEXITCODE`.
+    const PWSH_INERT_CMDLETS: [&str; 11] = [
+        "Write-Output",
+        "Write-Host",
+        "Write-Information",
+        "Write-Verbose",
+        "Write-Debug",
+        "Write-Warning",
+        "Out-File",
+        "Out-Null",
+        "Out-Host",
+        "Add-Content",
+        "Set-Content",
+    ];
+
+    /// Whether a pwsh statement can neither run a program nor touch
+    /// `$LASTEXITCODE`, so a native command's status survives it.
+    ///
+    /// Deliberately narrow, and erring towards "might": every quote in the
+    /// statement closes, and outside single quotes, which are literal, it
+    /// has no `(` (a subexpression
+    /// `$(…)` or a `(…)` argument runs a command, even inside double quotes),
+    /// no `{` (a script block), no `&` (the call operator, `&&`) and no
+    /// expanding `@"` here-string. What is left is a pipeline whose first
+    /// element is a value — a variable, a string or a number — or an
+    /// assignment of one, or one of [`PWSH_INERT_CMDLETS`], and whose every
+    /// later element is one of those cmdlets. Anything else, a keyword
+    /// (`exit`, a loop's closing `}`) or a function call included, is not.
+    fn leaves_last_exit_code_alone(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        if code.contains(['(', '{', '&']) || code.contains("@\"") {
+            return false;
+        }
+        code.split('|').enumerate().all(|(at, element)| {
+            let element = element.trim();
+            let first = element.split_whitespace().next().unwrap_or_default();
+            PWSH_INERT_CMDLETS
+                .iter()
+                .any(|cmdlet| cmdlet.eq_ignore_ascii_case(first))
+                || (at == 0 && is_value_or_assignment(element))
+        })
+    }
+
+    /// Whether a pipeline element is a plain value (`$x`, `"text"`, `'text'`,
+    /// `42`, a literal here-string) or `$name = …` of one, with a target other
+    /// than `$LASTEXITCODE`. A `+=`-style operator counts as `=`.
+    fn is_value_or_assignment(element: &str) -> bool {
+        let value = match element.split_once('=') {
+            Some((target, value)) if element.starts_with('$') => {
+                let target = target
+                    .trim_end()
+                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
+                    .trim_end();
+                let name = target.trim_start_matches('$');
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    || assigns_last_exit_code(element)
+                {
+                    return false;
+                }
+                // `$a = $b = cargo …` chains: the value must pass in turn.
+                return is_value_or_assignment(value.trim());
+            }
+            _ => element,
+        };
+        value.starts_with(['$', '"', '\''])
+            || value.starts_with("@'")
+            || value.starts_with(|c: char| c.is_ascii_digit())
+    }
+
+    /// `statement` with the text inside its single-quoted strings removed:
+    /// that text is literal, so nothing in it can run. Double-quoted strings
+    /// are kept whole, since `$(…)` inside one does run, and a `'` inside one
+    /// is just a character.
+    ///
+    /// `None` when a quote is still open at the end: what it hides cannot be
+    /// told from literal text, so the caller must assume the worst. A stray
+    /// `'@ | git …` would otherwise reduce to a lone `'`, a plain value.
+    fn without_single_quoted_text(statement: &str) -> Option<String> {
+        let mut kept = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = statement.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => {
+                    quote = None;
+                    kept.push(c);
+                }
+                (Some('\''), _) => {}
+                (_, '`') => {
+                    kept.push(c);
+                    if let Some(escaped) = chars.next() {
+                        kept.push(escaped);
+                    }
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    kept.push(c);
+                }
+                _ => kept.push(c),
+            }
+        }
+        quote.is_none().then_some(kept)
+    }
+
+    /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
+    /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
+    /// the same variable and count just the same.
+    ///
+    /// Only a mention outside single quotes counts (`'$LASTEXITCODE'` is
+    /// literal text), and only of the whole name (`$LASTEXITCODEX` is another
+    /// variable). A statement with a quote left open reads nothing.
+    fn reads_last_exit_code(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        let code = code.to_ascii_lowercase();
+        code.match_indices("$lastexitcode").any(|(at, name)| {
+            !code[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its
+    /// block-scalar `run:` (`|`, `|-`, `>`, `>-`, …, folded as YAML folds it),
+    /// or its one-line `run:` value, which can chain statements with `;` just
+    /// the same.
+    fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
+        match run_script(step) {
+            Some(script) => {
+                unchecked_native_commands(&script.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
+        }
+    }
+
+    /// pwsh steps allowed to run a native command whose status is unread,
+    /// keyed by `(workflow, step name)`, each with the reason it is safe.
+    const PWSH_UNCHECKED_NATIVE_ALLOWED: [(&str, &str, &str); 3] = [
+        (
+            "ci.yml",
+            "Probe sccache cache backend",
+            "the probe decides for itself and ends in `exit 0`; the one unread \
+             status is a best-effort `sccache --stop-server` cleanup",
+        ),
+        (
+            "nightly.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+        (
+            "release.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+    ];
+
+    /// GitHub runs a `shell: pwsh` body with `$ErrorActionPreference = 'stop'`
+    /// and then `exit $LASTEXITCODE`. A failing *cmdlet* stops the step, but a
+    /// failing *native command* does not: the script carries on, and only the
+    /// last native command's status decides the step. So in
+    ///
+    /// ```text
+    /// python a.py --self-test   # exits 1
+    /// python b.py --self-test   # exits 0
+    /// ```
+    ///
+    /// the step is green. Every native command must therefore have its
+    /// `$LASTEXITCODE` read before anything that could run another program or
+    /// reset it (see [`exit_status_is_read`]; the end of the body counts as a
+    /// read), or be split into its own step (#633), or be allow-listed above
+    /// with the reason its failure still surfaces.
+    #[test]
+    fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
+        let dir = repo_root().join(".github/workflows");
+        let mut workflows: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("workflow dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .map(|path| {
+                path.file_name()
+                    .expect("a read_dir entry has a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        workflows.sort();
+
+        let mut offenders = Vec::new();
+        let mut allowed_seen = Vec::new();
+        for workflow in &workflows {
+            let text = read_workflow(workflow);
+            for (name, step) in pwsh_steps(&text) {
+                let unchecked = unchecked_native_commands_in_step(&step);
+                if unchecked.is_empty() {
+                    continue;
+                }
+                if PWSH_UNCHECKED_NATIVE_ALLOWED
+                    .iter()
+                    .any(|(w, n, _)| w == workflow && *n == name)
+                {
+                    allowed_seen.push((workflow.clone(), name));
+                    continue;
+                }
+                offenders.push(format!("{workflow} step {name:?}: {unchecked:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these `shell: pwsh` steps run a native command whose failure the step \
+             would not report, because pwsh carries on and the step takes only the last \
+             command's exit code — split each into its own step, or check \
+             `$LASTEXITCODE` before anything that could run another program or \
+             reset it:\n  {}",
+            offenders.join("\n  ")
+        );
+        // An allow-list entry that no longer matches anything exempts nothing
+        // and would quietly cover the next step to take that name.
+        for (workflow, name, _) in PWSH_UNCHECKED_NATIVE_ALLOWED {
+            assert!(
+                allowed_seen.iter().any(|(w, n)| w == workflow && n == name),
+                "{workflow} step {name:?} is allow-listed in \
+                 PWSH_UNCHECKED_NATIVE_ALLOWED but no longer has an unchecked native \
+                 command; drop the entry"
+            );
+        }
+    }
+
+    /// The masking shape #633 removed is still caught, and the shapes that
+    /// read the status are not.
+    #[test]
+    fn unchecked_native_commands_finds_the_masking_shape() {
+        let merged = [
+            "python .\\scripts\\comfyui_therock_gpu_test.py --self-test",
+            "python .\\scripts\\local_assistant_therock_gpu_test.py --self-test",
+            "python .\\scripts\\vllm_therock_gpu_test.py --self-test",
+        ];
+        assert_eq!(unchecked_native_commands(&merged), merged[..2].to_vec());
+
+        let checked = [
+            "$targetDir = if ($env:X) { $env:X } else { \"target\" }",
+            "# a comment",
+            "sccache --start-server",
+            "if ($LASTEXITCODE -ne 0) {",
+            "  Write-Output \"::warning::no cache\"",
+            "}",
+            "@'",
+            "cargo build   # inside a here-string, not a command",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+            "cargo xtask e2e",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "python .\\scripts\\release_readiness.py `",
+            "  --dist dist",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            unchecked_native_commands(&checked)
+        );
+    }
+
+    /// A `;` ends a statement, so a native command chained before another
+    /// statement on one line is checked like one on a line of its own — but
+    /// only a top-level `;`: not one in a string, a hashtable or script
+    /// block, a comment, or escaped with a backtick.
+    #[test]
+    fn unchecked_native_commands_splits_statements_at_top_level_semicolons() {
+        let chained = [
+            "Write-Output 'ok'; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            unchecked_native_commands(&chained),
+            ["sccache --start-server"]
+        );
+        assert_eq!(
+            unchecked_native_commands(&["cargo build; cargo test"]),
+            ["cargo build"]
+        );
+        assert!(
+            unchecked_native_commands(&["cargo build; if ($LASTEXITCODE -ne 0) { exit 1 }"])
+                .is_empty()
+        );
+
+        // Each of these is ONE statement; splitting it would leave a
+        // lower-case fragment (`cargo`, `b`, `then`) that reads as a native
+        // command and, followed by `cargo xtask e2e`, as an unchecked one.
+        for line in [
+            "Write-Output \"done; cargo is next\"",
+            "Write-Output 'done; cargo is next'",
+            "Write-Output \"it`\"s done; cargo is next\"",
+            "$h = @{ a = 1; b = 2 }",
+            "$v = $(Get-Date; Get-Location)",
+            "Write-Output done # then; cargo",
+            "Write-Output done`; then",
+        ] {
+            let body = [line, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{line:?} split into {:?}",
+                pwsh_statements(&body)
+            );
+        }
+
+        // A one-line `run:` chains statements just the same.
+        let step = "      - name: Lint\n        shell: pwsh\n        \
+                    run: cargo fmt --check; cargo clippy  # both\n";
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["cargo fmt --check"]
+        );
+    }
+
+    /// Only the closing marker of a here-string is skipped: the rest of its
+    /// line is the tail of the statement the here-string opened, and any
+    /// statement chained after it is checked.
+    #[test]
+    fn unchecked_native_commands_reads_on_past_a_here_string_close() {
+        let body = [
+            "@'",
+            "## Summary",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            pwsh_statements(&body),
+            [
+                "@'…'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+                "sccache --start-server",
+                "cargo xtask e2e",
+            ]
+        );
+        assert_eq!(unchecked_native_commands(&body), ["sccache --start-server"]);
+
+        // A here-string inside the statement that reads the status leaves
+        // that statement whole: `if ($LASTEXITCODE …) { throw @"…"@ }`.
+        let checked = [
+            "cargo build",
+            "if ($LASTEXITCODE -ne 0) { throw @\"",
+            "build failed",
+            "\"@ }",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            pwsh_statements(&checked)
+        );
+
+        // `"@` does not close a `@'` here-string: its text runs on to `'@`.
+        let mismatched = [
+            "@'",
+            "\"@; cargo inside the text",
+            "'@ | Out-File x",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&mismatched).is_empty(),
+            "{:?}",
+            pwsh_statements(&mismatched)
+        );
+    }
+
+    /// A wrapped step name must not read as its block-scalar indicator: with
+    /// `name: >` taken literally, the GPU-preflight lookup would report the
+    /// step missing from a job that has it. A blank line among or after the
+    /// wrapped lines does not end the name. This parser joins the lines with
+    /// single spaces, so `Spaced out` is its reading where YAML would fold the
+    /// blank line to a newline; callers only match a name's prefix.
+    #[test]
+    fn a_block_scalar_step_name_is_read_from_its_wrapped_lines() {
+        let block = "    steps:\n\
+                     \x20     - name: >-\n\
+                     \x20         GPU preflight\n\
+                     \x20         (bounded wait)\n\
+                     \x20       run: |\n\
+                     \x20         echo wait\n\
+                     \x20     - name: >-\n\
+                     \x20         Spaced\n\
+                     \n\
+                     \x20         out\n\
+                     \n\
+                     \x20       run: |\n\
+                     \x20         echo spaced\n\
+                     \x20     - uses: actions/checkout@v4\n\
+                     \x20       name: |\n\
+                     \x20         Check out\n\
+                     \x20     - name: Plain # trailing comment\n\
+                     \x20       run: |\n\
+                     \x20         echo plain\n";
+        let names: Vec<String> = job_steps(block)
+            .expect("the block has a steps: list")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "GPU preflight (bounded wait)",
+                "Spaced out",
+                "Check out",
+                "Plain"
+            ]
+        );
+    }
+
+    /// The preflight lookup every script check reads from must see a wrapped
+    /// name exactly like a one-line one. Matched on the raw `- name:` text, a
+    /// preflight named through `name: >-` is not found, and the checks that
+    /// read the lookup then fail on a block count or an `.expect` that points
+    /// at a removed lane or the extractor, not at the name's form.
+    ///
+    /// It must return only preflight steps, and only real ones: a step with
+    /// another name, a commented-out preflight, and a `- name: GPU preflight`
+    /// line inside some step's script are all left out, and a job with no
+    /// `steps:` list (one that only `uses:` a reusable workflow) adds nothing.
+    #[test]
+    fn a_gpu_preflight_with_a_block_scalar_name_is_still_found() {
+        let workflow = "on: push\n\
+                        jobs:\n\
+                        \x20 wrapped:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - uses: actions/checkout@v4\n\
+                        \x20   # a comment at the steps: indent does not end them\n\
+                        \x20     - name: >-\n\
+                        \x20         GPU preflight\n\
+                        \n\
+                        \x20         (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo wrapped\n\
+                        \x20     # - name: GPU preflight (disabled)\n\
+                        \x20     - name: Generate the report\n\
+                        \x20       run: |\n\
+                        \x20         cat <<'YAML'\n\
+                        \x20         - name: GPU preflight (inside a script)\n\
+                        \x20         YAML\n\
+                        \x20 reusable:\n\
+                        \x20   uses: ./.github/workflows/other.yml\n\
+                        \x20 plain:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: GPU preflight (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo plain\n\
+                        \x20     - name: Run the suite\n\
+                        \x20       run: |\n\
+                        \x20         echo suite\n";
+        let scripts: Vec<String> = gpu_preflight_steps(workflow)
+            .iter()
+            .map(|step| {
+                run_block(step)
+                    .expect("every preflight step here has a `run: |` block")
+                    .join("\n")
+                    .trim()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(scripts, ["echo wrapped", "echo plain"]);
+    }
+
+    /// The pwsh contract keys its allow-list on a step's name, so a pwsh step
+    /// whose name is wrapped into a block scalar must come back under its
+    /// wrapped text, not as `>-`: read literally, every such step would share
+    /// the one name `>-`, and an allow-list entry could never match it.
+    #[test]
+    fn a_pwsh_step_with_a_block_scalar_name_is_read_from_its_wrapped_lines() {
+        let workflow = "jobs:\n\
+                        \x20 win:\n\
+                        \x20   runs-on: windows-latest\n\
+                        \x20   steps:\n\
+                        \x20     - name: >-\n\
+                        \x20         Package Windows\n\
+                        \x20         bundle\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: |\n\
+                        \x20         cargo xtask package\n\
+                        \x20     - name: Plain\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: cargo test\n";
+        let names: Vec<String> = pwsh_steps(workflow)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["Package Windows bundle", "Plain"]);
+    }
+
+    /// PowerShell variable names are case-insensitive: a check spelled
+    /// `$LastExitCode` reads the same variable as `$LASTEXITCODE`.
+    #[test]
+    fn unchecked_native_commands_reads_last_exit_code_in_any_case() {
+        for check in [
+            "if ($LastExitCode -ne 0) { exit $LastExitCode }",
+            "if ($lastexitcode -ne 0) { exit 1 }",
+        ] {
+            let body = ["cargo build", check, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{check:?} reads the status: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+    }
+
+    /// A statement that opens with a PowerShell keyword runs no program, so
+    /// it is not a native command left unchecked before `cargo xtask e2e`.
+    #[test]
+    fn a_statement_opening_with_a_pwsh_keyword_is_not_a_native_command() {
+        for statement in [
+            "break",
+            "continue",
+            "begin {",
+            "process {",
+            "end {",
+            "param([string] $Target)",
+            "trap { Write-Output 'trapped' }",
+        ] {
+            assert!(
+                !is_native_command_line(statement),
+                "{statement:?} reads as a native command"
+            );
+            assert!(
+                unchecked_native_commands(&[statement, "cargo xtask e2e"]).is_empty(),
+                "{statement:?}"
+            );
+        }
+    }
+
+    /// Every block-scalar form of `run:` hands a pwsh step a script, so every
+    /// form is checked. Read only as `run: |`, a `run: |-`, `run: >` or
+    /// `run: >-` step fell through to the one-line reading, whose value is the
+    /// bare indicator, and so escaped the contract whatever its script did.
+    #[test]
+    fn unchecked_native_commands_reads_every_block_scalar_run_form() {
+        // Literal forms: each line is a line of script.
+        for header in ["run: |", "run: |-", "run: |+", "run: |2", "run: |-  # note"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+        // Folded forms: a blank line separates two lines of script.
+        for header in ["run: >", "run: >-", "run: >+"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+    }
+
+    /// A folded `run: >` block is read as YAML folds it: lines at the block's
+    /// indent join with a space into one line of script, a blank line starts
+    /// a new one, and a more-indented line keeps its own line. Taken line by
+    /// line instead, the first two lines below would read as two commands and
+    /// the first as unchecked, where pwsh is handed one `cargo` command.
+    #[test]
+    fn a_folded_run_block_is_read_as_yaml_folds_it() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >-\n          \
+                    cargo build\n          --locked\n\n          if ($LASTEXITCODE) {\n            \
+                    exit 1\n          }\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "          cargo build --locked",
+                "",
+                "          if ($LASTEXITCODE) {",
+                "            exit 1",
+                "          }",
+            ]
+        );
+        assert!(unchecked_native_commands_in_step(step).is_empty());
+    }
+
+    /// A folded block with an indentation indicator (`>2`) sets its own
+    /// indent: the run key's column plus the digit, not the indent of its
+    /// first line. Here the first line is more indented than that, so it
+    /// keeps its own line, and the two lines at the block's indent fold into
+    /// one. PyYAML reads both fixtures this way.
+    #[test]
+    fn a_folded_run_block_honours_its_indentation_indicator() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >2\n            \
+                    python a.py --self-test\n          python b.py --self-test\n          \
+                    python c.py\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "            python a.py --self-test",
+                "          python b.py --self-test python c.py",
+            ]
+        );
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["python a.py --self-test"]
+        );
+        // `run:` as the step's first key: the key, not the dash, sets the
+        // column the digit counts from.
+        let step =
+            "      - run: >2\n            a1\n          b\n          c\n        shell: pwsh\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            ["            a1", "          b c"]
+        );
+    }
+
+    /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
+    /// the step is pwsh, and its script checked, just the same. Matched only
+    /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
+    /// `- run: |` read as no script at all.
+    #[test]
+    fn a_pwsh_step_is_checked_whichever_key_comes_first() {
+        let script = "            python a.py --self-test\n            \
+                      python b.py --self-test\n";
+        for step in [
+            format!("      - shell: pwsh\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - shell: 'pwsh'\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - run: |\n{script}        shell: pwsh\n        name: Self-tests\n"),
+        ] {
+            let text = format!("jobs:\n  win:\n    runs-on: windows-latest\n    steps:\n{step}");
+            let found: Vec<(String, Vec<String>)> = pwsh_steps(&text)
+                .into_iter()
+                .map(|(name, step)| (name, unchecked_native_commands_in_step(&step)))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    "Self-tests".to_owned(),
+                    vec!["python a.py --self-test".to_owned()]
+                )],
+                "{step}"
+            );
+        }
+    }
+
+    /// A `$LASTEXITCODE` check need not be the very next statement: what
+    /// sits between may only be statements that can neither run a program
+    /// nor touch `$LASTEXITCODE`. Each case below was run through pwsh after
+    /// a native command exiting 3, under GitHub's wrapper: in every accepted
+    /// case the check still saw 3.
+    #[test]
+    fn a_later_last_exit_code_check_counts_when_nothing_between_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["Write-Output 'built'"][..],
+            &["Write-Host \"built $target\""],
+            &["$artifact = 'dist/rocm.zip'"],
+            &["$env:RESULT = $artifact", "$count += 1"],
+            &["\"k=v\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append"],
+            &[
+                "@'",
+                "## Summary (cargo build; git status)",
+                "'@ | Add-Content $env:GITHUB_STEP_SUMMARY",
+            ],
+            &["Write-Output 'one'", "$x = 'two'", "Write-Host $x"],
+            &["Write-Output 'done (all targets) & {more}'"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{between:?} leaves the status for the check: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+        // The end of the body is a read too: GitHub's wrapper exits with
+        // `$LASTEXITCODE`, which a trailing cmdlet leaves alone.
+        assert!(unchecked_native_commands(&["cargo build", "Write-Output 'done'"]).is_empty());
+    }
+
+    /// The other side of the rule: a statement that can run a program, leave
+    /// the script, or set `$LASTEXITCODE` between a native command and the
+    /// check leaves that command unchecked. Run through pwsh after a native
+    /// command exiting 3 (`.\scripts\collect.ps1` standing for a script
+    /// that ends `exit 0`), each of these lost the 3 before the check —
+    /// another status took its place, or the step left first — except the
+    /// two marked: one this check cannot tell from a statement that does,
+    /// and a loop's closing brace, which is not a statement on its own.
+    #[test]
+    fn a_later_last_exit_code_check_does_not_count_past_a_statement_that_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["git rev-parse HEAD"][..],
+            &["Write-Output (git rev-parse HEAD)"],
+            &["Write-Output \"sha: $(git rev-parse HEAD)\""],
+            &["Write-Output \"it's $(git rev-parse HEAD)\""],
+            &["& .\\scripts\\collect.ps1"],
+            &["$LASTEXITCODE = 0"],
+            &["$global:LastExitCode = 0"],
+            &["$sha = git rev-parse HEAD"],
+            &["$a = $b = git rev-parse HEAD"],
+            &["Write-Output 'x' | git hash-object --stdin"],
+            // Conservative: runs git only if Write-Output fails.
+            &["Write-Output 'x' || git rev-parse HEAD"],
+            &["@\"", "$(git rev-parse HEAD)", "\"@ | Out-File summary.md"],
+            &["Invoke-Expression 'git rev-parse HEAD'"],
+            &["Write-Output 'x' && git rev-parse HEAD"],
+            // A hashtable value is a statement, and runs.
+            &["Write-Output @{ sha = git rev-parse HEAD }"],
+            &["Write-Output @\"", "$(git rev-parse HEAD)", "\"@"],
+            &["exit 0"],
+            // A loop's closing brace: the check reads the last pass only.
+            &["}"],
+            &["Write-Output 'fine'", "git rev-parse HEAD"],
+            // An unclosed `'` hides the rest of the statement, so the
+            // statement is not known to be inert: here a stray closing
+            // marker would leave just `'`, which reads as a plain value.
+            &["'@ | git hash-object --stdin"],
+            &["Write-Output 'open | git hash-object --stdin"],
+            // `$LASTEXITCODE` inside single quotes is literal text, and
+            // `$LASTEXITCODEX` is another variable: neither reads the status.
+            &["git log --grep '$LASTEXITCODE'"],
+            &["Invoke-Thing $LASTEXITCODEX"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).contains(&"cargo build".to_owned()),
+                "{between:?} can reset the status, yet `cargo build` reads as checked"
+            );
+        }
+        assert_eq!(
+            unchecked_native_commands(&["cargo build", "exit 0"]),
+            ["cargo build"]
+        );
     }
 }

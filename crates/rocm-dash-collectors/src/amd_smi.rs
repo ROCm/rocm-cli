@@ -20,7 +20,12 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
-const KFD_DEVICE: &str = "/dev/kfd";
+/// The real KFD device node, which the pre-flight always opens.
+///
+/// It is also the default for the caller's host-root view of that node, which
+/// is this same path unless an E2E build points the hardware probes at a
+/// simulated host.
+pub const KFD_DEVICE: &str = "/dev/kfd";
 const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -46,16 +51,26 @@ impl AmdSmiCollector {
     /// `gpu_reachable` lets the pre-flight pass without a readable `/dev/kfd`
     /// (e.g. on WSL, where the real signal is `rocm_core::has_usable_amd_gpu()`
     /// rather than any single device node this crate could probe directly).
-    /// This crate deliberately does not depend on `rocm-core` to compute that
-    /// verdict itself; the caller (`apps/rocm`, which already depends on it)
-    /// threads it through instead, so on WSL, `serve`/`examine`/the dashboard
-    /// never disagree about whether a host's GPU is usable. On bare metal the
-    /// caller always passes `false`, so this is still a plain `/dev/kfd` check.
+    /// This crate does depend on `rocm-core` (EAI-8457, for the shared bounded
+    /// device probe below), so computing the verdict here would compile — it is
+    /// still threaded in from the caller (`apps/rocm`) on purpose. The verdict
+    /// is a *decision about this host* that `serve`, `examine` and the dashboard
+    /// must not reach independently; recomputing it in the collector is how the
+    /// three come to disagree about whether a host's GPU is usable, not how they
+    /// stay in step. On bare metal the caller always passes `false`, so this is
+    /// still a plain `/dev/kfd` check.
+    ///
+    /// `host_kfd_device` is where the caller's hardware probes put `/dev/kfd`
+    /// (`rocm_core::host_path`'s answer, threaded in for the same reason as
+    /// `gpu_reachable`). It is [`KFD_DEVICE`] itself except in an E2E build
+    /// with a simulated host root; see [`preflight_passes`] for how the two
+    /// combine.
     pub async fn detect_with_binary(
         binary: impl Into<OsString>,
         gpu_reachable: bool,
+        host_kfd_device: &Path,
     ) -> Option<Self> {
-        Self::detect_with_binary_inner(binary, false, gpu_reachable).await
+        Self::detect_with_binary_inner(binary, false, gpu_reachable, host_kfd_device).await
     }
 
     /// Like [`detect_with_binary`](Self::detect_with_binary) but skips the
@@ -73,28 +88,42 @@ impl AmdSmiCollector {
     pub async fn detect_with_binary_skipping_device_preflight(
         binary: impl Into<OsString>,
     ) -> Option<Self> {
-        Self::detect_with_binary_inner(binary, true, false).await
+        Self::detect_with_binary_inner(binary, true, false, Path::new(KFD_DEVICE)).await
     }
 
     async fn detect_with_binary_inner(
         binary: impl Into<OsString>,
         skip_device_preflight: bool,
         gpu_reachable: bool,
+        host_kfd_device: &Path,
     ) -> Option<Self> {
-        if !preflight_passes(skip_device_preflight, gpu_reachable, Path::new(KFD_DEVICE)) {
+        if !preflight_passes_off_thread(
+            skip_device_preflight,
+            gpu_reachable,
+            Path::new(KFD_DEVICE),
+            host_kfd_device,
+        )
+        .await
+        {
             return None;
         }
         let me = Self {
             binary: binary.into(),
         };
-        match timeout(DETECT_TIMEOUT, me.run(&["version"])).await {
-            Ok(Ok(_)) => Some(me),
+        me.probe_version(DETECT_TIMEOUT).await
+    }
+
+    /// Runs `amd-smi version` and keeps the collector only if it answers within
+    /// `limit`. Split out of detection so a test can shorten the limit.
+    async fn probe_version(self, limit: Duration) -> Option<Self> {
+        match timeout(limit, self.run(&["version"])).await {
+            Ok(Ok(_)) => Some(self),
             Ok(Err(e)) => {
-                warn!(error = %e, binary = ?me.binary, "amd-smi present but `version` failed");
+                warn!(error = %e, binary = ?self.binary, "amd-smi present but `version` failed");
                 None
             }
             Err(_) => {
-                warn!(binary = ?me.binary, "amd-smi `version` timed out");
+                warn!(binary = ?self.binary, "amd-smi `version` timed out");
                 None
             }
         }
@@ -103,6 +132,13 @@ impl AmdSmiCollector {
     pub async fn metrics(&self) -> io::Result<Vec<GpuMetrics>> {
         let v = self.run_json(&["metric", "--json"]).await?;
         Ok(parse_metrics(&v))
+    }
+
+    /// Per-GPU power caps (W) from `amd-smi static --json`, keyed by the same
+    /// `gpu-N` id [`metrics`] uses. GPUs with no readable cap are omitted.
+    pub async fn power_limits(&self) -> io::Result<std::collections::HashMap<String, f32>> {
+        let v = self.run_json(&["static", "--json"]).await?;
+        Ok(parse_power_limits(&v))
     }
 
     /// Per-process GPU VRAM usage from `amd-smi process --json`.
@@ -128,7 +164,14 @@ impl AmdSmiCollector {
     }
 
     async fn run(&self, args: &[&str]) -> io::Result<String> {
-        let out = Command::new(&self.binary).args(args).output().await?;
+        // `kill_on_drop`: both callers await this under a `timeout`, and a timeout
+        // that fires drops this future. Without it the child would keep running
+        // (and keep a GPU query open) after the caller had given up on it.
+        let out = Command::new(&self.binary)
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
                 "amd-smi {args:?} exited {}: {}",
@@ -140,23 +183,100 @@ impl AmdSmiCollector {
     }
 
     async fn run_json(&self, args: &[&str]) -> io::Result<Value> {
-        let s = timeout(RUN_TIMEOUT, self.run(args))
+        self.run_json_within(RUN_TIMEOUT, args).await
+    }
+
+    /// [`run_json`](Self::run_json) with an explicit time limit, so a test can
+    /// shorten it.
+    async fn run_json_within(&self, limit: Duration, args: &[&str]) -> io::Result<Value> {
+        let s = timeout(limit, self.run(args))
             .await
             .map_err(|_| io::Error::other(format!("amd-smi {args:?} timed out")))??;
         serde_json::from_str(&s).map_err(|e| io::Error::other(format!("parse: {e}")))
     }
 }
 
+/// [`preflight_passes`] moved off the async worker thread.
+///
+/// The device branch of the pre-flight blocks: `device_accessible` waits on a
+/// bounded `open`, up to `rocm_core`'s 2s `KFD_OPEN_TIMEOUT` per probe, and
+/// under a simulated host root there are two probes, so ~4s. The only caller is
+/// an `async fn` reached from a `tokio::spawn` in `rocm-dash-daemon`'s run
+/// loop, and AGENTS.md puts blocking work on the blocking pool rather than on
+/// an async worker.
+///
+/// Deliberately no `timeout` wrapped around the `spawn_blocking`: that would
+/// drop only the `JoinHandle` and leave the blocking thread running, and the
+/// probe is already bounded from the inside, which is the bound that matters.
+///
+/// The two non-device branches short-circuit *before* the thread hop, so a
+/// caller that skips the pre-flight or already knows the GPU is reachable pays
+/// nothing and -- relevant to the `#[doc(hidden)]` skip entry point -- never
+/// needs a runtime with a blocking pool at all.
+///
+/// A `JoinError` reads as "not readable", matching
+/// `device_readable_within_budget`: every branch that fails to get an answer
+/// declines rather than falling back to a blocking open on the caller's thread.
+async fn preflight_passes_off_thread(
+    skip_device_preflight: bool,
+    gpu_reachable: bool,
+    real_kfd_device: &Path,
+    host_kfd_device: &Path,
+) -> bool {
+    if skip_device_preflight || gpu_reachable {
+        return true;
+    }
+    // Owned: `spawn_blocking` needs a `'static` closure.
+    let real_kfd_device = real_kfd_device.to_path_buf();
+    let host_kfd_device = host_kfd_device.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        preflight_passes(false, false, &real_kfd_device, &host_kfd_device)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// The device pre-flight passes if the caller already skipped it, already
 /// knows the GPU is reachable by some other means (e.g. WSL, via
 /// `rocm_core::has_usable_amd_gpu()`), or the bare-metal device node itself is
 /// readable.
-fn preflight_passes(skip_device_preflight: bool, gpu_reachable: bool, kfd_device: &Path) -> bool {
-    skip_device_preflight || gpu_reachable || device_accessible(kfd_device)
+///
+/// The device check needs BOTH the real node (`real_kfd_device`) and the
+/// caller's host-root view of it (`host_kfd_device`) to be readable. The real
+/// node keeps a veto because this check gates a real `amd-smi` process: a
+/// simulated host that plants a `/dev/kfd` on a machine without one must not
+/// start an `amd-smi` that can then hang in D-state. The host-root view can
+/// only take a GPU away, so a simulated GPU-less host keeps the dashboard from
+/// reporting the runner's real GPU. Outside an E2E build with a simulated root
+/// the two paths are the same, and the second open is skipped outright, so
+/// this is exactly the single `/dev/kfd` check it always was.
+///
+/// `gpu_reachable` still substitutes for the whole device check, as before:
+/// on WSL there is no `/dev/kfd` for either path to find. The real-device veto
+/// therefore does not cover it. The caller computes it as "WSL and a usable
+/// GPU" from `rocm-core`'s probes, which do follow a simulated root; under one,
+/// it is anchored to the real machine only through the parts of that verdict
+/// that still read the real host, chiefly the `ldconfig` cache lookup.
+fn preflight_passes(
+    skip_device_preflight: bool,
+    gpu_reachable: bool,
+    real_kfd_device: &Path,
+    host_kfd_device: &Path,
+) -> bool {
+    skip_device_preflight
+        || gpu_reachable
+        || (device_accessible(real_kfd_device)
+            && (host_kfd_device == real_kfd_device || device_accessible(host_kfd_device)))
 }
 
+/// Shared with `rocm-core`'s `/dev/kfd` pre-flight rather than restated here.
+///
+/// A plain `OpenOptions::open(..).is_ok()` would leave the dashboard collector
+/// as the one `amd-smi` launch site that can still block forever on a wedged
+/// device. The shared probe carries the 2s bound and the in-flight budget with
+/// it, so this site cannot drift away from the gate it is part of.
 fn device_accessible(path: &Path) -> bool {
-    std::fs::OpenOptions::new().read(true).open(path).is_ok()
+    rocm_core::device_readable_bounded(path)
 }
 
 fn val_u64(v: Option<&Value>) -> Option<u64> {
@@ -196,7 +316,47 @@ pub fn parse_metrics(v: &Value) -> Vec<GpuMetrics> {
                 temperature_c,
                 power_w: val_f32(nested(g, &["power", "socket_power", "value"])).unwrap_or(0.0),
                 clock_mhz: val_f32(nested(g, &["clock", "gfx_0", "clk", "value"])),
+                // Filled by the runner from `power_limits`; not in `metric`.
+                power_limit_w: None,
             }
+        })
+        .collect()
+}
+
+/// Candidate keys under a GPU's `limit` object for its power cap, in priority
+/// order: the cap currently in force, then the maximum the part allows.
+const POWER_LIMIT_KEYS: [&str; 2] = ["socket_power", "max_power"];
+
+/// Parse `amd-smi static --json` into per-GPU power caps (W), keyed `gpu-N`.
+///
+/// Assumed schema (not verified against every amd-smi release): top level
+/// `{ "gpu_data": [ <gpu>, ... ] }` or a bare array; each `<gpu>` has
+/// `{ "gpu": N, "limit": { "socket_power" | "max_power": <watts> } }` where the
+/// value is a raw number or a `{ "value": W, "unit": "W" }` wrapper. A missing,
+/// non-numeric, non-finite or non-positive cap (`N/A`, `0`) is omitted, so an
+/// unrecognised schema yields an empty map and callers treat the cap as
+/// unknown rather than guessing one.
+pub fn parse_power_limits(v: &Value) -> std::collections::HashMap<String, f32> {
+    let entries: Vec<&Value> = if let Some(arr) = v.get("gpu_data").and_then(|x| x.as_array()) {
+        arr.iter().collect()
+    } else if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else {
+        return std::collections::HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|g| {
+            let id = g.get("gpu").and_then(serde_json::Value::as_u64)?;
+            let limit = g.get("limit")?;
+            // Validity is judged per key, so an unreadable or zero current cap
+            // falls through to the part's maximum instead of masking it.
+            let watts = POWER_LIMIT_KEYS.iter().find_map(|k| {
+                let raw = limit.get(*k)?;
+                let w = val_f32(Some(raw)).or_else(|| val_f32(raw.get("value")))?;
+                (w.is_finite() && w > 0.0).then_some(w)
+            })?;
+            Some((format!("gpu-{id}"), watts))
         })
         .collect()
 }
@@ -386,13 +546,13 @@ mod tests {
     #[test]
     fn preflight_skipped_passes_regardless_of_device_or_reachability() {
         let missing = Path::new("/nonexistent/kfd");
-        assert!(preflight_passes(true, false, missing));
+        assert!(preflight_passes(true, false, missing, missing));
     }
 
     #[test]
     fn precomputed_reachability_satisfies_preflight_without_kfd() {
         let missing = Path::new("/nonexistent/kfd");
-        assert!(preflight_passes(false, true, missing));
+        assert!(preflight_passes(false, true, missing, missing));
     }
 
     #[test]
@@ -401,7 +561,7 @@ mod tests {
         let kfd = dir.path().join("kfd");
         std::fs::write(&kfd, []).unwrap();
 
-        assert!(preflight_passes(false, false, &kfd));
+        assert!(preflight_passes(false, false, &kfd, &kfd));
     }
 
     #[test]
@@ -409,7 +569,158 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing_kfd = dir.path().join("missing-kfd");
 
-        assert!(!preflight_passes(false, false, &missing_kfd));
+        assert!(!preflight_passes(false, false, &missing_kfd, &missing_kfd));
+    }
+
+    /// Under a simulated host root the real device and the host-root view are
+    /// different paths, and `amd-smi` may run only when both are readable.
+    #[test]
+    fn real_kfd_keeps_a_veto_over_the_host_root_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_present = dir.path().join("real-kfd");
+        let host_present = dir.path().join("host-root-kfd");
+        std::fs::write(&real_present, []).unwrap();
+        std::fs::write(&host_present, []).unwrap();
+        let real_missing = dir.path().join("real-missing");
+        let host_missing = dir.path().join("host-root-missing");
+
+        assert!(
+            preflight_passes(false, false, &real_present, &host_present),
+            "both readable: amd-smi runs"
+        );
+        assert!(
+            !preflight_passes(false, false, &real_present, &host_missing),
+            "a simulated GPU-less host hides the runner's real GPU"
+        );
+        assert!(
+            !preflight_passes(false, false, &real_missing, &host_present),
+            "a planted /dev/kfd must not start amd-smi on a host without one"
+        );
+        assert!(
+            !preflight_passes(false, false, &real_missing, &host_missing),
+            "neither readable: amd-smi does not run"
+        );
+    }
+
+    #[test]
+    fn power_limits_prefer_current_cap_and_skip_unreadable() {
+        let v: Value = serde_json::from_str(
+            r#"{ "gpu_data": [
+              { "gpu": 0, "limit": { "socket_power": { "value": 600, "unit": "W" },
+                                      "max_power":    { "value": 750, "unit": "W" } } },
+              { "gpu": 1, "limit": { "max_power": 750 } },
+              { "gpu": 2, "limit": { "socket_power": "N/A" } },
+              { "gpu": 3, "limit": { "max_power": { "value": 0, "unit": "W" } } },
+              { "gpu": 4 }
+            ] }"#,
+        )
+        .unwrap();
+        let m = parse_power_limits(&v);
+        assert_eq!(m.get("gpu-0"), Some(&600.0), "current cap wins over max");
+        assert_eq!(m.get("gpu-1"), Some(&750.0), "raw number falls back to max");
+        assert_eq!(m.len(), 2, "N/A, zero and absent caps are unknown: {m:?}");
+        // Unrecognised shapes are an empty map, not a panic.
+        assert!(parse_power_limits(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_zero_current_cap_falls_through_to_the_maximum() {
+        let v: Value = serde_json::from_str(
+            r#"[ { "gpu": 0, "limit": { "socket_power": 0, "max_power": 750 } },
+                 { "gpu": 1, "limit": { "socket_power": "N/A", "max_power": 600 } } ]"#,
+        )
+        .unwrap();
+        let m = parse_power_limits(&v);
+        assert_eq!(m.get("gpu-0"), Some(&750.0), "0 must not mask max_power");
+        assert_eq!(m.get("gpu-1"), Some(&600.0), "N/A falls through too");
+    }
+
+    /// A FIFO under `root`, or `None` (with a visible skip notice) on a host
+    /// with no `mkfifo(1)`.
+    ///
+    /// Shelled out rather than calling `libc::mkfifo`, because the workspace
+    /// lints deny `unsafe_code` — the same reason, and the same shape, as
+    /// `rocm_core::amd_smi`'s test helper of this name.
+    #[cfg(target_os = "linux")]
+    fn make_fifo(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+        let fifo = root.join(name);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(&made, Ok(status) if status.success()) {
+            return Some(fifo);
+        }
+        eprintln!(
+            "skip: no usable mkfifo(1), so the off-thread pre-flight check cannot be exercised \
+             here; this assertion did NOT run"
+        );
+        None
+    }
+
+    /// The blocking pre-flight must not be run on the async worker.
+    ///
+    /// `device_readable_bounded` parks its caller for up to `rocm_core`'s 2s
+    /// `KFD_OPEN_TIMEOUT`, and the only production caller is an `async fn`
+    /// reached from `rocm-dash-daemon`'s `tokio::spawn`. A single-worker
+    /// (`current_thread`) runtime is what makes the difference observable: a
+    /// ticker task can only make progress while the pre-flight is *not*
+    /// occupying the one worker, so an inline `preflight_passes` — the shape
+    /// this had before — records zero ticks, while the `spawn_blocking` version
+    /// lets the ticker run for the whole ~2s probe.
+    ///
+    /// The device is a FIFO with no writer, the same real blocking `open` the
+    /// `rocm-core` probe tests use: against an ordinary missing path the open
+    /// fails instantly and the test could pass without proving anything.
+    ///
+    /// Linux-only: off Linux `device_readable_bounded` is a direct unbounded
+    /// open, which on this FIFO would never return at all.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(target_os = "linux")]
+    async fn the_device_preflight_does_not_run_on_the_async_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some(fifo) = make_fifo(dir.path(), "blocking-kfd") else {
+            return;
+        };
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let passed = preflight_passes_off_thread(false, false, &fifo, &fifo).await;
+        ticker.abort();
+        let observed = ticks.load(Ordering::Relaxed);
+
+        assert!(
+            !passed,
+            "a device whose open never returns must fail the pre-flight, or the timing \
+             assertion below proves nothing"
+        );
+        assert!(
+            observed >= 5,
+            "the async worker was parked by the pre-flight: a 20ms ticker got {observed} ticks \
+             during a ~2s blocking probe, so the probe is not on the blocking pool"
+        );
+    }
+
+    /// The two non-device branches answer without a thread hop, so they stay
+    /// usable on a runtime with no blocking pool — notably the `#[doc(hidden)]`
+    /// skip entry point the daemon integration tests use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_short_circuit_branches_need_no_blocking_pool() {
+        let missing = Path::new("/nonexistent/kfd");
+        assert!(preflight_passes_off_thread(true, false, missing, missing).await);
+        assert!(preflight_passes_off_thread(false, true, missing, missing).await);
     }
 
     const SAMPLE_METRIC: &str = r#"{
@@ -572,10 +883,119 @@ mod tests {
         assert!(parse_processes(&v).is_empty());
     }
 
+    /// The limit the timeout tests give the collector. The clock starts at the
+    /// call, not when the fake script has written its pid file, so a limit near
+    /// the time a loaded runner needs to start a shell would end the run before
+    /// the child existed and fail the test as "never started".
+    #[cfg(target_os = "linux")]
+    const TEST_LIMIT: Duration = Duration::from_secs(10);
+
+    /// A fake `amd-smi` that records its own pid and then sleeps far past any
+    /// limit a test sets. `exec` makes the recorded pid the sleeper's own, so
+    /// the test watches the process the collector spawned and not a shell that
+    /// could exit separately.
+    #[cfg(target_os = "linux")]
+    fn write_sleeping_amd_smi(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pid_file = dir.join("child.pid");
+        let binary = dir.join("amd-smi");
+        rocm_core::fake_executable::write_fake_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        (binary, pid_file)
+    }
+
+    /// True while `pid` is a live process. A zombie that only awaits reaping
+    /// counts as gone: it has been killed and runs no code.
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // The state letter follows the parenthesised command name.
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                .is_some_and(|state| state != 'Z' && state != 'X'),
+            Err(_) => false,
+        }
+    }
+
+    /// Waits for the process `pid` to stop running, killing it first if it is
+    /// still alive after `grace` so a failing run does not leave a sleeper
+    /// behind. Returns whether it was gone without that kill.
+    #[cfg(target_os = "linux")]
+    async fn gone_within(pid: u32, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        while process_is_running(pid) {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recorded_pid(pid_file: &Path) -> u32 {
+        std::fs::read_to_string(pid_file)
+            .expect("the fake amd-smi never started, so the timeout proved nothing")
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_json_timeout_kills_the_amd_smi_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, pid_file) = write_sleeping_amd_smi(dir.path());
+        let collector = AmdSmiCollector {
+            binary: binary.into(),
+        };
+
+        let err = collector
+            .run_json_within(TEST_LIMIT, &["metric", "--json"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let pid = recorded_pid(&pid_file);
+        assert!(
+            gone_within(pid, Duration::from_secs(5)).await,
+            "amd-smi child {pid} was still running after its timeout fired"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn detection_timeout_kills_the_amd_smi_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, pid_file) = write_sleeping_amd_smi(dir.path());
+        let collector = AmdSmiCollector {
+            binary: binary.into(),
+        };
+
+        assert!(collector.probe_version(TEST_LIMIT).await.is_none());
+
+        let pid = recorded_pid(&pid_file);
+        assert!(
+            gone_within(pid, Duration::from_secs(5)).await,
+            "amd-smi child {pid} was still running after the detection timeout fired"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a real AMD GPU + amd-smi; run manually on hardware"]
     async fn live_processes_no_panic() {
-        if let Some(c) = AmdSmiCollector::detect_with_binary("amd-smi", false).await {
+        if let Some(c) =
+            AmdSmiCollector::detect_with_binary("amd-smi", false, Path::new(KFD_DEVICE)).await
+        {
             // Either Ok or Err is acceptable; the contract is "does not panic".
             let _ = c.processes().await;
         }

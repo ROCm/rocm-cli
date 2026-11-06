@@ -12,7 +12,7 @@
 use rocm_core::AppPaths;
 use rocm_dash_tui::tool_exec::{ApprovalIntent, RocmToolExecutor, RocmToolOutcome};
 
-use crate::providers;
+use crate::{chat, providers};
 
 /// Concrete tool executor injected into a live dash. Carries the resolved
 /// [`AppPaths`] so read-only tool calls can be served in-process.
@@ -34,16 +34,16 @@ impl RocmToolExecutor for BinToolExecutor {
             name: name.to_owned(),
             arguments: args.clone(),
         };
-        if let Err(e) = crate::validate_chat_tool_call(&call) {
+        if let Err(e) = chat::validate_chat_tool_call(&call) {
             return RocmToolOutcome::Error(e.to_string());
         }
-        if crate::chat_tool_call_is_read_only(&call) {
-            match crate::run_internal_mcp_call(&self.paths, name, args.clone(), false) {
+        if chat::chat_tool_call_is_read_only(&call) {
+            match chat::run_internal_mcp_call(&self.paths, name, args.clone(), false) {
                 Ok(v) => RocmToolOutcome::Result(v),
                 Err(e) => RocmToolOutcome::Error(e.to_string()),
             }
         } else {
-            match crate::chat_tool_approval_request(&call, None) {
+            match chat::chat_tool_approval_request(&call, None) {
                 Ok(req) => RocmToolOutcome::ApprovalRequired(ApprovalIntent {
                     title: req.pending_title,
                     body: {
@@ -67,7 +67,7 @@ impl RocmToolExecutor for BinToolExecutor {
         // call first, so the safety validators stay the single gate; it runs the
         // action with piped stdout/stderr (TUI-safe) — no `dispatch`, no stdout
         // corruption.
-        match crate::run_internal_mcp_call(&self.paths, name, args.clone(), true) {
+        match chat::run_internal_mcp_call(&self.paths, name, args.clone(), true) {
             Ok(v) => RocmToolOutcome::Result(v),
             // `Error` is *not* the failed-command arm. `run_rocm_capture_for_paths`
             // captures a non-zero `rocm` exit, so a refused command still returns
@@ -79,7 +79,7 @@ impl RocmToolExecutor for BinToolExecutor {
             // below, which drives this function against a real `rocm`
             // subprocess that exits non-zero; the collapsing half is pinned by
             // `approved_command_failure_stays_a_collapsed_envelope` in
-            // `crates/rocm-dash-tui/src/app/mod.rs`.
+            // `crates/rocm-dash-tui/src/app/tool_approval.rs`.
             Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }
@@ -186,6 +186,32 @@ mod tests {
         );
     }
 
+    /// The dash registers `rocm_command` as a *read-only* tool and runs whatever
+    /// `Result` `execute()` hands back, so this seam is what stops a
+    /// model-issued mutating argv from running. A bare `serve` fails the safety
+    /// validator; a well-formed managed `serve` is classified as mutating and
+    /// only surfaces an approval request. Neither may come back as a `Result`,
+    /// which is what an executed command looks like.
+    #[test]
+    fn seam_rejects_mutating_rocm_command() {
+        let exec = BinToolExecutor::new(temp_paths());
+
+        let outcome = exec.execute("rocm_command", &serde_json::json!({ "args": ["serve"] }));
+        assert!(
+            matches!(&outcome, RocmToolOutcome::Error(msg) if msg.contains("--managed")),
+            "a bare `serve` must be rejected by the managed-serving rule, got {outcome:?}"
+        );
+
+        let args = serde_json::json!({ "args": ["serve", "qwen", "--managed"] });
+        match exec.execute("rocm_command", &args) {
+            RocmToolOutcome::ApprovalRequired(intent) => {
+                assert_eq!(intent.name, "rocm_command");
+                assert_eq!(intent.arguments, args);
+            }
+            other => panic!("a managed `serve` must only surface for approval, got {other:?}"),
+        }
+    }
+
     /// Drives the *real* approved-replay chain for a `rocm` command that exits
     /// non-zero: `execute_approved` → `run_internal_mcp_call(…, true)` →
     /// `run_rocm_capture_for_paths` (a genuine subprocess) →
@@ -263,7 +289,7 @@ mod tests {
         );
         // The refusal text is buried in the envelope rather than surfaced —
         // exactly the shape `approved_command_failure_stays_a_collapsed_envelope`
-        // (`crates/rocm-dash-tui/src/app/mod.rs`) then collapses out of the chat.
+        // (`crates/rocm-dash-tui/src/app/tool_approval.rs`) then collapses out of the chat.
         //
         // Anchored on the rejected selector rather than on `select_runtime_manifest`'s
         // current "installed runtime not found" wording: that message is on this

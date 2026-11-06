@@ -26,7 +26,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -176,7 +176,7 @@ fn request_op(em: &mut EngineManagerState, action: EngineAction) {
     let request = ApprovalRequest::new(
         format!("{} engine “{}”", action.verb(), name),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             explain.to_string(),
         ],
@@ -301,11 +301,8 @@ pub fn draw_engine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn use_action_builds_config_set_default_engine() {

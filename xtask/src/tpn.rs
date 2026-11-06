@@ -29,8 +29,10 @@ const ABOUT_CONFIG: &str = "about.toml";
 /// cargo-about version the committed notices are reproducible with. Different
 /// versions format the output differently, so regenerating with anything else
 /// produces a file that fails the byte-for-byte `--check` gate in CI. Kept in
-/// sync with the workflows by `pinned_version_matches_workflows` below.
-const ABOUT_VERSION: &str = "0.9.1";
+/// sync with the workflows, CONTRIBUTING.md and MANIFEST.md by
+/// `pinned_tool_versions_match_across_docs_and_workflows` in
+/// `workflow_contract.rs`, which needs crate visibility to read this.
+pub(crate) const ABOUT_VERSION: &str = "0.9.1";
 
 /// What to do with freshly generated notices relative to what is on disk.
 #[derive(Debug, PartialEq, Eq)]
@@ -256,25 +258,5 @@ mod tests {
         assert_eq!(parse_about_version("cargo-about"), None);
         assert_eq!(parse_about_version("cargo-deny 0.9.1"), None);
         assert_eq!(parse_about_version(""), None);
-    }
-
-    /// The pinned constant and the version CI installs must never drift: if they
-    /// do, the hook regenerates notices that fail the byte-for-byte gate.
-    #[test]
-    fn pinned_version_matches_workflows() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask crate has a parent directory")
-            .to_path_buf();
-        let expected = format!("cargo-about@{ABOUT_VERSION}");
-        for workflow in ["ci.yml", "dependabot-manifests.yml"] {
-            let path = root.join(".github/workflows").join(workflow);
-            let yaml = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            assert!(
-                yaml.contains(&expected),
-                "{workflow} must install {expected} to match ABOUT_VERSION in tpn.rs"
-            );
-        }
     }
 }
