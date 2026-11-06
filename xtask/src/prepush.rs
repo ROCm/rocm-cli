@@ -321,6 +321,12 @@ fn banner(check: Check, push: &Push, selection: &Selection, fallback: Option<&st
              checking the whole workspace",
             check.label()
         ),
+        // The claim about CI is backed by `.github/workflows/ci.yml`: the
+        // `windows-debug` job runs `cargo test --workspace --all-targets` on every
+        // change, and the `test` job selects `--workspace` for every event but
+        // `pull_request` (the merge queue and pushes to main). The test
+        // `the_banner_claim_about_ci_matches_the_workflow` fails if either stops
+        // being true, so change the text and that test together.
         None => format!(
             "pre-push-check {}: {} for the changes in {range}; CI's Windows job, merge queue \
              and main still check the whole workspace",
@@ -656,6 +662,44 @@ mod tests {
         assert!(
             line.contains("Windows job, merge queue and main still check the whole workspace"),
             "{line}"
+        );
+    }
+
+    /// The banner tells the developer that the narrowing only affects the local
+    /// hook. That is true while CI's Windows job tests the whole workspace and the
+    /// `test` job is forced to `--workspace` outside pull requests; this reads the
+    /// workflow so the claim cannot go stale without a test failing.
+    #[test]
+    fn the_banner_claim_about_ci_matches_the_workflow() {
+        let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+            .expect("read ci.yml");
+        let mut windows_debug = String::new();
+        let mut inside = false;
+        for line in workflow.lines() {
+            if line == "  windows-debug:" {
+                inside = true;
+                continue;
+            }
+            // The next job key at two-space indent ends the job.
+            let next_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && !line.trim_start().starts_with('#');
+            if inside && next_key {
+                break;
+            }
+            if inside {
+                windows_debug.push_str(line);
+                windows_debug.push('\n');
+            }
+        }
+        assert!(
+            windows_debug.contains("cargo test --workspace --all-targets"),
+            "the `windows-debug` job no longer tests the whole workspace; update the banner text"
+        );
+        assert!(
+            workflow.contains("\"${{ github.event_name }}\" = \"pull_request\"")
+                && workflow.contains("sel=\"--workspace\""),
+            "the `test` job no longer forces `--workspace` outside pull requests; update the banner text"
         );
     }
 
@@ -1190,6 +1234,18 @@ mod tests {
     /// selection would not send to that crate's tests, or when a crate derives
     /// the repo root without being declared as a reader. Add the path to
     /// [`CROSS_CRATE_READS`] (or declare the crate) when this fails.
+    ///
+    /// What it can see is limited. An `include_str!`/`include_bytes!` literal and
+    /// a `env!("CARGO_MANIFEST_DIR")` chain that ends in literal `.join("...")`
+    /// segments name their file, and that file is checked. A chain that only
+    /// derives the repo root and is joined somewhere else (a helper such as
+    /// `repo_root()`) is recorded as a root derivation: the guard then requires
+    /// the crate to be declared as a reader in [`CROSS_CRATE_READS`], but not
+    /// that the files it goes on to read are covered. A test that reads a new kind
+    /// of file (a `Cargo.toml` or a `.feature` of another crate) through such a
+    /// root is selected only as that file's own crate, so its entry in
+    /// [`CROSS_CRATE_READS`] has to be added by hand. Widening the rule would need
+    /// data flow through helper functions, which a text scan cannot give exactly.
     #[test]
     fn every_cross_crate_read_is_covered_by_the_widening_rule() {
         let root = repo_root();

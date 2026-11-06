@@ -399,7 +399,13 @@ test reads them and `rocm` compiles in the assistant skill), and the e2e PowerSh
 selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
 [prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
 `include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
-covered, so a new cross-crate read cannot be added without a decision.
+covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
+whose path is written out (an `include_str!` literal, or a `CARGO_MANIFEST_DIR` chain ending in
+literal `.join("...")` segments) is checked file by file, but a test that derives the repo root in
+one place and joins the rest elsewhere (xtask's `repo_root()` helper) is only recorded as reading
+through the root. For that case the test checks that the crate is a declared reader, not which files
+it reads, so a test that starts reading a new kind of file of another crate needs its
+`CROSS_CRATE_READS` entry added by hand.
 
 A step that has nothing to check says so and exits successfully. A step whose affected crates
 cannot be determined (the pushed range's base is not available locally, the range lists no
