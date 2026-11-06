@@ -5475,8 +5475,9 @@ fi
         }
     }
 
-    /// Run the e2e gate's own script, the way GitHub runs a step with no `shell:`
-    /// (`bash -e`), over every event and every `build-and-test` result. The gate
+    /// Run the e2e gate's own script through `run_e2e_gate`, the way GitHub runs
+    /// a step with no `shell:` (`bash -e`), over every event and every
+    /// `build-and-test` result. The gate
     /// opens once `build-and-test` ran to a verdict, `success` or `failure`: it is
     /// a matrix over both images and its result is the aggregate, so a failure on
     /// one image must not skip the other's E2E. A `skipped` or `cancelled` build
@@ -5486,69 +5487,27 @@ fi
     #[cfg(unix)]
     #[test]
     fn ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict() {
-        let ci = read_workflow("ci.yml");
-        let steps = job_steps(&ci_job(&ci, "e2e")).expect("e2e has steps");
-        let gate = steps
-            .iter()
-            .find(|(name, _)| name == "Decide whether to run")
-            .expect("e2e has a gate step named `Decide whether to run`");
-        let script = preflight_body_code(&gate.1);
-        let run = |event: &str, build: &str, heavy: &str| -> String {
-            // `clippy` passed throughout; `e2e_gate_skips_scenarios_unless_clippy_passed`
-            // varies it.
-            let script = script
-                .replace("${{ github.event_name }}", event)
-                .replace("${{ needs.clippy.result }}", "success")
-                .replace("${{ needs.build-and-test.result }}", build)
-                .replace("${{ needs.changes.outputs.heavy }}", heavy);
-            assert!(
-                !script.contains("${{"),
-                "the gate reads an expression this test does not substitute: {script}"
-            );
-            let dir = tempfile::tempdir().expect("temp dir");
-            let output = dir.path().join("github_output");
-            std::fs::write(&output, "").expect("creating GITHUB_OUTPUT");
-            let out = std::process::Command::new("bash")
-                .args(["-e", "-c", &script])
-                .env("GITHUB_OUTPUT", &output)
-                .output()
-                .expect("running the e2e gate script");
-            assert_eq!(
-                exit_code(out.status, "the e2e gate script"),
-                0,
-                "the gate script must exit 0 for {event}/{build}/{heavy}"
-            );
-            std::fs::read_to_string(&output)
-                .expect("reading GITHUB_OUTPUT")
-                .trim()
-                .to_owned()
-        };
-
+        // The gate is driven through `run_e2e_gate`, which owns the `${{ }}`
+        // substitution, so a context the gate starts reading is added there once.
+        // `clippy` passed throughout, so the clippy notice must never print;
+        // `e2e_gate_skips_scenarios_unless_clippy_passed` varies it.
         for event in ["push", "pull_request", "merge_group"] {
             for ran in ["success", "failure"] {
-                assert_eq!(
-                    run(event, ran, "true"),
-                    "run=true",
-                    "{event}: a {ran} build-and-test ran to a verdict"
-                );
-                assert_eq!(
-                    run(event, ran, "false"),
-                    "run=false",
-                    "{event}: a {ran} build with no heavy change has no E2E work"
-                );
+                // A build that ran to a verdict opens the E2E work.
+                assert_e2e_gate(event, "success", ran, "true", "true", None);
+                // ... but with no heavy change there is no E2E work.
+                assert_e2e_gate(event, "success", ran, "false", "false", None);
             }
+            // A build that never ran to a verdict must not open the E2E work.
             for bad in ["skipped", "cancelled"] {
-                assert_eq!(
-                    run(event, bad, "true"),
-                    "run=false",
-                    "{event}: a {bad} build-and-test never ran to a verdict and must not open the E2E work"
-                );
+                assert_e2e_gate(event, "success", bad, "true", "false", None);
             }
         }
-        // build-and-test is skipped on a dispatch, so the dispatch opens the gate
-        // without it; the job-level platform gate decides whether the job runs.
+        // build-and-test and clippy are both skipped on a dispatch, so the
+        // dispatch opens the gate without them; the job-level platform gate
+        // decides whether the job runs.
         for build in ["success", "skipped", "failure"] {
-            assert_eq!(run("workflow_dispatch", build, ""), "run=true", "{build}");
+            assert_e2e_gate("workflow_dispatch", "skipped", build, "", "true", None);
         }
     }
 
