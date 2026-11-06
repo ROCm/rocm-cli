@@ -196,7 +196,7 @@ where
 }
 
 fn manifest_path(paths: &AppPaths) -> PathBuf {
-    paths.engine_runtime_manifest_path(ENGINE_NAME)
+    paths.engine_install_manifest_path(ENGINE_NAME)
 }
 
 fn lemonade_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
@@ -597,7 +597,7 @@ mod tests {
         };
         write_manifest(&paths, &manifest).unwrap();
 
-        let path = paths.engine_runtime_manifest_path("lemonade");
+        let path = paths.engine_install_manifest_path("lemonade");
         assert_eq!(manifest_path(&paths), path);
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["version"], "fixture");

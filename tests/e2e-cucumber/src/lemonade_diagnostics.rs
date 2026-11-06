@@ -1297,7 +1297,7 @@ mod tests {
         let server = runtime.join("bin/llamacpp/rocm-stable").join(binary);
         std::fs::create_dir_all(server.parent().unwrap()).unwrap();
         std::fs::write(&server, b"abc").unwrap();
-        let manifest = paths.engine_runtime_manifest_path("lemonade");
+        let manifest = paths.engine_install_manifest_path("lemonade");
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         std::fs::write(
             &manifest,

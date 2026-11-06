@@ -200,7 +200,12 @@ impl AppPaths {
     /// file, so a reader cannot drift to a different name: a reader that
     /// misses it degrades to "no manifest", which is indistinguishable from an
     /// engine that was never installed.
-    pub fn engine_runtime_manifest_path(&self, engine: &str) -> PathBuf {
+    ///
+    /// This is the engine's own install manifest, not an entry in the runtime
+    /// registry (that is `apps/rocm`'s `runtime_manifest_path`), and the name keeps
+    /// the two apart: the registry has a text guard that treats any file spelling
+    /// that helper's name and writing a file as a second registry writer.
+    pub fn engine_install_manifest_path(&self, engine: &str) -> PathBuf {
         self.engine_manifests_dir(engine).join("runtime.json")
     }
 
@@ -366,10 +371,10 @@ mod tests {
         );
     }
     #[test]
-    fn engine_runtime_manifest_lives_in_the_engine_manifests_dir() {
+    fn engine_install_manifest_lives_in_the_engine_manifests_dir() {
         let (_root, paths) = temp_app_paths("engine-runtime-manifest-path");
         assert_eq!(
-            paths.engine_runtime_manifest_path("lemonade"),
+            paths.engine_install_manifest_path("lemonade"),
             paths.engine_manifests_dir("lemonade").join("runtime.json")
         );
     }

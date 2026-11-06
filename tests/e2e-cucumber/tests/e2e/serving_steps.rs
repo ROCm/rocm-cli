@@ -172,7 +172,7 @@ async fn serve_failure_evidence(
             move || {
                 app_paths
                     .expect("a Lemonade serve runs in an isolated scenario root")
-                    .engine_runtime_manifest_path("lemonade")
+                    .engine_install_manifest_path("lemonade")
             },
             engine,
             move || stop_services_in(isolated_root.as_deref()),
