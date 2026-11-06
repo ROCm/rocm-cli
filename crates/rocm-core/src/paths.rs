@@ -194,6 +194,16 @@ impl AppPaths {
         self.engine_dir(engine).join("manifests")
     }
 
+    /// The manifest an engine's installer writes for its installed runtime.
+    ///
+    /// One definition for the writer (the engine) and for every reader of the
+    /// file, so a reader cannot drift to a different name: a reader that
+    /// misses it degrades to "no manifest", which is indistinguishable from an
+    /// engine that was never installed.
+    pub fn engine_runtime_manifest_path(&self, engine: &str) -> PathBuf {
+        self.engine_manifests_dir(engine).join("runtime.json")
+    }
+
     pub fn engine_state_dir(&self, engine: &str) -> PathBuf {
         self.engine_dir(engine).join("state")
     }
@@ -355,6 +365,15 @@ mod tests {
             paths.data_dir.join("automations").join("proposals.jsonl")
         );
     }
+    #[test]
+    fn engine_runtime_manifest_lives_in_the_engine_manifests_dir() {
+        let (_root, paths) = temp_app_paths("engine-runtime-manifest-path");
+        assert_eq!(
+            paths.engine_runtime_manifest_path("lemonade"),
+            paths.engine_manifests_dir("lemonade").join("runtime.json")
+        );
+    }
+
     #[test]
     fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
         let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");

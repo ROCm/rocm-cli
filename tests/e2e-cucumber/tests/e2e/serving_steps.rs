@@ -160,10 +160,7 @@ async fn serve_failure_evidence(
     let backend_evidence = match engine {
         Some("lemonade") => Some(
             e2e_cucumber::lemonade_diagnostics::backend_evidence(
-                &world
-                    .app_paths()
-                    .engine_manifests_dir("lemonade")
-                    .join("runtime.json"),
+                &world.app_paths().engine_runtime_manifest_path("lemonade"),
             )
             .await,
         ),
