@@ -130,7 +130,7 @@ impl InstalledRuntimeManifest {
         !self.read_only && self.imported_from.is_none()
     }
 
-    fn normalize_host_paths(mut self) -> Self {
+    pub(crate) fn normalize_host_paths(mut self) -> Self {
         self.install_root = normalize_manifest_path(self.install_root);
         self.python_launcher = self
             .python_launcher

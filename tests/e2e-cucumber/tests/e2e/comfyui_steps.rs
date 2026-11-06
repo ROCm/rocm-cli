@@ -34,6 +34,15 @@
 //! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
+//! `comfyui-15` and `comfyui-16` cover the other half of that selection: with
+//! nothing chosen, the install recovers the runtime `rocm setup` created before
+//! it counts the ready ones, as `rocm serve` does, so a runtime the registry
+//! lost is found. They plant a ready runtime and the setup folder that names it,
+//! but no registry entry. `comfyui-15` previews the install with `--dry-run`,
+//! which prints the `--runtime-id` of the runtime it chose and writes nothing,
+//! so the registry still has no entry afterwards; `comfyui-16` runs the install
+//! against an existing checkout and finds the entry written back.
+//!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
 //! mirroring `download_progress_pty.feature`'s tarball scenario but for
 //! `download_and_extract_source`'s in-process `GzDecoder`/`tar` unpack, which
@@ -194,6 +203,21 @@ fn rocm_library_filename(shortname: &str) -> String {
 /// confusing downstream assertion instead of on the fixture. If this step starts
 /// failing after an edit here, suspect the manifest shape first.
 fn plant_ready_runtime(data: &Path, key: &str) {
+    let manifest = plant_ready_runtime_tree(data, key);
+    let registry = data.join("runtimes").join("registry");
+    std::fs::create_dir_all(&registry)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", registry.display()));
+    std::fs::write(
+        registry.join(format!("{key}.json")),
+        serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
+    )
+    .unwrap_or_else(|e| panic!("failed to write the planted runtime manifest: {e}"));
+}
+
+/// The on-disk half of [`plant_ready_runtime`]: the install root and what the
+/// readiness check needs under it. Returns the manifest JSON that describes it,
+/// leaving it to the caller whether the registry gets an entry.
+fn plant_ready_runtime_tree(data: &Path, key: &str) -> serde_json::Value {
     let install_root = data.join("runtimes").join("roots").join(key);
     let sdk_root = install_root.join("sdk");
     let sdk_bin = sdk_root.join("bin");
@@ -208,7 +232,7 @@ fn plant_ready_runtime(data: &Path, key: &str) {
     write_fixture(&amdhip, "stub");
     write_fixture(&hipblas, "stub");
 
-    let manifest = serde_json::json!({
+    serde_json::json!({
         "runtime_key": key,
         "runtime_id": key,
         "channel": "release",
@@ -229,16 +253,7 @@ fn plant_ready_runtime(data: &Path, key: &str) {
             ],
         },
         "installed_at_unix_ms": 1,
-    });
-
-    let registry = data.join("runtimes").join("registry");
-    std::fs::create_dir_all(&registry)
-        .unwrap_or_else(|e| panic!("failed to create {}: {e}", registry.display()));
-    std::fs::write(
-        registry.join(format!("{key}.json")),
-        serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
-    )
-    .unwrap_or_else(|e| panic!("failed to write the planted runtime manifest: {e}"));
+    })
 }
 
 /// Combined stdout+stderr of the recorded `rocm` invocation. The refusal is an
@@ -534,6 +549,126 @@ async fn refusal_lists_both_keys(world: &mut E2eWorld) {
             "refusal should list runtime key `{key}`, got:\n{text}"
         );
     }
+}
+
+// --- comfyui-15: the install finds the runtime setup created ---
+
+/// The one runtime `comfyui-15` plants. Not in [`RUNTIME_KEYS`], which are the
+/// two the ambiguity scenario needs.
+const SETUP_RUNTIME_KEY: &str = "e2e-setup-created-runtime";
+
+fn registry_dir(world: &E2eWorld) -> PathBuf {
+    data_dir(world).join("runtimes").join("registry")
+}
+
+#[given("a ready ROCm runtime that setup created and the registry has forgotten")]
+async fn plant_runtime_setup_created_and_registry_forgot(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    let manifest = plant_ready_runtime_tree(&data, SETUP_RUNTIME_KEY);
+    let install_root = data.join("runtimes").join("roots").join(SETUP_RUNTIME_KEY);
+    // The install tree's own copy of its manifest is what makes the registry
+    // entry recoverable. Without it recovery finds nothing to restore and the
+    // scenario would pass or fail for the wrong reason.
+    write_fixture(
+        &install_root.join(".rocm-cli-runtime.json"),
+        &serde_json::to_string_pretty(&manifest).expect("manifest serialises"),
+    );
+    // Black-box: plain JSON matching the CLI's on-disk config schema. `setup`
+    // naming the folder is what lets recovery find the tree; there is no
+    // registry entry, and that is the state under test.
+    write_fixture(
+        &root(world).join("config").join("config.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "setup": { "therock_venv": install_root.display().to_string() },
+        }))
+        .expect("config serialises"),
+    );
+    assert!(
+        !registry_dir(world)
+            .join(format!("{SETUP_RUNTIME_KEY}.json"))
+            .exists(),
+        "the registry must start without the runtime for this scenario to mean anything"
+    );
+}
+
+#[when("the user previews a ComfyUI install without choosing a runtime")]
+async fn preview_comfyui_install_without_runtime(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the preview selects that runtime")]
+async fn preview_selects_setup_runtime(world: &mut E2eWorld) {
+    let text = refusal_text(world);
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the preview should succeed, got:\n{text}"
+    );
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        stdout.lines().any(|line| line.contains("install command:")
+            && line.contains(&format!("--runtime-id {SETUP_RUNTIME_KEY}"))),
+        "the preview should name the runtime setup created in its install command, got:\n{text}"
+    );
+}
+
+#[then("the runtime registry has an entry for it again")]
+async fn registry_has_the_setup_runtime_again(world: &mut E2eWorld) {
+    let entry = registry_dir(world).join(format!("{SETUP_RUNTIME_KEY}.json"));
+    assert!(
+        entry.is_file(),
+        "selecting the runtime setup created should have written {} back",
+        entry.display()
+    );
+}
+
+/// A preview promises not to change files, and the registry entry is a file: the
+/// runtime it named is not registered by having been previewed.
+#[then("the runtime registry still has no entry for it")]
+async fn registry_still_lacks_the_setup_runtime(world: &mut E2eWorld) {
+    let entry = registry_dir(world).join(format!("{SETUP_RUNTIME_KEY}.json"));
+    assert!(
+        !entry.exists(),
+        "a `--dry-run` preview must not write {}",
+        entry.display()
+    );
+}
+
+#[given("a ComfyUI checkout that needs nothing beyond the runtime's torch stack")]
+async fn comfyui_checkout_needing_no_dependencies(world: &mut E2eWorld) {
+    let source_dir = data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(SETUP_RUNTIME_KEY)
+        .join("apps")
+        .join("comfyui")
+        .join("source");
+    // Every ComfyUI release has a `main.py`. The requirements name only the
+    // torch stack the runtime provides, which the install filters out, so it
+    // reaches no package index.
+    write_fixture(&source_dir.join("main.py"), "");
+    write_fixture(
+        &source_dir.join("requirements.txt"),
+        "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
+    );
+}
+
+#[then("the install uses the runtime setup created")]
+async fn install_uses_the_setup_runtime(world: &mut E2eWorld) {
+    let text = refusal_text(world);
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the install should succeed, got:\n{text}"
+    );
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        stdout.contains("action: install") && stdout.contains("ROCm runtime: 7.13.0"),
+        "the install should report the runtime setup created, got:\n{text}"
+    );
 }
 
 /// Pacing knobs for `comfyui-04`'s download server, mirroring

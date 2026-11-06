@@ -328,3 +328,34 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch stack is unchanged
     And no nvidia-* packages were added to the runtime
+
+  # With no runtime chosen, `rocm comfyui install` uses the one ready runtime,
+  # and it finds it the way `rocm serve` and `rocm engines install` do: it
+  # recovers the runtime `rocm setup` created first. A runtime whose registry
+  # entry was lost, but whose install tree still holds its own manifest and that
+  # setup names, therefore counts as the ready runtime, instead of the install
+  # refusing with "Install ROCm first" while setup has finished. The real run
+  # writes the lost registry entry back (comfyui-16); a `--dry-run` preview
+  # names the same runtime but leaves the registry as it found it, because it
+  # promises not to change files (this scenario). The preview prints the
+  # `--runtime-id` of the command it would run, which is how it shows the
+  # choice. No GPU is needed: readiness is filesystem and manifest state.
+  @id:comfyui-install-finds-the-runtime-setup-created
+  Scenario: comfyui-15 - A ComfyUI install preview finds the runtime setup created without writing the registry
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    And the runtime registry still has no entry for it
+
+  # The real run of the same install: it uses the runtime setup created and
+  # writes its lost registry entry back, so the runtime it installed into is one
+  # `rocm runtimes list` shows afterwards. The ComfyUI checkout is already in
+  # place and asks for nothing beyond the torch stack the runtime provides, so
+  # the install needs no network and no package index.
+  @id:comfyui-install-restores-the-runtime-setup-created
+  Scenario: comfyui-16 - A ComfyUI install restores the registry entry of the runtime setup created
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user installs ComfyUI without choosing a runtime
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
