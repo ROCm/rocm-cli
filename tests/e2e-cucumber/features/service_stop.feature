@@ -119,3 +119,52 @@ Feature: Stopping a managed service
     Then the CLI reports the stop as not confirmed and names no stop command
     And the server's record still names its process and the stop request
     And the report says only the record was kept, and there is no key file
+
+  # `rocm services stop`'s confirmed half with a real process. service-stop-01
+  # plants PID 0, so it never signals anything and cannot show what the stop
+  # leaves in the record; service-stop-02 shows it for the daemon's tool. This
+  # runs the CLI's own stop against a real recorded process and checks the
+  # persisted state it claims: the process exited, and the record names no
+  # process any more, so a second stop of that record would signal nothing (a
+  # PID recorded without a start-time token cannot be refuted once the OS
+  # recycles it). The unit test
+  # `a_confirmed_stop_clears_the_recorded_processes_so_a_second_stop_signals_nothing`
+  # covers the second stop itself.
+  #
+  # Linux-only for the same reason as service-stop-02: the recorded process
+  # carries the start-time token `/proc` gives it.
+
+  @id:service-stop-cli-confirms-a-stop-and-clears-the-record
+  @requires-os:linux
+  Scenario: service-stop-06 - `rocm services stop` of a running managed server confirms the stop and leaves no process in its record
+    Given a managed server whose recorded process is running
+    When the user stops it with --yes
+    Then the CLI reports the service as stopped
+    And the recorded process is no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
+
+  # The Windows half of the stop. A managed engine runs one level below the
+  # recorded process (the daemon launches it through an `__engine-serve-http`
+  # process), and `terminate_verified` cannot walk a process tree on Windows, so
+  # the stop first runs `taskkill /PID <pid> /T /F` on the recorded process.
+  # service-stop-01 plants PID 0 and never reaches that step, and the scenarios
+  # above need Linux's start-time token, so none of them kills a real tree.
+  #
+  # This records a real parent that has started a real child, stops it, and
+  # checks that BOTH are gone together with the report and the record. Without
+  # the tree-kill step the stop ends only the recorded process, the child keeps
+  # running, and the scenario fails on it. No GPU, no engine, no network. The
+  # record carries no start-time token, because Windows has none: the case the
+  # tree kill and the cleared record exist for.
+
+  @id:service-stop-takes-down-the-whole-process-tree-on-windows
+  @requires-os:windows
+  Scenario: service-stop-07 - Stopping a managed server on Windows takes down its recorded process together with the process it started
+    Given a managed server whose recorded process has started another process
+    When the user stops it with --yes
+    Then the CLI reports the service as stopped
+    And the report counts one stopped process
+    And the recorded process and the process it started are no longer running
+    And the server's record reads stopped and names no process
+    And the server's endpoint key file is gone
