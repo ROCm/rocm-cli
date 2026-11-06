@@ -45,8 +45,9 @@ use self::python::{
     ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
 };
 use self::resolve::{
-    AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
-    resolve_tarball_artifact, unverified_torchaudio_note, wheel_runtime_composition,
+    AggregateDeviceTarget, PipRuntimePlan, canonical_auto_select_needs_next_python,
+    preview_pip_runtime, resolve_pip_runtime, resolve_tarball_artifact, unverified_torchaudio_note,
+    wheel_runtime_composition,
 };
 pub(crate) use self::source::RuntimeVersionSelector;
 #[cfg(test)]
@@ -63,7 +64,10 @@ pub(crate) use self::version::runtime_version_display;
 use self::version::{
     parse_host_version, parse_version_for_ordering, runtime_version_build_date, version_relation,
 };
-use self::wheel_plan::{WheelPlan, write_dry_run_tail, write_wheel_plan};
+use self::wheel_plan::{
+    PlanStack, ResolvedStack, UNRESOLVED_PROGRESS, UnresolvedPreview, WheelPlan,
+    unresolved_wheel_preview, write_dry_run_tail, write_wheel_plan,
+};
 #[cfg(test)]
 pub(crate) use crate::runtime_registry::RocmSdkLibraryProbe;
 #[cfg(test)]
@@ -388,15 +392,50 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    let resolution = resolve_pip_runtime(
-        paths,
-        channel,
-        recovered_family_override.as_deref(),
-        &wheel_compatibility,
-        version_selector,
-        layout_override,
-        include_devel,
-    )?;
+    // A preview must not fetch `uv` either: on the ROCm 10 layout resolving the
+    // package versions runs `uv pip compile`, and a real install gets the managed
+    // `uv` for that by downloading it. A preview uses a `uv` that is already there
+    // and otherwise stops with what it can know without one, which says so. A real
+    // install and an update resolve, and so fetch, exactly as they always did.
+    let resolution = if dry_run {
+        match preview_pip_runtime(
+            paths,
+            channel,
+            recovered_family_override.as_deref(),
+            &wheel_compatibility,
+            version_selector,
+            layout_override,
+            include_devel,
+        )? {
+            PipRuntimePlan::Resolved(resolution) => resolution,
+            PipRuntimePlan::NeedsUv(unresolved) => {
+                progress_line(UNRESOLVED_PROGRESS);
+                let host_version_newer = host_rocm_version_newer_than(&unresolved.rocm_version);
+                return Ok(SdkInstallResult::plan(unresolved_wheel_preview(
+                    &UnresolvedPreview {
+                        channel,
+                        version_selector,
+                        unresolved: &unresolved,
+                        device_target_override,
+                        prefix: prefix.as_deref(),
+                        host_version_newer: host_version_newer.as_deref(),
+                        python: &python,
+                        wheel_compatibility: &wheel_compatibility,
+                    },
+                )));
+            }
+        }
+    } else {
+        resolve_pip_runtime(
+            paths,
+            channel,
+            recovered_family_override.as_deref(),
+            &wheel_compatibility,
+            version_selector,
+            layout_override,
+            include_devel,
+        )?
+    };
     let device_target = device_target_override.map_or_else(
         || resolution.device_target.clone(),
         |target| {
@@ -425,16 +464,10 @@ fn install_wheel_runtime(
     // filesystem scan for a legacy ROCm, and the summary block and the visible
     // note report the same answer about the same resolved version.
     let host_version_newer = host_rocm_version_newer_than(&resolution.latest_version);
-    let no_wheel_warning = repo_version_without_wheels(
+    let no_wheel_warning = no_wheel_warning_for(
         resolution.newest_repo_version.as_deref(),
         &resolution.latest_version,
-    )
-    .map(|newest| {
-        no_wheel_warning_message(
-            &newest,
-            &runtime_version_display(&resolution.latest_version),
-        )
-    });
+    );
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -445,20 +478,23 @@ fn install_wheel_runtime(
         family_source: &resolution.family_source,
         device_target: &device_target,
         host_version_newer: host_version_newer.as_deref(),
-        compatibility_key: &resolution.package_versions.compatibility_key,
-        install_root: &install_root,
-        runtime_key: &runtime_key,
         python: &python,
         wheel_compatibility: &wheel_compatibility,
         version_resolution_specs: resolution.version_resolution_specs.as_deref(),
         torchaudio_pin: resolution.torchaudio_pin.as_ref(),
-        package_specs: &wheel_composition.package_specs,
         no_wheel_warning: no_wheel_warning.as_deref(),
+        stack: PlanStack::Resolved(ResolvedStack {
+            compatibility_key: &resolution.package_versions.compatibility_key,
+            install_root: &install_root,
+            runtime_key: &runtime_key,
+            package_specs: &wheel_composition.package_specs,
+            manifest_path: &manifest_path,
+        }),
     };
     let mut output = String::new();
     write_wheel_plan(&mut output, &plan);
     if dry_run {
-        write_dry_run_tail(&mut output, &plan, &manifest_path);
+        write_dry_run_tail(&mut output, &plan);
         return Ok(SdkInstallResult::plan(output));
     }
 
@@ -717,6 +753,15 @@ fn no_wheel_warning_message(newest: &str, resolved_display: &str) -> String {
     format!(
         "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved_display} instead"
     )
+}
+
+/// The `warning` surfaced when the repository's newest version has no installable
+/// PyTorch wheels, or `None` when there is no such gap: [`repo_version_without_wheels`]
+/// decides whether there is one and [`no_wheel_warning_message`] words it. One call
+/// for a plan that is resolved and one that is not, so they cannot disagree.
+fn no_wheel_warning_for(newest_repo: Option<&str>, resolved_version: &str) -> Option<String> {
+    repo_version_without_wheels(newest_repo, resolved_version)
+        .map(|newest| no_wheel_warning_message(&newest, &runtime_version_display(resolved_version)))
 }
 
 /// The repo's newest version when it is strictly newer than the version we are

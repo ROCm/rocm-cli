@@ -601,3 +601,31 @@ Feature: Runtime configuration
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the preview requests the gfx1200 device extras
     And the preview resolved the versions with the uv that was present
+
+  # A preview is a promise that nothing on the machine changes, and runtime-23 held
+  # the Python half of it. The other half is `uv`: a preview of a ROCm 10 or newer
+  # wheel used to go and fetch the managed `uv` (creating the data folder's `tools`
+  # folder) because `uv pip compile` is the one step that knows the torch and
+  # torchvision versions. On a host with no `uv` the preview now runs nothing and
+  # downloads nothing. It prints what it can know without `uv` (the ROCm version,
+  # the torchaudio pin, the requirements `uv` would be asked about), says in a
+  # `resolution_note:` line and a progress line what it did not do, and marks the
+  # lines made from the missing versions as not resolved rather than printing a
+  # guess. A real install and `rocm update` still fetch `uv` as they always did.
+  #
+  # The Then checks the message and the state together: with no `uv` to log, the
+  # evidence is the folders. No managed `tools` folder, no tool archive in the
+  # scenario's own cache, no saved configuration, and no torch version anywhere in
+  # the output, so the unresolved lines are not covering for a guess. runtime-27
+  # is the other polarity: with a `uv` present the compile still runs.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. The decision is
+  # unit-tested for every combination of layout, who may fetch `uv` and whether one
+  # is present in `apps/rocm/src/therock/resolve/wheel.rs`, and the plan's
+  # wording in `apps/rocm/src/therock/wheel_plan.rs`, on every platform.
+  @id:runtime-install-preview-of-rocm-10-fetches-no-uv @requires-os:linux
+  Scenario: runtime-28 - Previewing a ROCm 10 SDK install on a host with no uv fetches none and says what it did not resolve
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a host with no uv and no usable Python
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview says it did not resolve the ROCm 10 package versions, as it says
