@@ -68,6 +68,10 @@ reason = "A vLLM serve of a short name does not resolve to lemonade's full model
 # `bug`, so a new #897 row needs `flaky = true` added explicitly. Failed serves
 # now capture configured pins, candidate executable paths and fingerprints
 # before stopping the service, and each candidate's --version/--help after it.
+# Revisit under EAI-7853 before deleting any of these rows: which lemonade build
+# a given run used could not be read back from this lane, and until a failed run
+# there has carried that evidence, an XPASS streak is not by itself evidence that
+# the bug is fixed.
 #
 # os=linux: native Windows passed (29338475133 Strix-Windows).
 [["serve-default-engine-working-endpoint"]]
