@@ -18,10 +18,11 @@
 //! warning cheaper.
 //!
 //! **Fail safe.** Whenever the affected set cannot be determined (`git diff`
-//! fails because the base is not fetched, `cargo metadata` fails, ...) the step
-//! runs over the whole workspace, as it did before, and says why. A step is
-//! skipped only when the selection is known and contains nothing for that step
-//! to check, and it prints the reason then too.
+//! fails because the base is not fetched, `cargo metadata` fails, the range lists
+//! no changed files at all, ...) the step runs over the whole workspace, as it
+//! did before, and says why. A step is skipped only when the selection is known
+//! and contains nothing for that step to check, and it prints the reason then
+//! too.
 //!
 //! The range comes from the refs prek exports to a pre-push hook:
 //! `PRE_COMMIT_FROM_REF` is the commit the remote already has (the remote
@@ -284,6 +285,12 @@ pub fn resolve_selection(
     let resolved = changed_files()
         .context("could not list the changed files")
         .and_then(|files| {
+            // The hook only runs when the push contains a Rust file, so a range
+            // that lists no changed files means the range is wrong, not that
+            // nothing changed.
+            if files.is_empty() {
+                bail!("the pushed range lists no changed files");
+            }
             let graph = load_graph().context("could not read the workspace dependency graph")?;
             Ok(hook_selection(&files, &graph))
         });
@@ -323,6 +330,12 @@ fn banner(check: Check, push: &Push, selection: &Selection, fallback: Option<&st
              checking the whole workspace",
             check.label()
         ),
+        // The claim about CI is backed by `.github/workflows/ci.yml`: the
+        // `windows-debug` job runs `cargo test --workspace --all-targets` on every
+        // change, and the `test` job selects `--workspace` for every event but
+        // `pull_request` (the merge queue and pushes to main). The test
+        // `the_banner_claim_about_ci_matches_the_workflow` fails if either stops
+        // being true, so change the text and that test together.
         None => format!(
             "pre-push-check {}: {} for the changes in {range}; CI's Windows job, merge queue \
              and main still check the whole workspace",
@@ -632,6 +645,37 @@ mod tests {
         assert_eq!(selection, Selection::Empty);
     }
 
+    /// The hook fires only for a push that contains a Rust file, so an empty
+    /// list of changed files is a wrong range (a base that is not an ancestor, a
+    /// from-ref equal to the pushed commit), not a clean push. Skipping all three
+    /// steps on it would turn a bad range into a silent pass.
+    #[test]
+    fn an_empty_list_of_changed_files_falls_back_to_the_whole_workspace_and_says_why() {
+        let (selection, fallback) = resolve_selection(|| Ok(graph()), || files(&[]));
+        assert_eq!(selection, Selection::Workspace);
+        let reason = fallback.expect("an empty range gives a reason");
+        assert!(reason.contains("lists no changed files"), "{reason}");
+        // Every step then runs over the workspace instead of skipping.
+        for check in [Check::Clippy, Check::ClippyE2e, Check::Test] {
+            assert!(
+                matches!(plan(check, &selection), Plan::Cargo(_)),
+                "{check:?}"
+            );
+        }
+        // The banner names the fallback and the reason, not a narrowed scope.
+        let line = banner(
+            Check::Test,
+            &push_from_env(None, None),
+            &selection,
+            Some(&reason),
+        );
+        assert!(
+            line.contains("could not determine the affected crates"),
+            "{line}"
+        );
+        assert!(line.contains("lists no changed files"), "{line}");
+    }
+
     #[test]
     fn a_failed_diff_falls_back_to_the_whole_workspace_and_says_why() {
         let (selection, fallback) = resolve_selection(
@@ -696,6 +740,44 @@ mod tests {
         assert!(
             line.contains("Windows job, merge queue and main still check the whole workspace"),
             "{line}"
+        );
+    }
+
+    /// The banner tells the developer that the narrowing only affects the local
+    /// hook. That is true while CI's Windows job tests the whole workspace and the
+    /// `test` job is forced to `--workspace` outside pull requests; this reads the
+    /// workflow so the claim cannot go stale without a test failing.
+    #[test]
+    fn the_banner_claim_about_ci_matches_the_workflow() {
+        let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+            .expect("read ci.yml");
+        let mut windows_debug = String::new();
+        let mut inside = false;
+        for line in workflow.lines() {
+            if line == "  windows-debug:" {
+                inside = true;
+                continue;
+            }
+            // The next job key at two-space indent ends the job.
+            let next_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && !line.trim_start().starts_with('#');
+            if inside && next_key {
+                break;
+            }
+            if inside {
+                windows_debug.push_str(line);
+                windows_debug.push('\n');
+            }
+        }
+        assert!(
+            windows_debug.contains("cargo test --workspace --all-targets"),
+            "the `windows-debug` job no longer tests the whole workspace; update the banner text"
+        );
+        assert!(
+            workflow.contains("\"${{ github.event_name }}\" = \"pull_request\"")
+                && workflow.contains("sel=\"--workspace\""),
+            "the `test` job no longer forces `--workspace` outside pull requests; update the banner text"
         );
     }
 
@@ -1796,11 +1878,26 @@ mod tests {
     /// Collects the files under `dir`, skipping build output, vendored trees and
     /// every dot-directory (`.git`, `.rocm-work`, and nested checkouts such as
     /// `.claude/worktrees/...`, whose sources belong to another branch).
+    ///
+    /// Symbolic links are neither followed nor listed: a link loop would recurse
+    /// until the OS refuses, and a link out of the tree would scan files that are
+    /// not this workspace's. A directory that cannot be read contributes nothing
+    /// instead of failing the test, since a push should not be blocked by a folder
+    /// the developer has no access to.
     fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
         const SKIPPED: &[&str] = &["target", "node_modules", "third_party"];
-        for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if kind.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_str().unwrap_or_default();
                 if !name.starts_with('.') && !SKIPPED.contains(&name) {
@@ -1817,21 +1914,6 @@ mod tests {
             .expect("under the repo root")
             .to_string_lossy()
             .replace('\\', "/")
-    }
-
-    /// The workspace crates, found from their manifests on disk.
-    fn crates_on_disk(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
-        files
-            .iter()
-            .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
-            .filter_map(|path| {
-                let manifest: toml::Value =
-                    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-                let name = manifest.get("package")?.get("name")?.as_str()?.to_string();
-                let dir = relative(root, path.parent()?);
-                (!dir.is_empty()).then_some((name, dir))
-            })
-            .collect()
     }
 
     /// A raw-string include is a cross-crate read like any other; the scanner
@@ -1879,16 +1961,83 @@ mod tests {
         assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
     }
 
+    /// A link that points back up the tree would be followed forever, and one
+    /// that points out of it would scan files that are not this workspace's. Neither
+    /// is descended into or listed.
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symbolic_links() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(outside.path().join("elsewhere.rs"), "").expect("write");
+        let a = tmp.path().join("crates/a");
+        std::fs::create_dir_all(a.join("src")).expect("mkdir");
+        std::fs::write(a.join("src/lib.rs"), "").expect("write");
+        std::os::unix::fs::symlink(tmp.path(), a.join("loop")).expect("link up the tree");
+        std::os::unix::fs::symlink(outside.path(), a.join("out")).expect("link out of the tree");
+        std::os::unix::fs::symlink(a.join("src/lib.rs"), a.join("alias.rs")).expect("file link");
+        let mut files = Vec::new();
+        walk(tmp.path(), &mut files);
+        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
+        assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
+    }
+
+    /// A folder the developer cannot read must not fail the scan (and so block
+    /// a push); the files that can be read are still found. Running as root
+    /// reads everything, so this only asserts that nothing panics and that the
+    /// readable file is there.
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_an_unreadable_directory_instead_of_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        for file in ["crates/a/src/lib.rs", "private/hidden.rs"] {
+            let path = tmp.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "").expect("write");
+        }
+        let private = tmp.path().join("private");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
+            .expect("remove access");
+        let mut files = Vec::new();
+        walk(tmp.path(), &mut files);
+        // Restore access first so the temp dir can be removed even if an assert fails.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
+            .expect("restore access");
+        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
+        assert!(
+            found.contains(&"crates/a/src/lib.rs".to_string()),
+            "{found:?}"
+        );
+    }
+
     /// Fails when a crate reads a file outside its own directory that the hook's
     /// selection would not send to that crate's tests, or when a crate derives
     /// the repo root without being declared as a reader. Add the path to
     /// [`CROSS_CRATE_READS`] (or declare the crate) when this fails.
+    ///
+    /// What it can see is limited. An `include_str!`/`include_bytes!` literal and
+    /// a `env!("CARGO_MANIFEST_DIR")` chain that ends in literal `.join("...")`
+    /// segments name their file, and that file is checked. A chain that only
+    /// derives the repo root and is joined somewhere else (a helper such as
+    /// `repo_root()`) is recorded as a root derivation: the guard then requires
+    /// the crate to be declared as a reader in [`CROSS_CRATE_READS`], but not
+    /// that the files it goes on to read are covered. A test that reads a new kind
+    /// of file (a `Cargo.toml` or a `.feature` of another crate) through such a
+    /// root is selected only as that file's own crate, so its entry in
+    /// [`CROSS_CRATE_READS`] has to be added by hand. Widening the rule would need
+    /// data flow through helper functions, which a text scan cannot give exactly.
     #[test]
     fn every_cross_crate_read_is_covered_by_the_widening_rule() {
         let root = repo_root();
         let mut files = Vec::new();
         walk(&root, &mut files);
-        let crate_dirs = crates_on_disk(&root, &files);
+        // The workspace members, from the same `cargo metadata` the hook selects
+        // with, so a stray `Cargo.toml` (a fixture, a nested checkout) is not
+        // taken for a workspace crate.
+        let crate_dirs = affected::load_graph()
+            .expect("read the workspace graph")
+            .crate_dirs;
         assert!(
             crate_dirs.iter().any(|(name, _)| name == "xtask"),
             "found no crates under {}",

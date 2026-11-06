@@ -611,16 +611,36 @@ mod tests {
         for var in GIT_REPO_ENV {
             assert_eq!(envs.get(*var), Some(&true), "{var} is not cleared");
         }
-        assert!(
-            [
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-                "GIT_COMMON_DIR"
-            ]
-            .iter()
-            .all(|var| GIT_REPO_ENV.contains(var))
-        );
+    }
+
+    /// The loop above only checks the variables [`GIT_REPO_ENV`] lists, so it
+    /// cannot notice one missing from the list. This one runs git: with the
+    /// repository-selecting variables a hook exports pointing at another
+    /// repository, a scrubbed `git -C <repo>` must still resolve to `<repo>`.
+    #[test]
+    fn scrubbed_git_ignores_a_repository_a_hook_exported() {
+        let outer = tempfile::tempdir().expect("outer repo");
+        let inner = tempfile::tempdir().expect("inner repo");
+        git_in(outer.path(), &["init", "-q"]);
+        git_in(inner.path(), &["init", "-q"]);
+        let resolve = |arg: &str| {
+            let mut git = Command::new("git");
+            git.env("GIT_DIR", outer.path().join(".git"))
+                .env("GIT_WORK_TREE", outer.path());
+            scrub_git_env(&mut git);
+            let output = git
+                .arg("-C")
+                .arg(inner.path())
+                .args(["rev-parse", arg])
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git rev-parse {arg} failed");
+            std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("git printed an existing path")
+        };
+        let inner_root = std::fs::canonicalize(inner.path()).expect("inner path");
+        assert_eq!(resolve("--show-toplevel"), inner_root);
+        assert_eq!(resolve("--absolute-git-dir"), inner_root.join(".git"));
     }
 
     /// A file moved from one crate to another must select both crates. With git's

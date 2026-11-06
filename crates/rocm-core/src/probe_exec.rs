@@ -164,8 +164,12 @@ pub(crate) const MEDIUM: Duration = Duration::from_secs(8);
 /// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
 /// slice would panic when the cut lands inside a multibyte character.
 ///
-/// `pub(crate)` because [`crate::process`] bounds its timeout quote with the
-/// same marker, and a second copy here would be free to drift from it.
+/// `pub(crate)` because two other places bound a quote with the same marker and
+/// a second copy here would be free to drift from them: [`crate::process`] for
+/// its timeout quote, and [`crate::amd_smi`] for the `amd-smi` failure quote,
+/// which bounds raw child output for the same reason the examination bounds
+/// captured text. Those two also share one character budget, declared once in
+/// [`crate::process`].
 /// (`host_gpu/diagnostics.rs`'s `truncate_diagnostic_line` is a different function with a
 /// different marker — plain `...` — not a third copy of this one.)
 pub(crate) fn truncate_to_chars(value: String, max_chars: usize) -> String {
