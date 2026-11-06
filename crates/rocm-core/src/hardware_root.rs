@@ -23,7 +23,8 @@
 //! - the WSL plumbing: the `/usr/lib/wsl/lib` directory check and
 //!   `/usr/lib/wsl/lib/libdxcore.so`;
 //! - the WSL ROCDXG check: `lib/librocdxg.so` and `share/rocdxg/dids.conf`,
-//!   looked for under `/opt/rocm` and under each discovered ROCm install;
+//!   looked for under `/opt/rocm` and under each discovered ROCm install,
+//!   and `lib/librocdxg.so` again in each directory on `LD_LIBRARY_PATH`;
 //! - the container markers `/.dockerenv` and `/run/.containerenv`.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
