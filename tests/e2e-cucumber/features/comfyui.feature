@@ -95,6 +95,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # label-truncation fix in `cli_progress::assemble_status_line` — the
   # tarball scenario in `download_progress_pty.feature` is the regression
   # test for that.
+  # The fixture also switches the CLI's startup update check off. The planted
+  # runtime would otherwise make the check run first, before the install
+  # reaches its download: it fetches `uv` and a managed Python from the network
+  # and prints that progress on this terminal, and on a slow network it
+  # outlasts the 30s wait for the intermediate frame.
   # Linux-only: this scenario drives `rocm` under a real PTY, the same
   # suite-wide limitation `dash.feature`'s header comment documents
   # (portable-pty compiles on Windows via ConPTY, but that path isn't yet

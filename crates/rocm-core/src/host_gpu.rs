@@ -82,7 +82,7 @@ use windows_inventory::{
 use wsl::detect_wsl_windows_display_probe_text;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
-pub use wsl::{WslHostDriverProbe, is_wsl_host};
+pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
     ldconfig_cache, ldconfig_lists_librocdxg,
@@ -161,9 +161,30 @@ pub struct WslSummary {
     pub librocdxg: bool,
     pub rocdxg_dids: bool,
     pub ldconfig_librocdxg: bool,
+    /// `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the loader
+    /// searches before the linker cache. Absent from output written before the
+    /// field existed, hence the default.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
+    /// `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`,
+    /// which finds it through its own `$ORIGIN` runpath with no cache entry and
+    /// no `LD_LIBRARY_PATH`. Absent from output written before the field
+    /// existed, hence the default.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     pub rocminfo: bool,
     pub cargo: bool,
     pub detail: Option<String>,
+}
+
+impl WslSummary {
+    /// `librocdxg.so` exists under a ROCm install or in a directory on
+    /// `LD_LIBRARY_PATH`. The variable is the only source for a library that sits
+    /// outside every ROCm root, such as a source build in a home directory.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

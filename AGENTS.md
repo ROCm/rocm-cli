@@ -254,6 +254,7 @@ CLI:
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
 - [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtimes list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`JsonOrText`**/**`print_json_or_text`** — a command with a `--json` flag that prints one value either way implements `JsonOrText` (`render_text` returns the whole text form) and calls `print_json_or_text(json, &value)`, which writes pretty JSON plus one newline or the text verbatim and returns an error if serialization or the write fails (e.g. `rocm storage report`, `rocm diagnose`); new commands should use it instead of writing `if json { serde_json::to_string_pretty(..) } else { .. }`, and existing `--json` call sites move over as they are touched. Streaming output, output whose JSON and text differ in shape, and commands that interleave other work (side effects, audit events) with the printing stay hand-written
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
@@ -269,9 +270,10 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
 Guardrails:
 
-- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum and its dispatch function usually stay in `main.rs`, though not always — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
+- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum usually goes in [`cli.rs`](apps/rocm/src/cli.rs) with the rest of the command tree, and its dispatch function usually stays in `main.rs`; `bootstrap.rs` and `remote/mod.rs` are the exceptions that own their enum and dispatch outright — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
+- source file size is checked by `cargo xtask check-module-size` ([`module_size.rs`](xtask/src/module_size.rs)): no source file may exceed 1,500 production lines (test-gated items excluded), with one limit for every file and no exemption mechanism. A PR that would push a file past it splits the file in the same change; do not raise the limit or opt a file out. Merely editing a file that is already over the limit does not by itself require a split: those files are split under their own tickets, and the check cannot become blocking until none is left. Today the CI step and pre-commit hook only report; see `docs/architecture.md`
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
@@ -334,9 +336,10 @@ on two counts, and both change how you edit it:
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in [fix/catalog.rs](crates/rocm-core/src/fix/catalog.rs)
-  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
-  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
-  means changing the CLI **first**, then the two docs. That feature is what
+  (the `RECIPES` list) and [diagnose.rs](crates/rocm-core/src/diagnose.rs) with
+  the modules it declares, such as [catalog.rs](crates/rocm-core/src/diagnose/catalog.rs)
+  (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
+  failure mode means changing the CLI **first**, then the two docs. That feature is what
   catches you if you forget. Two sentences in
   [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
   sentence "requires `contract_version` N or higher": scenario skill-07 parses
