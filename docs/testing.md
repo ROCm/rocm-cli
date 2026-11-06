@@ -964,16 +964,31 @@ and `version.txt`,
 and each candidate's `--version` and `--help` output. Candidates are searched
 under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
 `bin/llamacpp`, down to three directory levels below each; the cpu backend is not
-searched. When nothing is found, the report lists those locations and what
-`bin/llamacpp` holds, and does not guess at the cause: an interrupted download, a
-layout outside the search and a build that was never installed look the same.
+searched. The search is bounded as a whole, not per directory: it reads at most
+128 directories and 2048 directory entries across all four backend directories,
+stops as soon as it has eight candidates, and stops when the inventory's time is
+up, checking the clock at every directory and entry. Siblings are visited in
+sorted order, so a search that finishes inside its limits is deterministic.
+Symlinks are never followed: only real directories are entered and only a regular
+file named `llama-server` counts, so a link cycle ends and a link out of the
+backend directory is not read; the report says how many symlinked entries it
+declined to follow. When a limit or the clock ends the search early the report
+says which, and does not claim an empty result. When nothing is found, the report
+lists the searched locations and what `bin/llamacpp` holds (the first 16 names
+out of at most 64 entries read, with a count of those omitted), and does not
+guess at the cause: an interrupted download, a layout outside the search and a
+build that was never installed look the same. The manifest and pin reads, the
+search and each candidate's fingerprint run on blocking threads, never on an
+async worker, and the search carries its own deadline because a timeout around a
+blocking task would only drop its handle.
 At most eight candidates
 are hashed and probed, with two read-only probes per candidate. Each probe retains
 up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
 marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
 output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
-Each probe has a five-second timeout. The inventory, including hashing, has a
-20-second budget and the probes have their own 20-second budget, which starts
+Each probe has a five-second timeout. The inventory has a 20-second budget that
+starts when it is entered and covers the manifest and pin reads, the search and
+the hashing; the probes have their own 20-second budget, which starts
 when the service stop returns; hashing runs off the async executor, rejects files
 over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
 one buffer whatever the size. The cap sits well above a dynamically linked

@@ -157,22 +157,57 @@ impl Inventory {
     }
 }
 
+/// Answers "has the inventory's time run out?". Injected so a test can drive the
+/// traversal's deadline without sleeping; the real one compares against an
+/// [`Instant`]. `Arc` because the scan runs on a blocking thread.
+type Expired = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Record the installed version and pins separately from executable build output:
 /// a pin describes what should be installed, not what a runner actually cached.
 ///
 /// Every candidate is labelled as such; finding a binary does not prove that the
 /// router launched it. Nothing here executes anything. No install, download,
 /// model load, or cache repair is done.
+///
+/// The budget starts here, at entry, and covers the manifest and pin reads, the
+/// directory search and the hashing alike.
 async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
+    let deadline = Instant::now() + budget;
+    take_inventory_with(
+        manifest_path,
+        deadline,
+        SEARCH_LIMITS,
+        std::sync::Arc::new(move || Instant::now() >= deadline),
+    )
+    .await
+}
+
+/// What [`scan_runtime`] read from disk.
+enum Scan {
+    /// The manifest could not be used; the report says why.
+    Unavailable(String),
+    Found {
+        /// Manifest fields and pins.
+        report: String,
+        discovery: Discovery,
+        /// Where an empty search looked, when it found nothing and was not cut short
+        /// by the clock.
+        empty_note: Option<String>,
+    },
+}
+
+/// Everything the inventory reads before it hashes anything: the manifest, the
+/// pins and the directory search. Blocking filesystem work, so it runs on a
+/// blocking thread; it carries its own clock because a `timeout` around
+/// `spawn_blocking` would only drop the join handle and leave this running.
+fn scan_runtime(manifest_path: &Path, limits: SearchLimits, expired: &dyn Fn() -> bool) -> Scan {
     let mut report = String::new();
     let _ = writeln!(report, "manifest: {}", manifest_path.display());
     let manifest = match read_clamped(manifest_path, MAX_EVIDENCE_BYTES).and_then(|(bytes, _)| {
         serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
     }) {
         Ok(manifest) => manifest,
-        Err(error) => {
-            return Inventory::without_probes(format!("{report}unavailable: {error}"));
-        }
+        Err(error) => return Scan::Unavailable(format!("{report}unavailable: {error}")),
     };
     for key in ["version", "backend_recipe", "backend_name", "runtime_dir"] {
         let _ = writeln!(
@@ -185,7 +220,7 @@ async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
         .get("runtime_dir")
         .and_then(serde_json::Value::as_str)
     else {
-        return Inventory::without_probes(format!(
+        return Scan::Unavailable(format!(
             "{report}backend inventory unavailable: no runtime_dir"
         ));
     };
@@ -200,13 +235,103 @@ async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
             let _ = writeln!(report, "{}: {error}", pins.display());
         }
     }
-    let candidates = backend_candidates(runtime);
-    if candidates.is_empty() {
-        let _ = writeln!(report, "{}", empty_search_note(runtime));
+    let discovery = discover_candidates(runtime, limits, expired);
+    let empty_note = (discovery.candidates.is_empty()
+        && !matches!(discovery.stop, Some(Stop::Deadline)))
+    .then(|| empty_search_note(runtime));
+    Scan::Found {
+        report,
+        discovery,
+        empty_note,
     }
-    let deadline = Instant::now() + budget;
+}
+
+/// One candidate's fingerprint and `version.txt`, rendered. Blocking reads, run on
+/// a blocking thread with the inventory's deadline checked between hash reads.
+fn inspect_candidate(server: &Path, deadline: Instant) -> String {
+    let mut report = String::new();
+    match fingerprint(server, deadline) {
+        Ok(hash) => {
+            let _ = writeln!(report, "sha256: {hash}");
+        }
+        Err(error) => {
+            let _ = writeln!(report, "sha256 unavailable: {error}");
+        }
+    }
+    if let Some(parent) = server.parent() {
+        let version = parent.join("version.txt");
+        if let Ok((bytes, note)) = read_clamped(&version, MAX_EVIDENCE_BYTES) {
+            let _ = writeln!(
+                report,
+                "{}: {}{note}",
+                version.display(),
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+    report
+}
+
+async fn take_inventory_with(
+    manifest_path: &Path,
+    deadline: Instant,
+    limits: SearchLimits,
+    expired: Expired,
+) -> Inventory {
+    let scan_path = manifest_path.to_owned();
+    let scan_clock = expired.clone();
+    let scan =
+        tokio::task::spawn_blocking(move || scan_runtime(&scan_path, limits, scan_clock.as_ref()))
+            .await;
+    let (mut report, discovery, empty_note) = match scan {
+        Ok(Scan::Found {
+            report,
+            discovery,
+            empty_note,
+        }) => (report, discovery, empty_note),
+        Ok(Scan::Unavailable(report)) => return Inventory::without_probes(report),
+        Err(error) => {
+            return Inventory::without_probes(format!(
+                "manifest: {}\nunavailable: inventory scan failed: {error}",
+                manifest_path.display()
+            ));
+        }
+    };
+    if let Some(note) = empty_note {
+        let _ = writeln!(report, "{note}");
+    }
+    match discovery.stop {
+        Some(Stop::Deadline) => {
+            let _ = writeln!(
+                report,
+                "remaining evidence skipped: evidence budget exhausted"
+            );
+        }
+        Some(Stop::Directories) => {
+            let _ = writeln!(
+                report,
+                "candidate search stopped: {} directories visited (limit)",
+                discovery.dirs_visited
+            );
+        }
+        Some(Stop::Entries) => {
+            let _ = writeln!(
+                report,
+                "candidate search stopped: {} directory entries read (limit)",
+                discovery.entries_read
+            );
+        }
+        Some(Stop::Candidates) | None => {}
+    }
+    if discovery.symlinks_skipped > 0 {
+        let _ = writeln!(
+            report,
+            "{} symlinked entries under the backend directories were not followed",
+            discovery.symlinks_skipped
+        );
+    }
     let mut servers = Vec::new();
-    for server in candidates.iter().take(MAX_CANDIDATES) {
+    for server in &discovery.candidates {
         if Instant::now() >= deadline {
             let _ = writeln!(
                 report,
@@ -221,34 +346,18 @@ async fn take_inventory(manifest_path: &Path, budget: Duration) -> Inventory {
         );
         servers.push(server.clone());
         let path = server.clone();
-        match tokio::task::spawn_blocking(move || fingerprint(&path, deadline))
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|result| result)
-        {
-            Ok(hash) => {
-                let _ = writeln!(report, "sha256: {hash}");
-            }
+        match tokio::task::spawn_blocking(move || inspect_candidate(&path, deadline)).await {
+            Ok(lines) => report.push_str(&lines),
             Err(error) => {
                 let _ = writeln!(report, "sha256 unavailable: {error}");
             }
         }
-        if let Some(parent) = server.parent() {
-            let version = parent.join("version.txt");
-            if let Ok((bytes, note)) = read_clamped(&version, MAX_EVIDENCE_BYTES) {
-                let _ = writeln!(
-                    report,
-                    "{}: {}{note}",
-                    version.display(),
-                    String::from_utf8_lossy(&bytes)
-                );
-            }
-        }
     }
-    if candidates.len() > MAX_CANDIDATES {
+    if matches!(discovery.stop, Some(Stop::Candidates)) {
         let _ = writeln!(
             report,
-            "backend inventory truncated after {MAX_CANDIDATES} candidates"
+            "backend inventory truncated after {MAX_CANDIDATES} candidates \
+             (the search stops there; more may exist)"
         );
     }
     Inventory { report, servers }
@@ -262,11 +371,54 @@ const BACKEND_DIRS: [&str; 4] = ["rocm-stable", "rocm-nightly", "rocm", "vulkan"
 /// unpacks some llama.cpp builds into a build-numbered directory, and the layout
 /// is the router's to choose, so the search is not pinned to one level.
 const MAX_SEARCH_DEPTH: usize = 3;
-/// Directory entries read per directory, so a corrupt tree cannot make the
-/// search unbounded.
-const MAX_DIR_ENTRIES: usize = 256;
 /// Names listed when explaining an empty search.
 const MAX_LISTED_NAMES: usize = 16;
+/// Directory entries read to build that listing. Bounded so a huge `bin/llamacpp`
+/// cannot make the explanation of an empty search expensive; the report says how
+/// many names it left out.
+const MAX_LISTING_SCAN: usize = 64;
+
+/// Global bounds on one candidate search. They apply to the whole search, across
+/// every backend directory, not per directory: a tree of many shallow directories
+/// is as expensive as a deep one.
+#[derive(Clone, Copy)]
+struct SearchLimits {
+    /// Directories whose entries are read.
+    dirs: usize,
+    /// Directory entries read, in total.
+    entries: usize,
+    /// Candidates collected; the search stops as soon as it has this many.
+    candidates: usize,
+}
+
+const SEARCH_LIMITS: SearchLimits = SearchLimits {
+    dirs: 128,
+    entries: 2048,
+    candidates: MAX_CANDIDATES,
+};
+
+/// Why a candidate search ended before it had looked everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Deadline,
+    Directories,
+    Entries,
+    Candidates,
+}
+
+#[derive(Debug, Default)]
+struct Discovery {
+    /// In a fixed order: backend directories as listed, then sibling directories
+    /// sorted by path.
+    candidates: Vec<PathBuf>,
+    stop: Option<Stop>,
+    /// Symlinks met and not followed. A cache that links out of its backend
+    /// directory, or back into it, is neither searched nor allowed to loop the
+    /// search.
+    symlinks_skipped: usize,
+    dirs_visited: usize,
+    entries_read: usize,
+}
 
 const fn server_binary() -> &'static str {
     if cfg!(windows) {
@@ -276,38 +428,98 @@ const fn server_binary() -> &'static str {
     }
 }
 
-fn backend_candidates(runtime: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+/// Look for `llama-server` under each backend directory, within `limits` and until
+/// `expired` says time is up. Symlinks are never followed: only real directories
+/// are entered and only a regular file counts as a candidate, so a link cycle
+/// ends and a link out of the tree is not read.
+fn discover_candidates(
+    runtime: &Path,
+    limits: SearchLimits,
+    expired: &dyn Fn() -> bool,
+) -> Discovery {
+    let mut search = Search {
+        limits,
+        expired,
+        out: Discovery::default(),
+    };
     for backend in BACKEND_DIRS {
-        collect_candidates(
-            &runtime.join("bin/llamacpp").join(backend),
-            0,
-            &mut candidates,
-        );
+        let dir = runtime.join("bin/llamacpp").join(backend);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => search.visit(&dir, 0),
+            Ok(meta) if meta.file_type().is_symlink() => search.out.symlinks_skipped += 1,
+            _ => {}
+        }
+        if search.out.stop.is_some() {
+            break;
+        }
     }
-    candidates
+    search.out
 }
 
-fn collect_candidates(dir: &Path, depth: usize, candidates: &mut Vec<PathBuf>) {
-    let direct = dir.join(server_binary());
-    if direct.is_file() {
-        candidates.push(direct);
+struct Search<'a> {
+    limits: SearchLimits,
+    expired: &'a dyn Fn() -> bool,
+    out: Discovery,
+}
+
+impl Search<'_> {
+    fn stop(&mut self, why: Stop) {
+        self.out.stop.get_or_insert(why);
     }
-    if depth >= MAX_SEARCH_DEPTH {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut subdirs: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .take(MAX_DIR_ENTRIES)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    subdirs.sort();
-    for subdir in subdirs {
-        collect_candidates(&subdir, depth + 1, candidates);
+
+    fn visit(&mut self, dir: &Path, depth: usize) {
+        if self.out.stop.is_some() {
+            return;
+        }
+        if (self.expired)() {
+            self.stop(Stop::Deadline);
+            return;
+        }
+        if self.out.dirs_visited >= self.limits.dirs {
+            self.stop(Stop::Directories);
+            return;
+        }
+        self.out.dirs_visited += 1;
+        let direct = dir.join(server_binary());
+        // A symlink named llama-server is not a candidate (and is counted below,
+        // as a directory entry, not here).
+        if std::fs::symlink_metadata(&direct).is_ok_and(|meta| meta.is_file()) {
+            self.out.candidates.push(direct);
+        }
+        if self.out.candidates.len() >= self.limits.candidates {
+            self.stop(Stop::Candidates);
+            return;
+        }
+        if depth >= MAX_SEARCH_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut subdirs = Vec::new();
+        for entry in entries {
+            if (self.expired)() {
+                self.stop(Stop::Deadline);
+                break;
+            }
+            if self.out.entries_read >= self.limits.entries {
+                self.stop(Stop::Entries);
+                break;
+            }
+            self.out.entries_read += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => subdirs.push(entry.path()),
+                Ok(kind) if kind.is_symlink() => self.out.symlinks_skipped += 1,
+                _ => {}
+            }
+        }
+        subdirs.sort();
+        for subdir in subdirs {
+            self.visit(&subdir, depth + 1);
+        }
     }
 }
 
@@ -325,19 +537,24 @@ fn empty_search_note(runtime: &Path) -> String {
     let present = match std::fs::read_dir(&llamacpp) {
         Ok(entries) => {
             let mut names: Vec<String> = entries
+                .take(MAX_LISTING_SCAN)
                 .filter_map(Result::ok)
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect();
+            let hit_scan_cap = names.len() >= MAX_LISTING_SCAN;
             names.sort();
             if names.is_empty() {
                 format!("{} is empty", llamacpp.display())
             } else {
-                let more = names.len().saturating_sub(MAX_LISTED_NAMES);
+                let omitted = names.len().saturating_sub(MAX_LISTED_NAMES);
                 names.truncate(MAX_LISTED_NAMES);
-                let more = if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
+                let more = match (omitted, hit_scan_cap) {
+                    (0, false) => String::new(),
+                    (_, false) => format!(" and {omitted} more"),
+                    (_, true) => format!(
+                        " and at least {omitted} more (only the first {MAX_LISTING_SCAN} \
+                         entries were read)"
+                    ),
                 };
                 format!(
                     "{} contains: {}{more}",
@@ -505,6 +722,17 @@ async fn drain_output(
 mod tests {
     use super::*;
 
+    fn candidates(runtime: &Path) -> Vec<PathBuf> {
+        discover_candidates(runtime, SEARCH_LIMITS, &|| false).candidates
+    }
+
+    fn touch_server(dir: &Path) -> PathBuf {
+        let server = dir.join(server_binary());
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&server, "").unwrap();
+        server
+    }
+
     async fn evidence(manifest: &Path) -> String {
         evidence_with(manifest, DEFAULT_BUDGETS).await
     }
@@ -630,7 +858,7 @@ mod tests {
         let cpu = root.path().join("bin/llamacpp/cpu").join(binary);
         std::fs::create_dir_all(cpu.parent().unwrap()).unwrap();
         std::fs::write(cpu, "").unwrap();
-        assert_eq!(backend_candidates(root.path()), wanted);
+        assert_eq!(candidates(root.path()), wanted);
     }
 
     #[test]
@@ -647,7 +875,7 @@ mod tests {
             std::fs::write(server, "").unwrap();
         }
         assert_eq!(
-            backend_candidates(root.path()),
+            candidates(root.path()),
             // Sorted by path, so `a/b/...` precedes `a/build/...`.
             vec![found_at_three, found_at_two]
         );
@@ -687,6 +915,236 @@ mod tests {
         let bare = tempfile::tempdir().unwrap();
         let report = evidence(&write_manifest(bare.path())).await;
         assert!(report.contains("cannot be read"), "{report}");
+    }
+
+    fn limits(dirs: usize, entries: usize) -> SearchLimits {
+        SearchLimits {
+            dirs,
+            entries,
+            candidates: MAX_CANDIDATES,
+        }
+    }
+
+    /// The clock is read while the tree is walked, not once before it: it reports
+    /// time up from its third reading on, so the walk must end partway through,
+    /// with what it had already found and the reason it stopped.
+    #[test]
+    fn the_clock_is_checked_during_the_walk() {
+        let root = tempfile::tempdir().unwrap();
+        let wanted: Vec<PathBuf> = BACKEND_DIRS
+            .iter()
+            .map(|backend| touch_server(&root.path().join("bin/llamacpp").join(backend)))
+            .collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        });
+        assert_eq!(found.stop, Some(Stop::Deadline));
+        assert_eq!(found.candidates, wanted[..1], "{found:?}");
+        let all = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
+        assert_eq!(all.candidates, wanted);
+        assert_eq!(all.stop, None);
+    }
+
+    /// The same, through the inventory: a clock that is already up stops the search
+    /// even though the hashing deadline is far off, so the walk consults the
+    /// inventory's clock and not only the hash loop's.
+    #[tokio::test]
+    async fn an_inventory_whose_time_is_up_skips_the_search() {
+        let root = tempfile::tempdir().unwrap();
+        touch_server(&root.path().join("bin/llamacpp/rocm-stable"));
+        let inventory = take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now() + INVENTORY_BUDGET,
+            SEARCH_LIMITS,
+            std::sync::Arc::new(|| true),
+        )
+        .await;
+        let report = &inventory.report;
+        assert!(
+            report.contains("remaining evidence skipped: evidence budget exhausted"),
+            "{report}"
+        );
+        assert!(!report.contains("candidate (not proof"), "{report}");
+        assert!(
+            !report.contains("no llama-server candidates found"),
+            "an unfinished search must not claim to have found nothing: {report}"
+        );
+        assert!(inventory.servers.is_empty());
+    }
+
+    /// The scan is blocking filesystem work and must not run on the async executor.
+    /// On a current-thread runtime the test's own thread is the executor, so a clock
+    /// read from any other thread shows the walk ran on a blocking one.
+    #[tokio::test]
+    async fn the_directory_scan_runs_off_the_async_executor() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("bin/llamacpp/rocm-stable/build")).unwrap();
+        let threads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = threads.clone();
+        take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now() + INVENTORY_BUDGET,
+            SEARCH_LIMITS,
+            std::sync::Arc::new(move || {
+                recorded.lock().unwrap().push(std::thread::current().id());
+                false
+            }),
+        )
+        .await;
+        let threads = threads.lock().unwrap();
+        assert!(!threads.is_empty(), "the walk never read the clock");
+        let executor = std::thread::current().id();
+        assert!(
+            threads.iter().all(|thread| *thread != executor),
+            "the scan ran on the async executor"
+        );
+    }
+
+    /// The limits cover the whole search: two backend directories with three
+    /// subdirectories each read six entries between them, so a limit of four stops
+    /// the second directory, which a per-directory limit of four would not.
+    #[test]
+    fn entry_and_directory_limits_apply_to_the_whole_search() {
+        let root = tempfile::tempdir().unwrap();
+        for backend in ["rocm-stable", "rocm-nightly"] {
+            for build in ["a", "b", "c"] {
+                std::fs::create_dir_all(root.path().join("bin/llamacpp").join(backend).join(build))
+                    .unwrap();
+            }
+        }
+        let found = discover_candidates(root.path(), limits(100, 4), &|| false);
+        assert_eq!(found.stop, Some(Stop::Entries), "{found:?}");
+        assert_eq!(found.entries_read, 4, "{found:?}");
+
+        let found = discover_candidates(root.path(), limits(2, 100), &|| false);
+        assert_eq!(found.stop, Some(Stop::Directories), "{found:?}");
+        assert_eq!(found.dirs_visited, 2, "{found:?}");
+
+        let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
+        assert_eq!(
+            found.stop, None,
+            "the default limits are not the small ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_cut_short_by_a_limit_says_so_and_does_not_claim_an_empty_result() {
+        let root = tempfile::tempdir().unwrap();
+        for build in ["a", "b", "c"] {
+            std::fs::create_dir_all(root.path().join("bin/llamacpp/rocm-stable").join(build))
+                .unwrap();
+        }
+        let inventory = take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now() + INVENTORY_BUDGET,
+            limits(2, 100),
+            std::sync::Arc::new(|| false),
+        )
+        .await;
+        assert!(
+            inventory
+                .report
+                .contains("candidate search stopped: 2 directories visited (limit)"),
+            "{}",
+            inventory.report
+        );
+        let inventory = take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now() + INVENTORY_BUDGET,
+            limits(100, 2),
+            std::sync::Arc::new(|| false),
+        )
+        .await;
+        assert!(
+            inventory
+                .report
+                .contains("candidate search stopped: 2 directory entries read (limit)"),
+            "{}",
+            inventory.report
+        );
+    }
+
+    /// The candidate cap ends the walk as soon as it is reached, instead of the walk
+    /// finishing and the list being cut afterwards: with twenty candidate
+    /// directories only the root and the first eight are entered, in sorted order.
+    #[test]
+    fn the_candidate_cap_stops_the_walk_when_it_is_reached() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = root.path().join("bin/llamacpp/rocm-stable");
+        let wanted: Vec<PathBuf> = (0..20)
+            .map(|i| touch_server(&backend.join(format!("{i:02}"))))
+            .collect();
+        let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
+        assert_eq!(found.stop, Some(Stop::Candidates));
+        assert_eq!(found.candidates, wanted[..MAX_CANDIDATES]);
+        assert_eq!(found.dirs_visited, 1 + MAX_CANDIDATES, "{found:?}");
+    }
+
+    /// A symlink is neither entered nor read as a candidate. The tree holds a link
+    /// back to its own backend directory (a cycle), a link out to a directory with a
+    /// real `llama-server`, a `llama-server` that is a link to a file outside, and a
+    /// whole backend directory that is a link. The walk must end, find only the real
+    /// file, and count what it declined to follow.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed_and_a_cycle_ends() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_server = touch_server(outside.path());
+        let backends = root.path().join("bin/llamacpp");
+        let real = touch_server(&backends.join("rocm-stable/real"));
+        symlink(
+            backends.join("rocm-stable"),
+            backends.join("rocm-stable/loop"),
+        )
+        .unwrap();
+        symlink(outside.path(), backends.join("rocm-stable/out")).unwrap();
+        symlink(
+            &outside_server,
+            backends.join("rocm-stable").join(server_binary()),
+        )
+        .unwrap();
+        symlink(outside.path(), backends.join("rocm-nightly")).unwrap();
+
+        let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
+        assert_eq!(found.candidates, vec![real], "{found:?}");
+        assert_eq!(found.stop, None, "{found:?}");
+        assert_eq!(found.symlinks_skipped, 4, "{found:?}");
+        assert_eq!(found.dirs_visited, 2, "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn the_empty_search_listing_is_bounded_and_counts_what_it_omits() {
+        let root = tempfile::tempdir().unwrap();
+        let llamacpp = root.path().join("bin/llamacpp");
+        for i in 0..(MAX_LISTED_NAMES + 4) {
+            std::fs::create_dir_all(llamacpp.join(format!("other-{i:03}"))).unwrap();
+        }
+        let report = evidence(&write_manifest(root.path())).await;
+        assert!(report.contains(" and 4 more"), "{report}");
+        assert!(!report.contains("at least"), "{report}");
+
+        for i in 0..(2 * MAX_LISTING_SCAN) {
+            std::fs::create_dir_all(llamacpp.join(format!("other-{i:03}"))).unwrap();
+        }
+        let report = evidence(&write_manifest(root.path())).await;
+        let listing = report
+            .split("contains: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap();
+        let (names, omitted) = listing.split_once(" and at least ").unwrap();
+        assert_eq!(names.split(", ").count(), MAX_LISTED_NAMES, "{report}");
+        assert!(
+            omitted.starts_with(&format!("{} more", MAX_LISTING_SCAN - MAX_LISTED_NAMES)),
+            "{report}"
+        );
+        assert!(
+            omitted.contains(&format!("first {MAX_LISTING_SCAN} entries")),
+            "{report}"
+        );
     }
 
     #[tokio::test]
