@@ -13,8 +13,10 @@
 //!
 //! This check starts from the source tree instead. Every tracked `.rs` file
 //! under `apps/*/src`, `crates/*/src` and `engines/*/src` must be cited by a
-//! relative markdown link in `docs/architecture.md`, or be listed in
-//! [`EXEMPT`], or be a test-only helper (see [`is_test_helper`]). It reads the
+//! relative markdown link in `docs/architecture.md` (one that renders as a
+//! link: a path inside an HTML comment, a code block or a code span does not
+//! count), or be listed in [`EXEMPT`], or be a test-only helper (see
+//! [`is_test_helper`]). It reads the
 //! index and the working tree, never a git diff, so it behaves the same in CI,
 //! in the pre-commit hook and in the pre-push hook.
 //!
@@ -177,10 +179,124 @@ fn resolve_link(target: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Every `.rs` file [`DOC`] links to, as repo-relative paths.
+/// The first line of `text` without its terminator, and the byte length of that
+/// line including the terminator.
+fn next_line(text: &str) -> (&str, usize) {
+    match text.find('\n') {
+        Some(end) => (&text[..end], end + 1),
+        None => (text, text.len()),
+    }
+}
+
+/// A code-fence marker at the start of `line`: its character and run length.
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let first = *line.as_bytes().first()?;
+    if first != b'`' && first != b'~' {
+        return None;
+    }
+    let run = line.bytes().take_while(|&byte| byte == first).count();
+    // A backtick fence's info string cannot contain a backtick: that line is an
+    // inline code span, not a fence.
+    if run < 3 || (first == b'`' && line[run..].contains('`')) {
+        return None;
+    }
+    Some((first, run))
+}
+
+/// Whether `line` closes a fence opened with `open`.
+fn closes_fence(line: &str, open: (u8, usize)) -> bool {
+    fence_marker(line).is_some_and(|(character, run)| {
+        character == open.0 && run >= open.1 && line.trim().bytes().all(|byte| byte == open.0)
+    })
+}
+
+/// The byte length of the code span that opens at the start of `text` (which
+/// starts with a backtick run), or `None` if no run of the same length closes
+/// it. Like a CommonMark code span it cannot cross a blank line, so a stray
+/// backtick in one paragraph does not pair with one in a later paragraph.
+fn code_span_len(text: &str) -> Option<usize> {
+    let window = &text[..text.find("\n\n").unwrap_or(text.len())];
+    let open = window.bytes().take_while(|&byte| byte == b'`').count();
+    let mut at = open;
+    while let Some(offset) = window[at..].find('`') {
+        let start = at + offset;
+        let run = window[start..]
+            .bytes()
+            .take_while(|&byte| byte == b'`')
+            .count();
+        if run == open {
+            return Some(start + run);
+        }
+        at = start + run;
+    }
+    None
+}
+
+/// `doc` with everything that does not render as a link removed: HTML comments,
+/// fenced code blocks and inline code spans. A link inside any of them is not
+/// part of the rendered module map, so it must not count as a citation. Each
+/// removed span leaves a space or newline behind so link text and line
+/// structure stay in place.
+///
+/// It scans once, left to right, so the usual precedence holds: a backtick
+/// inside a comment is part of the comment, and `<!--` inside a code span is
+/// code. Where it cannot tell (an unclosed backtick), it errs towards hiding a
+/// link, which can only make the check fail, never pass. Indented code blocks
+/// are not recognised.
+fn link_source_text(doc: &str) -> String {
+    let doc = doc.replace("\r\n", "\n");
+    let mut out = String::with_capacity(doc.len());
+    let mut at = 0;
+    while at < doc.len() {
+        let rest = &doc[at..];
+        let line_start = at == 0 || doc.as_bytes()[at - 1] == b'\n';
+        if line_start {
+            let (line, mut skipped) = next_line(rest);
+            if let Some(open) = fence_marker(line) {
+                while skipped < rest.len() {
+                    let (inner, length) = next_line(&rest[skipped..]);
+                    skipped += length;
+                    if closes_fence(inner, open) {
+                        break;
+                    }
+                }
+                at += skipped;
+                out.push('\n');
+                continue;
+            }
+        }
+        if rest.starts_with("<!--") {
+            at += rest.find("-->").map_or(rest.len(), |end| end + 3);
+            out.push(' ');
+            continue;
+        }
+        if rest.starts_with('`') {
+            if let Some(length) = code_span_len(rest) {
+                at += length;
+                out.push(' ');
+            } else {
+                let run = rest.bytes().take_while(|&byte| byte == b'`').count();
+                out.push_str(&rest[..run]);
+                at += run;
+            }
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        out.push(character);
+        at += character.len_utf8();
+    }
+    out
+}
+
+/// Every `.rs` file [`DOC`] links to, as repo-relative paths. Links inside HTML
+/// comments, code blocks and code spans are not counted.
 fn cited_paths(doc: &str) -> BTreeSet<String> {
+    let doc = link_source_text(doc);
     let mut cited = BTreeSet::new();
-    let mut rest = doc;
+    let mut rest = doc.as_str();
     while let Some(at) = rest.find("](") {
         rest = &rest[at + 2..];
         let end = rest.find([')', ' ', '\n']).unwrap_or(rest.len());
@@ -419,6 +535,83 @@ mod tests {
     fn a_link_with_a_title_is_still_a_citation() {
         let doc = "[cli](../apps/rocm/src/cli.rs \"the command tree\")";
         assert_eq!(cited_paths(doc), cites(&["apps/rocm/src/cli.rs"]));
+    }
+
+    const CLI: &str = "[cli](../apps/rocm/src/cli.rs)";
+
+    fn cited_cli(doc: &str) -> bool {
+        cited_paths(doc).contains("apps/rocm/src/cli.rs")
+    }
+
+    #[test]
+    fn commenting_out_the_only_entry_leaves_the_file_uncited() {
+        let doc = format!("<!-- {CLI} -->");
+        let tracked = files(&["apps/rocm/src/cli.rs"]);
+        let violations = check(&tracked, &cited_paths(&doc), &[]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("apps/rocm/src/cli.rs"));
+    }
+
+    #[test]
+    fn a_link_in_an_html_comment_is_not_a_citation() {
+        assert!(!cited_cli(&format!("<!-- {CLI} -->")));
+        assert!(!cited_cli(&format!(
+            "before\n<!--\nold entry: {CLI}\n-->\nafter"
+        )));
+        // An unterminated comment hides everything after it, as a renderer does.
+        assert!(!cited_cli(&format!("<!-- {CLI}")));
+        assert!(cited_cli(&format!("<!-- note -->\n{CLI}")));
+    }
+
+    #[test]
+    fn a_link_in_a_fenced_code_block_is_not_a_citation() {
+        assert!(!cited_cli(&format!("```\n{CLI}\n```")));
+        assert!(!cited_cli(&format!("```md\n{CLI}\n```")));
+        assert!(!cited_cli(&format!("~~~\n{CLI}\n~~~")));
+        assert!(!cited_cli(&format!("  ```\n  {CLI}\n  ```")));
+        // A longer closing fence closes it; a shorter or different one does not.
+        assert!(!cited_cli(&format!("````\n```\n{CLI}\n```\n````")));
+        assert!(!cited_cli(&format!("~~~\n```\n{CLI}\n```\n~~~")));
+        // An unclosed fence runs to the end of the document.
+        assert!(!cited_cli(&format!("```\n{CLI}")));
+        assert!(cited_cli(&format!("```\ncode\n```\n{CLI}")));
+    }
+
+    #[test]
+    fn a_link_in_an_inline_code_span_is_not_a_citation() {
+        assert!(!cited_cli(&format!("see `{CLI}` for more")));
+        assert!(!cited_cli(&format!("see ``a ` b {CLI}`` for more")));
+        assert!(cited_cli(&format!("see `code` and {CLI}")));
+    }
+
+    #[test]
+    fn a_code_span_inside_link_text_still_cites() {
+        assert!(cited_cli("[`cli.rs`](../apps/rocm/src/cli.rs)"));
+        assert!(cited_cli(
+            "- [`cli.rs`](../apps/rocm/src/cli.rs) - the command tree"
+        ));
+    }
+
+    #[test]
+    fn a_stray_backtick_does_not_hide_a_later_paragraph() {
+        assert!(cited_cli(&format!("a ` stray\n\n{CLI}")));
+        assert!(cited_cli(&format!("a ` stray {CLI}")));
+    }
+
+    #[test]
+    fn comment_and_code_markers_take_the_usual_precedence() {
+        // `<!--` inside a code span is code, so the comment never opens.
+        assert!(cited_cli(&format!("`<!--` {CLI} `-->`")));
+        // A fence marker inside a comment does not open a fence.
+        assert!(cited_cli(&format!("<!--\n```\n-->\n{CLI}")));
+        // A backtick inside a comment does not open a code span.
+        assert!(cited_cli(&format!("<!-- ` -->\n{CLI}\n<!-- ` -->")));
+    }
+
+    #[test]
+    fn crlf_documents_are_read_the_same() {
+        assert!(!cited_cli(&format!("```\r\n{CLI}\r\n```\r\n")));
+        assert!(cited_cli(&format!("a ` stray\r\n\r\n{CLI}")));
     }
 
     #[test]
