@@ -2,7 +2,8 @@
 #
 # queue-run.yml starts, waits for and publishes runs. This publishes one again
 # by its id, for instance one whose queue-run.yml job was cancelled while the
-# run went on: it prints the run's report and lane matrix, uploads the lanes'
+# run went on: once the run's lanes are done, it has the queue side finish the
+# run if no one has, prints its report and lane matrix, uploads the lanes'
 # files, and passes or fails with the run's verdict. It needs no credential, so
 # the shared self-hosted runner never holds the queue's. What that does and does
 # not protect is in docs/nightly-on-the-queue.md.
@@ -29,8 +30,9 @@ jobs:
   publish:
     name: Publish nightly results
     runs-on: [queue-report]
-    # Reads and uploads files a finished run left; nothing here waits on GPUs.
-    timeout-minutes: 15
+    # Nothing here waits on GPUs, but finishing a run nobody finished fetches
+    # and scans every lane's files, which the publisher allows 30 minutes.
+    timeout-minutes: 45
     steps:
       - name: Publish the run
         env:
