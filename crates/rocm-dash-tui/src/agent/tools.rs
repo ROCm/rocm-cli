@@ -207,11 +207,15 @@ pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
 // whose state changed (and drops the endpoint key of a service whose requested
 // stop has finished). `doctor`/`examine` can re-register the configured setup
 // runtime in the runtime registry when its entry is missing. `update_check` and
-// `install_sdk_dry_run` cache package-index metadata under the cache folder
-// and, on a host with no usable Python on PATH, can download a managed `uv` and
-// Python into the data folder and record that Python in the saved config. The
-// boundary type (`SharedRocmToolExecutor`) is plain data — importing it does NOT
-// pull `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
+// `install_sdk_dry_run` cache package-index metadata under the cache folder.
+// `update_check` can also, on a host with no usable Python on PATH, download a
+// managed `uv` and Python into the data folder and record that Python in the
+// saved config; `install_sdk_dry_run` prepares no Python and saves no Python
+// path: on such a host it reports the Python a real install would prepare. (A
+// ROCm 10 preview still resolves package versions with `uv` and can fetch the
+// managed `uv` into the data folder.) The boundary type
+// (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
+// `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
 
 /// Shared body for every read-only ROCm tool: forward the intent to the injected
@@ -557,7 +561,7 @@ rocm_mutating_tool!(
             "model": { "type": "string", "description": "Model id/name to serve." },
             "engine": { "type": "string", "description": "Optional engine, e.g. 'vllm'." },
             "host": { "type": "string", "description": "Loopback host only (e.g. 127.0.0.1)." },
-            "port": { "type": "integer", "description": "Optional TCP port." },
+            "port": { "type": "integer", "description": "TCP port. Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)." },
             "device": { "type": "string", "description": "GPU device selector (CPU is rejected)." }
         },
         "required": ["model"]

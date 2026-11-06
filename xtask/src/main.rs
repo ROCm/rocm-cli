@@ -12,6 +12,7 @@
 
 mod affected;
 mod amd_smi_launch_contract;
+mod architecture_doc;
 mod ascii_output_contract;
 mod catalog;
 mod coverage;
@@ -147,6 +148,10 @@ pub(crate) enum Command {
     /// non-zero before this code runs. The local pre-commit hook runs this until
     /// the limit is enforced.
     CheckModuleSizeAdvisory,
+    /// Fail if a production source file (a `.rs` file under `apps/*/src`,
+    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`,
+    /// or the exemption list in `xtask/src/architecture_doc.rs` has gone stale.
+    CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
@@ -410,6 +415,7 @@ fn run() -> Result<()> {
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckModuleSize => module_size::run()?,
         Command::CheckModuleSizeAdvisory => module_size::run_advisory()?,
+        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
