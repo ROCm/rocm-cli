@@ -1764,7 +1764,13 @@ services stop --yes`, and asserts that both processes are gone together with the
 report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
 no process, no stop request, key file gone). The child is the tree kill's own
 work: with the `taskkill /T` step removed the stop ends only the recorded
-process and the scenario fails on the surviving child. `service-stop-01` plants
+process and the scenario fails on the surviving child. The scenario keeps the
+child's own identity (`E2eWorld::recorded_descendant`) and teardown ends it when
+it is still that process, so a stop that fails to take it down does not leave
+`ping` running for its five minutes behind a dead parent; the decision is
+`e2e_cucumber::stray_process::leftover_action`, which a table test covers on
+every host (ended only while it is still the recorded process, never once gone,
+reused or unconfirmed). `service-stop-01` plants
 PID 0 and `service-stop-02` is Linux-only, so neither reaches that step; the
 injected unit tests above cover its ordering and verdicts on every host.
 
