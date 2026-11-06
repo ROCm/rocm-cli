@@ -206,6 +206,21 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
+      - id: cargo-module-size
+        name: Source files are within the module-size limit (advisory)
+        # Check-only: it never rewrites or restages anything. Advisory for now, so
+        # it prints the offenders and lets the commit through, because a blocking
+        # hook would fail the very commits that split an over-limit file. The
+        # advisory behaviour lives in the `-advisory` subcommand, not a flag on the
+        # check; making the limit blocking means pointing this entry at
+        # `cargo xtask check-module-size` and deleting the wrapper.
+        entry: cargo xtask check-module-size-advisory
+        language: system
+        types: [rust]
+        pass_filenames: false
+        verbose: true # a passing hook is silent otherwise, and this one passes while it warns
+        stages: [pre-commit]
+        groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
       - id: cargo-tpn
         name: THIRD_PARTY_NOTICES.txt is current
         # `--if-available` skips cleanly when cargo-about is absent or not the

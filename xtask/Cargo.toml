@@ -16,11 +16,17 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 e2e-report = { path = "../crates/e2e-report" }
+# `module_size` reads line numbers off syn's spans, which proc-macro2 only
+# records outside a proc macro when this feature is on.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# `module_size` parses each source file to find the lines a test-gated item
+# spans, so the production-line count is exact. `printing` is what `Spanned` needs.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "printing"] }
 toml = "1.1"
 
 # `cargo xtask package` builds `.tar.gz` on Unix and `.zip` on Windows, so each

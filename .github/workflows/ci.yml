@@ -1427,6 +1427,31 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask eval-fixtures --check
 
+      # Advisory for now. `cargo xtask check-module-size` is strict on its own;
+      # only this step is non-blocking. `continue-on-error` keeps the job green
+      # while the warning annotation and the job summary list the offenders.
+      # Making the limit blocking means deleting `continue-on-error` and the
+      # capture below, leaving the bare command.
+      - name: Source files are within the module-size limit (advisory)
+        if: needs.changes.outputs.rust == 'true'
+        continue-on-error: true
+        run: |
+          report="$RUNNER_TEMP/module-size.txt"
+          if cargo xtask check-module-size > "$report" 2>&1; then
+            cat "$report"
+          else
+            cat "$report"
+            echo "::warning title=Module size (advisory)::$(tr '\n' ' ' < "$report")"
+            {
+              echo '### Source files over the module-size limit (advisory)'
+              echo
+              echo '```'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
       # is gated on sccache being present rather than on the remote backend being
