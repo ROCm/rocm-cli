@@ -2115,11 +2115,45 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
 
+A check changes nothing, and that includes Python. Reading the index for a wheel
+runtime needs the interpreter's wheel tag. A runtime that records a usable Python
+supplies it. For one that does not, on a host with no usable Python, the check
+used to download a managed `uv`, have it install Python and save that Python's
+path in the config, only to ask it for the tag. The text report, `--json`, the
+startup check that runs ahead of other commands, and the plan behind
+`rocm update --apply --dry-run` now take the tag from the interpreter the layout
+requires instead and prepare nothing; the text report adds a `python_note:` line
+saying an update would use `uv` to install the managed Python, which the check did
+not do. `--json` carries no such line, since its shape is the dashboard's
+contract. `rocm update --apply` still prepares the Python, because the install
+that follows needs it. Scenarios `update-09` (the report) and `update-10`
+(`--dry-run`) check the note against the state it left, as `runtime-23` does for
+the install preview: the recording `uv` was never run, and there is no
+managed-tools folder and no saved config. They run on Linux; the entry points the
+scenarios do not drive are covered by
+`the_update_checks_prepare_no_python_and_the_apply_plan_does` in
+[update.rs](../apps/rocm/src/therock/update.rs), which drives the report, the
+JSON, the startup check, the check plan and `apply_runtime_update` with
+`--dry-run`, with the plan an apply works from, and a real apply, as the controls
+that show the stand-in `uv` is reachable. Which of the two plans a `--dry-run` and
+an apply take is also pinned on every platform, Windows included, by
+`a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in
+[update_cmd.rs](../apps/rocm/src/update_cmd.rs). As for the install preview, resolving a
+ROCm 10 or newer runtime uses `uv pip compile` and can fetch the managed `uv`,
+though never a Python.
+
 Runtime version-ordering tests:
 
 ```bash
 cargo test -p rocm --bin rocm version_proptests
 cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Update checks that must not prepare Python:
+
+```bash
+cargo test -p rocm --bin rocm the_update_checks_prepare_no_python
+cargo xtask e2e -- -n 'update-(09|10)'
 ```
 
 Where `rocm install sdk` and `rocm update` compare runtime versions, they

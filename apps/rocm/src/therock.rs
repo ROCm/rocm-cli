@@ -56,7 +56,7 @@ use self::source::{
 };
 pub(crate) use self::update::{
     maybe_refresh_startup_update_check, render_update_json, render_update_report,
-    runtime_update_plan,
+    runtime_update_check, runtime_update_plan,
 };
 pub(crate) use self::version::runtime_version_display;
 use self::version::{
