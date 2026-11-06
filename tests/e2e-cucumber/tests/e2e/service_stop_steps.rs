@@ -235,7 +235,7 @@ fn spawn_parent_with_descendant(pid_file: &std::path::Path) -> std::process::Chi
 
 /// The child's PID, once the parent has written it.
 fn wait_for_descendant_pid(pid_file: &std::path::Path) -> u32 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         if let Some(pid) = std::fs::read_to_string(pid_file)
             .ok()
