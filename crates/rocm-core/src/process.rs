@@ -662,23 +662,25 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// only as an opaque error, so this is the only place that can still tell which
 /// of its characters came from the child. All four callers inherit it.
 ///
-/// It bounds this message and nothing else. A caller that quotes the `Output`
-/// handed back to it is quoting raw child output of its own, unbounded and
-/// persisted the same way -- `capture_amd_smi_json`'s non-zero-exit `bail!` and
-/// the daemon's `parse_sandbox_child_output` both do. Both predate this
-/// constant and are outside its scope; of the two, #623 tracks the
-/// `capture_amd_smi_json` quote.
+/// It bounds this message by itself. A caller that quotes the `Output` handed
+/// back to it is quoting raw child output of its own, persisted the same way,
+/// so it has to apply a bound too -- which is why this is `pub(crate)` rather
+/// than private: [`crate::amd_smi::amd_smi_json`] bounds its non-zero-exit
+/// quote (the one #623 tracked) with *this* constant instead of declaring a
+/// second one free to drift from it. The daemon's
+/// `parse_sandbox_child_output` still predates both and is outside this scope.
 ///
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
 /// GPU-metrics watcher copies that note into the automation-event and audit
 /// JSONL files once a minute — stores that are never rotated or capped.
 /// Unbounded, a child that prints a megabyte and then stalls past its
-/// timeout grows both logs by that much per minute, forever.
+/// timeout grows both logs by that much per minute, forever. A 151K-character
+/// JSONL line was reproduced from exactly that poller.
 ///
 /// Sized to still hold a real stderr backtrace: the point is to stop a
 /// payload-sized quote, not to shorten diagnostics.
-const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
+pub(crate) const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 
 /// One captured stream: the bytes so far, whether its reader saw EOF, and the
 /// read error that stopped it, if one did.
