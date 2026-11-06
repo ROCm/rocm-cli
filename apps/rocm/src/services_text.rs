@@ -56,8 +56,8 @@
 //! `process_check_command` are `pub(crate)` for `service_control.rs` (the last
 //! one only for its tests); `read_tail_lines`, `render_logs_text`,
 //! `render_logs_browser_text`, `render_services_text` and
-//! `render_service_logs_text` are also `pub(crate)` and read from `chat.rs`'s
-//! deterministic tool-output summaries; `validate_service_id` is also
+//! `render_service_logs_text` are also `pub(crate)` and read from
+//! `chat/mcp_bridge.rs`'s read-only command runner; `validate_service_id` is also
 //! `pub(crate)` and read from `tool_policy.rs`'s service-tool validation,
 //! `services_cmd.rs` and `service_records.rs`; `read_optional_tail_lines` and
 //! `render_service_action_result` are also `pub(crate)` and read from
@@ -526,7 +526,7 @@ pub(crate) fn render_service_action_result_with_helper_note(
 ) -> String {
     let mut text = render_service_action_result(tool, value);
     if tool == "stop_server"
-        && let Some(note) = crate::service_launch::background_helper_note(paths)
+        && let Some(note) = crate::background_helper::background_helper_note(paths)
     {
         let _ = writeln!(text, "  note: {}", note.text);
     }
