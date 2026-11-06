@@ -1429,7 +1429,10 @@ jobs:
 
       # Advisory for now. `cargo xtask check-module-size` is strict on its own;
       # only this step is non-blocking. `continue-on-error` keeps the job green
-      # while the warning annotation and the job summary list the offenders.
+      # while the warning annotation and the job summary list the offenders. When
+      # files are over the limit the step itself shows as failed (red) in the
+      # job's step list, because it ends in `exit 1`, while the job and the check
+      # stay green: that is the advisory phase, not a failure to chase.
       # Making the limit blocking means deleting `continue-on-error` and the
       # capture below, leaving the bare command.
       - name: Source files are within the module-size limit (advisory)

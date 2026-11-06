@@ -54,6 +54,15 @@
 //! (an error that names it) rather than counted. That is deliberately loud: the
 //! fix is to declare the module in plain source, not to teach the walk about
 //! macros.
+//!
+//! Only a bare `#[path = ".."]` is honoured. A conditional `#[cfg_attr(cond,
+//! path = "..")] mod x;` is not read as a path, so the walk looks for `x.rs` and
+//! `x/mod.rs` and, when neither exists, fails with "has no file". That is loud
+//! too, and the fix is the same: write the `#[path]` unconditionally.
+//!
+//! The literals `#[cfg(true)]` and `#[cfg(false)]` (alone or as a term of
+//! `all(..)`/`any(..)`) are read, and never make an item test-only, so an item
+//! behind either is counted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -64,9 +73,10 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use syn::ext::IdentExt;
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{Attribute, Expr, ExprLit, ImplItem, Item, Lit, Meta, Token, TraitItem};
+use syn::{Attribute, Expr, ExprLit, ImplItem, Item, Lit, LitBool, Meta, Token, TraitItem};
 
 use crate::paths;
 
@@ -120,10 +130,13 @@ pub fn run() -> Result<()> {
 /// xtask has built it cannot fail a commit, including when the check itself cannot
 /// run. A compile failure in xtask or `rocm-core` never reaches this function.
 pub fn run_advisory() -> Result<()> {
-    advisory_to(evaluate(), &mut std::io::stdout())
+    advisory_to(evaluate(), &mut std::io::stdout());
+    Ok(())
 }
 
-fn advisory_to(result: Result<Outcome>, out: &mut impl Write) -> Result<()> {
+/// Print the report. A failed write (a closed pipe, say) is dropped: the wrapper
+/// exists so that nothing here can fail a commit.
+fn advisory_to(result: Result<Outcome>, out: &mut impl Write) {
     let text = match result {
         Ok(outcome) if outcome.offenders.is_empty() => passed_text(&outcome),
         Ok(outcome) => format!(
@@ -132,8 +145,7 @@ fn advisory_to(result: Result<Outcome>, out: &mut impl Write) -> Result<()> {
         ),
         Err(error) => format!("warning: the module-size check could not run: {error:#}"),
     };
-    writeln!(out, "{text}").context("failed to write the module-size report")?;
-    Ok(())
+    let _ = writeln!(out, "{text}");
 }
 
 fn passed_text(outcome: &Outcome) -> String {
@@ -602,7 +614,7 @@ fn attrs_are_test_gated(attrs: &[Attribute]) -> Result<bool> {
     for attr in attrs {
         let path = attr.path();
         if path.is_ident("cfg") {
-            let predicate: Meta = attr
+            let predicate: CfgTerm = attr
                 .parse_args()
                 .map_err(|e| anyhow!("cannot parse a `#[cfg(..)]` predicate: {e}"))?;
             if cfg_is_test_only(&predicate)? {
@@ -619,8 +631,27 @@ fn attrs_are_test_gated(attrs: &[Attribute]) -> Result<bool> {
     Ok(false)
 }
 
+/// One cfg predicate, or one term of `all(..)`/`any(..)`. The literals `true` and
+/// `false` are keywords, so `syn` does not read them as a [`Meta`]; they are
+/// accepted here and never make an item test-only.
+struct CfgTerm(Option<Meta>);
+
+impl Parse for CfgTerm {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(LitBool) {
+            input.parse::<LitBool>()?;
+            Ok(Self(None))
+        } else {
+            input.parse().map(|meta| Self(Some(meta)))
+        }
+    }
+}
+
 /// Whether a cfg predicate can only hold in a test build.
-fn cfg_is_test_only(predicate: &Meta) -> Result<bool> {
+fn cfg_is_test_only(predicate: &CfgTerm) -> Result<bool> {
+    let CfgTerm(Some(predicate)) = predicate else {
+        return Ok(false);
+    };
     let Meta::List(list) = predicate else {
         return Ok(matches!(predicate, Meta::Path(path) if path.is_ident("test")));
     };
@@ -632,7 +663,7 @@ fn cfg_is_test_only(predicate: &Meta) -> Result<bool> {
         return Ok(false);
     };
     let terms = list
-        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .parse_args_with(Punctuated::<CfgTerm, Token![,]>::parse_terminated)
         .map_err(|e| anyhow!("cannot parse a cfg combinator's terms: {e}"))?;
     if combinator {
         for term in &terms {
@@ -859,11 +890,42 @@ trait T {
             ("all(unix, not(test))", false),
             ("feature = \"test\"", false),
             ("unix", false),
+            ("true", false),
+            ("false", false),
+            ("all(true, test)", true),
+            ("all(test, false)", true),
+            ("all(true, unix)", false),
+            ("any(false, test)", false),
+            ("any(true, test)", false),
+            ("not(true)", false),
         ];
         for (text, expected) in table {
-            let meta: Meta = syn::parse_str(text).unwrap();
-            assert_eq!(cfg_is_test_only(&meta).unwrap(), expected, "cfg({text})");
+            let term: CfgTerm = syn::parse_str(text).unwrap();
+            assert_eq!(cfg_is_test_only(&term).unwrap(), expected, "cfg({text})");
         }
+    }
+
+    #[test]
+    fn items_behind_cfg_true_and_cfg_false_are_counted_not_errors() {
+        for gate in ["true", "false", "all(true, unix)", "any(false, test)"] {
+            let source = format!("#[cfg({gate})]\nmod m {{\n{}}}\n", filler(10));
+            assert_eq!(production_lines_of(&source).unwrap(), 13, "cfg({gate})");
+        }
+        let source = format!("#[cfg(all(true, test))]\nmod m {{\n{}}}\n", filler(10));
+        assert_eq!(production_lines_of(&source).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_conditional_path_attribute_is_not_read_and_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "#[cfg_attr(unix, path = \"other.rs\")]\nmod x;\n",
+        );
+        write(dir.path(), "src/other.rs", "fn a() {}\n");
+        let error = format!("{:#}", counted(dir.path()).unwrap_err());
+        assert!(error.contains("`mod x;` has no file"), "{error}");
     }
 
     // --- the limit ----------------------------------------------------------
@@ -1398,7 +1460,7 @@ trait T {
             }],
         };
         let mut out = Vec::new();
-        advisory_to(Ok(outcome), &mut out).expect("advisory never fails on a violation");
+        advisory_to(Ok(outcome), &mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("src/big.rs: 1600 production lines"), "{text}");
         assert!(text.contains("not blocking yet"), "{text}");
@@ -1407,9 +1469,25 @@ trait T {
     #[test]
     fn the_advisory_wrapper_succeeds_even_when_the_check_cannot_run() {
         let mut out = Vec::new();
-        advisory_to(Err(anyhow!("cargo metadata failed")), &mut out).expect("advisory never fails");
+        advisory_to(Err(anyhow!("cargo metadata failed")), &mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("could not run"), "{text}");
         assert!(text.contains("cargo metadata failed"), "{text}");
+    }
+
+    #[test]
+    fn the_advisory_wrapper_succeeds_even_when_the_report_cannot_be_written() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        // `advisory_to` returns nothing, so the test is that it returns at all
+        // instead of panicking; `run_advisory` is `Ok(())` around it.
+        advisory_to(Err(anyhow!("cargo metadata failed")), &mut Closed);
     }
 }
