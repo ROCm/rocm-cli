@@ -7,7 +7,8 @@
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`engines(command)`,
 //! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
-//! remains in the crate root and is reached via `use crate::EnginesCommand`;
+//! lives in `cli.rs` and is reached via `use crate::EnginesCommand`, a
+//! re-import in `main.rs`;
 //! `Cli` is not referenced from this file.
 //!
 //! Which runtime an engine installs into and where its environment lives is
