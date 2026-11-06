@@ -188,8 +188,11 @@ where
 /// Read `stderr` to the end line by line, optionally writing each line to
 /// `forward` (this process's stderr, in production) as it arrives, and return
 /// everything read. A failed forward is ignored: a closed terminal must not
-/// cost the request its answer. A read error ends the collection and is itself
-/// recorded as the last line.
+/// cost the request its answer. That holds for the signal as well as the error:
+/// under SIGPIPE's default action (`rocm` runs that way) a write to a closed
+/// pipe ends the whole process before `write_all` can return, so each forward
+/// runs inside [`with_sigpipe_ignored`] (see [`forward_best_effort`]). A read error ends the
+/// collection and is itself recorded as the last line.
 fn collect_stderr(stderr: impl Read, mut forward: Option<impl Write>) -> Vec<u8> {
     let mut reader = io::BufReader::new(stderr);
     let mut collected = Vec::new();
@@ -200,14 +203,14 @@ fn collect_stderr(stderr: impl Read, mut forward: Option<impl Write>) -> Vec<u8>
             Ok(0) => break,
             Ok(_) => {
                 if let Some(sink) = forward.as_mut() {
-                    let _ = sink.write_all(&line);
+                    forward_best_effort(sink, &line);
                 }
                 collected.extend_from_slice(&line);
             }
             Err(error) => {
                 let message = format!("failed to read engine progress: {error}\n");
                 if let Some(sink) = forward.as_mut() {
-                    let _ = sink.write_all(message.as_bytes());
+                    forward_best_effort(sink, message.as_bytes());
                 }
                 collected.extend_from_slice(message.as_bytes());
                 break;
@@ -215,6 +218,14 @@ fn collect_stderr(stderr: impl Read, mut forward: Option<impl Write>) -> Vec<u8>
         }
     }
     collected
+}
+
+/// Write `bytes` to the forwarding sink and drop the result: a sink that has
+/// gone away must not cost the request its answer. SIGPIPE is ignored for the
+/// write, so a closed pipe comes back as the error that is then discarded
+/// rather than as a signal that kills the process.
+fn forward_best_effort(sink: &mut impl Write, bytes: &[u8]) {
+    let _ = with_sigpipe_ignored(|| sink.write_all(bytes));
 }
 
 /// Turn an engine's answer into the response type the caller asked for: the
@@ -579,6 +590,54 @@ mod tests {
                 error.to_string(),
                 "failed to spawn engine stdio process /no/such/engine"
             );
+        }
+
+        /// Progress forwarded to a stderr whose reader has gone away is dropped, not
+        /// fatal, also where SIGPIPE is at its default action (`rocm` runs that
+        /// way). The `Closed` sink above cannot show this: it returns the error
+        /// itself, where the real failure is a signal that ends the process before
+        /// any error is returned. So this re-executes itself in a fresh process
+        /// that installs `SIG_DFL` and forwards into one end of a real pipe whose
+        /// other end is closed. Two arms, one per forwarding write in
+        /// `collect_stderr`: a line of the child's stderr, and the note recorded
+        /// when reading that stderr fails.
+        #[test]
+        #[allow(unsafe_code)] // libc::signal, to install the default action in the child
+        fn forwarding_stderr_to_a_closed_pipe_is_not_fatal_under_sig_dfl() {
+            if let Some(arm) = std::env::var_os("ROCM_TEST_CLIENT_FORWARD_ARM") {
+                // SAFETY: installing a signal disposition is always safe.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                }
+                let (reader, writer) = io::pipe().unwrap();
+                drop(reader);
+                let collected = if arm == "line" {
+                    collect_stderr(&b"progress\n"[..], Some(writer))
+                } else {
+                    collect_stderr(Fails, Some(writer))
+                };
+                // Surviving is the point; the text is still kept for the error.
+                assert!(!collected.is_empty());
+                return;
+            }
+
+            for arm in ["line", "read-error"] {
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "stdio_client::tests::child::forwarding_stderr_to_a_closed_pipe_is_not_fatal_under_sig_dfl",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("ROCM_TEST_CLIENT_FORWARD_ARM", arm)
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    status.signal(),
+                    None,
+                    "{arm}: SIGPIPE killed the process instead of the write failing: {status:?}"
+                );
+                assert!(status.success(), "{arm}: {status:?}");
+            }
         }
 
         /// A request written to an engine that has already exited comes back as an
