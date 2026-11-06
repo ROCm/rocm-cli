@@ -248,3 +248,43 @@ mod tests {
         assert_eq!(raised_case_count(Some("lots"), 256), 256);
     }
 }
+
+/// Plant an extracted Lemonade tree under `tree_root` the way an install leaves
+/// one: the server binary and `payload_bytes` of backend files. Black-box on
+/// purpose (plain files, not the engine's own writer), so a test reads it the
+/// way the CLI reads a real install.
+pub(crate) fn plant_lemonade_tree(tree_root: &std::path::Path, payload_bytes: usize) -> Result<()> {
+    let runtime_dir = tree_root.join("runtime");
+    let backend = runtime_dir.join("bin").join("llamacpp").join("rocm-stable");
+    fs::create_dir_all(&backend)?;
+    let lemond = if rocm_core::runtime_is_windows() {
+        "lemond.exe"
+    } else {
+        "lemond"
+    };
+    fs::write(runtime_dir.join(lemond), b"lemond")?;
+    fs::write(backend.join("payload.bin"), vec![0_u8; payload_bytes])?;
+    Ok(())
+}
+
+/// Write Lemonade's install record pointing at `tree_root`'s runtime, in the
+/// schema the engine writes (`<data>/engines/lemonade/manifests/runtime.json`).
+pub(crate) fn record_lemonade_install(paths: &AppPaths, tree_root: &std::path::Path) -> Result<()> {
+    let runtime_dir = tree_root.join("runtime");
+    let record = paths.engine_manifests_dir("lemonade").join("runtime.json");
+    fs::create_dir_all(record.parent().expect("record has a parent"))?;
+    fs::write(
+        &record,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "env_id": "lemonade-embeddable-test",
+            "version": "test",
+            "runtime_dir": runtime_dir,
+            "lemond": runtime_dir.join("lemond"),
+            "lemonade": runtime_dir.join("lemonade"),
+            "backend_recipe": "llamacpp",
+            "backend_name": "rocm",
+            "installed_at_unix_ms": 0,
+        }))?,
+    )?;
+    Ok(())
+}

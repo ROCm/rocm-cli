@@ -42,6 +42,12 @@ mod test_support;
 // the crate root before the split, and `apps/rocm` depends on this crate's
 // lib target.
 pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+// The read-only view of Lemonade's install trees and record that `apps/rocm`
+// needs for `rocm storage` and `rocm runtimes uninstall`; see `footprint`.
+pub use footprint::{
+    InstallRecord, RecordCleanup, forget_install_record_inside, install_record, install_tree_dirs,
+    install_tree_root, recorded_runtime_dir, tree_has_install,
+};
 
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
