@@ -529,6 +529,24 @@ async fn tool_reports_stopped(world: &mut E2eWorld) {
     );
 }
 
+/// The standalone `rocmd` reaches an engine through the `rocm` beside it (it has
+/// no engine verb of its own), so its `Stop` request is answered rather than
+/// failing with the standalone binary's "unrecognized subcommand". The report
+/// carries the engine's answer or the error that took its place.
+#[then("the tool asked the engine to stop and the engine answered")]
+async fn engine_answered_the_stop(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    let report: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(engine_stop["attempted"], true, "{report}");
+    assert!(
+        engine_stop.get("error").is_none(),
+        "the engine's answer was an error instead: {report}"
+    );
+    assert!(engine_stop["stopped"].is_boolean(), "{report}");
+}
+
 #[then("the recorded process is no longer running")]
 async fn recorded_process_gone(world: &mut E2eWorld) {
     assert_recorded_process_exited(world);

@@ -27,3 +27,11 @@ ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# The fake engine child both engine IPC callers are tested against.
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The SIGPIPE disposition a test restores in a re-executed child.
+libc.workspace = true
