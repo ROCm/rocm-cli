@@ -1570,7 +1570,11 @@ esac
     fn probe_child() {
         match std::env::var(PROBE_CHILD_ENV).as_deref() {
             Ok("sleep") => {
-                println!("pid:{}", std::process::id());
+                // With one test thread (RUST_TEST_THREADS=1, or one CPU) libtest
+                // writes "test <name> ... " first and our output continues that
+                // line, so start a fresh one: the parent reads the first line that
+                // begins with the marker.
+                println!("\npid:{}", std::process::id());
                 std::thread::sleep(Duration::from_secs(30));
             }
             Ok("exit") => println!("child-ran"),
@@ -1592,14 +1596,16 @@ esac
         command
     }
 
-    /// The timeout path on every platform: the child is still running when the
-    /// timeout fires, so the report must say so, return promptly, and leave no
-    /// process behind. `process_is_running` is false only once the child has been
-    /// killed and reaped, so a probe that merely abandoned it turns this red.
-    #[tokio::test]
-    async fn a_probe_that_outlives_its_timeout_is_killed_and_reaped() {
+    /// One run of the timeout path against a helper child that libtest runs with
+    /// `test_threads` test threads: the child is still running when the timeout
+    /// fires, so the report must say so, return promptly, and leave no process
+    /// behind. `process_is_running` is false only once the child has been killed
+    /// and reaped, so a probe that merely abandoned it turns this red.
+    async fn assert_timeout_kills_and_reaps(test_threads: &str) {
         let start = Instant::now();
-        let report = run_probe(probe_child_command("sleep"), Duration::from_secs(5)).await;
+        let mut command = probe_child_command("sleep");
+        command.env("RUST_TEST_THREADS", test_threads);
+        let report = run_probe(command, Duration::from_secs(5)).await;
         assert!(report.starts_with("probe timed out after 5s"), "{report}");
         assert!(!report.contains("kill/reap failed"), "{report}");
         assert!(start.elapsed() < Duration::from_secs(20), "{report}");
@@ -1607,11 +1613,27 @@ esac
             .lines()
             .find_map(|line| line.strip_prefix("pid:"))
             .unwrap_or_else(|| {
-                panic!("the child did not report its pid before the timeout: {report}")
+                panic!(
+                    "the child did not report its pid before the timeout \
+                     (test threads {test_threads}): {report}"
+                )
             })
             .parse::<u32>()
             .unwrap();
         assert!(!rocm_core::process_is_running(pid), "{report}");
+    }
+
+    /// The timeout path on every platform, with the child run both on one test
+    /// thread and on several. With one thread (also what a one-CPU host gets) libtest
+    /// prefixes the child's output with its test-name label, so a pid printed on
+    /// that same line is not found by a line-start match. The two runs overlap, so
+    /// this takes one timeout, not two.
+    #[tokio::test]
+    async fn a_probe_that_outlives_its_timeout_is_killed_and_reaped() {
+        tokio::join!(
+            assert_timeout_kills_and_reaps("1"),
+            assert_timeout_kills_and_reaps("8"),
+        );
     }
 
     /// The normal path on every platform: status and output come back, and the
