@@ -253,14 +253,29 @@ to ...` line in a file named after the source file the `proptest!` block is
 written in, and replays it before any new case on every later run: a block in
 `<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`. Moving
 the test to another file therefore leaves its saved cases behind, and proptest
-does not warn: they just stop being replayed. **Move the regression file with
-the test**, with `git mv` to the name the test's new file needs. This is
-enforced by a test, not by an `xtask` subcommand:
+does not warn: they just stop being replayed. **Carry the saved cases to the
+test's new file in the same commit**; what that takes depends on how much moved:
+
+- When every property test of the source file moves, and the new file has no
+  regression file yet, `git mv` the regression file to the name the new file
+  needs.
+- When only some of them move (a split), the tests left behind still read the
+  old regression file, and proptest does not record which test a saved case
+  belongs to: all the `proptest!` blocks of a file share one. Keep the old file
+  where it is and copy the `cc` lines to the new file's regression file. If that
+  file already exists, append to it so its own cases stay; do not overwrite it
+  and do not `git mv` onto it. A case copied to a test it did not come from is
+  only one more input for that test to run.
+
+This is enforced in part by a test, not by an `xtask` subcommand:
 `every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
 `xtask` walks the tree and **fails the build** on a file under any
 `proptest-regressions/` directory whose `<crate>/src/<path>.rs` is missing or
-holds no `proptest!` block, naming the file and the source file it expected.
-Run it on its own with:
+holds no `proptest!` block in code (a mention in a comment or a string literal
+does not count), naming the file and the source file it expected. It cannot see
+the opposite mistake, a split that `git mv`d the regression file away from tests
+that still need it: no file is orphaned then, one is just missing, so read the
+diff of a split for it. Run the check on its own with:
 
 ```bash
 cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
