@@ -74,6 +74,7 @@ use crate::serve_recipe::{
     parse_gpu_memory_utilization, protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
 };
 use crate::serve_summary;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
@@ -82,8 +83,8 @@ use crate::service_launch::{
     wait_begin_client_config,
 };
 use crate::{
-    GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
-    ensure_engine_allowed_on_platform,
+    GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
+    ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1314,6 +1315,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         launch_lock,
         require_api_key,
         gpu_refusal_waived_for_reuse,
+        |paths, service_id| {
+            run_internal_sandbox_tool(
+                paths,
+                SandboxToolArg::StopServer,
+                Some(service_id.to_owned()),
+                true,
+            )
+        },
     )
 }
 
