@@ -53,8 +53,13 @@ const DEFAULT_BUDGETS: Budgets = Budgets {
 
 /// Runs one `llama-server` flag and renders what came back. A trait so the order
 /// of probes against the service stop is testable without executing a binary.
-trait Probe {
-    async fn run(&self, server: &Path, flag: &str, timeout: Duration) -> String;
+trait Probe: Sync {
+    fn run(
+        &self,
+        server: &Path,
+        flag: &str,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = String> + Send;
 }
 
 struct RealProbe;
@@ -79,9 +84,9 @@ impl Probe for RealProbe {
 /// The report says `engine unknown` when no engine was determined, so a skipped
 /// inventory stays visible, and returns no evidence for another engine.
 pub async fn backend_evidence_around_stop(
-    manifest_path: impl FnOnce() -> PathBuf,
+    manifest_path: impl FnOnce() -> PathBuf + Send,
     engine: Option<&str>,
-    stop: impl FnOnce() -> String,
+    stop: impl FnOnce() -> String + Send,
 ) -> (String, Option<String>) {
     match engine {
         Some("lemonade") => {
@@ -98,7 +103,7 @@ async fn evidence_around_stop(
     manifest_path: &Path,
     budgets: Budgets,
     probe: &impl Probe,
-    stop: impl FnOnce() -> String,
+    stop: impl FnOnce() -> String + Send,
 ) -> (String, String) {
     let inventory = take_inventory(manifest_path, budgets.inventory).await;
     let stop_status = stop();
@@ -114,7 +119,7 @@ struct Inventory {
 }
 
 impl Inventory {
-    fn without_probes(report: String) -> Self {
+    const fn without_probes(report: String) -> Self {
         Self {
             report,
             servers: Vec::new(),
@@ -263,7 +268,7 @@ const MAX_DIR_ENTRIES: usize = 256;
 /// Names listed when explaining an empty search.
 const MAX_LISTED_NAMES: usize = 16;
 
-fn server_binary() -> &'static str {
+const fn server_binary() -> &'static str {
     if cfg!(windows) {
         "llama-server.exe"
     } else {
@@ -575,7 +580,7 @@ mod tests {
     #[test]
     fn a_server_above_the_old_32_mib_cap_is_still_fingerprinted() {
         const OLD_CAP: u64 = 32 * 1024 * 1024;
-        assert!(MAX_HASH_BYTES >= 256 * 1024 * 1024);
+        const { assert!(MAX_HASH_BYTES >= 256 * 1024 * 1024) };
         let root = tempfile::tempdir().unwrap();
         let server = root.path().join("llama-server");
         std::fs::File::create(&server)
@@ -779,13 +784,15 @@ mod tests {
         }
     }
 
+    type Events = std::sync::Mutex<Vec<String>>;
+
     struct RecordingProbe<'a> {
-        events: &'a std::cell::RefCell<Vec<String>>,
+        events: &'a Events,
     }
 
     impl Probe for RecordingProbe<'_> {
         async fn run(&self, _server: &Path, flag: &str, _timeout: Duration) -> String {
-            self.events.borrow_mut().push(format!("probe {flag}"));
+            self.events.lock().unwrap().push(format!("probe {flag}"));
             "recorded, not executed".to_owned()
         }
     }
@@ -829,13 +836,13 @@ mod tests {
     #[tokio::test]
     async fn inventory_precedes_the_stop_and_probes_follow_it() {
         let (_root, manifest, server) = lemonade_data_dir_with_candidate();
-        let events = std::cell::RefCell::new(Vec::new());
+        let events = Events::default();
         let (stop_status, report) = evidence_around_stop(
             &manifest,
             DEFAULT_BUDGETS,
             &RecordingProbe { events: &events },
             || {
-                events.borrow_mut().push("stop".to_owned());
+                events.lock().unwrap().push("stop".to_owned());
                 std::fs::remove_file(&server).unwrap();
                 "stopped".to_owned()
             },
@@ -843,7 +850,7 @@ mod tests {
         .await;
         assert_eq!(stop_status, "stopped");
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             ["stop", "probe --version", "probe --help"],
             "{report}"
         );
@@ -860,9 +867,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_runs_once_for_every_engine_and_an_unknown_engine_stays_visible() {
-        let stops = std::cell::Cell::new(0);
+        let stops = std::sync::atomic::AtomicUsize::new(0);
         let stop = || {
-            stops.set(stops.get() + 1);
+            stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             "stopped".to_owned()
         };
         let no_manifest = || -> PathBuf { panic!("the manifest is only read for lemonade") };
@@ -878,20 +885,20 @@ mod tests {
                 Some(ENGINE_UNKNOWN_EVIDENCE.to_owned())
             )
         );
-        assert_eq!(stops.get(), 2);
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         let (_root, manifest, _server) = lemonade_data_dir_with_candidate();
         let (status, evidence) =
             backend_evidence_around_stop(|| manifest, Some("lemonade"), stop).await;
         assert_eq!(status, "stopped");
         assert!(evidence.unwrap().contains("manifest: "));
-        assert_eq!(stops.get(), 3);
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn an_unreadable_manifest_is_reported_and_the_service_is_still_stopped() {
         let root = tempfile::tempdir().unwrap();
-        let events = std::cell::RefCell::new(Vec::new());
+        let events = Events::default();
         let (stop_status, report) = evidence_around_stop(
             &root.path().join("missing.json"),
             DEFAULT_BUDGETS,
@@ -901,7 +908,7 @@ mod tests {
         .await;
         assert_eq!(stop_status, "stopped");
         assert!(report.contains("unavailable:"), "{report}");
-        assert!(events.borrow().is_empty(), "no candidate, no probe");
+        assert!(events.lock().unwrap().is_empty(), "no candidate, no probe");
         assert!(!report.contains("probe target:"), "{report}");
     }
 
@@ -1129,7 +1136,7 @@ esac
     /// timeout branch is not taken.
     #[tokio::test]
     async fn a_probe_that_exits_reports_its_status_and_output() {
-        let report = run_probe(probe_child_command("exit"), Duration::from_secs(60)).await;
+        let report = run_probe(probe_child_command("exit"), Duration::from_mins(1)).await;
         let status = if cfg!(windows) {
             "exit code: 0\n"
         } else {
