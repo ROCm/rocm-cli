@@ -6803,7 +6803,8 @@ fi
 
     /// `cargo xtask check-architecture-doc` is only a gate if all three places
     /// that can fail a change actually run it: the pre-commit hook, the pre-push
-    /// hook (which catches a commit made with `--no-verify`) and a `rust`-gated
+    /// hook (which reads the working tree, so it catches a commit made with
+    /// `--no-verify` only when the tree is clean) and a `rust`-gated
     /// step in the `clippy` CI job. The hook must also see every commit: the
     /// answer depends on the whole tree, so a `files:` filter would let a
     /// delete-only or doc-only commit skip it. CI's `rust` path filter must

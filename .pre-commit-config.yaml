@@ -122,10 +122,12 @@ repos:
   # Module map: every production source file needs an entry in
   # docs/architecture.md. `lychee` above only checks that links already in the
   # doc resolve; this is the other direction, so a new file nobody wrote an
-  # entry for fails. Pre-commit for fast feedback, pre-push so a commit made
-  # with --no-verify is still caught. It reads the whole tree, so it is not
-  # narrowed to changed files: a rename or deletion anywhere can change the
-  # answer, and a delete-only commit has no changed files to match a filter.
+  # entry for fails. Pre-commit for fast feedback, pre-push for a commit made
+  # with --no-verify: it reads the working tree, not the pushed commits, so it
+  # only agrees with CI when the tree is clean, and CI is the gate. It reads the
+  # whole tree, so it is not narrowed to changed files: a rename or deletion
+  # anywhere can change the answer, and a delete-only commit has no changed
+  # files to match a filter.
   - repo: local
     hooks:
       - id: architecture-doc

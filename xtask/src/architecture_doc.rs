@@ -19,9 +19,19 @@
 //! neither does a link missing its `[` or `)`, one with an escaped bracket, an
 //! image, or the outer brackets of a link that contains another link),
 //! or be listed in [`EXEMPT`], or be a test-only helper (see
-//! [`is_test_helper`]). It reads the
-//! index and the working tree, never a git diff, so it behaves the same in CI,
-//! in the pre-commit hook and in the pre-push hook.
+//! [`is_test_helper`]). Out of scope: `build.rs` files at a crate's root and the
+//! `tests/` and `examples/` trees, which sit outside `<crate>/src`.
+//!
+//! It reads the git index and the working tree, never a git diff, so the answer
+//! does not depend on a base ref. That is the same answer in CI and in the
+//! pre-commit hook, where prek stashes unstaged changes first. The pre-push hook
+//! runs it too, but it reads the working tree, not the commits being pushed:
+//! with a clean tree that is the same thing, and with edits that are staged or
+//! unstaged it can pass where CI fails. CI is the gate; the hook is feedback.
+//!
+//! The doc must use inline `[text](path)` links. Reference-style links, a
+//! `?query` suffix and a root-relative path render as working links but are not
+//! recognised, so the failure message asks for the inline form.
 //!
 //! [`EXEMPT`] is the files that existed, uncited, when the check was added. It
 //! follows the pattern of `ALLOWLIST` in [`crate::crate_edges`] and is checked
@@ -132,7 +142,6 @@ const EXEMPT: &[&str] = &[
     "crates/rocm-dash-tui/src/ui/tabs/serving.rs",
     "crates/rocm-dash-tui/src/ui/update_manager.rs",
     "crates/rocm-deps/src/lib.rs",
-    "crates/rocm-engine-protocol/src/lib.rs",
     "engines/aim/src/main.rs",
     "engines/lemonade/src/main.rs",
     "engines/vllm/src/main.rs",
@@ -141,7 +150,7 @@ const EXEMPT: &[&str] = &[
 /// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
 /// not raise it to make the check pass, since a file with no entry in the module
 /// map should get one. Raising it is the visible, reviewed way to grow the list.
-const EXEMPT_CEILING: usize = 77;
+const EXEMPT_CEILING: usize = 76;
 
 /// Whether `path` is a tracked-file path this check covers: a `.rs` file under
 /// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
@@ -481,8 +490,9 @@ fn check(tracked: &[String], cited: &BTreeSet<String>, exempt: &[&str]) -> Vec<S
     for path in &in_tree {
         if !cited.contains(*path) && !exempt.contains(path) && !is_test_helper(path) {
             violations.push(format!(
-                "`{path}` is not cited in {DOC}: add an entry for it to the module map, as a \
-                 relative markdown link"
+                "`{path}` is not cited in {DOC}: add an entry for it to the module map, as an \
+                 inline `[text](path)` markdown link relative to docs/ (reference-style links, \
+                 `?query` suffixes and root-relative paths are not recognised)"
             ));
         }
     }
@@ -918,6 +928,20 @@ mod tests {
         let violation = ceiling_violation(78, 77).expect("one over the ceiling fails");
         assert!(violation.contains("78 entries"));
         assert!(violation.contains("EXEMPT_CEILING is 77"));
+    }
+
+    #[test]
+    fn the_link_forms_the_failure_message_rules_out_are_not_citations() {
+        // The message tells authors these forms are not recognised; this holds it
+        // to what the parser does.
+        assert!(!cited_cli("[cli][c]\n\n[c]: ../apps/rocm/src/cli.rs"));
+        assert!(!cited_cli("[cli](../apps/rocm/src/cli.rs?plain=1)"));
+        assert!(!cited_cli("[cli](/apps/rocm/src/cli.rs)"));
+        let message = &check(&files(&["apps/rocm/src/new.rs"]), &cites(&[]), &[])[0];
+        assert!(message.contains("inline `[text](path)`"));
+        assert!(message.contains("reference-style"));
+        assert!(message.contains("`?query`"));
+        assert!(message.contains("root-relative"));
     }
 
     #[test]
