@@ -204,6 +204,9 @@ Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
 Run `rocm <command> --help` for details and examples on any command."
 )]
+// No global flags, no subcommand aliases and no abbreviations: the logger gate in
+// `logging::is_enabled_for` reads the subcommand as `argv[1]` and relies on that
+// (guarded by `uninstall_stays_the_first_argument_the_logger_gate_reads`).
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -3738,6 +3741,42 @@ pub(crate) mod tests {
         let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
             .expect_err("zero timeout-secs is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `logging::is_enabled_for` decides that `rocm uninstall` skips the client
+    /// log by looking at the first raw argument. That is only right while the
+    /// subcommand is always `argv[1]`: a global flag in front of it, an alias
+    /// for `uninstall`, or an abbreviated name would start the logger again and
+    /// a dry run would list a `logs` folder it had just made. The e2e scenario
+    /// `uninstall-06` proves the behaviour; this fails earlier, naming the cause.
+    #[test]
+    fn uninstall_stays_the_first_argument_the_logger_gate_reads() {
+        let command = Cli::command();
+        let global_args: Vec<_> = command
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .filter(|id| !matches!(*id, "help" | "version"))
+            .collect();
+        assert!(
+            global_args.is_empty(),
+            "a top-level argument {global_args:?} can come before the subcommand, so \
+             logging::is_enabled_for no longer sees `uninstall` as the first argument"
+        );
+        let aliased: Vec<_> = command
+            .get_subcommands()
+            .filter(|sub| sub.get_all_aliases().any(|alias| alias == "uninstall"))
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(
+            aliased.is_empty(),
+            "{aliased:?} answers to `uninstall`, which logging::is_enabled_for does not check"
+        );
+        let uninstall = command
+            .find_subcommand("uninstall")
+            .expect("uninstall subcommand exists");
+        assert_eq!(uninstall.get_all_aliases().count(), 0);
+        Cli::try_parse_from(["rocm", "uninstal"])
+            .expect_err("an abbreviated subcommand name must not reach uninstall");
     }
 
     #[test]
