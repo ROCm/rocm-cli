@@ -1147,11 +1147,26 @@ mod tests {
     /// Collects the files under `dir`, skipping build output, vendored trees and
     /// every dot-directory (`.git`, `.rocm-work`, and nested checkouts such as
     /// `.claude/worktrees/...`, whose sources belong to another branch).
+    ///
+    /// Symbolic links are neither followed nor listed: a link loop would recurse
+    /// until the OS refuses, and a link out of the tree would scan files that are
+    /// not this workspace's. A directory that cannot be read contributes nothing
+    /// instead of failing the test, since a push should not be blocked by a folder
+    /// the developer has no access to.
     fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
         const SKIPPED: &[&str] = &["target", "node_modules", "third_party"];
-        for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if kind.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_str().unwrap_or_default();
                 if !name.starts_with('.') && !SKIPPED.contains(&name) {
@@ -1168,21 +1183,6 @@ mod tests {
             .expect("under the repo root")
             .to_string_lossy()
             .replace('\\', "/")
-    }
-
-    /// The workspace crates, found from their manifests on disk.
-    fn crates_on_disk(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
-        files
-            .iter()
-            .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
-            .filter_map(|path| {
-                let manifest: toml::Value =
-                    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-                let name = manifest.get("package")?.get("name")?.as_str()?.to_string();
-                let dir = relative(root, path.parent()?);
-                (!dir.is_empty()).then_some((name, dir))
-            })
-            .collect()
     }
 
     /// A raw-string include is a cross-crate read like any other; the scanner
@@ -1230,6 +1230,56 @@ mod tests {
         assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
     }
 
+    /// A link that points back up the tree would be followed forever, and one
+    /// that points out of it would scan files that are not this workspace's. Neither
+    /// is descended into or listed.
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symbolic_links() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(outside.path().join("elsewhere.rs"), "").expect("write");
+        let a = tmp.path().join("crates/a");
+        std::fs::create_dir_all(a.join("src")).expect("mkdir");
+        std::fs::write(a.join("src/lib.rs"), "").expect("write");
+        std::os::unix::fs::symlink(tmp.path(), a.join("loop")).expect("link up the tree");
+        std::os::unix::fs::symlink(outside.path(), a.join("out")).expect("link out of the tree");
+        std::os::unix::fs::symlink(a.join("src/lib.rs"), a.join("alias.rs")).expect("file link");
+        let mut files = Vec::new();
+        walk(tmp.path(), &mut files);
+        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
+        assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
+    }
+
+    /// A folder the developer cannot read must not fail the scan (and so block
+    /// a push); the files that can be read are still found. Running as root
+    /// reads everything, so this only asserts that nothing panics and that the
+    /// readable file is there.
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_an_unreadable_directory_instead_of_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        for file in ["crates/a/src/lib.rs", "private/hidden.rs"] {
+            let path = tmp.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "").expect("write");
+        }
+        let private = tmp.path().join("private");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
+            .expect("remove access");
+        let mut files = Vec::new();
+        walk(tmp.path(), &mut files);
+        // Restore access first so the temp dir can be removed even if an assert fails.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
+            .expect("restore access");
+        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
+        assert!(
+            found.contains(&"crates/a/src/lib.rs".to_string()),
+            "{found:?}"
+        );
+    }
+
     /// Fails when a crate reads a file outside its own directory that the hook's
     /// selection would not send to that crate's tests, or when a crate derives
     /// the repo root without being declared as a reader. Add the path to
@@ -1251,7 +1301,12 @@ mod tests {
         let root = repo_root();
         let mut files = Vec::new();
         walk(&root, &mut files);
-        let crate_dirs = crates_on_disk(&root, &files);
+        // The workspace members, from the same `cargo metadata` the hook selects
+        // with, so a stray `Cargo.toml` (a fixture, a nested checkout) is not
+        // taken for a workspace crate.
+        let crate_dirs = affected::load_graph()
+            .expect("read the workspace graph")
+            .crate_dirs;
         assert!(
             crate_dirs.iter().any(|(name, _)| name == "xtask"),
             "found no crates under {}",
