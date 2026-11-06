@@ -742,6 +742,27 @@ enum LookupPurpose {
     Preview,
 }
 
+impl LookupPurpose {
+    /// The progress line for an interpreter (`subject`) that exists but cannot
+    /// serve the install. Both purposes state the finding; an install then says
+    /// what it goes on to do (`install_next_step`) and a preview stops.
+    fn unusable_python_line(
+        self,
+        subject: &str,
+        requirement: PythonRequirement,
+        install_next_step: &str,
+    ) -> String {
+        let finding = format!(
+            "{subject} is not usable for this ROCm install ({} is required)",
+            requirement.tag
+        );
+        match self {
+            Self::Install => format!("{finding}; {install_next_step}."),
+            Self::Preview => format!("{finding}."),
+        }
+    }
+}
+
 /// Where the search for an interpreter ended.
 enum PythonLookup {
     /// An interpreter that is usable as it stands.
@@ -801,16 +822,11 @@ fn find_python_launcher_in(
     // `PlannedPython::progress_text`, after the decision. An install's wording is
     // unchanged.
     if skipped_path_python {
-        progress_line(match purpose {
-            LookupPurpose::Install => format!(
-                "Python from PATH is not usable for this ROCm install ({} is required); using ROCm CLI's managed Python.",
-                requirement.tag
-            ),
-            LookupPurpose::Preview => format!(
-                "Python from PATH is not usable for this ROCm install ({} is required).",
-                requirement.tag
-            ),
-        });
+        progress_line(purpose.unusable_python_line(
+            "Python from PATH",
+            requirement,
+            "using ROCm CLI's managed Python",
+        ));
     }
 
     if let Some(manifest) = load_managed_python_manifest(paths)?
@@ -822,16 +838,11 @@ fn find_python_launcher_in(
                 source: PythonSource::Managed,
             }));
         }
-        progress_line(match purpose {
-            LookupPurpose::Install => format!(
-                "Saved managed Python is not usable for this ROCm install ({} is required); preparing Python again.",
-                requirement.tag
-            ),
-            LookupPurpose::Preview => format!(
-                "Saved managed Python is not usable for this ROCm install ({} is required).",
-                requirement.tag
-            ),
-        });
+        progress_line(purpose.unusable_python_line(
+            "Saved managed Python",
+            requirement,
+            "preparing Python again",
+        ));
     }
 
     if env.managed_bootstrap_disabled {
