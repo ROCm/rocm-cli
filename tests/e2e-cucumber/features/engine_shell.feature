@@ -22,3 +22,35 @@ Feature: Engine shell
     And the engine environment's interpreter is the one that runs
     When the user leaves the engine shell
     Then the engine shell exits successfully
+
+  # The env_path is planted bin-shaped, the way the vLLM install RESPONSE reports it
+  # (`command.parent()` in engines/vllm/src/install.rs; users reach it through the
+  # auto-install branch of resolve_engine_env). No install writes such a manifest
+  # to disk — planting one is only the cheapest way to hand the shell that value
+  # without a multi-GiB install. The shell composes its activation hint by
+  # appending the interpreter directory to whatever env_path it is given, so a
+  # value that already points inside it yields a path nobody can source.
+  #
+  # Consequence for whoever fixes this: a fix in engines/vllm (report the env root)
+  # closes EAI-8049 but leaves this fixture unchanged, so the scenario must then be
+  # rewritten or deleted along with its expectation row. Only a fix to the hint
+  # composition itself makes this row go stale.
+  #
+  # The interpreter step is here because the same doubled path also sets a wrong
+  # VIRTUAL_ENV and puts a nonexistent bin/bin on PATH: a fix to the hint text
+  # alone would otherwise flip this row while the shell still runs the wrong
+  # python. The step runs the interpreter and also checks that VIRTUAL_ENV names
+  # an environment holding bin/activate, so the row flips only once the hint, PATH
+  # and VIRTUAL_ENV are all right.
+  #
+  # Phrased as "the file it names is there", not as "the path is not doubled": the
+  # first survives whichever way the mismatch is repaired, the second would go
+  # stale the moment it is.
+  @id:engine-shell-activation-hint-is-usable @requires-os:linux
+  Scenario: engine-shell-02 - The activation hint an engine shell prints refers to a real file
+    Given a machine with an engine environment installed the way the engine records it
+    When the user opens a shell for that engine
+    Then the printed activation hint names a file that exists
+    And the engine environment's interpreter is the one that runs
+    When the user leaves the engine shell
+    Then the engine shell exits successfully
