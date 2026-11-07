@@ -29,7 +29,10 @@ rocm-cli local assistants use structured tools, not shell commands.
   The provider-assisted planner's argv is held to the same rule, and a planner
   note carrying such a character is left out and counted.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
-  loudly when the ROCm GPU path is not ready.
+  loudly when the ROCm GPU path is not ready. Keeping some of a model's layers
+  in system RAM on a GPU that is ready (llama.cpp's `--n-gpu-layers`), which
+  `rocm diagnose --model` suggests when a GGUF model does not fit in VRAM, is
+  not CPU fallback, and the assistant may relay it.
 - A `rocm serve` the model proposes through `rocm_command`, or the
   provider-assisted planner proposes in its tool call, is refused unless it
   asks for no public bind (`--allow-public-bind`), no CPU device, a loopback
