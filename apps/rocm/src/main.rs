@@ -24,6 +24,7 @@ mod comfyui;
 mod config_cmd;
 mod dash;
 mod dash_seam;
+mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod deletion_properties;
@@ -685,9 +686,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             distro,
             model,
+            context_size,
+            kv_cache_type,
             report,
             send,
-        }) => diagnose(symptom, top, json, distro, model, report, send),
+        }) => {
+            let model = model.map(|model_ref| {
+                diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            diagnose(symptom, top, json, distro, model, report, send)
+        }
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
