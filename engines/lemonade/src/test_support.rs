@@ -8,6 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "../../../crates/rocm-core/tests/common/proptest_cases.rs"]
+mod proptest_cases;
+pub(crate) use proptest_cases::proptest_cases;
+
 /// A fresh, empty scratch directory under the crate's `target/`, named
 /// `lemonade-fs-test-<tag>-<pid>-<millis>-<counter>`.
 ///

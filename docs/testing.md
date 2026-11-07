@@ -317,9 +317,13 @@ PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
 reads the variable back itself: through the `proptest_cases` helper in each
 crate's test support, [rocm's](../apps/rocm/src/test_support.rs) and
-[rocm-core's](../crates/rocm-core/src/test_support.rs), and through
-`run_property` in [archive_props.rs](../crates/rocm-core/src/archive_props.rs),
-which keeps its own copy because three crates include it by `#[path]`. All of
+[rocm-core's](../crates/rocm-core/src/test_support.rs); through the copy in
+[tests/common/proptest_cases.rs](../crates/rocm-core/tests/common/proptest_cases.rs),
+which the `rocm-core` and `rocm-engine-protocol` integration tests and the
+Lemonade engine's unit tests include by `#[path]` because they cannot reach a
+crate's test support; and through `run_property` in
+[archive_props.rs](../crates/rocm-core/src/archive_props.rs), which keeps its
+own copy because three crates include it by `#[path]`. All of
 them only ever raise the module's count: a `PROPTEST_CASES` below it is
 ignored, because some of these properties catch their target defect in a small
 share of cases and would pass with it present on a short run. The uninstall properties read their own
@@ -2239,6 +2243,31 @@ index that publishes the other,
 because its runtime key and package specs carry the index's spelling.
 `generator_reach_report` prints how often each hard case is generated (run it
 with `-- --nocapture`), and fails if the generator stops reaching them.
+
+Artifact integrity and engine protocol property tests:
+
+```bash
+cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
+cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-engine-lemonade --lib archive_digest
+cargo test -p xtask verify_pinned_keys
+```
+
+These check the code that decides whether a download, a signature or the
+pinned release key is authentic, and the code that decodes engine output. The
+generators aim at near misses — a digest one nibble off or sharing a correct
+prefix, a signature with one byte changed or leading zeros, a loopback spelling
+padded or re-cased, a model id with a variant suffix — because a uniformly
+random input is rejected by any implementation, correct or not. The pinned-key
+tests run the real check over a scratch repository root and walk every
+position of the committed key. `model_selector_properties` also pins, rather
+than asserts away, two shapes where readiness accepts an engine's reported name
+for a different model: a bare family word such as `qwen` reads as ready for
+other models of that family, in the catalog and beyond, and a catalog alias
+that spells another catalog model's basename (`qwen3-32b`, an alias of
+`Qwen/Qwen3-32B-FP8` and the basename of `Qwen/Qwen3-32B`) reads as ready for
+that other model. The second is checked against a list of the catalog's
+current collisions, so a catalog change that adds one fails the test.
 
 Model recipe engine metadata checks:
 
