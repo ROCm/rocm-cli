@@ -11,6 +11,12 @@ SPDX-License-Identifier: MIT
 :end-before: "## Interactive interfaces"
 ```
 
+The following recording shows these steps: inspecting the environment,
+discovering engines and models, finding a running service, and chatting with a
+locally served model.
+
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
+
 ## Configure ROCm and serve a model
 
 ```{include} ../../README.md

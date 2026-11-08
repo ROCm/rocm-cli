@@ -8,8 +8,6 @@ subtrees:
   - caption: Getting started
     entries:
       - file: getting-started
-      - file: demos
-        title: See ROCm CLI in action
   - caption: Use ROCm CLI
     entries:
       - file: commands

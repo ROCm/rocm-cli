@@ -34,7 +34,6 @@ The ROCm CLI public repository is located at
    .. grid-item-card:: Getting started
 
       * :doc:`Getting started with ROCm CLI <getting-started>`
-      * :doc:`See ROCm CLI in action <demos>`
 
    .. grid-item-card:: Use ROCm CLI
 
