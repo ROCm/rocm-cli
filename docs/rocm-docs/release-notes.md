@@ -40,6 +40,11 @@ safer, and makes driver installation consistent across Linux distributions.
   flow as apt: it imports the AMD key, writes a package-manager repository file,
   and installs `amdgpu-dkms`. The default driver source moves from a pinned
   `7.2.4` to `latest`.
+- The `ROCM_CLI_AMDGPU_VERSION` and `ROCM_CLI_AMDGPU_PACKAGE_RELEASE`
+  environment variables are no longer read. Set `ROCM_CLI_AMDGPU_DRIVER_VERSION`
+  to pin a specific amdgpu release. `rocm install driver` refuses to plan while
+  either old variable is still set, so an old pin is never silently turned into
+  `latest`.
 
 ## Added
 
@@ -82,10 +87,10 @@ safer, and makes driver installation consistent across Linux distributions.
   and memory metrics in-process on Windows.
 - The dashboard **Diagnose** screen can prepare a Doctor report. Press `p` to
   preview what the report would carry (nothing is sent). Press `s` to send it
-  only after approval; Deny is the default.
+  only after approval. Deny is the default.
 - The Doctor skill (`rocm-doctor`), which diagnoses broken ROCm, HIP SDK, and
   PyTorch setups, stops when the CLI predates the failure catalog that the skill
-  describes. It also covers the two vLLM startup failures above: out of memory,
+  requires. It also covers the two vLLM startup failures above: out of memory,
   and a `libtorch_cuda.so` import error.
 - Before offering the mail, `rocm diagnose --report` now says that the mail goes
   from your own account and carries your address, and that the report itself
@@ -103,7 +108,7 @@ safer, and makes driver installation consistent across Linux distributions.
 - The dashboard serve wizard is now model selection plus inline **Advanced**
   settings, validated the same way as the CLI before approval.
 - The dashboard assistant no longer advertises the `list_skills` and
-  `skill_plan` tools, whose install recipes nothing could run.
+  `skill_plan` tools, whose install recipes could not run.
 
 ## Resolved issues
 
