@@ -40,7 +40,7 @@ rocm install driver            # print the plan
 rocm install driver --yes      # run it
 ```
 
-On WSL2 this installs ROCDXG rather than Linux DKMS. There is no in-tree
+On WSL2 this installs ROCDXG instead of Linux DKMS. There is no in-tree
 amdgpu driver to build, because the GPU comes from the Windows host driver
 through `/dev/dxg`. The plan is printed for review first and only runs with
 `--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
@@ -74,7 +74,7 @@ ROCM_CLI_ROCDXG_VERSION=<version> \
 ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
 ```
 
-Without one of those, an unpinned version is refused rather than installed
+Without one of those, an unpinned version is refused instead of being installed
 unverified.
 
 ### Doing it by hand
@@ -102,8 +102,8 @@ sudo apt install -y "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
 sudo ldconfig
 ```
 
-Source-build alternative. Set `win_sdk` to the Windows SDK version installed on
-your host; the version in this example may differ from yours:
+To build from source instead, set `win_sdk` to the Windows SDK version installed
+on your host. The version in this example can differ from yours:
 
 ```bash
 git clone https://github.com/ROCm/librocdxg.git
@@ -270,7 +270,7 @@ collects a fixed set of data. This leaves four limits:
   `rocm diagnose` inside the distro finds healthy. A library beside its runtime,
   the layout of a TheRock tarball, is a file check, so `--distro` does see that
   one. The finding's evidence says
-  the variable could not be checked from outside the distribution, rather than
+  the variable could not be checked from outside the distribution, instead of
   claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
   that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
@@ -302,7 +302,7 @@ below.
 - WSL major version, 1 or 2 (`--json` only)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
-- `librocdxg.so` presence, resolved across every ROCm install rather than
+- `librocdxg.so` presence, resolved across every ROCm install instead of
   assuming `/opt/rocm`, and counted as present when it is in a directory on
   `LD_LIBRARY_PATH` even if no ROCm install holds it (the `wsl_librocdxg` line
   stays `false` for such a library; `driver_status` and the `missing` detail
