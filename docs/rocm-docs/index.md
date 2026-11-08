@@ -30,6 +30,11 @@ notice. Intended for experimentation and early feedback only.
 The ROCm CLI public repository is located at
 [ROCm/rocm-cli](https://github.com/ROCm/rocm-cli).
 
+Inspect the environment, discover engines and models, find a running service,
+and chat with a locally served model:
+
+![ROCm CLI demo](https://raw.githubusercontent.com/ROCm/rocm-cli/media/cli.gif)
+
 ````{grid} 1 2 2 2
 :gutter: 3
 
