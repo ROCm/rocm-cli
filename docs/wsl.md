@@ -14,12 +14,14 @@ virtual environments and ROCDXG (`librocdxg`).
 The AMD WSL path is:
 
 1. Windows 11 with the AMD Adrenalin WSL-capable driver.
-2. WSL2 with Ubuntu 24.04 or newer. Ubuntu 22.04 is not supported: it ships
-   glibc 2.35, below the minimum that every published Lemonade embeddable
-   requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the Lemonade engine cannot
-   start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
+2. WSL2 with Ubuntu 24.04 or newer.
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
+
+Ubuntu 22.04 is not supported. It ships glibc 2.35, below the minimum that every
+published Lemonade embeddable requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the
+Lemonade engine cannot start there. Ubuntu 24.04 provides glibc 2.39 and
+`GLIBCXX_3.4.33`.
 
 To run a read-only preflight check from inside the distro:
 
@@ -42,14 +44,15 @@ rocm install driver --yes      # run it
 
 On WSL2 this installs ROCDXG instead of Linux DKMS. There is no in-tree
 amdgpu driver to build, because the GPU comes from the Windows host driver
-through `/dev/dxg`. The plan is printed for review first and only runs with
+through `/dev/dxg`.
+
+The plan is printed for review first and only runs with
 `--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
 touching anything, installs the release package, runs `ldconfig`, and then
 verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
 No reboot is needed: ROCDXG is userspace.
 
-Confirm afterwards with
-`rocm examine`, which should report
+Confirm afterwards with `rocm examine`, which should report
 `driver_status: wsl_rocdxg_ready`.
 
 The download is verified before it is installed. `rocm install driver` carries a
