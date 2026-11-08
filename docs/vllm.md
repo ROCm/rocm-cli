@@ -291,13 +291,13 @@ a tiny model. ROCm CLI helps in three ways:
 - **The serve summary warns on low free VRAM.** When the selected GPU is already
   heavily used, `rocm serve` prints a note. The note appears before launch on
   the plain path, or in the post-readiness summary in the default interactive
-  mode. For vLLM, the note also points at `--gpu-memory-utilization` as the fix.
+  mode. For vLLM, the note also points to `--gpu-memory-utilization` as the fix.
 - **OOM failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
   reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
-  GPU with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
-  for the full conditional remediation (busy GPU versus a model that does not
-  fit). "Shows an out-of-memory error" means a line carrying an allocator-shaped
+  GPU with `--gpu <index>`. It also points to `rocm diagnose --symptom '<the
+  error>'` for the full conditional remediation (busy GPU versus a model that
+  does not fit). "Shows an out-of-memory error" means a line carrying an allocator-shaped
   signature: `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
   or a `torch.OutOfMemoryError` corroborated by an allocator message. A bare
   `HIP error: out of memory`, a kernel OOM-killer line, or vLLM's generic

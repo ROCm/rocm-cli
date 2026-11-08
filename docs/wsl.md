@@ -349,11 +349,11 @@ that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what
 is missing.
 
 A `librocdxg.so` that the loader finds through `LD_LIBRARY_PATH`, or beside the
-runtime that opens it, counts as ready. A library in a non-ROCm directory, such
-as a source build in your home directory, is counted once its directory is on
-`LD_LIBRARY_PATH`. A TheRock tarball is laid out the second way and needs
-nothing exported. For a library that sits alone, export its `lib` directory in
-the shell that runs `rocm` (see
+runtime that opens it, counts as ready wherever it lives. A library in a
+non-ROCm directory, such as a source build in your home directory, is counted
+once its directory is on `LD_LIBRARY_PATH`. A TheRock tarball places the library
+beside the runtime and needs nothing exported. For a library that sits alone,
+export its `lib` directory in the shell that runs `rocm` (see
 [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
 
 ## Install UX Recommendations

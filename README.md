@@ -39,7 +39,7 @@ for Lemonade and vLLM.
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory.
-The serving-instance registry view needs the `rocmdashd` unix socket, so it's
+The serving-instance registry view needs the `rocmdashd` Unix socket, so it's
 Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
@@ -575,8 +575,8 @@ you what it couldn't find instead.
 #### Driver installation
 
 `install driver` previews or installs Linux AMD driver support. Without `--dkms`
-it prints a non-mutating plan and changes nothing; add `--dkms` to plan the DKMS
-install, and `--yes` to apply it. On bare metal it defaults to the floating
+it prints a non-mutating plan and changes nothing; `--dkms` plans the DKMS
+install; add `--yes` to apply it. On bare metal it defaults to the floating
 `latest` amdgpu release;
 set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
 older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
@@ -1025,8 +1025,8 @@ key, and the service's recorded device policy must satisfy this one: a
 `gpu_required` serve is not reused from a service recorded as `cpu_only`. That
 is the only policy pair refused; any other combination, including a record that
 predates the field and so names no policy at all, is accepted. (No `rocm serve`
-can record a `cpu_only` service today: `--device cpu_only` is refused outright,
-since CPU is not a fallback path here, so that term is a guard, not a refusal
+can record a `cpu_only` service today. `--device cpu_only` is refused outright
+because CPU is not a fallback path here, so that term is a guard, not a refusal
 you will meet.) A live service that fails any of those is not reusable, so it
 buys no bypass: `rocm serve` refuses on the GPU instead, which is the accurate
 message and leaves your running server alone. (Telling you to stop it and re-run
@@ -1090,8 +1090,8 @@ fine. It appears only when all of the following hold:
   (`readiness: <status>`), which carries no *post-launch* notes. It still
   prints the pre-launch planning lines, including the low-VRAM `note:` when
   amd-smi reports a tight card, so a `note:` in piped output is never this one.
-  `--verbose`/`--foreground` streams the engine log in your terminal instead,
-  where the traceback is already in front of you. Either way, the log is on
+  With `--verbose` or `--foreground`, the engine log streams in your terminal
+  instead, where the traceback is already in front of you. Either way, the log is on
   disk: `rocm services logs <service-id>`.
 - The service **failed to become ready** (recorded status `starting`). A `ready`
   service, or a `running` one whose endpoint is up while the model is still
@@ -1237,7 +1237,7 @@ For `rocm dash`:
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
 - Live mode works on Windows too, but shows only GPU/CPU/memory. There is no
-  `rocmdashd` unix socket to connect to there, so the serving-instance
+  `rocmdashd` Unix socket to connect to there, so the serving-instance
   registry view stays empty (Linux and WSL2 get the full live view).
 
 ### Bench
