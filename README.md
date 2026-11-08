@@ -44,11 +44,13 @@ Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
-other distributions the equivalent requirement is glibc 2.38 with
-`GLIBCXX_3.4.32`: that is what the Lemonade engine is linked against, and every
-published build of it needs those versions, so there is no older release to fall
-back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
-glibc 2.39 and `GLIBCXX_3.4.33`.
+other distributions, the equivalent requirement is glibc 2.38 with
+`GLIBCXX_3.4.32`.
+
+The Lemonade engine is linked against these versions, and every published build
+of it needs them, so there is no older release to fall back to. Ubuntu 22.04
+ships glibc 2.35 and cannot run the engine. Ubuntu 24.04 provides glibc 2.39 and
+`GLIBCXX_3.4.33`.
 
 > [!IMPORTANT]
 > **Tech Preview:** This software is provided as-is, without warranty or
@@ -126,10 +128,10 @@ version. A successful install prints the CLI version line. The SDK and driver
 lines read `not detected` when none is found, which is expected on a computer
 where you haven't installed ROCm or a driver yet.
 
-If the shell reports `rocm: command not found`, confirm that the install
-directory is on your `PATH`. That is `~/.local/bin` on Linux,
-`%USERPROFILE%\.local\bin` on Windows, or the folder you set with
-`ROCM_CLI_INSTALL_DIR`.
+If your shell can't find the `rocm` command, for example with
+`rocm: command not found`, confirm that the install directory is on your `PATH`.
+The directory is `~/.local/bin` on Linux, `%USERPROFILE%\.local\bin` on Windows,
+or the folder you set with `ROCM_CLI_INSTALL_DIR`.
 
 ## Build from source
 
@@ -189,11 +191,18 @@ that job finishes, `Ctrl-C` quits there too.
 
 If a model is still being served, quitting asks for confirmation first. This
 covers `q`, the Esc menu's `Quit` row, and `/quit` or `/exit` in chat, from the
-launcher or from a dashboard or chat session opened directly. The prompt names
-the model and the `rocm services stop <id> --yes` command to stop it. From
-the dashboard, pressing `s` instead jumps straight to the Services overlay to
-stop it there. Declining (`n` or Esc) returns to where you were. Confirming
-(`y` or Enter) quits anyway, and the model keeps running in the background.
+launcher or from a dashboard or chat session opened directly.
+
+The prompt names the model and the `rocm services stop <id> --yes` command to
+stop it. From the dashboard, press `s` instead to jump straight to the Services overlay and
+stop it there.
+
+At the prompt:
+
+- Decline (`n` or Esc) to return to where you were.
+- Confirm (`y` or Enter) to quit anyway. The model keeps running in the
+  background.
+
 Unlike `q`, `Ctrl-C` always quits immediately without asking, with the same
 running-job exception as above. See
 [Developer manual QA](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md)
