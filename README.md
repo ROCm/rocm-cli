@@ -190,7 +190,7 @@ that job finishes, `Ctrl-C` quits there too.
 If a model is still being served, quitting asks for confirmation first. This
 covers `q`, the Esc menu's `Quit` row, and `/quit` or `/exit` in chat, from the
 launcher or from a dashboard or chat session opened directly. The prompt names
-the model and the real `rocm services stop <id> --yes` command to stop it. From
+the model and the `rocm services stop <id> --yes` command to stop it. From
 the dashboard, pressing `s` instead jumps straight to the Services overlay to
 stop it there. Declining (`n` or Esc) returns to where you were. Confirming
 (`y` or Enter) quits anyway, and the model keeps running in the background.
@@ -256,7 +256,7 @@ legacy install.
 
 ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
 `rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
-add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
+add `--version`. If ROCm CLI can't tell which exact GPU architecture this computer has,
 or you want a different one, also add `--family` with the raw `gfx` code from
 `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
@@ -325,7 +325,7 @@ compares the driver date with the release of the first HIP SDK for Windows
 (27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
 the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
 statement that the driver is broken. The date is only a floor: it cannot judge
-newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers.
+newer GPUs such as gfx120X, gfx1150 and gfx1151, which might need newer drivers.
 `rocm diagnose` lists the same finding as
 `fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
 page and a restart after the install. The entry is advice about the host, not a
@@ -392,7 +392,7 @@ text.
 
 The ROCm release and the inference engine's release are each cut
 back to a release, so a build number that would narrow toward one machine
-never appears there; the CLI's own version is the exception, since it names
+never appears there; the CLI's own version is the exception, because it names
 the tool that wrote the report instead of something read off the machine.
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
@@ -535,7 +535,7 @@ active default runtime, not about what a named prefix loses.
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
 version with `--version`. These versions select their device payload by exact
-GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
+GPU architecture, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
 
@@ -949,9 +949,9 @@ terminal and streams every engine log line. Use it to debug a startup problem.
 The server still runs as a managed background process, so while streaming you
 can:
 
-- Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
+- Press `Ctrl-D` to detach. The log stream stops, your shell comes back, and
   the server keeps running. Manage it afterward with `rocm services`.
-- Press **Ctrl-C** to stop the server instead. If the stop answers that it
+- Press `Ctrl-C` to stop the server instead. If the stop answers that it
   could not confirm the server's process exited, the command prints the same
   report as `rocm services stop` on stderr and exits with an error. If the stop
   itself fails, the command says why on stderr, signals the server process
@@ -1037,7 +1037,7 @@ Under the default `gpu_required` policy, `rocm serve` on a host with no usable
 AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
 prepared or downloaded. A `rocm serve` that matches an **already-running
 managed service for the same engine and model** now skips that refusal and
-prints the reuse summary instead. This is a real change to a refusal you may be
+prints the reuse summary instead. This is a real change to a refusal you might be
 relying on: on a GPU-less host, `rocm serve <model>` can now succeed where it
 previously always failed.
 
@@ -1089,7 +1089,7 @@ than they are:
   check refuses *every* index on a host with no usable GPU, because there is no
   visible ordinal for one to name. So `rocm serve <model> --gpu 0` is refused on
   a GPU-less host whether or not a reusable service is running, and so is
-  `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
+  any other index, such as `--gpu 1`. The exemption applies under the default `--gpu auto`.
 
 #### When a serve runs out of GPU memory
 
@@ -1098,7 +1098,7 @@ engine log shows an out-of-memory failure, the deployment summary adds a note
 confirming the attempt ran out of GPU memory, naming the two knobs that can fix
 it (`--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
 `--gpu <index>`), warning that lowering the reservation will not help if the
-model simply does not fit, and printing a
+model does not fit, and printing a
 `rocm diagnose --symptom '<your failing line>'` command for the full
 busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
 in a shell-quoted argument intact (one containing an apostrophe, for instance)
@@ -1173,7 +1173,7 @@ rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 `stop` reports a server stopped only once every recorded process is confirmed
 gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
-processes, and any endpoint key, which the server may still be enforcing. It
+processes, and any endpoint key, which the server might still be enforcing. It
 names each process that, or a process under it, did not exit after it was
 signaled; for a process it could not verify as the server's, it signals nothing
 and names an operating-system command to check on it. It does not suggest
@@ -1400,7 +1400,7 @@ A reinstall also behaves as follows:
   says so; stop it with `rocm comfyui stop` first. This is checked before the
   download and again just before the code is replaced, so a ComfyUI started
   during the download is caught too. If rocm-cli's saved record of that ComfyUI
-  cannot be read, the reinstall says so and is not refused, since `stop` cannot
+  cannot be read, the reinstall says so and is not refused, because `stop` cannot
   read it either.
 - **Interrupted or stopped part-way.** If a reinstall is interrupted, or stops
   (because a file it must delete or move is in use, say), `start` refuses to
@@ -1524,7 +1524,7 @@ and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
 The binaries it removes include the running `rocm.exe` on Windows. It also
 undoes the `PATH` change the installer made: the marked block in your shell
 profile, or the user `PATH` entry the Windows installer recorded adding. That
-change stays when other programs live in the same folder, since they may rely
+change stays when other programs live in the same folder, because they might rely
 on it (the review names them), and with `--keep-binaries`. A `PATH` line you
 wrote yourself is never touched. The `PATH` change is undone first: if it can't
 be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
