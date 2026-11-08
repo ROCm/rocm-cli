@@ -22,24 +22,16 @@ release. For the full list, see the
 ROCm CLI 0.3.0 adds a third serving engine, makes serving and runtime changes
 safer, and makes driver installation consistent across Linux distributions.
 
-- **AIM serving engine.** Use `--engine aim` to serve AMD Enterprise AI AIM
-  pre-built Docker containers alongside vLLM and Lemonade. The engine is
-  opt-in.
-- **Follow a starting server.** `rocm logs --service <id> --follow` streams a
-  server's output, including download progress bars, until the server is no
-  longer starting or running.
-- **Collision-safe ports.** `rocm serve` without `--port` now picks the first
-  free loopback port in `11435..=11535`, and two launches can no longer take
-  the same port.
-- **Transactional runtime activation.** Activating or rolling back a runtime
-  names the running servers that keep the old runtime, and a failed write no
-  longer leaves the configuration and the active-runtime marker disagreeing.
-- **Repo-native driver installs.** `rocm install driver` now uses the same
-  repository-based flow on apt, dnf, and zypper hosts, and plans the Ubuntu
-  26.04 DKMS flow. `amdgpu-install` is removed as an install method.
-- **Clearer failures on Windows.** `rocm serve --engine vllm` and
-  `rocm engines install vllm` now refuse up front on native Windows and give the
-  platform reason, instead of reporting a launch that cannot work.
+- **AIM serving engine.** Serve AMD Enterprise AI AIM pre-built Docker
+  containers with `--engine aim`, alongside vLLM and Lemonade.
+- **Follow a starting server.** Stream a server's output, including download
+  progress bars, with `rocm logs --service <id> --follow`.
+- **Safer serving and runtime changes.** `rocm serve` picks a free port without
+  collisions, runtime activation and rollback no longer leave the configuration
+  inconsistent, and native Windows refuses vLLM up front with the reason.
+- **Repo-native driver installs.** `rocm install driver` uses the same
+  repository-based flow on apt, dnf, and zypper hosts. `amdgpu-install` is
+  removed.
 
 ## Breaking changes
 
@@ -60,9 +52,9 @@ safer, and makes driver installation consistent across Linux distributions.
   bars, until the server is no longer starting or running. Press `Ctrl-C` to
   stop following and leave the server running.
 - `rocm serve` without `--port` picks the first free loopback port in
-  `11435..=11535`. Port claims are serialized between the CLI and `rocmd`, so
-  two launches can no longer take the same port. An explicit `--port` behaves as
-  before.
+  `11435..=11535`. Port claims are serialized between the CLI and the `rocmd`
+  background daemon, so two launches can no longer take the same port. An
+  explicit `--port` behaves as before.
 - `rocm runtimes activate`, `rocm runtimes rollback`, and the `--activate` tail
   of `rocm update` and `rocm install sdk` are now transactional. They name the
   running servers that keep the old runtime, and a failed second write no longer
@@ -76,20 +68,22 @@ safer, and makes driver installation consistent across Linux distributions.
   `msvc_redist_version`, and a new print-only fix covers the condition.
 - `rocm examine` detects `gfx90c` (Renoir and Cezanne Vega integrated GPUs)
   instead of mapping it to `gfx90X-dcgpu`.
-- vLLM serve summaries give out-of-memory diagnostics and guidance.
-- When vLLM aborts at startup because its engine can't be imported (for example,
-  a missing `libtorch_cuda.so`), the failure now names the failing line and the
-  `rocm diagnose --symptom '<line>'` command that diagnoses it.
-  `fix-17-torch-dlpack` now covers Linux and WSL.
+- vLLM startup failures are easier to diagnose. Serve summaries give
+  out-of-memory diagnostics and guidance. When vLLM aborts at startup because it
+  can't import its engine (for example, a missing `libtorch_cuda.so`), the
+  failure names the failing line and the `rocm diagnose --symptom '<line>'`
+  command that diagnoses it. The `rocm diagnose` fix `fix-17-torch-dlpack` now
+  covers Linux and WSL.
 - The dashboard shows recent serving throughput in the instance detail view,
   shows starting services on the **Home** and **Serving** tabs, and collects GPU
   and memory metrics in-process on Windows.
 - The dashboard **Diagnose** screen can prepare a Doctor report. Press `p` to
   preview what the report would carry (nothing is sent). Press `s` to send it
   only after approval; Deny is the default.
-- The Doctor skill stops when the CLI predates the failure catalog it describes,
-  and covers the two vLLM startup failures (out of memory, and a
-  `libtorch_cuda.so` import error).
+- The Doctor skill (`rocm-doctor`), which diagnoses broken ROCm, HIP SDK, and
+  PyTorch setups, stops when the CLI predates the failure catalog that the skill
+  describes. It also covers the two vLLM startup failures above: out of memory,
+  and a `libtorch_cuda.so` import error.
 - Before offering the mail, `rocm diagnose --report` now says that the mail goes
   from your own account and carries your address, and that the report itself
   names no user, host, or file path.
@@ -110,6 +104,8 @@ safer, and makes driver installation consistent across Linux distributions.
 
 ## Resolved issues
 
+### Install and uninstall
+
 - Fixed `rocm install sdk --dry-run` downloading `uv` and installing a managed
   Python on a host without one. The preview now says that a real install would
   prepare Python (`python_note:`) and changes nothing.
@@ -119,63 +115,74 @@ safer, and makes driver installation consistent across Linux distributions.
   made, and, on Windows, leaving the running `rocm.exe` in the install folder.
   The installers now record their `PATH` change so that uninstall can undo
   exactly that change.
+- Fixed `rocm storage` and `rocm uninstall` acting on the default `~/.rocm/cache`
+  instead of `<data>/cache` when `ROCM_CLI_CONFIG_DIR` and `ROCM_CLI_DATA_DIR`
+  are set but `ROCM_CLI_CACHE_DIR` is not.
+- Fixed vLLM installs on ROCm 10.x failing with an unsatisfiable `amd-aiter`
+  pin. The `flash-attn` and `amd-aiter` pins now come from what the discovered
+  vLLM depends on.
+- Fixed `rocm engines install lemonade` failing on every run when a kept ROCm
+  alignment pin names a download that is no longer served. The packaged backend
+  pins are now restored.
+
+### Serving and services
+
+- Fixed `rocm serve --engine vllm` on native Windows printing
+  `managed service launched` and exiting with code 0 while the engine died with
+  no output. It, and `rocm engines install vllm`, now refuse up front and give
+  the platform reason.
+- Fixed `rocm serve` on Windows reporting a managed server as started when it
+  exited immediately. It now fails fast and shows the startup log.
+- Fixed `rocm services` reporting an unconfirmed stop as stopped.
+- Fixed `rocm serve` hanging, and surviving `Ctrl-C`, when `amd-smi` ran against
+  a kernel driver in a bad state. The `/dev/kfd` pre-flight check now runs every
+  time `amd-smi` is launched, and an `amd-smi` child can no longer outlive its
+  timeout.
+- Fixed `--gpu` accepting an index that Windows does not have.
+- Fixed an unknown service ID surfacing the raw operating system error instead
+  of saying that the service was not found.
+
+### Detection and diagnosis
+
 - Fixed `rocm examine` reporting `wsl_rocdxg_missing` and
   `rocm serve --gpu auto` refusing with `no usable AMD GPU detected` on WSL when
   `librocdxg.so` is reachable only through `LD_LIBRARY_PATH`.
 - Fixed `rocm examine --json` not reporting an AMD GPU on WSL when the Windows
   host has one.
-- Fixed `rocm serve --engine vllm` on native Windows printing "managed service
-  launched" and exiting with code 0 while the engine died with no output. It,
-  and `rocm engines install vllm`, now refuse up front and give the platform
-  reason.
-- Fixed `rocm serve` on Windows reporting a managed server as started when it
-  exited immediately. It now fails fast and shows the startup log.
-- Fixed `rocm services` reporting an unconfirmed stop as stopped.
-- Fixed the dashboard daemon dropping managed services when the registry could
-  not be read, and keeping a stale Lemonade instance after its host or port
-  changed.
-- Fixed `rocm serve` hanging, and surviving `Ctrl-C`, when `amd-smi` ran against
-  a kernel driver in a bad state. The `/dev/kfd` pre-flight check now runs at
-  every `amd-smi` launch site, and an `amd-smi` child can no longer outlive its
-  timeout.
-- Fixed `--gpu` accepting an index that Windows does not have.
-- Fixed `rocm diagnose` ranking `fix-13-hip-sdk-missing` first on hosts with no
-  HIP-based setup.
-- Fixed lines printed for Windows by `rocm diagnose` not running in PowerShell.
+- Fixed `rocm diagnose` listing `fix-13-hip-sdk-missing` as the top result on
+  hosts with no HIP-based setup.
+- Fixed commands that `rocm diagnose` prints for Windows not running in
+  PowerShell.
 - Fixed a host ROCm version with a non-numeric build suffix, such as
   `7.2.4-98rc1`, being silently read as `7.2.4`. It is now treated as unknown.
-- Fixed `rocm storage` and `rocm uninstall` acting on the default `~/.rocm/cache`
-  instead of `<data>/cache` when `ROCM_CLI_CONFIG_DIR` and `ROCM_CLI_DATA_DIR`
-  are set but `ROCM_CLI_CACHE_DIR` is not.
-- Fixed an unknown service ID surfacing the raw operating system error instead
-  of saying that the service was not found.
-- Fixed automation stores (events, audit, and proposals) losing records to
-  concurrent writers. A store whose torn tail couldn't be repaired by atomic
-  replace, for example on a full disk or when Windows security software held the
-  file open, could stop `rocmd` from starting. It is now repaired in place.
-- Fixed automation stores growing without bound. They are now capped by rotation
-  and compaction.
-- Fixed a detached `rocm daemon` staying alive on native Windows after
-  `rocm serve` and `rocm services stop`. It now runs only while an automation
-  needs it, and `rocm services stop` and the uninstall plan say what remains.
-- Fixed `rocmd` reporting a timeout when a child wrote more output than the pipe
-  holds, because it did not drain the pipes until the child exited.
-- Fixed `rocm engines install lemonade` failing on every run when a kept ROCm
-  alignment pin names a download that is no longer served. The packaged backend
-  pins are now restored.
-- Fixed vLLM installs on ROCm 10.x failing with an unsatisfiable `amd-aiter`
-  pin. The `flash-attn` and `amd-aiter` pins now come from what the discovered
-  vLLM depends on.
 - Fixed `/etc/os-release` being parsed differently by the driver plan,
   `rocm examine`, and the OpenMPI hint, so that a quoted `ID='ubuntu'` read as an
   unsupported distribution. One parser now reads it, and `/usr/lib/os-release` is
   used when `/etc/os-release` is absent.
 - Fixed `rocm diagnose --report --send` and the dashboard send action never
-  opening a mail client on Windows, because `cmd` split the link at `&`.
-- Fixed command previews that did not read back as the exact arguments that run.
-  Arguments are now quoted for a POSIX shell, including in copyable lines.
-- Fixed CLI output such as `rocm model` showing an em dash as `ΓÇö` on Windows
-  consoles that use the OEM code page. Output text is now ASCII.
+  opening a mail client on Windows, because the link was cut off at the `&`
+  character.
+
+### Daemon and automation
+
+- Fixed automation stores (events, audit, and proposals) losing records when
+  several writers wrote at once. A store whose last record was incomplete and
+  couldn't be repaired by replacing the file, for example on a full disk or when
+  Windows security software held the file open, could stop `rocmd` from
+  starting. It is now repaired in place.
+- Fixed automation stores growing without bound. They are now capped by rotation
+  and compaction.
+- Fixed a detached `rocm daemon` staying alive on native Windows after
+  `rocm serve` and `rocm services stop`. It now runs only while an automation
+  needs it, and `rocm services stop` and the uninstall plan say what remains.
+- Fixed `rocmd` reporting a timeout when a child process wrote more output than
+  a pipe can hold, because it did not read the output until the child exited.
+
+### Dashboard and chat
+
+- Fixed the dashboard daemon dropping managed services when the registry could
+  not be read, and keeping a stale Lemonade instance after its host or port
+  changed.
 - Fixed the dashboard **Hardware** tab labeling binary VRAM figures as GB instead
   of GiB.
 - Fixed the dashboard header warning badge (`⚠ N`) giving no way to read the
@@ -190,10 +197,17 @@ safer, and makes driver installation consistent across Linux distributions.
 - Fixed chat with the ChatGPT sign-in silently ignoring `--temperature`,
   `--top-p`, and `--max-tokens`. It now warns.
 
+### Command output
+
+- Fixed command previews that did not read back as the exact arguments that run.
+  Arguments are now quoted for a POSIX shell, including in copyable lines.
+- Fixed CLI output such as `rocm model` showing an em dash as `ΓÇö` on Windows
+  consoles that use the OEM code page. Output text is now ASCII.
+
 ## Known issues
 
 - Instinct serving on RHEL 9.6 can still need manual vLLM, OpenMPI, and
   `amdsmi` workarounds.
 - The Lemonade `llamacpp:rocm` backend can't align to ROCm 10.1 yet, because
-  upstream hasn't published a matching build. ROCm CLI reverts to the last-known-good
-  pin, which still works.
+  upstream hasn't published a matching build. ROCm CLI reverts to the
+  last-known-good pin, which still works.
