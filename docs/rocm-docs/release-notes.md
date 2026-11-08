@@ -27,8 +27,8 @@ safer, and makes driver installation consistent across Linux distributions.
 - **Follow a starting server.** Stream a server's output, including download
   progress bars, with `rocm logs --service <id> --follow`.
 - **Safer serving and runtime changes.** `rocm serve` picks a free port without
-  collisions, runtime activation and rollback no longer leave the configuration
-  inconsistent, and native Windows refuses vLLM up front with the reason.
+  collisions, runtime activation and rollback are transactional, and native
+  Windows refuses vLLM up front with the reason.
 - **Repo-native driver installs.** `rocm install driver` uses the same
   repository-based flow on apt, dnf, and zypper hosts. `amdgpu-install` is
   removed.
@@ -52,13 +52,14 @@ safer, and makes driver installation consistent across Linux distributions.
   bars, until the server is no longer starting or running. Press `Ctrl-C` to
   stop following and leave the server running.
 - `rocm serve` without `--port` picks the first free loopback port in
-  `11435..=11535`. Port claims are serialized between the CLI and the `rocmd`
-  background daemon, so two launches can no longer take the same port. An
-  explicit `--port` behaves as before.
-- `rocm runtimes activate`, `rocm runtimes rollback`, and the `--activate` tail
-  of `rocm update` and `rocm install sdk` are now transactional. They name the
-  running servers that keep the old runtime, and a failed second write no longer
-  leaves the configuration and the active-runtime marker disagreeing.
+  `11435..=11535`. The CLI and the `rocmd` background daemon now claim ports one
+  at a time, so two launches can no longer take the same port. An explicit
+  `--port` behaves as before.
+- `rocm runtimes activate`, `rocm runtimes rollback`, and the activation step of
+  `rocm update --activate` and `rocm install sdk` are now transactional. They
+  name the running servers that keep the old runtime. If the second of the two
+  writes (the configuration and the active-runtime marker) fails, the two no
+  longer disagree.
 - `rocm install driver` plans the Ubuntu 26.04 (`resolute`) DKMS flow and warns
   about `amdgpu-dkms` left by a previous install, without removing anything.
 - `rocm examine` shows the AMD display driver version, date, and age on Windows,
