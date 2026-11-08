@@ -38,6 +38,8 @@ for _logger_name in ("sphinx.rocm_docs.projects", "sphinx.rocm_docs.theme"):
 # -- Project information ---------------------------------------------------
 
 project = "ROCm CLI"
+version = "0.3.0"
+release = version
 author = "Advanced Micro Devices, Inc."
 # pylint: disable=redefined-builtin
 copyright = "Copyright (c) Advanced Micro Devices, Inc. All rights reserved."
@@ -56,8 +58,9 @@ html_theme_options = {
     # crashes sphinx_book_theme's repository button.
     "repository_url": "https://github.com/ROCm/rocm-cli",
     "repository_branch": "main",
+    "version_list_link": "https://rocm.docs.amd.com/projects/rocm-cli/en/latest/release.html",
 }
-html_title = "ROCm CLI documentation"
+html_title = f"{project} {version} documentation"
 # myst.header: `:start-after:` on included README sections strips the heading
 # line itself, so the first heading in the chunk renders one level below its
 # expected depth; docutils re-normalizes this in the rendered output, so it's
@@ -80,6 +83,17 @@ exclude_patterns = []
 # -- Sphinx setup ----------------------------------------------------------
 
 
+ROCM_CORE_SDK_URL = "https://rocm.docs.amd.com/en/latest/"
+
+
+def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):
+    # On docs-X.Y.Z branches rocm-docs-core resolves every sister project to
+    # that same version, but the ROCm Core SDK has no docs-0.3.0 build.
+    context["projects"] = {**context["projects"], "rocm": ROCM_CORE_SDK_URL}
+
+
 def setup(app):
     """Sphinx setup"""
+    # Priority 900 runs after rocm_docs sets context["projects"] (default 500).
+    app.connect("html-page-context", _point_core_sdk_link_to_latest, priority=900)
     return {"parallel_read_safe": True, "parallel_write_safe": True}

@@ -1,5 +1,8 @@
 root: index
 subtrees:
+  - entries:
+      - file: release-notes
+        title: Release notes
   - caption: Get started
     entries:
       - file: install/installation
