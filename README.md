@@ -334,7 +334,7 @@ compares the driver date with the release of the first HIP SDK for Windows
 (27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
 the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
 statement that the driver is broken. The date is only a floor: it cannot judge
-newer GPUs such as gfx120X, gfx1150 and gfx1151, which might need newer drivers.
+newer GPUs such as gfx120X, gfx1150, and gfx1151, which might need newer drivers.
 `rocm diagnose` lists the same finding as
 `fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
 page and a restart after the install. The entry is advice about the host, not a
@@ -392,35 +392,43 @@ position.
   address even though the report does not, and the CLI says so each time it
   offers one.
 
-The `--report` content is deliberately narrow (a schema version, the matched entry, whether
-a fix was offered for it, the GPU architecture and which compatibility
-matrix snapshot it was checked against, the OS family, distribution and
-major version, the ROCm release, the inference engine and its release, the
-CLI version), and it carries no host name, user name, file path, or error
-text.
+The `--report` content is deliberately narrow. It consists of:
 
-The ROCm release and the inference engine's release are each cut
-back to a release, so a build number that would narrow toward one machine
-never appears there; the CLI's own version is the exception, because it names
-the tool that wrote the report instead of something read off the machine.
-The distribution is checked against a list of known names instead of
-being repeated from the machine.
+- A schema version
+- The matched entry
+- Whether a fix was offered for it
+- The GPU architecture
+- The compatibility matrix snapshot it was checked against
+- The OS family, distribution, and major version
+- The ROCm release
+- The inference engine and its release
+- The CLI version
 
-Hardware that is not on AMD's published
-compatibility matrix produces no report at all, and the CLI says why. So
-does a WSL machine, for a different reason: this CLI does not inspect the
-GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
-matrix and says that instead of claiming the architecture could not be
-read.
+It carries no host name, user name, file path, or error text. Two values are
+generalized first:
 
-With `--send`, a mail client opens only when you asked and the machine looks like
-a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
-set, the address and the link are printed instead, which is also what
-happens on a machine with no mail client. It is not combinable with
-`--json`, which exists for scripts, and a script is not a person who can
-read a mail before sending it. Note that a mail carries your address, which
-the report itself does not. The dashboard offers the same path on its Diagnose
-screen: `p` shows the report, and `s` asks before it runs `--report --send`.
+- The ROCm release and the inference engine's release are each cut back to a
+  release, so a build number that would narrow toward one machine never
+  appears there. The CLI's own version is the exception, because it names the
+  tool that wrote the report instead of something read off the machine.
+- The distribution is checked against a list of known names instead of being
+  repeated from the machine.
+
+No report is produced in two cases, and the CLI says why each time:
+
+- The hardware is not on AMD's published compatibility matrix.
+- The machine is WSL. The CLI does not inspect the GPU on WSL yet, so it
+  cannot confirm that the hardware is on the compatibility matrix, and it says
+  that instead of claiming the architecture could not be read.
+
+With `--send`, a mail client opens only when you asked and the machine looks
+like a desktop you are at. Over SSH, with no display, or with `ROCM_NO_BROWSER`
+set, the address and the link are printed instead, which is also what happens
+on a machine with no mail client. `--send` is not combinable with `--json`,
+which exists for scripts, and a script is not a person who can read a mail
+before sending it. A mail carries your address, which the report itself does
+not. The dashboard offers the same path on its Diagnose screen: `p` shows the
+report, and `s` asks before it runs `--report --send`.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported, not the
 ranking position noted above, which isn't a stable name. Run it with no id
@@ -613,7 +621,7 @@ with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first
 HIP SDK for Windows, 27 July 2023 (`outdated: yes`, `no` or `unknown`). Next to
 `outdated: no` it repeats that the date cannot judge newer GPUs such as
-gfx120X, gfx1150 and gfx1151. For an
+gfx120X, gfx1150, and gfx1151. For an
 old driver it also names the fix id `fix-22-display-driver-old`. Run
 `rocm diagnose` for the advice. AMD publishes no minimum driver version, so an
 old date is a hint to look at the driver, not a finding that it is broken. See
@@ -670,12 +678,14 @@ When nothing is left behind the count is `services_on_previous_runtime: 0`. A
 running server whose record names no runtime is counted separately under
 `services_with_unrecorded_runtime:`, because what it loaded cannot be read back
 from the record. Only servers on an engine that brings its own runtime
-(`lemonade`) are never counted; an `env_id` recorded in a service record is not
-a pin and does not exempt the server. The same summary appears in the
-`rocm install sdk` and `rocm update --apply --activate` reports, which activate
-a runtime without taking `--restart-services` themselves, which is why the note
-names the `rocm runtimes activate` invocation that does, instead of a flag to
-add to whatever was just run.
+(`lemonade`) are never counted. An `env_id` recorded in a service record is not
+a pin and does not exempt the server.
+
+The same summary appears in the `rocm install sdk` and
+`rocm update --apply --activate` reports. Those commands activate a runtime
+without taking `--restart-services` themselves, so the note names the
+`rocm runtimes activate` invocation that does, instead of a flag to add to
+whatever was just run.
 
 The note's command re-activates the runtime that is already active, which moves
 the servers without moving the runtime. Re-activating the active runtime prints
@@ -755,9 +765,9 @@ two are separate runtimes serving different purposes instead of newer and
 older versions of the same thing. Anything it declines to remove is listed with
 the reason, and `--dry-run` shows the whole plan without changing anything.
 
-`remove-downloads` clears cached archives that ROCm CLI can download again; a
-cache folder that is a link to somewhere else is left alone instead of
-being followed. The two archive rows the report prints are tagged
+`remove-downloads` clears cached archives that ROCm CLI can download again. A
+cache folder that is a link to somewhere else is left alone instead of being
+followed. The two archive rows the report prints are tagged
 `note: can be downloaded again; safe to remove`, so it is visible which rows
 `remove-downloads` acts on.
 
@@ -911,7 +921,7 @@ address.
 #### Other serve options
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
-total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
+total video RAM, or VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
 `mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
 the memory fraction when a small model shouldn't reserve most of a large card.
 
@@ -975,7 +985,7 @@ of returning `starting` after 45 seconds. While it waits:
 - If the server exits first (crashes, is killed, or is stopped with
   `rocm services stop`), the command fails with an error that points at the
   server's logs instead of waiting forever.
-- Ctrl-C ends the wait and leaves the server starting in the background. A
+- `Ctrl-C` ends the wait and leaves the server starting in the background. A
   generated API key (public bind) is printed when the wait begins, so
   interrupting the wait does not lose it.
 - If the model is already being served and still starting, the command waits on
@@ -1103,7 +1113,7 @@ than they are:
 #### When a serve runs out of GPU memory
 
 When a vLLM serve that **this command launched** fails to become ready and its
-engine log shows an out-of-memory failure, the deployment summary adds a note
+engine log shows an out-of-memory (OOM) failure, the deployment summary adds a note
 confirming the attempt ran out of GPU memory, naming the two knobs that can fix
 it (`--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
 `--gpu <index>`), warning that lowering the reservation will not help if the
@@ -1113,19 +1123,23 @@ busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
 in a shell-quoted argument intact (one containing an apostrophe, for instance)
 is replaced by a canonical vLLM OOM symptom, which reports the same cause.
 
-A line carrying **terminal control bytes** that an *escape sequence* is part of
-(vLLM's colorized logger, or a repaint that moves the cursor with something
-like `ESC[1A` or clears the row with `ESC[2K`) is the one case where the two
-surfaces can print different commands for the same failure, and both are sound.
-(A bare carriage-return repaint is not that case: the log is split on `\r`, so
-the allocator line comes back as a clean segment carrying no escape and the two
-surfaces quote it identically.) The engine's own failure
-message refuses the raw line and falls back to the canonical symptom. The serve
-summary reads the log *after* the engine has echoed its tail into it as the rows
-a terminal would have drawn, so the note quotes that rendered row (real text the
-terminal printed, carrying no control bytes) instead. See
-[docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
-flag itself and the quoting rule each printed command follows.
+One case makes the deployment summary and the engine's own failure message print
+different commands for the same failure, and both commands are sound: a failing
+line that carries **terminal control bytes**. These are escape sequences, such
+as vLLM's colorized logger output, a repaint that moves the cursor (`ESC[1A`),
+or one that clears the row (`ESC[2K`). The engine's failure message refuses the
+raw line and falls back to the canonical symptom. The serve summary reads the
+log *after* the engine has echoed its tail into it as the rows a terminal would
+have drawn, so the note quotes that rendered row (real text the terminal
+printed, carrying no control bytes) instead.
+
+A bare carriage-return repaint is not that case. The log is split on `\r`, so
+the allocator line comes back as a clean segment carrying no escape, and the two
+surfaces quote it identically.
+
+For the `--gpu-memory-utilization` flag and the quoting rule each printed
+command follows, see the
+[vLLM adapter page](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md).
 
 The note is deliberately narrow, so its absence is not evidence that memory was
 fine. It appears only when all of the following hold:
@@ -1282,7 +1296,7 @@ For `rocm dash`:
 
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
-- `--replay <file>` replays a recorded NDJSON session.
+- `--replay <file>` replays a recorded newline-delimited JSON (NDJSON) session.
 - Live mode works on Windows too, but shows only GPU/CPU/memory. There is no
   `rocmdashd` Unix socket to connect to there, so the serving-instance
   registry view stays empty (Linux and WSL2 get the full live view).
@@ -1306,7 +1320,7 @@ Flags and output for `rocm bench load`:
 - `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
   plain host address without `/v1` also works). Only `http://` is accepted;
   `https://` endpoints are rejected outright, because the load generator has no
-  TLS backend compiled in.
+  Transport Layer Security (TLS) backend compiled in.
 - `--concurrency` sweeps a comma-separated list of levels (default
   `1,8,32,64`, each 1-128); `--auto-ramp` ignores `--concurrency` and instead
   ramps `1,2,4,8,16,32,64,128` automatically, stopping early once generation
@@ -1314,11 +1328,11 @@ Flags and output for `rocm bench load`:
 - `--isl` and `--osl` (input and output sequence length, default 1024 each) accept
   1-32768, and `--requests` (default 128) accepts 1-10000.
 - Results are written to `--out` (default `<data-dir>/bench/results.csv`,
-  where `<data-dir>` is `~/.rocm` unless overridden), intended to match the
-  path the daemon tails to feed the dashboard's **Observe** tab. The CLI's
-  default output path and the daemon's tailed path are computed
-  independently, so if either the CLI's data dir or the daemon's
-  `bench_results_dir` config has been customized, confirm they still point
+  where `<data-dir>` is `~/.rocm` unless overridden). This is intended to
+  match the path the daemon tails to feed the dashboard's **Observe** tab. The
+  CLI's default output path and the daemon's tailed path are computed
+  independently. If either the CLI's data directory or the daemon's
+  `bench_results_dir` config has been customized, confirm that they still point
   at the same file.
 
 ### Chat
@@ -1377,7 +1391,7 @@ folder that contains the `models path:` it prints):
 - **Kept:** `models/` (the folder `models-path` prints), `user/` (saved
   workflows and settings), `output/`, `input/`, `custom_nodes/`, `datasets/`
   and `extra_model_paths.yaml`. They are never moved, copied or deleted. Files
-  a new release adds inside them are added alongside yours; where both have a
+  a new release adds inside them are added alongside yours. Where both have a
   file of the same name, yours is kept, and a folder you replaced with a
   symlink is not written into.
 - **Set aside:** an entry of yours whose name the new release starts shipping
@@ -1390,7 +1404,7 @@ folder that contains the `models path:` it prints):
 An install made before rocm-cli recorded what its release shipped has nothing
 to tell release code from your entries. There, the entries with the names the
 new release ships are deleted and replaced instead, including one of yours of
-the same name, and the reinstall lists them under `replaced:`; everything else
+the same name, and the reinstall lists them under `replaced:`. Everything else
 is left in place. On Windows, names that differ only in case (`readme.md`,
 `README.md`) count as the same entry, as they do on its file systems.
 
@@ -1495,13 +1509,17 @@ rocm uninstall [--yes] [--dry-run]
 ```
 
 `--follow` (`-f`) keeps printing a server's new log output, such as a model
-download's progress, until the server stops (a server that ends `failed` makes the command exit
-non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
-ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
-line stays on the row under the newest output. Piped or redirected output keeps
-stdout to the log text alone: the hint (once), `is ready.` and `stopped following.`
-lines go to stderr. A server that is already `failed` when the follow starts exits
-non-zero too, after printing its log.
+download's progress:
+
+- It runs until the server stops. A server that ends `failed` makes the command
+  exit non-zero. A server that is already `failed` when the follow starts also
+  exits non-zero, after printing its log.
+- It prints `Service <id> is ready.` when the server finishes starting.
+- `Ctrl-C` ends the follow and leaves the server running. On a terminal, a
+  line stays on the row under the newest output:
+  `Ctrl-C stops following, the server keeps running. Following <id>`
+- With piped or redirected output, stdout carries the log text alone. The hint
+  (once), the `is ready.` line, and the `stopped following.` line go to stderr.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
@@ -1524,10 +1542,10 @@ cache directory is `~/.rocm/cache`. The `ROCM_CLI_CONFIG_DIR`,
 `ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR` environment variables move them;
 when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
 `<data directory>/cache`. A cache that an earlier version kept at `~/.rocm/cache`
-while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by `rocm
-uninstall`; delete it by hand if you don't need it. `uninstall` removes a category's directory
-unless you keep that category, so on a default installation a flag doesn't
-protect its files by itself. To keep your settings and data, pass `--keep-config`
+while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by
+`rocm uninstall`. Delete it by hand if you don't need it. `uninstall` removes a
+category's directory unless you keep that category, so on a default
+installation a flag doesn't protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
 
 The binaries it removes include the running `rocm.exe` on Windows. It also
@@ -1574,30 +1592,55 @@ stdout. Supported shells are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
 rocm completions <bash|zsh|fish|elvish|powershell>
 ```
 
-Install the script for your shell:
+Install the script for your shell.
 
-```
-# bash (per-user, no sudo; add this line to ~/.bashrc to persist)
+For bash, per user with no `sudo`, run the following command. Add the line to
+`~/.bashrc` to persist it:
+
+```bash
 source <(rocm completions bash)
-# bash (system-wide; requires the bash-completion package)
-rocm completions bash | sudo tee /etc/bash_completion.d/rocm > /dev/null
+```
 
-# zsh (per-user; the directory must be on $fpath and compinit must run)
+For bash, system-wide, run the following command. It requires the
+`bash-completion` package:
+
+```bash
+rocm completions bash | sudo tee /etc/bash_completion.d/rocm > /dev/null
+```
+
+For zsh, per user, the directory must be on `$fpath` and `compinit` must run:
+
+```bash
 mkdir -p ~/.zsh/completions
 rocm completions zsh > ~/.zsh/completions/_rocm
-# then in ~/.zshrc, before `compinit`:
-#   fpath=(~/.zsh/completions $fpath)
-#   autoload -Uz compinit && compinit
+```
 
-# fish
+Then add these lines to `~/.zshrc`, before `compinit`:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+For fish:
+
+```bash
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
+```
 
-# elvish (run once; re-running appends a duplicate block to rc.elv)
+For elvish, run the following commands once. Running them again appends a
+duplicate block to `rc.elv`:
+
+```text
 mkdir -p ~/.config/elvish
 rocm completions elvish >> ~/.config/elvish/rc.elv
+```
 
-# powershell (current session only; to persist, append the output to $PROFILE)
+For PowerShell, the following command applies to the current session only. To
+persist it, append the output to `$PROFILE`:
+
+```powershell
 rocm completions powershell | Out-String | Invoke-Expression
 ```
 
