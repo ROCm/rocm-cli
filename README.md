@@ -854,16 +854,22 @@ rocm serve <model> [--engine lemonade|vllm|aim]
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
+`ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait for a
+cold-start model download.
+
 `--engine-env` passes an extra environment variable through to the engine's
 own process/container (repeatable); currently only `aim` consumes these (for
-example, `AIM_PROFILE_ID`). `KEY=VALUE` values are visible in the detached child's
-argv and in `rocm services list --json`, so do not put secrets there; pass a
-bare `KEY` (for example, `--engine-env HF_TOKEN`) to forward the value from your
-current environment without storing it. A service restarted by the daemon
-after a crash (with the `server-recover` automation enabled) inherits the
-daemon's environment, not yours, so a forwarded secret must also be set
-there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
-for a cold-start model download.
+example, `AIM_PROFILE_ID`). Handle secrets as follows:
+
+- `KEY=VALUE` values are visible in the detached child's argv and in
+  `rocm services list --json`, so do not put secrets there.
+- Pass a bare `KEY` (for example, `--engine-env HF_TOKEN`) to forward the value
+  from your current environment without storing it.
+- A service restarted by the daemon after a crash (with the `server-recover`
+  automation enabled) inherits the daemon's environment, not yours, so a
+  forwarded secret must also be set there.
+
+#### Ports and hosts
 
 `--port` is optional on the default loopback host (`127.0.0.1`): omit it and
 `rocm serve` picks the first free port in `11435`-`11535`, checking both
@@ -871,25 +877,29 @@ rocm-cli's own records and the OS. The non-interactive plan output (piped
 output, or the Dash approval card) shows `Port: automatic; endpoint shown
 after launch` while the launch is in flight and prints the concrete endpoint
 once the port is actually leased; the interactive deployment summary table
-only ever shows the final resolved endpoint. Pass `--port` explicitly to pin
-one; on `127.0.0.1`, an explicit loopback port already reserved by another
-managed service is rejected up front, naming that service and how to free it
-(`rocm services stop <service-id> --yes`). A port held by an untracked process
-is rejected too, but without naming the holder. `--host` to anything other
-than the default
-loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
-requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
-cannot promise a free port anywhere else. An explicit `--port` on such a host
-is refused when a live managed service already holds that port on the same
-address (`localhost` counts as both loopback addresses) or on a wildcard
-listener that covers it (`0.0.0.0` for IPv4 addresses, `::` for any); the OS is not probed on such a
-host, so any other clash is reported by the engine when it starts.
+only ever shows the final resolved endpoint.
+
+Pass `--port` explicitly to pin one; on `127.0.0.1`, an explicit loopback port
+already reserved by another managed service is rejected up front, naming that
+service and how to free it (`rocm services stop <service-id> --yes`). A port
+held by an untracked process is rejected too, but without naming the holder.
+
+`--host` to anything other than the default loopback address (`localhost`,
+`::1`, `0.0.0.0`, or any other address) requires an explicit `--port`:
+automatic selection only probes `127.0.0.1` and cannot promise a free port
+anywhere else. An explicit `--port` on such a host is refused when a live
+managed service already holds that port on the same address (`localhost` counts
+as both loopback addresses) or on a wildcard listener that covers it (`0.0.0.0`
+for IPv4 addresses, `::` for any); the OS is not probed on such a host, so any
+other clash is reported by the engine when it starts.
 
 `rocm services restart` and `rocmd`'s automatic recovery are deliberately
 stricter about hosts than that launch check: they refuse to bring a service
 back on a port that any other live managed service has recorded, whatever host
 that service is bound to, because a `0.0.0.0` listener also covers the loopback
 address.
+
+#### Other serve options
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -911,6 +921,8 @@ llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
 is optional and independent, so omit any of them to keep the engine's own
 default.
 
+#### Reusing a running service
+
 `rocm serve` only reuses an already-running service for the same engine and
 model if its sampling controls (and other recipe settings) match the ones
 requested this time; otherwise it errors out instead of silently serving with
@@ -922,6 +934,8 @@ services stop <service-id> --yes`) or match the original flags.
 Likewise, an explicit `--port` that differs from the port the running service
 is already on is refused instead of silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
+
+#### Foreground, background, and waiting
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
@@ -947,15 +961,22 @@ can:
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
 `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
-`rocm services stop`), it fails with an error that points at the server's logs
-instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
-in the background; a generated API key (public bind) is printed when the wait
-begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
-when the model is already being served and still starting, it waits on that
-server instead (an already-serving one is reported at once). Watch the download with
-`rocm logs --service <id> --follow` from another terminal.
+of returning `starting` after 45 seconds. While it waits:
+
+- If the server exits first (crashes, is killed, or is stopped with
+  `rocm services stop`), the command fails with an error that points at the
+  server's logs instead of waiting forever.
+- Ctrl-C ends the wait and leaves the server starting in the background. A
+  generated API key (public bind) is printed when the wait begins, so
+  interrupting the wait does not lose it.
+- If the model is already being served and still starting, the command waits on
+  that server instead. An already-serving one is reported at once.
+
+`--wait` cannot be combined with `--foreground` or `--verbose`. Watch the
+download with `rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
+
+#### Choosing the model form
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
 engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models. Pass a GGUF repo
@@ -974,25 +995,36 @@ does not read your environment on its own: export `HF_TOKEN` and pass
 `--engine-env HF_TOKEN` (see above), or `rocm serve` refuses a gated AIM image
 before pulling anything.
 
-`--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
-per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
-is not installed) and picks the lowest-numbered GPU that is idle and not already
-used by another ROCm CLI server (managed or foreground), falling back to the GPU
-with the most free memory. Pass a single index (`--gpu 1`) to pin a specific
-device. An index the machine does not have is refused before anything starts,
-and the error lists the indices that exist. On Windows the index is checked
-against the AMD display adapters Windows reports (and against the `amd-smi`
-count when that works, whichever is lower). That list can include an adapter the
-ROCm runtime does not support, so on Windows the check can still accept an index
-the runtime cannot use; it is a guard against a mistyped index, not a guarantee
-the device is usable. If neither the Windows list nor `amd-smi` can be read, the
-index is used unchecked and `rocm serve` prints a warning on stderr saying so.
-If a visibility mask is set but cannot be applied (on Windows `HIP_VISIBLE_DEVICES`
-holding an empty value, a UUID, or an ordinal past the adapters Windows lists; on
-Linux a mask when the GPU lists could not be read but `amd-smi` still gives a
-count), the index is still refused when it is at or past the GPU count, and one
-below the count is accepted with a warning that the mask was not applied. When
-`amd-smi` gives a count and no mask is set, the Windows list is not queried.
+#### Choosing a GPU
+
+`--gpu` selects which AMD GPU the server runs on:
+
+- **`auto` (the default):** probes per-GPU VRAM (through `amd-smi`, or the
+  amdgpu DRM sysfs counters when `amd-smi` is not installed) and picks the
+  lowest-numbered GPU that is idle and not already used by another ROCm CLI
+  server (managed or foreground), falling back to the GPU with the most free
+  memory.
+- **A single index (`--gpu 1`):** pins a specific device. An index the machine
+  does not have is refused before anything starts, and the error lists the
+  indices that exist.
+
+On Windows, the index check has these details:
+
+- The index is checked against the AMD display adapters Windows reports (and
+  against the `amd-smi` count when that works, whichever is lower). That list
+  can include an adapter the ROCm runtime does not support, so the check can
+  still accept an index the runtime cannot use; it is a guard against a
+  mistyped index, not a guarantee the device is usable.
+- If neither the Windows list nor `amd-smi` can be read, the index is used
+  unchecked and `rocm serve` prints a warning on stderr saying so.
+
+If a visibility mask is set but cannot be applied (on Windows
+`HIP_VISIBLE_DEVICES` holding an empty value, a UUID, or an ordinal past the
+adapters Windows lists; on Linux a mask when the GPU lists could not be read but
+`amd-smi` still gives a count), the index is still refused when it is at or past
+the GPU count, and one below the count is accepted with a warning that the mask
+was not applied. When `amd-smi` gives a count and no mask is set, the Windows
+list is not queried.
 
 The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
@@ -1018,20 +1050,25 @@ message and prepare nothing.
 
 Matching the engine and model is necessary but not sufficient. The exemption
 applies only when the service would *actually* be reused, and that is decided by
-exactly the predicate the launch itself applies: the recipe settings must match
-(the sampling-control rule under [Model serving](#model-serving) above), a
-`--require-api-key` request must be satisfiable by a service that already has a
-key, and the service's recorded device policy must satisfy this one: a
-`gpu_required` serve is not reused from a service recorded as `cpu_only`. That
-is the only policy pair refused; any other combination, including a record that
-predates the field and so names no policy at all, is accepted. (No `rocm serve`
-can record a `cpu_only` service today. `--device cpu_only` is refused outright
-because CPU is not a fallback path here, so that term is a guard, not a refusal
-you will meet.) A live service that fails any of those is not reusable, so it
-buys no bypass: `rocm serve` refuses on the GPU instead, which is the accurate
-message and leaves your running server alone. (Telling you to stop it and re-run
-would not help: the re-run would have nothing left to reuse and would hit the
-same GPU refusal.)
+exactly the predicate the launch itself applies. All of these must hold:
+
+- The recipe settings match (the sampling-control rule under
+  [Model serving](#model-serving) above).
+- A `--require-api-key` request is satisfiable by a service that already has a
+  key.
+- The service's recorded device policy satisfies this one: a `gpu_required`
+  serve is not reused from a service recorded as `cpu_only`. That is the only
+  policy pair refused; any other combination, including a record that predates
+  the field and so names no policy at all, is accepted. (No `rocm serve` can
+  record a `cpu_only` service today. `--device cpu_only` is refused outright
+  because CPU is not a fallback path here, so that term is a guard, not a
+  refusal you will meet.)
+
+A live service that fails any of those is not reusable, so it buys no bypass:
+`rocm serve` refuses on the GPU instead, which is the accurate message and
+leaves your running server alone. (Telling you to stop it and re-run would not
+help: the re-run would have nothing left to reuse and would hit the same GPU
+refusal.)
 
 Two limits are worth stating exactly, because they are easy to read as stronger
 than they are:
@@ -1042,10 +1079,11 @@ than they are:
   `rocm serve qwen`. On a GPU-less host that invocation then does engine
   preparation (possibly printing `Preparing <engine> for GPU serving...` and
   installing) *before* the refusal it ultimately gets, and if that preparation
-  fails you get its error instead of the GPU one. Leniency is deliberate:
-  tightening it would silently break legitimate reuse by short name. Only a
-  model name that does not overlap is guaranteed to refuse first with nothing
-  prepared.
+  fails you get its error instead of the GPU one.
+
+  Leniency is deliberate: tightening it would silently break legitimate reuse
+  by short name. Only a model name that does not overlap is guaranteed to
+  refuse first with nothing prepared.
 - **The exemption does not apply with an explicit `--gpu <index>`.** It skips
   the no-usable-GPU bail, not the pinned-index check that follows it. That
   check refuses *every* index on a host with no usable GPU, because there is no
@@ -1347,26 +1385,31 @@ the same name, and the reinstall lists them under `replaced:`; everything else
 is left in place. On Windows, names that differ only in case (`readme.md`,
 `README.md`) count as the same entry, as they do on its file systems.
 
-The new copy is unpacked before the existing one is touched, so a failed
-download, or a download that is not a ComfyUI release (no `main.py` at its
-top), leaves the install as it was; such a download is not kept, so the next
-attempt downloads again. `--reinstall --dry-run` names the folder
-whose code would be replaced, which of the kept folders it holds, and whether
-an entry of yours named like the new release's code would be set aside or
-replaced; which entries those are is only known once the new release is
-downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
-launched is running or still starting, and its dry run says so; stop it with
-`rocm comfyui stop` first. This is checked before the download and again just
-before the code is replaced, so a ComfyUI started during the download is
-caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
-reinstall says so and is not refused, since `stop` cannot read it either. If a
-reinstall is interrupted part-way, or stops part-way (because a file it must
-delete or move is in use, say), `start` refuses to launch the half-replaced
-folder, and `start`, `status`, the answer to
-`rocm "what is the comfyui status"` and the failed reinstall name the
-`rocm comfyui install --runtime-id <key>` command that finishes it. If the
-install fails after the new code is in place (in the GPU check, say), the
-error names that command too, and what was replaced or set aside.
+A reinstall also behaves as follows:
+
+- **Unpacked first.** The new copy is unpacked before the existing one is
+  touched, so a failed download, or a download that is not a ComfyUI release (no
+  `main.py` at its top), leaves the install as it was. Such a download is not
+  kept, so the next attempt downloads again.
+- **Dry run.** `--reinstall --dry-run` names the folder whose code would be
+  replaced, which of the kept folders it holds, and whether an entry of yours
+  named like the new release's code would be set aside or replaced. Which
+  entries those are is only known once the new release is downloaded.
+- **Refused while running.** A reinstall is refused while the ComfyUI that
+  `rocm comfyui start` launched is running or still starting, and its dry run
+  says so; stop it with `rocm comfyui stop` first. This is checked before the
+  download and again just before the code is replaced, so a ComfyUI started
+  during the download is caught too. If rocm-cli's saved record of that ComfyUI
+  cannot be read, the reinstall says so and is not refused, since `stop` cannot
+  read it either.
+- **Interrupted or stopped part-way.** If a reinstall is interrupted, or stops
+  (because a file it must delete or move is in use, say), `start` refuses to
+  launch the half-replaced folder. `start`, `status`, the answer to
+  `rocm "what is the comfyui status"` and the failed reinstall name the
+  `rocm comfyui install --runtime-id <key>` command that finishes it.
+- **Failure after the new code is in place.** If the install fails at that point
+  (in the GPU check, say), the error names that command too, and what was
+  replaced or set aside.
 
 ### Automations
 
