@@ -290,7 +290,7 @@ form works depends on the engine your GPU selects.
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
-| `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
+| `rocm remote serve <machine> <model>` (preview) | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
@@ -1272,7 +1272,7 @@ Flags and output for `rocm bench load`:
   `bench_results_dir` config has been customized, confirm they still point
   at the same file.
 
-### Chat
+### Chat (preview)
 
 ```
 rocm chat [--provider local|openai|anthropic] [--model NAME] [--prompt TEXT] [--tools]
@@ -1302,7 +1302,7 @@ upstream rig-core limitation that ROCm CLI can't forward around; see
 [#664](https://github.com/ROCm/rocm-cli/issues/664). The non-interactive
 `--prompt` and piped-input path never reaches this fallback.
 
-### ComfyUI
+### ComfyUI (preview)
 
 Install and manage ComfyUI for image generation (alias: `rocm comfy`):
 
@@ -1366,7 +1366,7 @@ folder, and `start`, `status`, the answer to
 install fails after the new code is in place (in the GPU check, say), the
 error names that command too, and what was replaced or set aside.
 
-### Automations
+### Automations (preview)
 
 ```
 rocm automations list
