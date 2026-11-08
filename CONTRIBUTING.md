@@ -20,7 +20,7 @@ Bug reports and feature requests are tracked as [GitHub Issues](https://github.c
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages:
 
-```
+```text
 feat: add support for vLLM multi-GPU serving
 fix: correct VRAM probe when amd-smi is absent
 docs: clarify GPU selection flag behavior
@@ -29,7 +29,7 @@ chore: bump rust-toolchain to 1.96
 
 Branch names should be short and descriptive:
 
-```
+```text
 feat/vllm-multi-gpu
 fix/vram-probe-fallback
 ```
@@ -58,7 +58,7 @@ The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, 
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
-The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. `prek` runs it like the others, but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version may run whatever that version's own license-header rules happen to be, which may disagree with CI, or may reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
+The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. `prek` runs it like the others, but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version might run whatever that version's own license-header rules happen to be, which might disagree with CI, or might reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
 
 ```bash
 cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
@@ -66,7 +66,7 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 
 To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
 
-The Markdown-links hook (`lychee`) runs on every commit, over the whole repository rather than just the changed files, since moving or deleting a file can break a link in a Markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. `prek` doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
+The Markdown-links hook (`lychee`) runs on every commit, over the whole repository instead of just the changed files, because moving or deleting a file can break a link in a Markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. `prek` doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
 
 ```bash
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
@@ -80,7 +80,7 @@ cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (
 | `apps/rocmd` | Background daemon |
 | `crates/rocm-core` | Core library |
 | `crates/rocm-dash-*` | Dashboard terminal user interface (TUI) libraries |
-| `crates/rocm-engine-protocol` | Engine IPC protocol |
+| `crates/rocm-engine-protocol` | Engine inter-process communication (IPC) protocol |
 | `engines/` | Inference engine adapters (lemonade, vllm, aim) |
 
 ### Module organization
@@ -91,7 +91,7 @@ Crate-layering invariants, such as `rocmd` never depending on `rocm`, are enforc
 
 Every local (relative-path) Markdown link and `#anchor` fragment in the repository (outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which neither check walks) is checked by the `docs-links` CI job and by the `lychee` prek hook above, both configured by `lychee.toml` (which lists the current exclusions). Both run offline only, so they don't catch broken external `https://` links.
 
-Since only links are checked, cite a specific repository file as a link relative to the citing file, `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/`, rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, links leaving a `skills/` folder, and `docs/rocm-docs/` along with the files it includes, which are this file and README.md), is in AGENTS.md section 5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
+Because only links are checked, cite a specific repository file as a link relative to the citing file, `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/`, instead of a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, links leaving a `skills/` folder, and `docs/rocm-docs/` along with the files it includes, which are this file and README.md), is in AGENTS.md section 5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
 
 ### Updating the AIM catalog
 
