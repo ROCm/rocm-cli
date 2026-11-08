@@ -6,9 +6,18 @@ SPDX-License-Identifier: MIT
 
 # Getting started with ROCm CLI
 
+## First run
+
 ```{include} ../../README.md
 :start-after: "## First run"
 :end-before: "## Interactive interfaces"
+```
+
+## Interactive interfaces
+
+```{include} ../../README.md
+:start-after: "## Interactive interfaces"
+:end-before: "## Configure ROCm and serve a model"
 ```
 
 ## Configure ROCm and serve a model
@@ -39,11 +48,4 @@ because which form works depends on the engine your GPU selects.
 ```{include} ../../README.md
 :start-after: "form works depends on the engine your GPU selects."
 :end-before: "## Commands"
-```
-
-## Interactive interfaces
-
-```{include} ../../README.md
-:start-after: "## Interactive interfaces"
-:end-before: "## Configure ROCm and serve a model"
 ```
