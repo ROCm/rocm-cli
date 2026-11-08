@@ -141,12 +141,12 @@ AMD's index doesn't host. A generated `uv.toml` sets `ignore-error-codes = [403]
 for that index so `uv` falls through to PyPI for those instead of treating the
 index's 403 as fatal.
 
-That same full-dependency resolve can also pull in an unconstrained `torch`
+The full-dependency resolve in that final install can also pull in an unconstrained `torch`
 from PyPI, undoing the exact ROCm pin just installed, and transitively an
 unconstrained `torchvision` and `torchaudio` with it. The install re-pins all
 three back to the exact builds discovered above immediately afterwards.
 
-That same realign also covers AMD's per-GPU-architecture device-kernel plugins
+The re-pin also covers AMD's per-GPU-architecture device-kernel plugins
 (`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`): each is versioned in
 lockstep with its own base package but resolved independently of it, so the
 full-dependency install can leave one ahead of the base package it ships
