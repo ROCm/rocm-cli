@@ -308,7 +308,7 @@ a tiny model. ROCm CLI helps in three ways:
 
   The printed command quotes your actual failing line when it can be rendered as
   one intact single-quoted argument; a line carrying an apostrophe or terminal
-  control bytes falls back to the canonical symptom below rather than handing you
+  control bytes falls back to the canonical symptom below instead of handing you
   a command whose quoting the log text broke. The `rocm serve` summary's
   out-of-memory note applies that same guard, from the same shared helper, to the
   same engine log, so neither surface can hand you a half-quoted command the
@@ -324,7 +324,7 @@ a tiny model. ROCm CLI helps in three ways:
   the guard accepts is diagnosable. They are two reads of a file that changed in
   between, not a disagreement about the rule. Lines rocm-cli wrote into that log
   itself are skipped when picking the line, so the note quotes *your* error
-  rather than the hint printed above it: the supervisor and the engine share one
+  instead of the hint printed above it: the supervisor and the engine share one
   log file, and the engine's failure (hint included) is appended to it after the
   error that caused it.
 
