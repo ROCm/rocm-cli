@@ -475,6 +475,18 @@ mod tests {
             )
         }
 
+        /// Run `f` holding the lock that serialises every test that sets
+        /// `ROCM_CLI_*` process-wide (`with_scoped_builtin_engine_env`), so that
+        /// what a child inherits when `f` starts it and what [`ambient`] reads
+        /// inside `f` come from the same instant.
+        fn under_env_lock<R>(f: impl FnOnce() -> R) -> R {
+            let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f()
+        }
+
         fn ambient(key: &str) -> Option<String> {
             std::env::var(key).ok()
         }
@@ -515,16 +527,60 @@ mod tests {
 
         #[test]
         fn the_child_inherits_the_callers_environment_when_no_app_paths_are_given() {
-            let engine = FakeEngine::answering("rocm-no-app-paths", STOPPED, 0);
-            request(&engine, None, None, false).unwrap();
-
-            for key in [
+            const KEYS: [&str; 3] = [
                 "ROCM_CLI_CONFIG_DIR",
                 "ROCM_CLI_DATA_DIR",
                 "ROCM_CLI_CACHE_DIR",
-            ] {
-                assert_eq!(engine.env(key), ambient(key), "{key}");
+            ];
+            let engine = FakeEngine::answering("rocm-no-app-paths", STOPPED, 0);
+            let expected = under_env_lock(|| {
+                request(&engine, None, None, false).unwrap();
+                KEYS.map(ambient)
+            });
+
+            for (key, expected) in KEYS.into_iter().zip(expected) {
+                assert_eq!(engine.env(key), expected, "{key}");
             }
+        }
+
+        /// The comparison of a child's inherited environment with the ambient one
+        /// holds while another thread scopes `ROCM_CLI_*` process-wide, which
+        /// other tests of this module do: the spawn and the read happen under the
+        /// same lock. Without the lock the child can start while the variables
+        /// are scoped and the read see them restored (or the other way round).
+        #[test]
+        fn the_inherited_environment_is_compared_at_the_instant_the_child_starts() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let (root, paths) = crate::tests::test_paths("engine-ipc-env-race");
+            let done = Arc::new(AtomicBool::new(false));
+            let flipper = {
+                let done = Arc::clone(&done);
+                let paths = paths.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        with_scoped_builtin_engine_env(Some(&paths), None, || {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        });
+                        // Outside the lock, so the test's own turn is not starved.
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                })
+            };
+
+            for round in 0..25 {
+                let engine = FakeEngine::answering("rocm-env-race", STOPPED, 0);
+                let expected = under_env_lock(|| {
+                    request(&engine, None, None, false).unwrap();
+                    ambient("ROCM_CLI_DATA_DIR")
+                });
+                assert_eq!(engine.env("ROCM_CLI_DATA_DIR"), expected, "round {round}");
+            }
+
+            done.store(true, Ordering::Relaxed);
+            flipper.join().unwrap();
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]
@@ -538,11 +594,11 @@ mod tests {
             );
 
             let without = FakeEngine::answering("rocm-no-env-root", STOPPED, 0);
-            request(&without, None, None, false).unwrap();
-            assert_eq!(
-                without.env("ROCM_CLI_ENGINE_ENVS_ROOT"),
+            let expected = under_env_lock(|| {
+                request(&without, None, None, false).unwrap();
                 ambient("ROCM_CLI_ENGINE_ENVS_ROOT")
-            );
+            });
+            assert_eq!(without.env("ROCM_CLI_ENGINE_ENVS_ROOT"), expected);
         }
 
         #[test]
@@ -555,11 +611,11 @@ mod tests {
             );
 
             let quiet = FakeEngine::answering("rocm-progress-off", STOPPED, 0);
-            request(&quiet, None, None, false).unwrap();
-            assert_eq!(
-                quiet.env("ROCM_ENGINE_PROGRESS_STDERR"),
+            let expected = under_env_lock(|| {
+                request(&quiet, None, None, false).unwrap();
                 ambient("ROCM_ENGINE_PROGRESS_STDERR")
-            );
+            });
+            assert_eq!(quiet.env("ROCM_ENGINE_PROGRESS_STDERR"), expected);
         }
 
         #[test]
@@ -568,11 +624,12 @@ mod tests {
             // install, resolve-model, stop), so this client has no service to find
             // a key for. `rocmd`'s healthcheck is the call that threads one.
             let engine = FakeEngine::answering("rocm-no-key", STOPPED, 0);
-            request(&engine, None, None, false).unwrap();
-            assert_eq!(
-                engine.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
-                ambient(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV)
-            );
+            let key = rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV;
+            let expected = under_env_lock(|| {
+                request(&engine, None, None, false).unwrap();
+                ambient(key)
+            });
+            assert_eq!(engine.env(key), expected);
         }
 
         #[test]
