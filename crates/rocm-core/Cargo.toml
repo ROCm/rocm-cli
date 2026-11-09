@@ -14,6 +14,10 @@ workspace = true
 # Lets the E2E suite re-root the hardware probes under a simulated host; see
 # `src/hardware_root.rs`. Never enabled in a release build.
 e2e-test-hooks = []
+# Compiles the `foreign_temp_probe` test probe so a dependent crate's tests can
+# use it. Enabled only from a `[dev-dependencies]` entry; never in a shipped
+# build.
+test-support = []
 
 [build-dependencies]
 cc = "1"
