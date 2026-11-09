@@ -157,16 +157,55 @@ fn slugify(name: &str) -> String {
 /// this is collecting. Seeking keeps the cost fixed however big the log grows.
 ///
 /// The log may still be being written, so `len` is a snapshot: the head and tail
-/// are always real, and only the elided count can be slightly stale.
+/// are always real, and only the elided count can be slightly stale. A log that
+/// grows past the cap after the size was taken is clamped the same way and the
+/// note says it grew (see [`read_clamped_file`]); no caller gets a silent
+/// truncation. Callers: `archive_service_log` (the note lands on the archived-path
+/// line) and the Lemonade report's pins and `version.txt` reads (the note follows
+/// the quoted text); its manifest read discards the note, but a truncated JSON
+/// manifest fails to parse and the report says so.
 pub(crate) fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    read_clamped_file(file, len, max)
+}
+
+/// [`read_clamped`] on an open file whose size was read as `len`. Split out so a
+/// test can hand it a `len` that has gone stale, which is what a log that grows
+/// between the size check and the read looks like.
+///
+/// A file that fits is read in full, but one byte past `max` is asked for: if it
+/// is there, the log grew after `len` was taken. That is not allowed to pass as
+/// "fits" with the surplus dropped without a word, so the read falls back to the
+/// head and tail of the file as it is now and the note says it grew. A file that
+/// shrank instead is returned as read, with a note that it changed.
+fn read_clamped_file(
+    mut file: std::fs::File,
+    len: u64,
+    max: u64,
+) -> std::io::Result<(Vec<u8>, String)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
+    let mut len = len;
+    let mut grown = false;
     if len <= max {
         let mut body = Vec::new();
-        file.take(max).read_to_end(&mut body)?;
-        return Ok((body, String::new()));
+        file.by_ref()
+            .take(max.saturating_add(1))
+            .read_to_end(&mut body)?;
+        if body.len() as u64 <= max {
+            return Ok((body, String::new()));
+        }
+        len = file.metadata()?.len();
+        if len <= max {
+            body.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+            return Ok((
+                body,
+                format!(" (truncated at {max} bytes: the file changed while it was read)"),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        grown = true;
     }
     // `len > max >= 2 * half`, so the two halves can never overlap.
     let half = max / 2;
@@ -181,7 +220,15 @@ pub(crate) fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, S
     let mut body = head;
     body.extend_from_slice(marker.as_bytes());
     body.extend_from_slice(&tail);
-    Ok((body, format!(" ({elided} bytes elided from the middle)")))
+    let grown_note = if grown {
+        "; the file grew while it was read"
+    } else {
+        ""
+    };
+    Ok((
+        body,
+        format!(" ({elided} bytes elided from the middle{grown_note})"),
+    ))
 }
 
 /// Copy the log written by the managed service `serve_stdout` launched into
@@ -302,8 +349,8 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
 mod tests {
     use super::{
         MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, engine_from_serve_args,
-        parse_log_path, read_clamped, reported_engine, serve_attempt_report, service_log_tail,
-        slugify, tail_lines,
+        parse_log_path, read_clamped, read_clamped_file, reported_engine, serve_attempt_report,
+        service_log_tail, slugify, tail_lines,
     };
 
     const SERVE_PLAN: &str = "\
@@ -471,6 +518,34 @@ managed service launched
         let path = dir.path().join("service.log");
         std::fs::write(&path, body).expect("write log");
         read_clamped(&path, max).expect("read log")
+    }
+
+    /// A log that grows after its size was read must not be cut at the cap without
+    /// saying so. `len` is handed in stale (10 bytes under a 20-byte cap) for a file
+    /// that now holds 60: the read keeps the head and tail of what is there and the
+    /// note says it grew. Cutting at the cap silently turns this red, and a file
+    /// that really fits (stale or not) stays verbatim with no note.
+    #[test]
+    fn a_log_that_grew_after_its_size_was_read_is_clamped_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("service.log");
+        let body: Vec<u8> = (0..60u8).map(|i| b'a' + i % 26).collect();
+        std::fs::write(&path, &body).expect("write log");
+
+        let (clamped, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 10, 20).expect("read");
+        assert!(note.contains("the file grew while it was read"), "{note}");
+        assert!(note.contains("40 bytes elided from the middle"), "{note}");
+        let text = String::from_utf8_lossy(&clamped);
+        assert!(text.starts_with(&String::from_utf8_lossy(&body[..10]).to_string()));
+        assert!(text.ends_with(&String::from_utf8_lossy(&body[50..]).to_string()));
+
+        let (whole, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 60, 100).expect("read");
+        assert_eq!((whole, note), (body.clone(), String::new()));
+        let (exact, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 60, 60).expect("read");
+        assert_eq!((exact, note), (body, String::new()));
     }
 
     /// A runaway log is bounded, but never at the cost of the startup banner:
