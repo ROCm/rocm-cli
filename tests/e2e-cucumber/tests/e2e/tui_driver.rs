@@ -36,7 +36,7 @@ use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
-use e2e_cucumber::terminal_size::non_zero_dimensions;
+use e2e_cucumber::terminal_size::resize_screen_then_pty;
 
 use crate::E2eWorld;
 
@@ -645,28 +645,24 @@ impl TuiSession {
     /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
+    ///
+    /// The emulated screen is resized first and the PTY second, through
+    /// [`resize_screen_then_pty`]: the other order lets the application's
+    /// redraw for the new size be parsed by the old, narrower screen whenever
+    /// this thread is descheduled between the two calls, which corrupts the
+    /// screen for good (see that function).
     fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
-        // Validate before resizing the PTY so a zero dimension fails cleanly
-        // instead of leaving the PTY and the emulated screen at different sizes.
-        let (vt_rows, vt_cols) = non_zero_dimensions(rows, cols)?;
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        self.master
-            .resize(size)
-            .map_err(|e| format!("failed to resize pty: {e}"))?;
-        // As in `screen_snapshot`, recover rather than fail on a poisoned lock —
-        // resizing is still meaningful even if some earlier operation panicked
-        // while holding it.
-        self.parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .screen_mut()
-            .set_size(vt_rows, vt_cols);
-        Ok(())
+        let master = &self.master;
+        resize_screen_then_pty(&self.parser, rows, cols, || {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("failed to resize pty: {e}"))
+        })
     }
 
     /// Enlarge to [`DETAIL_ROWS`]x[`DETAIL_COLS`], for journeys that assert
