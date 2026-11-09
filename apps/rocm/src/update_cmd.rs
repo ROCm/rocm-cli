@@ -334,6 +334,11 @@ fn apply_runtime_update_with(
         return Ok(output);
     }
 
+    // The plan's `python_note` is not printed here: the preview below prints its
+    // own `python_note:` from the decision a real install takes (scenario
+    // `update-10` asserts it), so a second line would say the same thing twice.
+    // A dry run that finds nothing newer returned above and prints neither; the
+    // plain `rocm update` report is where the check's note shows.
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
         let install_plan = therock::install_sdk_for_update(
