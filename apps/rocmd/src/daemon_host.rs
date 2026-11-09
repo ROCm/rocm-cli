@@ -30,7 +30,22 @@ pub(crate) fn mark_embedded_in_rocm() {
 }
 
 fn is_embedded_in_rocm() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(flag) = EMBEDDED_OVERRIDE.with(std::cell::Cell::get) {
+            return flag;
+        }
+    }
     EMBEDDED_IN_ROCM.load(Ordering::Relaxed)
+}
+
+// Unit tests only: the answer `is_embedded_in_rocm` gives on this thread. The
+// real flag is process-wide, so a test that set it would change the answer for
+// every other test; a thread-local lets a test see both answers and no other
+// test see either.
+#[cfg(test)]
+thread_local! {
+    static EMBEDDED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The host the daemon is running in, with the one executable path that every
@@ -59,20 +74,19 @@ impl DaemonHost {
     /// it exercises a host of its own.
     pub(crate) fn detect() -> Result<Self> {
         #[cfg(test)]
-        {
-            let mut host = Self::new(
-                std::env::current_exe().context("the test binary has a path")?,
-                false,
-            );
-            host.test_binary_has_every_command = true;
-            Ok(host)
-        }
+        let current_exe = std::env::current_exe().context("the test binary has a path")?;
         #[cfg(not(test))]
-        {
-            let current_exe = rocm_core::current_executable_path()
-                .context("failed to resolve the current executable path")?;
-            Ok(Self::new(current_exe, is_embedded_in_rocm()))
-        }
+        let current_exe = rocm_core::current_executable_path()
+            .context("failed to resolve the current executable path")?;
+        // The same composition in both builds, so a test reaches the line that
+        // takes the host's embedded flag from the process.
+        let host = Self::new(current_exe, is_embedded_in_rocm());
+        #[cfg(test)]
+        let host = Self {
+            test_binary_has_every_command: true,
+            ..host
+        };
+        Ok(host)
     }
 
     pub(crate) const fn new(current_exe: PathBuf, embedded_in_rocm: bool) -> Self {
@@ -339,6 +353,29 @@ mod tests {
             "{error:#}"
         );
         assert!(rocmd.rocm_binary().is_err());
+    }
+
+    /// `detect` takes the embedded flag from the process, and not its negation
+    /// or a constant: with the flag set on this thread the host it returns is
+    /// the embedded one, and with it clear it is not. The two answers are the
+    /// whole premise of the fix, since they decide which binary each spawn runs.
+    /// What a unit test still cannot reach is the production arm that resolves
+    /// the executable (`rocm_core::current_executable_path`).
+    #[test]
+    fn detect_takes_the_embedded_flag_from_the_process() {
+        let this = std::env::current_exe().unwrap();
+        for flag in [false, true] {
+            EMBEDDED_OVERRIDE.with(|cell| cell.set(Some(flag)));
+            let host = DaemonHost::detect();
+            EMBEDDED_OVERRIDE.with(|cell| cell.set(None));
+            let host = host.unwrap();
+            assert_eq!(host.embedded_in_rocm, flag, "embedded flag {flag}");
+            // The stand-in still answers with the test binary for both
+            // commands whatever the flag says.
+            assert_eq!(host.rocmd_binary().unwrap(), this, "embedded flag {flag}");
+            assert_eq!(host.rocm_binary().unwrap(), this, "embedded flag {flag}");
+        }
+        assert!(!is_embedded_in_rocm(), "the override is cleared again");
     }
 
     /// A process that did not enter through `run_from_args` is not embedded.
