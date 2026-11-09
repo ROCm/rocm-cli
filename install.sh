@@ -396,18 +396,25 @@ configure_fish_path() {
   fi
   case "${fish_result}" in
     updated:*)
-      echo "fish shell profile updated:"
-      echo "  profile: ${fish_result#updated:}"
+      ok "fish shell profile updated:"
+      info "profile: ${fish_result#updated:}"
       ;;
     unchanged:*)
-      echo "fish shell profile already configured:"
-      echo "  profile: ${fish_result#unchanged:}"
+      info "fish shell profile already configured:"
+      info "profile: ${fish_result#unchanged:}"
       ;;
     *)
-      echo "note: ${INSTALL_DIR} is not saved in your fish config"
+      info "note: ${INSTALL_DIR} is not saved in your fish config"
       ;;
   esac
 }
+
+# The first line of the fish completion script this installer writes, followed
+# by the install folder. `rocm uninstall` removes the script only when it still
+# starts with this line naming its own folder, so a script the user wrote, or
+# one another install folder wrote over this one, stays. Keep it in step with
+# FISH_COMPLETIONS_MARKER in apps/rocm/src/uninstall.rs.
+FISH_COMPLETIONS_MARKER='# rocm-cli fish completions for '
 
 # Install fish completions from the binary that was just placed, so they match
 # it, and record the file so `rocm uninstall` removes it with the binary. Best
@@ -417,17 +424,20 @@ install_fish_completions() {
   completions_dir="$(fish_config_dir)/completions"
   completions_path="${completions_dir}/rocm.fish"
   completions_tmp="${tmp_dir}/rocm.fish"
+  completions_marked="${tmp_dir}/rocm.fish.marked"
   if "${INSTALL_DIR}/rocm" completions fish < /dev/null > "${completions_tmp}" \
     && [ -s "${completions_tmp}" ] \
+    && { printf '%s%s\n' "${FISH_COMPLETIONS_MARKER}" "${INSTALL_DIR}" \
+      && cat "${completions_tmp}"; } > "${completions_marked}" \
     && mkdir -p "${completions_dir}" \
-    && install -m 0644 "${completions_tmp}" "${completions_path}"; then
+    && install -m 0644 "${completions_marked}" "${completions_path}"; then
     record_path_edit "completions ${completions_path}"
-    echo "fish completions installed:"
-    echo "  ${completions_path}"
+    ok "fish completions installed:"
+    info "${completions_path}"
   else
-    echo "note: could not install fish completions"
-    echo "  run: mkdir -p ${completions_dir}"
-    echo "  run: rocm completions fish > ${completions_path}"
+    info "note: could not install fish completions"
+    info "run: mkdir -p ${completions_dir}"
+    info "run: rocm completions fish > ${completions_path}"
   fi
 }
 

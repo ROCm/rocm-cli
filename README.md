@@ -90,7 +90,7 @@ including when the login shell is bash, zsh, or ksh. Fish's config folder is
 Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
 its completions included. Rerun the installer any time to upgrade.
 `rocm uninstall` removes the binaries and the fish completions the installer
-recorded writing, and undoes the `PATH` change too when no other program lives
+wrote for them, and undoes the `PATH` change too when no other program lives
 in that directory.
 
 ### Linux and WSL2 (x86_64)
@@ -1662,6 +1662,16 @@ wrote yourself is never touched. The `PATH` change is undone first: if it can't
 be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
+
+On Linux it also removes the fish completion script (`completions/rocm.fish`
+in fish's config folder) that the installer recorded writing, even when the
+`PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+The installer starts that file with a line naming the folder it installed into,
+and uninstall removes the file only when that line names its own folder. A
+`rocm.fish` you wrote yourself, a link, or one another install folder wrote
+since is left in place, and the review says so under `Left alone:`. If the
+file cannot be removed, uninstall prints a warning naming it and carries on,
+since the completions are only a convenience; delete it yourself then.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and

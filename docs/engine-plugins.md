@@ -147,9 +147,11 @@ Installer policy:
   when fish is installed, or the user `PATH` on Windows. When fish is
   installed, `install.sh` also writes the fish completion script to
   `completions/rocm.fish` in fish's config folder (`$XDG_CONFIG_HOME/fish`,
-  else `~/.config/fish`) and records it, so `rocm uninstall` removes it with
-  the binaries. A custom `ROCM_CLI_SHELL_PROFILE` replaces only the login
-  shell's profile; fish's is still updated.
+  else `~/.config/fish`), starting with a line naming the install folder, and
+  records it, so `rocm uninstall` removes it with the binaries. Uninstall
+  leaves a `rocm.fish` that does not start with that line for its own folder.
+  A custom `ROCM_CLI_SHELL_PROFILE` replaces only the login shell's profile;
+  fish's is still updated.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use

@@ -1633,6 +1633,16 @@ async fn then_fish_completions_installed(world: &mut E2eWorld) {
         "{} is not a rocm completion script:\n{contents}",
         path.display()
     );
+    // Uninstall removes the file only when this line names its own folder.
+    let marker = format!(
+        "# rocm-cli fish completions for {}\n",
+        st.install_dir.display()
+    );
+    assert!(
+        contents.starts_with(&marker),
+        "{} does not start with the installer's marker {marker:?}:\n{contents}",
+        path.display()
+    );
     let out = &st.last_output;
     assert!(
         out.contains("fish completions installed:") && out.contains(&path.display().to_string()),
@@ -1674,6 +1684,106 @@ async fn then_fish_completions_removed(world: &mut E2eWorld) {
     );
 }
 
+/// What the user writes over the installer's fish completions in a scenario.
+const USERS_OWN_COMPLETIONS: &str = "complete -c rocm -l my-own-flag\n";
+
+#[given("the user has replaced the fish completions with their own")]
+async fn given_users_own_fish_completions(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    assert!(path.is_file(), "the installer wrote no {}", path.display());
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to replace the fish completions");
+}
+
+/// Set the Unix permission bits of `path`. The scenarios that use this are
+/// `@requires-os:linux`; the stub only keeps the Windows build compiling.
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_unix_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix permission bits do not apply on this platform",
+    ))
+}
+
+#[given("the fish completions folder cannot be written to")]
+async fn given_fish_completions_folder_read_only(world: &mut E2eWorld) {
+    let dir = fish_completions(state(world))
+        .parent()
+        .expect("completions have a folder")
+        .to_path_buf();
+    set_unix_mode(&dir, 0o555).expect("failed to make the fish completions folder read-only");
+    // Root writes through folder permissions, so the scenario would not reach
+    // the failure it is about.
+    let probe = dir.join(".rocm-e2e-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = set_unix_mode(&dir, 0o755);
+        panic!(
+            "{} is still writable after chmod 0555; this scenario needs a non-root runner",
+            dir.display()
+        );
+    }
+}
+
+#[then("uninstall leaves the user's own fish completions in place and says why")]
+async fn then_users_fish_completions_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        contents,
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "fish completions {} left in place: it does not start with the rocm-cli \
+             installer's marker, so the installer did not write it",
+            path.display()
+        )),
+        "uninstall did not say why it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it kept:\n{out}"
+    );
+}
+
+#[then("uninstall warns that the fish completions could not be removed and still finishes")]
+async fn then_fish_completions_removal_warned(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let dir = path.parent().expect("completions have a folder");
+    // Put the folder back first, so the scratch tree can be cleaned up even if
+    // an assertion below fails.
+    let _ = set_unix_mode(dir, 0o755);
+    let out = &st.last_output;
+    assert_eq!(st.last_rc, 0, "uninstall did not finish:\n{out}");
+    assert!(
+        out.contains(&format!(
+            "warning: could not remove shell completions {}",
+            path.display()
+        )) && out.contains("The uninstall went on without it"),
+        "uninstall did not warn about the fish completions:\n{out}"
+    );
+    assert!(
+        out.contains("uninstall complete"),
+        "uninstall did not report finishing:\n{out}"
+    );
+    assert!(
+        path.is_file(),
+        "{} is gone, so the warning was not true",
+        path.display()
+    );
+}
+
 #[then("the shell profile still adds the install directory to PATH")]
 async fn then_profile_kept(world: &mut E2eWorld) {
     assert_single_path_marker(state(world));
@@ -1707,7 +1817,7 @@ async fn then_reports_path_kept_with_binaries(world: &mut E2eWorld) {
     let out = &state(world).last_output;
     assert!(
         out.contains("binary removal disabled by --keep-binaries")
-            && out.contains("any PATH change the installer made stays too"),
+            && out.contains("any PATH change and fish completions the installer made stay too"),
         "uninstall did not say the PATH change stays with the binaries:\n{out}"
     );
 }

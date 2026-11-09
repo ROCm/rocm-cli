@@ -688,10 +688,11 @@ rocm logs --search error timeout")]
     ///
     /// Removes the config, data, and cache directories and the installed
     /// binaries, including the running rocm.exe on Windows, and the fish
-    /// completion script the Linux installer recorded writing. It also undoes
-    /// the PATH change the installer made (its marked shell-profile block, or
-    /// the user PATH entry it recorded adding on Windows), unless other
-    /// programs share the install folder.
+    /// completion script the Linux installer wrote for them (a rocm.fish it
+    /// did not write is left in place, and one it cannot remove is only a
+    /// warning). It also undoes the PATH change the installer made (its marked
+    /// shell-profile block, or the user PATH entry it recorded adding on
+    /// Windows), unless other programs share the install folder.
     #[command(after_help = "EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \

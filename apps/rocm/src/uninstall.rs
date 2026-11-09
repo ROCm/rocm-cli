@@ -113,6 +113,8 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// the record of the change are all still there to retry with. Then the
 /// config, data, and cache go, while `rocm` is still there to retry a failure
 /// with; then the binaries, and the record only once every change is undone.
+/// A fish completion script that cannot be removed is reported as a warning
+/// and the rest goes on.
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
     for edit in &plan.path_edits {
         match apply_path_edit(edit) {
@@ -129,9 +131,22 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
     let non_binaries = plan.actions.iter().filter(|entry| !is_binary(entry.kind));
     let binaries = plan.actions.iter().filter(|entry| is_binary(entry.kind));
     for entry in non_binaries.chain(binaries) {
-        remove_path(&entry.path)
-            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
-        report(format!("removed {} {}", entry.kind, entry.path.display()));
+        match remove_path(&entry.path) {
+            Ok(()) => report(format!("removed {} {}", entry.kind, entry.path.display())),
+            // Completions are best effort when installed, so a script that
+            // cannot be removed does not stop the uninstall either.
+            Err(error) if entry.kind == SHELL_COMPLETIONS_KIND => report(format!(
+                "warning: could not remove {} {}: {error:#}\n  \
+                 The uninstall went on without it; delete that file yourself so fish \
+                 stops completing rocm.",
+                entry.kind,
+                entry.path.display()
+            )),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove {}", entry.path.display()));
+            }
+        }
     }
     if let Some(record) = &plan.path_record {
         remove_path(record).with_context(|| format!("failed to remove {}", record.display()))?;
@@ -241,7 +256,7 @@ pub(crate) fn plan_path_edits(
             ));
         }
     } else {
-        plan_completion_removals(plan, &entries);
+        plan_completion_removals(plan, &entries, bin_dir);
         let mut path_exprs = profile_path_exprs(bin_dir, home);
         for (kind, target) in &entries {
             if *kind == "path-expr" && !path_exprs.contains(target) {
@@ -337,37 +352,117 @@ pub(crate) fn plan_path_edits(
     }
 }
 
+/// The plan entry kind for a fish completion script `install.sh` wrote. A
+/// failure to remove one is a warning, not a stop: the installer treats
+/// completions as best effort, so uninstall does too.
+pub(crate) const SHELL_COMPLETIONS_KIND: &str = "shell completions";
+
+/// The first line of the fish completion script `install.sh` writes, followed
+/// by the folder it installed into. Kept in step with `FISH_COMPLETIONS_MARKER`
+/// in `install.sh`, which a test below checks.
+const FISH_COMPLETIONS_MARKER: &[u8] = b"# rocm-cli fish completions for ";
+
 /// Plan removing the fish completion scripts `install.sh` recorded writing.
 ///
 /// They only describe the binaries being removed, so they go with them even
-/// when the PATH change stays for other programs in the folder. Only an
-/// absolute path with no `..`, naming a regular file or link at
-/// `completions/rocm.fish`, is taken: the record sits in a user-writable
-/// folder, and a line naming anything else is not one the installer wrote.
-fn plan_completion_removals(plan: &mut UninstallPlan, entries: &[(&str, OsString)]) {
+/// when the PATH change stays for other programs in the folder. `rocm.fish` is
+/// one fixed path that the user, or another install folder, may have written
+/// since, so a script is removed only when it is still a regular file whose
+/// first line is the installer's marker naming `bin_dir`. Any other script the
+/// record names is left in place, and the review says why.
+fn plan_completion_removals(
+    plan: &mut UninstallPlan,
+    entries: &[(&str, OsString)],
+    bin_dir: &Path,
+) {
     for (kind, target) in entries {
         if *kind != "completions" {
             continue;
         }
         let path = PathBuf::from(target);
-        let is_fish_script = path.is_absolute()
-            && !path
-                .components()
-                .any(|part| part == std::path::Component::ParentDir)
-            && path.file_name().is_some_and(|name| name == "rocm.fish")
-            && path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "completions");
-        let is_file = fs::symlink_metadata(&path)
-            .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink());
-        if is_fish_script && is_file && !plan.actions.iter().any(|entry| entry.path == path) {
-            plan.actions.push(UninstallPlanEntry {
-                kind: "shell completions",
-                path,
-            });
+        if !is_recorded_fish_script(&path) || plan.actions.iter().any(|entry| entry.path == path) {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            plan.skipped.push(format!(
+                "fish completions {} left in place: it is a link, and the installer writes a file",
+                path.display()
+            ));
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        match fish_completions_owner(&path) {
+            Ok(Some(owner)) if same_folder(&owner, bin_dir) => {
+                plan.actions.push(UninstallPlanEntry {
+                    kind: SHELL_COMPLETIONS_KIND,
+                    path,
+                });
+            }
+            Ok(Some(owner)) => plan.skipped.push(format!(
+                "fish completions {} left in place: the rocm-cli install in {} wrote it, not \
+                 this one in {}",
+                path.display(),
+                owner.display(),
+                bin_dir.display()
+            )),
+            Ok(None) => plan.skipped.push(format!(
+                "fish completions {} left in place: it does not start with the rocm-cli \
+                 installer's marker, so the installer did not write it",
+                path.display()
+            )),
+            Err(error) => plan.warnings.push(format!(
+                "could not read {} to check that the installer wrote it, so it is left in \
+                 place: {error}",
+                path.display()
+            )),
         }
     }
+}
+
+/// Whether a `completions` line in the record names a path `install.sh`
+/// writes: absolute, with no `..`, and ending in `completions/rocm.fish`. The
+/// record sits in a user-writable folder, so a line naming anything else is not
+/// one the installer wrote.
+fn is_recorded_fish_script(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && path.file_name().is_some_and(|name| name == "rocm.fish")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "completions")
+}
+
+/// The install folder named by the marker on the first line of `path`, or
+/// `None` when that line is not the installer's marker.
+fn fish_completions_owner(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::{BufRead as _, BufReader};
+    let mut first = Vec::new();
+    BufReader::new(fs::File::open(path)?).read_until(b'\n', &mut first)?;
+    let line = first.strip_suffix(b"\n").unwrap_or(&first);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    Ok(line
+        .strip_prefix(FISH_COMPLETIONS_MARKER)
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(os_string_from_bytes(dir))))
+}
+
+/// Whether `a` and `b` name the same folder, as spelled or with links
+/// resolved: the installer names the folder as `$HOME` spelled it, while the
+/// running binary reports it resolved.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// The `kind target` lines of a PATH-edit record. A target is kept as the
@@ -1296,15 +1391,24 @@ mod tests {
             Ok(())
         }
 
-        /// `--keep-binaries` keeps the installer's PATH change and its record
-        /// with the binaries, and says so. Run against an installed folder that
-        /// holds both, so the same plan without the flag would undo them.
+        /// `--keep-binaries` keeps the installer's PATH change, its fish
+        /// completions, and its record with the binaries, and says so. Run
+        /// against an installed folder that holds all of them, so the same plan
+        /// without the flag would remove them.
         #[test]
         fn keeping_the_binaries_keeps_the_path_change_and_says_so() -> Result<()> {
             let layout = layout()?;
             let profile = layout.home.join(".bashrc");
             fs::write(&profile, POSIX_BLOCK)?;
-            let record = record(&layout, &format!("profile {}\n", profile.display()))?;
+            let completions = fish_completions(&layout)?;
+            let record = record(
+                &layout,
+                &format!(
+                    "profile {}\ncompletions {}\n",
+                    profile.display(),
+                    completions.display()
+                ),
+            )?;
             let plan_with = |keep_binaries| -> Result<UninstallPlan> {
                 let mut plan = UninstallPlan::default();
                 let options = UninstallOptions {
@@ -1323,6 +1427,11 @@ mod tests {
             let plan = plan_with(false)?;
             assert_eq!(profiles(&plan), vec![profile.clone()], "{plan:?}");
             assert_eq!(plan.path_record.as_ref(), Some(&record));
+            assert_eq!(
+                completion_actions(&plan),
+                vec![completions.clone()],
+                "{plan:?}"
+            );
 
             let plan = plan_with(true)?;
             assert!(
@@ -1334,14 +1443,20 @@ mod tests {
                 plan.skipped
                     .iter()
                     .any(|note| note.contains("--keep-binaries")
-                        && note.contains("PATH change the installer made stays too")),
+                        && note.contains(
+                            "PATH change and fish completions the installer made stay too"
+                        )),
                 "{plan:?}"
             );
-            // Carrying the plan out leaves the change, its record, and the
-            // binaries where they are.
+            // Carrying the plan out leaves the change, the completions, their
+            // record, and the binaries where they are.
             run(&plan).1?;
             assert_eq!(fs::read_to_string(&profile)?, POSIX_BLOCK);
             assert!(record.exists() && layout.removed.iter().all(|path| path.exists()));
+            assert!(
+                completions.exists(),
+                "the completions stay with the binaries"
+            );
             Ok(())
         }
 
@@ -1368,21 +1483,46 @@ mod tests {
             Ok(())
         }
 
-        /// Where `install.sh` writes fish completions under `layout`'s home.
+        /// The fish completion script `install.sh` writes for the install in
+        /// `bin`: its marker line naming that folder, then the script.
+        fn marked_script(bin: &Path) -> String {
+            format!(
+                "{}{}\ncomplete -c rocm\n",
+                String::from_utf8_lossy(FISH_COMPLETIONS_MARKER),
+                bin.display()
+            )
+        }
+
+        /// Write `contents` to `path`, creating its folder.
+        fn write_script(path: &Path, contents: &str) -> Result<()> {
+            fs::create_dir_all(path.parent().expect("has a folder"))?;
+            fs::write(path, contents)?;
+            Ok(())
+        }
+
+        /// Where `install.sh` writes fish completions under `layout`'s home,
+        /// written there as it writes them.
         fn fish_completions(layout: &Layout) -> Result<PathBuf> {
-            let dir = layout.home.join(".config").join("fish").join("completions");
-            fs::create_dir_all(&dir)?;
-            let path = dir.join("rocm.fish");
-            fs::write(&path, "complete -c rocm\n")?;
+            let path = layout
+                .home
+                .join(".config")
+                .join("fish")
+                .join("completions")
+                .join("rocm.fish");
+            write_script(&path, &marked_script(&layout.bin))?;
             Ok(path)
         }
 
         fn completion_actions(plan: &UninstallPlan) -> Vec<PathBuf> {
             plan.actions
                 .iter()
-                .filter(|entry| entry.kind == "shell completions")
+                .filter(|entry| entry.kind == SHELL_COMPLETIONS_KIND)
                 .map(|entry| entry.path.clone())
                 .collect()
+        }
+
+        fn completions_record(layout: &Layout, completions: &Path) -> Result<PathBuf> {
+            record(layout, &format!("completions {}\n", completions.display()))
         }
 
         #[test]
@@ -1446,14 +1586,14 @@ mod tests {
             Ok(())
         }
 
+        /// Every file below carries this install's marker, so only the check
+        /// on the recorded path keeps each one.
         #[test]
         fn a_completions_line_naming_another_file_is_not_trusted() -> Result<()> {
             let layout = layout()?;
-            let profile = layout.home.join(".bashrc");
-            fs::write(&profile, "export A=1\n")?;
+            let marked = marked_script(&layout.bin);
             let elsewhere = layout.home.join("completions").join("other.fish");
-            fs::create_dir_all(elsewhere.parent().expect("has a folder"))?;
-            fs::write(&elsewhere, "")?;
+            write_script(&elsewhere, &marked)?;
             let folder = layout
                 .home
                 .join("dir")
@@ -1461,8 +1601,8 @@ mod tests {
                 .join("rocm.fish");
             fs::create_dir_all(folder.join("keep"))?;
             let not_completions = layout.home.join("notcompletions").join("rocm.fish");
-            fs::create_dir_all(not_completions.parent().expect("has a folder"))?;
-            fs::write(&not_completions, "")?;
+            write_script(&not_completions, &marked)?;
+            // `..` that lands on a real `completions/rocm.fish` file.
             let dotted = layout
                 .home
                 .join("x")
@@ -1470,49 +1610,190 @@ mod tests {
                 .join("..")
                 .join("completions")
                 .join("rocm.fish");
-            // `..` that lands on a real `completions/rocm.fish` file.
-            let dotted_target = layout.home.join("x").join("completions");
-            fs::create_dir_all(&dotted_target)?;
-            fs::write(dotted_target.join("rocm.fish"), "")?;
+            write_script(
+                &layout.home.join("x").join("completions").join("rocm.fish"),
+                &marked,
+            )?;
             let missing = layout
                 .home
                 .join("gone")
                 .join("completions")
                 .join("rocm.fish");
+            // A line of another kind naming a real script this install wrote.
+            let other_kind = fish_completions(&layout)?;
             record(
                 &layout,
                 &format!(
                     "completions {}\ncompletions {}\ncompletions {}\ncompletions {}\n\
-                     completions {}\ncompletions {}\n",
-                    profile.display(),
+                     completions {}\nprofile {}\npath-expr {}\n",
                     elsewhere.display(),
                     folder.display(),
                     missing.display(),
                     not_completions.display(),
-                    dotted.display()
+                    dotted.display(),
+                    other_kind.display(),
+                    other_kind.display()
                 ),
             )?;
             let plan = plan_for(&layout);
             assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            run(&plan).1?;
+            assert!(other_kind.exists(), "a line of another kind removed it");
+            Ok(())
+        }
+
+        /// A relative path cannot be tried against the filesystem without
+        /// depending on the test's working folder, so the check is pinned
+        /// directly.
+        #[test]
+        fn only_an_absolute_completions_rocm_fish_path_is_the_installers() {
+            assert!(is_recorded_fish_script(Path::new(
+                "/home/me/.config/fish/completions/rocm.fish"
+            )));
+            for path in [
+                ".config/fish/completions/rocm.fish",
+                "completions/rocm.fish",
+                "/home/me/.config/fish/completions/../completions/rocm.fish",
+                "/home/me/.config/fish/completions/other.fish",
+                "/home/me/.config/fish/rocm.fish",
+            ] {
+                assert!(!is_recorded_fish_script(Path::new(path)), "{path}");
+            }
+        }
+
+        /// A script the installer did not write, such as one the user made
+        /// with `rocm completions fish > ...`, stays, and the review shown
+        /// before the uninstall runs says so.
+        #[test]
+        fn unmarked_fish_completions_are_left_in_place_and_the_review_says_so() -> Result<()> {
+            let layout = layout()?;
+            let completions = fish_completions(&layout)?;
+            fs::write(&completions, "complete -c rocm\n")?;
+            completions_record(&layout, &completions)?;
+            let plan = with_binaries(&layout, plan_for(&layout));
+            assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+
+            let review = render_uninstall_plan(&plan, &UninstallOptions::default());
+            let note = format!(
+                "  - fish completions {} left in place: it does not start with the rocm-cli \
+                 installer's marker, so the installer did not write it",
+                completions.display()
+            );
+            assert!(review.contains(&format!("Left alone:\n{note}")), "{review}");
+            let (lines, result) = run(&plan);
+            result?;
+            assert_eq!(fs::read_to_string(&completions)?, "complete -c rocm\n");
+            assert!(!layout.removed[0].exists(), "the binaries still go");
+            assert!(
+                !lines.iter().any(|line| line.contains("rocm.fish")),
+                "{lines:?}"
+            );
+            Ok(())
+        }
+
+        /// `rocm.fish` is one path for every install folder, so the one that
+        /// wrote it last owns it: uninstalling another leaves it.
+        #[test]
+        fn fish_completions_another_install_folder_wrote_are_left_in_place() -> Result<()> {
+            let layout = layout()?;
+            let other_bin = layout.home.join("opt").join("rocm").join("bin");
+            fs::create_dir_all(&other_bin)?;
+            let completions = fish_completions(&layout)?;
+            fs::write(&completions, marked_script(&other_bin))?;
+            completions_record(&layout, &completions)?;
+            let plan = with_binaries(&layout, plan_for(&layout));
+            assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            let review = render_uninstall_plan(&plan, &UninstallOptions::default());
+            assert!(
+                review.contains(&format!(
+                    "fish completions {} left in place: the rocm-cli install in {} wrote it, \
+                     not this one in {}",
+                    completions.display(),
+                    other_bin.display(),
+                    layout.bin.display()
+                )),
+                "{review}"
+            );
+            run(&plan).1?;
+            assert_eq!(fs::read_to_string(&completions)?, marked_script(&other_bin));
+            Ok(())
+        }
+
+        /// The installer names the folder as `$HOME` spells it, while the
+        /// running binary reports it with links resolved.
+        #[test]
+        fn a_marker_naming_this_folder_through_a_link_still_counts() -> Result<()> {
+            let layout = layout()?;
+            let linked_bin = layout.home.join("linked-bin");
+            std::os::unix::fs::symlink(&layout.bin, &linked_bin)?;
+            let completions = fish_completions(&layout)?;
+            fs::write(&completions, marked_script(&linked_bin))?;
+            completions_record(&layout, &completions)?;
+            let plan = plan_for(&layout);
+            assert_eq!(completion_actions(&plan), vec![completions], "{plan:?}");
             Ok(())
         }
 
         #[test]
-        fn linked_fish_completions_lose_the_link_and_keep_its_target() -> Result<()> {
+        fn linked_fish_completions_are_left_in_place() -> Result<()> {
             let layout = layout()?;
             let target = layout.home.join("dotfiles").join("rocm.fish");
-            fs::create_dir_all(target.parent().expect("has a folder"))?;
-            fs::write(&target, "complete -c rocm\n")?;
+            write_script(&target, &marked_script(&layout.bin))?;
             let dir = layout.home.join(".config").join("fish").join("completions");
             fs::create_dir_all(&dir)?;
             let link = dir.join("rocm.fish");
             std::os::unix::fs::symlink(&target, &link)?;
-            record(&layout, &format!("completions {}\n", link.display()))?;
-            let plan = plan_for(&layout);
-            assert_eq!(completion_actions(&plan), vec![link.clone()], "{plan:?}");
+            completions_record(&layout, &link)?;
+            let plan = with_binaries(&layout, plan_for(&layout));
+            assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
+            assert!(
+                plan.skipped.iter().any(|note| note
+                    == &format!(
+                        "fish completions {} left in place: it is a link, and the installer \
+                         writes a file",
+                        link.display()
+                    )),
+                "{plan:?}"
+            );
             run(&plan).1?;
-            assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
-            assert!(target.exists(), "what the link pointed at stays");
+            assert!(fs::symlink_metadata(&link)?.is_symlink(), "the link stays");
+            assert!(target.exists(), "what the link points at stays");
+            Ok(())
+        }
+
+        /// The installer treats completions as best effort, so a script that
+        /// cannot be removed is a warning: the binaries and the record still
+        /// go, and the uninstall reports success.
+        #[test]
+        fn fish_completions_that_cannot_be_removed_are_a_warning_and_the_rest_goes_on() -> Result<()>
+        {
+            let layout = layout()?;
+            let record = record(&layout, "")?;
+            let mut plan = with_binaries(&layout, plan_for(&layout));
+            plan.path_record = Some(record.clone());
+            // A name too long for any filesystem fails to remove, even for root.
+            let stuck = layout.home.join("x".repeat(300));
+            plan.actions.insert(
+                0,
+                crate::uninstall_plan::UninstallPlanEntry {
+                    kind: SHELL_COMPLETIONS_KIND,
+                    path: stuck.clone(),
+                },
+            );
+
+            let (lines, result) = run(&plan);
+            result?;
+            let warning = format!(
+                "warning: could not remove shell completions {}: ",
+                stuck.display()
+            );
+            assert!(
+                lines.iter().any(|line| line.starts_with(&warning)
+                    && line.contains("The uninstall went on without it")),
+                "{lines:?}"
+            );
+            assert!(layout.removed.iter().all(|path| !path.exists()));
+            assert!(!record.exists(), "the record still goes last");
             Ok(())
         }
 
@@ -1523,7 +1804,8 @@ mod tests {
             let profile = layout.home.join(".bashrc");
             fs::write(&profile, format!("export A=1\n{POSIX_BLOCK}"))?;
             // An earlier installer wrote the script but no `completions` line,
-            // so uninstall has no record of it and leaves it alone.
+            // so uninstall has no record of it and leaves it alone, marker or
+            // not.
             let completions = fish_completions(&layout)?;
             let record = record(
                 &layout,
@@ -1532,13 +1814,24 @@ mod tests {
                     profile.display()
                 ),
             )?;
-            let plan = with_binaries(&layout, plan_for(&layout));
+            let plan = plan_for(&layout);
             assert_eq!(completion_actions(&plan), Vec::<PathBuf>::new(), "{plan:?}");
             assert_eq!(profiles(&plan), vec![profile.clone()]);
-            run(&plan).1?;
+            run(&with_binaries(&layout, plan)).1?;
             assert_eq!(fs::read_to_string(&profile)?, "export A=1\n");
             assert!(!record.exists() && completions.exists());
             Ok(())
         }
+    }
+
+    /// `install.sh` writes the marker this module looks for.
+    #[test]
+    fn the_installer_writes_the_fish_completions_marker_uninstall_reads() {
+        let installer = include_str!("../../../install.sh");
+        let marker = std::str::from_utf8(FISH_COMPLETIONS_MARKER).expect("ASCII");
+        assert!(
+            installer.contains(&format!("FISH_COMPLETIONS_MARKER='{marker}'")),
+            "install.sh no longer writes {marker:?} as its fish completions marker"
+        );
     }
 }

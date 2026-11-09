@@ -2702,18 +2702,32 @@ expectation and applicability resolver.
 
 Fish profile setup in `install.sh` is covered on its own by
 [`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
-local bundle, points the installer at a temporary home, and checks that a
-bash, zsh, or ksh login shell still updates its own profile and, when `fish`
-is on `PATH` or fish's config folder exists (`$XDG_CONFIG_HOME/fish` when that
-is absolute, else `~/.config/fish`), also writes the fish `PATH` block, fish
-completions, and the uninstall record for both. A bash home with no fish
-install keeps no fish config. It also checks that a `rocm` that cannot print
-completions leaves the install and the `PATH` block in place with a hint that
-works, that `rocm` is not handed the installer's stdin, and, as a non-root
-user, that a profile that cannot be written is reported rather than claimed
-as updated, under both `sh` and `bash`. It needs no network or GPU. Set
-`INSTALL_SH` to run it against another copy of the installer. The Linux
-`build-and-test` job runs it:
+local bundle, points the installer at a temporary home, and checks:
+
+- a bash, zsh, or ksh login shell still updates its own profile and, with
+  `fish` on `PATH`, also writes the fish `PATH` block and records both
+  profiles;
+- the fish completion script, starting with the marker line that names the
+  install folder, and its `completions` record line, for a bash login shell
+  with `fish` on `PATH`, a bash login shell with only `~/.config/fish`, and a
+  fish login shell;
+- an absolute `$XDG_CONFIG_HOME` moves fish's config and completions there,
+  and a relative one is ignored (both with a bash login shell only);
+- a reinstall adds no second block or record line and reports fish's config
+  as already configured;
+- a fish config that already names the install folder with the user's own
+  line is left alone and not recorded;
+- a bash home with no fish install grows no fish config, and
+  `ROCM_CLI_UPDATE_SHELL_PATH=0` writes no profile and no completions;
+- a `rocm` that cannot print completions, or prints nothing, leaves the install
+  and the `PATH` block in place with a hint that works when run as printed,
+  and `rocm` is never handed the installer's stdin;
+- as a non-root user only, a profile that cannot be written is reported rather
+  than claimed as updated, and not recorded, under both `sh` and `bash`.
+
+It needs no network or GPU. Set `INSTALL_SH` to run it against another copy of
+the installer. The Linux `build-and-test` job runs it when the change touches
+the heavy path (`needs.changes.outputs.heavy == 'true'`):
 
 ```bash
 sh tests/install-sh/run.sh
@@ -2721,7 +2735,13 @@ sh tests/install-sh/run.sh
 
 The same path with the packaged binary, including `rocm uninstall` putting the
 bash and fish configs back and removing the fish completions, is
-`@id:lifecycle-linux-fish-configured-from-bash` in the lifecycle set above.
+`@id:lifecycle-linux-fish-configured-from-bash` (lifecycle-32) in the lifecycle
+set above. `@id:lifecycle-linux-fish-completions-not-ours-kept` (lifecycle-33)
+checks that uninstall leaves a `rocm.fish` the user wrote over the installer's
+and says so, and `@id:lifecycle-linux-fish-completions-removal-failure-warns`
+(lifecycle-34) that a `rocm.fish` it cannot remove is a warning while the rest
+of the uninstall still happens. lifecycle-34 makes the `completions` folder
+read-only, so it needs a non-root runner.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`

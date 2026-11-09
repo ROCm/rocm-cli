@@ -90,7 +90,7 @@ if [ "${1:-}" = "completions" ] && [ "${2:-}" = "fish" ]; then
     fail) printf '%s\n' "stub completions failure" >&2; exit 1 ;;
     empty) exit 0 ;;
   esac
-  printf '%s\n' '# rocm-cli fish completions fixture'
+  printf '%s\n' 'complete -c rocm # stub completions'
   exit 0
 fi
 printf '%s\n' "unexpected rocm invocation: $*" >&2
@@ -117,7 +117,15 @@ MARKER='# >>> rocm-cli path >>>'
 FISH_SNIPPET='if not contains -- "$HOME/.local/bin" $PATH'
 # shellcheck disable=SC2016
 POSIX_SNIPPET='case ":$PATH:" in'
-COMPLETIONS_FIXTURE='# rocm-cli fish completions fixture'
+COMPLETIONS_FIXTURE='complete -c rocm # stub completions'
+# The line install.sh puts above the script so `rocm uninstall` can tell its
+# own file from one the user or another install folder wrote.
+COMPLETIONS_MARKER='# rocm-cli fish completions for '
+
+# What install.sh writes to rocm.fish for an install under home $1.
+installed_completions() {
+  printf '%s%s\n%s' "${COMPLETIONS_MARKER}" "$1/.local/bin" "${COMPLETIONS_FIXTURE}"
+}
 # The installer's stdin: what `curl | sh` would still have to run.
 STDIN_FIXTURE="${WORK}/installer-stdin"
 printf '%s\n' 'echo the rest of the installer script' > "${STDIN_FIXTURE}"
@@ -237,7 +245,7 @@ assert_contains "${record}" "profile ${fish_profile}" "uninstall record missing 
 # shellcheck disable=SC2016
 assert_contains "${record}" 'path-expr $HOME/.local/bin' "uninstall record missing the path expression"
 assert_contains "${record}" "completions ${fish_completions}" "uninstall record missing the fish completions"
-assert_eq "completions file" "$(cat "${fish_completions}")" "${COMPLETIONS_FIXTURE}"
+assert_eq "completions file" "$(cat "${fish_completions}")" "$(installed_completions "${bash_home}")"
 assert_log_contains "${WORK}/bash-fish.log" "shell profile updated:" "installer did not report a shell profile update"
 assert_log_contains "${WORK}/bash-fish.log" "profile: ${fish_profile}" "installer did not report the fish profile"
 assert_log_contains "${WORK}/bash-fish.log" "fish completions installed:" "installer did not report fish completions"
@@ -253,8 +261,8 @@ assert_eq "fish marker count after reinstall" "$(marker_count "${fish_profile}")
 assert_eq "recorded bash profile lines" "$(grep -F -c "profile ${bash_profile}" "${record}" || true)" 1
 assert_eq "recorded fish profile lines" "$(grep -F -c "profile ${fish_profile}" "${record}" || true)" 1
 assert_eq "recorded completions lines" "$(grep -F -c "completions ${fish_completions}" "${record}" || true)" 1
-assert_eq "completions file after reinstall" "$(cat "${fish_completions}")" "${COMPLETIONS_FIXTURE}"
-assert_log_contains "${WORK}/bash-fish-again.log" "shell profile already configured:" "reinstall did not report the existing profile"
+assert_eq "completions file after reinstall" "$(cat "${fish_completions}")" "$(installed_completions "${bash_home}")"
+assert_log_contains "${WORK}/bash-fish-again.log" "fish shell profile already configured:" "reinstall did not report the existing fish profile"
 if [ "${FAILURES}" -eq 0 ]; then
   pass "reinstall does not duplicate the fish block"
 fi
@@ -281,9 +289,29 @@ assert_contains "${dir_home}/.config/fish/config.fish" "set -gx EDITOR vim" "exi
 assert_contains "${dir_home}/.config/fish/config.fish" "${FISH_SNIPPET}" "existing fish config was not given the PATH snippet"
 assert_eq "fish marker count for an existing config dir" "$(marker_count "${dir_home}/.config/fish/config.fish")" 1
 assert_contains "${dir_home}/.local/bin/.rocm-cli-path-edit" "profile ${dir_home}/.config/fish/config.fish" "uninstall record missing fish when only the config dir exists"
-assert_eq "completions from a config dir" "$(cat "${dir_home}/.config/fish/completions/rocm.fish")" "${COMPLETIONS_FIXTURE}"
+assert_eq "completions from a config dir" "$(cat "${dir_home}/.config/fish/completions/rocm.fish")" "$(installed_completions "${dir_home}")"
 if [ "${FAILURES}" -eq 0 ]; then
   pass "an existing fish config dir is configured when fish is not on PATH"
+fi
+
+# A fish config that already puts the install folder on PATH with the user's
+# own line is left alone and not recorded: uninstall must not go looking for a
+# block the installer never wrote there.
+own_home="${WORK}/homes/fish-own-line"
+own_config="${own_home}/.config/fish/config.fish"
+mkdir -p "${own_home}/.config/fish"
+# shellcheck disable=SC2016
+printf '%s\n' 'fish_add_path $HOME/.local/bin' > "${own_config}"
+install_case "${WORK}/fish-own-line.log" "${own_home}" /bin/bash "${BASE_PATH}" 1
+# shellcheck disable=SC2016
+assert_eq "fish config with the user's own PATH line" "$(cat "${own_config}")" 'fish_add_path $HOME/.local/bin'
+assert_log_contains "${WORK}/fish-own-line.log" "fish shell profile already configured:" "the user's own fish PATH line was not reported as configured"
+if grep -F -q -- "profile ${own_config}" "${own_home}/.local/bin/.rocm-cli-path-edit"; then
+  fail "a fish config holding only the user's own PATH line was recorded"
+fi
+assert_contains "${own_home}/.local/bin/.rocm-cli-path-edit" "profile ${own_home}/.bashrc" "the bash profile beside the user's own fish line was not recorded"
+if [ "${FAILURES}" -eq 0 ]; then
+  pass "a fish config with the user's own PATH line is not recorded"
 fi
 
 # Login shell is fish. The fish profile is the one the login-shell path writes,
@@ -293,7 +321,7 @@ install_case "${WORK}/fish-login.log" "${fish_home}" "${FISH_BIN}/fish" "${FISH_
 assert_contains "${fish_home}/.config/fish/config.fish" "${FISH_SNIPPET}" "fish login shell did not get the fish snippet"
 assert_eq "fish login marker count" "$(marker_count "${fish_home}/.config/fish/config.fish")" 1
 assert_absent_file "${fish_home}/.bashrc" "fish login shell also wrote a bash profile"
-assert_eq "fish login completions" "$(cat "${fish_home}/.config/fish/completions/rocm.fish")" "${COMPLETIONS_FIXTURE}"
+assert_eq "fish login completions" "$(cat "${fish_home}/.config/fish/completions/rocm.fish")" "$(installed_completions "${fish_home}")"
 assert_contains "${fish_home}/.local/bin/.rocm-cli-path-edit" "profile ${fish_home}/.config/fish/config.fish" "fish login shell was not recorded"
 # The login-shell step already reported config.fish; a second fish step would
 # report it again as "already configured".
@@ -359,7 +387,7 @@ xdg_config="${xdg_home}/xdg-config"
 mkdir -p "${xdg_config}/fish"
 install_case "${WORK}/xdg.log" "${xdg_home}" /bin/bash "${BASE_PATH}" 1 "XDG_CONFIG_HOME=${xdg_config}"
 assert_contains "${xdg_config}/fish/config.fish" "${FISH_SNIPPET}" "XDG fish config missing the fish PATH snippet"
-assert_eq "XDG completions" "$(cat "${xdg_config}/fish/completions/rocm.fish" 2>/dev/null)" "${COMPLETIONS_FIXTURE}"
+assert_eq "XDG completions" "$(cat "${xdg_config}/fish/completions/rocm.fish" 2>/dev/null)" "$(installed_completions "${xdg_home}")"
 assert_absent_file "${xdg_home}/.config/fish/config.fish" "XDG_CONFIG_HOME was ignored for the fish config"
 assert_contains "${xdg_home}/.local/bin/.rocm-cli-path-edit" "profile ${xdg_config}/fish/config.fish" "uninstall record missing the XDG fish profile"
 assert_contains "${xdg_home}/.local/bin/.rocm-cli-path-edit" "completions ${xdg_config}/fish/completions/rocm.fish" "uninstall record missing the XDG completions"

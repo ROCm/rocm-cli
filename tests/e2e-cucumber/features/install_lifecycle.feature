@@ -374,6 +374,33 @@ Feature: Release install lifecycle
     And the fish completions for the uninstalled rocm are gone
     And the record of the installer's PATH change is gone
 
+  @id:lifecycle-linux-fish-completions-not-ours-kept @lifecycle @requires-os:linux
+  Scenario: lifecycle-33 - Linux - uninstall leaves fish completions the installer did not write, and says so
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the user has replaced the fish completions with their own
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And uninstall leaves the user's own fish completions in place and says why
+
+  @id:lifecycle-linux-fish-completions-removal-failure-warns @lifecycle @requires-os:linux
+  Scenario: lifecycle-34 - Linux - fish completions that cannot be removed are a warning, and the rest of the uninstall still happens
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the fish completions folder cannot be written to
+    When the user uninstalls from the installed binary
+    Then uninstall warns that the fish completions could not be removed and still finishes
+    And the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And the record of the installer's PATH change is gone
+
   # ── Installer output: banner, hint, markers, color gating ───────────────
   # The harness captures the installer through pipes, so these prove the piped
   # (no-color) contract. The colored TTY branch is not driven here: the PTY
