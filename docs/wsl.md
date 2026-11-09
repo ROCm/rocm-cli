@@ -83,7 +83,7 @@ The equivalent manual steps, for reference or for a host where the CLI is not
 installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
 the package's maintainer scripts as root. `rocm install driver` checks the
 download against a digest pinned in the ROCm CLI source
-(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_install.rs`), which also
+(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_plan/rocdxg.rs`), which also
 catches a replaced release asset. A digest read from the release page at
 install time catches only a corrupted download. For a version listed in
 `ROCDXG_PINNED_DIGESTS`, use the pinned digest. Set `ROCDXG_VERSION` to the
@@ -181,7 +181,7 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
 | `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
 | `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
-| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but the loader has no way to find it: it is absent from the linker cache and from the `LD_LIBRARY_PATH` of the shell running the check, and is not in the same directory as a `libhsa-runtime64` |
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
@@ -264,7 +264,14 @@ collects a fixed set of data. This leaves four limits:
   distro reports.
 - **No environment checks.** The script collects no environment, so the checks
   that read one do not run: `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the
-  framework and ROCm version pairing.
+  framework and ROCm version pairing. That includes `LD_LIBRARY_PATH`: a
+  library the loader reaches only through that variable is not in the linker
+  cache, so `--distro` can still report `fix-wsl-4` for an install that
+  `rocm diagnose` inside the distro finds healthy. A library beside its runtime,
+  the layout of a TheRock tarball, is a file check, so `--distro` does see that
+  one. The finding's evidence says
+  the variable could not be checked from outside the distribution, rather than
+  claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
   that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
   not run either.
@@ -296,16 +303,42 @@ below.
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
 - `librocdxg.so` presence, resolved across every ROCm install rather than
-  assuming `/opt/rocm`
+  assuming `/opt/rocm`, and counted as present when it is in a directory on
+  `LD_LIBRARY_PATH` even if no ROCm install holds it (the `wsl_librocdxg` line
+  stays `false` for such a library; `driver_status` and the `missing` detail
+  treat it as found)
 - `librocdxg` linker-cache visibility from `ldconfig -p`
+- whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`
+  (`wsl_librocdxg_on_ld_library_path`). The loader searches that variable
+  before the cache, so an install exported there is reachable without a cache
+  entry
+- whether `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`
+  (`wsl_librocdxg_beside_runtime`). The runtime opens `librocdxg.so` by name and
+  carries `RUNPATH $ORIGIN`, so a TheRock tarball under `/opt/rocm-<version>`,
+  which keeps the two side by side and registers nothing with `ldconfig`, loads
+  with neither the cache nor the variable. `driver_status` is
+  `wsl_rocdxg_ready` when any of the three sources finds the library, and
+  `wsl_rocdxg_missing` only when none does
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
 - managed TheRock runtime count and active default runtime
 
-The driver, device-node, and group probes stay skipped. In the `--json` output,
-`has_amd_gpu` is therefore always false and `gpus` is empty on WSL, even on a
-healthy host, because both describe the bare-metal view.
+The driver, device-node, and group probes stay skipped, and `gpus` is empty on
+WSL, even on a healthy host, because it describes the bare-metal view. In the
+`--json` output, `has_amd_gpu` follows the GPU target the Windows side reports,
+the same value behind the text report's "AMD GPU detected" line, so the two
+forms agree. It says an AMD display adapter exists, not that ROCm can enumerate
+it from inside the distro: `rocm_sees_gpu` under `wsl` answers that. `has_apu`
+and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
+a listing that says whether the part is an APU or a discrete card, so
+`has_amd_gpu: true` beside both `false` is the expected WSL shape.
+
+## How `rocm serve` Finds The GPU On WSL
+
+On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there. Under the default `gpu_required` policy it asks the same question `rocm examine` answers, whether the WSL GPU path is ready (`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on top. `--gpu auto` therefore selects GPU 0 on a ready host.
+
+When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH`, or beside the runtime that opens it, counts as ready, wherever it lives: a library in a non-ROCm directory such as a source build in your home directory is counted once its directory is on `LD_LIBRARY_PATH`. A TheRock tarball is laid out the second way and needs nothing exported; for a library that sits alone, export its `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
 
 ## Install UX Recommendations
 

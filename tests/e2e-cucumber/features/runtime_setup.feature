@@ -415,3 +415,166 @@ Feature: Runtime configuration
     When the user dry-runs an SDK install for the gfx90c Vega iGPU
     Then the install is refused as having no ROCm build for that GPU
     And the refusal offers no package family to install instead
+
+  # When the machine already has its own (unmanaged) ROCm and that ROCm is newer
+  # than the SDK the install picks, the preview says why the older SDK is
+  # selected. Such a host often reports its version with a packaging build
+  # number on the end, which must not stop the CLI from reading it.
+  #
+  # Linux-only: `--format tarball` is rejected outright on Windows. Hermetic:
+  # the catalog is a loopback fixture and `--family` is named, so no GPU and no
+  # network are needed and this runs on the ordinary E2E lane.
+  #
+  # Technical details: the host install is planted under the scenario's root
+  # and exported as ROCM_PATH; its `.info/version` reads `7.20.1-33`. The
+  # catalog serves one release tarball, ROCm 7.10.0, for `gfx120X-all`.
+  @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
+  Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a newer version with a packaging build number
+    When the user previews a tarball SDK install
+    Then the preview explains that the host's newer ROCm is passed over for the selected SDK
+
+  # A host version the CLI cannot read is "can't tell", and "can't tell" is
+  # never "newer". The regression this pins: a suffix that merely starts with a
+  # digit was dropped whole, so the host was read as a plain, newer release and
+  # the preview claimed so. runtime-20 is what makes the absence below
+  # evidence: it shows the same preview printing the note when the host
+  # version is readable and newer.
+  #
+  # Technical details: `.info/version` reads `7.20.1-33rc1`, which with its
+  # suffix dropped would be `7.20.1`, newer than the catalog's 7.10.0.
+  @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
+  Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
+    Given a release tarball catalog whose newest ROCm is older than the host's
+    And a machine whose own ROCm install reports a version with an unreadable build suffix
+    When the user previews a tarball SDK install
+    Then the preview selects the newest SDK in the catalog
+    And the preview does not claim the host's ROCm is newer
+
+  # The `tool_call:` lines `rocm <request>` prints are the command the operator
+  # reviews before re-running with `--yes`, and the one that then runs. Their
+  # quoter used to wrap a value only when it held whitespace, so a folder whose
+  # name carries a lone `'` rendered bare and left a line no shell can parse —
+  # the operator was shown something that denotes no argv at all. The
+  # assertion reads each line back through a POSIX word-splitter and demands
+  # `--prefix` followed by exactly the requested folder: what the line has to
+  # mean, rather than one spelling of it. (A space alone does not distinguish
+  # the two quoters on this surface — the old one wrapped whitespace — which is
+  # why the folder name carries a quote.)
+  #
+  # The argv the dispatched install receives is not observable here: the Given
+  # stops it on its first step, as in runtime-15, and for the same reasons —
+  # offline, instant, writes nothing, identical on every lane. The executed
+  # `tool_call:` line is the closest observable account of it.
+  @id:runtime-freeform-prefix-with-quote-is-one-argument
+  Scenario: runtime-22 - A natural-language install into a folder named with a quote keeps the folder one argument
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install into a folder whose name has a quote
+    Then the request plan names that folder as a single argument
+    And the executed command names that folder as a single argument
+
+  # A preview is a promise that nothing on the machine changes. On a host with
+  # no usable Python the install needs one, and the preview used to go and get
+  # it: it downloaded a managed `uv`, had `uv` install Python, and saved that
+  # Python's path in the configuration, all before printing a plan. The assistant's
+  # `install_sdk_dry_run` tool reaches the same code. Now the preview reports that
+  # a managed Python would be prepared and prepares nothing.
+  #
+  # The preview's own note says it prepared nothing, so the Then checks that note
+  # and the state together. The evidence is the recording `uv`: the CLI reaches
+  # it only by going on to prepare a Python, so its log not existing means no
+  # preparation was attempted, with no network needed. Beside it the Then checks
+  # that no managed tools folder and no configuration exist; a tool archive in the
+  # scenario's cache is checked too, but only as a backstop, since the stand-in
+  # `uv` is returned before any download could start. The first Then shows the
+  # preview still got as far as a plan, so the absences are not just a command
+  # that stopped early.
+  #
+  # The guarantee is the canonical layout's. A preview of a ROCm 10 or newer wheel
+  # resolves its package versions with `uv pip compile` and so can fetch the
+  # managed `uv` (creating the `tools` folder) on a clean host, though it still
+  # prepares no Python; this scenario is not that case and does not claim it.
+  #
+  # Linux only: the empty-`PATH` host is built for the Linux search order. The
+  # decision itself is unit-tested against an injected resolver environment on
+  # every platform, the Windows CI job included
+  # (`a_dry_run_decides_from_an_injected_environment_on_every_platform` in
+  # `apps/rocm/src/therock/python.rs`, which needs no interpreter); the Windows
+  # search order and a Windows run of this preview are not covered by a test.
+  #
+  # Technical details: the fixture serves one canonical release index, `PATH` is a
+  # single empty folder, `ROCM_CLI_UV_BINARY` names a stand-in that appends its
+  # arguments to a log file, and `ROCM_CLI_CACHE_DIR` is a folder of this
+  # scenario's own, so a tool archive left in the cache the suite shares across
+  # scenarios and runs cannot trip the backstop check.
+  @id:runtime-install-preview-prepares-no-python @requires-os:linux
+  Scenario: runtime-23 - Previewing an SDK install on a host with no usable Python prepares no Python
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    Then the preview says a real install would prepare a managed Python
+    And the preview prepared no Python, as it says
+
+  # A preview must not announce a plan the install would refuse.
+  # `ROCM_CLI_MANAGED_PYTHON_VERSION` can name a Python other than the one the
+  # wheels need (3.12 for this layout); a real install prepares it, finds its
+  # wheel tag is wrong and refuses. The preview refuses by the same rule instead
+  # of saying it would prepare 3.13, and still prepares nothing on the way to
+  # refusing, which the last Then checks against the folders, as runtime-23 does.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. The tag rule is
+  # unit-tested on every platform
+  # (`a_managed_python_version_is_read_as_the_wheel_tag_it_reports` in
+  # `apps/rocm/src/therock/python.rs`).
+  @id:runtime-install-preview-refuses-unusable-managed-python @requires-os:linux
+  Scenario: runtime-24 - Previewing an SDK install is refused when the install would refuse the managed Python version
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the managed Python version is overridden to 3.13
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    Then the install fails
+    And the preview is refused because the install would refuse that Python
+
+  # The sibling of runtime-24 for the policy refusal. A preview must not say what
+  # a real install would do on a path where it would do nothing. Here the host's
+  # only Python cannot serve the install and managed Python is switched off with
+  # `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`, so a real install refuses; the
+  # preview used to print that it would use ROCm CLI's managed Python first. It
+  # now prints the finding about the PATH Python, neutrally, and then the same
+  # refusal as the install, with no line predicting anything. The state is checked
+  # as in runtime-23. Every other combination of PATH Python, saved Python,
+  # bootstrap policy and version override is pinned by the unit test
+  # `a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
+  # `apps/rocm/src/therock/python.rs`, which asserts each row's complete output.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23, with `fake-python`
+  # planted on it as the unusable interpreter.
+  @id:runtime-install-preview-refuses-disabled-managed-python @requires-os:linux
+  Scenario: runtime-25 - Previewing an SDK install is refused when managed Python is disabled and the host's Python is unusable
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And the only Python on the host's path is not usable
+    And managed Python bootstrap is disabled
+    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    Then the install fails
+    And the preview is refused because managed Python is disabled, without a promise
+
+  # `rocm runtimes adopt --python` takes the environment folder from where the
+  # interpreter sits: the folder that holds its `bin` (or `Scripts`) folder. An
+  # interpreter anywhere else has no environment folder to infer, and a guess (the
+  # interpreter's grandparent, which is what the command used to adopt) would
+  # register a folder that is not an environment as a runtime. The command refuses
+  # instead and names the flag that supplies the folder; nothing is saved.
+  #
+  # Linux-only: the stand-in interpreter is a POSIX shell script. The "adopts with
+  # --root" half is covered by the unit test
+  # `adopt_request_without_an_inferred_root_asks_for_root`, which shows an explicit
+  # root clears the refusal; adopting for real needs a genuine ROCm SDK environment.
+  @id:runtime-adopt-outside-a-venv-asks-for-root @requires-os:linux
+  Scenario: runtime-26 - Adopting a Python that sits outside any environment's bin folder asks for --root
+    Given a Python interpreter that sits outside any environment's bin folder
+    When the user adopts that interpreter without naming an environment folder
+    Then the adoption is refused
+    And the refusal asks for the environment folder with --root
+    And no runtime is registered

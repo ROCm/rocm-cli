@@ -2,12 +2,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm serve` command handler and engine-recipe overrides.
+//! `rocm serve` command handler and the AIM pre-flight that runs inside it.
+//!
+//! The engine-recipe overrides `serve()` applies to the launch hint
+//! (`--tool-call-parser`, `--gpu-memory-utilization`, generation defaults and
+//! `--engine-env`) live in `serve_recipe.rs`; this file imports them by name.
 //!
 //! Originally a mechanical relocation from `main.rs` with no behavior change —
 //! the `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
-//! re-imported via `use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};`
-//! — `select_serve_engine` rides along for `assess_model_for_host`, not dispatch).
+//! re-imported via `use crate::serve_cmd::{ServeArgs, serve};`; `model_fit.rs`'s
+//! `assess_model_for_host` calls `select_serve_engine` directly).
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
@@ -17,8 +21,10 @@
 //! bail. Read the comment at the pre-gate, not this paragraph, for what the
 //! serve path does today.
 //!
-//! `collect_serve_notes` stays in `main.rs` (no entanglement; a later pass
-//! can relocate it). `detect_gpu_count`, `gpu_vram_usage`,
+//! `collect_serve_notes`, the GPU/device warnings folded into the interactive
+//! summary, was relocated here from `main.rs` verbatim, with its two tests and
+//! their `vram`/`host_gpu` fixtures; `serve` is its only production caller.
+//! `detect_gpu_count`, `gpu_vram_usage`,
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
@@ -34,8 +40,6 @@
 //! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
-use std::fmt::Write as _;
-
 use anyhow::{Context as _, Result, bail};
 use rocm_core::{
     AppPaths, GfxSupport, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
@@ -44,32 +48,42 @@ use rocm_core::{
     resolve_model_recipe,
 };
 use rocm_engine_protocol::{
-    DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod, EngineRecipeEndpointHint,
-    EngineRecipeHint, EngineRecipeUnsupportedCombinationHint, GpuSelection, ResolveModelRequest,
+    DevicePolicy, EngineMethod, EngineRecipeHint, GpuSelection, ResolveModelRequest,
     ResolveModelResponse,
 };
 
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
+use crate::engine_install_env::engine_manages_own_runtime;
 use crate::engine_ipc::engine_request;
 use crate::engine_runtime_select::{
     EngineSelection, resolve_engine_selection, validate_engine_selection_runtime,
 };
-use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
+use crate::engines_cmd::ensure_self_managed_engine_ready;
 use crate::gpu_policy::{
-    detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
+    GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage, parse_device_policy,
+    parse_gpu_selection, pinned_index_bound, select_gpu_indices_under_launch_lock,
+    serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_port;
+use crate::serve_recipe::{
+    ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
+    engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
+    engine_recipe_with_gpu_memory_utilization_override, engine_recipe_with_tool_call_override,
+    parse_gpu_memory_utilization, protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
+};
 use crate::serve_summary;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_launch::{
-    drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
-    ensure_public_bind_engine_supported, managed_service_reuse_refusal, no_usable_gpu_refusal,
-    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
-    validate_bind_host,
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
+    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
+    wait_begin_client_config,
 };
 use crate::{
-    GatedEngineAction, cli_progress, collect_serve_notes, device_policy_name,
+    GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
     ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
 };
 
@@ -215,28 +229,6 @@ fn serve_model_ref_for_engine(
 
 fn serve_engine_selection_line(selection: &ServeEngineSelection) -> String {
     format!("  engine_selection: {}", selection.source)
-}
-
-fn render_serve_engine_recipe_lines(engine_recipe: &EngineRecipeHint) -> String {
-    let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "  engine_recipe_contract: {}",
-        engine_recipe.contract_version
-    );
-    let _ = writeln!(
-        output,
-        "  engine_recipe_policy: selected-engine required_flags are applied at launch; parser/endpoint metadata is forwarded to the adapter"
-    );
-    let _ = writeln!(output, "  engine_recipe_engine: {}", engine_recipe.engine);
-    if !engine_recipe.required_flags.is_empty() {
-        let _ = writeln!(
-            output,
-            "  engine_recipe_required_flags: {}",
-            engine_recipe.required_flags.join(" ")
-        );
-    }
-    output
 }
 
 /// For AIM, refuses a GPU the catalog has no profile for and pins the catalog's
@@ -417,391 +409,6 @@ fn aim_board_note(
     ))
 }
 
-fn protocol_engine_recipe_hint(
-    recipe: &ModelRecipeRecord,
-    engine: &str,
-) -> Option<EngineRecipeHint> {
-    recipe
-        .engine_recipes
-        .iter()
-        .find(|engine_recipe| engine_recipe.engine == engine)
-        .map(|engine_recipe| EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: engine_recipe.engine.clone(),
-            required_flags: engine_recipe.required_flags.clone(),
-            parser_settings: engine_recipe.parser_settings.clone(),
-            extra_env: engine_recipe.extra_env.clone(),
-            preferred_endpoint: engine_recipe.preferred_endpoint.as_ref().map(|endpoint| {
-                EngineRecipeEndpointHint {
-                    endpoint_mode: endpoint.endpoint_mode.clone(),
-                    settings: endpoint.settings.clone(),
-                }
-            }),
-            unsupported_combinations: engine_recipe
-                .unsupported_combinations
-                .iter()
-                .map(|combination| EngineRecipeUnsupportedCombinationHint {
-                    combination: combination.combination.clone(),
-                    reason: combination.reason.clone(),
-                })
-                .collect(),
-            notes: engine_recipe.notes.clone(),
-        })
-}
-
-/// Applies an explicit `--tool-call-parser` override to a vLLM engine recipe hint.
-///
-/// The TUI chat tab always attaches tool definitions to non-streaming chat
-/// requests (`tool_choice: "auto"`). vLLM rejects those with HTTP 400 unless it was
-/// started with `--enable-auto-tool-choice` *and* a matching `--tool-call-parser`.
-/// The correct parser is model-specific and vLLM does not auto-detect it, so it is
-/// never guessed from the model ref: it comes either from authored catalog recipe
-/// metadata (already carried in `required_flags`) or from the explicit
-/// `--tool-call-parser` serve flag, which this applies.
-///
-/// Only vLLM is affected. When an override is supplied it wins over any
-/// recipe-authored parser (a single `--tool-call-parser`, no duplication) and a
-/// minimal hint is synthesized when none exists (arbitrary HF repos, or a catalog
-/// model forced onto a non-preferred engine). With no override the hint passes
-/// through unchanged.
-fn engine_recipe_with_tool_call_override(
-    engine: &str,
-    hint: Option<EngineRecipeHint>,
-    tool_call_parser: Option<&str>,
-) -> Option<EngineRecipeHint> {
-    if !engine.eq_ignore_ascii_case("vllm") {
-        return hint;
-    }
-    let Some(parser) = tool_call_parser
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return hint;
-    };
-    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
-        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-        engine: engine.to_owned(),
-        ..EngineRecipeHint::default()
-    });
-    set_vllm_tool_call_parser(&mut hint.required_flags, parser);
-    Some(hint)
-}
-
-/// Sampling defaults a `rocm serve` invocation can push into a vLLM launch.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct ServeGenerationDefaults {
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    max_tokens: Option<u32>,
-}
-
-impl ServeGenerationDefaults {
-    const fn is_empty(&self) -> bool {
-        self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none()
-    }
-}
-
-/// Applies `rocm serve` generation defaults (`--temperature`/`--top-p`/`--max-tokens`)
-/// to the selected engine's launch recipe.
-///
-/// vLLM `serve` has no raw `--temperature`/`--top-p` flags; `--override-generation-config`
-/// is the supported way to set server-wide sampling defaults, so `--max-tokens` is
-/// mapped onto vLLM's `max_new_tokens` output cap. Only supplied values are written,
-/// and any values already carried by an authored recipe's
-/// `--override-generation-config` are preserved (the CLI-supplied keys win).
-///
-/// Lemonade's llama.cpp backend accepts the equivalent `--temperature`, `--top-p`,
-/// and `--n-predict` launch flags. A minimal hint is synthesized when none exists.
-/// With no defaults supplied the hint passes through unchanged.
-fn engine_recipe_with_generation_defaults(
-    engine: &str,
-    hint: Option<EngineRecipeHint>,
-    defaults: ServeGenerationDefaults,
-) -> Result<Option<EngineRecipeHint>> {
-    if defaults.is_empty() {
-        return Ok(hint);
-    }
-    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
-        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-        engine: engine.to_owned(),
-        ..EngineRecipeHint::default()
-    });
-    if engine.eq_ignore_ascii_case("vllm") {
-        let mut overrides = serde_json::Map::new();
-        if let Some(temperature) = defaults.temperature {
-            overrides.insert("temperature".to_owned(), serde_json::json!(temperature));
-        }
-        if let Some(top_p) = defaults.top_p {
-            overrides.insert("top_p".to_owned(), serde_json::json!(top_p));
-        }
-        if let Some(max_tokens) = defaults.max_tokens {
-            overrides.insert("max_new_tokens".to_owned(), serde_json::json!(max_tokens));
-        }
-        set_vllm_override_generation_config(&mut hint.required_flags, &overrides);
-    } else if engine.eq_ignore_ascii_case("lemonade") {
-        set_lemonade_generation_defaults(&mut hint.required_flags, defaults);
-    } else {
-        bail!(
-            "generation defaults are not supported by engine `{engine}`; omit --temperature/--top-p/--max-tokens or select vllm/lemonade"
-        );
-    }
-    Ok(Some(hint))
-}
-
-fn set_lemonade_generation_defaults(flags: &mut Vec<String>, defaults: ServeGenerationDefaults) {
-    // Only touch a flag pair when the caller actually supplied that control —
-    // an unset field must leave any authored recipe value in place rather than
-    // deleting it, mirroring the vLLM merge semantics in
-    // `set_vllm_override_generation_config`.
-    for (name, value) in [
-        (
-            "--temperature",
-            defaults.temperature.map(|value| value.to_string()),
-        ),
-        ("--top-p", defaults.top_p.map(|value| value.to_string())),
-        (
-            "--n-predict",
-            defaults.max_tokens.map(|value| value.to_string()),
-        ),
-    ] {
-        let Some(value) = value else {
-            continue;
-        };
-        let mut rewritten = Vec::with_capacity(flags.len() + 2);
-        let mut skip_value = false;
-        for flag in std::mem::take(flags) {
-            if skip_value {
-                skip_value = false;
-                continue;
-            }
-            if flag == name {
-                skip_value = true;
-            } else {
-                rewritten.push(flag);
-            }
-        }
-        rewritten.extend([name.to_owned(), value]);
-        *flags = rewritten;
-    }
-}
-
-/// Rewrites `flags` so vLLM's `--override-generation-config` carries exactly one
-/// merged JSON object: any existing `--override-generation-config <value>` pair is
-/// removed, its keys are used as a base, and `overrides` are layered on top (CLI
-/// values win). Emits a single flag pair with the merged, stably-ordered config.
-fn set_vllm_override_generation_config(
-    flags: &mut Vec<String>,
-    overrides: &serde_json::Map<String, serde_json::Value>,
-) {
-    let existing = std::mem::take(flags);
-    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
-    let mut merged = serde_json::Map::new();
-    let mut take_value = false;
-    for flag in existing {
-        if take_value {
-            take_value = false;
-            if let Ok(serde_json::Value::Object(existing_config)) =
-                serde_json::from_str::<serde_json::Value>(&flag)
-            {
-                for (key, value) in existing_config {
-                    merged.insert(key, value);
-                }
-            } else {
-                eprintln!(
-                    "warning: existing --override-generation-config value is not valid JSON; discarding it"
-                );
-            }
-            continue;
-        }
-        if flag == "--override-generation-config" {
-            take_value = true;
-            continue;
-        }
-        rewritten.push(flag);
-    }
-    for (key, value) in overrides {
-        merged.insert(key.clone(), value.clone());
-    }
-    rewritten.push("--override-generation-config".to_owned());
-    rewritten.push(serde_json::Value::Object(merged).to_string());
-    *flags = rewritten;
-}
-
-/// Rewrites `flags` so vLLM tool calling uses exactly `parser`: drops any existing
-/// `--tool-call-parser <value>` pair, ensures `--enable-auto-tool-choice` is
-/// present, then appends the new parser flag.
-fn set_vllm_tool_call_parser(flags: &mut Vec<String>, parser: &str) {
-    let existing = std::mem::take(flags);
-    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 3);
-    let mut skip_value = false;
-    for flag in existing {
-        if skip_value {
-            // Drop the value that followed the removed `--tool-call-parser`.
-            skip_value = false;
-            continue;
-        }
-        if flag == "--tool-call-parser" {
-            skip_value = true;
-            continue;
-        }
-        rewritten.push(flag);
-    }
-    if !rewritten
-        .iter()
-        .any(|flag| flag == "--enable-auto-tool-choice")
-    {
-        rewritten.push("--enable-auto-tool-choice".to_owned());
-    }
-    rewritten.push("--tool-call-parser".to_owned());
-    rewritten.push(parser.to_owned());
-    *flags = rewritten;
-}
-
-/// Applies an explicit `--gpu-memory-utilization` to the vLLM engine recipe.
-///
-/// rocm-cli intentionally ships no default for this: vLLM sizes its KV cache as
-/// a fraction of the device's TOTAL VRAM, and any number rocm-cli picked would
-/// silently override upstream's and drift from it. So the flag is passed through
-/// only when the user asked for one, via `required_flags` (the same channel the
-/// `--tool-call-parser` override uses — no protocol change needed).
-///
-/// Only vLLM is affected. An explicit value wins over any recipe-authored one,
-/// and a minimal hint is synthesized when none exists.
-fn engine_recipe_with_gpu_memory_utilization_override(
-    engine: &str,
-    hint: Option<EngineRecipeHint>,
-    gpu_memory_utilization: Option<f64>,
-) -> Option<EngineRecipeHint> {
-    if !engine.eq_ignore_ascii_case("vllm") {
-        return hint;
-    }
-    let Some(value) = gpu_memory_utilization else {
-        return hint;
-    };
-    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
-        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-        engine: engine.to_owned(),
-        ..EngineRecipeHint::default()
-    });
-    set_vllm_gpu_memory_utilization(&mut hint.required_flags, value);
-    Some(hint)
-}
-
-/// Rewrites `flags` so vLLM receives exactly one `--gpu-memory-utilization
-/// <value>` pair: drops any existing pair, then appends the new one.
-fn set_vllm_gpu_memory_utilization(flags: &mut Vec<String>, value: f64) {
-    let existing = std::mem::take(flags);
-    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
-    let mut skip_value = false;
-    for flag in existing {
-        if skip_value {
-            // Drop the value that followed the removed flag.
-            skip_value = false;
-            continue;
-        }
-        if flag == "--gpu-memory-utilization" {
-            skip_value = true;
-            continue;
-        }
-        rewritten.push(flag);
-    }
-    rewritten.push("--gpu-memory-utilization".to_owned());
-    rewritten.push(format!("{value}"));
-    *flags = rewritten;
-}
-
-/// Parse `rocm serve --gpu-memory-utilization`. Unlike the env-var overrides
-/// elsewhere in this file, an explicit CLI value is never silently ignored: a
-/// user who types a bad fraction is told so.
-fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
-    let Some(raw) = value else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let parsed: f64 = trimmed.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "--gpu-memory-utilization expects a fraction greater than 0 and at most 1 \
-             (e.g. 0.5); got `{trimmed}`"
-        )
-    })?;
-    if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
-        bail!(
-            "--gpu-memory-utilization must be greater than 0 and at most 1 (a fraction of \
-             the GPU's TOTAL VRAM, e.g. 0.5); got `{trimmed}`"
-        );
-    }
-    Ok(Some(parsed))
-}
-
-/// Env vars the engine sets itself, which `--engine-env` may not override.
-const RESERVED_ENGINE_ENV_KEYS: [&str; 2] = ["HIP_VISIBLE_DEVICES", "VLLM_API_KEY"];
-
-/// Applies `--engine-env` overrides to the engine recipe's `extra_env` map, for
-/// the one engine that consumes it (`aim`, e.g. `AIM_PROFILE_ID`): `KEY=VALUE`
-/// sets a value, and a bare `KEY` forwards `KEY` from the engine process's own
-/// environment so a secret such as `HF_TOKEN` never lands in argv or the
-/// service record (recorded as an empty value, meaning "forward"). Other engines
-/// ignore the flag (see [`engine_env_ignored_note`]) and get their hint back
-/// unchanged. A minimal hint is synthesized when none exists.
-fn engine_recipe_with_extra_env(
-    engine: &str,
-    hint: Option<EngineRecipeHint>,
-    engine_env: &[String],
-) -> Result<Option<EngineRecipeHint>> {
-    if engine_env.is_empty() || !engine.eq_ignore_ascii_case("aim") {
-        return Ok(hint);
-    }
-    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
-        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-        engine: engine.to_owned(),
-        ..EngineRecipeHint::default()
-    });
-    for entry in engine_env {
-        let (key, value) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
-        // A bare `KEY` forwards it from the environment; the hint cannot carry an
-        // explicitly empty value, so `KEY=` would silently mean the same thing.
-        if entry.contains('=') && value.is_empty() {
-            bail!(
-                "--engine-env `{entry}` sets an empty value; pass `{key}` alone to forward it \
-                 from your environment, or `{key}=VALUE`"
-            );
-        }
-        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            bail!(
-                "--engine-env expects `KEY=VALUE` (or a bare `KEY` to forward it from the \
-                 environment) with a non-empty name of letters, digits and `_`; got `{entry}`"
-            );
-        }
-        if RESERVED_ENGINE_ENV_KEYS.contains(&key) {
-            bail!("--engine-env cannot set `{key}`; rocm-cli manages it for the engine");
-        }
-        if value.contains(['\n', '\r']) {
-            bail!("--engine-env value for `{key}` cannot contain newlines");
-        }
-        hint.extra_env.insert(key.to_owned(), value.to_owned());
-    }
-    Ok(Some(hint))
-}
-
-/// `--engine-env` note shown when the flag was passed but the selected engine
-/// never consumes `EngineRecipeHint::extra_env` (only `aim` does; see
-/// `engine_recipe_with_extra_env`), so the override would otherwise be silently
-/// dropped with no indication to the user.
-fn engine_env_ignored_note(engine: &str, engine_env: &[String]) -> Option<String> {
-    (!engine_env.is_empty() && !engine.eq_ignore_ascii_case("aim")).then(|| {
-        format!("--engine-env applies only to engine 'aim'; ignored for engine '{engine}'")
-    })
-}
-
-/// Whether the resolved engine recipe launches vLLM with tool calling enabled.
-fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
-    hint.is_some_and(|hint| {
-        hint.required_flags
-            .iter()
-            .any(|flag| flag == "--enable-auto-tool-choice")
-    })
-}
-
 /// Whether the reuse pre-gate may run its engine/runtime probe.
 ///
 /// The pre-gate exists for exactly one purpose: to answer the no-usable-GPU
@@ -875,9 +482,10 @@ pub(crate) struct ServeArgs {
     pub(crate) runtime_id: Option<String>,
     pub(crate) env_id: Option<String>,
     pub(crate) host: String,
-    pub(crate) port: u16,
+    pub(crate) port: Option<u16>,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
+    pub(crate) wait: bool,
     pub(crate) verbose: bool,
     pub(crate) no_smoke_test: bool,
     pub(crate) allow_public_bind: bool,
@@ -903,6 +511,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         port,
         foreground,
         managed,
+        wait,
         verbose,
         no_smoke_test,
         allow_public_bind,
@@ -915,8 +524,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         api_key,
         engine_env,
     } = args;
+    let port_request = serve_port::PortRequest::from_flag(port);
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    serve_port::validate_port_request(&host, port_request)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
     // (or generate) the endpoint key now so every downstream path — engine spawn,
     // readiness probe, smoke test, and the client-config we print — shares one value.
@@ -1252,10 +863,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // launched); permissive when availability cannot be probed on this platform
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
-    if !cpu_only && !scripted_backend_failure && !reuse_existing && host_has_no_usable_gpu {
+    if !cpu_only
+        && !scripted_backend_failure
+        && !e2e_simulate_oom_launch()
+        && !reuse_existing
+        && host_has_no_usable_gpu
+    {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
     // The Docker probe comes after every refusal that needs no daemon (the AIM
@@ -1273,14 +891,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
-    // Whether *any* visibility mask is active. The visible set alone cannot say:
-    // with no mask it is just `0..present`, indistinguishable from a HIP mask
-    // that happens to list the low ordinals. `validate_pinned_gpu_index` uses
-    // this only to word its rejection — "under the active visibility mask" when a
-    // mask is set, "not present on this host" when none is — so an out-of-range
-    // `--gpu` on an unmasked host is not blamed on a mask the user never set.
-    let visibility_mask_active =
-        rocr_visible_devices_set || std::env::var_os("HIP_VISIBLE_DEVICES").is_some();
+    // Which visibility variables name a mask that acts on this platform, or
+    // `None` when none does. The visible set alone cannot say: with no mask it
+    // is just `0..present`, indistinguishable from a HIP mask that happens to
+    // list the low ordinals. `validate_pinned_gpu_index` uses this only to word
+    // its rejection — "under the active visibility mask" when a mask is set,
+    // "not present on this host" when none is — so an out-of-range `--gpu` on an
+    // unmasked host is not blamed on a mask the user never set. Native Windows
+    // HIP has no ROCr layer, so `ROCR_VISIBLE_DEVICES` is no mask there.
+    let visibility_mask = active_visibility_mask(
+        rocr_visible_devices_set,
+        std::env::var_os("HIP_VISIBLE_DEVICES").is_some(),
+        rocm_core::runtime_is_windows(),
+    );
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
     // Validate an explicit `--gpu <index>` up front — before engine/runtime
     // resolution — so an out-of-range or masked-out ordinal produces a
@@ -1295,13 +918,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // The single exception is the reuse exemption, which by construction only
     // runs on a host the bail above already applies to — where `visible_gpu_indices`
     // is `Some([])` and so *every* `--gpu <index>` is out of range anyway.
+    //
+    // On native Windows `visible_gpu_indices` is always `None` and amd-smi is
+    // usually missing or unusable, so the index had nothing to be checked
+    // against and `--gpu 7` on a one-GPU machine was accepted (ROCMAI-824).
+    // There the AMD display adapters Windows lists bound the index instead.
+    // That listing is only queried here, for an explicit index: it can count an
+    // adapter HIP does not support, so it may refuse an index but must not pick
+    // one for `--gpu auto`.
     let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
-        Some(validate_pinned_gpu_index(
+        let detected = detect_gpu_count();
+        let bound = pinned_index_bound(
+            visible_gpu_indices.clone(),
+            detected,
+            visibility_mask.is_some(),
+            rocm_core::windows_amd_gpu_listing,
+        );
+        let pinned = validate_pinned_gpu_index(
             *index,
-            detect_gpu_count(),
-            visible_gpu_indices.as_deref(),
-            visibility_mask_active,
-        )?)
+            bound.count,
+            bound.visible.as_deref(),
+            visibility_mask,
+            bound.mask_unresolved,
+        )?;
+        write_unchecked_index_warning(&mut std::io::stderr(), &pinned).ok();
+        Some(pinned.indices)
     } else {
         None
     };
@@ -1402,7 +1043,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
-        println!("  port: {port}");
+        match port {
+            Some(port) => println!("  port: {port}"),
+            None => println!("  {}", serve_port::AUTOMATIC_PORT_DISCLOSURE),
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -1479,16 +1123,22 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let mut spinner =
-            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
-        spinner.tick();
-        let report = start_managed_service(
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
+            "Starting {model} on {selected_engine}…"
+        )));
+        spinner.borrow_mut().tick();
+        // The key is shown when the wait begins, since Ctrl-C or a failed wait
+        // would otherwise leave a running authenticated server whose key was never
+        // printed. It is then not repeated in the summary below.
+        let key_shown_before_wait = std::cell::Cell::new(false);
+        let launched = start_managed_service(
+            &paths,
             &selected_engine,
             &service_id,
             &model,
             &resolve,
             &host,
-            port,
+            port_request,
             &resolve.device_policy,
             &gpu_indices,
             managed_runtime_id.as_deref(),
@@ -1498,9 +1148,62 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             gpu_refusal_waived_for_reuse,
-            &mut |_elapsed| spinner.tick(),
-        )?;
-        ensure_background_helper_running_quiet(summary_mode)?;
+            wait,
+            // Named with the id the launch resolved to: an already-starting
+            // server keeps its own, not the one generated above. The spinner
+            // has no id on it, and a non-TTY stderr gets no spinner at all.
+            &mut |waiting_on, waiting_port| {
+                spinner.borrow_mut().clear();
+                eprintln!(
+                    "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
+                     Follow: rocm logs --service {waiting_on} --follow"
+                );
+                if let Some(config) = wait_begin_client_config(
+                    waiting_on,
+                    &service_id,
+                    &host,
+                    waiting_port,
+                    endpoint_auth.as_deref(),
+                ) {
+                    key_shown_before_wait.set(true);
+                    // Same intentional one-time key display as
+                    // `print_managed_launch_plain`; see its rationale.
+                    // codeql[rust/cleartext-logging]
+                    print!("{config}");
+                }
+            },
+            &mut |_elapsed| spinner.borrow_mut().tick(),
+        );
+        // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
+        let report = match launched {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.borrow_mut().clear();
+                return Err(error);
+            }
+        };
+        let mut spinner = spinner.into_inner();
+        // Not when the launch was fabricated. `simulate_oom_managed_launch`
+        // writes a `starting` record for a process that never existed, so the
+        // helper would be left watching a pid that will never appear, with
+        // nothing in the scenario's teardown to stop it: observed as `rocm
+        // daemon` processes outliving their e2e checkout by days, still
+        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // supervising a real spawned server, and there is none here.
+        //
+        // That — not ordering — is the whole justification. This suppression
+        // runs *before* the OOM note is computed in the `summary_mode` block
+        // below, so the previous claim here, that the note "is computed before
+        // it would have run", was backwards and could not have excused it.
+        // serve-40's `no background automation daemon was left behind` is what
+        // holds the branch: deleting it left the scenario green with a `rocm
+        // daemon` still running.
+        //
+        // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
+        // the test-only feature, so this branch folds away in shipped builds.
+        if !e2e_simulate_oom_launch() {
+            ensure_background_helper_running_quiet(summary_mode)?;
+        }
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1514,7 +1217,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         }
         // Safe to move `endpoint_auth` here: this branch always returns, so the
         // fall-through (attached) path below never observes it moved.
-        let launched_key = if report.already_running {
+        let launched_key = if report.already_running || key_shown_before_wait.get() {
             None
         } else {
             endpoint_auth
@@ -1547,6 +1250,33 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine_serves_vllm,
             );
             notes.extend(engine_env_notes.iter().cloned());
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which ends at `readiness: {status}`
+            // and carries no *post-launch* note. It is not noteless: the
+            // `!summary_mode` branch above still prints the pre-launch planning
+            // lines, low-VRAM `note:` included, so the asymmetry is precisely
+            // that the OOM confirmation and the `rocm diagnose --symptom`
+            // command are missing — not that the path prints nothing. That path
+            // is machine-readable by design and is not the place to grow prose,
+            // but it does mean the same failed launch is explained in one
+            // invocation and not the other.
+            // The engine *name*, not `engine_serves_vllm`: the note's gate is
+            // derived inside `append_oom_serve_note` from the value it is about,
+            // because a boolean here was a call-site seam no test could hold.
+            let notes = serve_summary::append_oom_serve_note(
+                notes,
+                &selected_engine,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
+            );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -1571,12 +1301,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     run_attached_service(
+        &paths,
         &selected_engine,
         &service_id,
         &model,
         &resolve,
         &host,
-        port,
+        port_request,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
@@ -1584,13 +1315,68 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         launch_lock,
         require_api_key,
         gpu_refusal_waived_for_reuse,
+        |paths, service_id| {
+            run_internal_sandbox_tool(
+                paths,
+                SandboxToolArg::StopServer,
+                Some(service_id.to_owned()),
+                true,
+            )
+        },
     )
+}
+
+/// GPU/device warnings folded into the interactive deployment summary. Mirrors the
+/// inline warnings printed in the plain serve plan, in the same order.
+#[allow(clippy::too_many_arguments)]
+fn collect_serve_notes(
+    cpu_only: bool,
+    gpu_selection: &GpuSelection,
+    rocr_visible_devices_set: bool,
+    gpu_indices: &[u32],
+    gpu_vram: Option<&[GpuVramUsage]>,
+    engine_flag_note: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    engine_is_vllm: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    // An engine-scoped flag the selected engine cannot honor must be reported here
+    // too: the summary path is what an interactive `rocm serve` actually prints, so
+    // a note only emitted on the plan path would never reach that user.
+    if let Some(note) = engine_flag_note {
+        notes.push(note.to_owned());
+    }
+    if cpu_only {
+        if matches!(gpu_selection, GpuSelection::Index(_)) {
+            notes.push(
+                "--gpu was ignored because --device cpu_only runs the model on CPU".to_owned(),
+            );
+        }
+    } else {
+        if rocr_visible_devices_set {
+            notes.push(
+                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
+                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
+                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
+                 ROCR_VISIBLE_DEVICES."
+                    .to_owned(),
+            );
+        }
+        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
+        {
+            notes.push(warning);
+            // vLLM's total-VRAM reservation is what turns a busy card into an OOM;
+            // pair the generic warning with the concrete knob that avoids it.
+            if engine_is_vllm {
+                notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
+            }
+        }
+    }
+    notes
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use rocm_core::resolve_builtin_model_recipe;
 
@@ -2233,617 +2019,130 @@ mod tests {
     }
 
     #[test]
-    fn protocol_engine_recipe_hint_maps_selected_engine_metadata() {
-        let mut recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
-        recipe.engine_recipes = vec![
-            rocm_core::ModelRecipeEngineRecord {
-                engine: "vllm".to_owned(),
-                required_flags: vec!["--enable-auto-tool-choice".to_owned()],
-                parser_settings: BTreeMap::from([(
-                    "reasoning_parser".to_owned(),
-                    "qwen3".to_owned(),
-                )]),
-                preferred_endpoint: Some(rocm_core::ModelRecipeEndpointRecord {
-                    endpoint_mode: "openai".to_owned(),
-                    settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
-                }),
-                unsupported_combinations: vec![
-                    rocm_core::ModelRecipeUnsupportedCombinationRecord {
-                        combination: "native Windows GPU serving".to_owned(),
-                        reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
-                    },
-                ],
-                notes: vec!["adapter hint".to_owned()],
-                model_id_override: None,
-                image_digest: None,
-                generated_at_unix_ms: None,
-                supported_gfx_families: Vec::new(),
-                profile_ids: BTreeMap::new(),
-                requires_hf_token: false,
-                supported_boards: Vec::new(),
-                min_gpu_counts: BTreeMap::new(),
-                extra_env: BTreeMap::new(),
-            },
-            rocm_core::ModelRecipeEngineRecord {
-                engine: "lemonade".to_owned(),
-                required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
-                parser_settings: BTreeMap::new(),
-                preferred_endpoint: None,
-                unsupported_combinations: Vec::new(),
-                notes: Vec::new(),
-                model_id_override: None,
-                image_digest: None,
-                generated_at_unix_ms: None,
-                supported_gfx_families: Vec::new(),
-                profile_ids: BTreeMap::new(),
-                requires_hf_token: false,
-                supported_boards: Vec::new(),
-                min_gpu_counts: BTreeMap::new(),
-                extra_env: BTreeMap::new(),
-            },
-        ];
-
-        let hint = protocol_engine_recipe_hint(&recipe, "vllm").expect("vllm hint");
-
-        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
-        assert_eq!(hint.engine, "vllm");
-        assert_eq!(
-            hint.required_flags,
-            vec!["--enable-auto-tool-choice".to_owned()]
+    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
+        // The interactive summary is what a default `rocm serve` prints, so a flag
+        // the selected engine cannot honor has to be reported through this path —
+        // not only on the plan path that an interactive run never takes.
+        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            Some(note),
+            None,
+            false,
         );
-        assert_eq!(
-            hint.parser_settings
-                .get("reasoning_parser")
-                .map(String::as_str),
-            Some("qwen3")
-        );
-        assert_eq!(
-            hint.preferred_endpoint
-                .as_ref()
-                .map(|endpoint| endpoint.endpoint_mode.as_str()),
-            Some("openai")
-        );
-        assert_eq!(
-            hint.preferred_endpoint
-                .as_ref()
-                .and_then(|endpoint| endpoint.settings.get("streaming"))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(hint.unsupported_combinations.len(), 1);
-        assert_eq!(hint.notes, vec!["adapter hint".to_owned()]);
-        let serve_lines = render_serve_engine_recipe_lines(&hint);
-        assert!(serve_lines.contains(
-            "engine_recipe_policy: selected-engine required_flags are applied at launch"
-        ));
-        assert!(serve_lines.contains("engine_recipe_required_flags: --enable-auto-tool-choice"));
-        assert!(protocol_engine_recipe_hint(&recipe, "unknown-engine").is_none());
-    }
-
-    #[test]
-    fn tool_call_override_synthesizes_hint_for_vllm_without_recipe() {
-        // Arbitrary HF repo with no catalog recipe: the explicit override is the
-        // only source of the parser, and a minimal hint is synthesized to carry it.
-        let hint = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"))
-            .expect("an override should synthesize a vllm tool-choice hint");
-        assert_eq!(hint.engine, "vllm");
-        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
-        assert_eq!(
-            hint.required_flags,
-            vec![
-                "--enable-auto-tool-choice".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "hermes".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_override_replaces_recipe_authored_parser() {
-        // Override wins over an authored parser: exactly one `--tool-call-parser`,
-        // set to the override value, with unrelated flags preserved in order.
-        let existing = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec![
-                "--reasoning-parser".to_owned(),
-                "qwen3".to_owned(),
-                "--enable-auto-tool-choice".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "llama3_json".to_owned(),
-            ],
-            ..EngineRecipeHint::default()
-        };
-        let hint =
-            engine_recipe_with_tool_call_override("vllm", Some(existing), Some("hermes")).unwrap();
-        assert_eq!(
-            hint.required_flags,
-            vec![
-                "--reasoning-parser".to_owned(),
-                "qwen3".to_owned(),
-                "--enable-auto-tool-choice".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "hermes".to_owned(),
-            ]
-        );
-        assert_eq!(
-            hint.required_flags
-                .iter()
-                .filter(|flag| *flag == "--tool-call-parser")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn tool_call_override_absent_preserves_recipe_flags_without_guessing() {
-        // No override: authored recipe metadata flows through unchanged and no
-        // parser is ever guessed from the model ref.
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec![
-                "--enable-auto-tool-choice".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "hermes".to_owned(),
-            ],
-            ..EngineRecipeHint::default()
-        };
-        let hint =
-            engine_recipe_with_tool_call_override("vllm", Some(authored.clone()), None).unwrap();
-        assert_eq!(hint.required_flags, authored.required_flags);
-
-        // Unknown model, no recipe, no override: nothing is injected.
-        assert!(engine_recipe_with_tool_call_override("vllm", None, None).is_none());
-        // A blank override is treated as absent.
-        assert!(engine_recipe_with_tool_call_override("vllm", None, Some("  ")).is_none());
-    }
-
-    #[test]
-    fn tool_call_override_leaves_non_vllm_engines_untouched() {
-        // The override is vLLM-specific: other engines are never rewritten.
-        assert!(engine_recipe_with_tool_call_override("lemonade", None, Some("hermes")).is_none());
-        let existing = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "lemonade".to_owned(),
-            required_flags: vec!["--some-flag".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_tool_call_override(
-            "lemonade",
-            Some(existing.clone()),
-            Some("hermes"),
-        )
-        .unwrap();
-        assert_eq!(hint.required_flags, existing.required_flags);
-    }
-
-    #[test]
-    fn gpu_memory_utilization_absent_without_explicit_flag() {
-        // rocm-cli ships no default: with nothing supplied the recipe is left
-        // alone, so vLLM applies its own default rather than one rocm-cli owns.
-        assert_eq!(parse_gpu_memory_utilization(None).unwrap(), None);
-        assert!(engine_recipe_with_gpu_memory_utilization_override("vllm", None, None).is_none());
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", Some(authored), None)
-            .unwrap();
         assert!(
-            !hint
-                .required_flags
-                .iter()
-                .any(|flag| flag == "--gpu-memory-utilization"),
-            "no default may be injected: {:?}",
-            hint.required_flags
+            notes.iter().any(|entry| entry == note),
+            "the ignored-flag note must reach the summary: {notes:?}"
         );
-    }
 
-    #[test]
-    fn gpu_memory_utilization_override_reaches_required_flags() {
-        let value = parse_gpu_memory_utilization(Some("0.35")).unwrap();
-        let hint = engine_recipe_with_gpu_memory_utilization_override("vllm", None, value)
-            .expect("an explicit value should synthesize a vllm hint");
-        assert_eq!(hint.engine, "vllm");
-        assert_eq!(hint.contract_version, ENGINE_RECIPE_CONTRACT_VERSION);
-        assert_eq!(
-            hint.required_flags,
-            vec!["--gpu-memory-utilization".to_owned(), "0.35".to_owned()]
+        let quiet = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            None,
+            None,
+            false,
         );
-    }
-
-    #[test]
-    fn gpu_memory_utilization_override_replaces_authored_value_and_keeps_others() {
-        let existing = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec![
-                "--enable-auto-tool-choice".to_owned(),
-                "--gpu-memory-utilization".to_owned(),
-                "0.8".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "hermes".to_owned(),
-            ],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_gpu_memory_utilization_override(
-            "vllm",
-            Some(existing),
-            parse_gpu_memory_utilization(Some("1.0")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            hint.required_flags,
-            vec![
-                "--enable-auto-tool-choice".to_owned(),
-                "--tool-call-parser".to_owned(),
-                "hermes".to_owned(),
-                "--gpu-memory-utilization".to_owned(),
-                "1".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn gpu_memory_utilization_override_leaves_non_vllm_engines_untouched() {
-        // The override is vLLM-specific: other engines are never rewritten, with
-        // or without a recipe of their own.
         assert!(
-            engine_recipe_with_gpu_memory_utilization_override("lemonade", None, Some(0.5))
-                .is_none()
+            !quiet
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "nothing to report when the flag was honored: {quiet:?}"
         );
-        let existing = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "lemonade".to_owned(),
-            required_flags: vec!["--some-flag".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_gpu_memory_utilization_override(
-            "lemonade",
-            Some(existing.clone()),
-            Some(0.5),
-        )
-        .unwrap();
-        assert_eq!(hint.required_flags, existing.required_flags);
     }
 
-    #[test]
-    fn gpu_memory_utilization_rejects_out_of_range_and_unparsable_values() {
-        // An explicit CLI value is never silently ignored (unlike the env-var
-        // overrides elsewhere): each bad value must produce an actionable error.
-        for bad in ["0", "0.0", "1.5", "-0.2", "abc", "", "NaN", "inf"] {
-            let Err(error) = parse_gpu_memory_utilization(Some(bad)) else {
-                panic!("`{bad}` must be rejected, not silently ignored");
-            };
-            let message = error.to_string();
-            assert!(
-                message.contains("--gpu-memory-utilization"),
-                "error for `{bad}` should name the flag: {message}"
-            );
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214): both this test module
+    /// and `gpu_policy.rs`'s own build `GpuVramUsage` fixtures, and this helper
+    /// has no other home now that `gpu_policy.rs` owns the type.
+    fn vram(index: u32, used_mb: u64, total_mb: u64) -> GpuVramUsage {
+        GpuVramUsage {
+            index,
+            used_mb,
+            total_mb,
         }
-        assert_eq!(
-            parse_gpu_memory_utilization(Some(" 0.5 ")).unwrap(),
-            Some(0.5)
-        );
-        assert_eq!(parse_gpu_memory_utilization(Some("1")).unwrap(), Some(1.0));
     }
 
-    #[test]
-    fn generation_defaults_inject_override_generation_config_for_vllm() {
-        // vLLM has no raw sampling flags: all three controls collapse into a single
-        // `--override-generation-config` JSON with `--max-tokens` mapped to the
-        // engine's `max_new_tokens` output cap.
-        let hint = engine_recipe_with_generation_defaults(
-            "vllm",
-            None,
-            ServeGenerationDefaults {
-                temperature: Some(0.5),
-                top_p: Some(0.25),
-                max_tokens: Some(128),
-            },
-        )
-        .expect("vllm defaults are supported")
-        .expect("supplied defaults should synthesize a vllm hint");
-        assert_eq!(hint.engine, "vllm");
-        assert_eq!(hint.required_flags.len(), 2);
-        assert_eq!(hint.required_flags[0], "--override-generation-config");
-        let config: serde_json::Value =
-            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
-        assert_eq!(config["temperature"], 0.5);
-        assert_eq!(config["top_p"], 0.25);
-        assert_eq!(config["max_new_tokens"], 128);
-    }
-
-    #[test]
-    fn generation_defaults_include_only_supplied_values() {
-        // Unset controls are omitted so the engine keeps its own defaults.
-        let hint = engine_recipe_with_generation_defaults(
-            "vllm",
-            None,
-            ServeGenerationDefaults {
-                temperature: Some(0.25),
-                top_p: None,
-                max_tokens: None,
-            },
-        )
-        .expect("vllm defaults are supported")
-        .expect("a single supplied default still synthesizes a hint");
-        let config: serde_json::Value =
-            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
-        assert_eq!(config["temperature"], 0.25);
-        assert!(config.get("top_p").is_none());
-        assert!(config.get("max_new_tokens").is_none());
-    }
-
-    #[test]
-    fn generation_defaults_merge_with_recipe_authored_config() {
-        // CLI values win, but authored keys the CLI does not set are preserved and
-        // exactly one `--override-generation-config` pair remains.
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec![
-                "--enable-auto-tool-choice".to_owned(),
-                "--override-generation-config".to_owned(),
-                "{\"temperature\":0.9,\"repetition_penalty\":1.1}".to_owned(),
-            ],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_generation_defaults(
-            "vllm",
-            Some(authored),
-            ServeGenerationDefaults {
-                temperature: Some(0.25),
-                top_p: Some(0.5),
-                max_tokens: None,
-            },
-        )
-        .expect("vllm defaults are supported")
-        .unwrap();
-        assert_eq!(
-            hint.required_flags
-                .iter()
-                .filter(|flag| *flag == "--override-generation-config")
-                .count(),
-            1
-        );
-        assert_eq!(hint.required_flags[0], "--enable-auto-tool-choice");
-        let config: serde_json::Value =
-            serde_json::from_str(hint.required_flags.last().unwrap()).unwrap();
-        assert_eq!(config["temperature"], 0.25);
-        assert_eq!(config["top_p"], 0.5);
-        assert_eq!(config["repetition_penalty"], 1.1);
-    }
-
-    #[test]
-    fn generation_defaults_absent_or_non_vllm_pass_through() {
-        // No controls supplied: the hint flows through unchanged.
-        assert!(
-            engine_recipe_with_generation_defaults(
-                "vllm",
-                None,
-                ServeGenerationDefaults::default()
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            engine_recipe_with_generation_defaults(
-                "unknown",
-                None,
-                ServeGenerationDefaults {
-                    temperature: Some(0.5),
-                    top_p: Some(0.5),
-                    max_tokens: Some(64),
-                },
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn generation_defaults_reject_aim_instead_of_silently_dropping() {
-        // AIM's engine code only ever reads `extra_env`, never `required_flags` — a
-        // container launch has no argv to carry `--override-generation-config`
-        // into, unlike vLLM's own host process. Writing it into `required_flags`
-        // anyway would silently drop `--temperature`/`--top-p`/`--max-tokens` for
-        // `rocm serve --engine aim`, so this must fail fast instead.
-        let error = engine_recipe_with_generation_defaults(
-            "aim",
-            None,
-            ServeGenerationDefaults {
-                temperature: Some(0.5),
-                top_p: None,
-                max_tokens: None,
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("aim"));
-    }
-
-    #[test]
-    fn generation_defaults_translate_to_lemonade_llama_server_flags() {
-        let hint = engine_recipe_with_generation_defaults(
-            "lemonade",
-            None,
-            ServeGenerationDefaults {
-                temperature: Some(0.5),
-                top_p: Some(0.25),
-                max_tokens: Some(128),
-            },
-        )
-        .expect("lemonade defaults are supported")
-        .expect("defaults synthesize a recipe");
-        assert_eq!(
-            hint.required_flags,
-            [
-                "--temperature",
-                "0.5",
-                "--top-p",
-                "0.25",
-                "--n-predict",
-                "128"
-            ]
-        );
-    }
-
-    #[test]
-    fn generation_defaults_preserve_unset_lemonade_recipe_flags() {
-        // Only --temperature is supplied via CLI; an authored --top-p already
-        // present in the recipe must survive untouched, mirroring the vLLM
-        // merge behavior instead of being deleted.
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "lemonade".to_owned(),
-            required_flags: vec!["--top-p".to_owned(), "0.9".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_generation_defaults(
-            "lemonade",
-            Some(authored),
-            ServeGenerationDefaults {
-                temperature: Some(0.5),
-                top_p: None,
-                max_tokens: None,
-            },
-        )
-        .expect("lemonade defaults are supported")
-        .expect("supplied defaults should synthesize a hint");
-        assert_eq!(
-            hint.required_flags,
-            ["--top-p", "0.9", "--temperature", "0.5"]
-        );
-    }
-
-    #[test]
-    fn extra_env_absent_passes_hint_through_unchanged() {
-        assert!(
-            engine_recipe_with_extra_env("aim", None, &[])
-                .unwrap()
-                .is_none()
-        );
-
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "aim".to_owned(),
-            ..EngineRecipeHint::default()
-        };
-        let hint = engine_recipe_with_extra_env("aim", Some(authored.clone()), &[]).unwrap();
-        assert_eq!(hint, Some(authored));
-    }
-
-    #[test]
-    fn extra_env_synthesizes_hint_and_merges_into_authored_one() {
-        let hint = engine_recipe_with_extra_env("aim", None, &["AIM_PROFILE_ID=foo".to_owned()])
-            .unwrap()
-            .expect("--engine-env should synthesize a hint");
-        assert_eq!(hint.engine, "aim");
-        assert_eq!(
-            hint.extra_env.get("AIM_PROFILE_ID"),
-            Some(&"foo".to_owned())
-        );
-
-        let authored = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "aim".to_owned(),
-            extra_env: BTreeMap::from([("EXISTING".to_owned(), "kept".to_owned())]),
-            ..EngineRecipeHint::default()
-        };
-        let hint =
-            engine_recipe_with_extra_env("aim", Some(authored), &["AIM_PROFILE_ID=foo".to_owned()])
-                .unwrap()
-                .unwrap();
-        assert_eq!(hint.extra_env.get("EXISTING"), Some(&"kept".to_owned()));
-        assert_eq!(
-            hint.extra_env.get("AIM_PROFILE_ID"),
-            Some(&"foo".to_owned())
-        );
-    }
-
-    #[test]
-    fn extra_env_bare_key_forwards_from_the_environment_without_recording_a_value() {
-        let hint = engine_recipe_with_extra_env("aim", None, &["HF_TOKEN".to_owned()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(hint.extra_env.get("HF_TOKEN"), Some(&String::new()));
-    }
-
-    #[test]
-    fn extra_env_rejects_entry_with_empty_or_malformed_key() {
-        for entry in ["=some-value", "", "BAD KEY=1", "A-B=1"] {
-            let error = engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]).unwrap_err();
-            assert!(error.to_string().contains("KEY=VALUE"), "{entry}: {error}");
+    /// Duplicated from `gpu_policy::tests` (ROCMAI-214) for the same reason as
+    /// `vram` above.
+    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
+        rocm_core::HostGpuSummary {
+            gfx_target: Some(gfx_target.to_owned()),
+            ..rocm_core::HostGpuSummary::default()
         }
     }
 
     #[test]
-    fn extra_env_rejects_reserved_keys_and_newlines() {
-        for entry in ["VLLM_API_KEY=x", "HIP_VISIBLE_DEVICES=0", "VLLM_API_KEY"] {
-            let error = engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]).unwrap_err();
-            assert!(error.to_string().contains("manages it"), "{entry}: {error}");
-        }
-        assert!(engine_recipe_with_extra_env("aim", None, &["A=b\nc".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn extra_env_leaves_the_hint_alone_for_engines_that_ignore_it() {
-        assert_eq!(
-            engine_recipe_with_extra_env("vllm", None, &["FOO=bar".to_owned()]).unwrap(),
+    fn serve_notes_pair_low_vram_with_the_vllm_utilization_hint() {
+        // A busy discrete card that trips the low-VRAM warning: on vLLM the note
+        // must also carry the concrete `--gpu-memory-utilization` workaround, so
+        // the interactive summary tells the user how to avoid the OOM.
+        let busy = [vram(0, 182_000, 192_000)];
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
             None,
-            "a flag reported as ignored must not change what the engine is sent"
+            Some(&host_gpu("gfx1100")),
+            true,
         );
-    }
-
-    #[test]
-    fn engine_env_distinguishes_a_bare_key_from_an_empty_value() {
-        let env = |entry: &str| engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]);
-        let bare = env("HF_TOKEN").unwrap().expect("hint");
-        assert_eq!(bare.extra_env.get("HF_TOKEN").map(String::as_str), Some(""));
-        let err = env("HF_TOKEN=").unwrap_err().to_string();
         assert!(
-            err.contains("empty value") && err.contains("`HF_TOKEN` alone"),
-            "{err}"
+            notes.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning must be present: {notes:?}"
         );
-        let set = env("A=b").unwrap().expect("hint");
-        assert_eq!(set.extra_env.get("A").map(String::as_str), Some("b"));
-    }
-
-    #[test]
-    fn engine_env_ignored_note_is_none_for_aim() {
-        assert_eq!(
-            engine_env_ignored_note("aim", &["AIM_PROFILE_ID=foo".to_owned()]),
-            None
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
         );
-    }
 
-    #[test]
-    fn engine_env_ignored_note_is_none_when_engine_env_is_empty() {
-        assert_eq!(engine_env_ignored_note("vllm", &[]), None);
-    }
+        // The literal fragments the GPU-lane scenario
+        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
+        // only where a real card exists, so pin the wording here too: a rename
+        // then fails on every lane rather than silently on the one lane that can
+        // observe it. `GPU 0 has only` is what makes the warning provably about
+        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
+        // pre-launch hint from any other line that merely names the flag.
+        assert!(
+            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
+            "the warning must name the selected GPU: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("vLLM reserves ~90%")),
+            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
+        );
 
-    #[test]
-    fn engine_env_ignored_note_warns_for_engines_that_do_not_consume_it() {
-        let note = engine_env_ignored_note("vllm", &["FOO=bar".to_owned()])
-            .expect("vllm does not consume extra_env");
-        assert!(note.contains("--engine-env"));
-        assert!(note.contains("'aim'"));
-        assert!(note.contains("'vllm'"));
-    }
-
-    #[test]
-    fn engine_recipe_enables_tool_choice_reflects_flags() {
-        assert!(!engine_recipe_enables_tool_choice(None));
-        let without = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "vllm".to_owned(),
-            required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-        assert!(!engine_recipe_enables_tool_choice(Some(&without)));
-        let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
-        assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+        // The same busy card on a non-vLLM engine keeps the warning but omits the
+        // vLLM-only knob, which that engine cannot honor.
+        let lemonade = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            false,
+        );
+        assert!(
+            lemonade.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning still fires for other engines: {lemonade:?}"
+        );
+        assert!(
+            !lemonade
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
+        );
     }
 }

@@ -304,7 +304,8 @@ Feature: Diagnosing failures and listing fixes
     And the preview states that the CLI can run it automatically
   # `--model` answers the question that comes before the other two: given this
   # machine and that model, will it run. The point is that it answers in seconds
-  # and fetches nothing, so the user is not told by a download that failed.
+  # and downloads no weights (a curated model fetches nothing at all), so the user
+  # is not told by a download that failed.
   #
   # Host-agnostic in the same way diagnose-10 is, and for the same reason. The
   # verdict depends on what this machine can measure of its own GPU, which
@@ -663,7 +664,7 @@ Feature: Diagnosing failures and listing fixes
   # gate, so the text is the same on every lane, and the scenario asserts the
   # printed lines and not the exit code. It does not run the line. The test
   # `the_msvc_verify_runs_in_cmd_and_powershell` in
-  # crates/rocm-core/src/fix.rs does that, and only on Windows.
+  # crates/rocm-core/src/fix/catalog.rs does that, and only on Windows.
   @id:diagnose-msvc-verify-line-text-is-powershell-safe
   Scenario: diagnose-43 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
     Given a user who has chosen the fix for the missing MSVC runtime
@@ -680,11 +681,11 @@ Feature: Diagnosing failures and listing fixes
   # and Windows PowerShell 5.1 drops the empty argument, so setx failed with
   # "Invalid syntax" and cleared nothing; the step refuses an empty-string
   # argument too. Text only, like diagnose-43. `the_override_verify_runs_in_cmd_and_powershell`
-  # in crates/rocm-core/src/fix.rs runs the override verify line, on Windows.
+  # in crates/rocm-core/src/fix/catalog.rs runs the override verify line, on Windows.
   # These three scenarios see what `rocm fix <id> --dry-run` prints from the
   # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
   # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
-  # in crates/rocm-core/src/diagnose.rs, and a printed line the rule passes is
+  # in crates/rocm-core/src/diagnose/catalog.rs, and a printed line the rule passes is
   # still not proven to run: the Windows-only tests named above do that.
   @id:diagnose-override-fix-lines-are-powershell-safe
   Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
@@ -709,10 +710,10 @@ Feature: Diagnosing failures and listing fixes
   # the binary. The exact line is asserted, and that it names `python3`: a stock
   # Ubuntu has no `python`. Text only: the line is run by
   # `the_override_fix_verify_runs_where_only_python3_exists` in
-  # crates/rocm-core/src/diagnose.rs, on Unix hosts. The Windows arms of these
+  # crates/rocm-core/src/diagnose/host.rs, on Unix hosts. The Windows arms of these
   # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
   # (text) and the Windows-only `*_verify_runs_*` tests in
-  # crates/rocm-core/src/fix.rs (run); there is no Windows scenario for them.
+  # crates/rocm-core/src/fix/catalog.rs (run); there is no Windows scenario for them.
   @id:diagnose-override-verify-line-names-python3 @requires-os:linux
   Scenario: diagnose-46 - The verify line printed for the GPU override cause reads the override and uses python3
     Given a Linux machine whose shell has a GPU override set
@@ -739,7 +740,7 @@ Feature: Diagnosing failures and listing fixes
   # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
   # an ambient HIP framework needs the SDK is held by the unit test
   # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
-  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # in crates/rocm-core/src/diagnose/windows.rs. The oracle also counts a weak listing
   # (below the match threshold) as present, which is what production does for
   # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
   # bonus wrong, so whoever changes it must update this scenario's oracle too.
@@ -748,3 +749,103 @@ Feature: Diagnosing failures and listing fixes
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom
     Then the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+
+  # A GGUF outside the catalog has no recipe, so there is no tested minimum to
+  # compare. Its header still says how many layers it has, how many KV heads and
+  # how wide, and the file's size is the weights: enough to estimate memory at a
+  # chosen context size. (That a remote file is read for its header alone is
+  # asserted by the gguf_source unit test that serves an 8 GiB file and records
+  # every range; a local file is only opened, so no step here could see a
+  # download.) The answer must stay
+  # visibly an estimate -- a different outcome from the closed verdict, and a
+  # different word -- because a figure derived from metadata and allowances
+  # calibrated on one GPU is not a model that was loaded. The file is a few kilobytes of header and a
+  # tiny weight region, so the scenario is deterministic on every lane; the
+  # comparison with GPU memory is host-specific and asserted per half, as
+  # diagnose-21 and diagnose-22 do.
+  @id:diagnose-model-gguf-is-estimated-from-its-header-not-judged
+  Scenario: diagnose-49 - A GGUF outside the catalog is sized from its header and reported as an estimate, not a verdict
+    Given a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
+    Then the answer is an estimate under its own outcome, and the verdict stays undetermined
+    And the estimate sizes the file's weights and its KV cache at that context
+    And a machine that measured its GPU is told whether the estimate fits, and one that could not is told why
+
+  # The human-readable half of diagnose-49: the label is what a reader sees
+  # first, and READY or BLOCKED over a figure derived from metadata would claim
+  # a certainty the estimate does not have.
+  @id:diagnose-model-gguf-estimate-is-labelled-in-the-text-report
+  Scenario: diagnose-50 - The text report labels a GGUF estimate as an estimate and never calls the file ready or blocked
+    Given a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form
+    Then the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
+
+  # `--report` promises that nothing leaves the machine. A GGUF reference such as
+  # owner/repo:Q4_K_M is read from Hugging Face, which would put the model's name
+  # on the wire, so a prepared report must not assess the model at all. The
+  # second half proves the endpoint is wired in: without `--report` the same
+  # question does reach it, and the note about ignoring the model is not shown.
+  @id:diagnose-report-never-reaches-the-hub-for-a-model
+  Scenario: diagnose-51 - A prepared problem report never asks the hub about a model
+    Given a Hugging Face endpoint that records every request made to it
+    When the user asks the CLI to prepare a problem report that names a model on that endpoint
+    Then no request reached the endpoint
+    And the CLI says the model was ignored rather than assessed
+    When the user asks the CLI the same model question without preparing a report
+    Then the endpoint was asked about the model
+    And the CLI does not say the model was ignored
+
+  # A llama.cpp vision model ships its multimodal projector (mmproj) beside the
+  # model. Naming the projector exactly is answered for what it is, with the
+  # model file named instead, rather than as a file the repository lacks; and
+  # it is refused from the listing alone, before any header is read.
+  @id:diagnose-a-projector-named-exactly-is-answered-as-a-projector
+  Scenario: diagnose-52 - Naming a model's multimodal projector says what it is and names the model
+    Given a Hugging Face repository that holds a model and its multimodal projector
+    When the user asks the CLI whether the projector file would run, naming it exactly
+    Then the CLI says the file is a multimodal projector and names the model file instead
+    And the endpoint was asked only for the repository's file list
+
+  # The context options describe the model being asked about. Without --model
+  # they would be accepted and do nothing, so the CLI refuses them as a usage
+  # error before anything runs.
+  @id:diagnose-context-options-need-a-model
+  Scenario: diagnose-53 - The context options are refused without a model to apply them to
+    When the user asks the CLI for a context size or a KV cache type without naming a model
+    Then the CLI refuses each as a usage error that names --model
+
+  # A curated model's memory minimum comes from its recipe and is fixed, so a
+  # context size cannot change the answer. The report says so instead of
+  # silently ignoring the option, and makes no estimate.
+  @id:diagnose-context-options-do-not-apply-to-a-curated-model
+  Scenario: diagnose-54 - A curated model is told the context options do not apply to it
+    When the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form
+    Then the answer says the context options do not apply to a curated recipe, and carries no estimate
+
+  # A .gguf path that does not exist is a path to check, not a model to report
+  # upstream: the answer names the path, gives no upstream route, and its plan
+  # is to ask again once the path is right.
+  @id:diagnose-a-missing-gguf-path-is-a-path-to-check
+  Scenario: diagnose-55 - A GGUF path that does not exist is answered as a path to check, not a model to report
+    When the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form
+    Then the answer says the file could not be opened and offers no upstream route
+    And the plan is to ask again about that path
+
+  # owner/repo with no :QUANT names a repository, and every file in it is a
+  # different model, so nothing is read; with a context size the user is told
+  # what would make it answerable. The stand-in hub shows no request was made.
+  @id:diagnose-a-bare-repository-with-a-context-size-asks-for-a-quantization
+  Scenario: diagnose-56 - A bare repository with a context size is told to name a quantization, and nothing is fetched
+    Given a Hugging Face endpoint that records every request made to it
+    When the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form
+    Then the answer says the reference names a repository and asks for a quantization
+    And no request reached the endpoint
+
+  # A quantization that matches nothing lists what the repository does hold,
+  # and a multimodal projector is among the files listed, marked as one, rather
+  # than left out: a user looking at the hub sees it there too.
+  @id:diagnose-a-quantization-that-matches-nothing-lists-every-gguf
+  Scenario: diagnose-57 - A quantization that matches nothing lists the repository's files, projectors marked
+    Given a Hugging Face repository that holds a model and its multimodal projector
+    When the user asks the CLI about a quantization the repository does not hold
+    Then the CLI says nothing matches and lists the model and the projector, marked as a projector

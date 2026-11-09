@@ -113,6 +113,21 @@ pub struct WslFacts {
     /// unreadable cache is not an unregistered library, and reporting it as one
     /// told users with a working install to re-run `ldconfig`.
     pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `librocdxg.so` is in a directory on `LD_LIBRARY_PATH`, which the
+    /// loader searches before the linker cache. A library there loads without
+    /// being registered, so only [`Self::librocdxg_unloadable`] -- not the cache
+    /// answer alone -- says the runtime cannot find it. `false` from the
+    /// `--distro` probe, which runs a non-login shell and sees none of the
+    /// user's environment.
+    #[serde(default)]
+    pub librocdxg_on_ld_library_path: bool,
+    /// Whether `librocdxg.so` is in the same `lib` directory as a
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// TheRock tarball is laid out this way and is never in the linker cache.
+    /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
+    /// can ask it from outside the distribution.
+    #[serde(default)]
+    pub librocdxg_beside_runtime: bool,
     /// Whether `rocminfo` is on PATH.
     pub rocminfo: bool,
     /// Whether ROCm can actually enumerate a GPU here.
@@ -120,9 +135,12 @@ pub struct WslFacts {
     /// `None` when `rocminfo` is absent, so the question could not be asked. This
     /// is the only WSL-collected evidence that the plumbing is complete yet no
     /// device is reachable, which is what distinguishes an out-of-date Windows
-    /// host driver from a distro-side fault. The bare-metal `has_amd_gpu` cannot
-    /// stand in: the probes that populate it are skipped here, so it is always
-    /// false on WSL and reads as "no GPU" on a perfectly healthy machine.
+    /// host driver from a distro-side fault. The probe's own `has_amd_gpu` cannot
+    /// stand in: the probes that populate it are skipped here, so it is `false`
+    /// straight out of the probe. It only becomes meaningful once
+    /// [`Examination::adopt_wsl_host_gpu`] has set it from the Windows-side
+    /// detection, which says a display adapter exists, not that ROCm can
+    /// enumerate it. This field is the only evidence of the latter.
     pub rocm_sees_gpu: Option<bool>,
     /// `None` when the distro release could not be parsed, which fails closed:
     /// an unreadable release is not evidence of a supported one.
@@ -138,6 +156,27 @@ pub struct WslFacts {
     /// run, and a caller must say so rather than let "nothing matched" read as
     /// a clean bill of health.
     pub locally_probed: bool,
+}
+
+impl WslFacts {
+    /// `librocdxg.so` exists somewhere the probe looked: under a ROCm install, or
+    /// in a directory on `LD_LIBRARY_PATH`. A library reached only through the
+    /// variable (a source build in a home directory) is on disk even though no
+    /// ROCm root holds it.
+    #[must_use]
+    pub const fn librocdxg_present(&self) -> bool {
+        self.librocdxg || self.librocdxg_on_ld_library_path
+    }
+
+    /// The linker cache positively lacks ROCDXG and neither `LD_LIBRARY_PATH` nor
+    /// the runtime's own directory supplies it. `None` from the cache (ldconfig
+    /// could not run) is not evidence, so it is not "unloadable".
+    #[must_use]
+    pub const fn librocdxg_unloadable(&self) -> bool {
+        matches!(self.ldconfig_librocdxg, Some(false))
+            && !self.librocdxg_on_ld_library_path
+            && !self.librocdxg_beside_runtime
+    }
 }
 
 /// One copy of a ROCm library found on the machine.
@@ -212,6 +251,18 @@ pub struct Examination {
     pub cpu_vendor: String,
     pub cpu_model: String,
     pub gpus: Vec<Gpu>,
+    /// Whether an AMD GPU was found. On bare metal the hardware probes own this
+    /// field. WSL skips those probes, so [`Examination::probe_with_interpreter`]
+    /// leaves it `false` there; `rocm examine --json` then sets it with
+    /// [`Examination::adopt_wsl_host_gpu`] from the Windows-side detection the
+    /// human report also reads. `gpus`, `has_apu` and `has_discrete_amd` stay
+    /// at their probe values (empty, `false`, `false`) on WSL either way, so
+    /// `has_amd_gpu: true` beside both `false` is the normal WSL shape: the
+    /// Windows side reports a gfx target, not a PCI listing to tell an APU
+    /// from a discrete part. Other readers do not depend on them on WSL: the
+    /// failure catalog scopes the checks that read them to `linux` and
+    /// `windows`, and the WSL checks and the model-fit probe-result check use
+    /// `wsl.rocm_sees_gpu`.
     pub has_amd_gpu: bool,
     pub has_nvidia_gpu: bool,
     pub has_apu: bool,
@@ -272,7 +323,7 @@ pub struct Examination {
     /// installation as the selected HIP runtime.
     ///
     /// Computed by [`comgr_matches_runtime`], the same function
-    /// `check_18_comgr_conflict` in `diagnose.rs` uses to decide whether to
+    /// `check_18_comgr_conflict` in `diagnose/engine.rs` uses to decide whether to
     /// report a conflict -- so this field and that finding cannot disagree
     /// about one machine.
     ///
@@ -332,7 +383,7 @@ pub struct Examination {
     /// the distinction decides whether comparing it against the *system* ROCm
     /// means anything. A managed runtime ships its own ROCm and never loads the
     /// system's, so for it the comparison is meaningless. See
-    /// `check_8_wheel_rocm_mismatch` in `diagnose.rs`.
+    /// `check_8_wheel_rocm_mismatch` in `diagnose/host.rs`.
     pub framework_source: String,
 
     // environment
@@ -557,6 +608,26 @@ impl Examination {
         }
         e.status = e.compute_status();
         e
+    }
+
+    /// Set `has_amd_gpu` on a WSL host from whether the Windows side detected a
+    /// GPU target, the value the human report's "AMD GPU detected" line reads.
+    /// It sets that one field only: `has_apu` and `has_discrete_amd` stay at
+    /// their probe values, because a target string does not say which kind of
+    /// part it is.
+    ///
+    /// WSL reaches the GPU through the Windows host driver, so the DRM/KFD probes
+    /// that fill `has_amd_gpu` are skipped and the field would read `false` on a
+    /// healthy machine. The caller already holds the detection (it is the
+    /// `summary` of `rocm examine --json`), so this takes it rather than probing
+    /// again: the Windows query is a PowerShell call with its own timeout. Does
+    /// nothing off WSL, where the probes own the field, and leaves `gpus` empty
+    /// (there is no PCI listing to build entries from) and `status` alone
+    /// (`compute_status` answers `wsl` before it asks about a GPU).
+    pub const fn adopt_wsl_host_gpu(&mut self, host_has_amd_gpu: bool) {
+        if self.is_wsl {
+            self.has_amd_gpu = host_has_amd_gpu;
+        }
     }
 
     /// Coarse machine-readable verdict reported via the `status` field. The
@@ -790,6 +861,56 @@ mod tests {
         assert_eq!(e.compute_status(), "unsupported-os");
         e.is_wsl = true;
         assert_eq!(e.compute_status(), "wsl");
+    }
+
+    /// `rocm examine --json` and the human report must answer "is there an AMD
+    /// GPU" from one value on WSL. The probe leaves `has_amd_gpu` false there
+    /// (its hardware probes are skipped), and the human report reads the
+    /// Windows-side gfx target, so the field follows that target.
+    #[test]
+    fn wsl_has_amd_gpu_follows_the_windows_side_gfx_target() {
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            is_wsl: true,
+            ..Examination::default()
+        };
+        assert!(!e.has_amd_gpu, "the probe itself reports no GPU on WSL");
+
+        e.adopt_wsl_host_gpu(true);
+        assert!(e.has_amd_gpu, "a detected gfx target means a GPU is there");
+        assert!(
+            e.gpus.is_empty(),
+            "there is no PCI listing on WSL to build gpu entries from"
+        );
+        assert!(
+            !e.has_apu && !e.has_discrete_amd,
+            "a target string does not say which kind of part it is"
+        );
+        assert_eq!(
+            e.compute_status(),
+            "wsl",
+            "status answers wsl before it asks about a GPU"
+        );
+
+        e.adopt_wsl_host_gpu(false);
+        assert!(!e.has_amd_gpu, "no detected target, no GPU: it can go back");
+    }
+
+    /// Off WSL the hardware probes own `has_amd_gpu`; a gfx target from the
+    /// summary must neither set nor clear it.
+    #[test]
+    fn adopting_a_host_gpu_does_nothing_off_wsl() {
+        let mut bare_metal = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: false,
+            ..Examination::default()
+        };
+        bare_metal.adopt_wsl_host_gpu(true);
+        assert!(!bare_metal.has_amd_gpu);
+
+        bare_metal.has_amd_gpu = true;
+        bare_metal.adopt_wsl_host_gpu(false);
+        assert!(bare_metal.has_amd_gpu);
     }
 
     /// The probes themselves, not just `host_path`, answer from a simulated

@@ -11,7 +11,10 @@
 //! split into focused modules (see `docs/architecture.md`).
 
 use anyhow::Result;
-use rocm_core::{AppPaths, ManagedServiceRecord, unix_time_millis};
+use rocm_core::{
+    AppPaths, AutomationRuntimeState, ManagedServiceRecord, WatcherMode, WatcherRuntimeSnapshot,
+    unix_time_millis,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +97,18 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
     );
 }
 
+/// A loopback port the OS just handed out and nothing holds now.
+///
+/// For tests that make the code under test bind the port for real: a fixed
+/// number inside the automatic range 11435-11535 fails whenever a real
+/// `rocm serve` is running on the developer's machine.
+pub(crate) fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("bind an ephemeral loopback port")
+        .port()
+}
+
 /// Build the record a supervisor would construct for `service_id`, to learn
 /// the paths it derives before the real call does. Not platform-gated:
 /// the supervisor exit-write tests use it on every platform.
@@ -165,8 +180,8 @@ pub(crate) fn seed_keyed_service(paths: &AppPaths, service_id: &str, port: u16) 
 }
 
 /// The state an unconfirmed stop must leave behind: not marked stopped, the
-/// PID kept so a later stop can still reach it, the deferred-cleanup marker
-/// set, and the endpoint key still on disk.
+/// PID kept because the record still names that process, the deferred-cleanup
+/// marker set, and the endpoint key still on disk.
 pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     reloaded: &ManagedServiceRecord,
     key_kept: bool,
@@ -177,13 +192,54 @@ pub(crate) fn assert_unconfirmed_stop_kept_the_service(
     );
     assert_eq!(
         reloaded.supervisor_pid, UNCONFIRMED_STOP_PID,
-        "an unconfirmed stop must keep the PID a later stop needs"
+        "an unconfirmed stop must keep the PID of the process it may have left running"
     );
     assert!(
         reloaded.stop_requested_unix_ms.is_some(),
         "an unconfirmed stop must hand key cleanup to the liveness refresh"
     );
     assert!(key_kept, "an unconfirmed stop must keep the endpoint key");
+}
+
+/// One enabled watcher snapshot in `mode`, for tests that build an automation
+/// runtime state by hand.
+pub(crate) fn test_watcher_snapshot(
+    id: &str,
+    mode: WatcherMode,
+    last_event_unix_ms: Option<u128>,
+) -> WatcherRuntimeSnapshot {
+    WatcherRuntimeSnapshot {
+        id: id.to_owned(),
+        enabled: true,
+        mode,
+        summary: "test watcher".to_owned(),
+        last_event: None,
+        last_event_unix_ms,
+    }
+}
+
+/// A running automation runtime state carrying `active_watchers`.
+pub(crate) fn test_runtime_state(
+    active_watchers: Vec<WatcherRuntimeSnapshot>,
+) -> AutomationRuntimeState {
+    AutomationRuntimeState {
+        running: true,
+        automations_enabled: true,
+        daemon_pid: 1,
+        started_at_unix_ms: 1,
+        last_tick_unix_ms: 1,
+        local_webhook_endpoint: None,
+        active_watchers,
+    }
+}
+
+/// How many pending proposals to queue behind the one under test so it sits
+/// beyond a recent-window read: more than the reviewed-retention cap, and
+/// more than the 100 the code once read, so the tests keep guarding that
+/// window even if the cap is ever lowered below it.
+pub(crate) fn proposals_beyond_a_recent_window() -> usize {
+    const WINDOW_THE_CODE_ONCE_READ: usize = 100;
+    rocm_core::REVIEWED_PROPOSALS_RETAINED.max(WINDOW_THE_CODE_ONCE_READ) + 1
 }
 
 #[cfg(test)]

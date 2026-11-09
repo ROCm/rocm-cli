@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use rocm_core::AppPaths;
+use rocm_core::{AppPaths, AutomationRuntimeState};
 
 use crate::runtimes_cmd::{runtime_manifest_path, runtime_registry_dir};
 use crate::therock;
@@ -48,6 +48,56 @@ pub(crate) fn unique_suffix() -> String {
         rocm_core::unix_time_millis(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Case count for a property test: `PROPTEST_CASES` (proptest's own knob,
+/// which an explicit `with_cases` would otherwise override) when it is set and
+/// above `default`, otherwise `default`.
+///
+/// Never below `default`: the counts are chosen so a property catches the
+/// defects it targets with near certainty, and some of those are hit by a
+/// small share of cases, so a lower count would pass with them present. `0`
+/// would pass vacuously.
+pub(crate) fn proptest_cases(default: u32) -> u32 {
+    case_count_from_env("PROPTEST_CASES", default)
+}
+
+/// Case count read from `var`, raising `default` but never lowering it, for
+/// the same reason as [`proptest_cases`]. The uninstall properties use it with
+/// their own knob, `ROCM_DELETION_PROP_CASES`. A value that is ignored,
+/// because it is lower or does not parse, is reported on stderr.
+pub(crate) fn case_count_from_env(var: &str, default: u32) -> u32 {
+    let requested = std::env::var(var).ok();
+    let cases = raised_case_count(requested.as_deref(), default);
+    if let Some(requested) = requested
+        && requested.parse::<u32>().ok() != Some(cases)
+    {
+        eprintln!("{var}={requested} ignored: this property runs at least {default} cases");
+    }
+    cases
+}
+
+/// The pure half of [`case_count_from_env`].
+fn raised_case_count(requested: Option<&str>, default: u32) -> u32 {
+    requested
+        .and_then(|value| value.parse().ok())
+        .map_or(default, |requested: u32| requested.max(default))
+}
+
+/// Split `bytes` at the given (unsorted, possibly duplicated) offsets, each
+/// taken modulo `bytes.len() + 1`.
+pub(crate) fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
+    let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for cut in cuts {
+        pieces.push(&bytes[start..cut]);
+        start = cut;
+    }
+    pieces.push(&bytes[start..]);
+    pieces
 }
 
 /// Call `make_root` from many threads at once, remove what it made, and
@@ -179,6 +229,243 @@ pub(crate) fn write_test_pip_runtime(
     Ok(manifest)
 }
 
+/// A `rocm serve` argv the serve safety policy refuses, with the refusal each
+/// surface reports for it.
+///
+/// Two surfaces enforce the policy on a model-proposed `serve`: the chat tool
+/// policy (`tool_policy::validate_chat_rocm_command_safety`) and the
+/// provider-assisted planner (`freeform_planner::validate_provider_planner_tool_call`).
+/// Both suites run this one table, so a rule missing from either surface fails
+/// that surface's tests, and the same argv cannot be refused by one for a
+/// different reason than the other without the table saying so.
+pub(crate) struct ServeSafetyCase {
+    /// The rule the argv breaks.
+    pub(crate) rule: &'static str,
+    pub(crate) args: &'static [&'static str],
+    /// The full message the chat tool policy refuses it with.
+    pub(crate) chat_error: &'static str,
+    /// The full message the planner refuses it with.
+    pub(crate) planner_error: &'static str,
+}
+
+/// Every refusal the serve safety policy has, each rule reached by more than one
+/// spelling of its trigger. A case breaks exactly one rule, so the message names
+/// the rule that fired and nothing else could have.
+pub(crate) const SERVE_SAFETY_REFUSALS: &[ServeSafetyCase] = &[
+    ServeSafetyCase {
+        rule: "public bind",
+        args: &[
+            "serve",
+            "qwen",
+            "--engine",
+            "vllm",
+            "--allow-public-bind",
+            "--managed",
+        ],
+        chat_error: "local assistant cannot request public network binding",
+        planner_error: "provider planner cannot request public network binding",
+    },
+    ServeSafetyCase {
+        rule: "public bind",
+        args: &["serve", "qwen", "--managed", "--allow-public-bind"],
+        chat_error: "local assistant cannot request public network binding",
+        planner_error: "provider planner cannot request public network binding",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &[
+            "serve",
+            "qwen",
+            "--engine",
+            "vllm",
+            "--device",
+            "cpu",
+            "--managed",
+        ],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &["serve", "qwen", "--device=cpu", "--managed"],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
+    },
+    ServeSafetyCase {
+        rule: "cpu device",
+        args: &["serve", "qwen", "--device", "cpu_only", "--managed"],
+        chat_error: "local assistant cannot request CPU execution; ROCm GPU execution is required",
+        planner_error: "provider planner cannot request CPU execution; ROCm GPU execution is required",
+    },
+    ServeSafetyCase {
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host", "0.0.0.0", "--managed"],
+        chat_error: "local assistant cannot request non-local host `0.0.0.0`",
+        planner_error: "provider planner cannot request non-local host `0.0.0.0`",
+    },
+    ServeSafetyCase {
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host=example.test", "--managed"],
+        chat_error: "local assistant cannot request non-local host `example.test`",
+        planner_error: "provider planner cannot request non-local host `example.test`",
+    },
+    ServeSafetyCase {
+        // Classified public on purpose: only the three exact loopback spellings
+        // pass (see `is_public_bind_host`).
+        rule: "non-loopback host",
+        args: &["serve", "qwen", "--host", "LOCALHOST", "--managed"],
+        chat_error: "local assistant cannot request non-local host `LOCALHOST`",
+        planner_error: "provider planner cannot request non-local host `LOCALHOST`",
+    },
+    ServeSafetyCase {
+        rule: "managed required",
+        args: &["serve", "qwen", "--engine", "vllm"],
+        chat_error: "local assistant must request managed serving with --managed",
+        planner_error: "provider planner must request managed serving with --managed",
+    },
+    ServeSafetyCase {
+        rule: "managed required",
+        args: &["serve", "qwen", "--engine", "vllm", "--foreground"],
+        chat_error: "local assistant must request managed serving with --managed",
+        planner_error: "provider planner must request managed serving with --managed",
+    },
+];
+
+/// `--foreground` next to `--managed`: the safety check refuses the pair, but
+/// clap does too (the flags conflict), so the planner never reaches its safety
+/// check with it and only the chat check is what refuses it first.
+pub(crate) const SERVE_FOREGROUND_AND_MANAGED: &[&str] =
+    &["serve", "qwen", "--managed", "--foreground"];
+
+/// `rocm serve` argvs the serve safety policy lets through on both surfaces, and
+/// that also parse as a `rocm` command, so the planner reaches its safety check
+/// with them. A host other than `127.0.0.1` carries an explicit `--port`, which
+/// the chat policy requires there (see [`SERVE_PORT_RULE_CHAT_ONLY`]).
+pub(crate) const SERVE_SAFETY_ACCEPTED: &[&[&str]] = &[
+    &["serve", "qwen", "--managed"],
+    &[
+        "serve",
+        "qwen",
+        "--engine",
+        "vllm",
+        "--device",
+        "gpu_required",
+        "--managed",
+    ],
+    &["serve", "qwen", "--device=gpu_required", "--managed"],
+    &["serve", "qwen", "--host", "127.0.0.1", "--managed"],
+    &[
+        "serve",
+        "qwen",
+        "--host=localhost",
+        "--port",
+        "8000",
+        "--managed",
+    ],
+    &["serve", "qwen", "--host", "::1", "--port=8000", "--managed"],
+];
+
+/// `rocm serve` argvs the planner lets through but the chat policy refuses: a
+/// loopback host other than `127.0.0.1` without an explicit `--port`. The chat
+/// policy applies `rocm serve`'s own port rule so that an approval card is never
+/// offered for a command the CLI then refuses; the planner's check has no port
+/// rule. Each entry is the argv and the full message the chat policy refuses it
+/// with.
+pub(crate) const SERVE_PORT_RULE_CHAT_ONLY: &[(&[&str], &str)] = &[
+    (
+        &["serve", "qwen", "--host=localhost", "--managed"],
+        "`rocm serve --host localhost` needs an explicit `--port <1-65535>`. Automatic port selection is supported only on the default host 127.0.0.1, where ROCm can prove a port is free before launching; on any other address the engine owns the bind.",
+    ),
+    (
+        &["serve", "qwen", "--host", "::1", "--managed"],
+        "`rocm serve --host ::1` needs an explicit `--port <1-65535>`. Automatic port selection is supported only on the default host 127.0.0.1, where ROCm can prove a port is free before launching; on any other address the engine owns the bind.",
+    ),
+];
+
+/// `args` as the owned argv both surfaces take.
+pub(crate) fn owned_argv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_owned()).collect()
+}
+
+/// Build an `AutomationRuntimeState` for the background-helper tests (the
+/// no-double-spawn guard in `background_helper.rs` and the autostart tests in
+/// `service_launch.rs`).
+pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
+    AutomationRuntimeState {
+        running,
+        automations_enabled: true,
+        daemon_pid,
+        started_at_unix_ms: 1,
+        last_tick_unix_ms: 1,
+        local_webhook_endpoint: None,
+        active_watchers: Vec::new(),
+    }
+}
+
+/// Put the on-disk facts in one of the four combinations: whether a watcher
+/// is enabled, and whether the helper is running (this process stands in for
+/// a live daemon).
+pub(crate) fn set_helper_facts(paths: &AppPaths, watcher_enabled: bool, helper_running: bool) {
+    let mut config = rocm_core::RocmCliConfig::default();
+    config.watcher_config_mut("server-recover").enabled = watcher_enabled;
+    config.save(paths).expect("save config");
+    runtime_state(helper_running, std::process::id())
+        .write(paths)
+        .expect("write runtime state");
+}
+
+/// Leave `paths` as `rocm setup` followed by a lost registry entry would: a ready
+/// wheel runtime whose install tree holds its own `.rocm-cli-runtime.json` and
+/// that `config.json` names as the setup folder, but that the runtime registry
+/// has no entry for. Only `recover_setup_runtime_registration` can make it
+/// visible again, so a selection that finds it has run that recovery.
+pub(crate) fn write_test_setup_runtime_missing_from_registry(
+    paths: &AppPaths,
+    runtime_key: &str,
+) -> Result<therock::InstalledRuntimeManifest> {
+    let manifest = write_test_pip_runtime(
+        paths,
+        runtime_key,
+        "therock-release:gfx120X-all",
+        "7.13.0",
+        20,
+    )?;
+    fs::remove_file(runtime_manifest_path(paths, runtime_key))?;
+    let mut config = rocm_core::RocmCliConfig::default();
+    config.setup.therock_venv = Some(manifest.install_root.clone());
+    config.save(paths)?;
+    Ok(manifest)
+}
+
+/// Make the runtime registry impossible to write for any user, an administrator
+/// included: a plain file stands where its directory should be, so listing the
+/// registry finds nothing and creating it fails. A read-only directory would
+/// not do, because it does not stop `root`, which is who the e2e suite can run as.
+/// Returns the path of that file, so a test can show it was left as it was.
+pub(crate) fn make_runtime_registry_unwritable(paths: &AppPaths) -> Result<PathBuf> {
+    let registry = runtime_registry_dir(paths);
+    let _ = fs::remove_dir_all(&registry);
+    if let Some(parent) = registry.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&registry, "not a directory")?;
+    Ok(registry)
+}
+
+/// File names in the runtime registry directory, sorted; empty when the
+/// directory does not exist. Lets a test assert that a selection did, or did
+/// not, write a registry entry.
+pub(crate) fn runtime_registry_entry_names(paths: &AppPaths) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(runtime_registry_dir(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 mod tests {
     use super::*;
 
@@ -187,5 +474,14 @@ mod tests {
         let suffixes: std::collections::HashSet<String> =
             (0..64).map(|_| unique_suffix()).collect();
         assert_eq!(suffixes.len(), 64, "two calls must never share a suffix");
+    }
+
+    #[test]
+    fn case_counts_are_raised_but_never_lowered() {
+        assert_eq!(raised_case_count(None, 256), 256);
+        assert_eq!(raised_case_count(Some("4096"), 256), 4096);
+        assert_eq!(raised_case_count(Some("16"), 256), 256);
+        assert_eq!(raised_case_count(Some("0"), 256), 256);
+        assert_eq!(raised_case_count(Some("lots"), 256), 256);
     }
 }

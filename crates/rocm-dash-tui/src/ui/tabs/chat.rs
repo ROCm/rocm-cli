@@ -62,7 +62,7 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (
             " Chat — detecting… ",
             vec![Line::from(Span::styled(
-                "Probing for a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…",
+                "Probing for a local engine (Lemonade :13305 / vLLM :8000 / a rocm serve service)…",
                 Style::default().fg(theme.fg),
             ))],
         )
@@ -211,7 +211,7 @@ fn consent_gate_lines<'a>(
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
-                    "  • or run a local endpoint (vLLM :8000, rocm serve :11435)",
+                    "  • or run a local endpoint (vLLM :8000, a rocm serve service)",
                     Style::default().fg(theme.muted),
                 )),
             ],
@@ -319,10 +319,6 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 
 /// Pure transcript → styled lines mapping. Each turn becomes a role-prefixed,
 /// role-colored line. Kept free of `Frame` so it can be unit-tested.
-pub fn transcript_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>> {
-    transcript_lines_from_turns(&state.chat, theme)
-}
-
 fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<Line<'a>> {
     let mut lines = Vec::with_capacity(turns.len());
     for turn in turns {
@@ -332,7 +328,7 @@ fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<
             ChatRole::Error => ("err  ", theme.err),
             ChatRole::System => ("··   ", theme.muted),
         };
-        // Multi-line content (e.g. an answer plus a "⚙ via: …" Skill annotation)
+        // Multi-line content (e.g. an answer plus a "⚙ via: …" fired-tools annotation)
         // renders one terminal line per segment; continuation lines are indented
         // to align under the first line's content.
         for (i, seg) in turn.content.split('\n').enumerate() {
@@ -444,24 +440,24 @@ mod tests {
         s.chat.push(ChatTurn::agent("echo: hello"));
         s.chat.push(ChatTurn::error("boom"));
         let theme = s.theme;
-        let lines = transcript_lines(&s, &theme);
+        let lines = transcript_lines_from_turns(&s.chat, &theme);
         assert_eq!(lines.len(), 3);
     }
 
     #[test]
-    fn transcript_renders_skill_annotation_on_its_own_line() {
+    fn transcript_renders_tool_annotation_on_its_own_line() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // An agent reply carrying a tool-call surfacing annotation.
         s.chat.push(ChatTurn::agent(
             "GPU-2 is at 87% util, 71°C.\n⚙ via: gpu_status",
         ));
         let theme = s.theme;
-        let lines = transcript_lines(&s, &theme);
+        let lines = transcript_lines_from_turns(&s.chat, &theme);
         // The annotation splits into its own line and is visible in the render.
         assert_eq!(lines.len(), 2, "answer + annotation render as two lines");
         assert!(
             format!("{lines:?}").contains("gpu_status"),
-            "the fired Skill is surfaced in the transcript"
+            "the fired tool is surfaced in the transcript"
         );
     }
 
@@ -547,7 +543,7 @@ mod tests {
 
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.chat.push(ChatTurn::agent("borrow me"));
-        let lines = transcript_lines(&s, &s.theme);
+        let lines = transcript_lines_from_turns(&s.chat, &s.theme);
         assert!(matches!(
             lines[0].spans[1].content,
             Cow::Borrowed("borrow me")
@@ -637,7 +633,10 @@ mod tests {
         assert!(render_str(&mut s).contains("detect a local engine"));
         // After a fruitless detect, the message shows.
         s.set_detect_result(None);
-        assert!(render_str(&mut s).contains("no local engine found"));
+        let out = render_str(&mut s);
+        assert!(out.contains("no local engine found"));
+        // `rocm serve` leases its port at launch, so no fixed one is promised.
+        assert!(!out.contains("11435"), "{out:?}");
     }
 
     #[test]
@@ -645,7 +644,9 @@ mod tests {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
         s.request_detect();
-        assert!(render_str(&mut s).contains("Probing for a local engine"));
+        let out = render_str(&mut s);
+        assert!(out.contains("Probing for a local engine"));
+        assert!(!out.contains("11435"), "{out:?}");
     }
 
     #[test]

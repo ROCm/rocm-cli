@@ -20,8 +20,27 @@ rocm-cli local assistants use structured tools, not shell commands.
   result shows it is useful.
 - The model must use argv-style `rocm` arguments. It must not invent PowerShell,
   Bash, `cmd`, `git`, or arbitrary package-manager commands.
+- A tool call is refused if its name or any string in its arguments carries a
+  terminal control or format character (an escape sequence, a carriage return,
+  a bidi override, a zero-width character). Those values are printed — in the
+  approval card, the request plan, tool output and error messages — and a
+  terminal acts on such a character instead of showing it. This applies to
+  every tool; `rocm_command` checks each `args` entry itself, after trimming it.
+  The provider-assisted planner's argv is held to the same rule, and a planner
+  note carrying such a character is left out and counted.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
-  loudly when the ROCm GPU path is not ready.
+  loudly when the ROCm GPU path is not ready. Keeping some of a model's layers
+  in system RAM on a GPU that is ready (llama.cpp's `--n-gpu-layers`), which
+  `rocm diagnose --model` suggests when a GGUF model does not fit in VRAM, is
+  not CPU fallback, and the assistant may relay it.
+- A `rocm serve` the model proposes through `rocm_command`, or the
+  provider-assisted planner proposes in its tool call, is refused unless it
+  asks for no public bind (`--allow-public-bind`), no CPU device, a loopback
+  `--host` if it names one, and managed serving (`--managed`, never
+  `--foreground`). One shared check applies those four rules to both, in that
+  order, and a refused call is neither proposed for approval nor planned; the
+  two refusals read alike and differ only in naming the local assistant or the
+  provider planner.
 - The built-in local assistant is fixed to `qwen`
   (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, Lemonade and AIM (a
   Docker-based engine) are the general serving engines; the assistant may inspect or manage them for model

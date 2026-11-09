@@ -47,15 +47,27 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     // `examine` cannot contradict each other in either direction: ready means a
     // device, not-ready means none, and both match what the report prints.
     if is_wsl_host() {
-        let ready = detect_wsl_summary().is_some_and(|wsl| wsl.rocdxg_ready());
-        // One device: WSL2 exposes no per-device topology to enumerate, and the
-        // visibility mask still applies on top so an explicit
-        // HIP_VISIBLE_DEVICES="" is honoured.
-        return usable_amd_gpu_indices_from(usize::from(ready), visibility_mask_from_env());
+        return wsl_usable_indices(detect_wsl_summary().as_ref(), visibility_mask_from_env());
     }
     let present =
         combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
     usable_amd_gpu_indices_from(present, visibility_mask_from_env())
+}
+
+/// The usable ordinals on a WSL host, from the plumbing `examine` reports on.
+///
+/// One device: WSL2 exposes no per-device topology to enumerate, and the
+/// visibility mask still applies on top so an explicit `HIP_VISIBLE_DEVICES=""`
+/// is honoured. Takes the summary rather than reading the machine so the
+/// decision -- ready means a device, anything else means none -- is testable
+/// without a WSL host.
+#[cfg(any(target_os = "linux", test))]
+fn wsl_usable_indices(
+    wsl: Option<&super::WslSummary>,
+    mask: Option<GpuVisibilityMask>,
+) -> Option<Vec<u32>> {
+    let ready = wsl.is_some_and(super::WslSummary::rocdxg_ready);
+    usable_amd_gpu_indices_from(usize::from(ready), mask)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -65,6 +77,95 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 #[allow(clippy::missing_const_for_fn)]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     None
+}
+
+/// What the Windows adapter listing says about the ordinals an explicit
+/// `--gpu <index>` can name. See [`windows_amd_gpu_listing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsGpuListing {
+    /// No inventory source answered, none listed an AMD adapter, or this is not
+    /// native Windows. Nothing was learned about the host's GPUs.
+    Unavailable,
+    /// The listing succeeded and found `adapters` AMD adapters, but
+    /// `HIP_VISIBLE_DEVICES` could not be resolved to ordinals (an empty value,
+    /// a UUID token, or an ordinal past the adapter count). The host's GPUs are known; the mask
+    /// is what cannot be interpreted.
+    MaskUnresolved {
+        /// AMD display adapters the Windows inventory listed.
+        adapters: usize,
+    },
+    /// The HIP ordinals left after `HIP_VISIBLE_DEVICES`. May be empty when the
+    /// mask hides every device.
+    Indices(Vec<u32>),
+}
+
+/// The HIP ordinals an explicit `--gpu <index>` can name on native Windows,
+/// after `HIP_VISIBLE_DEVICES`. Always [`WindowsGpuListing::Unavailable`] off
+/// Windows.
+///
+/// [`usable_amd_gpu_indices`] has no Windows probe, and `amd-smi` is usually
+/// missing or unusable there, so without this `rocm serve --gpu 7` on a
+/// one-GPU Windows machine had nothing to check the index against and was
+/// accepted (ROCMAI-824).
+///
+/// The count is the AMD display adapters in the same Windows inventory
+/// `rocm examine` reads (`pnputil` first, then the CIM queries). Every device
+/// HIP can open is one of those adapters, so an index at or past that count
+/// cannot exist. The count may be too high: an adapter HIP does not support is
+/// still counted. So it is used to refuse an index, never to choose one. That
+/// is why it stays out of [`usable_amd_gpu_indices`], which `--gpu auto` and
+/// the engines act on.
+///
+/// An inventory with no AMD adapter reads as `Unavailable`: it does not prove
+/// the host has no GPU, so it may not refuse a launch.
+#[must_use]
+// Off Windows the body is a bare constant; see `probe_usable_amd_gpu_indices`
+// for why the stub is not made `const`.
+#[cfg_attr(not(windows), allow(clippy::missing_const_for_fn))]
+pub fn windows_amd_gpu_listing() -> WindowsGpuListing {
+    #[cfg(windows)]
+    {
+        let Some(adapters) = super::windows_inventory::detect_windows_amd_display_count() else {
+            return WindowsGpuListing::Unavailable;
+        };
+        windows_gpu_listing_from(adapters, std::env::var("HIP_VISIBLE_DEVICES").ok())
+    }
+    #[cfg(not(windows))]
+    {
+        WindowsGpuListing::Unavailable
+    }
+}
+
+/// [`windows_amd_gpu_listing`] for a given adapter count and
+/// `HIP_VISIBLE_DEVICES` value. Native Windows HIP has no ROCr layer, so
+/// `ROCR_VISIBLE_DEVICES` does not apply there and only the HIP mask is used.
+#[cfg(any(windows, test))]
+fn windows_gpu_listing_from(adapters: usize, hip_mask: Option<String>) -> WindowsGpuListing {
+    if adapters == 0 {
+        return WindowsGpuListing::Unavailable;
+    }
+    // An empty value hides every device under Linux/ROCr semantics, but nothing
+    // verifies that for Windows HIP (and Windows treats an empty variable as
+    // unset in most shells). Guessing "all hidden" would refuse every index, so
+    // an empty value reads as a mask that cannot be understood: the adapter
+    // count still bounds the index and the caller warns.
+    if hip_mask
+        .as_deref()
+        .is_some_and(|mask| mask.trim().is_empty())
+    {
+        return WindowsGpuListing::MaskUnresolved { adapters };
+    }
+    usable_amd_gpu_indices_from(
+        adapters,
+        hip_mask.map(|hip| GpuVisibilityMask {
+            rocr: None,
+            hip: Some(hip),
+        }),
+    )
+    .map_or(
+        WindowsGpuListing::MaskUnresolved { adapters },
+        WindowsGpuListing::Indices,
+    )
 }
 
 /// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
@@ -101,7 +202,7 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
 /// set. Collapsing the two into one "winning" value loses the composition and
 /// makes HIP tokens look like physical ordinals. See
 /// [`usable_amd_gpu_indices_from`].
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 #[derive(Debug, Clone)]
 struct GpuVisibilityMask {
     /// `ROCR_VISIBLE_DEVICES`, when set. Its tokens are physical ordinals.
@@ -137,7 +238,7 @@ fn visibility_mask_from_env() -> Option<GpuVisibilityMask> {
 /// order. An empty mask yields an empty set (every device hidden). `None` when
 /// the mask cannot be interpreted by ordinal alone — a UUID token, or an ordinal
 /// outside `0..count` — so callers must not mistake it for "no GPU".
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn mask_tokens_within(count: usize, mask: &str) -> Option<Vec<u32>> {
     if mask.is_empty() {
         return Some(Vec::new());
@@ -175,7 +276,7 @@ fn mask_tokens_within(count: usize, mask: &str) -> Option<Vec<u32>> {
 ///    (EAI-7194). Checking it against `present` accepted a `--gpu` ordinal that
 ///    cannot bind, and steered `--gpu auto` onto it — the exact failure this
 ///    composition exists to prevent, reached through the other variable.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn usable_amd_gpu_indices_from(
     present: usize,
     mask: Option<GpuVisibilityMask>,
@@ -207,6 +308,55 @@ fn usable_amd_gpu_indices_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wsl_summary(librocdxg_in_cache: bool, on_ld_library_path: bool) -> super::super::WslSummary {
+        super::super::WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: true,
+            ldconfig_librocdxg: librocdxg_in_cache,
+            librocdxg_on_ld_library_path: on_ld_library_path,
+            librocdxg_beside_runtime: false,
+            rocminfo: false,
+            cargo: false,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_wsl_host_whose_loader_reaches_rocdxg_has_one_usable_gpu() {
+        // The `rocm serve --gpu auto` side of an unregistered library reached
+        // through LD_LIBRARY_PATH: the same readiness `examine` reports must
+        // yield a device, or serve refuses a GPU examine says is there.
+        for (in_cache, on_path) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                wsl_usable_indices(Some(&wsl_summary(in_cache, on_path)), None),
+                Some(vec![0]),
+                "cache {in_cache}, LD_LIBRARY_PATH {on_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wsl_host_with_rocdxg_beside_the_runtime_has_one_usable_gpu() {
+        // The tarball layout: no cache entry and no LD_LIBRARY_PATH, but the
+        // runtime opens the library from its own directory.
+        let mut summary = wsl_summary(false, false);
+        summary.librocdxg_beside_runtime = true;
+        assert_eq!(wsl_usable_indices(Some(&summary), None), Some(vec![0]));
+    }
+
+    #[test]
+    fn a_wsl_host_the_loader_cannot_reach_rocdxg_on_has_no_usable_gpu() {
+        assert_eq!(
+            wsl_usable_indices(Some(&wsl_summary(false, false)), None),
+            Some(vec![])
+        );
+        // No summary at all is not a GPU either.
+        assert_eq!(wsl_usable_indices(None, None), Some(vec![]));
+    }
 
     #[test]
     fn a_ready_wsl_host_offers_a_device_and_an_unready_one_does_not() {
@@ -313,6 +463,86 @@ mod tests {
             usable_amd_gpu_indices_from(2, hip_mask("1,1")),
             Some(vec![1])
         );
+    }
+
+    #[test]
+    fn windows_gpu_indices_cover_each_listed_amd_adapter() {
+        // ROCMAI-824: the single-iGPU Strix Halo host the bug was found on.
+        // One adapter means ordinal 0 only, so `--gpu 7` has a set to miss.
+        assert_eq!(
+            windows_gpu_listing_from(1, None),
+            WindowsGpuListing::Indices(vec![0])
+        );
+        assert_eq!(
+            windows_gpu_listing_from(2, None),
+            WindowsGpuListing::Indices(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn windows_gpu_indices_never_report_no_gpu_from_an_empty_listing() {
+        // An inventory with no AMD adapter does not prove the host has
+        // no GPU, so it must read as unavailable, never as an authoritative
+        // empty set that would refuse every index.
+        assert_eq!(
+            windows_gpu_listing_from(0, None),
+            WindowsGpuListing::Unavailable
+        );
+        assert_eq!(
+            windows_gpu_listing_from(0, Some("0".to_owned())),
+            WindowsGpuListing::Unavailable
+        );
+    }
+
+    #[test]
+    fn windows_gpu_indices_apply_only_the_hip_mask() {
+        assert_eq!(
+            windows_gpu_listing_from(2, Some("1".to_owned())),
+            WindowsGpuListing::Indices(vec![1])
+        );
+        // An empty mask is not assumed to hide every device on Windows: nothing
+        // verifies that for Windows HIP, and a wrong guess would refuse every
+        // index. It reads as a mask that cannot be understood.
+        for empty in ["", "  "] {
+            assert_eq!(
+                windows_gpu_listing_from(2, Some(empty.to_owned())),
+                WindowsGpuListing::MaskUnresolved { adapters: 2 },
+                "mask {empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_gpu_listing_tells_an_unresolvable_mask_from_a_failed_listing() {
+        // The listing succeeded (one adapter), but the mask cannot be read by
+        // ordinal: an ordinal past the adapter count, or a UUID. That is not
+        // "could not list the GPUs".
+        for mask in ["3", "GPU-0a1b2c3d"] {
+            assert_eq!(
+                windows_gpu_listing_from(1, Some(mask.to_owned())),
+                WindowsGpuListing::MaskUnresolved { adapters: 1 },
+                "mask {mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_gpu_listing_keeps_the_adapter_count_for_an_unresolvable_mask() {
+        // The count is what still bounds an explicit `--gpu <index>` when the
+        // mask cannot be read: it must be the listed count, whatever the mask.
+        for (adapters, mask) in [(1, "7"), (3, "5"), (2, "GPU-0a1b2c3d")] {
+            assert_eq!(
+                windows_gpu_listing_from(adapters, Some(mask.to_owned())),
+                WindowsGpuListing::MaskUnresolved { adapters },
+                "{adapters} adapters, mask {mask}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_gpu_indices_are_unknown_off_windows() {
+        assert_eq!(windows_amd_gpu_listing(), WindowsGpuListing::Unavailable);
     }
 
     #[test]

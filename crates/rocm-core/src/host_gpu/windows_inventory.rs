@@ -134,6 +134,26 @@ impl WindowsExamineInventory {
         }
     }
 
+    /// How many listed rows are AMD GPUs, by the stricter test the driver and
+    /// GPU-name picks use (`preferred_amd_display`), not the loose name match
+    /// `pnputil`'s rows are filtered with. The CIM sources do not filter by
+    /// vendor, so the rows also hold devices like "AMD Bluetooth Capture Audio
+    /// Device" and "Intel(R) UHD Graphics". A row counts only with an AMD PCI
+    /// device id (`PCI\VEN_1002`) or a marketing name `rocm examine` recognizes.
+    #[cfg(any(windows, test))]
+    fn amd_display_count(&self) -> usize {
+        self.displays
+            .iter()
+            .filter(|display| {
+                display
+                    .pnp_device_id
+                    .as_deref()
+                    .is_some_and(|id| id.to_ascii_uppercase().starts_with("PCI\\VEN_1002"))
+                    || gfx_target_from_amd_marketing_name(&display.name).is_some()
+            })
+            .count()
+    }
+
     pub(super) fn amd_display_driver_detail(&self) -> Option<String> {
         let display = self.preferred_amd_display()?;
         let name = display.name.trim();
@@ -299,6 +319,11 @@ impl InventoryScope {
         system: true,
         driver_facts: true,
     };
+    /// `rocm serve --gpu <index>`, which only counts the AMD adapters.
+    const DISPLAYS_ONLY: Self = Self {
+        system: false,
+        driver_facts: false,
+    };
     /// `rocm diagnose`, which needs the driver but not the CPU or RAM.
     pub(super) const DRIVER_ONLY: Self = Self {
         system: false,
@@ -394,6 +419,23 @@ pub(super) fn detect_windows_examine_inventory_with_driver_facts() -> Option<Win
         return None;
     }
     assemble_windows_inventory(&mut LiveWindowsInventorySources, InventoryScope::SUMMARY)
+}
+
+/// How many AMD display adapters the Windows inventory lists, for
+/// `rocm serve --gpu <index>`. Asks only `pnputil` and, when it lists none, the
+/// CIM queries: no CPU, RAM or driver fact the index check never reads. `None`
+/// when no source answered or none listed an AMD adapter, since that does not
+/// prove the host has no GPU.
+#[cfg(windows)]
+pub(super) fn detect_windows_amd_display_count() -> Option<usize> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    let inventory = assemble_windows_inventory(
+        &mut LiveWindowsInventorySources,
+        InventoryScope::DISPLAYS_ONLY,
+    )?;
+    Some(inventory.amd_display_count()).filter(|&count| count > 0)
 }
 
 /// The inventory for a caller that needs the display driver but not the CPU
@@ -611,6 +653,19 @@ pub(super) fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsExam
     inventory
 }
 
+/// Whether a Windows display adapter is AMD: an AMD PCI vendor id, or "AMD",
+/// "Radeon" or "Instinct" as a word of its name.
+#[cfg(any(windows, test))]
+fn is_amd_windows_display(name: &str, pnp_device_id: Option<&str>) -> bool {
+    let has_amd_id =
+        pnp_device_id.is_some_and(|value| value.to_ascii_uppercase().contains("VEN_1002"));
+    let has_amd_name = name
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .any(|token| matches!(token, "amd" | "radeon" | "instinct"));
+    has_amd_id || has_amd_name
+}
+
 #[cfg(any(windows, test))]
 fn push_windows_pnputil_display(
     inventory: &mut WindowsExamineInventory,
@@ -621,14 +676,7 @@ fn push_windows_pnputil_display(
     let pnp = instance_id.take();
     let display_name = name.take().unwrap_or_default();
     let driver = driver_version.take();
-    let has_amd_id = pnp
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_uppercase().contains("VEN_1002"));
-    let has_amd_name = display_name
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .any(|token| matches!(token, "amd" | "radeon" | "instinct"));
-    if !has_amd_id && !has_amd_name {
+    if !is_amd_windows_display(&display_name, pnp.as_deref()) {
         return;
     }
     inventory.displays.push(WindowsDisplayAdapter {
@@ -827,6 +875,49 @@ Class Name:                Display
         );
         let info = inventory.amd_display_driver_info().expect("filled");
         assert_eq!(info.version, "32.0.23033.1002");
+    }
+
+    #[test]
+    fn the_gpu_index_check_counts_amd_adapters_from_the_cheapest_source() {
+        // ROCMAI-824: `rocm serve --gpu <index>` on Windows. `pnputil` lists the
+        // adapter, so no PowerShell query starts for a CPU, RAM or driver fact
+        // the index check never reads.
+        let mut sources = pnputil_host();
+        let inventory = assemble_windows_inventory(&mut sources, InventoryScope::DISPLAYS_ONLY)
+            .expect("an inventory");
+        assert_eq!(sources.calls, vec!["pnputil"]);
+        assert_eq!(inventory.amd_display_count(), 1);
+    }
+
+    #[test]
+    fn the_gpu_index_check_does_not_count_an_amd_named_non_gpu_device() {
+        // The CIM rows are not vendor-filtered: this is the noisy fixture
+        // `windows_examine_inventory_prefers_real_gpu_over_noisy_amd_pnp_entries`
+        // reads, where an "AMD" audio device and driver entry sit beside the
+        // one real GPU. Only the GPU may count, or `--gpu 1` would pass.
+        let inventory = parse_windows_examine_inventory(
+            "GPU\tAMD Bluetooth Capture Audio Device\t\t{2101C4C0-2C15-4035-A0D0-EEC3C2277B11}\\CAPTURE&CP_111215637\nGPU\tAMD-OpenGL User Mode Driver\t\tSWD\\DRIVERENUM\\AMDOGL&5&BAA66E4&0\nGPU\tAMD Radeon 780M Graphics\t\tPCI\\VEN_1002&DEV_1900&SUBSYS_50EE17AA&REV_D0\\4&EB5E2B6&0&0041\n",
+        );
+        assert_eq!(inventory.displays.len(), 3);
+        assert_eq!(inventory.amd_display_count(), 1);
+    }
+
+    #[test]
+    fn the_gpu_index_check_does_not_count_another_vendors_adapter() {
+        // The Plug and Play fallback matches any display device named
+        // "...Graphics", so an Intel iGPU can reach the inventory beside the
+        // AMD one. Counting it would let `--gpu 1` through on a one-AMD-GPU host.
+        let mut sources = CountingSources {
+            pnp_entity: Some(
+                "GPU\tAMD Radeon(TM) 8060S Graphics\t\tPCI\\VEN_1002&DEV_1586\n\
+                 GPU\tIntel(R) UHD Graphics\t\tPCI\\VEN_8086&DEV_9A49\n",
+            ),
+            ..CountingSources::default()
+        };
+        let inventory = assemble_windows_inventory(&mut sources, InventoryScope::DISPLAYS_ONLY)
+            .expect("an inventory");
+        assert_eq!(inventory.displays.len(), 2);
+        assert_eq!(inventory.amd_display_count(), 1);
     }
 
     #[test]

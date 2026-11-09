@@ -1131,12 +1131,12 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     // Prose that happens to begin with the program name.
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat would see this result, a plain shell might not",
         "note naming the two commands a managed runtime affects, not advice",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/engine.rs",
         "rocm serve/rocm chat prepend the active managed runtime's own directories ahead of LD_LIBRARY_PATH, so the export below may not change what they load; reinstalling or repairing that runtime so it ships its own code object manager is the fix that reaches it directly.",
         "explanation of what the two commands load, not advice",
     ),
@@ -1146,12 +1146,20 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
+        "crates/rocm-core/src/vllm_oom.rs",
+        "rocm diagnose --symptom",
+        "shared marker prefix (`VLLM_OOM_DIAGNOSE_COMMAND`): it exists so a log \
+         line rocm-cli authored can be told apart from one the engine printed. \
+         The runnable advice is composed from it with the user's symptom \
+         appended, and those full lines are scanned on their own",
+    ),
+    (
         "apps/rocm/src/examine_report_text.rs",
         "rocm interactive shell",
         "heading of the non-interactive launcher report",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm tools: {}",
         "`rocm tools: enabled` status row",
     ),
@@ -1161,32 +1169,32 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the model-readiness report, `<command>: <verdict>`, naming what was run",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm install folder",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed at",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm please",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/mcp_bridge.rs",
         "rocm command requires at least one argument",
         "validation error naming the chat `rocm` tool",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm command",
         "fallback label for an unrenderable chat tool call",
     ),
@@ -1211,24 +1219,24 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "log line",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/catalog.rs",
         "rocm diagnose covers Linux, Windows and WSL2. This host reports '{}', which the \
          catalog has no entries for, so nothing was checked -- this is not a clean bill of \
          health. Run `rocm examine --json` and report the platform upstream.",
         "out-of-scope report prose",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: out of scope for this platform.",
         "report heading",
     ),
     (
-        "crates/rocm-core/src/diagnose.rs",
+        "crates/rocm-core/src/diagnose/report.rs",
         "rocm diagnose: no known misconfiguration matched.",
         "report heading",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/config_cmd.rs",
         "rocm config",
         "heading of the `rocm config` report (`writeln!(output, \"rocm config\")`)",
     ),
@@ -1239,7 +1247,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "apps/rocm/src/service_hints.rs",
-        "rocm services {action} {service_id} --yes",
+        "rocm services {action} {} --yes",
         "the verb is a format argument; every value it takes is checked against the \
          real hint by `service_action_retry_advice_parses_for_generated_ids` (the \
          `run_approved_service_action` verbs) and `every_service_action_hint_verb_parses` \
@@ -1258,7 +1266,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "crates/rocm-core/src/fix.rs",
+        "crates/rocm-core/src/fix/render.rs",
         "rocm fix can run it",
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
@@ -1448,7 +1456,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --dry-run",
             Surface::CommandLine
         ),
@@ -1457,7 +1465,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --yes",
             Surface::CommandLine
         ),

@@ -28,11 +28,11 @@
 //! `watcher_plain_trigger`, `watcher_plain_action`, `watcher_policy_note`),
 //! and `render_daemon_text`. `render_automations_text` and
 //! `render_daemon_text` are `pub(crate)`: `main.rs`'s `dispatch()` calls
-//! `render_daemon_text` directly (via the re-import above), and `chat.rs`'s
-//! deterministic tool summaries call both. Everything else here has no
-//! caller outside this module (including `watcher_policy_note`, now that the
-//! `automations()` handler above reaches it locally rather than through a
-//! crate-root re-import) and stays private.
+//! `render_daemon_text` directly (via the re-import above), and `chat/mcp_bridge.rs`'s
+//! read-only command runner calls both. Everything else here has no
+//! caller outside this module (including `watcher_policy_note`, which the
+//! `automations()` handler and `render_automations_text` both reach locally
+//! rather than through a crate-root re-import) and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::` the
@@ -436,7 +436,7 @@ pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> St
     let _ = writeln!(output, "Startup: on demand");
     let _ = writeln!(
         output,
-        "Why it runs: automation checks and local model servers use it when needed."
+        "Why it runs: enabled automation checks (server recovery is one) need it; it stops on its own when none is on."
     );
     let _ = writeln!(
         output,

@@ -217,18 +217,26 @@ where
     })
 }
 
-const LOCAL_ENDPOINT_CANDIDATES: [&str; 3] = [
-    crate::skills::LEMONADE_ENDPOINT,
-    crate::skills::VLLM_ENDPOINT,
-    crate::skills::ROCM_SERVE_ENDPOINT,
-];
+/// Lemonade's default OpenAI-compatible endpoint.
+const LEMONADE_ENDPOINT: &str = "http://localhost:13305/v1";
+/// vLLM's conventional OpenAI-compatible endpoint.
+const VLLM_ENDPOINT: &str = "http://localhost:8000/v1";
+/// `rocm serve`'s (non-managed) default vLLM endpoint.
+///
+/// The port mirrors `rocm_core::DEFAULT_LOCAL_PORT`; duplicated as a literal
+/// because this crate deliberately carries no `rocm-core` dependency (see
+/// `AppState::model_recipes`).
+const ROCM_SERVE_ENDPOINT: &str = "http://localhost:11435/v1";
+
+const LOCAL_ENDPOINT_CANDIDATES: [&str; 3] =
+    [LEMONADE_ENDPOINT, VLLM_ENDPOINT, ROCM_SERVE_ENDPOINT];
 
 /// Probe the known local serving endpoints (Lemonade, vLLM, then `rocm
 /// serve`'s non-managed default) concurrently and return the highest-priority
 /// one that answered.
 ///
 /// Used by the TUI's in-app "detect a local engine" action, and by chat
-/// startup, so the user need not run the CLI skill first.
+/// startup, so the user need not configure an endpoint first.
 pub fn detect_local_endpoint() -> Option<&'static str> {
     probe_first_reachable(&LOCAL_ENDPOINT_CANDIDATES, probe_endpoint)
 }
@@ -539,11 +547,7 @@ mod tests {
     fn local_endpoint_candidates_preserve_supported_order() {
         assert_eq!(
             LOCAL_ENDPOINT_CANDIDATES,
-            [
-                crate::skills::LEMONADE_ENDPOINT,
-                crate::skills::VLLM_ENDPOINT,
-                crate::skills::ROCM_SERVE_ENDPOINT,
-            ]
+            [LEMONADE_ENDPOINT, VLLM_ENDPOINT, ROCM_SERVE_ENDPOINT]
         );
     }
 }

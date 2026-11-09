@@ -26,8 +26,6 @@
 //! it. Both paths run through the approval gate and the job-bridge — zero
 //! `std::thread::spawn`/`try_recv`.
 
-use std::path::Path;
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -40,7 +38,7 @@ use rocm_dash_core::state::{JobStatus, SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{display_args, exe_label, resolve_exe};
+use crate::ui::exec::{adopt_args, display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
@@ -261,18 +259,6 @@ pub struct OnboardingState {
     pub message: Option<String>,
 }
 
-/// Derive the conventional Python executable inside an env root (matches the
-/// runtime_manager / rocm-core per-host layout without a `rocm-core` dep).
-fn derive_python_executable(root: &str) -> String {
-    let root = Path::new(root);
-    let path = if cfg!(windows) {
-        root.join("Scripts").join("python.exe")
-    } else {
-        root.join("bin").join("python")
-    };
-    path.to_string_lossy().into_owned()
-}
-
 /// Handle a key while the wizard is open.
 pub fn on_key(
     ob: &mut Option<OnboardingState>,
@@ -300,15 +286,7 @@ pub fn on_key(
                     // field; the user still confirms with Enter.
                     cfg.prefix = selected;
                 } else {
-                    let root = selected;
-                    let args = vec![
-                        "runtimes".to_string(),
-                        "adopt".to_string(),
-                        "--root".to_string(),
-                        root.clone(),
-                        "--python".to_string(),
-                        derive_python_executable(&root),
-                    ];
+                    let args = adopt_args(&selected);
                     stage_approval(o, OnboardingChoice::AdoptExisting, args);
                 }
             }

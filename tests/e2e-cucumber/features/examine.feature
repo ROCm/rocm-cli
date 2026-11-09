@@ -77,7 +77,10 @@ Feature: GPU detection and system inspection
   # load-bearing: every host capability the suite resolves comes from scraped
   # text, so if the two forms ever diverge again, every capability-keyed
   # expectation silently resolves against the wrong host. Since fixed; this is
-  # the guard that keeps it fixed.
+  # the guard that keeps it fixed. On WSL2 the same disagreement came from the
+  # skipped hardware probes (the machine-readable form said no GPU beside a
+  # human report naming a gfx target); `has_amd_gpu` now follows that target
+  # there, so this runs on WSL2 hosts too and is no longer an expected failure.
   @id:examine-both-forms-agree-on-gpu
   Scenario: examine-08 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting
@@ -144,7 +147,8 @@ Feature: GPU detection and system inspection
   # `rocm examine`'s own engine_inventory block prefixes the effective default
   # engine with the same `*` marker, via a renderer separate from `engines
   # list`'s (see `append_examine_engine_inventory` vs
-  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # `render_engine_inventory_text_with_paths`, both in
+  # apps/rocm/src/examine_report_text.rs) — the
   # two used to be able to drift apart. examine-13 only ever drove `engines
   # list`, leaving this second renderer's legend unexercised end-to-end.
   @id:examine-shows-default-engine-legend
@@ -269,7 +273,7 @@ Feature: GPU detection and system inspection
   # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
   # the WSL lane, where the managed runtime really does carry a `.so`. This
   # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
-  # diagnose.rs -- the same boundary, stated once there and once here.
+  # diagnose/catalog.rs -- the same boundary, stated once there and once here.
   @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
   Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
     Given a managed runtime is active
@@ -282,8 +286,10 @@ Feature: GPU detection and system inspection
   # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
   # machine other than the runner. The driver plan cannot be exercised this way:
   # `rocm install driver` builds a plan that runs against the real machine, so it
-  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
-  # parsing is covered by the unit tests in `driver_install.rs`.
+  # deliberately reads the real `/etc/os-release` (`real_os_release` in
+  # `hardware_root.rs`, whose test in `system_packages.rs` pins that it ignores
+  # a simulated host root); the plan built from it is covered by the unit tests
+  # in `driver_plan.rs`.
   #
   # The planted distributions are ones no CI runner or developer host here runs,
   # so a probe that read the real file instead would report a different one.
@@ -464,3 +470,81 @@ Feature: GPU detection and system inspection
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system in machine-readable form
     Then the inspection reports a current install-method name
+
+  # The other side of examine-24/25/26, and the user-observable half of the
+  # `/dev/kfd` pre-flight (EAI-8457): where those three prove a healthy device
+  # still reaches amd-smi, this proves an unopenable one stops the launch from
+  # happening at all. (Declared here at the end rather than beside them because
+  # the scenario index is per-feature and in declaration order.) On a host in
+  # that state amd-smi can park in
+  # uninterruptible sleep, where no signal and therefore no timeout reaches it,
+  # so "declined" is the only outcome that bounds the daemon's 60s telemetry
+  # poll. The snapshot degrades; the command still succeeds.
+  #
+  # Non-vacuity is the whole difficulty here, and it is carried in two places.
+  # The stub amd-smi would answer this probe perfectly and records that it ran,
+  # so the marker's absence is what distinguishes "refused before the spawn"
+  # from "spawned and failed" -- deleting the gate makes this scenario fail
+  # rather than merely changing a message. And the note must name the device
+  # this run pointed the pre-flight at: the lane that runs this per PR has no
+  # `/dev/kfd` of its own, so a build that ignored the seam would decline for
+  # the host's own reasons and otherwise look identical.
+  #
+  # The seam is `ROCM_E2E_KFD_DEVICE`, honoured only by an `e2e-test-hooks`
+  # build (`rocm_core::preflight_kfd_device`), and it moves the device the gate
+  # opens rather than skipping the gate. `ROCM_CLI_TEST_HOST_ROOT` cannot stand
+  # in for it: the gate keeps the real node's veto on purpose, so a simulated
+  # root can only ever make it decline -- which is this branch, but leaves
+  # examine-24/25/26 unable to reach amd-smi on a GPU-less runner at all.
+  # Linux-only, like its three siblings: the stub is a shell script, and the
+  # gate is a wave-through on every other platform.
+  # `@requires-bare-metal`, not just `@requires-os:linux`: WSL2 reports an
+  # os_family of `linux`, so the Linux tag matches there — but on a WSL host
+  # with a usable GPU `kfd_readable`'s wave-through short-circuits the device
+  # open entirely, and the decline this scenario asserts never happens. The
+  # premise is a host where the `/dev/kfd` open is what decides.
+  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux @requires-bare-metal
+  Scenario: examine-31 - An unopenable KFD device stops amd-smi being launched at all
+    Given the KFD device cannot be opened
+    When the daemon gathers a bridge snapshot
+    Then the snapshot says amd-smi was never launched and names the device
+
+  # ROCDXG is found by the dynamic loader through LD_LIBRARY_PATH as well as
+  # through the linker cache, and a TheRock tarball under /opt/rocm-<version> is
+  # reachable only the first way: nothing registers it with `ldconfig`. The
+  # inspection used to require the cache entry regardless, so a working WSL GPU
+  # read `wsl_rocdxg_missing` and the CLI refused to serve on it (ROCMAI-870).
+  #
+  # The planted root supplies `/dev/dxg`, DXCore and the library under
+  # `/opt/rocm`, and a stand-in `ldconfig` on PATH answers with a cache that
+  # does not list it, so the verdict rests on LD_LIBRARY_PATH alone on every
+  # Linux lane, WSL or not. The `@id:examine-rocdxg-missing-without-loader-path`
+  # scenario below is its control: the same machine without the variable.
+  @id:examine-rocdxg-ready-from-ld-library-path @requires-os:linux
+  Scenario: examine-32 - The inspection reports ROCDXG ready when the loader reaches it through LD_LIBRARY_PATH
+    Given a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache
+    And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  @id:examine-rocdxg-missing-without-loader-path @requires-os:linux
+  Scenario: examine-33 - The inspection reports ROCDXG missing when neither the linker cache nor LD_LIBRARY_PATH reaches it
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_missing"
+    And the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail says the library is missing from the linker cache
+
+  # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
+  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
+  # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
+  # control is `examine-33`, the same machine with the library alone.
+  @id:examine-rocdxg-ready-beside-runtime @requires-os:linux
+  Scenario: examine-34 - The inspection reports ROCDXG ready when the library sits beside the runtime that opens it
+    Given a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
+    And the inspection's driver detail does not send the user to register the library with ldconfig

@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for stopping a managed service: `rocm services stop <id> --yes`, and
+//! Steps for stopping a managed service: `rocm services stop <id> --yes`
+//! (confirmed, and unconfirmed through the `ROCM_E2E_STOP_OUTCOME` seam), and
 //! `rocmd sandbox-tool stop_server`.
 //!
 //! Black-box: plants a managed-service record as plain JSON in its own isolated
@@ -147,6 +148,17 @@ async fn plant_running_service(world: &mut E2eWorld) {
 /// endpoint key on disk beside the record.
 #[given("a managed server whose recorded process is running")]
 async fn managed_server_with_running_process(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "0.0.0.0", true);
+}
+
+/// The same server bound to loopback and started without an API key, so no
+/// endpoint key file exists for it.
+#[given("a managed server without an endpoint key whose recorded process is running")]
+async fn keyless_managed_server_with_running_process(world: &mut E2eWorld) {
+    plant_server_with_running_process(world, "127.0.0.1", false);
+}
+
+fn plant_server_with_running_process(world: &mut E2eWorld, host: &str, with_key: bool) {
     let process = Command::new("sleep")
         .arg("300")
         .stdin(Stdio::null())
@@ -166,10 +178,10 @@ async fn managed_server_with_running_process(world: &mut E2eWorld) {
         "engine": "vllm",
         "model_ref": "qwen",
         "canonical_model_id": "Qwen/Qwen3.5",
-        "host": "0.0.0.0",
+        "host": host,
         // Discard port: closed, so nothing can answer on the server's behalf.
         "port": 9,
-        "endpoint_url": "http://0.0.0.0:9/v1",
+        "endpoint_url": format!("http://{host}:9/v1"),
         "mode": "managed",
         "status": "ready",
         "supervisor_pid": pid,
@@ -185,8 +197,29 @@ async fn managed_server_with_running_process(world: &mut E2eWorld) {
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
-    std::fs::write(endpoint_key_path(world), "e2e-endpoint-key")
-        .expect("failed to write endpoint key");
+    if with_key {
+        std::fs::write(endpoint_key_path(world), "e2e-endpoint-key")
+            .expect("failed to write endpoint key");
+    }
+}
+
+/// Script the next `rocm` stop's verified termination to report `outcome` for
+/// the recorded process, without signalling it — the `e2e-test-hooks` seam
+/// `ROCM_E2E_STOP_OUTCOME`. Consumed by that one invocation.
+fn script_next_stop_outcome(world: &mut E2eWorld, outcome: &str) {
+    world
+        .command_env
+        .push(("ROCM_E2E_STOP_OUTCOME", outcome.into()));
+}
+
+#[given("the next stop cannot confirm that process exited")]
+async fn next_stop_times_out(world: &mut E2eWorld) {
+    script_next_stop_outcome(world, "timed_out");
+}
+
+#[given("the next stop cannot verify that process as the server's")]
+async fn next_stop_unverified(world: &mut E2eWorld) {
+    script_next_stop_outcome(world, "unverified");
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -199,7 +232,8 @@ async fn managed_server_with_running_process(world: &mut E2eWorld) {
 /// prove, by asserting the hint text first and then running it.
 #[when("the user stops it with --yes")]
 async fn stop_with_yes(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "stop", SERVICE_ID, "--yes"]);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "stop", SERVICE_ID, "--yes"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -221,9 +255,8 @@ async fn stop_server_tool(world: &mut E2eWorld) {
 // (as `restart_server` does); `stop_server`'s result is the flat
 // `service_id`/`status` shape `stop_internal_managed_service` returns, so none
 // of those lines ever print for a stop today. That mismatch is a pre-existing
-// gap in that renderer, unrelated to the summary hint this PR fixes, so this
-// assertion covers only what the command actually prints; the on-disk status
-// below is what proves the stop itself.
+// gap in that renderer, so this assertion covers only what the command
+// actually prints; the on-disk status below is what proves the stop itself.
 #[then("the CLI reports the service as stopped")]
 async fn reports_stopped(world: &mut E2eWorld) {
     assert_succeeded(world);
@@ -312,6 +345,124 @@ async fn record_reads_stopped(world: &mut E2eWorld) {
 async fn endpoint_key_gone(world: &mut E2eWorld) {
     let key = endpoint_key_path(world);
     assert!(!key.exists(), "{} survived the stop", key.display());
+}
+
+/// An unconfirmed stop fails, on stderr, and never claims the server stopped.
+fn assert_unconfirmed_stop_reported(world: &E2eWorld) -> String {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_eq!(rc, 1, "an unconfirmed stop must exit 1:\n{combined}");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        stderr.contains("Local server stop not confirmed"),
+        "the stop must say, on stderr, that it was not confirmed:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Local server stopped"),
+        "an unconfirmed stop must not claim the server stopped:\n{combined}"
+    );
+    combined
+}
+
+/// No line of an unconfirmed-stop report offers a command to run the stop
+/// again — no `retry:` line, and no `services stop` anywhere: a second stop
+/// can confirm without reaching a surviving process under the recorded one.
+fn assert_no_retry_line(combined: &str) {
+    assert!(
+        !combined.lines().any(|line| {
+            line.trim_start().starts_with("retry:") || line.contains("services stop")
+        }),
+        "an unconfirmed stop names no stop command: {combined}"
+    );
+}
+
+#[then("the CLI reports the stop as not confirmed for a process that did not exit")]
+async fn reports_unconfirmed_timed_out(world: &mut E2eWorld) {
+    let combined = assert_unconfirmed_stop_reported(world);
+    let pid = recorded_pid(world);
+    assert!(
+        combined.contains(&format!(
+            "still running: process {pid} (supervisor) or a process under it did not exit"
+        )),
+        "{combined}"
+    );
+    assert_no_retry_line(&combined);
+}
+
+#[then("the CLI reports the stop as not confirmed for a process it could not verify")]
+async fn reports_unconfirmed_unverified(world: &mut E2eWorld) {
+    let combined = assert_unconfirmed_stop_reported(world);
+    let pid = recorded_pid(world);
+    assert!(
+        combined.contains(&format!("not signaled: process {pid} (supervisor)")),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("check: `ps -p {pid} -o pid,args`")),
+        "{combined}"
+    );
+    assert_no_retry_line(&combined);
+}
+
+#[then("the server's record still names its process and the stop request")]
+async fn record_keeps_process_and_marker(world: &mut E2eWorld) {
+    let record = read_record(world);
+    assert_eq!(
+        record["supervisor_pid"],
+        u64::from(recorded_pid(world)),
+        "{record}"
+    );
+    assert!(
+        !record["stop_requested_unix_ms"].is_null(),
+        "the unconfirmed stop keeps its request recorded: {record}"
+    );
+    assert_ne!(
+        record["status"], "stopped",
+        "a stop that confirmed nothing must not mark the record stopped: {record}"
+    );
+}
+
+/// The report's `kept:` line, checked against the key file it describes.
+#[then(
+    "the report says the record and the endpoint key were kept, and the key file is still there"
+)]
+async fn kept_line_names_the_key(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(
+        combined.lines().any(|line| line
+            == "  kept: the server record, which still names its processes, and its endpoint key, which the server may still be enforcing"),
+        "{combined}"
+    );
+    let key = endpoint_key_path(world);
+    assert!(
+        key.exists(),
+        "the report says the key was kept, but {} is gone",
+        key.display()
+    );
+}
+
+#[then("the report says only the record was kept, and there is no key file")]
+async fn kept_line_omits_the_key(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(
+        combined
+            .lines()
+            .any(|line| line == "  kept: the server record, which still names its processes"),
+        "{combined}"
+    );
+    assert!(!combined.contains("endpoint key"), "{combined}");
+    let key = endpoint_key_path(world);
+    assert!(
+        !key.exists(),
+        "a keyless server has a key file: {}",
+        key.display()
+    );
+}
+
+#[then("the CLI reports the stop as not confirmed and names no stop command")]
+async fn reports_unconfirmed_no_command(world: &mut E2eWorld) {
+    let combined = assert_unconfirmed_stop_reported(world);
+    assert_no_retry_line(&combined);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

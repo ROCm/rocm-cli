@@ -5,15 +5,15 @@
 //! The shared `[y/N]` confirmation prompt.
 //!
 //! Before this module existed, `fix.rs`, `apps/rocm/src/uninstall_plan.rs` and
-//! `apps/rocm/src/therock.rs` each hand-rolled the same print-prompt / flush
-//! stdout / read a line / normalize / match `"y"`/`"yes"` sequence. This is
-//! that sequence, split into the two fallible steps callers compose.
+//! `apps/rocm/src/therock/consent.rs` each hand-rolled the same print-prompt /
+//! flush stdout / read a line / normalize / match `"y"`/`"yes"` sequence. This
+//! is that sequence, split into the two fallible steps callers compose.
 //!
 //! [`print_prompt`] and [`read_answer`] stay two calls rather than one bundled
-//! "ask and read" function because `fix.rs`'s `confirm()` attempts the read
+//! "ask and read" function because `fix/consent.rs`'s `confirm()` attempts the read
 //! even when the prompt couldn't be written — its behavior before this module
-//! existed — while `uninstall_plan.rs` and `therock.rs` treat a failed write
-//! as fatal, each with their own phase-specific message. A single
+//! existed — while `uninstall_plan.rs` and `therock/consent.rs` treat a failed
+//! write as fatal, each with their own phase-specific message. A single
 //! `Result`-returning function can't express "ignore this step's error and
 //! keep going"; only a caller holding a separate `Result` per step can.
 //!
@@ -25,7 +25,11 @@
 //!
 //! [`interactive_terminal`] answers the question callers ask before prompting at
 //! all: whether this process has a terminal on both streams.
+//! [`require_yes_or_interactive`] is the guard built on it for a mutating
+//! command that confirms with a `[y/N]` prompt: `--yes` approves, a terminal
+//! gets asked, and anything else is refused with one shared message.
 
+use anyhow::{Result, bail};
 use std::io::{BufRead, IsTerminal, Write, stdin, stdout};
 
 /// Parse a user's typed response to a `[y/N]` prompt.
@@ -67,6 +71,39 @@ pub fn read_answer(input: &mut impl BufRead) -> std::io::Result<bool> {
 /// pasted report explains why prompts were skipped.
 pub fn interactive_terminal() -> bool {
     stdin().is_terminal() && stdout().is_terminal()
+}
+
+/// Guard a mutating command that confirms with a `[y/N]` prompt.
+///
+/// Returns `Ok(true)` when `yes` (the command's `--yes`) already approves it, so
+/// the caller proceeds without prompting. Returns `Ok(false)` when there is no
+/// `--yes` but [`interactive_terminal`] holds, so the caller still has to ask.
+/// Otherwise nobody can answer a prompt and the command is refused with
+/// `"{action} requires --yes outside an interactive terminal"`; `action` is the
+/// command as the user typed it (`"uninstall"`, `"runtimes uninstall"`).
+///
+/// `--yes` is checked first, so it never touches the terminal probe. Commands
+/// whose refusal deliberately differs (a different exit code, or two consents
+/// that are not interchangeable) do not use this.
+pub fn require_yes_or_interactive(yes: bool, action: &str) -> Result<bool> {
+    require_yes_or_interactive_with(yes, action, interactive_terminal)
+}
+
+/// [`require_yes_or_interactive`] with the terminal probe injected, so the
+/// refusal is testable without depending on how the test runner's streams are
+/// wired. The probe is only called when `yes` is false.
+fn require_yes_or_interactive_with(
+    yes: bool,
+    action: &str,
+    interactive: impl FnOnce() -> bool,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive() {
+        bail!("{action} requires --yes outside an interactive terminal");
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -188,5 +225,31 @@ mod tests {
     fn read_answer_surfaces_a_read_failure_as_an_error() {
         let mut input = FailingReader;
         read_answer(&mut input).expect_err("a failing reader must return Err");
+    }
+
+    #[test]
+    fn guard_approves_on_yes_without_probing_the_terminal() {
+        let approved = require_yes_or_interactive_with(true, "uninstall", || {
+            panic!("--yes must short-circuit before the terminal probe")
+        })
+        .expect("--yes approves");
+        assert!(approved);
+    }
+
+    #[test]
+    fn guard_asks_for_a_prompt_when_a_terminal_is_present_and_yes_is_absent() {
+        let approved = require_yes_or_interactive_with(false, "uninstall", || true)
+            .expect("an interactive terminal is allowed to prompt");
+        assert!(!approved, "the caller still has to ask");
+    }
+
+    #[test]
+    fn guard_refuses_without_yes_outside_a_terminal_naming_the_action() {
+        let error = require_yes_or_interactive_with(false, "runtimes uninstall", || false)
+            .expect_err("no --yes and no terminal must refuse");
+        assert_eq!(
+            error.to_string(),
+            "runtimes uninstall requires --yes outside an interactive terminal"
+        );
     }
 }
