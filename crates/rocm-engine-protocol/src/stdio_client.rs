@@ -151,7 +151,11 @@ where
 ///
 /// A failing exit status is an error only when the child printed no answer: an
 /// engine that reports its own failure in an error envelope and then exits
-/// non-zero is read as that envelope, which says more than the status does.
+/// non-zero is read as that envelope, which says more than the status does. The
+/// same holds for a success envelope (`ok: true`): a child that answers
+/// successfully and then exits non-zero is reported as the success it answered,
+/// and the failing exit is not reported or logged anywhere, by design, because
+/// the answer is what the caller asked for.
 /// Every other failure names what went wrong and carries the child's stderr.
 pub fn run_engine_stdio<I, S>(
     program: &Path,
