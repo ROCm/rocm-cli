@@ -2127,7 +2127,16 @@ instead of already gone (`a_pid_that_cannot_be_queried_is_unverified_not_already
 `a_failed_open_is_gone_only_for_no_such_process` for the error codes). The PID is
 held open from before the identity read until the stop returns, so the creation
 time that was compared is that of the process the kill then reaches
-(`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). And a
+(`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). A PID
+that could not be held (the process could not be opened) while its identity still
+reads as matching is not signalled either: nothing would reserve it between the
+read and `taskkill`, so the stop is `unverified` and neither the tree kill nor the
+termination runs
+(`a_tree_kill_is_not_run_for_a_pid_that_could_not_be_held_even_when_its_identity_matches`;
+a gone, recycled or unreadable PID keeps its own refusal,
+`an_unheld_pid_that_is_gone_recycled_or_unverifiable_keeps_its_refusal`, and
+where there is no tree-kill step the missing hold changes nothing,
+`without_a_tree_kill_step_an_unheld_pid_is_still_terminated`). And a
 `taskkill` that failed to start or exited nonzero leaves the stop unconfirmed,
 whatever the root's own termination says, because only the root's exit is
 watched on Windows. When the root itself was seen to exit (or was already gone)

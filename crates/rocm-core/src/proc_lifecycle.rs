@@ -706,18 +706,18 @@ const fn after_tree_kill(tree: TreeKill, outcome: TerminationOutcome) -> Termina
 /// [`terminate_recorded_pid`] with its platform and system touchpoints supplied
 /// by the caller, so a test drives the tree-kill step on every host:
 /// `tree_kill` takes one PID's descendants down (`None` where the platform needs
-/// no separate step), `hold` keeps the PID reserved and is dropped when the call
-/// returns, `state_of` reads the PID's identity, and `terminate` is the verified
-/// termination of the root.
+/// no separate step), `hold` keeps the PID reserved, answering `None` when it
+/// could not, and is dropped when the call returns, `state_of` reads the PID's
+/// identity, and `terminate` is the verified termination of the root.
 fn terminate_recorded_pid_with<Held>(
     identity: &ProcessIdentity,
     tree_kill: Option<&dyn Fn(u32) -> TreeKill>,
-    hold: impl FnOnce(&ProcessIdentity) -> Held,
+    hold: impl FnOnce(&ProcessIdentity) -> Option<Held>,
     state_of: impl Fn(&ProcessIdentity) -> IdentityState,
     terminate: impl Fn(&ProcessIdentity) -> TerminationOutcome,
 ) -> TerminationOutcome {
     // Before anything reads the identity, and until the end of the call.
-    let _hold = hold(identity);
+    let held = hold(identity);
     if let Some(tree_kill) = tree_kill {
         // The identity read that decides about the tree kill also decides about
         // the stop. A refusal here (gone, recycled, unverifiable) is the verdict:
@@ -726,6 +726,14 @@ fn terminate_recorded_pid_with<Held>(
         // and then stop the root alone with the tree kill skipped.
         if let Some(refusal) = refusal_before_signalling(state_of(identity)) {
             return refusal;
+        }
+        // An identity that matches is only worth acting on while the PID cannot
+        // change hands before `taskkill` reaches it. Without a hold nothing
+        // reserves it between this read and the kill, which takes a whole tree by
+        // PID, so the stop is not confirmed and nothing is signalled. A process
+        // that could not be opened and also cannot be read was refused above.
+        if held.is_none() {
+            return TerminationOutcome::Unverified;
         }
         // Taken while the root is still alive: `taskkill /T` resolves children
         // through the live parent, so it cannot reach them once the root is gone.
@@ -751,37 +759,41 @@ fn terminate_recorded_pid_with<Held>(
 /// re-verifies it.
 #[cfg(windows)]
 struct PidHold {
-    _handle: Option<std::os::windows::io::OwnedHandle>,
+    _handle: std::os::windows::io::OwnedHandle,
 }
 
 #[cfg(not(windows))]
 struct PidHold;
 
-/// Hold `identity`'s PID. A process that cannot be opened is not held, and the
-/// identity read that follows then refuses it as gone or unverifiable.
+/// Hold `identity`'s PID, or `None` when the process cannot be opened. A stop
+/// whose identity matches but whose PID is not held is not carried out, see
+/// [`terminate_recorded_pid_with`].
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
-fn hold_pid(identity: &ProcessIdentity) -> PidHold {
+fn hold_pid(identity: &ProcessIdentity) -> Option<PidHold> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SAFETY: `OpenProcess` takes only plain values and returns a handle or null;
     // there is no pointer to keep valid.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
-    PidHold {
-        // SAFETY: this closure runs only for a non-null handle, which
-        // `OpenProcess` just returned and which nothing else owns or closes, so
-        // the `OwnedHandle` may take ownership and close it exactly once on drop.
-        _handle: (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) }),
+    if handle.is_null() {
+        return None;
     }
+    Some(PidHold {
+        // SAFETY: `handle` is non-null, `OpenProcess` just returned it and nothing
+        // else owns or closes it, so the `OwnedHandle` may take ownership and
+        // close it exactly once on drop.
+        _handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+    })
 }
 
 // The `cfg` sibling calls non-const code, so this arm cannot be `const` without
 // giving the two platforms different signatures.
 #[cfg(not(windows))]
-#[allow(clippy::missing_const_for_fn)]
-fn hold_pid(_identity: &ProcessIdentity) -> PidHold {
-    PidHold
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+fn hold_pid(_identity: &ProcessIdentity) -> Option<PidHold> {
+    Some(PidHold)
 }
 
 /// The separate descendant kill this platform needs before the verified
@@ -1518,6 +1530,8 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Step {
         Hold(u32),
+        /// The hold could not be taken: nothing reserves the PID.
+        HoldFailed(u32),
         TreeKill(u32),
         Terminate(u32),
         Release,
@@ -1553,7 +1567,7 @@ mod tests {
             has_tree_kill.then_some(&tree_kill as &dyn Fn(u32) -> TreeKill),
             |identity| {
                 steps.borrow_mut().push(Step::Hold(identity.pid));
-                RecordedHold(&steps)
+                Some(RecordedHold(&steps))
             },
             |_| state,
             |identity| {
@@ -1748,7 +1762,7 @@ mod tests {
                 Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
                 |id| {
                     steps.borrow_mut().push(Step::Hold(id.pid));
-                    RecordedHold(&steps)
+                    Some(RecordedHold(&steps))
                 },
                 |id| classify_live_identity(id.start_ticks, live),
                 |id| {
@@ -1794,6 +1808,83 @@ mod tests {
         // step they exercise is the one `terminate_recorded_pid` has on Windows
         // and does without elsewhere, where `terminate_verified` walks the tree.
         assert_eq!(platform_tree_kill().is_some(), cfg!(windows));
+    }
+
+    /// Run `terminate_recorded_pid_with` for a PID whose hold could not be taken
+    /// (the process could not be opened), the identity reading as `state`.
+    fn unheld_run(
+        has_tree_kill: bool,
+        state: IdentityState,
+        outcome: TerminationOutcome,
+    ) -> (TerminationOutcome, Vec<Step>) {
+        let steps = RefCell::new(Vec::new());
+        let tree_kill = |pid: u32| {
+            steps.borrow_mut().push(Step::TreeKill(pid));
+            TreeKill::Completed
+        };
+        let verdict = terminate_recorded_pid_with(
+            &ProcessIdentity::new(SUPERVISOR_PID, None),
+            has_tree_kill.then_some(&tree_kill as &dyn Fn(u32) -> TreeKill),
+            |identity| {
+                steps.borrow_mut().push(Step::HoldFailed(identity.pid));
+                None::<RecordedHold<'_>>
+            },
+            |_| state,
+            |identity| {
+                steps.borrow_mut().push(Step::Terminate(identity.pid));
+                outcome
+            },
+        );
+        (verdict, steps.into_inner())
+    }
+
+    #[test]
+    fn a_tree_kill_is_not_run_for_a_pid_that_could_not_be_held_even_when_its_identity_matches() {
+        // Nothing reserves the PID between the identity read and `taskkill`, which
+        // takes a whole tree by PID, so a recycled PID would lose its tree. The
+        // stop is not confirmed, and neither the tree kill nor the termination runs.
+        let (verdict, steps) = unheld_run(true, IdentityState::Matches, TerminationOutcome::Forced);
+
+        assert_eq!(verdict, TerminationOutcome::Unverified);
+        assert!(!verdict.stopped());
+        assert_eq!(steps, vec![Step::HoldFailed(SUPERVISOR_PID)]);
+    }
+
+    #[test]
+    fn an_unheld_pid_that_is_gone_recycled_or_unverifiable_keeps_its_refusal() {
+        // The hold only adds a refusal for an identity that matches: a process
+        // already known to be gone, a stranger, or unreadable keeps the verdict
+        // the identity read gives it.
+        for (state, expected) in [
+            (IdentityState::Gone, TerminationOutcome::AlreadyGone),
+            (
+                IdentityState::Recycled,
+                TerminationOutcome::IdentityMismatch,
+            ),
+            (IdentityState::Indeterminate, TerminationOutcome::Unverified),
+        ] {
+            let (verdict, steps) = unheld_run(true, state, TerminationOutcome::Forced);
+
+            assert_eq!(verdict, expected, "{state:?}");
+            assert_eq!(steps, vec![Step::HoldFailed(SUPERVISOR_PID)], "{state:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_tree_kill_step_an_unheld_pid_is_still_terminated() {
+        // Elsewhere nothing is held and the termination re-verifies the identity
+        // itself, so the missing hold must not turn a stop into a refusal.
+        let (verdict, steps) =
+            unheld_run(false, IdentityState::Matches, TerminationOutcome::Graceful);
+
+        assert_eq!(verdict, TerminationOutcome::Graceful);
+        assert_eq!(
+            steps,
+            vec![
+                Step::HoldFailed(SUPERVISOR_PID),
+                Step::Terminate(SUPERVISOR_PID)
+            ]
+        );
     }
 
     #[test]
@@ -1892,7 +1983,7 @@ mod tests {
         let verdict = terminate_recorded_pid_with(
             &ProcessIdentity::new(SUPERVISOR_PID, Some(7)),
             Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
-            |_| (),
+            |_| Some(()),
             |_| {
                 // Indeterminate the first time, matching from then on.
                 reads.set(reads.get() + 1);
@@ -2316,7 +2407,7 @@ mod tests {
         let verdict = terminate_recorded_pid_with(
             &ProcessIdentity::new(SUPERVISOR_PID, Some(7)),
             Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
-            |_| (),
+            |_| Some(()),
             state_of,
             // The verified termination's own gate, with the same read.
             |id| refusal_before_signalling(state_of(id)).unwrap_or(TerminationOutcome::Forced),
