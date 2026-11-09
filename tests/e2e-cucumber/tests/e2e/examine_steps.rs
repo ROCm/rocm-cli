@@ -2544,6 +2544,129 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
     );
 }
 
+// ── Both reports read the CPU from one reader ──────────────────────
+
+/// The model a planted AMD `/proc/cpuinfo` names, spelled as `/proc/cpuinfo`
+/// does, with runs of spaces inside it.
+const PLANTED_AMD_CPUINFO: &str = "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 26\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \nprocessor\t: 1\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \n";
+
+/// The same model with its whitespace collapsed: what both reports show.
+const PLANTED_AMD_CPU_MODEL: &str = "AMD Ryzen 9 9950X 16-Core Processor";
+
+/// An Arm board's cpuinfo: a `Hardware` line, no `model name` and no `vendor_id`.
+const PLANTED_HARDWARE_ONLY_CPUINFO: &str =
+    "processor\t: 0\nBogoMIPS\t: 38.40\nCPU implementer\t: 0x41\nHardware\t: BCM2835\n";
+
+/// Plant `cpuinfo` as `/proc/cpuinfo` under a simulated host root inside the
+/// scenario's isolated tree, with a `/dev/dxg` when `wsl`, and hand that root to
+/// the next `rocm` invocation. The root holds nothing else, so the machine reads
+/// as WSL only when asked to and every other re-rooted probe sees an empty one.
+fn plant_cpuinfo_machine(world: &mut E2eWorld, cpuinfo: &str, wsl: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(root.join("proc")).expect("failed to create planted /proc");
+    std::fs::write(root.join("proc").join("cpuinfo"), cpuinfo)
+        .expect("failed to write planted cpuinfo");
+    if wsl {
+        std::fs::create_dir_all(root.join("dev")).expect("failed to create planted /dev");
+        std::fs::write(root.join("dev").join("dxg"), "").expect("failed to plant /dev/dxg");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
+#[given(
+    "a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model"
+)]
+async fn machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, false);
+}
+
+#[given("a machine that is not WSL whose cpuinfo has a Hardware line and no model name")]
+async fn machine_with_a_hardware_only_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_HARDWARE_ONLY_CPUINFO, false);
+}
+
+#[given("a WSL machine whose cpuinfo names an AMD CPU")]
+async fn wsl_machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, true);
+}
+
+/// `summary.cpu`, `cpu_model`, `cpu_vendor` and `is_wsl` of one `rocm examine
+/// --json` run.
+fn cpu_answers(world: &E2eWorld) -> (Option<String>, String, String, bool) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let summary = json
+        .pointer("/summary/cpu")
+        .unwrap_or_else(|| panic!("`examine --json` has no summary.cpu:\n{json:#}"))
+        .as_str()
+        .map(str::to_owned);
+    let is_wsl = json
+        .pointer("/is_wsl")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("`examine --json` has no boolean is_wsl:\n{json:#}"));
+    (
+        summary,
+        inspection_str(&json, "/cpu_model").to_owned(),
+        inspection_str(&json, "/cpu_vendor").to_owned(),
+        is_wsl,
+    )
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as amd"
+)]
+async fn assert_both_report_the_planted_amd_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            PLANTED_AMD_CPU_MODEL.to_owned(),
+            "amd".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as unknown"
+)]
+async fn assert_both_report_the_hardware_line_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some("BCM2835".to_owned()),
+            "BCM2835".to_owned(),
+            "unknown".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor"
+)]
+async fn assert_only_the_summary_reports_the_cpu_on_wsl(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            String::new(),
+            "unknown".to_owned(),
+            true
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]
