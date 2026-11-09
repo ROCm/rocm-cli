@@ -2527,7 +2527,7 @@ async fn plant_oom_launch(world: &mut E2eWorld) {
     // in the `When`, which left this step a no-op whose deletion changed nothing.
     //
     // The consumer of this variable is `e2e_simulate_oom_launch` in
-    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // `apps/rocm/src/service_launch/readiness.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
     // through `e2e-report`, whose producer and consumer are both test-side), the
     // consumer here is the shipped binary's crate, which must not depend on the
     // e2e harness — so the name is spelled out on both sides. A typo fails loudly
