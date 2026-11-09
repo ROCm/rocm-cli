@@ -909,20 +909,6 @@ The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
 previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
 can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
 
-`--version` accepts a `major.minor` line as well as an exact
-`major.minor.patch`. `--version 10.1` resolves the newest stable 10.1.x on the
-ROCm 10 next layout, and `--version 7.14` the newest stable 7.14.x on the
-canonical index. When a ROCm 10 pin cannot be satisfied, the error lists the
-other stable ROCm 10 releases that layout publishes, if any, and suggests one
-of them, never the release that just failed and never `--channel nightly`.
-Loopback-fixture scenarios in
-[therock_next_generation.feature](../tests/e2e-cucumber/features/therock_next_generation.feature)
-cover this: `therock-next-16` (a wheel line pin), `therock-next-17` (the
-failure, which re-runs the suggested command to prove it succeeds) and
-`therock-next-18` (a tarball line pin takes the newest release in the line, not
-the newest upload). They run in the default e2e lane; `therock-next-18` is
-Linux-only because Windows refuses tarball installs.
-
 Then it verifies:
 
 - runtime manifest metadata
@@ -946,6 +932,20 @@ Then it verifies:
 - runtime-only TheRock wheel discovery through
   `rocm_sdk.find_libraries("amdhip64", "hipblas")`
 - vLLM adapter discovery of the managed TheRock runtime environment
+
+`--version` accepts a `major.minor` line as well as an exact
+`major.minor.patch`. `--version 10.1` resolves the newest stable 10.1.x on the
+ROCm 10 next layout, and `--version 7.14` the newest stable 7.14.x on the
+canonical index. When a ROCm 10 pin cannot be satisfied, the error lists the
+other stable ROCm 10 releases that layout publishes, if any, and suggests one
+of them, never the release that just failed and never `--channel nightly`.
+Loopback-fixture scenarios in
+[therock_next_generation.feature](../tests/e2e-cucumber/features/therock_next_generation.feature)
+cover this: `therock-next-16` (a wheel line pin), `therock-next-17` (the
+failure, which re-runs the suggested command to prove it succeeds) and
+`therock-next-18` (a tarball line pin takes the newest release in the line, not
+the newest upload). They run in the default e2e lane; `therock-next-18` is
+Linux-only because Windows refuses tarball installs.
 
 Run the full live test with auto-detected GPU family:
 
@@ -2585,10 +2585,15 @@ compare them in one PEP 440 order over published version strings (`7.9` <
 `7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`, `7.2.4.70204` above
 `7.2.4`). That covers picking the newest ROCm version from a wheel index,
 breaking ties between tarball builds uploaded at the same time, and the
-update-or-not verdict. It does not decide everything on its own: tarball builds
-are picked by upload time first, and on the release channel only a stable
-version in the strict `X.Y.Z` shape is a candidate at all, so a four-component
-release such as `7.2.4.70204` is never picked there. The property tests check
+update-or-not verdict. It does not decide everything on its own: an unpinned
+tarball pick goes by upload time first (a `major.minor` line pin such as
+`--version 10.1` goes by this order first), and without a `--version` pin the
+release channel takes only a stable version in the strict `X.Y.Z` shape, so an
+unpinned pick never lands on a four-component release such as `7.2.4.70204`.
+A wheel line pin is different: `--version 7.2` selects the newest stable
+release in the 7.2 line, `7.2.4.70204` included. The tarball catalog still
+requires the strict shape, so the same line pin cannot pick that release
+there. The property tests check
 that the order is total, that picks do not depend on the order the index lists
 versions in, and that the update verdict points the same way as the order. Two
 spellings of one version (`7.0.0-rc1` and `7.0.0rc1`) are not offered as an
