@@ -1025,9 +1025,13 @@ the running service, or stop it first to serve on the new port.
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+quick smoke test (time to first token and approximate tokens per second). A
+managed vLLM launch waits on vLLM's own readiness budget (5 minutes by default,
+set with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`); other engines keep the 45-second
+managed-launch budget. If the engine records a terminal failure first, the wait
+ends promptly and the failed status is saved instead of being reported as still
+loading. When the service is live, it keeps running after control returns to
+your shell; manage it later with `rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1043,16 +1047,19 @@ can:
   directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
-`--wait` keeps `rocm serve` waiting until the server answers requests or its
-engine gives up (vLLM and AIM after 5 minutes by default; raise it with
-`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
-`rocm services stop`), it fails with an error that points at the server's logs
-instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+`--wait` keeps `rocm serve` waiting in additional readiness-budget windows while
+the server remains alive, until it answers requests or its engine gives up (vLLM
+and AIM after 5 minutes by default; raise that engine limit with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the
+server exits first (crashes, is killed, or is stopped with `rocm services stop`),
+it fails with an error that points at the server's logs instead of waiting
+forever; an engine-reported failure remains `failed` in
+`rocm services list --all`. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
-begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
-when the model is already being served and still starting, it waits on that
-server instead (an already-serving one is reported at once). Watch the download with
+begins, so interrupting the wait does not lose it. It cannot be combined with
+`--foreground` or `--verbose`, and when the model is already being served and
+still starting, it waits on that server instead (an already-serving one is
+reported at once). Watch the download with
 `rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
@@ -1192,9 +1199,11 @@ fine. It appears only when all of the following hold:
   and `--verbose`/`--foreground` streams the engine log in your terminal instead,
   where the traceback is already in front of you. Either way, the log is on
   disk: `rocm services logs <service-id>`.
-- The service **failed to become ready** (recorded status `starting`). A `ready`
-  service, or a `running` one whose endpoint is up while the model is still
-  loading, is healthy and is never given memory advice.
+- The service **failed to become ready** (recorded status `starting` if its
+  readiness budget ended while it was still alive, or `failed` if the engine
+  reported a terminal failure). A `ready` service, or a `running` one whose
+  endpoint is up while the model is still loading, is healthy and is never
+  given memory advice.
 - The log tail carries a real allocator failure — `HIP out of memory`,
   `CUDA out of memory`, `hipErrorOutOfMemory`, or a `torch.OutOfMemoryError`
   corroborated by an allocator message. A bare "out of memory" phrase from the

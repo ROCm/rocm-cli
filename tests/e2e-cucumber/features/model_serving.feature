@@ -721,11 +721,12 @@ Feature: Model serving
     And the refusal points the user at the WSL driver status instead of /dev/kfd
     And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
 
-  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
-  # so it cannot be combined with the attached modes, which already stay on the
-  # terminal. The waiting itself (a live server that becomes ready, one that
-  # exits first) is covered by `wait_past_readiness_budget_*` in
-  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  # `--wait` makes a managed serve continue through readiness-budget windows
+  # while its server remains alive, so it cannot be combined with the attached
+  # modes, which already stay on the terminal. The waiting itself (a live server
+  # that becomes ready, one that exits first) is covered by
+  # `wait_past_readiness_budget_*` in `apps/rocm/src/service_launch.rs`, since a
+  # scenario would need a slow engine.
   @id:serve-wait-conflicts-with-attached-modes
   Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
     When the user serves a model with both --wait and --verbose
@@ -810,3 +811,16 @@ Feature: Model serving
     And a stopped managed service is recorded on the default serve port
     When the user restarts the stopped service
     Then the restart is refused naming the service that holds the port
+
+  # The vLLM adapter and GPU preflight are real, but the server executable is a
+  # short-lived fixture. Deliberately no `@requires-engine:vllm`: that gate asks
+  # whether real vLLM can start on this GPU family, while this scenario overrides
+  # the runtime and would otherwise skip valid adapter coverage on Strix.
+  @id:serve-vllm-engine-exit-reported-failed @requires-gpu @requires-os:linux
+  Scenario: serve-50 - A vLLM server that exits during startup is reported as failed promptly
+    Given a managed runtime is active
+    And a vLLM server will exit during startup
+    When the user launches it as a managed model server
+    Then the managed launch is reported as failed
+    And the failed launch returns promptly
+    And the service state reports the launch as failed

@@ -26,6 +26,8 @@ mod startup_diagnostics;
 mod state;
 mod wheel_builds;
 
+pub use process::ready_timeout;
+
 pub(crate) const ENGINE_NAME: &str = "vllm";
 
 /// The torchaudio release (no `+rocm…` local label) confirmed on hardware for
