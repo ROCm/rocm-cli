@@ -1153,7 +1153,12 @@ Expected result:
   HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
   ```
 
-  At a terminal, the same command asks `[y/N]` and treats Enter as no.
+  At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
+  `maybe` and it cancels after printing `"maybe" is not yes or no; treating it
+  as no.`; press Ctrl-D and `uninstall cancelled` appears on a line of its own,
+  not after the prompt. Nothing is removed in either case. The same prompt is
+  shared by `rocm fix` and the SDK-overwrite prompt, so the same answers behave
+  the same way there.
 
 ## 11. AIM (Docker) Engine Verification
 

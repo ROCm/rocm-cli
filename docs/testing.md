@@ -1314,7 +1314,14 @@ including a folder that cannot be checked stopping the uninstall before
 anything is removed, and a dry run on a machine ROCm CLI never touched
 (`uninstall-06`) reporting nothing to remove and creating no folder. The
 `uninstall` command does not start the file logger, which would otherwise create
-the data folder's `logs` folder before the plan is built:
+the data folder's `logs` folder before the plan is built. `uninstall-07` to
+`uninstall-09` drive the confirmation prompt under a pseudo-terminal, which is
+the only way to reach it, and pin the shared `[y/N]` helper's behaviour for an
+answer that is neither yes nor no, for ending the input with Ctrl-D, and for a
+plain no, each together with the config folder being left in place. They run on
+the default mock lane; the helper's other callers (`rocm fix`, the SDK-overwrite
+prompt) share it and are covered by its unit tests in
+[confirm.rs](../crates/rocm-core/src/confirm.rs):
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"

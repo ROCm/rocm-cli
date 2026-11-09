@@ -80,3 +80,34 @@ Feature: Uninstall
     Then the uninstall succeeds
     And the uninstall reports that nothing would be removed
     And ROCm CLI has still not created its folders
+
+  # The `[y/N]` prompt is shared with `rocm fix` and the SDK-overwrite prompt;
+  # `rocm uninstall` is the one that is cheap to isolate, so the shared helper's
+  # behaviour is pinned here. A prompt is only reached on a real terminal (without
+  # one the command is refused, see uninstall-04), so these run under a
+  # pseudo-terminal. An answer that is neither yes nor no used to be declined with
+  # no sign it was not understood, and ending the input (Ctrl-D) left the
+  # cancellation on the prompt line because no newline had been echoed.
+  @id:uninstall-unrecognized-answer-is-declined-and-said-so @requires-os:linux
+  Scenario: uninstall-07 - An answer that is neither yes nor no is declined, and the user is told so
+    Given the config folder holds the user's files
+    When the user is asked to confirm an uninstall on a real terminal and types an answer that is neither yes nor no
+    Then the user is told the answer was not understood and is treated as no
+    And the uninstall is reported as cancelled
+    And the config folder still holds the user's files
+
+  @id:uninstall-end-of-input-cancels-on-a-fresh-line @requires-os:linux
+  Scenario: uninstall-08 - Ending the input at the confirmation prompt cancels on a fresh line
+    Given the config folder holds the user's files
+    When the user is asked to confirm an uninstall on a real terminal and ends the input instead of answering
+    Then the cancellation is reported on its own line, not on the prompt line
+    And the config folder still holds the user's files
+
+  # The other side of uninstall-07: a deliberate no is not an error to explain.
+  @id:uninstall-plain-no-is-declined-without-complaint @requires-os:linux
+  Scenario: uninstall-09 - Answering no is declined without any complaint
+    Given the config folder holds the user's files
+    When the user is asked to confirm an uninstall on a real terminal and types no
+    Then the uninstall is reported as cancelled
+    And the user is not told the answer was misunderstood
+    And the config folder still holds the user's files

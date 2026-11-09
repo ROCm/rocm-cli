@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 const USER_FILE: &str = "keep.txt";
 
@@ -154,6 +155,145 @@ async fn uninstall_config_unconfirmed(world: &mut E2eWorld) {
         false,
         &["--keep-data", "--keep-cache"],
         &[("ROCM_CLI_CONFIG_DIR", &config)],
+    );
+}
+
+/// Run `rocm uninstall` of the config folder only, without `--yes`, under a real
+/// terminal, wait for the confirmation prompt and send `keys` as the answer.
+///
+/// The piped harness can never reach the prompt (no terminal, so the command is
+/// refused first); a pseudo-terminal is the only way to answer it. The screen
+/// the user would be looking at is kept as the scenario's output.
+async fn answer_uninstall_prompt(world: &mut E2eWorld, keys: &str) {
+    let root = root(world).to_path_buf();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
+    let home = home.display().to_string();
+    let uv = root.join("uv-cache").display().to_string();
+    let hf = root.join("hf-home").display().to_string();
+    let config = config_dir(world).display().to_string();
+    let mut session = TuiSession::spawn_with_env(
+        world,
+        &[
+            "uninstall",
+            "--keep-binaries",
+            "--keep-data",
+            "--keep-cache",
+        ],
+        &[
+            ("HOME", home.as_str()),
+            ("UV_CACHE_DIR", uv.as_str()),
+            ("HF_HOME", hf.as_str()),
+            ("ROCM_CLI_CONFIG_DIR", config.as_str()),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to open the uninstall prompt: {e}"));
+    session
+        .wait_for_screen("Proceed with uninstall? [y/N]:", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the confirmation prompt never appeared: {e}"));
+    session
+        .send(keys)
+        .unwrap_or_else(|e| panic!("failed to answer the prompt: {e}"));
+    let rc = session
+        .wait_for_exit_code(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the CLI never exited after the answer: {e}"));
+    world.cli_output = Some(session.screen_text());
+    world.cli_rc = Some(rc);
+    world.tui = Some(session);
+}
+
+#[when(
+    "the user is asked to confirm an uninstall on a real terminal and types an answer that is neither yes nor no"
+)]
+async fn uninstall_prompt_unrecognized(world: &mut E2eWorld) {
+    answer_uninstall_prompt(world, "maybe\r").await;
+}
+
+#[when(
+    "the user is asked to confirm an uninstall on a real terminal and ends the input instead of answering"
+)]
+async fn uninstall_prompt_end_of_input(world: &mut E2eWorld) {
+    // Ctrl-D on an empty line: the terminal reports end of input and echoes
+    // nothing, which is what left the cursor on the prompt line.
+    answer_uninstall_prompt(world, "\x04").await;
+}
+
+#[when("the user is asked to confirm an uninstall on a real terminal and types no")]
+async fn uninstall_prompt_no(world: &mut E2eWorld) {
+    answer_uninstall_prompt(world, "no\r").await;
+}
+
+/// The screen's lines with trailing padding removed.
+fn screen_lines(world: &E2eWorld) -> Vec<String> {
+    output(world)
+        .lines()
+        .map(|l| l.trim_end().to_owned())
+        .collect()
+}
+
+#[then("the user is told the answer was not understood and is treated as no")]
+async fn told_answer_not_understood(world: &mut E2eWorld) {
+    let lines = screen_lines(world);
+    let expected = "\"maybe\" is not yes or no; treating it as no.";
+    assert!(
+        lines.iter().any(|l| l == expected),
+        "expected a `{expected}` line on the terminal:\n{}",
+        output(world)
+    );
+}
+
+#[then("the user is not told the answer was misunderstood")]
+async fn not_told_answer_misunderstood(world: &mut E2eWorld) {
+    assert!(
+        !output(world).contains("is not yes or no"),
+        "a plain no must not be commented on:\n{}",
+        output(world)
+    );
+}
+
+#[then("the uninstall is reported as cancelled")]
+async fn uninstall_reported_cancelled(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    assert_eq!(
+        rc,
+        0,
+        "declining is not a failure, got exit {rc}:\n{}",
+        output(world)
+    );
+    assert!(
+        screen_lines(world)
+            .iter()
+            .any(|l| l == "uninstall cancelled"),
+        "expected an `uninstall cancelled` line on its own:\n{}",
+        output(world)
+    );
+}
+
+#[then("the cancellation is reported on its own line, not on the prompt line")]
+async fn cancellation_on_its_own_line(world: &mut E2eWorld) {
+    let lines = screen_lines(world);
+    let prompt = lines
+        .iter()
+        .find(|l| l.starts_with("Proceed with uninstall? [y/N]:"))
+        .unwrap_or_else(|| panic!("no prompt line on the terminal:\n{}", output(world)));
+    assert_eq!(
+        prompt,
+        "Proceed with uninstall? [y/N]:",
+        "nothing may follow the prompt after the input ended:\n{}",
+        output(world)
+    );
+    assert!(
+        lines.iter().any(|l| l == "uninstall cancelled"),
+        "expected an `uninstall cancelled` line on its own:\n{}",
+        output(world)
+    );
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "ending the input declines, it does not fail:\n{}",
+        output(world)
     );
 }
 

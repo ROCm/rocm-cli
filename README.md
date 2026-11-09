@@ -1552,10 +1552,12 @@ non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. It does not create the folders it reports
-on: with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there
-is nothing to remove. Outside an interactive terminal, when there is something
+do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds;
+Enter, `n` and `no` cancel quietly, and any other answer cancels too, after a
+line saying it was not understood and is treated as no. Use `--dry-run` to only
+list, and `--yes` to skip the confirmation. It does not create the folders it
+reports on: with `--keep-binaries`, on a computer where ROCm CLI never ran, it
+says there is nothing to remove. Outside an interactive terminal, when there is something
 to remove, it refuses with exit code 1 and removes nothing unless you pass
 `--yes`. Each `--keep-*` flag skips the removal of one category:
 

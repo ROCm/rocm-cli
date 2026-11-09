@@ -23,6 +23,13 @@
 //! without a controlled terminal. Real callers pass `std::io::stdout()` and
 //! `std::io::stdin().lock()`.
 //!
+//! [`read_answer`] also tells the user when their answer was not understood, and
+//! ends the prompt line when the input ended without a newline. Both go to the
+//! `out` stream the caller passes, so every caller gets them and none can forget.
+//! `y`/`yes` approve; `n`/`no`/an empty line decline silently (an empty line is
+//! the documented default); anything else declines with a line saying so, rather
+//! than being mistaken for a deliberate "no".
+//!
 //! [`interactive_terminal`] answers the question callers ask before prompting at
 //! all: whether this process has a terminal on both streams.
 //! [`require_yes_or_interactive`] is the guard built on it for a mutating
@@ -32,9 +39,24 @@
 use anyhow::{Result, bail};
 use std::io::{BufRead, IsTerminal, Write, stdin, stdout};
 
-/// Parse a user's typed response to a `[y/N]` prompt.
-pub fn is_affirmative_answer(line: &str) -> bool {
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+/// How a typed response to a `[y/N]` prompt reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// `y` or `yes`, in any case.
+    Yes,
+    /// `n` or `no`, or an empty line: the prompt's default.
+    No,
+    /// Anything else. Declined like [`Answer::No`], but worth saying so.
+    Unrecognized,
+}
+
+/// Classify a user's typed response to a `[y/N]` prompt.
+pub fn parse_answer(line: &str) -> Answer {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Answer::Yes,
+        "" | "n" | "no" => Answer::No,
+        _ => Answer::Unrecognized,
+    }
 }
 
 /// Write `prompt` to `out` and flush it, so it's visible before a blocking
@@ -54,10 +76,31 @@ pub fn print_prompt(out: &mut impl Write, prompt: &str) -> std::io::Result<()> {
 /// Read one line from `input` and parse it as yes/no. Only errors if the
 /// line can't be read; a declined answer — including an empty read at EOF —
 /// is `Ok(false)`, not an error.
-pub fn read_answer(input: &mut impl BufRead) -> std::io::Result<bool> {
+///
+/// Two things are written to `out` so the caller's own message lands where the
+/// user can read it:
+/// - when the line did not end in a newline (EOF, as from Ctrl-D, so none was
+///   echoed), a newline, ending the prompt line;
+/// - when the answer is [`Answer::Unrecognized`], a line saying it is being
+///   treated as no.
+///
+/// Both writes are best effort: a failure to explain a decline must not turn
+/// into an error that replaces the decline, which `fix`'s `confirm()` relies on.
+pub fn read_answer(input: &mut impl BufRead, out: &mut impl Write) -> std::io::Result<bool> {
     let mut line = String::new();
     input.read_line(&mut line)?;
-    Ok(is_affirmative_answer(&line))
+    if !line.ends_with('\n') {
+        let _ = writeln!(out);
+    }
+    let answer = parse_answer(&line);
+    if answer == Answer::Unrecognized {
+        let _ = writeln!(
+            out,
+            "{:?} is not yes or no; treating it as no.",
+            line.trim()
+        );
+    }
+    Ok(answer == Answer::Yes)
 }
 
 /// Whether this process can hold an interactive exchange with a user.
@@ -112,21 +155,34 @@ mod tests {
     use std::io::{Error, Result};
 
     #[test]
-    fn is_affirmative_answer_accepts_only_y_and_yes() {
+    fn parse_answer_accepts_only_y_and_yes() {
         for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
-            assert!(
-                is_affirmative_answer(accepted),
+            assert_eq!(
+                parse_answer(accepted),
+                Answer::Yes,
                 "expected {accepted:?} to be treated as a yes"
             );
         }
     }
 
     #[test]
-    fn is_affirmative_answer_rejects_everything_else() {
-        for declined in ["n", "no", "", "\n", "yep", "ye"] {
-            assert!(
-                !is_affirmative_answer(declined),
-                "expected {declined:?} to be treated as a decline"
+    fn parse_answer_reads_n_no_and_an_empty_line_as_the_default_no() {
+        for declined in ["n", "N", "no", "NO", " no ", "", "\n", "   \n"] {
+            assert_eq!(
+                parse_answer(declined),
+                Answer::No,
+                "expected {declined:?} to be the default no"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_answer_flags_everything_else_as_unrecognized() {
+        for odd in ["maybe", "yep", "ye", "yes please", "nope", "1", "y n"] {
+            assert_eq!(
+                parse_answer(odd),
+                Answer::Unrecognized,
+                "expected {odd:?} to be unrecognized"
             );
         }
     }
@@ -189,19 +245,92 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_answer_parses_a_typed_line() {
-        let mut input: &[u8] = b"yes\n";
-        assert!(read_answer(&mut input).expect("read from a byte slice cannot fail"));
-
-        let mut input: &[u8] = b"n\n";
-        assert!(!read_answer(&mut input).expect("read from a byte slice cannot fail"));
+    /// Run `read_answer` over `typed` and return the verdict and everything it
+    /// wrote to the output stream.
+    fn answer_and_output(typed: &[u8]) -> (bool, String) {
+        let mut input = typed;
+        let mut out = Vec::new();
+        let verdict =
+            read_answer(&mut input, &mut out).expect("read from a byte slice cannot fail");
+        (
+            verdict,
+            String::from_utf8(out).expect("the helper writes UTF-8"),
+        )
     }
 
     #[test]
-    fn read_answer_at_eof_declines_without_erroring() {
-        let mut input: &[u8] = b"";
-        assert!(!read_answer(&mut input).expect("EOF is Ok(false), not an error"));
+    fn read_answer_approves_y_and_yes_without_writing_anything() {
+        for typed in [&b"y\n"[..], b"yes\n", b"YES\n"] {
+            let (verdict, written) = answer_and_output(typed);
+            assert!(verdict, "{typed:?} must approve");
+            assert_eq!(written, "", "an approval needs no comment");
+        }
+    }
+
+    #[test]
+    fn read_answer_declines_n_no_and_enter_without_writing_anything() {
+        for typed in [&b"n\n"[..], b"no\n", b"\n"] {
+            let (verdict, written) = answer_and_output(typed);
+            assert!(!verdict, "{typed:?} must decline");
+            assert_eq!(
+                written, "",
+                "a deliberate no (or the default) must not be commented on"
+            );
+        }
+    }
+
+    #[test]
+    fn read_answer_declines_an_unrecognized_answer_and_says_so() {
+        let (verdict, written) = answer_and_output(b"maybe\n");
+        assert!(!verdict, "an unrecognized answer must decline");
+        assert_eq!(written, "\"maybe\" is not yes or no; treating it as no.\n");
+    }
+
+    #[test]
+    fn read_answer_at_eof_declines_and_ends_the_prompt_line() {
+        let (verdict, written) = answer_and_output(b"");
+        assert!(!verdict, "EOF is Ok(false), not an error");
+        assert_eq!(written, "\n", "EOF leaves the cursor on the prompt line");
+    }
+
+    #[test]
+    fn read_answer_for_a_partial_line_ends_the_prompt_line_then_says_so() {
+        // Typed text and then EOF, with no newline: the terminal echoed the text
+        // but no newline, so the line must be ended before the feedback line.
+        let (verdict, written) = answer_and_output(b"maybe");
+        assert!(!verdict);
+        assert_eq!(
+            written,
+            "\n\"maybe\" is not yes or no; treating it as no.\n"
+        );
+    }
+
+    #[test]
+    fn read_answer_for_a_yes_without_a_newline_still_approves() {
+        let (verdict, written) = answer_and_output(b"yes");
+        assert!(verdict, "a yes is a yes with or without the final newline");
+        assert_eq!(written, "\n", "the unfinished prompt line is still ended");
+    }
+
+    #[test]
+    fn read_answer_quotes_an_answer_that_holds_control_characters() {
+        // The answer is echoed back, so it is escaped rather than written raw.
+        let (_, written) = answer_and_output(b"\x1b[31mred\n");
+        assert_eq!(
+            written,
+            "\"\\u{1b}[31mred\" is not yes or no; treating it as no.\n"
+        );
+    }
+
+    #[test]
+    fn read_answer_keeps_the_verdict_when_the_feedback_cannot_be_written() {
+        // The explanation is best effort: a closed stdout must not turn a
+        // decline into an error, which `fix`'s `confirm()` relies on.
+        let mut input: &[u8] = b"maybe\n";
+        let mut out = FailingWriter;
+        let verdict = read_answer(&mut input, &mut out)
+            .expect("a failed feedback write must not replace the verdict");
+        assert!(!verdict);
     }
 
     /// A reader whose `read_line` always fails, so a real I/O failure on the
@@ -224,7 +353,9 @@ mod tests {
     #[test]
     fn read_answer_surfaces_a_read_failure_as_an_error() {
         let mut input = FailingReader;
-        read_answer(&mut input).expect_err("a failing reader must return Err");
+        let mut out = Vec::new();
+        read_answer(&mut input, &mut out).expect_err("a failing reader must return Err");
+        assert!(out.is_empty(), "nothing is written for a failed read");
     }
 
     #[test]
