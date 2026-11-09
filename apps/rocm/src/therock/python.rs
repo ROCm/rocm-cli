@@ -1367,7 +1367,11 @@ fn python_venv_probe_temp_root() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    // Only the Unix tests use these two; the tests that run on every platform
+    // import the sink in their own bodies.
+    #[cfg(unix)]
     use super::super::managed_runtime_root;
+    #[cfg(unix)]
     use super::super::process::PROGRESS_LINE_SINK;
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
