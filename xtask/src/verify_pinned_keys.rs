@@ -1221,10 +1221,20 @@ mod tests {
     /// embedded key's body — whitespace or punctuation — are normalized away
     /// and do not register as divergence.
     ///
-    /// Whether such a body is harmless rests on the consumers' PEM readers
-    /// (OpenSSL in the installers, `pem-rfc7468` in the binary) rejecting or
-    /// ignoring it at load time; this check does not decide that. Pinned so the
-    /// normalization's reach is visible rather than implicit.
+    /// The two kinds differ for the installers that read the key. Whitespace
+    /// is harmless: OpenSSL, which install.sh calls, loads the key with a space
+    /// inserted, and `Convert.FromBase64String` (install.ps1) skips whitespace.
+    /// Punctuation is not: OpenSSL refuses to load the key with a `!` or `.`
+    /// inserted, and `FromBase64String` throws on any other character outside
+    /// the alphabet. Such an installer rejects every release signed with that
+    /// key — it fails closed, not open — while this check passes, which is the
+    /// drift between CI and the installers that the check exists to catch.
+    ///
+    /// Not changed here. Tightening means keeping every non-whitespace
+    /// character in the comparison while still dropping what each embedding's
+    /// quoting adds (the `\n` and `` `n `` escapes, a Rust string's `\` line
+    /// continuations); that change should turn the `!` and `.` cases below into
+    /// divergence and update this test.
     #[test]
     fn non_base64_noise_in_an_embedded_key_is_normalized_away() {
         let canonical = canonical_release_key_text();
