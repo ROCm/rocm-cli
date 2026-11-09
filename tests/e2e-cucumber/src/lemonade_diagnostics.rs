@@ -1913,7 +1913,7 @@ esac
                 // line, so start a fresh one: the parent reads the first line that
                 // begins with the marker.
                 println!("\npid:{}", std::process::id());
-                std::thread::sleep(Duration::from_secs(30));
+                std::thread::sleep(Duration::from_secs(CHILD_LIFETIME_SECS));
             }
             Ok("exit") => println!("child-ran"),
             _ => {}
@@ -1940,6 +1940,41 @@ esac
     /// and print its pid inside the earlier one (a loaded runner, a cold test
     /// binary), which is a slow start and not a failure of the probe.
     const CHILD_START_ATTEMPTS: [u64; 3] = [5, 20, 60];
+
+    /// How much longer than the longest attempt the helper child stays alive. The
+    /// child must still be running when the probe's timeout fires on any attempt:
+    /// one that had exited by itself would be a normal exit, not a timeout, and the
+    /// test would fail for a correct probe.
+    const CHILD_LIFETIME_MARGIN_SECS: u64 = 60;
+
+    /// The helper child's lifetime, derived from the attempt timeouts so the two
+    /// cannot drift apart.
+    const CHILD_LIFETIME_SECS: u64 = {
+        let mut longest = 0;
+        let mut at = 0;
+        while at < CHILD_START_ATTEMPTS.len() {
+            if CHILD_START_ATTEMPTS[at] > longest {
+                longest = CHILD_START_ATTEMPTS[at];
+            }
+            at += 1;
+        }
+        longest + CHILD_LIFETIME_MARGIN_SECS
+    };
+
+    /// The helper child outlives every attempt's timeout by at least half a minute
+    /// (the margin is asserted as a literal so shrinking the constant fails), so the
+    /// timeout, kill and reap path is what ends it on each retry. Giving the child a
+    /// literal lifetime that a longer attempt can overtake (it was 30 seconds against
+    /// a 60-second attempt) turns this red.
+    #[test]
+    fn the_helper_child_outlives_every_attempt_deadline() {
+        for attempt in CHILD_START_ATTEMPTS {
+            assert!(
+                CHILD_LIFETIME_SECS >= attempt + 30,
+                "the child lives {CHILD_LIFETIME_SECS}s but an attempt waits {attempt}s"
+            );
+        }
+    }
 
     /// One run of the timeout path against a helper child that libtest runs with
     /// `test_threads` test threads: the child is still running when the timeout
