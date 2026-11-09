@@ -125,6 +125,9 @@ fn runtime_library_path_env(
 }
 
 fn probe_pytorch_on_path(e: &mut Examination) {
+    // On Windows `which` also accepts any `PATHEXT` spelling (`python.PY`, `.PS1`),
+    // while the probe starts the bare name through `Command`, which only starts an
+    // `.exe`: the same caveat as in `probe_llama_cpp`.
     let py = if which("python") {
         "python"
     } else if which("python3") {
@@ -222,6 +225,10 @@ fn record_pytorch_probe(e: &mut Examination, rc: i32, out: &str, err: &str) {
 }
 
 fn probe_llama_cpp(e: &mut Examination) {
+    // `which` follows `PATHEXT` on Windows, so a name can read as found through an
+    // extension this probe cannot run (`llama-cli.PS1`): the probe starts the bare
+    // name through `Command`, which only starts an `.exe`. The report can then
+    // name a binary it cannot start; the later run fails and says so.
     let binary = ["llama-cli", "llama-server", "main"]
         .into_iter()
         .find(|name| which(name));

@@ -552,7 +552,7 @@ Feature: GPU detection and system inspection
   # `rocm examine --json` asks twice whether `rocminfo` is installed on WSL: the
   # host summary (`summary.wsl.rocminfo`) and the examination (`wsl.rocminfo`).
   # They used to use two different PATH lookups and could disagree; they now use
-  # one, and these three scenarios hold the two answers level on the cases where
+  # one, and these scenarios hold the two answers level on the cases where
   # the old lookups differed. The planted WSL machine is the one `examine-32` uses
   # (a simulated host root with `/dev/dxg`); the runner's own PATH entries that
   # hold a `rocminfo` are left out, so a runner with ROCm installed cannot be the
