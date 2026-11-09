@@ -23,12 +23,14 @@ pub fn non_zero_dimensions(rows: u16, cols: u16) -> Result<(NonZeroU16, NonZeroU
     }
 }
 
-/// Resize the emulated screen first, then the real PTY, under one lock.
+/// Resize the emulated screen first, then the real PTY.
 ///
-/// `resize_pty` is the call that resizes the real PTY and so signals the child;
-/// it runs while the emulator is still locked, and whatever it returns is
-/// returned. If it fails, the emulated screen goes back to its old size so the
-/// two never disagree.
+/// `resize_pty` is the call that resizes the real PTY and so signals the child.
+/// It runs after the emulated screen has taken the new size and with the
+/// emulator unlocked, so the reader thread keeps draining the child's output
+/// while it runs. If it fails, the emulated screen goes back to its old size so
+/// the two never disagree; that restores the size only, not any cells a shrink
+/// truncated, which is acceptable because a failed resize fails the step.
 ///
 /// The order is the point. The child redraws the moment it learns the new size,
 /// and the reader thread feeds whatever it writes to the emulator. Resizing the
@@ -39,33 +41,47 @@ pub fn non_zero_dimensions(rows: u16, cols: u16) -> Result<(NonZeroU16, NonZeroU
 /// repairs the damage. Any scheduling stall of the harness thread between the
 /// two calls (a loaded CI runner) opens that window. With the emulator resized
 /// first, whatever the child writes in answer to the resize is parsed at the new
-/// size, and a frame it drew for the old size is only repainted over, because
-/// the child clears and redraws on a resize. The emulator stays locked across
-/// the PTY call so the reader parses nothing at a size that is about to be
-/// rolled back.
+/// size.
+///
+/// The same argument is not made, and not tested, for shrinking: a frame the
+/// child drew for the old, larger size can reach the already smaller emulator
+/// and wrap there, but the child clears and redraws on a resize, so that residue
+/// is repainted over. Shrinking relies on the child doing so; a test of it would
+/// pass with either order and so would not guard anything.
+///
+/// The emulator is deliberately not held locked across `resize_pty`: the reader
+/// drains the PTY under that lock, and a PTY resize that waits for the child's
+/// output to drain (which a Windows pseudoconsole is not documented to rule out)
+/// would then deadlock against it.
 ///
 /// Pure of any PTY on purpose, like [`non_zero_dimensions`]: the driver lives in
 /// the cucumber binary, where plain `#[test]`s never run, so the ordering is
 /// covered here by `cargo test -p e2e-cucumber --lib`.
-pub fn resize_screen_then_pty<T>(
+pub fn resize_screen_then_pty(
     parser: &Mutex<vt100::Parser>,
     rows: u16,
     cols: u16,
-    resize_pty: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    resize_pty: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     // Validate before touching either side, so a zero dimension fails cleanly
     // instead of leaving the PTY and the emulated screen at different sizes.
     let (vt_rows, vt_cols) = non_zero_dimensions(rows, cols)?;
     // Recover rather than fail on a poisoned lock: resizing is still meaningful
     // even if some earlier operation panicked while holding it.
-    let mut parser = parser
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (old_rows, old_cols) = parser.screen().size();
-    parser.screen_mut().set_size(vt_rows, vt_cols);
+    let lock = || {
+        parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let (old_rows, old_cols) = {
+        let mut parser = lock();
+        let old = parser.screen().size();
+        parser.screen_mut().set_size(vt_rows, vt_cols);
+        old
+    };
     let resized = resize_pty();
     if resized.is_err() {
-        parser.screen_mut().set_size(old_rows, old_cols);
+        lock().screen_mut().set_size(old_rows, old_cols);
     }
     resized
 }
@@ -148,17 +164,21 @@ mod tests {
         };
 
         let resized = resize_screen_then_pty(&parser, 40, 120, || {
-            // The child redraws as soon as it is signalled; then the harness
-            // thread is descheduled for a while before it returns, which is the
-            // window a PTY-first order leaves open.
+            // The child redraws as soon as it is signalled, and the harness
+            // thread does not return from the PTY call until the reader has
+            // parsed that redraw: the window a PTY-first order leaves open (a
+            // frame parsed before the emulator has its new size), and, if the
+            // emulator were kept locked across this call, one the reader could
+            // never get through, so the wait below would time out.
             go.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-            Ok(())
+            wait_parsed
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| {
+                    "the reader could not parse the child's redraw while the PTY resize ran"
+                        .to_owned()
+                })
         });
         assert_eq!(resized, Ok(()));
-        wait_parsed
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the child's frame was never parsed");
         reader.join().unwrap();
 
         assert_eq!(size(&parser), (40, 120));
@@ -178,7 +198,7 @@ mod tests {
     #[test]
     fn a_failed_pty_resize_puts_the_emulated_screen_back_and_reports_the_error() {
         let parser = parser(24, 80);
-        let resized: Result<(), String> =
+        let resized =
             resize_screen_then_pty(
                 &parser,
                 40,
@@ -203,12 +223,5 @@ mod tests {
         );
         assert!(!pty_resized, "the PTY was resized for an invalid size");
         assert_eq!(size(&parser), (24, 80));
-    }
-
-    #[test]
-    fn a_successful_resize_returns_what_the_pty_call_returned() {
-        let parser = parser(24, 80);
-        assert_eq!(resize_screen_then_pty(&parser, 45, 180, || Ok(7)), Ok(7));
-        assert_eq!(size(&parser), (45, 180));
     }
 }
