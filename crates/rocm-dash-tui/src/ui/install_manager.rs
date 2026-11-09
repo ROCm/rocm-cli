@@ -2,12 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Install overlay (Phase 3 Wave 2).
+//! Install overlay.
 //!
 //! A compact form that builds a `rocm install sdk …` invocation (TheRock ROCm
 //! wheels). Dry-run is read-only and spawns straight through the job-bridge; a
 //! real install is mutating and routes through the approval gate first. The
-//! install folder is picked with the Wave-0 [`FolderBrowser`]. Streaming-install
+//! install folder is picked with the [`FolderBrowser`]. Streaming-install
 //! archetype, zero thread::spawn/try_recv.
 
 use crossterm::event::{KeyCode, KeyEvent};

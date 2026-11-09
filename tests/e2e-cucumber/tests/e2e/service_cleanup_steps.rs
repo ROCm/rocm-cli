@@ -18,7 +18,7 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 
 /// Id of the record every scenario here plants.
-const SERVICE_ID: &str = "vllm-e2e-cleanup";
+pub(crate) const SERVICE_ID: &str = "vllm-e2e-cleanup";
 /// Engine name, which also picks the engine state directory the record's third
 /// file lives in (`<data>/engines/vllm/state/`).
 const ENGINE: &str = "vllm";
@@ -62,7 +62,7 @@ fn data_dir(world: &E2eWorld) -> PathBuf {
         .join("data")
 }
 
-fn services_dir(world: &E2eWorld) -> PathBuf {
+pub(crate) fn services_dir(world: &E2eWorld) -> PathBuf {
     data_dir(world).join("services")
 }
 
@@ -96,7 +96,7 @@ fn record_files(world: &E2eWorld) -> Vec<PathBuf> {
 ///
 /// The engine state file must agree with `status`: the CLI adopts whatever that
 /// file says before it decides anything else.
-fn plant_record(world: &E2eWorld, status: &str) {
+pub(crate) fn plant_record(world: &E2eWorld, status: &str) {
     let services = services_dir(world);
     let states = engine_state_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");

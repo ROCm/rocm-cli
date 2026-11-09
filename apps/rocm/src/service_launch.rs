@@ -74,6 +74,11 @@ pub(crate) use spawn::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
     managed_service_process_command,
 };
+// The helper is platform-independent, but outside tests nothing on Windows
+// calls it through this path, so a plain re-export there would be unused. The
+// `services_text` log-tail tests call it and are compiled on Windows too.
+#[cfg(all(windows, test))]
+pub(crate) use spawn::managed_engine_startup_failure_detail;
 pub(crate) use start::{
     print_managed_launch_plain, start_managed_service, wait_begin_client_config,
 };
