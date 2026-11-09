@@ -289,7 +289,7 @@ form works depends on the engine your GPU selects.
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
-| `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus a text-only Anthropic `/v1/messages` endpoint) |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
@@ -958,6 +958,25 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
                    [--engine-env KEY=VALUE]...
 ```
+
+Alongside the OpenAI-compatible endpoint, a served model gets an
+Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
+`rocm services list` and in the interactive `rocm serve` summary (a fresh launch
+waits briefly for it; if it is not there yet, check `rocm services list`). It is
+a text-only, non-streaming endpoint. It is a base URL: point an
+Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
+if the service has one, as `x-api-key` (the translation front also accepts a
+bearer token). `rocm` runs a
+translation front on its own port, inside the serving process, so it starts and
+stops with the service; it fronts the engine even when the engine has its own
+`/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
+answers, and the reply names it. The translation covers text turns, system
+prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
+streaming, tool use (`tools`, `tool_choice`), extended thinking and image or
+other non-text content blocks are refused with
+an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
+marks the endpoint `(not responding)` when a ready service's endpoint does not
+answer.
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
