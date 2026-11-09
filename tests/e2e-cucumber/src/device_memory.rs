@@ -553,10 +553,19 @@ pub const SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SMI_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How long to wait for the reader after the child has exited. A grandchild
-/// that inherited the pipe can keep it open, so the reader is abandoned
-/// rather than joined.
-const SMI_DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// How long to wait for the reader after the child has exited successfully.
+///
+/// The output is already in the pipe by then and the reader only has to be
+/// scheduled to hand it over, so the wait ends the moment it does and the bound
+/// matters only when it cannot: a loaded runner that has not run the reader
+/// thread yet, where a short bound would turn a good sample into an unreadable
+/// one (and three of those in a row make the wait give up). A grandchild that
+/// inherited the pipe can keep it open for good, so past this bound the reader
+/// is abandoned rather than joined. The bound is generous because the cost of
+/// that case, one grace per probe, is small next to [`SMI_PROBE_TIMEOUT`] and
+/// the probes here do not fork helpers that outlive them. After a kill there is
+/// no wait at all: a probe that outlived its deadline is unreadable at once.
+const SMI_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Run `command` and return its stdout if it exits successfully within `timeout`.
 ///
@@ -610,11 +619,18 @@ pub fn bounded_stdout(mut command: Command, timeout: Duration) -> Probe<String> 
     if !status.success() {
         return Probe::Unreadable;
     }
-    receiver
-        .recv_timeout(SMI_DRAIN_GRACE)
-        .map_or(Probe::Unreadable, |bytes| {
-            Probe::Read(String::from_utf8_lossy(&bytes).into_owned())
-        })
+    output_after_clean_exit(|grace| receiver.recv_timeout(grace).ok())
+}
+
+/// The reading from a probe that exited successfully, given a way to wait for
+/// the reader's bytes for at most the grace it is passed. A function of the wait
+/// so a test can pin the bound that is offered without sleeping.
+fn output_after_clean_exit(
+    wait_for_reader: impl FnOnce(Duration) -> Option<Vec<u8>>,
+) -> Probe<String> {
+    wait_for_reader(SMI_DRAIN_GRACE).map_or(Probe::Unreadable, |bytes| {
+        Probe::Read(String::from_utf8_lossy(&bytes).into_owned())
+    })
 }
 
 #[cfg(test)]
@@ -1364,6 +1380,31 @@ mod tests {
             sample_is_truncated(now + Duration::from_secs(5), now),
             "past the deadline is truncated"
         );
+    }
+
+    /// A probe that exited successfully has its output in the pipe, and a loaded
+    /// runner can take longer than the old 200 ms to run the reader thread that
+    /// hands it over. The wait it is offered must outlast that, the bytes it
+    /// returns are the reading, and only a reader that never answers (a
+    /// grandchild holding the pipe) is unreadable.
+    #[test]
+    fn a_clean_exit_waits_for_a_slow_reader_and_only_a_silent_one_is_unreadable() {
+        let mut offered = None;
+        let out = output_after_clean_exit(|grace| {
+            offered = Some(grace);
+            Some(b"MEM 1 2\n".to_vec())
+        });
+        assert_eq!(out, Probe::Read("MEM 1 2\n".to_owned()));
+        let offered = offered.expect("the wait was asked for");
+        assert!(
+            offered >= Duration::from_secs(1),
+            "a reader on a loaded runner was offered only {offered:?}"
+        );
+        assert!(
+            offered <= SMI_PROBE_TIMEOUT,
+            "the grace for one probe is {offered:?}, longer than the probe itself"
+        );
+        assert_eq!(output_after_clean_exit(|_| None), Probe::Unreadable);
     }
 
     #[cfg(unix)]
