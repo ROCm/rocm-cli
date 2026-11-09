@@ -350,7 +350,7 @@ fn describe_hours(hours: u64) -> String {
 ///
 /// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
 /// like: `serve` writes the 0600 `<id>.endpoint-key` before
-/// `spawn_managed_engine_child` (in `service_launch.rs`) writes the first
+/// `spawn_managed_engine_child` (in `service_launch/spawn.rs`) writes the first
 /// `<id>.json`. Nothing about
 /// the file distinguishes the two cases — under `--any-age` there is no age gate
 /// left to ask — so this function does not try. It is only ever reached with the
@@ -633,9 +633,9 @@ fn apply_service_prune_plan(
 /// leftover, and that is also what a launch looks like mid-flight: `serve`
 /// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
 /// first `<id>.json` only lands at `record.write()` inside
-/// `spawn_managed_engine_child` (in `service_launch.rs`). Between those two writes a live server's
-/// secret is indistinguishable from a leftover, and `--any-age` removes the age
-/// gate that used to hide the window, so a concurrent
+/// `spawn_managed_engine_child` (in `service_launch/spawn.rs`). Between those two
+/// writes a live server's secret is indistinguishable from a leftover, and
+/// `--any-age` removes the age gate that used to hide the window, so a concurrent
 /// `rocm services prune --any-age --yes` deleted it.
 ///
 /// `serve` already holds `managed_launch_lock_path` across the whole of that

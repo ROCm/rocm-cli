@@ -22,7 +22,7 @@ e2e-test-hooks = [
 # hook that simulates a managed vLLM launch which OOM'd and never became ready,
 # so the positive OOM-guidance summary can be verified on a GPU-less CI host.
 # See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in
-# `service_launch.rs`.
+# `service_launch/readiness.rs`.
 e2e-oom-fault-injection = []
 
 [dependencies]
@@ -65,7 +65,6 @@ libc.workspace = true
 [target.'cfg(windows)'.dependencies]
 self-replace = "1.5"
 windows-native-keyring-store = "1.1"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0", features = ["keychain"] }

@@ -11,6 +11,13 @@ Feature: TheRock "next" ROCm 10 install layout
   # Scenarios 01-05 point source overrides at loopback fixtures through the
   # explicit trust gate. Scenario 06 proves the same overrides are inert when
   # the trust gate is absent; scenario 07 supplies the live GPU evidence.
+  #
+  # A ROCm 10 preview has a real `uv pip compile` choose the torch and torchvision
+  # versions, and a preview never fetches `uv` itself. The scenarios below that
+  # print resolved package specs (02, 10, 11 and 13) therefore start from an
+  # installed `uv`, which is the precondition they always had when the preview
+  # fetched one for them. runtime-27 and runtime-28 in `runtime_setup.feature` pin
+  # the preview's behaviour with a `uv` present and with none.
 
   # The regression this pins: a "next-first" dispatch that probes the ROCm 10
   # sources before the canonical ones. An unpinned release install must never
@@ -30,6 +37,7 @@ Feature: TheRock "next" ROCm 10 install layout
   @id:therock-next-02-wheel-pins-raw-device-extras
   Scenario: therock-next-02 - A pinned ROCm 10 wheel install resolves the next index with raw device extras
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the preview resolves the ROCm 10 pip index
     And the preview reports the next source layout generation
@@ -195,6 +203,7 @@ Feature: TheRock "next" ROCm 10 install layout
   @id:therock-next-09-wheel-devel-adds-the-toolchain
   Scenario: therock-next-10 - A pinned ROCm 10 wheel install adds the toolchain when asked
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
     Then the preview resolves the ROCm 10 pip index
     And the preview requests the gfx1200 device extras with the toolchain
@@ -210,6 +219,7 @@ Feature: TheRock "next" ROCm 10 install layout
   @id:therock-next-11-older-pin-keeps-one-rocm-build
   Scenario: therock-next-11 - A ROCm 10 wheel install pinned below the newest build installs only that build
     Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the preview resolves the ROCm 10 pip index
     And every package in the preview is built for ROCm 10.0.0
@@ -235,6 +245,7 @@ Feature: TheRock "next" ROCm 10 install layout
   @id:therock-next-13-verified-torchaudio-over-newer-rebuild
   Scenario: therock-next-13 - A ROCm 10 wheel install takes the hardware-verified torchaudio over a newer rebuild
     Given a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label
+    And a uv is already installed
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0
     Then the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild
 

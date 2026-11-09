@@ -143,6 +143,11 @@ reason = "example"
 when = {}
 bug = "#123"
 reason = "example"
+
+[["serve-lemonade-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "example"
 """
 
 
@@ -187,6 +192,15 @@ def run_self_test() -> None:
     hits = check(commits="abc123 Fixes EAI-7333\n")
     assert hits == {"EAI-7333": ["serve-vllm-inference"]}, hits
     print("self-test: refs read from commit messages ok")
+
+    # A row keyed to an open tracker id follows that id, and an id that is no
+    # longer in any row (a closed issue the rows were repointed away from) does
+    # not match: the hint reads the ids out of the matrix, it hard-codes none.
+    hits = check(body="Refs ROCMAI-898")
+    assert hits == {"ROCMAI-898": ["serve-lemonade-inference"]}, hits
+    hits = check(body="Refs #897")
+    assert hits == {}, hits
+    print("self-test: hint follows the id in the matrix (ROCMAI-898 yes, #897 no) ok")
 
     print("xfail hint self-test: ok")
 

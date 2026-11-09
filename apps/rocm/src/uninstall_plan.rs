@@ -21,22 +21,26 @@
 //! describe the `uninstall` command's own, exclusive logic.
 //!
 //! This module owns: the plan types (`UninstallOptions`, `UninstallPlan`,
-//! `UninstallPlanEntry`), building the plan (`build_uninstall_plan`,
+//! `UninstallPlanEntry`), the `PlanAudience` a rendered plan is written for
+//! (a person at a terminal, a captured caller, or the assistant's preview),
+//! which decides what the dry-run footer says comes next, building the plan (`build_uninstall_plan`,
 //! `plan_installed_binaries`, and the installed-binary/shared-cache
 //! discovery helpers behind them), rendering it (`render_uninstall_dry_run`,
 //! `render_uninstall_plan`), the `[y/N]` confirmation prompt
 //! (`confirm_uninstall`), and the filesystem removal primitive both
 //! `uninstall.rs` and `storage.rs` call to carry a plan out (`remove_path`,
 //! and the entry-resolution helpers behind it). `uninstall.rs` calls into it
-//! for `UninstallOptions`/`UninstallPlan`/`build_uninstall_plan`/
+//! for `PlanAudience`/`UninstallOptions`/`UninstallPlan`/`build_uninstall_plan`/
 //! `confirm_uninstall`/`is_rocm_install_entry_name`/`remove_path`/
 //! `render_uninstall_plan`; `storage.rs` calls into it for
 //! `UninstallPlan`/`UninstallPlanEntry`/`confirm_uninstall`; `runtimes_cmd.rs`
 //! calls into it for `confirm_uninstall` (the same `[y/N]` prompt, reused for
 //! `rocm runtimes uninstall`); `chat/mcp_bridge.rs` calls into it for
 //! `render_uninstall_dry_run` (the deterministic uninstall-preview tool
-//! result); `deletion_properties.rs`'s recursive-deletion property tests call
-//! into it for `UninstallOptions`/`build_uninstall_plan`/`remove_path`/
+//! result, which renders for `PlanAudience::Assistant` itself and so does not
+//! import the type); `deletion_properties.rs`'s recursive-deletion property
+//! tests call into it for `PlanAudience` (the `uninstall_case` property renders
+//! as `Captured`)/`UninstallOptions`/`build_uninstall_plan`/`remove_path`/
 //! `render_uninstall_plan`.
 
 use std::fmt::Write as _;
@@ -268,10 +272,61 @@ pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
         ..UninstallOptions::default()
     };
     let plan = build_uninstall_plan(paths, &options)?;
-    Ok(render_uninstall_plan(&plan, &options))
+    Ok(render_uninstall_plan(
+        &plan,
+        &options,
+        PlanAudience::Assistant,
+    ))
 }
 
-pub(crate) fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> String {
+/// Who reads a rendered plan, which decides what its dry-run footer can truthfully
+/// say comes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanAudience {
+    /// A person at a terminal ran `rocm uninstall --dry-run` themselves: running
+    /// the same command again without `--dry-run` is the next step.
+    Terminal,
+    /// The output is captured by a caller (a script, the dashboard, the daemon's
+    /// tool). Whatever drives that caller has its own way to proceed, so there
+    /// is no next step to name; "run it again" would address the wrong reader.
+    Captured,
+    /// The assistant's read-only preview tool: it has no flag to offer, and the
+    /// removal itself goes through an approval step.
+    Assistant,
+}
+
+impl PlanAudience {
+    /// The audience for `rocm uninstall` itself, from whether `interactive_terminal`
+    /// holds: stdin and stdout are both terminals. A dry run with either one
+    /// redirected, `--dry-run < /dev/null` at a terminal for one, is `Captured`
+    /// and prints no footer.
+    pub(crate) const fn for_command(interactive_terminal: bool) -> Self {
+        if interactive_terminal {
+            Self::Terminal
+        } else {
+            Self::Captured
+        }
+    }
+
+    /// What a dry run says to do next, if anything.
+    const fn dry_run_footer(self) -> Option<&'static str> {
+        match self {
+            Self::Terminal => {
+                Some("Nothing was removed. To remove these items, run it again without --dry-run.")
+            }
+            Self::Captured => None,
+            // The assistant's own uninstall is an approval action; see
+            // `lifecycle_read_mutate_split_is_honest` in `tool_policy.rs`.
+            Self::Assistant => Some("Nothing was removed. Removal needs your approval."),
+        }
+    }
+}
+
+pub(crate) fn render_uninstall_plan(
+    plan: &UninstallPlan,
+    options: &UninstallOptions,
+    audience: PlanAudience,
+) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "Uninstall review");
     let _ = writeln!(output);
@@ -299,9 +354,13 @@ pub(crate) fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOpt
     for skipped in &plan.skipped {
         let _ = writeln!(output, "  - {skipped}");
     }
-    if options.dry_run {
+    // An empty plan has nothing to approve, so a dry run says nothing about a next step.
+    if options.dry_run
+        && !uninstall::plan_is_empty(plan)
+        && let Some(footer) = audience.dry_run_footer()
+    {
         let _ = writeln!(output);
-        let _ = writeln!(output, "Choose Review uninstall to approve removal.");
+        let _ = writeln!(output, "{footer}");
     }
     output
 }
@@ -379,7 +438,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 pub(crate) fn confirm_uninstall() -> Result<bool> {
     rocm_core::confirm::print_prompt(&mut io::stdout(), "Proceed with uninstall? [y/N]: ")
         .context("failed to write uninstall prompt")?;
-    rocm_core::confirm::read_answer(&mut io::stdin().lock())
+    rocm_core::confirm::read_answer(&mut io::stdin().lock(), &mut io::stdout())
         .context("failed to read uninstall confirmation")
 }
 
@@ -520,6 +579,95 @@ pub(crate) fn remove_path(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+
+    fn plan_with_a_binary() -> UninstallPlan {
+        UninstallPlan {
+            self_delete: Some(PathBuf::from("/opt/bin/rocm")),
+            ..UninstallPlan::default()
+        }
+    }
+
+    fn dry_run() -> UninstallOptions {
+        UninstallOptions {
+            dry_run: true,
+            ..UninstallOptions::default()
+        }
+    }
+
+    /// A person at a terminal who dry-runs is told to run the same command again
+    /// without `--dry-run`: the next step is a rerun, not a control the command
+    /// line lacks. The scenario `uninstall-07` runs it again at a terminal and
+    /// checks that the listed folder goes.
+    #[test]
+    fn terminal_dry_run_footer_says_to_run_it_again_without_dry_run() {
+        let output =
+            render_uninstall_plan(&plan_with_a_binary(), &dry_run(), PlanAudience::Terminal);
+        assert!(
+            output.ends_with(
+                "\nNothing was removed. To remove these items, run it again without --dry-run.\n"
+            ),
+            "unexpected footer in:\n{output}"
+        );
+        assert!(!output.contains("Review uninstall"), "{output}");
+    }
+
+    /// Output a caller captures is not addressed to someone who can rerun it, so
+    /// it carries no next step (the dashboard's `/uninstall` and the daemon's
+    /// `rocm_command` tool run the dry run as a subprocess, where the real step
+    /// is theirs to offer).
+    #[test]
+    fn captured_dry_run_names_no_next_step() {
+        let output =
+            render_uninstall_plan(&plan_with_a_binary(), &dry_run(), PlanAudience::Captured);
+        assert!(!output.contains("Nothing was removed."), "{output}");
+        assert!(!output.contains("run it again"), "{output}");
+        assert!(output.contains("1 item(s) would be removed:"), "{output}");
+    }
+
+    /// The command picks its audience from whether it has a terminal.
+    #[test]
+    fn the_command_is_addressed_to_a_terminal_only_when_it_has_one() {
+        assert_eq!(PlanAudience::for_command(true), PlanAudience::Terminal);
+        assert_eq!(PlanAudience::for_command(false), PlanAudience::Captured);
+    }
+
+    /// An empty plan has nothing to approve, so a dry run adds no next step for
+    /// anyone; a real run adds none either, since its confirmation prompt follows.
+    #[test]
+    fn footer_is_only_for_a_dry_run_that_has_something_to_remove() {
+        for audience in [
+            PlanAudience::Terminal,
+            PlanAudience::Captured,
+            PlanAudience::Assistant,
+        ] {
+            let empty = render_uninstall_plan(&UninstallPlan::default(), &dry_run(), audience);
+            assert!(!empty.contains("Nothing was removed."), "{empty}");
+            let real_run = render_uninstall_plan(
+                &plan_with_a_binary(),
+                &UninstallOptions::default(),
+                audience,
+            );
+            assert!(!real_run.contains("Nothing was removed."), "{real_run}");
+        }
+    }
+
+    /// The assistant's preview has no flag to offer, so it must not point at a
+    /// command line it cannot run; what it can truthfully say is that removal
+    /// needs approval (`lifecycle_read_mutate_split_is_honest` in `tool_policy.rs` pins
+    /// that its own `uninstall` is an approval action). It does not say "these
+    /// items": the preview always plans with the default options, while the
+    /// approval carries the user's own.
+    #[test]
+    fn assistant_dry_run_footer_names_no_command() {
+        let output =
+            render_uninstall_plan(&plan_with_a_binary(), &dry_run(), PlanAudience::Assistant);
+        assert!(
+            output.ends_with("\nNothing was removed. Removal needs your approval.\n"),
+            "unexpected footer in:\n{output}"
+        );
+        assert!(!output.contains("rocm uninstall"), "{output}");
+        assert!(!output.contains("these items"), "{output}");
+    }
 
     /// A cache that has moved inside a directory uninstall already removes must
     /// not be reported as "not removed" — the note would be false.
