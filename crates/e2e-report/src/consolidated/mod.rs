@@ -1770,13 +1770,21 @@ mod tests {
     ///
     /// This is a hand-rolled scanner, not a Rust lexer, and its gaps are
     /// deliberate. It knows plain `"..."` strings (with `\` escapes) and the
-    /// one-character char literals `'x'` and `'\x'`; it does NOT know raw
-    /// strings (`r"..."`, `r#"..."#`, `br"..."`), whose contents it would scan
-    /// as code, so a raw string holding a quote, `//` or `use` would change the
-    /// result silently. It does not know byte-string or other literal forms
-    /// either. [`contains_raw_string`] exists so the test using this helper
-    /// fails loudly if a renderer ever grows a raw string, instead of trusting
-    /// this scan on text it cannot read.
+    /// one-character char literals `'x'` and the single-character-escape form
+    /// (`'\"'`, `'\''`, `'\n'`); it does NOT know raw strings (`r"..."`,
+    /// `r#"..."#`, `br"..."`), whose contents it would scan as code, so a raw
+    /// string holding a quote, `//` or `use` would change the result silently.
+    /// [`contains_raw_string`] exists so the test using this helper fails
+    /// loudly if a renderer ever grows a raw string, instead of trusting this
+    /// scan on text it cannot read.
+    ///
+    /// It also does not know the multi-character char escapes `'\x41'` and
+    /// `'\u{41}'`. That gap is benign rather than guarded: those forms spell
+    /// the character in hex, so they never contain a bare quote, slash or
+    /// `use` for the scanner to misread, and it passes them through as plain
+    /// code (`strip_comments_and_uses_passes_hex_char_escapes_through` pins
+    /// that). A literal written some other way that the scanner misreads would
+    /// need this helper extended.
     fn strip_comments_and_uses(src: &str) -> String {
         let chars: Vec<char> = src.chars().collect();
         let mut out = String::new();
@@ -1866,9 +1874,16 @@ mod tests {
     /// ...). The plain byte and C strings `b"..."` and `c"..."` are not raw:
     /// they follow the ordinary `"` and `\` rules, so the scanner reads them as
     /// an identifier followed by a plain string.
+    ///
     /// Deliberately over-eager: it does not skip comments or strings, because a
     /// false alarm only makes the caller's assertion fail loudly, while a miss
-    /// would let [`strip_comments_and_uses`] mis-scan text it cannot read.
+    /// would let [`strip_comments_and_uses`] mis-scan text it cannot read. The
+    /// known false alarm is an ordinary string whose text ends in `r` right
+    /// before its closing quote, such as `"\r"` or `"for r"`: the `r"` looks
+    /// like a raw-string opener. If a renderer needs such a string, the test
+    /// fails with the raw-string message, and the fix is to reword that string
+    /// or make this check string-aware, not to loosen it
+    /// (`contains_raw_string_trips_on_ordinary_strings_ending_in_r` pins it).
     fn contains_raw_string(src: &str) -> bool {
         let chars: Vec<char> = src.chars().collect();
         let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
@@ -1935,24 +1950,39 @@ mod tests {
         (outside, strings)
     }
 
+    /// Whether `text` holds a real format placeholder for `constant`: `{NAME}`
+    /// or `{NAME:spec}`, where the `{` is not half of an escaped `{{`. In a
+    /// format string a run of `n` consecutive `{` before the name is `n / 2`
+    /// literal braces followed, when `n` is odd, by one placeholder opener, so
+    /// `{NAME}` and `{{{NAME}}}` count and `{{NAME}}` (which prints the text
+    /// `{NAME}`) does not.
+    fn has_placeholder(text: &str, constant: &str) -> bool {
+        text.match_indices(constant).any(|(at, _)| {
+            let closes = text[at + constant.len()..].starts_with(['}', ':']);
+            let opening_braces = text[..at].chars().rev().take_while(|&ch| ch == '{').count();
+            closes && opening_braces % 2 == 1
+        })
+    }
+
     /// Whether `code` (already stripped by [`strip_comments_and_uses`]) refers
     /// to `constant` the way the renderers do: as a `{NAME}` (or `{NAME:..}`)
-    /// interpolation inside a string literal, or as a `(NAME)` splice outside
-    /// any string that is not a call argument (`foo(NAME)` and `.m(NAME)` are
-    /// refused: the `(` must not directly follow an identifier). A bare mention
-    /// that is none of these (an import, a comment, a `let _ = NAME;`) is not
-    /// use.
+    /// placeholder inside a string literal (see [`has_placeholder`]; an escaped
+    /// `{{NAME}}` is not one), or as a `(NAME)` splice outside any string that
+    /// is not a call argument (`foo(NAME)` and `.m(NAME)` are refused: the `(`
+    /// must not directly follow an identifier). A bare mention that is none of
+    /// these (an import, a comment, a `let _ = NAME;`) is not use.
     ///
-    /// What this still cannot tell: whether the interpolation is in the
-    /// gating sentence rather than in some other string, or the splice in the
-    /// right `maud` block. Placement is carried by the verbatim pins
+    /// What this still cannot tell, and does not try to: whether the
+    /// placeholder's string is ever passed to a format macro (a plain `"{NAME}"`
+    /// literal that is just printed would satisfy it), whether the
+    /// interpolation is in the gating sentence rather than in some other
+    /// string, or the splice in the right `maud` block. Those are known gaps;
+    /// placement and rendering are carried by the verbatim pins
     /// `summary_explanation_paragraphs_are_unchanged` and
     /// `legend_mock_and_other_platform_items_are_unchanged`, not by this check.
     fn references_constant(code: &str, constant: &str) -> bool {
         let (outside, strings) = split_string_literals(code);
-        let interpolated = strings.iter().any(|s| {
-            s.contains(&format!("{{{constant}}}")) || s.contains(&format!("{{{constant}:"))
-        });
+        let interpolated = strings.iter().any(|s| has_placeholder(s, constant));
         let splice = format!("({constant})");
         let spliced = outside.match_indices(&splice).any(|(at, _)| {
             !outside[..at]
@@ -2101,6 +2131,59 @@ mod tests {
         );
         assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
         assert!(!code.contains("gone"), "{code:?}");
+    }
+
+    #[test]
+    fn references_constant_counts_only_unescaped_placeholders() {
+        // `<` and `>` stand in for braces so clippy does not take the fixtures
+        // for malformed format strings.
+        let refs = |literal: &str| {
+            let src = format!("fn f() {{ let s = \"{literal}\"; }}\n")
+                .replace('<', "{")
+                .replace('>', "}");
+            references_constant(&strip_comments_and_uses(&src), "MOCK_GATES_PR")
+        };
+        // One brace is a placeholder; a doubled pair is an escaped literal
+        // brace and prints the name as text; an escaped pair plus one more
+        // brace is a placeholder again.
+        assert!(refs("It <MOCK_GATES_PR>."));
+        assert!(!refs("It <<MOCK_GATES_PR>>."));
+        assert!(refs("It <<<MOCK_GATES_PR>>>."));
+        assert!(!refs("It <<<<MOCK_GATES_PR>>>>."));
+        // The spec form follows the same rule.
+        assert!(refs("It <MOCK_GATES_PR:?>."));
+        assert!(!refs("It <<MOCK_GATES_PR:?>>."));
+        // A longer name, or the name as a suffix of one, is not this constant.
+        assert!(!refs("It <MOCK_GATES_PR_EXTRA>."));
+        assert!(!refs("It <X_MOCK_GATES_PR>."));
+    }
+
+    #[test]
+    fn strip_comments_and_uses_passes_hex_char_escapes_through() {
+        // `'\x41'` and `'\u{41}'` are not read as literals (see the helper's doc
+        // comment), but they hold no quote or slash, so nothing after them is
+        // misread: the comment is still dropped and the string still scanned.
+        let src = "let a = '\\x41'; let b = '\\u{41}'; // gone\n\
+                   let s = \"<MOCK_GATES_PR>\";\n"
+            .replace('<', "{")
+            .replace('>', "}");
+        let code = strip_comments_and_uses(&src);
+        assert!(
+            code.contains("'\\x41'") && code.contains("'\\u{41}'"),
+            "{code:?}"
+        );
+        assert!(!code.contains("gone"), "{code:?}");
+        assert!(references_constant(&code, "MOCK_GATES_PR"), "{code:?}");
+    }
+
+    #[test]
+    fn contains_raw_string_trips_on_ordinary_strings_ending_in_r() {
+        // Known, accepted false alarms: the guard fails loudly rather than
+        // guess, so a renderer that grows such a string is told to deal with it.
+        assert!(contains_raw_string("let s = \"\\r\";"));
+        assert!(contains_raw_string("let s = \"for r\";"));
+        // An identifier-final `r` with no quote right after does not trip it.
+        assert!(!contains_raw_string("let s = \"for rx\"; let r2 = for_r;"));
     }
 
     #[test]
