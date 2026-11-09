@@ -4837,3 +4837,26 @@ always keep the stub first on `PATH`, so a machine that has a `rocm` installed (
 developer's, not a grading runner) may show the real CLI's output and miss the pins. A
 miss on the `logs_contain` pin with the agent otherwise behaving as expected is that,
 not a regression.
+
+## Dashboard Chat Request Timeout
+
+A dashboard chat message is cut off after a fixed wait so a hung backend ends the
+turn instead of freezing the pane. The wait is 2 minutes by default and
+`ROCM_DASH_CHAT_TIMEOUT_SECS` (whole seconds, 1 to 3600) changes it; an unset,
+empty, non-numeric or out-of-range value keeps the default.
+
+The behavior is covered by unit tests in
+[mod.rs](../crates/rocm-dash-tui/src/agent/mod.rs) (how the variable is read) and
+[clients.rs](../crates/rocm-dash-tui/src/agent/clients.rs) (a request that outlives
+its budget times out and names that budget, a slow reply inside it is returned, and
+the real request path takes its budget from the variable):
+
+```bash
+cargo test -p rocm-dash-tui --lib request_timeout
+cargo test -p rocm-dash-tui --lib agent::clients
+```
+
+There is no Gherkin scenario: the timeout is a dashboard (TUI) behavior that no
+`rocm` command output exposes, and driving it end to end needs a model that
+answers slower than the wait. The manual check is in
+[manual-testing.md](manual-testing.md#4d-dashboard-chat-request-timeout).

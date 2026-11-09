@@ -261,7 +261,7 @@ The `rocm-dash-tui` lists below cover every production file in the crate: the to
 
 The old agent.rs was split (mechanical relocation — the shared seam types stay in [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs), reached from the split-out files via `super::`) into:
 
-- [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs) — the `AgentClient` seam, `AgentError`, `StateSnapshot`, `InferenceParams`, `REQUEST_TIMEOUT`.
+- [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs) — the `AgentClient` seam, `AgentError`, `StateSnapshot`, `InferenceParams`, `request_timeout`.
 - [`agent/snapshot.rs`](../crates/rocm-dash-tui/src/agent/snapshot.rs) — pure JSON telemetry helpers with no `rig` dependency.
 - [`agent/tools.rs`](../crates/rocm-dash-tui/src/agent/tools.rs) — the `rig::tool::Tool` wrappers for the four telemetry tools (`gpu_status`, `list_instances`, `bench_summary`, `tokens_per_watt`), their name table `TELEMETRY_TOOL_NAMES`, and the ROCm read/mutating tool dispatch.
 - [`agent/clients.rs`](../crates/rocm-dash-tui/src/agent/clients.rs) — the `RigAgentClient`/`ChatGptAgentClient`/`AnthropicAgentClient`/`MockAgentClient` backends.
