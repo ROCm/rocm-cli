@@ -1386,6 +1386,13 @@ pub(crate) mod tests {
     /// point is held to it: on a vLLM family and a runtime on 3.12 it returns
     /// without an engine request, which would otherwise fail here (no engine
     /// binary exists in this test).
+    ///
+    /// Native Windows never prefers vLLM (`preferred_serve_engine_for_host_gpu_summary`),
+    /// so the skip path is unreachable there and the precondition below cannot hold.
+    #[cfg_attr(
+        windows,
+        ignore = "vLLM is never the preferred engine on native Windows"
+    )]
     #[test]
     fn auto_install_skips_vllm_on_an_sdk_moved_off_its_python() {
         let (_root, paths) = test_paths("auto-engine-skipped-for-python");
