@@ -300,15 +300,6 @@ pub(crate) fn managed_engine_startup_failure_detail(
         recent_lines.join("\n")
     )
 }
-/// Render an unexpected managed-engine exit for the user, when the engine was
-/// already running and then disappeared on its own — unlike
-/// [`managed_engine_startup_failure_detail`], there is no [`ExitStatus`] to
-/// quote here. Callers reach this only after [`managed_service_stop_was_requested`]
-/// has already ruled out an intentional/external stop, so by the time this
-/// renders, the exit really is unexplained — i.e. a crash. The service log is
-/// the only record of why, since the child is detached and writes nowhere else
-/// — platform-generic since ROCMAI-541 attaches it on Windows too (see
-/// `spawn_detached_with_log` above).
 /// Retire a crashed service: mark the manifest and the engine's own state file
 /// `failed`. The engine process is gone and cannot stamp its own file, so this
 /// does it on the engine's behalf.
@@ -332,6 +323,15 @@ pub(crate) fn mark_service_failed(manifest_path: &Path, engine_state_path: &Path
     );
 }
 
+/// Render an unexpected managed-engine exit for the user, when the engine was
+/// already running and then disappeared on its own — unlike
+/// [`managed_engine_startup_failure_detail`], there is no [`ExitStatus`] to
+/// quote here. Callers reach this only after [`managed_service_stop_was_requested`]
+/// has already ruled out an intentional/external stop, so by the time this
+/// renders, the exit really is unexplained — i.e. a crash. The service log is
+/// the only record of why, since the child is detached and writes nowhere else
+/// — platform-generic since ROCMAI-541 attaches it on Windows too (see
+/// `spawn_detached_with_log`).
 pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
     let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
@@ -398,13 +398,30 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// and the dashboard, and is deliberately out of this change's scope.
 /// [`StopWatch`] narrows the window (it catches any stop visible while the
 /// child was still being watched) but cannot close it.
-///
-/// Read fresh from disk — never a `record` some caller captured at spawn
-/// time, which cannot reflect a stop another process requested afterward.
 pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
     crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
         |(record, _)| record.stop_requested_unix_ms.is_some() || record.status == "stopped",
     )
+}
+
+/// The marker half of [`managed_service_stop_was_requested`], without its
+/// `status == "stopped"` term.
+///
+/// For the one caller whose own precondition is a `stopped` record: a restart
+/// completes a confirmed stop before it respawns, and `record_restarted_child`
+/// does not publish `running` until after the new child clears its early-exit
+/// window. Inside that window the manifest still reads `stopped` because *this
+/// restart* stopped it, so the full predicate fires unconditionally and reports
+/// every early crash as a deliberate stop — dropping the exit status and log
+/// tail, and leaving the engine state file unstamped.
+///
+/// The marker alone is sound evidence here precisely because that preceding
+/// stop cleared it (`stop_internal_managed_service_confirmed_with`): anything
+/// still set has been written since this restart began, so it belongs to a
+/// *new* stop racing the restart rather than to the one the restart performed.
+pub(crate) fn managed_service_stop_marker_present(paths: &AppPaths, service_id: &str) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id)
+        .is_ok_and(|(record, _)| record.stop_requested_unix_ms.is_some())
 }
 
 /// Latches an operator-requested stop seen at any point while a managed child

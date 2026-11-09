@@ -472,9 +472,16 @@ fn record_engine_serve_http_failure(
             .append(true)
             .open(log_path)
     {
+        // One compact line (`{:#}`), not the full `{:?}` chain `detail` holds:
+        // this process's stderr is attached to this same log, so whatever the
+        // binary prints on its way out already lands here. The backstop still
+        // has to exist — that attach is exactly what can be missing — but
+        // writing the identical multi-line chain made `rocm logs` show it
+        // twice. A single `service_id`-tagged summary stays legible beside the
+        // real stderr copy, and is still the only record when there is none.
         let _ = writeln!(
             file,
-            "__engine-serve-http service_id={service_id} failed: {detail}"
+            "__engine-serve-http service_id={service_id} failed: {error:#}"
         );
     }
     let _ =

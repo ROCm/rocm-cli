@@ -3141,6 +3141,23 @@ const SCRIPTED_ENGINE: &str = "lemonade";
 /// resolving on the no-GPU lane.
 const SCRIPTED_ENGINE_MODEL: &str = "Qwen3-0.6B-GGUF";
 
+/// A port nothing holds right now, asked of the OS rather than hardcoded.
+///
+/// These two scenarios used fixed 11483/11484, which a busy self-hosted lane
+/// can collide on — and a collision fails the serve for a reason that has
+/// nothing to do with what the scenario tests. The listener closes before this
+/// returns, so it is the same inherently racy bind-then-release every other
+/// port helper in this suite uses; the scenario's own serve claims the port
+/// immediately afterwards.
+fn scripted_engine_free_port() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind a loopback port for the scripted serve")
+        .local_addr()
+        .expect("failed to read the bound loopback address")
+        .port()
+        .to_string()
+}
+
 fn scripted_engine_services_dir(world: &E2eWorld) -> PathBuf {
     world
         .isolated_root
@@ -3226,6 +3243,7 @@ async fn scripted_engine_armed_to_die(world: &mut E2eWorld) {
 
 #[when("the user serves a model expecting the engine to crash after startup")]
 async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
+    let port = scripted_engine_free_port();
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
@@ -3234,7 +3252,7 @@ async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
             "--engine",
             SCRIPTED_ENGINE,
             "--port",
-            "11483",
+            &port,
             "--verbose",
         ],
     );
@@ -3348,6 +3366,7 @@ fn kill_and_collect_combined_output(mut child: std::process::Child) -> String {
 
 #[when("the user attaches to the scripted serve in the background")]
 async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
+    let port = scripted_engine_free_port();
     let mut cmd = Command::new(crate::rocm_binary());
     cmd.args([
         "serve",
@@ -3355,7 +3374,7 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
         "--engine",
         SCRIPTED_ENGINE,
         "--port",
-        "11484",
+        &port,
         "--verbose",
     ]);
     world.isolate_cmd(&mut cmd);

@@ -810,6 +810,8 @@ Feature: Model serving
     And a stopped managed service is recorded on the default serve port
     When the user restarts the stopped service
     Then the restart is refused naming the service that holds the port
+
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the

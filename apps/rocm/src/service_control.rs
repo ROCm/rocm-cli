@@ -750,7 +750,14 @@ fn restart_internal_managed_service_inner(
             // bookkeeping would report a deliberate stop as a crash. Checked
             // first, as every sibling branch does and as
             // `mark_service_failed`'s contract requires.
-            if crate::service_launch::managed_service_stop_was_requested(paths, &record.service_id)
+            //
+            // The MARKER-only predicate, not the full
+            // `managed_service_stop_was_requested`: `record_restarted_child`
+            // has not run yet, so the manifest still reads `stopped` from this
+            // restart's own confirmed stop, and the status term would fire on
+            // every early crash. See
+            // `managed_service_stop_marker_present`'s doc comment.
+            if crate::service_launch::managed_service_stop_marker_present(paths, &record.service_id)
             {
                 bail!(
                     "managed engine for service `{}` was stopped while it was restarting",
@@ -1926,6 +1933,142 @@ mod tests {
             "the manifest must not be overwritten with `failed`"
         );
         assert_eq!(on_disk.stop_requested_unix_ms, Some(4_321));
+    }
+
+    /// Spawn a child that is certainly gone by the time the restart's 200ms
+    /// early-exit window elapses, so `try_wait()` yields a real exit status.
+    #[cfg(not(windows))]
+    fn spawn_immediately_exiting_child(code: i32) -> io::Result<std::process::Child> {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
+    /// ROCMAI-541 N2 on the restart's *early-exit* branch, which no test used
+    /// to drive at all.
+    ///
+    /// The branch runs before `record_restarted_child` publishes `running`, so
+    /// the manifest still reads `stopped` from the restart's own confirmed
+    /// stop. Checking the full `managed_service_stop_was_requested` there made
+    /// its `status == "stopped"` term fire on *every* early crash: the restart
+    /// bailed "was stopped while it was restarting", stamped nothing `failed`,
+    /// and threw away the exit status and log tail the pre-fix code printed.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_restarted_child_that_dies_immediately_is_a_crash_not_a_stop() -> Result<()> {
+        let (root, paths) = test_paths("restart-early-exit-crash");
+        paths.ensure()?;
+        let service_id = "svc-restart-early-exit-crash";
+        let record = stop_test_record(&paths, service_id);
+        let log_path = record.log_path.clone();
+        let engine_state_path = record.engine_state_path.clone();
+        record.write()?;
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&log_path, "engine said: CUDA driver not found\n")?;
+
+        let spawn: &RestartSpawnOverride<'_> = &|_command| spawn_immediately_exiting_child(3);
+        let result = restart_internal_managed_service_inner(
+            &paths,
+            service_id,
+            None,
+            |_| bare_termination(Vec::new(), true),
+            Some(spawn),
+        );
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let engine_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&engine_state_path)?)?;
+        let _ = fs::remove_dir_all(root);
+
+        let rendered = format!(
+            "{:#}",
+            result.expect_err("an early-exiting child must fail")
+        );
+        assert!(
+            !rendered.contains("was stopped while it was restarting"),
+            "a crash must not be reported as a deliberate stop: {rendered}"
+        );
+        assert!(
+            rendered.contains("engine said: CUDA driver not found"),
+            "the failure must quote the engine's own log tail: {rendered}"
+        );
+        assert!(
+            rendered.contains("exit status: 3"),
+            "the failure must carry the child's exit status: {rendered}"
+        );
+        assert_eq!(on_disk.status, "failed");
+        assert_eq!(
+            engine_state["status"], "failed",
+            "the engine cannot stamp its own state file once it is gone (AC3)"
+        );
+        Ok(())
+    }
+
+    /// The control for the test above, and what keeps its fix honest: a stop
+    /// that genuinely lands inside the same early-exit window — writing the
+    /// marker, as `stop_internal_managed_service_confirmed_with` does before
+    /// it signals anything — must still be reported as a stop, not a crash.
+    ///
+    /// Without this, "check only the marker" could be satisfied by deleting
+    /// the check outright.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_stop_landing_inside_the_restart_window_is_still_a_stop() -> Result<()> {
+        let (root, paths) = test_paths("restart-early-exit-stop");
+        paths.ensure()?;
+        let service_id = "svc-restart-early-exit-stop";
+        let record = stop_test_record(&paths, service_id);
+        let engine_state_path = record.engine_state_path.clone();
+        record.write()?;
+
+        // Stand in for a concurrent `rocm services stop`: it persists the
+        // marker before it signals the child the restart just spawned, so the
+        // marker is on disk by the time the early-exit check reads it.
+        let marked = std::cell::Cell::new(false);
+        let manifest_path = paths.service_manifest_path(service_id);
+        let spawn: &RestartSpawnOverride<'_> = &|_command| {
+            let _ = rocm_core::merge_json_state_file(
+                &manifest_path,
+                &serde_json::json!({ "stop_requested_unix_ms": 9_876 }),
+            );
+            marked.set(true);
+            spawn_immediately_exiting_child(3)
+        };
+        let result = restart_internal_managed_service_inner(
+            &paths,
+            service_id,
+            None,
+            |_| bare_termination(Vec::new(), true),
+            Some(spawn),
+        );
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let engine_state = fs::read(&engine_state_path).ok();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(marked.get(), "the test's own stop marker was never written");
+        let rendered = format!(
+            "{:#}",
+            result.expect_err("a stopped restart must still fail")
+        );
+        assert!(
+            rendered.contains("was stopped while it was restarting"),
+            "a stop that landed in the window must be named as a stop: {rendered}"
+        );
+        assert_ne!(
+            on_disk.status, "failed",
+            "a deliberate stop must not be stamped `failed`"
+        );
+        if let Some(bytes) = engine_state {
+            let state: serde_json::Value = serde_json::from_slice(&bytes)?;
+            assert_ne!(state["status"], "failed");
+        }
+        Ok(())
     }
 
     #[test]
