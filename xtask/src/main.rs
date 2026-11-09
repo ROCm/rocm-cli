@@ -22,6 +22,7 @@ mod demos;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
+mod engine_stdio_client_contract;
 mod env_mutation_contract;
 mod eval_fixtures;
 mod lychee;

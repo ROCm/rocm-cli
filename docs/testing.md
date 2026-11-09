@@ -221,13 +221,29 @@ choose: the program and verb, the app paths, and whether stderr is forwarded (se
 `apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). These tests
 catch behavioural drift: a caller whose own copy of the conversation behaved
 differently from the shared client in what they pin (the framing, the
-environment, the exit and answer handling, the guards) would fail them, but a
-copy that behaves the same passes them, so nothing here rules out a second
-copy existing. A structural check would have to read the callers' files from
-outside this crate, a cross-crate read that `cargo xtask prepush` only accepts
-with an entry in its widening rule
-(`every_cross_crate_read_is_covered_by_the_widening_rule`), which is not worth
-adding for this, so the guarantee is for behaviour only.
+environment, the exit and answer handling, the guards) would fail them. A copy
+that behaves the same passes them, so a second guard is on the existence of a
+second copy:
+[engine_stdio_client_contract.rs](../xtask/src/engine_stdio_client_contract.rs)
+is a static text scan over every `.rs` file in the tree (comments stripped) that
+fails when a file other than the shared client both pipes a child's stdin and
+names an engine request or response envelope, which is what an engine stdio
+client is made of. A caller that reaches an engine through `run_engine_stdio`
+has neither. Pasting the old rocmd copy back into `apps/rocmd/src/engine_ipc.rs`
+fails it by name (and, separately, five of rocmd's pinning tests: the
+app-paths, crash, unparseable-answer, nonzero-with-answer and SIGPIPE ones). Like
+the other allowlists it is bidirectional, so an exemption cannot outlive its
+reason.
+
+```bash
+cargo test -p xtask engine_stdio_client_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a copy that makes its pipe
+by hand, or reaches the envelope types under another name, is outside what it
+can see, and it does not check that a caller uses the shared client correctly
+(the callers' tests do). It closes the cheap, likely regression of a
+spawn-write-read helper pasted back into a binary.
 
 An answer that is not a response envelope is reported as that, and when the
 child also exited with a failing status the error says so, because the status is
