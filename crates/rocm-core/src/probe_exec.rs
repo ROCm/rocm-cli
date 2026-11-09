@@ -134,7 +134,8 @@ pub(crate) fn read_host_text(path: &str) -> String {
     std::fs::read_to_string(crate::host_path(path)).unwrap_or_default()
 }
 
-/// Whether `program` resolves on `PATH` (best-effort, no execution).
+/// Whether `program` is installed, by `PATH` lookup plus a few fixed Windows
+/// locations (best-effort, no execution).
 ///
 /// The one PATH lookup of the host probes: the examination stack's capability
 /// checks and the summary stack's WSL facts both ask it, so a tool reads as
@@ -156,13 +157,18 @@ pub(crate) fn read_host_text(path: &str) -> String {
 /// - The directories are split the way [`std::env::split_paths`] splits them on
 ///   this platform, so on Windows an entry may be quoted to hold a `;`.
 /// - On Windows a program without an extension is tried with every `PATHEXT`
-///   entry in both cases, and `cmd`, `pnputil`, `powershell` and `pwsh` are
-///   also found at their fixed System32 locations. An absolute candidate is
-///   tested once as it is, not joined onto each `PATH` directory, so it is found
-///   whether or not `PATH` is set, on `PATH` or not: the lookup then agrees with
-///   what the capture runner, which starts those locations, can run. No caller
-///   asks for those four today; they stay in the shared candidate list because
-///   the runner needs them and one list cannot drift from the other.
+///   entry in both cases. A name that already has an extension (`python3.11`,
+///   `wsl.exe`) is tried as given and nothing else; the examination's old copy
+///   also tried `.exe`, `.bat` and `.cmd` after it, and no caller passes a
+///   dotted name that relied on that (`wsl.exe` is found as given).
+/// - On Windows `cmd`, `pnputil` and `powershell` are also found at their fixed
+///   System32 locations (`pwsh` has no fixed location: its only extra candidate
+///   is the bare `pwsh.exe`). An absolute candidate is tested once as it is, not
+///   joined onto each `PATH` directory, so it is found whether or not `PATH` is
+///   set, on `PATH` or not: the lookup then agrees with what the capture runner,
+///   which starts those locations, can run. No caller asks for those names
+///   today; they stay in the shared candidate list because the runner needs
+///   them and one list cannot drift from the other.
 pub(crate) fn which(program: &str) -> bool {
     let dirs = std::env::var_os("PATH")
         .map(|path| path_dirs(&path))
@@ -376,6 +382,19 @@ mod path_lookup_tests {
             path_candidates("tool.ps1", true, Some(".PS1"), r"C:\Windows"),
             names(&["tool.ps1"])
         );
+        // A dotted name is not a bare name with an unknown extension: PATHEXT is
+        // not tried after it, so `python3.11` is looked for as `python3.11` only.
+        // The examination's old copy also tried `.exe`, `.bat` and `.cmd`; no
+        // caller passes such a name (they are all bare, or `wsl.exe`).
+        assert_eq!(
+            path_candidates(
+                "python3.11",
+                true,
+                Some(".COM;.EXE;.BAT;.CMD"),
+                r"C:\Windows"
+            ),
+            names(&["python3.11"])
+        );
     }
 
     #[test]
@@ -413,7 +432,10 @@ mod path_lookup_tests {
     #[test]
     fn candidates_on_windows_add_the_fixed_system32_locations() {
         let root = r"C:\Win";
-        let with = |program: &str| path_candidates(program, true, Some(".EXE"), root);
+        // A `PATHEXT` without `.EXE`, so `powershell.exe` and `pwsh.exe` can only
+        // come from the fixed list: with `.EXE` in it the expansion adds them
+        // anyway and these assertions would not notice the list losing them.
+        let with = |program: &str| path_candidates(program, true, Some(".BAT"), root);
 
         assert!(
             with("cmd").contains(&r"C:\Win\System32\cmd.exe".to_owned()),
@@ -752,5 +774,41 @@ mod path_lookup_tests {
         assert!(ask_for("cmd", Some(&join(&[&empty])), scratch.path(), &[]));
         // And with no PATH at all, as the capture runner could still start it.
         assert!(ask_for("cmd", None, scratch.path(), &[]));
+    }
+
+    /// A note that cites a test by name is only as good as the name. The
+    /// host-probing note cites the tests that pin each answer this lookup moved,
+    /// and a bare backtick name is not checked by the link checker, so check here
+    /// that every cited name of this module's tests is a function in this file.
+    #[test]
+    fn the_host_probing_note_cites_only_tests_that_exist() {
+        let note = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/host-probing.md"),
+        )
+        .expect("read docs/host-probing.md");
+        let source = include_str!("probe_exec.rs");
+        let prefixes = ["which_", "candidates_", "found_in_", "path_dirs_"];
+        let cited: std::collections::BTreeSet<&str> = note
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| prefixes.iter().any(|prefix| word.starts_with(prefix)))
+            .filter(|word| {
+                word.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+        assert!(
+            cited.len() >= 8,
+            "the note should cite this module's tests, found {cited:?}"
+        );
+        let missing: Vec<_> = cited
+            .iter()
+            .filter(|name| !source.contains(&format!("fn {name}(")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/host-probing.md cites tests that do not exist in probe_exec.rs: {missing:?}"
+        );
     }
 }
