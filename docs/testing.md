@@ -237,13 +237,12 @@ PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 ```
 
 An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
-reads the variable back itself: through the `proptest_cases` helper in each
-crate's test support, [rocm's](../apps/rocm/src/test_support.rs) and
-[rocm-core's](../crates/rocm-core/src/test_support.rs); through the copy in
+reads the variable back itself: through the `proptest_cases` helper in
 [tests/common/proptest_cases.rs](../crates/rocm-core/tests/common/proptest_cases.rs),
-which the `rocm-core` and `rocm-engine-protocol` integration tests and the
-Lemonade engine's unit tests include by `#[path]` because they cannot reach a
-crate's test support; and through `run_property` in
+which [rocm's](../apps/rocm/src/test_support.rs) and
+[rocm-core's](../crates/rocm-core/src/test_support.rs) test support, the
+`rocm-core` and `rocm-engine-protocol` integration tests and the Lemonade
+engine's unit tests all include by `#[path]`; and through `run_property` in
 [archive_props.rs](../crates/rocm-core/src/archive_props.rs), which keeps its
 own copy because three crates include it by `#[path]`. All of
 them only ever raise the module's count: a `PROPTEST_CASES` below it is
