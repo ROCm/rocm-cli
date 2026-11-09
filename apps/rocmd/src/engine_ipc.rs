@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result, bail};
+use crate::daemon_host::DaemonHost;
+use anyhow::{Result, bail};
 use rocm_core::AppPaths;
 use rocm_engine_protocol::{
     EngineMethod, EngineStdioOptions, HealthcheckRequest, HealthcheckResponse,
@@ -18,7 +19,19 @@ pub(crate) fn engine_healthcheck_response(
     engine: &str,
     service_id: &str,
 ) -> Result<HealthcheckResponse> {
-    engine_request::<_, HealthcheckResponse>(
+    engine_healthcheck_response_on(&DaemonHost::detect()?, paths, engine, service_id)
+}
+
+/// [`engine_healthcheck_response`] on a given host. The supervisor polls
+/// through the host it started its engine on, so a test can supply both.
+pub(crate) fn engine_healthcheck_response_on(
+    daemon_host: &DaemonHost,
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Result<HealthcheckResponse> {
+    engine_request_on::<_, HealthcheckResponse>(
+        daemon_host,
         paths,
         engine,
         service_id,
@@ -112,7 +125,7 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
 ///
 /// The engine is reached by running the `rocm` executable as
 /// `__engine-stdio <engine>`, the verb `rocm` serves for its built-in engines
-/// ([`rocm_executable`] says which executable that is).
+/// ([`DaemonHost::rocm_binary`] says which executable that is).
 pub(crate) fn engine_request<T, R>(
     paths: &AppPaths,
     engine: &str,
@@ -124,79 +137,34 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
+    engine_request_on(
+        &DaemonHost::detect()?,
+        paths,
+        engine,
+        service_id,
+        method,
+        request,
+    )
+}
+
+/// [`engine_request`] on a given host, so a test can supply the binary that
+/// answers. The stdio command is `rocm`'s alone, so the daemon runs it on the
+/// `rocm` binary, not on whatever it is itself.
+fn engine_request_on<T, R>(
+    daemon_host: &DaemonHost,
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    method: EngineMethod,
+    request: &T,
+) -> Result<R>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
     let envelope = engine_request_envelope(method, request)?;
-    let engine_binary = rocm_executable()?;
+    let engine_binary = daemon_host.rocm_binary()?;
     engine_request_via(&engine_binary, paths, engine, service_id, &envelope)
-}
-
-/// The `rocm` executable that serves `__engine-stdio`.
-///
-/// `rocmd` runs in two shapes. Embedded, as `rocm daemon`, this process
-/// is `rocm` and its own executable is the answer. Run as the standalone
-/// `rocmd` binary shipped beside `rocm`, its own executable has no such verb
-/// (its parser answers "unrecognized subcommand"), so every engine request
-/// failed; there the answer is the `rocm` next to it.
-fn rocm_executable() -> Result<PathBuf> {
-    let current =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
-    rocm_executable_from(current, cfg!(windows), || {
-        rocm_core::sibling_binary_path("rocm")
-    })
-}
-
-/// [`rocm_executable`] given this process's executable, whether it runs on
-/// Windows, and the way to find a sibling `rocm`, so the choice can be tested
-/// without any of them.
-fn rocm_executable_from(
-    current: PathBuf,
-    windows: bool,
-    sibling_rocm: impl FnOnce() -> Result<PathBuf>,
-) -> Result<PathBuf> {
-    let current = without_deleted_marker(current);
-    // The whole file name is `rocmd`, or `rocmd.exe` on Windows: not `rocmd.bak`,
-    // not `rocmd-0.3`. A renamed or test binary is not known to lack the verb, and
-    // has no `rocm` beside it to prefer: it runs itself, so a standalone `rocmd`
-    // shipped under another name still answers an engine request with
-    // "unrecognized subcommand".
-    if current
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| is_standalone_rocmd_name(name, windows))
-    {
-        return sibling_rocm().context(
-            "the standalone rocmd needs the rocm executable beside it to reach an engine",
-        );
-    }
-    Ok(current)
-}
-
-/// Whether `name`, a file name, is the standalone daemon's: exactly `rocmd`, plus
-/// `rocmd.exe` (in any case) where `windows` says the platform names executables
-/// that way. The platform is a parameter so both spellings are tested everywhere.
-fn is_standalone_rocmd_name(name: &str, windows: bool) -> bool {
-    name == "rocmd" || (windows && name.eq_ignore_ascii_case("rocmd.exe"))
-}
-
-/// What Linux appends to the name `current_exe()` reports when the running
-/// executable's file has been replaced or removed since the process started,
-/// which is what an in-place upgrade of a long-lived daemon does.
-const DELETED_MARKER: &str = " (deleted)";
-
-/// `path` without the [`DELETED_MARKER`] on its file name. The marker is not
-/// part of any file's name, and left in place it hides the `rocmd` the name check
-/// looks for and names a file that cannot be run; the path without it is where
-/// the upgraded executable now is.
-fn without_deleted_marker(path: PathBuf) -> PathBuf {
-    let stripped = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(DELETED_MARKER))
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned);
-    match stripped {
-        Some(name) => path.with_file_name(name),
-        None => path,
-    }
 }
 
 /// [`engine_request`] with the executable that serves `__engine-stdio` named by
@@ -418,98 +386,6 @@ mod tests {
     // other caller's choices are pinned in `apps/rocm/src/engine_ipc.rs`.
 
     #[test]
-    fn the_standalone_rocmd_reaches_engines_through_the_rocm_beside_it() {
-        let beside = || Ok(PathBuf::from("/opt/rocm-cli/bin/rocm"));
-
-        // The standalone binary has no `__engine-stdio` verb, so it must not
-        // re-execute itself.
-        for (standalone, windows) in [
-            ("/opt/rocm-cli/bin/rocmd", false),
-            ("/opt/rocm-cli/bin/rocmd", true),
-            ("C:/rocm-cli/bin/rocmd.exe", true),
-            ("C:/rocm-cli/bin/ROCMD.EXE", true),
-        ] {
-            assert_eq!(
-                rocm_executable_from(PathBuf::from(standalone), windows, beside).unwrap(),
-                Path::new("/opt/rocm-cli/bin/rocm"),
-                "{standalone} (windows: {windows})"
-            );
-        }
-
-        // Embedded as `rocm daemon`, this process is `rocm`; a test binary, a
-        // renamed copy or a backup of the daemon has no `rocm` beside it to
-        // prefer, and only the whole name `rocmd` counts: a file stem would also
-        // match `rocmd.bak`. `rocmd.exe` is the daemon's name only on Windows.
-        for (own, windows) in [
-            ("/opt/rocm-cli/bin/rocm", false),
-            ("C:/rocm-cli/bin/rocm.exe", true),
-            ("/work/target/debug/deps/rocmd-0f3a9c1d", false),
-            ("/opt/rocm-cli/bin/rocm-0.3", false),
-            ("/opt/rocm-cli/bin/rocmd.bak", false),
-            ("/opt/rocm-cli/bin/rocmd.old", false),
-            ("C:/rocm-cli/bin/rocmd.bak", true),
-            ("/opt/rocm-cli/bin/rocmd.exe", false),
-            ("/opt/rocm-cli/bin/rocmd.bak (deleted)", false),
-        ] {
-            let chosen = rocm_executable_from(PathBuf::from(own), windows, || {
-                panic!("{own} has no use for a sibling")
-            })
-            .unwrap();
-            let expected = own.strip_suffix(" (deleted)").unwrap_or(own);
-            assert_eq!(chosen, Path::new(expected), "{own} (windows: {windows})");
-        }
-
-        // A standalone `rocmd` with no `rocm` beside it fails with a message that
-        // says why, rather than running something that cannot serve the verb.
-        let error = rocm_executable_from(PathBuf::from("/opt/rocm-cli/bin/rocmd"), false, || {
-            anyhow::bail!("unable to locate sibling binary rocm")
-        })
-        .unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            "the standalone rocmd needs the rocm executable beside it to reach an engine: \
-             unable to locate sibling binary rocm"
-        );
-    }
-
-    /// After an in-place upgrade Linux reports the running executable as
-    /// `<path> (deleted)`. The daemon is long-lived, so that is the usual state
-    /// of a standalone `rocmd` right after its package is upgraded: it must
-    /// still be recognised, and an embedded `rocm` must be run by a path that
-    /// exists.
-    #[test]
-    fn an_executable_replaced_while_running_is_still_told_apart_by_its_name() {
-        let beside = || Ok(PathBuf::from("/usr/bin/rocm"));
-
-        let chosen =
-            rocm_executable_from(PathBuf::from("/usr/bin/rocmd (deleted)"), false, beside).unwrap();
-        assert_eq!(chosen, Path::new("/usr/bin/rocm"));
-
-        // Embedded `rocm daemon`: run the file now at that path, not the
-        // marker-suffixed name, which no file has.
-        let chosen = rocm_executable_from(PathBuf::from("/usr/bin/rocm (deleted)"), false, || {
-            panic!("an embedded rocm has no use for a sibling")
-        })
-        .unwrap();
-        assert_eq!(chosen, Path::new("/usr/bin/rocm"));
-
-        // The marker is only ever a suffix of the file name, and only that
-        // exact one; nothing else is touched.
-        for untouched in [
-            "/opt/(deleted)/rocm",
-            "/opt/rocm-cli/bin/rocm (deleted) extra",
-            "/opt/rocm-cli/bin/ (deleted)",
-            "/opt/rocm-cli/bin/rocm",
-        ] {
-            assert_eq!(
-                without_deleted_marker(PathBuf::from(untouched)),
-                Path::new(untouched),
-                "{untouched}"
-            );
-        }
-    }
-
-    #[test]
     fn rocmd_runs_the_child_on_its_own_paths_keeps_stderr_and_asks_for_no_progress() {
         let (_root, paths) = temp_app_paths("stdio-options");
         let key_file = Path::new("/keys/svc.endpoint-key");
@@ -719,5 +595,84 @@ mod tests {
             );
             assert!(default_action.success(), "{default_action:?}");
         }
+    }
+
+    /// The stdio command is `rocm`'s alone: a daemon run as `rocmd` asks the
+    /// engine through the `rocm` beside it, which `rocmd` answered with an
+    /// unrecognised-subcommand error, so its readiness checks and its engine
+    /// stops could never succeed.
+    ///
+    /// The stand-in `rocm` records its arguments, reads the request line and
+    /// answers with an `ok` envelope.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd() -> Result<()> {
+        use crate::test_support::{lock_script_tests, script_tools, write_executable_script};
+
+        let _serial = lock_script_tests();
+        let tools = script_tools();
+        let (root, paths) = temp_app_paths("engine-request-on-rocm");
+        let seen = root.join("rocm-args.txt");
+        write_executable_script(
+            &root.join("rocm"),
+            &tools,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nread -r _request\n{}\n",
+                seen.display(),
+                r#"printf '%s\n' '{"ok":true,"data":{"status":"ready"}}'"#
+            ),
+        )?;
+        let daemon_host = DaemonHost::new(root.join("rocmd"), false);
+
+        // The first exec of a new file can lose a race with an unrelated fork
+        // (ETXTBSY); the spawn then fails at once, and one more try is enough.
+        let mut outcome = Err(anyhow::anyhow!("not attempted"));
+        for _ in 0..10 {
+            outcome = engine_request_on::<_, serde_json::Value>(
+                &daemon_host,
+                &paths,
+                "vllm",
+                "svc-engine-request",
+                EngineMethod::Healthcheck,
+                &serde_json::json!({ "service_id": "svc-engine-request" }),
+            );
+            match &outcome {
+                Err(error) if format!("{error:#}").contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
+        let args = fs::read_to_string(&seen).unwrap_or_default();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["__engine-stdio", "vllm"],
+            "the engine must be asked through `rocm __engine-stdio <engine>`"
+        );
+        assert_eq!(outcome?, serde_json::json!({ "status": "ready" }));
+        Ok(())
+    }
+
+    /// With no `rocm` beside `rocmd` the request fails, and says what it looked
+    /// for, instead of running a command `rocmd` does not have.
+    #[test]
+    fn engine_request_without_a_rocm_beside_rocmd_names_it() {
+        let (root, paths) = temp_app_paths("engine-request-no-rocm");
+        let error = engine_request_on::<_, serde_json::Value>(
+            &DaemonHost::new(root.join("rocmd"), false),
+            &paths,
+            "vllm",
+            "svc-engine-request",
+            EngineMethod::Healthcheck,
+            &serde_json::json!({ "service_id": "svc-engine-request" }),
+        )
+        .expect_err("no rocm to ask");
+        fs::remove_dir_all(root).ok();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("no engine commands"), "{text}");
+        assert!(text.contains("unable to locate sibling binary"), "{text}");
     }
 }

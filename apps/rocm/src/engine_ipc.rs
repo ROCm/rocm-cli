@@ -282,6 +282,16 @@ pub(crate) fn run_builtin_engine_serve_http(
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
     let parsed_policy = parse_device_policy(Some(device_policy))?;
+    // Every engine is fronted the same way, so the Anthropic endpoint is started
+    // here once rather than inside each adapter. It runs on a thread of this
+    // process, which is the service's supervisor: it ends when the service does.
+    rocmd::anthropic_proxy::spawn_alongside_engine(rocmd::anthropic_proxy::AnthropicProxyConfig {
+        host: host.clone(),
+        engine_port: port,
+        served_model: model_ref.clone(),
+        state_path: state_path.clone(),
+        probe_api_key: rocm_engine_protocol::resolve_endpoint_api_key(),
+    });
     match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
             service_id,

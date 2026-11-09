@@ -32,6 +32,7 @@ mod e2e {
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod host_guard;
+    pub mod lemonade_install_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
     pub mod model_catalog_steps;
@@ -79,6 +80,9 @@ pub struct E2eWorld {
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
     pub chat_response: Option<serde_json::Value>,
+    /// The reply to a request sent to the served model's Anthropic-compatible
+    /// `/v1/messages` endpoint.
+    pub anthropic_response: Option<serde_json::Value>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
@@ -336,6 +340,7 @@ impl Default for E2eWorld {
             endpoint: None,
             model_name: None,
             chat_response: None,
+            anthropic_response: None,
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
