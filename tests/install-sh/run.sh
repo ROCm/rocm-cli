@@ -76,9 +76,11 @@ chmod 755 "${FISH_BIN}/fish"
 
 BUNDLE="${WORK}/bundle/rocm-cli-linux-amd64/bin"
 mkdir -p "${BUNDLE}"
-# Completions fail when $HOME/.stub-completions says `fail`, and print nothing
-# when it says `empty`. They also fail when the installer hands `rocm` its own
-# stdin, which under `curl | sh` is the rest of the script.
+# Completions fail once when $HOME/.stub-completions says `fail-once`, and
+# print nothing once when it says `empty-once`: the stub consumes the file, so
+# the next run works, as a failure that clears by itself would. They also fail
+# when the installer hands `rocm` its own stdin, which under `curl | sh` is the
+# rest of the script.
 cat > "${BUNDLE}/rocm" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "completions" ] && [ "${2:-}" = "fish" ]; then
@@ -86,9 +88,11 @@ if [ "${1:-}" = "completions" ] && [ "${2:-}" = "fish" ]; then
     printf '%s\n' "rocm read the installer's stdin: ${_line}" >&2
     exit 1
   fi
-  case "$(cat "${HOME}/.stub-completions" 2>/dev/null || true)" in
-    fail) printf '%s\n' "stub completions failure" >&2; exit 1 ;;
-    empty) exit 0 ;;
+  _mode="$(cat "${HOME}/.stub-completions" 2>/dev/null || true)"
+  rm -f "${HOME}/.stub-completions"
+  case "${_mode}" in
+    fail-once) printf '%s\n' "stub completions failure" >&2; exit 1 ;;
+    empty-once) exit 0 ;;
   esac
   printf '%s\n' 'complete -c rocm # stub completions'
   exit 0
@@ -391,26 +395,31 @@ assert_eq "XDG completions" "$(cat "${xdg_config}/fish/completions/rocm.fish" 2>
 assert_absent_file "${xdg_home}/.config/fish/config.fish" "XDG_CONFIG_HOME was ignored for the fish config"
 assert_contains "${xdg_home}/.local/bin/.rocm-cli-path-edit" "profile ${xdg_config}/fish/config.fish" "uninstall record missing the XDG fish profile"
 assert_contains "${xdg_home}/.local/bin/.rocm-cli-path-edit" "completions ${xdg_config}/fish/completions/rocm.fish" "uninstall record missing the XDG completions"
-# A relative XDG_CONFIG_HOME is ignored, as fish ignores it.
+# A relative XDG_CONFIG_HOME names a different folder from each directory (fish
+# resolves it against its own working directory), so the installer keeps
+# ~/.config/fish for it.
 rel_home="${WORK}/homes/xdg-relative"
 mkdir -p "${rel_home}/.config/fish"
 install_case "${WORK}/xdg-relative.log" "${rel_home}" /bin/bash "${BASE_PATH}" 1 "XDG_CONFIG_HOME=relative-config"
-assert_contains "${rel_home}/.config/fish/config.fish" "${FISH_SNIPPET}" "a relative XDG_CONFIG_HOME moved the fish config"
+assert_contains "${rel_home}/.config/fish/config.fish" "${FISH_SNIPPET}" "a relative XDG_CONFIG_HOME moved the fish config away from ~/.config/fish"
 if [ "${FAILURES}" -eq 0 ]; then
   pass "fish config follows an absolute XDG_CONFIG_HOME"
 fi
 
 # A rocm that cannot print completions, or prints nothing, still installs
-# cleanly with the PATH block on record, writes no completion file, and prints
-# advice that does create it.
-for mode in fail empty; do
-  comp_home="${WORK}/homes/completions-${mode}"
+# cleanly with the PATH block on record and writes no completion file. The
+# failure here clears by itself (the stub works on its second run), and the
+# printed advice, run as printed from a bare environment in a home whose name
+# holds a space, then creates the file.
+for mode in fail-once empty-once; do
+  comp_home="${WORK}/homes/spaced home ${mode}"
   comp_log="${WORK}/completions-${mode}.log"
   comp_path="${comp_home}/.config/fish/completions/rocm.fish"
   comp_record="${comp_home}/.local/bin/.rocm-cli-path-edit"
   mkdir -p "${comp_home}"
   printf '%s\n' "${mode}" > "${comp_home}/.stub-completions"
   install_case "${comp_log}" "${comp_home}" /bin/bash "${FISH_PATH}" 1
+  assert_absent_file "${comp_home}/.stub-completions" "completions (${mode}) were never attempted"
   assert_absent_file "${comp_path}" "completions (${mode}) left a completion file"
   assert_log_contains "${comp_log}" "note: could not install fish completions" "completions (${mode}) did not print the note"
   assert_log_lacks "${comp_log}" "fish completions installed:" "completions (${mode}) were reported installed"
@@ -419,12 +428,13 @@ for mode in fail empty; do
   if grep -F -q -- "completions " "${comp_record}"; then
     fail "completions (${mode}) recorded a file that was not written"
   fi
-  # The advice is runnable as printed, with the installed rocm on PATH.
-  rm -f "${comp_home}/.stub-completions"
-  advice="$(sed -n 's/^  run: //p' "${comp_log}")"
+  # The advice names the installed binary by its full path, so it works in a
+  # terminal that does not have the install folder on PATH yet.
+  assert_log_contains "${comp_log}" "to try again, run the installer again, or run:" "completions (${mode}) did not offer to run the installer again"
+  advice="$(grep -F -A2 'to try again, run the installer again, or run:' "${comp_log}" | tail -n 2 | sed 's/^  //')"
   if [ -z "${advice}" ]; then
     fail "completions (${mode}) printed no advice"
-  elif ! env -i HOME="${comp_home}" PATH="${comp_home}/.local/bin:${TOOLS}" \
+  elif ! env -i HOME="${comp_home}" PATH="${TOOLS}" \
     "${TOOLS}/sh" -c "${advice}" < /dev/null; then
     fail "completions (${mode}) advice did not run"
   fi
@@ -432,6 +442,98 @@ for mode in fail empty; do
 done
 if [ "${FAILURES}" -eq 0 ]; then
   pass "completions that cannot be generated leave the PATH block and a working hint"
+fi
+
+# A rocm.fish that is already there and did not come from this installer is the
+# user's: a regular file, a link to a dotfiles copy, and a dangling link are all
+# left exactly as they are, not recorded, with a note saying why.
+USERS_COMPLETIONS='complete -c rocm -l my-own-flag'
+for kind in file link markedlink dangling; do
+  own_home="${WORK}/homes/own-completions-${kind}"
+  own_log="${WORK}/own-completions-${kind}.log"
+  own_dir="${own_home}/.config/fish/completions"
+  own_path="${own_dir}/rocm.fish"
+  own_target="${own_home}/dotfiles/rocm.fish"
+  mkdir -p "${own_dir}" "${own_home}/dotfiles"
+  case "${kind}" in
+    file) printf '%s\n' "${USERS_COMPLETIONS}" > "${own_path}" ;;
+    link)
+      printf '%s\n' "${USERS_COMPLETIONS}" > "${own_target}"
+      ln -s "${own_target}" "${own_path}"
+      ;;
+    markedlink)
+      # Even a target that carries the installer's marker is not written through.
+      printf '%s\n%s\n' "${COMPLETIONS_MARKER}/opt/other/bin" "${USERS_COMPLETIONS}" > "${own_target}"
+      ln -s "${own_target}" "${own_path}"
+      ;;
+    dangling) ln -s "${own_target}" "${own_path}" ;;
+  esac
+  install_case "${own_log}" "${own_home}" /bin/bash "${FISH_PATH}" 1
+  assert_log_contains "${own_log}" "note: fish completions not installed: ${own_path} already exists and was not written by this installer" "user's rocm.fish (${kind}) was not reported as left alone"
+  assert_log_lacks "${own_log}" "fish completions installed:" "user's rocm.fish (${kind}) was reported replaced"
+  case "${kind}" in
+    file) assert_eq "user's rocm.fish (${kind})" "$(cat "${own_path}")" "${USERS_COMPLETIONS}" ;;
+    link)
+      [ -L "${own_path}" ] || fail "user's rocm.fish link was replaced"
+      assert_eq "what the user's rocm.fish link points at" "$(cat "${own_target}")" "${USERS_COMPLETIONS}"
+      ;;
+    markedlink)
+      [ -L "${own_path}" ] || fail "user's marked rocm.fish link was replaced"
+      assert_eq "what the user's marked rocm.fish link points at" "$(tail -n 1 "${own_target}")" "${USERS_COMPLETIONS}"
+      ;;
+    dangling)
+      [ -L "${own_path}" ] || fail "user's dangling rocm.fish link was replaced"
+      assert_absent_file "${own_target}" "the installer wrote through the user's dangling rocm.fish link"
+      ;;
+  esac
+  if grep -F -q -- "completions " "${own_home}/.local/bin/.rocm-cli-path-edit"; then
+    fail "user's rocm.fish (${kind}) was recorded for uninstall to remove"
+  fi
+  assert_contains "${own_home}/.config/fish/config.fish" "${FISH_SNIPPET}" "user's rocm.fish (${kind}) stopped the fish PATH block"
+done
+# A file another install folder of this installer wrote is replaced, and the
+# new install records it.
+mk_home="${WORK}/homes/marked-completions"
+mkdir -p "${mk_home}/.config/fish/completions"
+printf '%s\n%s\n' "${COMPLETIONS_MARKER}/opt/other/bin" "old script" > "${mk_home}/.config/fish/completions/rocm.fish"
+install_case "${WORK}/marked-completions.log" "${mk_home}" /bin/bash "${FISH_PATH}" 1
+assert_eq "an earlier installer's rocm.fish" "$(cat "${mk_home}/.config/fish/completions/rocm.fish")" "$(installed_completions "${mk_home}")"
+assert_contains "${mk_home}/.local/bin/.rocm-cli-path-edit" "completions ${mk_home}/.config/fish/completions/rocm.fish" "a replaced installer rocm.fish was not recorded"
+if [ "${FAILURES}" -eq 0 ]; then
+  pass "a rocm.fish the installer did not write is left alone, and one it wrote is replaced"
+fi
+
+# The login shell's own profile is recorded only when it holds the installer's
+# block: a PATH line the user wrote is theirs, and uninstall must not look for
+# a block there.
+ob_home="${WORK}/homes/bash-own-line"
+mkdir -p "${ob_home}"
+# shellcheck disable=SC2016
+printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' > "${ob_home}/.bashrc"
+install_case "${WORK}/bash-own-line.log" "${ob_home}" /bin/bash "${BASE_PATH}" 1
+assert_eq "bashrc with the user's own PATH line" "$(marker_count "${ob_home}/.bashrc")" 0
+assert_log_contains "${WORK}/bash-own-line.log" "shell profile already configured:" "the user's own PATH line was not reported as configured"
+if grep -F -q -- "profile ${ob_home}/.bashrc" "${ob_home}/.local/bin/.rocm-cli-path-edit" 2>/dev/null; then
+  fail "a bash profile holding only the user's own PATH line was recorded"
+fi
+if [ "${FAILURES}" -eq 0 ]; then
+  pass "the login profile is recorded only when it holds the installer's block"
+fi
+
+# A profile that cannot even be created (its folder's name is taken by a file)
+# is reported as not saved, and not recorded. This works as root too.
+bl_home="${WORK}/homes/profile-blocked"
+mkdir -p "${bl_home}"
+printf '%s\n' 'a file where a folder is needed' > "${bl_home}/blocker"
+install_case "${WORK}/profile-blocked.log" "${bl_home}" /bin/bash "${BASE_PATH}" 1 "ROCM_CLI_SHELL_PROFILE=${bl_home}/blocker/profile"
+assert_log_lacks "${WORK}/profile-blocked.log" "shell profile updated:" "an uncreatable profile was reported updated"
+assert_log_contains "${WORK}/profile-blocked.log" "is not saved in your shell profile" "an uncreatable profile was not reported"
+assert_absent_file "${bl_home}/blocker/profile" "a profile was written through a file"
+if grep -F -q -- "profile " "${bl_home}/.local/bin/.rocm-cli-path-edit" 2>/dev/null; then
+  fail "an uncreatable profile was recorded"
+fi
+if [ "${FAILURES}" -eq 0 ]; then
+  pass "a profile that cannot be created is reported, not recorded"
 fi
 
 # A profile that cannot be written is not reported as updated or recorded.

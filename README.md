@@ -86,7 +86,10 @@ directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
 directory to `PATH` in fish's `config.fish` and installs fish completions,
 including when the login shell is bash, zsh, or ksh. Fish's config folder is
 `$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
-`~/.config/fish`.
+`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
+installer did not write (your own file, or a link) is left as it is: the
+installer prints a note that completions were not installed, and
+`rocm uninstall` leaves it too.
 Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
 its completions included. Rerun the installer any time to upgrade.
 `rocm uninstall` removes the binaries and the fish completions the installer
@@ -1724,8 +1727,9 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 
 # fish
 # The Linux installer writes this file when fish is installed (under
-# $XDG_CONFIG_HOME/fish when that is an absolute path). Run the same command
-# after copying the binaries yourself, or to refresh the script:
+# $XDG_CONFIG_HOME/fish when that is an absolute path). To refresh it, run the
+# installer again. A file you write with the command below carries no
+# installer marker line, so `rocm uninstall` leaves it in place:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 

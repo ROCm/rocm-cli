@@ -150,6 +150,8 @@ Installer policy:
   else `~/.config/fish`), starting with a line naming the install folder, and
   records it, so `rocm uninstall` removes it with the binaries. Uninstall
   leaves a `rocm.fish` that does not start with that line for its own folder.
+  The installer itself leaves an existing `rocm.fish` (or link) that does not
+  start with that marker as it is, prints a note, and records nothing for it.
   A custom `ROCM_CLI_SHELL_PROFILE` replaces only the login shell's profile;
   fish's is still updated.
 - External plugins under the rocm-cli data directory are not touched by

@@ -707,7 +707,8 @@ rocm uninstall --keep-data --yes")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries, and the installer's PATH change.
+        /// Keep installed rocm-cli binaries, the installer's PATH change, and the
+        /// fish completions it wrote.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.

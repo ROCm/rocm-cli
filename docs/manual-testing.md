@@ -1258,6 +1258,10 @@ Expected result:
 - If another program lives in the install folder, the review instead says
   `PATH change left in place` and names it, and the `PATH` change stays; the
   fish completion script still goes.
+- If you already have your own `completions/rocm.fish` (or a link there) when
+  you run the installer, it prints `note: fish completions not installed: …
+  already exists and was not written by this installer`, changes nothing, and
+  a later uninstall leaves the file (scenario `lifecycle-35`).
 - If you replace `rocm.fish` with your own file before uninstalling (for
   example `rocm completions fish > <that path>`, which writes no installer
   marker line), the review lists it under `Left alone:` as not written by the
@@ -1267,7 +1271,7 @@ Expected result:
   still removes everything else, and ends with `uninstall complete`
   (scenario `lifecycle-34`).
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
-  fish completions stay too, and they do.
+  fish completions stay too, and they do (scenario `lifecycle-25`).
 - On a home folder ROCm CLI never touched, the dry run says
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run

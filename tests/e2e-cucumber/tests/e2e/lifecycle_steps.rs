@@ -1730,6 +1730,80 @@ async fn given_fish_completions_folder_read_only(world: &mut E2eWorld) {
     }
 }
 
+#[given("the user already has their own fish completions")]
+async fn given_users_fish_completions_before_install(world: &mut E2eWorld) {
+    let path = fish_completions(state(world));
+    std::fs::create_dir_all(path.parent().expect("completions have a folder"))
+        .expect("failed to create the fish completions folder");
+    std::fs::write(&path, USERS_OWN_COMPLETIONS).expect("failed to seed the fish completions");
+}
+
+#[then("the installer leaves the user's own fish completions and says why")]
+async fn then_installer_leaves_users_fish_completions(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "the installer changed {}, which it did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&format!(
+            "note: fish completions not installed: {} already exists and was not written by \
+             this installer",
+            path.display()
+        )),
+        "the installer did not say it left the fish completions:\n{out}"
+    );
+    assert!(
+        !out.contains("fish completions installed:"),
+        "the installer reported installing completions it did not write:\n{out}"
+    );
+    let record = std::fs::read_to_string(st.install_dir.join(".rocm-cli-path-edit"))
+        .expect("the installer wrote no PATH-edit record");
+    assert!(
+        !record.contains("completions "),
+        "the installer recorded completions it did not write, so uninstall could remove them:\n{record}"
+    );
+}
+
+#[then("the user's own fish completions are untouched")]
+async fn then_users_fish_completions_untouched(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap_or_default(),
+        USERS_OWN_COMPLETIONS,
+        "uninstall removed or changed {}, which the installer did not write",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        !out.contains("removed shell completions"),
+        "uninstall reported removing completions it should not have touched:\n{out}"
+    );
+}
+
+#[then("the fish completions are still in place")]
+async fn then_fish_completions_still_in_place(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("complete -c rocm"),
+        "{} is gone after an uninstall that keeps the binaries",
+        path.display()
+    );
+    assert!(
+        !st.last_output.contains("removed shell completions"),
+        "uninstall reported removing the fish completions it was told to keep:\n{}",
+        st.last_output
+    );
+}
+
 #[then("uninstall leaves the user's own fish completions in place and says why")]
 async fn then_users_fish_completions_kept(world: &mut E2eWorld) {
     let st = state(world);
@@ -1814,6 +1888,9 @@ async fn then_xdg_kept(world: &mut E2eWorld) {
 
 #[then("uninstall reports keeping the PATH change with the binaries")]
 async fn then_reports_path_kept_with_binaries(world: &mut E2eWorld) {
+    // The message is true because lifecycle-25 also asserts the state it
+    // promises: the PATH change and the fish completions stay (see
+    // `then_fish_completions_still_in_place` and the profile step).
     let out = &state(world).last_output;
     assert!(
         out.contains("binary removal disabled by --keep-binaries")

@@ -2712,18 +2712,26 @@ local bundle, points the installer at a temporary home, and checks:
   with `fish` on `PATH`, a bash login shell with only `~/.config/fish`, and a
   fish login shell;
 - an absolute `$XDG_CONFIG_HOME` moves fish's config and completions there,
-  and a relative one is ignored (both with a bash login shell only);
+  and a relative one leaves them in `~/.config/fish` (it names a different
+  folder from each directory; both with a bash login shell only);
 - a reinstall adds no second block or record line and reports fish's config
   as already configured;
-- a fish config that already names the install folder with the user's own
-  line is left alone and not recorded;
+- a fish config, or a bash profile, that already names the install folder with
+  the user's own line is left alone and not recorded;
+- a `rocm.fish` that is already there and was not written by the installer (a
+  file, a link, a link whose target carries the marker, a dangling link) is
+  left exactly as it is, not recorded, with a note, while one an earlier
+  install wrote is replaced and recorded;
 - a bash home with no fish install grows no fish config, and
   `ROCM_CLI_UPDATE_SHELL_PATH=0` writes no profile and no completions;
 - a `rocm` that cannot print completions, or prints nothing, leaves the install
-  and the `PATH` block in place with a hint that works when run as printed,
-  and `rocm` is never handed the installer's stdin;
-- as a non-root user only, a profile that cannot be written is reported rather
-  than claimed as updated, and not recorded, under both `sh` and `bash`.
+  and the `PATH` block in place with a note. The stub fails only once, as a
+  failure that clears by itself would, and the printed lines, run as printed
+  from a bare environment in a home whose name holds a space, then create the
+  file; `rocm` is never handed the installer's stdin;
+- a profile that cannot be created is reported rather than claimed as updated,
+  and not recorded; as a non-root user only, so is one that cannot be written,
+  under both `sh` and `bash`.
 
 It needs no network or GPU. Set `INSTALL_SH` to run it against another copy of
 the installer. The Linux `build-and-test` job runs it when the change touches
@@ -2738,10 +2746,15 @@ bash and fish configs back and removing the fish completions, is
 `@id:lifecycle-linux-fish-configured-from-bash` (lifecycle-32) in the lifecycle
 set above. `@id:lifecycle-linux-fish-completions-not-ours-kept` (lifecycle-33)
 checks that uninstall leaves a `rocm.fish` the user wrote over the installer's
-and says so, and `@id:lifecycle-linux-fish-completions-removal-failure-warns`
+and says so, `@id:lifecycle-linux-fish-completions-removal-failure-warns`
 (lifecycle-34) that a `rocm.fish` it cannot remove is a warning while the rest
-of the uninstall still happens. lifecycle-34 makes the `completions` folder
-read-only, so it needs a non-root runner.
+of the uninstall still happens, and
+`@id:lifecycle-linux-fish-existing-completions-left-alone` (lifecycle-35) that
+the installer leaves a `rocm.fish` it did not write, says so, and uninstall
+leaves it too. lifecycle-34 makes the `completions` folder read-only, so it
+needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path`
+(lifecycle-25) also seeds fish and checks the completions stay with
+`--keep-binaries`.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
