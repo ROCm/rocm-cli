@@ -436,15 +436,11 @@ fn install_wheel_runtime(
             include_devel,
         )?
     };
-    let device_target = device_target_override.map_or_else(
-        || resolution.device_target.clone(),
-        |target| {
-            AggregateDeviceTarget::resolve(
-                Some(target),
-                &resolution.family,
-                &resolution.published_device_targets,
-            )
-        },
+    let device_target = AggregateDeviceTarget::prefer_recorded(
+        &resolution.device_target,
+        device_target_override,
+        &resolution.family,
+        &resolution.published_device_targets,
     );
     // The exact device payload, not the version alone, decides what this runtime
     // can run, so it is what identifies the runtime. A preview on a host with no

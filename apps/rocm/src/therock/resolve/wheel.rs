@@ -200,6 +200,26 @@ impl AggregateDeviceTarget {
         Self::Exact(target)
     }
 
+    /// The device payload to plan for when the caller may already know the exact
+    /// target: an update apply's recorded arch, or the one a runtime's manifest was
+    /// built with. A recorded target wins over `detected` (the resolution's own
+    /// answer, from a probe of this host), and is checked against the targets the
+    /// source publishes exactly as a detected one is; with none recorded the
+    /// detected answer stands as it is, `Undetermined` included. The one place
+    /// that rule is written: a plan, a preview and an update's plan all call it, so
+    /// they cannot disagree about which target a runtime is for.
+    pub(in crate::therock) fn prefer_recorded(
+        detected: &Self,
+        recorded: Option<&str>,
+        family: &str,
+        published: &[String],
+    ) -> Self {
+        recorded.map_or_else(
+            || detected.clone(),
+            |target| Self::resolve(Some(target), family, published),
+        )
+    }
+
     pub(in crate::therock) fn as_str(&self) -> &str {
         match self {
             Self::Exact(target) => target,
@@ -3059,5 +3079,97 @@ sdk install
         );
         assert!(!resolved.contains("not resolved"), "{resolved}");
         assert!(!resolved.contains("resolution_note"), "{resolved}");
+    }
+
+    // ---- the recorded device target ------------------------------------------
+
+    /// The rule in one place: nothing recorded leaves the detected answer as it
+    /// was, a recorded target is judged against what the source publishes, and an
+    /// unpublished one is `Undetermined` with the reason rather than a guess.
+    #[test]
+    fn a_recorded_device_target_is_judged_against_what_the_source_publishes() {
+        let published = vec!["gfx1200".to_owned()];
+        let undetected = AggregateDeviceTarget::Undetermined("no GPU".to_owned());
+        let exact = AggregateDeviceTarget::Exact("gfx1200".to_owned());
+        // Nothing recorded: the detected answer stands, undetermined included.
+        assert_eq!(
+            AggregateDeviceTarget::prefer_recorded(&undetected, None, "gfx120X-all", &published),
+            undetected
+        );
+        assert_eq!(
+            AggregateDeviceTarget::prefer_recorded(&exact, None, "gfx120X-all", &published),
+            exact
+        );
+        // Recorded and published: it wins over an undetermined host probe.
+        assert_eq!(
+            AggregateDeviceTarget::prefer_recorded(
+                &undetected,
+                Some("gfx1200"),
+                "gfx120X-all",
+                &published
+            ),
+            exact
+        );
+        // Recorded but not published: undetermined, whatever the host probe said.
+        let refused = AggregateDeviceTarget::prefer_recorded(
+            &exact,
+            Some("gfx1201"),
+            "gfx120X-all",
+            &published,
+        );
+        assert!(
+            matches!(&refused, AggregateDeviceTarget::Undetermined(reason) if reason.contains("gfx1201")),
+            "{refused:?}"
+        );
+    }
+
+    /// The same rule reaches a preview that stopped before `uv`: an override the
+    /// source does not publish shows as `<undetermined>` with its reason, not as the
+    /// target the resolution detected. Red if `unresolved_wheel_preview` stops
+    /// using the helper and keeps the detected target.
+    #[test]
+    fn a_preview_without_uv_applies_a_recorded_device_target_through_the_helper() {
+        let unresolved = unresolved_runtime();
+        let (python, wheel_compatibility) = clean_host_python();
+        let text = super::super::super::wheel_plan::unresolved_wheel_preview(
+            &super::super::super::wheel_plan::UnresolvedPreview {
+                channel: TheRockChannel::Release,
+                version_selector: None,
+                unresolved: &unresolved,
+                device_target_override: Some("gfx1201"),
+                prefix: None,
+                host_version_newer: None,
+                python: &python,
+                wheel_compatibility: &wheel_compatibility,
+            },
+        );
+        assert!(
+            text.contains("\n  device_target: <undetermined>\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n  device_target_reason: "), "{text}");
+        assert!(!text.contains("device_target: gfx1200"), "{text}");
+    }
+
+    /// No call site writes the rule by hand again: every one goes through
+    /// `AggregateDeviceTarget::prefer_recorded`, so a change to the rule reaches
+    /// the install plan, the preview and an update's plan together. A scan of the
+    /// three files that call it, red if one resolves a recorded target itself.
+    #[test]
+    fn the_recorded_device_target_rule_is_written_once() {
+        for (name, source) in [
+            ("therock.rs", include_str!("../../therock.rs")),
+            ("therock/update.rs", include_str!("../update.rs")),
+            ("therock/wheel_plan.rs", include_str!("../wheel_plan.rs")),
+        ] {
+            assert!(
+                source.contains("AggregateDeviceTarget::prefer_recorded("),
+                "{name} no longer resolves its device target through the helper"
+            );
+            assert!(
+                !source.contains("AggregateDeviceTarget::resolve("),
+                "{name} resolves a device target by hand; use AggregateDeviceTarget::prefer_recorded"
+            );
+        }
     }
 }

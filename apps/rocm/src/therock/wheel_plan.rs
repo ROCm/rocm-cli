@@ -296,15 +296,11 @@ pub(super) fn unresolved_wheel_preview(preview: &UnresolvedPreview<'_>) -> Strin
         python,
         wheel_compatibility,
     } = *preview;
-    let device_target = device_target_override.map_or_else(
-        || unresolved.device_target.clone(),
-        |target| {
-            AggregateDeviceTarget::resolve(
-                Some(target),
-                &unresolved.family,
-                &unresolved.published_device_targets,
-            )
-        },
+    let device_target = AggregateDeviceTarget::prefer_recorded(
+        &unresolved.device_target,
+        device_target_override,
+        &unresolved.family,
+        &unresolved.published_device_targets,
     );
     let explicit_install_root = prefix.map(rocm_core::resolve_path_through_symlinks);
     let no_wheel_warning = no_wheel_warning_for(
