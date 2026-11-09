@@ -21,8 +21,11 @@
 //! A ref that resolved to the literal name `unknown` (a branch or
 //! `ROCM_CLI_RELEASE_REF` of that name) is indistinguishable from one that did
 //! not resolve, and takes the package-version fallback.
-//! The workspace package version is shared by every crate and unpublished, so
-//! it is the leading version only when the ref did not resolve.
+//! The workspace package version is shared by every crate and is not bumped
+//! per release, so it is the leading version only when the ref did not
+//! resolve. It still reads as a published version (`0.1.0` is also a release
+//! tag), so an unresolved build cannot be told apart from that release by its
+//! leading version alone; its `(unknown, <hash>)` suffix is what marks it.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -532,6 +535,13 @@ mod tests {
             format_cli_version("v1.2.3+", "abcdef1", "0.1.0"),
             "0.0.0-dev (v1.2.3+, abcdef1)"
         );
+        // Three components, but one is not all digits or is empty.
+        for near_miss in ["v1.x.3", "v1..3", "vfoo.bar.baz", "v1.2.3a"] {
+            assert_eq!(
+                format_cli_version(near_miss, "abcdef1", "0.1.0"),
+                format!("0.0.0-dev ({near_miss}, abcdef1)")
+            );
+        }
         // A pre-release and a build suffix together are still a release.
         assert_eq!(
             format_cli_version("v1.2.3-rc.1+build.5", "abcdef1", "0.1.0"),

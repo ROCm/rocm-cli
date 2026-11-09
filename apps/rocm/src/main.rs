@@ -422,7 +422,7 @@ fn parse_cli() -> Result<Cli> {
 /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A branch,
 /// including `main`, is shown as `0.0.0-dev (<ref>, <hash>)`. Only an
 /// unresolved ref falls back to the workspace package version, which is not
-/// itself a release.
+/// bumped per release (see the module docs in `build.rs`).
 fn cli_version_string() -> String {
     env!("ROCM_CLI_VERSION").to_owned()
 }

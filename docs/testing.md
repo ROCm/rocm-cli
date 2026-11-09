@@ -3895,7 +3895,7 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
 `cli_version` is the leading version `rocm version` prints (`X.Y.Z` for a
-`vX.Y.Z` tag build, `0.0.0-dev` for any other ref), never the ref and hash
+`vX.Y.Z` tag build, `0.0.0-dev` for any other resolved ref), never the ref and hash
 after it (a release suffix outside letters, digits, `.`, `-` and `+`, or a
 version over 64 characters, is published as `unknown`). Scenario
 `diagnose-58` in

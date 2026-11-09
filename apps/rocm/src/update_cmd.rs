@@ -566,8 +566,8 @@ mod tests {
 
         assert!(rendered.contains("update_surfaces:"));
         // One token, taken from the same string `rocm version` prints. Which
-        // leading version a tag, `main`, or an unknown ref produces is
-        // `version_surfaces_share_one_build_script_string` in `main.rs`.
+        // leading version a tag, `main`, or an unknown ref produces is the
+        // `format_cli_version_*` tests in `build.rs`.
         let installed = crate::cli_version_number();
         assert!(!installed.contains(' '), "{installed}");
         assert!(crate::cli_version_string().starts_with(&installed));

@@ -1708,7 +1708,9 @@ mod tests {
     /// from the machine and is published as `unknown` rather than repeated.
     #[test]
     fn a_cli_version_that_is_not_a_version_token_is_published_as_unknown() {
-        let too_long = format!("1.{}", "0".repeat(CLI_VERSION_MAX_LEN));
+        // One character over the limit, so a limit off by one is caught.
+        let too_long = format!("1.{}", "0".repeat(CLI_VERSION_MAX_LEN - 1));
+        assert_eq!(too_long.len(), CLI_VERSION_MAX_LEN + 1);
         for candidate in [
             "0.0.0-dev (SENTINEL-BRANCH, abcdef1)",
             "SENTINEL-USER",
