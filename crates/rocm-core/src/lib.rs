@@ -99,8 +99,8 @@ pub use disk_space::{
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 pub use download::{
-    Backoff, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
+    Backoff, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome, DownloadRequest,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress,
 };
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};

@@ -24,7 +24,7 @@ use std::time::Duration;
 use loopback::LoopbackServer;
 use proptest::prelude::*;
 use proptest_cases::proptest_cases;
-use rocm_core::{DownloadRequest, download_file_streaming};
+use rocm_core::{DOWNLOAD_CHUNK_BYTES, DownloadRequest, download_file_streaming};
 use sha2::{Digest, Sha256};
 
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -93,12 +93,6 @@ fn is_digest_rejection(result: &Result<(), String>) -> bool {
         .as_ref()
         .is_err_and(|error| error.contains("SHA-256 mismatch"))
 }
-
-/// The chunk size the download streams through, copied from the private
-/// `DOWNLOAD_CHUNK_BYTES` in `download.rs`. The multi-chunk body below spans three
-/// of these plus a byte, so it still crosses a chunk boundary if that constant
-/// grows a little, and regardless of how short the socket reads come back.
-const CHUNK_BYTES: usize = 64 * 1024;
 
 fn digest_of(body: &[u8]) -> String {
     format!("{:x}", Sha256::digest(body))
@@ -297,7 +291,12 @@ proptest! {
 /// is skipped or disabled for a body this large.)
 #[test]
 fn tampering_past_the_first_chunk_is_rejected() {
-    let body: Vec<u8> = (0..=255_u8).cycle().take(3 * CHUNK_BYTES + 1).collect();
+    // Three chunks plus a byte, so the body crosses a chunk boundary
+    // regardless of how short the socket reads come back.
+    let body: Vec<u8> = (0..=255_u8)
+        .cycle()
+        .take(3 * DOWNLOAD_CHUNK_BYTES + 1)
+        .collect();
     let truth = digest_of(&body);
     assert!(
         download_accepts(&body, Some(&truth), "multi-chunk-intact"),
