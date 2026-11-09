@@ -3905,9 +3905,11 @@ dependencies = [
 name = "rocm-engine-protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "rocm-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

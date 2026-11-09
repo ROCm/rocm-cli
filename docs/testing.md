@@ -1121,8 +1121,9 @@ self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
 above, so on WSL2, Windows or a machine with no GPU it would still run the real
 install.
 
-`serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
-restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
+`serve-26`, `serve-27` and `serve-51` (`features/model_serving.feature`, the
+AIM serve and restart canaries and the AIM endpoint-key check) are `@nightly`
+for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
 per-PR Strix Ubuntu job (about 25 minutes without them, 45 minute cap) used up
 the whole budget. They still need `@requires-engine:aim`, i.e. Docker reachable
@@ -1133,7 +1134,7 @@ cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
 they stay reachable when the opt-in is set.
 
 Caveat: it is unconfirmed that the nightly Strix Halo host has Docker (nothing in
-`nightly.yml` installs or checks it). Without it these two scenarios skip on
+`nightly.yml` installs or checks it). Without it these three scenarios skip on
 every nightly run, and only a manual `include_nightly` dispatch on a host with
 Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
@@ -1545,8 +1546,10 @@ key-file resolution. Verifying that the running server actually *rejects* an
 unauthenticated request requires a live engine. For vLLM that is the `@nightly`
 GPU scenario `serve-vllm-key-guards-every-route` (serve-50), which runs on the
 nightly MI300X and MI350P lanes (see "vLLM endpoint-key coverage"
-below). For the other engines, AIM included, no test yet asserts that the
-running server refuses a keyless request.
+below). For AIM it is the `@nightly` scenario
+`serve-aim-key-guards-every-route` (serve-51; see "AIM endpoint-key coverage"
+below), and an AIM start also checks it itself before serving. For the other
+engines no test yet asserts that the running server refuses a keyless request.
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -1652,7 +1655,7 @@ via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
-and directs the user to `--engine vllm` or a loopback host. vLLM (via
+and directs the user to `--engine vllm` or a loopback host. vLLM and AIM (via
 `VLLM_API_KEY` plus the `rocm_cli_vllm_auth` middleware described below), the
 packaged llama-server fallback (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
@@ -1684,8 +1687,10 @@ only under a fixed set of path prefixes (`/v1` and a few others), while the
 server also answers routes such as `/invocations`, `/tokenize` and `/metrics`.
 So a keyed vLLM launch also passes `--middleware
 rocm_cli_vllm_auth.RequireEndpointApiKey`, an ASGI middleware compiled into the
-engine adapter
-([rocm_cli_vllm_auth.py](../engines/vllm/src/rocm_cli_vllm_auth.py)), written
+binary
+([rocm_cli_vllm_auth.py](../crates/rocm-engine-protocol/src/rocm_cli_vllm_auth.py),
+shared by both engines that run vLLM through
+[endpoint_auth.rs](../crates/rocm-engine-protocol/src/endpoint_auth.rs)), written
 under the engine's data directory at launch and put on the server's
 `PYTHONPATH`. It
 requires the key on every route except `GET`/`HEAD /health` and CORS
@@ -1693,14 +1698,15 @@ preflights, and raises instead of constructing when the key is empty, so a
 server that loaded it never answers a request unchecked.
 
 ```bash
+cargo test -p rocm-engine-protocol endpoint_auth
 cargo test -p rocm-engine-vllm endpoint_auth
 cargo test -p rocm-engine-vllm vllm_serve_args
 ```
 
-The `endpoint_auth` tests run the shipped middleware under `python3` with a
-standard-library ASGI harness (they fail, rather than skip, when `python3` is
-missing on Linux), so the per-route behavior is covered on every PR without a
-GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
+The `rocm-engine-protocol` `endpoint_auth` tests run the shipped middleware
+under `python3` with a standard-library ASGI harness (they fail, rather than
+skip, when `python3` is missing on Linux), so the per-route behavior is covered
+on every PR without a GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
 gets the `--middleware` argument, `VLLM_API_KEY`, and the middleware directory
 at the front of `PYTHONPATH` ahead of the runtime's own entry, together, and
 that an unkeyed launch gets none of them:
@@ -1730,6 +1736,30 @@ the scenario runs without `include_nightly`:
 gh workflow run e2e-selfhosted.yml --ref <branch> \
   -f platform=app-dev-gpu -f name_filter='^serve-50 '
 ```
+
+AIM endpoint-key coverage: an AIM container bundles vLLM, so the same gap
+applies to it. A keyed AIM launch
+([endpoint_auth.rs](../engines/aim/src/endpoint_auth.rs)) bind-mounts the
+middleware's directory read-only at `/opt/rocm-cli/python`, prepends that to
+the container's `PYTHONPATH` (keeping the caller's or the image's value) and
+adds `"middleware"` to `AIM_ENGINE_ARGS` (keeping any arguments already there),
+all through the container's env file. Since the container's vLLM is not under
+rocm-cli's control, `serve_http` then calls `POST /tokenize` without the key
+once the container is ready, and stops the container and fails unless that is
+refused with `401`.
+
+```bash
+cargo test -p rocm-engine-aim endpoint_auth
+cargo test -p rocm-engine-aim keyed
+cargo test -p rocm-engine-aim run_args_mount
+```
+
+These cover the env and mount built for a keyed launch against one without a
+key, and the refusal against a fake server (`spawn_fake_server`) that does or
+does not check every route. That a real AIM image applies `AIM_ENGINE_ARGS`
+and loads the middleware is covered only by the `@nightly` scenario
+`serve-aim-key-guards-every-route`, which has the same Docker caveat as
+`serve-26` and `serve-27` above.
 
 Engine recipe adapter contract focused tests:
 

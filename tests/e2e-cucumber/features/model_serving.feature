@@ -832,3 +832,21 @@ Feature: Model serving
     Then every one of those calls is refused as unauthorized
     And the same calls succeed when the client presents the key
     And the server's health check still answers without the key
+
+  # The AIM engine's container bundles vLLM, so the same gap applies: its
+  # `VLLM_API_KEY` check guards only vLLM's own path prefixes. rocm-cli mounts
+  # the same middleware into the container and adds it through the AIM
+  # runtime's `AIM_ENGINE_ARGS`, then refuses to serve unless a keyless call to
+  # `/tokenize` is refused. The env, mount and refusal are unit-tested on every
+  # PR (`endpoint_auth` and the keyed `run_container`/`serve_http` tests in the
+  # AIM engine crate); this proves a real AIM image actually loads the
+  # middleware. `@nightly` for the same reason as serve-26: it pulls the image
+  # and a 9B checkpoint on a cold runner.
+  @id:serve-aim-key-guards-every-route @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  Scenario: serve-51 - A key-protected AIM endpoint refuses keyless requests on every route
+    Given a managed runtime is active
+    And a model is being served on aim behind an API key
+    When a client calls the server's other routes without the key
+    Then every one of those calls is refused as unauthorized
+    And the same calls succeed when the client presents the key
+    And the server's health check still answers without the key

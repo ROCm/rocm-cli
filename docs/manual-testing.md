@@ -1250,6 +1250,33 @@ Expected result:
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
 
+To check that an endpoint key covers every route of an AIM container, not only
+`/v1`, serve the same raw image behind a key and repeat the calls from section
+7 against it:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency --require-api-key
+docker inspect --format '{{json .Mounts}}' rocm-aim-<service-id>
+```
+
+Expected result:
+
+- The service reaches `ready`, and `docker inspect` shows the engine's
+  `python` directory mounted read-only at `/opt/rocm-cli/python`.
+- With `Qwen/Qwen3.5-9B` as the model, the `/invocations` and `/tokenize` calls
+  from section 7 print `401` without the key and `200` with
+  `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"`; `/health` prints `200`
+  without it.
+- If the image does not apply `AIM_ENGINE_ARGS`, the serve fails instead,
+  naming `POST /tokenize` and the status it answered, and the container is
+  removed.
+
+The automated scenario is the `@nightly` `serve-aim-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs only on a nightly host with Docker and a Radeon or Strix Halo GPU.
+
 ## 12. Background Automation Helper
 
 The helper (`rocm daemon`) runs only while an automation watcher is enabled.

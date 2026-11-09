@@ -5,7 +5,8 @@
 """Require the endpoint API key on every route of a vLLM OpenAI server.
 
 rocm-cli passes ``--middleware rocm_cli_vllm_auth.RequireEndpointApiKey`` to
-``vllm serve`` whenever it protects an endpoint with an API key. vLLM's own
+``vllm serve`` -- directly, or through ``AIM_ENGINE_ARGS`` in an AIM
+container -- whenever it protects an endpoint with an API key. vLLM's own
 ``VLLM_API_KEY`` check guards only a fixed set of path prefixes (``/v1`` and
 a few others), while the server also registers inference-capable routes
 outside them (``/invocations``, ``/tokenize``, ...). This middleware closes
@@ -24,8 +25,8 @@ protection cannot come up unprotected.
 
 Pure ASGI and standard library only: it must import in whichever vLLM
 release the runtime ships, with no assumption about its Starlette version.
-This file is written out by the rocm-cli vLLM engine adapter at launch;
-edit the copy in the rocm-cli source tree, not the one on disk.
+This file is written out by the rocm-cli vLLM and AIM engine adapters at
+launch; edit the copy in the rocm-cli source tree, not the one on disk.
 """
 
 import hashlib

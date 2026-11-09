@@ -202,10 +202,33 @@ async fn serve_and_wait(
     model: &str,
     ready_substr: &str,
 ) -> String {
+    serve_and_wait_with_key(world, args, model, ready_substr, None).await
+}
+
+/// [`serve_and_wait`], protecting the endpoint with `api_key` when one is
+/// given: `--require-api-key` is appended and the key travels in
+/// `ROCM_SERVE_API_KEY`, never argv, which is recorded verbatim in the
+/// uploaded `results/commands.jsonl`.
+async fn serve_and_wait_with_key(
+    world: &mut E2eWorld,
+    args: &[&str],
+    model: &str,
+    ready_substr: &str,
+    api_key: Option<&str>,
+) -> String {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
-    let (stdout, stderr, rc) = crate::run_rocm(world, args);
-    if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
+    let mut args = args.to_vec();
+    let mut envs = Vec::new();
+    if let Some(key) = api_key {
+        args.push("--require-api-key");
+        envs.push(("ROCM_SERVE_API_KEY", key));
+    }
+    let args = args.as_slice();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(world, args, &envs);
+    if rc == 0
+        && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+    {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
         return stdout;
@@ -933,10 +956,21 @@ async fn setup_aim_model(world: &mut E2eWorld) {
     serve_aim_canary(world).await;
 }
 
+#[given("a model is being served on aim behind an API key")]
+async fn setup_aim_model_behind_key(world: &mut E2eWorld) {
+    serve_aim_canary_with_key(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+}
+
 /// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
 /// Factored out so the lifecycle-parity scenario can call it a second time,
 /// after stopping the service, without duplicating the image/profile pin.
 async fn serve_aim_canary(world: &mut E2eWorld) {
+    serve_aim_canary_with_key(world, None).await;
+}
+
+/// [`serve_aim_canary`], protecting the endpoint with `api_key` when one is
+/// given (`--require-api-key`, so even this loopback bind demands it).
+async fn serve_aim_canary_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
     // Serves via the raw AIM Docker image reference rather than the catalog
     // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
     // canary pinned to one exact image/profile, not a catalog-discovery test.
@@ -954,7 +988,7 @@ async fn serve_aim_canary(world: &mut E2eWorld) {
     // (not the Docker image reference) as `model` — confirmed live on Strix
     // Halo.
     let model = "Qwen/Qwen3.5-9B";
-    serve_and_wait(
+    serve_and_wait_with_key(
         world,
         &[
             "serve",
@@ -967,6 +1001,7 @@ async fn serve_aim_canary(world: &mut E2eWorld) {
         ],
         model,
         "Qwen3.5-9B",
+        api_key,
     )
     .await;
 }

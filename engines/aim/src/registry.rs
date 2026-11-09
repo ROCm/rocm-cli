@@ -22,6 +22,9 @@ pub(crate) struct AimImageMetadata {
     pub accelerator_type: Option<String>,
     pub pytorch_rocm_arch: Vec<String>,
     pub canonical_name: Option<String>,
+    /// Every `KEY=VALUE` entry of the image's `Env`, for values a launch has
+    /// to extend rather than replace (`PYTHONPATH`, `AIM_ENGINE_ARGS`).
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Normalizes a user- or catalog-supplied image reference so the registry
@@ -156,6 +159,7 @@ fn parse_image_config(config: &Value) -> AimImageMetadata {
         .unwrap_or_default();
     for entry in env_entries {
         if let Some((key, value)) = entry.split_once('=') {
+            metadata.env.insert(key.to_owned(), value.to_owned());
             match key {
                 "AIM_ACCELERATOR_TYPE" => metadata.accelerator_type = Some(value.to_owned()),
                 "PYTORCH_ROCM_ARCH" => {
@@ -290,6 +294,10 @@ mod tests {
         assert_eq!(
             metadata.canonical_name.as_deref(),
             Some("Llama-3.2-1B-Instruct")
+        );
+        assert_eq!(
+            metadata.env.get("PATH").map(String::as_str),
+            Some("/usr/bin")
         );
     }
 }

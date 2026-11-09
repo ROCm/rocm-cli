@@ -164,7 +164,10 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
 
     let state_path = crate::state::state_path(&request.service_id);
 
-    let served_model_id = run_container(
+    // Returns once `docker run -d` has created the container, before it is
+    // ready, so unlike `serve_http` (the path `rocm serve` takes) it cannot
+    // probe a keyed container's routes; the middleware is installed the same way.
+    let launched = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -178,7 +181,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         &state_path,
         &request.service_id,
         &request.model_ref,
-        served_model_id.as_deref(),
+        launched.label_name.as_deref(),
         &request.host,
         request.port,
         device_policy,
@@ -246,8 +249,17 @@ fn plan_gpus(requested: &[u32], usable: Option<Vec<u32>>, windows: bool) -> Resu
     })
 }
 
-/// Starts the named service's container unless it is already running, and
-/// returns the model name the image says it serves under, if known.
+/// What [`run_container`] started (or found already running).
+#[derive(Debug)]
+struct Launched {
+    /// The model name the image says it serves under, if known.
+    label_name: Option<String>,
+    /// Whether the endpoint is protected by an API key, so the container must
+    /// refuse keyless calls on every route once ready.
+    keyed: bool,
+}
+
+/// Starts the named service's container unless it is already running.
 ///
 /// Container names are unique in Docker, so `docker run --name X` against a
 /// name still held by an exited container (a crash, a reboot, a failed
@@ -261,15 +273,20 @@ fn run_container(
     device_policy: &DevicePolicy,
     requested_gpus: &[u32],
     extra_env: Option<&BTreeMap<String, String>>,
-) -> Result<Option<String>> {
+) -> Result<Launched> {
     let name = crate::docker::container_name(service_id);
+    let api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let keyed = api_key.is_some();
     // Normalize once so the pull, the metadata and the run all use the same image.
     let image_ref = crate::registry::normalize_image_ref(model_ref);
 
     match crate::docker::container_state(&name)? {
         ContainerState::Running => {
-            return Ok(crate::registry::local_image_metadata(&image_ref)
-                .and_then(|metadata| metadata.canonical_name));
+            return Ok(Launched {
+                label_name: crate::registry::local_image_metadata(&image_ref)
+                    .and_then(|metadata| metadata.canonical_name),
+                keyed,
+            });
         }
         ContainerState::Exited(_) => crate::docker::remove(&name)?,
         ContainerState::Missing => {}
@@ -306,13 +323,31 @@ fn run_container(
         bail!("engine env `{key}` is managed by rocm-cli and cannot be overridden");
     }
     // AIM images bundle vLLM's OpenAI server, so it is `VLLM_API_KEY` that this
-    // engine's actual server enforces. The container is the only process this
-    // engine runs, so without this the require-api-key setting a public
-    // `rocm serve --engine aim` was given is silently never enforced. The value
-    // reaches docker through a private env file, never argv.
-    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
-        env.insert("VLLM_API_KEY".to_owned(), api_key);
-    }
+    // engine's actual server enforces — but only under vLLM's own fixed path
+    // prefixes, so a keyed launch also mounts in the every-route middleware
+    // (`endpoint_auth`). The container is the only process this engine runs, so
+    // without this the require-api-key setting a public `rocm serve --engine
+    // aim` was given is never enforced. The values reach docker through a
+    // private env file, never argv.
+    let module_dir = match api_key.as_deref() {
+        Some(api_key) => {
+            crate::endpoint_auth::protect_container_env(&mut env, api_key, &metadata.env, |key| {
+                std::env::var(key).ok()
+            })?;
+            Some(crate::endpoint_auth::stage_module(
+                &crate::endpoint_auth::module_dir(&rocm_core::AppPaths::discover()?),
+            )?)
+        }
+        None => None,
+    };
+    let mounts: Vec<crate::docker::ReadOnlyMount<'_>> = module_dir
+        .as_deref()
+        .map(|source| crate::docker::ReadOnlyMount {
+            source,
+            target: crate::endpoint_auth::CONTAINER_MODULE_DIR,
+        })
+        .into_iter()
+        .collect();
     crate::docker::run(&crate::docker::RunSpec {
         name: &name,
         image: &image_ref,
@@ -323,8 +358,12 @@ fn run_container(
         gpu_indices: if use_gpu { &gpus.indices } else { &[] },
         render_gid,
         env: &env,
+        read_only_mounts: &mounts,
     })?;
-    Ok(metadata.canonical_name)
+    Ok(Launched {
+        label_name: metadata.canonical_name,
+        keyed,
+    })
 }
 
 /// Enforces `device_policy` instead of treating GPU use as a soft heuristic:
@@ -357,7 +396,7 @@ fn resolve_use_gpu(
 
 pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
     let name = crate::docker::container_name(&request.service_id);
-    let label_name = run_container(
+    let launched = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -377,7 +416,7 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.state_path,
         &request.service_id,
         &request.model_ref,
-        label_name.as_deref(),
+        launched.label_name.as_deref(),
         &request.host,
         request.port,
         request.device_policy,
@@ -387,13 +426,26 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
     // The container serves under the image's HF-style canonical name, not the
     // Docker image reference used for `docker pull`/`run`. When the image didn't
     // label one, wait for the container to list whatever it serves instead.
-    match wait_for_container_ready(
+    let ready = wait_for_container_ready(
         &name,
         &request.host,
         request.port,
-        label_name.as_deref(),
+        launched.label_name.as_deref(),
         aim_ready_timeout(),
-    ) {
+    )
+    .and_then(|served_model_id| {
+        // A keyed container must refuse keyless calls on every route before
+        // it is reported as serving; otherwise it is torn down like any
+        // other failed start.
+        if launched.keyed {
+            crate::endpoint_auth::verify_every_route_guarded(
+                &name,
+                &crate::state::endpoint_url(&request.host, request.port),
+            )?;
+        }
+        Ok(served_model_id)
+    });
+    match ready {
         Ok(served_model_id) => {
             crate::state::record_served_model_id(&request.state_path, &served_model_id)?;
             let exit = wait_for_exit(
@@ -861,6 +913,14 @@ mod subprocess_tests {
     /// Serves `GET /v1/models` (listing `model`) and `POST /v1/chat/completions`
     /// (always 200) on an ephemeral loopback port; returns the port.
     fn spawn_fake_openai(model: &'static str) -> u16 {
+        spawn_fake_server(model, false)
+    }
+
+    /// As [`spawn_fake_openai`], and when `guard_every_route` answers `401` to
+    /// any request without an `Authorization` header, whatever its path — as
+    /// the endpoint-key middleware does. Without it every other path answers
+    /// `200`, like a vLLM whose own key check skips that route.
+    fn spawn_fake_server(model: &'static str, guard_every_route: bool) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -870,28 +930,31 @@ mod subprocess_tests {
                     let mut request_line = String::new();
                     reader.read_line(&mut request_line).ok();
                     let mut content_length = 0usize;
+                    let mut authorized = false;
                     loop {
                         let mut header = String::new();
                         if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
                             break;
                         }
-                        if let Some(value) =
-                            header.to_ascii_lowercase().strip_prefix("content-length:")
-                        {
+                        let lower = header.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
                             content_length = value.trim().parse().unwrap_or(0);
                         }
+                        authorized |= lower.starts_with("authorization:");
                     }
                     let mut body = vec![0; content_length];
                     reader.read_exact(&mut body).ok();
-                    let payload = if request_line.starts_with("GET /v1/models") {
-                        format!(r#"{{"data":[{{"id":"{model}"}}]}}"#)
+                    let (status, payload) = if guard_every_route && !authorized {
+                        ("401 Unauthorized", r#"{"error":"Unauthorized"}"#.to_owned())
+                    } else if request_line.starts_with("GET /v1/models") {
+                        ("200 OK", format!(r#"{{"data":[{{"id":"{model}"}}]}}"#))
                     } else {
-                        r#"{"choices":[]}"#.to_owned()
+                        ("200 OK", r#"{"choices":[]}"#.to_owned())
                     };
                     let mut stream = stream;
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
                     );
                 });
@@ -1264,14 +1327,28 @@ mod subprocess_tests {
             ],
         );
         assert!(!fixture.argv().join("\n").contains("vllm-profile"));
+        assert!(
+            !fixture.argv().join("\n").contains("--mount"),
+            "an unkeyed launch mounts nothing: {:?}",
+            fixture.argv()
+        );
         assert_eq!(
             fixture.env_copy().as_deref(),
-            Some("AIM_PROFILE_ID=vllm-profile\n")
+            Some("AIM_PROFILE_ID=vllm-profile\n"),
+            "an unkeyed launch adds no key, PYTHONPATH or AIM_ENGINE_ARGS"
         );
     }
 
+    /// Writes an endpoint key file for a keyed launch and returns its path;
+    /// the caller removes it.
+    fn endpoint_key_file(tag: &str) -> std::path::PathBuf {
+        let key_file = std::env::temp_dir().join(format!("aim-key-{tag}-{}", std::process::id()));
+        std::fs::write(&key_file, "s3cret\n").unwrap();
+        key_file
+    }
+
     #[test]
-    fn run_container_forwards_the_endpoint_api_key_as_vllm_api_key() {
+    fn run_container_installs_the_every_route_middleware_for_a_keyed_launch() {
         if in_subprocess() {
             run_container(
                 "svc-key",
@@ -1283,12 +1360,19 @@ mod subprocess_tests {
                 None,
             )
             .unwrap();
+            let module =
+                crate::endpoint_auth::module_dir(&rocm_core::AppPaths::discover().unwrap())
+                    .join("rocm_cli_vllm_auth.py");
+            assert_eq!(
+                std::fs::read_to_string(&module).unwrap(),
+                rocm_engine_protocol::endpoint_auth::MIDDLEWARE_MODULE_SOURCE,
+                "the mounted directory must hold the middleware the container imports"
+            );
             return;
         }
-        let key_file = std::env::temp_dir().join(format!("aim-key-{}", std::process::id()));
-        std::fs::write(&key_file, "s3cret\n").unwrap();
+        let key_file = endpoint_key_file("run");
         let fixture = run_with_fake_docker(
-            "process::subprocess_tests::run_container_forwards_the_endpoint_api_key_as_vllm_api_key",
+            "process::subprocess_tests::run_container_installs_the_every_route_middleware_for_a_keyed_launch",
             &[
                 ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
                 ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
@@ -1299,8 +1383,92 @@ mod subprocess_tests {
             ],
         );
         std::fs::remove_file(&key_file).ok();
-        assert!(!fixture.argv().join("\n").contains("s3cret"));
-        assert_eq!(fixture.env_copy().as_deref(), Some("VLLM_API_KEY=s3cret\n"));
+        let argv = fixture.argv().join("\n");
+        assert!(
+            !argv.contains("s3cret"),
+            "the key must stay off argv: {argv}"
+        );
+        assert!(
+            argv.contains("--mount type=bind,source=")
+                && argv.contains("/engines/aim/python,target=/opt/rocm-cli/python,readonly"),
+            "the middleware directory must be mounted read-only: {argv}"
+        );
+        assert_eq!(
+            fixture.env_copy().as_deref(),
+            Some(
+                "AIM_ENGINE_ARGS={\"middleware\":\"rocm_cli_vllm_auth.RequireEndpointApiKey\"}\n\
+                 PYTHONPATH=/opt/rocm-cli/python\n\
+                 VLLM_API_KEY=s3cret\n"
+            )
+        );
+    }
+
+    #[test]
+    fn serve_http_refuses_a_keyed_container_that_answers_a_route_without_the_key() {
+        if in_subprocess() {
+            let port = spawn_fake_server(SERVED, false);
+            let state_path = data_dir().join("svc.json");
+            let error = serve_http(serve_request("svc-open-route", port, state_path.clone()))
+                .expect_err("a keyed container that answers keyless calls must not serve");
+            let text = format!("{error:#}");
+            assert!(text.contains("POST /tokenize"), "{text}");
+            assert!(text.contains("HTTP 200"), "{text}");
+            assert_eq!(status_of(&state_path).as_deref(), Some("failed"));
+            return;
+        }
+        let key_file = endpoint_key_file("open");
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::serve_http_refuses_a_keyed_container_that_answers_a_route_without_the_key",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                // Ends exited, so a start that skipped the check would return
+                // instead of supervising the fake container forever.
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing,true 0,false 0"),
+                (
+                    rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
+                    key_file.to_str().unwrap(),
+                ),
+            ],
+        );
+        std::fs::remove_file(&key_file).ok();
+        assert!(
+            fixture
+                .argv()
+                .contains(&"rm -f rocm-aim-svc-open-route".to_owned()),
+            "the unprotected container must be removed: {:?}",
+            fixture.argv()
+        );
+    }
+
+    #[test]
+    fn serve_http_serves_a_keyed_container_that_refuses_keyless_calls() {
+        if in_subprocess() {
+            let port = spawn_fake_server(SERVED, true);
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-guarded", port, state_path.clone())).unwrap();
+            assert_eq!(status_of(&state_path).as_deref(), Some("stopped"));
+            let state = crate::state::read_service_state(&state_path).unwrap();
+            assert_eq!(state["served_model_id"], SERVED);
+            return;
+        }
+        let key_file = endpoint_key_file("guarded");
+        run_with_fake_docker(
+            "process::subprocess_tests::serve_http_serves_a_keyed_container_that_refuses_keyless_calls",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    "FAKE_DOCKER_INSPECT_SEQUENCE",
+                    "missing,true 0,true 0,false 0",
+                ),
+                (
+                    rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
+                    key_file.to_str().unwrap(),
+                ),
+            ],
+        );
+        std::fs::remove_file(&key_file).ok();
     }
 
     #[test]
