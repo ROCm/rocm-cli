@@ -9,8 +9,10 @@
 //! Mechanically relocated from `main.rs` with no behavior change, and later
 //! narrowed: the process-control cluster (stop, restart and the internal
 //! sandbox-tool runner) lives in `service_control.rs` (see
-//! `docs/architecture.md`). The `--follow` tail (`LogTail`, `FollowFooter`,
-//! `follow_service_logs`) is new code written here, not relocated.
+//! `docs/architecture.md`). The `--follow` tail (`FollowCursor`, `FollowFooter`,
+//! `follow_service_logs`) is new code written here, not relocated. A
+//! `FollowCursor` follows a growing file; it is not `rocm_core::LogTail`, the
+//! result of a bounded tail read that the log views here use.
 //!
 //! This module owns: the CLI/TUI logs browser (`render_logs_text`,
 //! `render_logs_browser_text`, `render_logs_browser_page_text`,
@@ -23,7 +25,7 @@
 //! `render_service_action_result`, `read_managed_service_manifest`,
 //! `load_managed_service`), the `--follow` tail behind `rocm logs --service
 //! <id> --follow` and `rocm services logs <id> --follow`
-//! (`follow_service_logs`, `follow_service_logs_with`, the `LogTail` and
+//! (`follow_service_logs`, `follow_service_logs_with`, the `FollowCursor` and
 //! `LogSegment` types, `write_log_segments`), the internal `rocmd`-compatible
 //! status surface (`render_internal_status_text`), the `stop_server` answer shape
 //! (`internal_stop_server_value`, `service_stop_unconfirmed`) and its renderer
@@ -557,11 +559,13 @@ const LOG_FOLLOW_POLL: Duration = Duration::from_millis(500);
 const LOG_FOLLOW_LIVENESS_EVERY: Duration = Duration::from_secs(2);
 
 /// Reads whatever a growing log file gained since the last [`Self::poll`].
+/// Not `rocm_core::LogTail`, which is what a bounded read of the end of a log
+/// returns.
 ///
 /// Download bars (tqdm, huggingface_hub) redraw in place with `\r`, so a
 /// finished segment ends at either `\r` or `\n`; a trailing partial segment is
 /// held back until its terminator arrives.
-struct LogTail {
+struct FollowCursor {
     path: PathBuf,
     offset: u64,
     pending: Vec<u8>,
@@ -574,7 +578,7 @@ struct LogSegment {
     redraw: bool,
 }
 
-impl LogTail {
+impl FollowCursor {
     /// Start following at the file's current end.
     fn at_end(path: &Path) -> Self {
         let offset = fs::metadata(path).map_or(0, |meta| meta.len());
@@ -869,7 +873,7 @@ fn follow_service_logs_via(
     // Open the tail before the snapshot: output written in between is then shown
     // twice (in the snapshot and by the first poll) rather than lost, and the
     // tail can start mid-line.
-    let mut tail = LogTail::at_end(&record.log_path);
+    let mut tail = FollowCursor::at_end(&record.log_path);
     write!(out, "{}", render_service_logs_text(paths, service_id)?)?;
     out.flush()?;
     if !managed_service_is_live(&record) {
@@ -923,7 +927,7 @@ fn follow_service_logs_via(
 fn follow_loop(
     load: &dyn Fn() -> Result<ManagedServiceRecord>,
     record: &ManagedServiceRecord,
-    tail: &mut LogTail,
+    tail: &mut FollowCursor,
     footer: &mut Option<FollowFooter>,
     out: &mut impl io::Write,
     err: &mut impl io::Write,
@@ -1743,7 +1747,7 @@ pub(crate) mod tests {
         paths.ensure()?;
         let log = root.join("tail.log");
         fs::write(&log, "old line\n")?;
-        let mut tail = LogTail::at_end(&log);
+        let mut tail = FollowCursor::at_end(&log);
         assert!(tail.poll().is_empty());
 
         // tqdm-style bar redraws with `\r`; the last piece has no terminator yet.
@@ -1796,7 +1800,7 @@ pub(crate) mod tests {
         paths.ensure()?;
         let log = root.join("edges.log");
         fs::write(&log, "")?;
-        let mut tail = LogTail::at_end(&log);
+        let mut tail = FollowCursor::at_end(&log);
 
         // A `\r` ending the data may be half of a `\r\n`: it is not a redraw yet.
         fs::write(&log, " 99%|#\r")?;
@@ -1942,7 +1946,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&root)?;
         let log = root.join("engine.log");
         fs::write(&log, "")?;
-        let mut tail = LogTail::at_end(&log);
+        let mut tail = FollowCursor::at_end(&log);
         fs::write(&log, "before\x1b[1Aafter\n")?;
         let segments = tail.poll();
         assert_eq!(segments.len(), 1);
@@ -1957,7 +1961,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&root)?;
         let log = root.join("engine.log");
         fs::write(&log, "")?;
-        let mut tail = LogTail::at_end(&log);
+        let mut tail = FollowCursor::at_end(&log);
         fs::write(&log, "last\x1b[1Aword")?;
         assert!(tail.poll().is_empty());
         let segment = tail.finish().expect("unterminated output is returned");
