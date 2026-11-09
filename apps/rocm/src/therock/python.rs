@@ -212,8 +212,24 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Record the managed interpreter under `tools.python` in `config.json`.
+///
+/// A `config.json` that exists but cannot be read is an error here, as it is
+/// for [`RocmCliConfig::load`] itself: it is not "no config yet", and saving
+/// over it would replace the user's active runtime, TheRock folder, providers
+/// and preferences with defaults. The callers fail rather than skip the
+/// record: the install cannot finish against that file anyway (activating the
+/// new runtime loads it strictly), and failing here does so before any runtime
+/// is downloaded.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = RocmCliConfig::load(paths).unwrap_or_default();
+    let mut config = RocmCliConfig::load(paths).with_context(|| {
+        format!(
+            "cannot record the managed Python in {} because that file cannot be read; it was \
+             left unchanged. Repair it, then run the command again. {}",
+            paths.config_path().display(),
+            paths.config_aside_advice()
+        )
+    })?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -309,7 +325,7 @@ fn ensure_managed_python(
             "Using existing Python {version} at {}.",
             manifest.executable.display()
         ));
-        let _ = record_managed_python_config(paths, &manifest.executable);
+        record_managed_python_config(paths, &manifest.executable)?;
         return Ok(PythonLauncher {
             executable: manifest.executable,
             source: PythonSource::Managed,
@@ -379,7 +395,7 @@ fn ensure_managed_python(
         installed_at_unix_ms: unix_time_millis(),
     };
     save_managed_python_manifest(paths, &manifest)?;
-    let _ = record_managed_python_config(paths, &executable);
+    record_managed_python_config(paths, &executable)?;
     progress_line(format!(
         "Python {version} is ready at {}.",
         executable.display()
@@ -1008,6 +1024,10 @@ fn python_venv_probe_temp_root() -> Result<PathBuf> {
         linux_temp_dir("rocm-cli-python-venv-probe")
     }
 }
+
+#[cfg(test)]
+#[path = "python_config_props.rs"]
+mod config_props;
 
 #[cfg(test)]
 mod tests {
@@ -2520,5 +2540,152 @@ exit 1
         );
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// A stand-in `uv` that records every invocation and answers
+    /// `python install` / `python find` without touching the network.
+    /// Planted where `ensure_uv_binary` looks for the managed copy, so no
+    /// download and no environment override is needed.
+    #[cfg(unix)]
+    fn plant_fake_uv(paths: &AppPaths, python: &Path, log: &Path) -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let dir = managed_tools_dir(&paths.data_dir).join("uv").join("latest");
+        fs::create_dir_all(&dir)?;
+        let uv = dir.join(rocm_core::uv_binary_name());
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ \"$1 $2\" = \"python find\" ]; then echo '{python}'; fi\nexit 0\n",
+            log = log.display(),
+            python = python.display(),
+        );
+        write_fake_executable(&uv, script)?;
+        Ok(())
+    }
+
+    /// A config.json `load` rejects, holding settings that must survive.
+    #[cfg(unix)]
+    fn plant_unreadable_config(paths: &AppPaths) -> Result<Vec<u8>> {
+        fs::create_dir_all(&paths.config_dir)?;
+        let damaged = br#"{"active_runtime_key": "kept-runtime", "onboarding_dismissed": "yes"}"#;
+        fs::write(paths.config_path(), damaged)?;
+        assert!(RocmCliConfig::load(paths).is_err());
+        Ok(damaged.to_vec())
+    }
+
+    /// The error names the exact file to rename and what to rename it to.
+    /// The advice text itself is `AppPaths::config_aside_advice`; that
+    /// following it keeps the data dir is
+    /// `config_rename_advice_keeps_a_recorded_data_dir_when_followed` in
+    /// rocm-core's paths.rs.
+    #[cfg(unix)]
+    fn assert_names_the_file_to_rename(message: &str, paths: &AppPaths) {
+        let config = paths.config_path();
+        assert!(
+            message.contains(&format!(
+                "rename {} to {}.broken",
+                config.display(),
+                config.display()
+            )) && message.contains(&paths.config_aside_advice()),
+            "the error does not name the file to rename: {message}"
+        );
+    }
+
+    /// The reuse path: a usable managed Python is already recorded, so
+    /// `ensure_managed_python` returns early. Meeting an unreadable config
+    /// there must fail — not report success with the record silently skipped
+    /// — before anything is installed, and leave the file as it was.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_reuse_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        // Held because the uv and Python versions are read from the
+        // environment, which other tests in this module set.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-reuse-unreadable");
+        let python_dir = managed_tools_dir(&paths.data_dir).join("python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        save_managed_python_manifest(
+            &paths,
+            &ManagedPythonManifest {
+                executable: python.clone(),
+                version: managed_python_version(python_requirement(SourceLayout::Canonical)),
+                installed_at_unix_ms: 1,
+            },
+        )?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let Err(error) =
+            ensure_managed_python(&paths, requirement, managed_python_version(requirement))
+        else {
+            panic!("an unreadable config must fail the reuse path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_names_the_file_to_rename(&message, &paths);
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            !uv_calls.contains("python install"),
+            "the reuse path installed Python before failing: {uv_calls}"
+        );
+        Ok(())
+    }
+
+    /// The install path: no managed Python yet, so `uv python install` runs
+    /// and the new interpreter is recorded at the end. An unreadable config
+    /// there fails the bootstrap too, with the file left as it was, before
+    /// the caller goes on to download a runtime.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_install_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-install-unreadable");
+        let python_dir = root.join("uv-python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let Err(error) =
+            ensure_managed_python(&paths, requirement, managed_python_version(requirement))
+        else {
+            panic!("an unreadable config must fail the install path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_names_the_file_to_rename(&message, &paths);
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            uv_calls.contains("python install"),
+            "expected the install path to run: {uv_calls}"
+        );
+        Ok(())
     }
 }
