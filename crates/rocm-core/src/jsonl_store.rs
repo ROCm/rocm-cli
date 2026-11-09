@@ -14,13 +14,13 @@
 //! rewrite via [`crate::atomic_write::write_file_atomically`], so a lock-free
 //! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
 //! rather than O(record), the same as a proposal status update, which rewrites
-//! the whole store the same way. Only when that rewrite itself fails (a full disk, or on
-//! Windows another program holding the store open without delete sharing) does
-//! the append cut the debris in place instead, so a store cannot be wedged by
-//! a failed repair; otherwise nothing in this module ever shrinks a store in
-//! place. Readers take no lock, and an unterminated last line that is not
-//! valid JSON — an append caught mid-write — is skipped rather than reported
-//! as corruption.
+//! the whole store the same way. Only when that rewrite itself fails (a full
+//! disk, or on Windows another program holding the store open without delete
+//! sharing) does the append cut the debris in place instead, so a store cannot
+//! be wedged by a failed repair; otherwise nothing in this module ever shrinks
+//! a store in place. Readers take no lock, and an unterminated last line that
+//! is not valid JSON — an append caught mid-write — is skipped rather than
+//! reported as corruption.
 //!
 //! A store can additionally be capped by size-based rotation (see
 //! [`JsonlRotation`]): the append that finds the live file at the cap renames
@@ -1182,9 +1182,11 @@ mod tests {
         let seeded = format!("{}\n{torn}", entry_line("a"));
         seed_store(&path, &seeded)?;
 
-        // Layered like the real steps (`write_file_atomically` and
-        // `truncate_jsonl_in_place` both wrap the OS error in a context), so
-        // the assertion fails if either cause is formatted without its chain.
+        // Layered like the real steps (`write_file_atomically` puts a context
+        // such as `failed to publish <path>` over the OS error, and
+        // `truncate_jsonl_in_place` puts `failed to truncate <path>` over its
+        // own), so the assertion fails if either cause is formatted without its
+        // chain.
         let result = repair_store_with(
             &path,
             |_, _| {
