@@ -54,7 +54,10 @@ pub(super) fn probe_os(e: &mut Examination) {
     };
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
-        e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
+        // The summary's read, so `kernel:` and `kernel_release` come from one
+        // `uname -r`. A failed read is empty here, with no `probe_failures`
+        // entry, as before: a host without a usable `uname` is not a degraded one.
+        e.kernel_release = crate::host_gpu::detect_kernel_version().unwrap_or_default();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
         record_distro(
             e,
@@ -667,6 +670,11 @@ mod tests {
             let answers = serde_json::json!({
                 "summary": crate::host_gpu::detect_kernel_version(),
                 "examination": e.kernel_release,
+                "failures_about_uname": e
+                    .probe_failures
+                    .iter()
+                    .filter(|failure| failure.contains("uname") || failure.contains("kernel"))
+                    .count(),
             });
             println!("{ANSWER_PREFIX}{answers}");
         }
@@ -714,6 +722,10 @@ mod tests {
                     )
                 });
             let json: serde_json::Value = serde_json::from_str(line).expect("answers are JSON");
+            // A failed read is empty, not a failure: no case leaves a
+            // `probe_failures` entry about the kernel, so a host with a missing
+            // or broken `uname` does not read as degraded.
+            assert_eq!(json["failures_about_uname"], 0, "{json}");
             Pair {
                 summary: json["summary"].as_str().map(str::to_owned),
                 examination: json["examination"]
@@ -748,14 +760,11 @@ mod tests {
             }
         }
 
-        /// The first difference: a `uname` that prints a release and exits
-        /// non-zero. The summary drops it, the examination keeps it.
+        /// A `uname` that prints a release and exits non-zero is dropped by
+        /// both. The examination used to keep the release.
         #[test]
-        fn a_non_zero_exit_with_output_is_dropped_by_the_summary_and_kept_by_the_examination() {
-            assert_eq!(
-                ask("echo 6.8.0-partial; exit 3"),
-                pair(None, "6.8.0-partial")
-            );
+        fn a_non_zero_exit_with_output_is_dropped_by_both() {
+            assert_eq!(ask("echo 6.8.0-partial; exit 3"), pair(None, ""));
         }
 
         /// Both read a successful but silent `uname` as nothing: `None` in the
@@ -766,24 +775,28 @@ mod tests {
             assert_eq!(ask("exit 0"), pair(None, ""));
         }
 
-        /// The second difference: output that is not UTF-8. The summary reads
-        /// `None`; the examination keeps it with the bad byte replaced.
+        /// Output that is not UTF-8 is dropped by both. The examination used to
+        /// keep it with the bad byte replaced.
         #[test]
-        fn output_that_is_not_utf8_is_dropped_by_the_summary_and_kept_lossy_by_the_examination() {
-            assert_eq!(ask("printf '6.8.0-\\377\\n'"), pair(None, "6.8.0-\u{fffd}"));
+        fn output_that_is_not_utf8_is_dropped_by_both() {
+            assert_eq!(ask("printf '6.8.0-\\377\\n'"), pair(None, ""));
         }
 
-        /// The third difference: a `uname` that answers after 3 s. That is past
-        /// the summary's 1.5 s and within the examination's 5 s.
+        /// A `uname` that answers after 3 s is read by both: the one timeout is
+        /// the longer of the two old ones, 5 s. The summary used to give up at
+        /// 1.5 s.
         #[test]
-        fn an_answer_after_three_seconds_is_missed_by_the_summary_and_read_by_the_examination() {
+        fn an_answer_after_three_seconds_is_read_by_both() {
             let started = Instant::now();
-            assert_eq!(ask("sleep 3; echo 6.8.0-slow"), pair(None, "6.8.0-slow"));
+            assert_eq!(
+                ask("sleep 3; echo 6.8.0-slow"),
+                pair(Some("6.8.0-slow"), "6.8.0-slow")
+            );
             assert!(started.elapsed() >= std::time::Duration::from_secs(3));
         }
 
         /// A `uname` that never answers is read as nothing by both, each after
-        /// its own timeout. `exec` leaves no grandchild holding the pipe.
+        /// the one timeout. `exec` leaves no grandchild holding the pipe.
         #[test]
         fn a_uname_that_never_answers_reads_as_nothing_in_both() {
             assert_eq!(ask("exec sleep 30"), pair(None, ""));

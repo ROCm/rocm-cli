@@ -8,19 +8,46 @@
 use super::capture::{
     OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
 };
+use crate::probe_exec::SHORT;
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
+use std::time::Duration;
 
+/// How long `uname -r` may take.
+///
+/// The longer of the two limits the summary and the examination used to apply
+/// separately (1.5 s and 5 s). The release is a few bytes read from the kernel,
+/// so a `uname` that takes more than a moment is a stalled host, where waiting
+/// longer costs little and a spurious "unknown" costs more: `kernel_release`
+/// feeds the WSL version check and the kernel-dependent diagnoses, which read
+/// an empty value as "nothing to report".
+const KERNEL_RELEASE_TIMEOUT: Duration = SHORT;
+
+/// The running kernel, as the text of `rocm examine` and `summary.kernel` show it
+/// and as `kernel_release` in the examination reports it.
+///
+/// On Linux (native and WSL), the trimmed output of `uname -r`. That is the one
+/// read of the kernel release for both stacks: `Examination`'s `kernel_release`
+/// is this value, with `None` shown as empty. The read is strict:
+///
+/// - a non-zero exit gives `None`, whatever `uname` printed;
+/// - output that is not UTF-8 gives `None` rather than a string with replacement
+///   characters in it;
+/// - an empty answer gives `None`;
+/// - a `uname` that has not answered after [`KERNEL_RELEASE_TIMEOUT`] gives
+///   `None`.
+///
+/// On Windows, the trimmed output of `cmd /C ver`, under the shorter optional
+/// command timeout; the examination does not read that into `kernel_release`.
 pub(crate) fn detect_kernel_version() -> Option<String> {
-    if runtime_is_windows() {
+    let output = if runtime_is_windows() {
         capture_optional_command("cmd", &["/C", "ver"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
     } else {
-        capture_optional_command("uname", &["-r"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    }
+        capture_optional_command_with_timeout("uname", &["-r"], KERNEL_RELEASE_TIMEOUT)
+    };
+    output
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn detect_distro_name() -> Option<String> {
