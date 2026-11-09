@@ -598,3 +598,31 @@ Feature: GPU detection and system inspection
     Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
     When the user inspects that machine in machine-readable form
     Then both reports say rocminfo is installed
+
+  # `rocm examine --json` reads the kernel release twice: the host summary
+  # (`summary.kernel`, which the text form prints as `kernel:`) and the examination
+  # (`kernel_release`, which the WSL version check and the kernel-dependent
+  # diagnoses read). They used to run `uname -r` separately, with different limits
+  # and different rules for a failed or malformed answer, and could disagree. They
+  # share one read now, so one `--json` run holds the two level on a specific
+  # value, not only on both being filled.
+  #
+  # The stand-in `uname` is planted first on PATH, so the scenario describes a
+  # kernel no runner has. It runs on every Linux lane, native or WSL, because both
+  # stacks read `uname -r` on both; Windows is out of scope, where the examination
+  # leaves `kernel_release` empty and the summary reads `cmd /C ver`.
+  @id:examine-reports-one-kernel-release-in-both-forms @requires-os:linux
+  Scenario: examine-39 - The summary and the examination report the same kernel release
+    Given a machine whose uname reports a kernel release
+    When the user inspects that machine in machine-readable form
+    Then the summary and the examination report that kernel release
+
+  # A `uname` that fails is not trusted for what it printed first: the examination
+  # used to keep that release while the summary dropped it. Neither reports a
+  # kernel now, and a failed read is not a probe failure, so a host without a
+  # usable `uname` does not read as degraded.
+  @id:examine-reports-no-kernel-release-from-a-failing-uname @requires-os:linux
+  Scenario: examine-40 - Neither report keeps a kernel release from a uname that failed
+    Given a machine whose uname prints a kernel release and then fails
+    When the user inspects that machine in machine-readable form
+    Then neither the summary nor the examination reports a kernel release, and neither calls it a failure

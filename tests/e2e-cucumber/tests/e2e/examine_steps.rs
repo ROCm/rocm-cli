@@ -2544,6 +2544,95 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
     );
 }
 
+// ── Both reports read the kernel release from one `uname -r` ───────
+
+/// The release the stand-in `uname` reports, chosen so no real host has it.
+const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
+
+/// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
+/// `release_body` (a shell fragment); `-v` answers a fixed string, so the
+/// examination's other `uname` read has nothing to wait for. Nothing else on the
+/// machine is planted: the stand-in is what `rocm examine` reads on any Linux
+/// host, native or WSL, because both stacks run `uname -r` there.
+fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -v ]; then echo '#1 SMP stand-in'; exit 0; fi\n{release_body}\n"
+        ),
+    )
+    .expect("failed to write the stand-in uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a machine whose uname reports a kernel release")]
+async fn machine_whose_uname_reports_a_release(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}"));
+}
+
+#[given("a machine whose uname prints a kernel release and then fails")]
+async fn machine_whose_uname_prints_a_release_and_fails(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}; exit 3"));
+}
+
+/// The `probe_failures` entries that are about reading the kernel release.
+fn kernel_read_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|failure| failure.contains("uname") || failure.contains("kernel release"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[then("the summary and the examination report that kernel release")]
+async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/kernel"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/kernel_release"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+}
+
+#[then(
+    "neither the summary nor the examination reports a kernel release, and neither calls it a failure"
+)]
+async fn assert_neither_reports_a_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert!(
+        json.pointer("/summary/kernel")
+            .is_some_and(serde_json::Value::is_null),
+        "the summary must read no kernel from a uname that failed:\n{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/kernel_release"), "", "{json:#}");
+    assert_eq!(
+        kernel_read_failures(&json),
+        Vec::<String>::new(),
+        "{json:#}"
+    );
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]
