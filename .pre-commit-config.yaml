@@ -4,7 +4,7 @@
 # Setup:
 #   uv tool install prek        # or: cargo install --locked prek
 #   prek install                # install the pre-commit hook
-#   prek install -t pre-push    # install the pre-push hook (clippy + tests)
+#   prek install -t pre-push    # install the pre-push hook (clippy + tests of the affected crates)
 #
 # Run against everything on demand:
 #   prek run --all-files
@@ -124,6 +124,26 @@ repos:
         stages: [pre-commit]
         groups: [local-tools] # runs in the dedicated `docs-links` CI job
 
+  # Module map: every production source file needs an entry in
+  # docs/architecture.md. `lychee` above only checks that links already in the
+  # doc resolve; this is the other direction, so a new file nobody wrote an
+  # entry for fails. Pre-commit for fast feedback, pre-push for a commit made
+  # with --no-verify: it reads the working tree, not the pushed commits, so it
+  # only agrees with CI when the tree is clean, and CI is the gate. It reads the
+  # whole tree, so it is not narrowed to changed files: a rename or deletion
+  # anywhere can change the answer, and a delete-only commit has no changed
+  # files to match a filter.
+  - repo: local
+    hooks:
+      - id: architecture-doc
+        name: every source file is in docs/architecture.md
+        entry: cargo xtask check-architecture-doc
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+        groups: [local-tools] # runs in the `clippy` CI job (compiles xtask)
+
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
     hooks:
@@ -135,12 +155,29 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      # The three pre-push cargo steps run through `cargo xtask pre-push-check`,
+      # which narrows each to the crates the push affects (the changed crates and
+      # everything that depends on them, selected as CI's `cargo xtask affected`
+      # does) and falls back to the whole workspace whenever it cannot tell. It
+      # prints the scope it chose, so these hooks are `verbose`. CI's Windows job,
+      # merge queue and `main` still check the whole workspace. Without the
+      # narrowing the steps are
+      #   cargo clippy --workspace --all-targets -- -D warnings
+      #   cargo clippy -p e2e-cucumber --test e2e -- -D warnings
+      #   cargo test --workspace --all-targets --exclude e2e-cucumber
+      # and `cargo xtask pre-push-check <step> --base <ref>` runs one by hand.
+      # A step that already passed on the same tree (same cargo command, toolchain
+      # and environment, clean working tree) is skipped and says so; a green run
+      # records the pass under the git directory. `ROCM_PRE_PUSH_RERUN=1` (or
+      # `--rerun` by hand) ignores recorded passes, and `SKIP=<hook id>` still
+      # skips a hook.
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: cargo xtask pre-push-check clippy
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true # shows which crates the push selected
         stages: [pre-push] # compiles the workspace; too slow for every commit
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-clippy-e2e
@@ -148,19 +185,22 @@ repos:
         # e2e-cucumber's `e2e` test sets `harness = false, test = false` (see its
         # Cargo.toml), which also excludes it from `clippy --all-targets` above --
         # leaving the ~1.6k lines of harness + step code unlinted. Clippy honours
-        # an explicit `--test`, so lint it directly, mirroring the CI job.
-        entry: cargo clippy -p e2e-cucumber --test e2e -- -D warnings
+        # an explicit `--test`, so the step lints it directly, mirroring the CI
+        # job, whenever e2e-cucumber is among the affected crates.
+        entry: cargo xtask pre-push-check clippy-e2e
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-test
         name: cargo test
-        entry: cargo test --workspace --all-targets --exclude e2e-cucumber
+        entry: cargo xtask pre-push-check test
         language: system
         types: [rust]
         pass_filenames: false
+        verbose: true
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated build-and-test CI job
       - id: powershell-script-analyzer
@@ -209,6 +249,23 @@ repos:
         language: system
         files: '^(crates/rocm-core/src/fix\.rs|crates/rocm-core/src/fix/.*|xtask/.*|doctor-catalog\.json)$'
         pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
+      - id: cargo-module-size
+        name: Source files are within the module-size limit (advisory)
+        # Check-only: it never rewrites or restages anything. Advisory for now, so
+        # it prints the offenders and lets the commit through, because a blocking
+        # hook would fail the very commits that split an over-limit file. The
+        # advisory behaviour lives in the `-advisory` subcommand, not a flag on the
+        # check; making the limit blocking means pointing this entry at
+        # `cargo xtask check-module-size` and deleting the wrapper. Advisory only
+        # once xtask has built: a WIP commit that leaves xtask or rocm-core not
+        # compiling still fails here, as it does the other xtask hooks.
+        entry: cargo xtask check-module-size-advisory
+        language: system
+        types: [rust]
+        pass_filenames: false
+        verbose: true # a passing hook is silent otherwise, and this one passes while it warns
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
       - id: cargo-tpn

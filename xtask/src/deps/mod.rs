@@ -87,9 +87,10 @@ mod tests {
     fn the_remediation_command_is_spelled_the_same_everywhere() {
         let root = crate::paths::workspace_root().unwrap();
         for file in [
+            // The design doc is where the command is documented; other docs
+            // link to it rather than being read here, so an edit to them does
+            // not force every crate's tests to run (`XTASK_READ_DOCS`).
             "docs/runtime-dependencies.md",
-            "docs/testing.md",
-            "docs/engine-plugins.md",
             "runtimes/mise.toml",
             ".github/workflows/ci.yml",
             ".github/workflows/runtime-deps-update.yml",
