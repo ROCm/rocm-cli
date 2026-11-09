@@ -772,7 +772,11 @@ mod tests {
 
     /// Twenty eight-byte lines, `line-00` to `line-19`.
     fn twenty_lines() -> String {
-        (0..20).map(|index| format!("line-{index:02}\n")).collect()
+        use std::fmt::Write as _;
+        (0..20).fold(String::new(), |mut text, index| {
+            let _ = writeln!(text, "line-{index:02}");
+            text
+        })
     }
 
     fn tail_of_shrinking(
