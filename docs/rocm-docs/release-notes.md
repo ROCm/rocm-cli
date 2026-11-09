@@ -72,7 +72,7 @@ safer, and makes driver installation consistent across Linux distributions.
 - `rocm diagnose` flags a Visual C++ runtime older than 14.40, which can crash
   programs such as the Lemonade llama.cpp server. `rocm examine --json` gains
   `msvc_redist_version`, and a new fix (`fix-21-msvc-redist-outdated`) covers
-  the condition. `rocm fix` only prints its update plan and never runs the
+  the condition. That fix only prints its update plan and never runs the
   install.
 - `rocm examine` detects `gfx90c` (Renoir and Cezanne Vega integrated GPUs)
   instead of mapping it to `gfx90X-dcgpu`.

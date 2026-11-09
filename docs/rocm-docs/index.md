@@ -17,9 +17,9 @@ ROCm CLI is a command-line tool for setting up and running local AI on AMD
 GPUs, with a full-screen TUI dashboard for GPU telemetry, model serving, and
 chat.
 
-It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
-Python, Rust, or existing ROCm install, and includes inference engine
-adapters for Lemonade and vLLM.
+It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows
+(x86_64), needs no Python, Rust, or existing ROCm install, and includes
+inference engine adapters for Lemonade and vLLM.
 
 ```{important}
 **Tech Preview:** This software is provided as-is, without warranty or
@@ -40,7 +40,7 @@ and chat with a locally served model:
 
 ```{grid-item-card} Install ROCm CLI
 
-Check platform support and install the prebuilt binary.
+Check platform support and install the prebuilt binaries.
 
 * [Installing ROCm CLI](install/installation.md)
 * [ROCm CLI on WSL2](install/wsl.md)
