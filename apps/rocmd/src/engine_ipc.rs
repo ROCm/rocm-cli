@@ -148,14 +148,39 @@ fn rocm_executable_from(
     current: PathBuf,
     sibling_rocm: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
+    let current = without_deleted_marker(current);
     // Exactly `rocmd` (or `rocmd.exe`). A renamed or test binary is not known to
-    // lack the verb, and has no `rocm` beside it to prefer.
+    // lack the verb, and has no `rocm` beside it to prefer: it runs itself, so a
+    // standalone `rocmd` shipped under another name still answers an engine
+    // request with "unrecognized subcommand".
     if current.file_stem().is_some_and(|stem| stem == "rocmd") {
         return sibling_rocm().context(
             "the standalone rocmd needs the rocm executable beside it to reach an engine",
         );
     }
     Ok(current)
+}
+
+/// What Linux appends to the name `current_exe()` reports when the running
+/// executable's file has been replaced or removed since the process started,
+/// which is what an in-place upgrade of a long-lived daemon does.
+const DELETED_MARKER: &str = " (deleted)";
+
+/// `path` without the [`DELETED_MARKER`] on its file name. The marker is not
+/// part of any file's name, and left in place it hides the `rocmd` the name check
+/// looks for and names a file that cannot be run; the path without it is where
+/// the upgraded executable now is.
+fn without_deleted_marker(path: PathBuf) -> PathBuf {
+    let stripped = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(DELETED_MARKER))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    match stripped {
+        Some(name) => path.with_file_name(name),
+        None => path,
+    }
 }
 
 /// [`engine_request`] with the executable that serves `__engine-stdio` named by
@@ -416,6 +441,43 @@ mod tests {
             "the standalone rocmd needs the rocm executable beside it to reach an engine: \
              unable to locate sibling binary rocm"
         );
+    }
+
+    /// After an in-place upgrade Linux reports the running executable as
+    /// `<path> (deleted)`. The daemon is long-lived, so that is the usual state
+    /// of a standalone `rocmd` right after its package is upgraded: it must
+    /// still be recognised, and an embedded `rocm` must be run by a path that
+    /// exists.
+    #[test]
+    fn an_executable_replaced_while_running_is_still_told_apart_by_its_name() {
+        let beside = || Ok(PathBuf::from("/usr/bin/rocm"));
+
+        let chosen =
+            rocm_executable_from(PathBuf::from("/usr/bin/rocmd (deleted)"), beside).unwrap();
+        assert_eq!(chosen, Path::new("/usr/bin/rocm"));
+
+        // Embedded `rocm daemon`: run the file now at that path, not the
+        // marker-suffixed name, which no file has.
+        let chosen = rocm_executable_from(PathBuf::from("/usr/bin/rocm (deleted)"), || {
+            panic!("an embedded rocm has no use for a sibling")
+        })
+        .unwrap();
+        assert_eq!(chosen, Path::new("/usr/bin/rocm"));
+
+        // The marker is only ever a suffix of the file name, and only that
+        // exact one; nothing else is touched.
+        for untouched in [
+            "/opt/(deleted)/rocm",
+            "/opt/rocm-cli/bin/rocm (deleted) extra",
+            "/opt/rocm-cli/bin/ (deleted)",
+            "/opt/rocm-cli/bin/rocm",
+        ] {
+            assert_eq!(
+                without_deleted_marker(PathBuf::from(untouched)),
+                Path::new(untouched),
+                "{untouched}"
+            );
+        }
     }
 
     #[test]
