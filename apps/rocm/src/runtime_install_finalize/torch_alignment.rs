@@ -22,7 +22,7 @@ use anyhow::Result;
 use rocm_core::AppPaths;
 
 use super::{RuntimeDeviceCheck, device_check_verdict};
-use crate::engines_cmd::runtime_manifest_for_selector;
+use crate::engine_install_env::runtime_manifest_for_selector;
 use crate::therock;
 use crate::{record_cli_audit_event, sanitize_log_value};
 

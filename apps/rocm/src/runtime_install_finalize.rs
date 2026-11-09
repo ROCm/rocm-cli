@@ -30,10 +30,10 @@ use rocm_core::{
 };
 use rocm_engine_protocol::{EngineMethod, InstallRequest, InstallResponse};
 
-use crate::engine_ipc::engine_request_with_env_root;
-use crate::engines_cmd::{
+use crate::engine_install_env::{
     engine_manages_own_runtime, env_root_for_engine_install, runtime_key_for_python,
 };
+use crate::engine_ipc::engine_request_with_env_root;
 use crate::runtimes_cmd::{
     activate_runtime, newest_installed_runtime_manifest, recover_setup_runtime_registration,
 };

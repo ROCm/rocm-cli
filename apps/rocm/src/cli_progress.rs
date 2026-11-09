@@ -198,7 +198,7 @@ impl Spinner {
 /// CJK glyph occupies two terminal columns) to fit within `max_width`
 /// columns, appending an ellipsis when it doesn't already fit, so a repaint
 /// can never wrap to a second terminal row.
-fn truncate_to_width(line: &str, max_width: usize) -> String {
+pub(crate) fn truncate_to_width(line: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }

@@ -33,7 +33,6 @@ pub(crate) use self::consent::{
 use self::family::{family_override_or_recovered_arch, resolve_family};
 pub(crate) use self::fetch::truthy_env;
 use self::fetch::{download_file, preflight_tarball_space};
-pub(crate) use self::io::write_file_atomically;
 use self::probe::probe_rocm_sdk_runtime_for_target;
 pub(crate) use self::probe::{
     RuntimeDeviceProbe, TorchAlignmentProbe, install_pinned_package, probe_rocm_sdk_runtime,
@@ -41,8 +40,7 @@ pub(crate) use self::probe::{
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_requirement, resolve_python_launcher,
-    wheel_compatibility_for_python,
+    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
 };
 use self::resolve::{
     AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
@@ -72,8 +70,10 @@ pub(crate) use crate::runtime_registry::{
     validate_rocm_sdk_runtime_probe,
 };
 use crate::runtime_registry::{
-    runtime_manifest_path, save_runtime_manifest, wheel_composition_includes_devel,
+    ManifestOverwrite, runtime_manifest_path, wheel_composition_includes_devel,
+    write_runtime_manifest,
 };
+use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, detect_host_gpu_diagnostics, detect_legacy_rocm_summary, ensure_uv_binary,
@@ -362,30 +362,24 @@ fn install_wheel_runtime(
             }
         }
     };
-    progress_line(format!(
-        "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
-        managed_python_version(python_requirement)
-    ));
-    let python_launcher = resolve_python_launcher(paths, python_requirement)?;
-    progress_line(match python_launcher.source {
-        "path" => format!(
-            "Using Python from PATH: {}.",
-            python_launcher.executable.display()
-        ),
-        "env" => format!(
-            "Using Python from ROCM_CLI_PYTHON: {}.",
-            python_launcher.executable.display()
-        ),
-        "managed" => format!(
-            "Using ROCm CLI's portable Python: {}.",
-            python_launcher.executable.display()
-        ),
-        _ => format!(
-            "Using Python from {}.",
-            python_launcher.executable.display()
-        ),
+    // A preview promises nothing here: whether a Python would be prepared, and
+    // which, is only known once the search below has run (a version override can
+    // make the answer a refusal), and is reported then.
+    progress_line(if dry_run {
+        "Checking Python for the ROCm install.".to_owned()
+    } else {
+        format!(
+            "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
+            managed_python_version(python_requirement)
+        )
     });
-    let wheel_compatibility = wheel_compatibility_for_python(&python_launcher.executable)?;
+    // A preview must not prepare the Python it reports: resolving one can
+    // download a managed `uv` and Python and save the result in the
+    // configuration. It asks what a real install would do instead and prints
+    // that. A real install resolves, and so prepares, exactly as it always did.
+    // It also prints the line naming the interpreter, once the decision is made.
+    let python = python_for_install(paths, python_requirement, dry_run)?;
+    let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
@@ -477,12 +471,11 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
-    let _ = writeln!(
-        output,
-        "  python_launcher: {}",
-        python_launcher.executable.display()
-    );
-    let _ = writeln!(output, "  python_source: {}", python_launcher.source);
+    let _ = writeln!(output, "  python_launcher: {}", python.launcher_display());
+    let _ = writeln!(output, "  python_source: {}", python.source().as_str());
+    if let Some(note) = python.note() {
+        let _ = writeln!(output, "  python_note: {note}");
+    }
     let _ = writeln!(
         output,
         "  python_wheel_tag: {}",
@@ -537,15 +530,21 @@ fn install_wheel_runtime(
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
-        let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
+        let venv_args = uv_venv_args(&python.venv_python_arg(), &install_root);
+        // This line is offered as the command to run, so it has to be one a
+        // shell reads back as the argv it previews. The install root in it
+        // comes from a `--prefix` the local assistant can choose
+        // (`install_sdk_dry_run` is a model-callable tool), so a bare or
+        // double-quoted value here would be a model-chosen value in a line a
+        // user is invited to paste.
         let venv_args_display = venv_args
             .iter()
-            .map(|arg| quote_display_arg(arg))
+            .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
         let install_args_display = install_args
             .iter()
-            .map(|arg| quote_display_arg(arg))
+            .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
         let _ = writeln!(output, "  mode: dry-run");
@@ -560,6 +559,9 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
         return Ok(SdkInstallResult::plan(output));
     }
+
+    // Only a preview returns above with an interpreter it has not prepared.
+    let python_launcher = python.into_launcher()?;
 
     // Requirement: surface the "newest version has no wheels" case as a warning
     // on the real install path too, not only in the dry-run plan.
@@ -728,7 +730,7 @@ fn install_wheel_runtime(
         devel: include_devel,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(
         output,
@@ -757,21 +759,6 @@ fn install_wheel_runtime(
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(SdkInstallResult::installed(output))
-}
-
-/// Quotes `value` for the dry-run preview line only -- it is never fed to a
-/// real subprocess. Deliberately kept separate from `rocm_core::quoting`
-/// (ROCMAI-727); see that module's doc comment for why.
-fn quote_display_arg(value: &str) -> String {
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')' | '&' | ';' | '|'))
-    {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 /// The host's legacy/system ROCm version when it is strictly newer than the
@@ -968,12 +955,7 @@ fn install_tarball_runtime(
 
     fs::create_dir_all(paths.cache_dir.join("therock"))?;
     fs::create_dir_all(&install_root)?;
-    if has_nontrivial_directory_contents(&install_root)? {
-        bail!(
-            "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
-            install_root.display()
-        );
-    }
+    ensure_tarball_install_target_is_clean(&install_root)?;
 
     if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
         let _ = writeln!(output, "  {warning}");
@@ -1020,7 +1002,7 @@ fn install_tarball_runtime(
         devel: true,
         installed_at_unix_ms: unix_time_millis(),
     };
-    save_runtime_manifest(paths, &manifest)?;
+    write_runtime_manifest(paths, &manifest, ManifestOverwrite::Replace)?;
 
     let _ = writeln!(output, "  extracted: {}", install_root.display());
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
@@ -1110,7 +1092,7 @@ fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> Pa
 /// keep the venv's own `bin/python`, which is itself a symlink to the base
 /// interpreter — resolving that would record the system Python and break venv
 /// semantics. The adopt path already draws the line in the same place: see
-/// `main::adopt_runtime_from_probe`, which canonicalizes the install root next to
+/// `runtime_adopt::adopt_runtime_from_probe`, which canonicalizes the install root next to
 /// `absolute_existing_file_path_preserving_symlink` for the interpreter.
 fn resolved_install_root(
     paths: &AppPaths,
@@ -1122,21 +1104,18 @@ fn resolved_install_root(
     rocm_core::resolve_path_through_symlinks(&requested)
 }
 
-fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
+/// Refuses to extract a tarball into a root that already holds a payload.
+///
+/// "Holds a payload" is [`rocm_core::install_root_has_payload`]: dot-entries (the
+/// runtime marker) do not count, so a root that has only been prepared passes.
+fn ensure_tarball_install_target_is_clean(install_root: &Path) -> Result<()> {
+    if rocm_core::install_root_has_payload(install_root)? {
+        bail!(
+            "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
+            install_root.display()
+        );
     }
-    let entries =
-        fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
-        }
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(())
 }
 
 fn venv_python_path(install_root: &Path) -> PathBuf {
@@ -1179,17 +1158,6 @@ mod tests {
             "extraction must reserve headroom beyond the archive: {estimate} vs {archive}"
         );
         assert_eq!(estimate, archive * disk_space::EXTRACTED_SIZE_MULTIPLIER);
-    }
-
-    #[test]
-    fn write_file_atomically_reports_a_full_disk_clearly() {
-        // Exercise the mapping the write path uses, without filling a disk.
-        let error = disk_space::map_write_error(
-            std::io::Error::from(std::io::ErrorKind::StorageFull),
-            Path::new("/cache/rocm.tar.gz.tmp"),
-        );
-        let text = format!("{error:#}");
-        assert!(text.contains("ran out of disk space"), "{text}");
     }
 
     #[test]
@@ -1445,12 +1413,53 @@ mod tests {
     }
 
     #[test]
-    fn display_command_quotes_package_extras() {
-        assert_eq!(quote_display_arg("package[extra]"), "\"package[extra]\"");
+    fn the_dry_run_quoter_quotes_package_extras() {
+        assert_eq!(shell_quote("package[extra]"), "'package[extra]'");
         assert_eq!(
-            quote_display_arg("C:\\Program Files\\Python\\python.exe"),
-            "\"C:\\Program Files\\Python\\python.exe\""
+            shell_quote("C:\\Program Files\\Python\\python.exe"),
+            "'C:\\Program Files\\Python\\python.exe'"
         );
+    }
+
+    /// The dry-run's `command:` line is printed as the command to run, and the
+    /// install root in it comes from a `--prefix` the local assistant can
+    /// choose (`install_sdk_dry_run` is model-callable). The double-quoting
+    /// helper that line used to be built with returned `` /tmp/`id` `` completely bare — no
+    /// trigger character in it — and wrapped `/tmp/$(id)` in double quotes,
+    /// where substitution still fires. Both ran on paste.
+    ///
+    /// This asks the quoter the line is built with, `shell_quote`; scenario
+    /// therock-next-15 checks the rendered line itself end to end.
+    ///
+    /// Asked of a real `sh`, not of a word-splitter. That distinction is the
+    /// whole test: `shlex` is a *splitter*, so it hands back
+    /// `` /tmp/`id` `` unchanged and reports a clean round-trip for precisely
+    /// the value that executes. Only a shell models expansion, so only a shell
+    /// can answer "would this run something". Written with `shlex` first, this
+    /// test passed against the defect it exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn the_dry_run_quoter_cannot_run_a_second_command_on_paste() {
+        for hostile in [
+            "/tmp/`id`",
+            "/tmp/$(id)",
+            "/tmp/a'; id; echo '",
+            "/tmp/my folder",
+            "/tmp/$HOME",
+            "",
+        ] {
+            let quoted = shell_quote(hostile);
+            let output = std::process::Command::new(crate::shell_quote::TEST_SH)
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("sh should run");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                hostile,
+                "{hostile:?} rendered as {quoted:?}, which a shell did not read back literally"
+            );
+        }
     }
 
     #[test]
@@ -1673,6 +1682,43 @@ mod tests {
         assert_eq!(
             warning,
             "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
+        );
+    }
+
+    /// The extraction guard refuses a root that holds a payload and says so, and
+    /// it follows `rocm_core::install_root_has_payload` for what that means: a
+    /// root that does not exist yet (the case `install_tarball_runtime` hits when
+    /// `--prefix` names a new folder) and one holding only dot-entries pass.
+    /// Refusing must leave the existing files where they were.
+    #[test]
+    fn the_tarball_install_guard_follows_the_shared_payload_rule() {
+        let base = tempfile::tempdir().expect("scratch dir");
+
+        ensure_tarball_install_target_is_clean(&base.path().join("not-created-yet"))
+            .expect("a missing root is clean");
+
+        let marker_only = base.path().join("marker-only");
+        fs::create_dir_all(&marker_only).unwrap();
+        fs::write(marker_only.join(".rocm-cli-runtime.json"), b"{}").unwrap();
+        ensure_tarball_install_target_is_clean(&marker_only)
+            .expect("a root with only the dot-marker is clean");
+
+        let populated = base.path().join("populated");
+        fs::create_dir_all(populated.join("bin")).unwrap();
+        fs::write(populated.join("bin").join("tool"), b"x").unwrap();
+        let error = ensure_tarball_install_target_is_clean(&populated)
+            .expect_err("a root with a payload is refused")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "tarball install target {} is not empty; choose a clean prefix or remove the old extraction first",
+                populated.display()
+            )
+        );
+        assert!(
+            populated.join("bin").join("tool").is_file(),
+            "the refusal must not touch what is already there"
         );
     }
 }

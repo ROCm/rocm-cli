@@ -9,7 +9,7 @@
 //! (`install_driver(...)`/`reconcile_driver_install(...)`, re-imported via
 //! `use crate::driver_install::{install_driver, reconcile_driver_install};`);
 //! `install()` has since moved to `install_cmd.rs`, which imports them itself.
-//! `InstallTarget`/`Cli` remain in the crate root; neither is referenced
+//! `InstallTarget`/`Cli` live in `cli.rs`; neither is referenced
 //! from this file. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
 //! private types (`DriverInstallState` and friends), so those moved here too
 //! rather than staying in `main.rs`. `DriverInstallResult`/`DriverInstallError`
@@ -19,7 +19,7 @@
 //! The plan this module runs (its model, rendering, per-distro builders and the
 //! WSL rocDXG plan) lives in `driver_plan.rs`, which does not depend on this
 //! module; the host's os-release comes from `system_packages.rs`. This module
-//! re-exports `host_install_driver_only_reports` for `chat.rs` and
+//! re-exports `host_install_driver_only_reports` for `tool_policy.rs` and
 //! `freeform_planner.rs`.
 
 use std::fmt::Write as _;
@@ -37,7 +37,6 @@ use crate::driver_plan::{
     DriverCommandPhase, DriverInstallPlan, PrivilegeEscalation, build_driver_install_plan_read,
     render_driver_install_plan,
 };
-use crate::system_packages::real_os_release;
 
 /// Whether `rocm install driver` goes on to run the plan's commands. Pure so
 /// the gate that keeps native Windows from installing anything (its plan is
@@ -62,7 +61,7 @@ pub(crate) fn install_driver(
 ) -> std::result::Result<DriverInstallResult, DriverInstallError> {
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
-    let os_release = real_os_release();
+    let os_release = rocm_core::hardware_root::real_os_release();
     // The only place the real privilege level is read; every builder below takes
     // it as a parameter so both branches stay testable on any host.
     let plan =

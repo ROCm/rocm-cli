@@ -12,11 +12,11 @@
 //! Mechanically relocated from `main.rs` (and, for `sdk_install_request`, from
 //! `chat.rs`) with no behavior change; see `docs/architecture.md`.
 //! `InstallTarget` and `InstallFormat`, the clap types `install` matches on,
-//! stay in `main.rs` with the rest of the `Command`/`Cli` definition.
+//! live in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `dispatch()` calls `install` through the re-import `use
 //! crate::install_cmd::{...};`. `therock_install_version_selector` is also
-//! `pub(crate)`: `chat.rs`'s `render_install_sdk_dry_run_for_args` calls it as
-//! `crate::therock_install_version_selector` through that re-import, which is
+//! `pub(crate)`: `chat/mcp_bridge.rs`'s `render_install_sdk_dry_run_for_args`
+//! calls it as `crate::therock_install_version_selector` through that re-import, which is
 //! why `sdk_install_request` moved here rather than staying in `chat.rs` —
 //! this module does not depend on `chat.rs`. `sdk_install_request` keeps the
 //! `pub(crate)` it had in `chat.rs`, although only `install` and this module's
@@ -284,7 +284,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
 
-    /// The half `main.rs`'s
+    /// The half `cli.rs`'s
     /// `install_sdk_devel_flag_defaults_off_and_wires_through_when_passed` cannot reach: that the parsed flag is what
     /// the install request carries.
     ///

@@ -13,9 +13,6 @@
 use super::{AppState, ChatConsent, ChatProvider, ChatTurn, SlashOutcome};
 
 impl AppState {
-    /// Install the resolved chat endpoint and set the initial consent state.
-    /// `None` → `Unavailable`; `Some` → `Accepted` when pre-consented (e.g.
-    /// `--chat-yes`), otherwise `Pending` (the one-time in-TUI prompt).
     /// Accept the detected endpoint and enable chat. No-op when no endpoint is
     /// available. Focuses the input so the user can type immediately.
     pub const fn accept_chat_consent(&mut self) {
@@ -53,7 +50,7 @@ impl AppState {
         self.chat_detect_dispatch = true;
         if self.chat_consent == ChatConsent::Accepted {
             self.chat.push(ChatTurn::agent(
-                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…"
+                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / a rocm serve service)…"
                     .to_string(),
             ));
         }
@@ -83,7 +80,7 @@ impl AppState {
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)";
+            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / a rocm serve service)";
             if accepted {
                 self.chat.push(ChatTurn::agent(msg.to_string()));
             } else {

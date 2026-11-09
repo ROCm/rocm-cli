@@ -41,7 +41,7 @@
 //! `main.rs` calls into it for `GpuVramUsage`, `gpu_vram_usage`,
 //! `parse_gpu_indices_arg` (the `dispatch()` call site above),
 //! `serve_gpu_low_memory_warning`, and `vram_capacity_is_meaningful`;
-//! `services_text.rs` calls into it for `parse_device_policy` (from
+//! `service_control.rs` calls into it for `parse_device_policy` (from
 //! `restart_child_argv`); `serve_cmd.rs` calls into it for
 //! `detect_gpu_count`, `gpu_vram_usage`, `parse_device_policy`,
 //! `parse_gpu_selection`, `select_gpu_indices_under_launch_lock`,
@@ -67,7 +67,7 @@
 use std::fs;
 #[cfg(any(target_os = "linux", test))]
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use rocm_core::AppPaths;
@@ -640,6 +640,64 @@ fn select_auto_gpu_index(
     vec![reported[0]]
 }
 
+/// How long the `serve` path waits on `amd-smi` before giving up on it. Both
+/// probes below are advisory — GPU auto-selection degrades to service state
+/// alone without them — so a stalled `amd-smi` must not hold up a launch. This
+/// bounds the ordinary stalls only; the unkillable one is prevented by the
+/// pre-flight inside [`rocm_core::amd_smi_json`], not by any timeout.
+///
+/// Named for `serve` because that is the path the budget is sized for, not
+/// because it is the only one that spends it. [`detect_gpu_count`] is reached
+/// solely from `serve_cmd::serve`, but [`gpu_vram_usage_amd_smi`] is also
+/// reached from `main.rs`'s `host_accelerator_memory`, and so from
+/// `assess_model_with_host_paths` on the `--model` readiness path. That path
+/// wants the same answer for the same reason — how much VRAM this host has, to
+/// decide what it can run — so it wants the same budget; the one-shot argument
+/// below applies to it unchanged. It is one probe there rather than two, so its
+/// worst case is one probe's, not two.
+///
+/// `rocmd`'s watcher has its own, shorter `AMD_SMI_PROBE_TIMEOUT` (2s) for the
+/// same helper: that one fires on a polling cadence where a stalled probe costs
+/// a missed telemetry tick and nothing else, so it can afford to give up early,
+/// while a serve launch gets exactly one chance to learn the GPU layout and
+/// giving up early there degrades the placement decision itself.
+///
+/// # Worst-case latency, deliberately accepted rather than parallelised
+///
+/// This value is not the whole wait. `rocm_core::amd_smi_json` runs its
+/// `/dev/kfd` pre-flight *before* it spawns anything, and that open is bounded
+/// separately by `rocm_core`'s `KFD_OPEN_TIMEOUT` (2s on Linux, no probe at all
+/// elsewhere). So one probe costs up to 12s on Linux, not 10s.
+///
+/// `serve` runs the two probes sequentially — `gpu_vram_usage` before the launch
+/// lock, `detect_gpu_count` either in the `--gpu <index>` validation or inside
+/// the lock for `--gpu auto` — so a Linux host where the KFD open hangs *and*
+/// `amd-smi` then stalls adds up to ~24s to an interactive launch (2 × (2s +
+/// 10s)); the single-probe `--model` readiness path adds up to ~12s.
+///
+/// The pre-flight's 2s is only spent on a host whose device open is actually
+/// hanging, which is also the host on which the probe then declines and the
+/// `amd-smi` 10s is *not* spent — so the two bounds are additive in the formula
+/// but rarely both paid in practice. Quoted additively anyway: a ceiling that
+/// assumes the good case is not a ceiling.
+///
+/// Before this bound existed both probes called `.output()` with no timeout at
+/// all, so a stalling host hung indefinitely; ~24s is the ceiling replacing
+/// "forever", not a new cost.
+///
+/// It is a ceiling on *this* hazard, not on every one. It holds when the
+/// `open` is what hangs, which is what the pre-flight bounds. If `amd-smi`
+/// gets past the open and a later ioctl wedges it into uninterruptible sleep,
+/// `run_with_timeout`'s post-kill `wait` does not return either, and no number
+/// quoted here applies — the pre-flight is a mitigation for the reachable
+/// case, not a proof about the whole call. Running them concurrently is not free:
+/// `detect_gpu_count` is invoked inside [`select_gpu_indices_under_launch_lock`]
+/// precisely so the cpu-only and pinned paths never pay for the subprocess, and
+/// hoisting it out to overlap with the VRAM probe would make every
+/// `rocm serve --cpu-only` spawn an `amd-smi` it has no use for. The stall is
+/// rare, the extra spawn would be unconditional.
+const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Best-effort per-GPU VRAM occupancy. Prefers `amd-smi metric --json`; when
 /// amd-smi is not installed (e.g. a shared node or container that ships no
 /// amd-smi — this never tries `rocm-smi`) it falls back to the amdgpu DRM sysfs
@@ -686,24 +744,55 @@ fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
     }])
 }
 
-/// Per-GPU VRAM occupancy via `amd-smi metric --json`. Returns `None` when
-/// amd-smi is unavailable or its output cannot be parsed.
+/// The `amd-smi` half of [`gpu_vram_usage`], routed through the guarded
+/// launcher so a missing `/dev/kfd` declines the spawn instead of stalling.
 fn gpu_vram_usage_amd_smi() -> Option<Vec<GpuVramUsage>> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("metric")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = amd_smi_probe_json(&["metric", "--json"], "per-GPU VRAM occupancy")?;
     let rows = parse_gpu_vram_usage(&value);
     if rows.is_empty() { None } else { Some(rows) }
+}
+
+/// Run one advisory `serve`-path `amd-smi` probe, logging the error on the way
+/// to the `None` both callers want.
+///
+/// Both probes degrade rather than fail, so neither has anywhere to *return* an
+/// error: the caller's contract is `Option`, and a decline is a normal, expected
+/// answer on a GPU-less host. That made the whole class silent, including the
+/// two cases a user would want to know about — the pre-flight refusing a device
+/// that is merely slow rather than wedged (the 2s `KFD_OPEN_TIMEOUT` is a
+/// heuristic bound, and a loaded host can trip it while being perfectly
+/// healthy), and an `amd-smi` that ran and failed. "Why did `--gpu auto` not
+/// rank my GPUs?" had no answer anywhere.
+///
+/// `info!` and not `warn!` or `debug!`. Not `warn!`: on a GPU-less host this
+/// fires on every `serve`, where it is the expected outcome and not a problem,
+/// so at `warn` it would be noise that trains people to ignore the level. Not
+/// `debug!` either, which is where this started: the default filter is
+/// `warn,rocm=info`, so a `debug!` line in this crate is invisible unless
+/// someone already suspected it and re-ran with `RUST_LOG`. That is the wrong
+/// way round for the case that actually needs explaining — the 2s open bound
+/// tripping on a slow but healthy host, or an exhausted probe budget — where
+/// the decline is indistinguishable from "no GPU" and the user has no reason
+/// to go looking. `rocm=info` is on by default, so the reason is there the
+/// first time.
+///
+/// `{error:#}` rather than `to_string()`, matching `rocmd`'s bridge-snapshot
+/// note: the outermost context says "failed to launch amd-smi ...", which names
+/// the wrong thing when what happened was a pre-flight decline or a timeout.
+/// The causes are the whole value of the line.
+fn amd_smi_probe_json(args: &[&str], purpose: &str) -> Option<serde_json::Value> {
+    match rocm_core::amd_smi_json(args, AMD_SMI_SERVE_PROBE_TIMEOUT) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::info!(
+                probe = purpose,
+                args = args.join(" "),
+                error = format!("{error:#}"),
+                "amd-smi probe declined or failed; GPU selection degrades to service state alone"
+            );
+            None
+        }
+    }
 }
 
 /// Fallback per-GPU VRAM occupancy read straight from the amdgpu DRM sysfs
@@ -963,23 +1052,24 @@ fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
 /// Best-effort count of local AMD GPUs via `amd-smi`. Returns `None` when
 /// amd-smi is unavailable or its output cannot be parsed (callers then fall
 /// back to conservative defaults).
+///
+/// Also `None` whenever the `/dev/kfd` pre-flight declines the launch, which it
+/// does for an unreachable device and not only for one that would hang — so a
+/// host outside the render group lands here, with no sysfs fallback of the kind
+/// [`gpu_vram_usage`] has. That is deliberate and is not a loss of GPU
+/// detection; `rocm_core`'s `kfd_readable` documents why, and what answers in
+/// this count's place.
 pub(crate) fn detect_gpu_count() -> Option<usize> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("list")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = amd_smi_probe_json(&["list", "--json"], "local AMD GPU count")?;
     let count = value.as_array().map(Vec::len)?;
     if count == 0 { None } else { Some(count) }
 }
+
+/// Property tests for `--gpu` selection; a child module so it can reach the
+/// private selection functions above.
+#[cfg(test)]
+#[path = "gpu_selection_proptests.rs"]
+mod gpu_selection_proptests;
 
 #[cfg(test)]
 mod tests {

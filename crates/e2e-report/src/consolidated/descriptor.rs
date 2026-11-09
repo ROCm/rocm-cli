@@ -4,8 +4,12 @@
 
 //! Artifact-name identity: parses a report's artifact/directory name (e.g.
 //! `e2e-gpu-strix-windows-nightly-report`) into the platform, OS, legacy
-//! known-bugs flag and channel it stands for, and builds the platform labels
-//! derived from it.
+//! known-bugs flag and channel it stands for, and owns the platform-label rule
+//! ([`full_platform_label`]) every report surface derives its lane name from.
+//! The artifact-name table (`KNOWN_PLATFORMS`) is also what maps a
+//! `platform.json` `platform_slug` back to an artifact name
+//! ([`artifact_name_for_platform_slug`], used by `xtask` for a report downloaded
+//! without its per-artifact directory), so the two directions read one table.
 
 /// The platform/OS a report belongs to, parsed from its artifact name.
 ///
@@ -30,10 +34,7 @@ pub(super) struct Descriptor {
 /// into its Platform / OS. Unknown shapes fall back to a titlecased
 /// platform on Linux so a new artifact still renders sensibly.
 pub(super) fn parse_descriptor(name: &str) -> Descriptor {
-    // Strip prefix, then suffix, each relative to the prior result (not `name`),
-    // so `e2e-report` correctly reduces to the empty core, not back to itself.
-    let core = name.strip_prefix("e2e-").unwrap_or(name);
-    let core = core.strip_suffix("-report").unwrap_or(core);
+    let core = artifact_core(name);
 
     // The nightly workflow always appends the channel as the final segment
     // before `-report` (e.g. `e2e-gpu-strix-windows-nightly-report`). Captured
@@ -67,47 +68,135 @@ pub(super) fn parse_descriptor(name: &str) -> Descriptor {
         },
     };
 
-    let (platform, os) = match core {
-        // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
-        "" | "report" => ("Mock", "Linux"),
-        "gpu" => ("MI300X", "Linux"),
-        "gpu-rad3" => ("R9700", "Linux"),
-        "gpu-mi350p" => ("MI350P", "Linux"),
-        "gpu-w7900" => ("W7900", "Linux"),
-        "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
-        "gpu-strix-windows" => ("Strix Halo", "Windows"),
-        // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
-        // the Windows box. It is neither the native Ubuntu nor the Windows lane —
-        // GPU access goes through the WSL passthrough — so it needs its own OS
-        // value, not a reuse of "Ubuntu", or the grid would show two rows that
-        // claim to be the same host and disagree.
-        "gpu-strix-wsl" => ("Strix Halo", "WSL2"),
-        // `e2e-unknown-report`: a report whose platform.json sidecar was missing
-        // or unrecognized (e.g. a GPU run that errored before writing it). The OS
-        // is genuinely unknown here — a Windows GPU run that erupted early must NOT
-        // be reported as Linux — so render Unknown / Unknown rather than defaulting
-        // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
-        "unknown" => ("Unknown", "Unknown"),
-        other => return fallback_descriptor(other, known_bugs, channel_from_name, release_label),
+    // `e2e--report` reduces to the empty core, which is the bare mock artifact
+    // just like `e2e-report` (core "report") — see the `Mock` row below.
+    let core = if core.is_empty() { "report" } else { core };
+    let Some(known) = KNOWN_PLATFORMS
+        .iter()
+        .find(|k| artifact_core(k.artifact) == core)
+    else {
+        return fallback_descriptor(core, known_bugs, channel_from_name, release_label);
     };
 
     Descriptor {
-        platform: labeled_platform(platform, release_label),
-        os: os.to_string(),
+        platform: with_paren_suffix(known.platform, release_label),
+        os: known.os.to_string(),
         known_bugs,
         channel_from_name,
     }
 }
 
-/// Append the sdk_version matrix leg (`n-1`/`n-2`) to a platform label so two
-/// legs of the same platform don't render as identical rows/columns. `None`
-/// (the `current` leg) is left alone — its artifact name is unchanged from
-/// before the matrix existed, so that leg's label is too.
-fn labeled_platform(platform: &str, release_label: Option<&str>) -> String {
-    match release_label {
-        Some(label) => format!("{platform} ({label})"),
-        None => platform.to_string(),
-    }
+/// The identity-bearing core of an artifact name: `e2e-` prefix and `-report`
+/// suffix stripped, each relative to the prior result (not `name`), so
+/// `e2e-report` correctly reduces to `report`, not back to itself.
+fn artifact_core(name: &str) -> &str {
+    let core = name.strip_prefix("e2e-").unwrap_or(name);
+    core.strip_suffix("-report").unwrap_or(core)
+}
+
+/// One row of the artifact-name table: the report artifact a lane uploads, the
+/// platform and OS it stands for, and the `platform.json` `platform_slug`s that
+/// identify the same lane when only the sidecar survives.
+struct KnownPlatform {
+    /// The un-suffixed artifact name (no channel, no sdk_version leg).
+    artifact: &'static str,
+    platform: &'static str,
+    os: &'static str,
+    /// The manifest `platform_slug` values that map back to `artifact`. Empty for
+    /// a row no sidecar can name (the unknown sentinel).
+    slugs: &'static [&'static str],
+}
+
+/// The sentinel artifact name for a report whose platform could not be
+/// recovered: a missing or unrecognized `platform.json`, e.g. a GPU run that
+/// errored before writing it. Never uploaded by a workflow — it only ever comes
+/// out of [`artifact_name_for_platform_slug`]. The OS is genuinely unknown here —
+/// a Windows GPU run that erupted early must NOT be reported as Linux — so it
+/// renders Unknown / Unknown rather than defaulting OS to Linux the way
+/// `fallback_descriptor` does for a titlecased platform.
+const UNKNOWN_PLATFORM_ARTIFACT: &str = "e2e-unknown-report";
+
+/// Every artifact name [`parse_descriptor`] resolves to a real platform and OS,
+/// and the sidecar slugs that map back to it ([`artifact_name_for_platform_slug`]).
+/// The one table both directions read, so a lane added or renamed here cannot
+/// leave the artifact-name side and the slug side disagreeing.
+const KNOWN_PLATFORMS: &[KnownPlatform] = &[
+    // The bare mock expect-pass artifact `e2e-report`.
+    KnownPlatform {
+        artifact: "e2e-report",
+        platform: "Mock",
+        os: "Linux",
+        slugs: &["mock"],
+    },
+    KnownPlatform {
+        artifact: "e2e-gpu-report",
+        platform: "MI300X",
+        os: "Linux",
+        slugs: &["mi300x"],
+    },
+    // The gfx target IS the slug for this lane: `platform_hardware_slug` has no
+    // product-name mapping for it.
+    KnownPlatform {
+        artifact: "e2e-gpu-rad3-report",
+        platform: "R9700",
+        os: "Linux",
+        slugs: &["gfx1201"],
+    },
+    KnownPlatform {
+        artifact: "e2e-gpu-mi350p-report",
+        platform: "MI350P",
+        os: "Linux",
+        slugs: &["mi350p"],
+    },
+    // Like rad3 above, the raw gfx target is the slug for the W7900 lane.
+    KnownPlatform {
+        artifact: "e2e-gpu-w7900-report",
+        platform: "W7900",
+        os: "Linux",
+        slugs: &["gfx1100"],
+    },
+    KnownPlatform {
+        artifact: "e2e-gpu-strix-ubuntu-report",
+        platform: "Strix Halo",
+        os: "Ubuntu",
+        slugs: &["strix-halo-linux"],
+    },
+    KnownPlatform {
+        artifact: "e2e-gpu-strix-windows-report",
+        platform: "Strix Halo",
+        os: "Windows",
+        slugs: &["strix-halo-windows"],
+    },
+    // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
+    // the Windows box. It is neither the native Ubuntu nor the Windows lane —
+    // GPU access goes through the WSL passthrough — so it needs its own OS
+    // value, not a reuse of "Ubuntu", or the grid would show two rows that
+    // claim to be the same host and disagree. The WSL workflow is statically
+    // pinned to the Strix WSL runner, so a bare `wsl` slug (the probe could not
+    // recover a gfx target) names the same lane as `strix-halo-wsl`.
+    KnownPlatform {
+        artifact: "e2e-gpu-strix-wsl-report",
+        platform: "Strix Halo",
+        os: "WSL2",
+        slugs: &["wsl", "strix-halo-wsl"],
+    },
+    KnownPlatform {
+        artifact: UNKNOWN_PLATFORM_ARTIFACT,
+        platform: "Unknown",
+        os: "Unknown",
+        slugs: &[],
+    },
+];
+
+/// The artifact name a `platform.json` `platform_slug` stands for.
+///
+/// Lets a report downloaded without its per-artifact directory (and so without a
+/// name) render identically to one that kept it. `None`, or a slug no lane
+/// claims, gets [`UNKNOWN_PLATFORM_ARTIFACT`], never a guessed real platform: a
+/// hardware failure must not be misattributed to Mock/Linux.
+pub fn artifact_name_for_platform_slug(slug: Option<&str>) -> &'static str {
+    slug.and_then(|slug| KNOWN_PLATFORMS.iter().find(|k| k.slugs.contains(&slug)))
+        .map_or(UNKNOWN_PLATFORM_ARTIFACT, |k| k.artifact)
 }
 
 fn fallback_descriptor(
@@ -133,40 +222,49 @@ fn fallback_descriptor(
         platform
     };
     Descriptor {
-        platform: labeled_platform(&platform, release_label),
+        platform: with_paren_suffix(&platform, release_label),
         os: "Linux".to_string(),
         known_bugs,
         channel_from_name,
     }
 }
 
-/// Append a "(channel)" suffix to `base` when known.
-pub(super) fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
-    match channel {
-        Some(c) => format!("{base} ({c})"),
+/// Append a "(suffix)" to `base` when `suffix` is known. The one place the
+/// parenthesised-suffix shape lives: [`parse_descriptor`] uses it for the
+/// sdk_version matrix leg (`n-1`/`n-2`) so two legs of the same platform don't
+/// render as identical rows/columns (`None`, the `current` leg, is left alone
+/// because its artifact name is unchanged from before the matrix existed), and
+/// the labels below use it for the channel.
+pub(super) fn with_paren_suffix(base: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("{base} ({s})"),
         None => base.to_string(),
     }
 }
 
-/// Full label (platform AND OS) for a platform excluded from the expectation
-/// grid because its artifact has no usable `platform.json` (see
-/// [`Grid::excluded`](super::Grid::excluded)). Takes the already-computed `PlatformReport::desc`
-/// rather than re-deriving one from the raw artifact name.
-/// Deliberately mirrors [`PlatformReport::load`](super::PlatformReport::load)'s `label` field and
-/// [`GridColumn::label`](super::GridColumn::label) (same shape, no `versions.channel` to prefer since
-/// there is no manifest, so this falls back to the artifact-name channel
-/// directly) rather than the OS-less [`platform_cell`](super::platform_cell): two real lanes of the
-/// same silicon family (e.g. "Strix Halo" Ubuntu vs. Windows, see
-/// `parse_descriptor`) must stay distinguishable here, or an excluded Windows
-/// lane would read as the identical string to an included Ubuntu column of
-/// the same platform — an outright contradiction in the rendered report — and
+/// The one full platform label: platform AND OS, plus the channel when known
+/// (e.g. `Strix Halo Windows (nightly)`).
+///
+/// Every surface that names a whole platform lane builds it here:
+/// `PlatformReport::label` (built by [`PlatformReport::load`](super::PlatformReport::load); per-platform detail
+/// sections, XPASS notes and the command-coverage column key),
+/// [`GridColumn::label`](super::GridColumn::label) (grid headings and the
+/// needs-attention list) and the excluded-platform caption
+/// ([`Grid::excluded`](super::Grid::excluded)). The callers differ only in where
+/// `channel` comes from (the manifest preferred over the artifact name for the
+/// report label, the manifest alone for the grid heading, the artifact name
+/// alone when there is no manifest), never in the shape of the label.
+///
+/// Deliberately not the OS-less [`platform_cell`](super::platform_cell), which is
+/// only safe where the OS has its own table column: two real lanes of the same
+/// silicon family (e.g. "Strix Halo" Ubuntu vs. Windows, see
+/// `parse_descriptor`) must stay distinguishable everywhere else, or an excluded
+/// Windows lane would read as the identical string to an included Ubuntu column
+/// of the same platform — an outright contradiction in the rendered report — and
 /// two such excluded lanes would silently collapse into one `BTreeSet` entry,
 /// undercounting how many artifacts are actually missing.
-pub(super) fn excluded_platform_label(desc: &Descriptor) -> String {
-    with_channel_suffix(
-        &format!("{} {}", desc.platform, desc.os),
-        desc.channel_from_name,
-    )
+pub(super) fn full_platform_label(platform: &str, os: &str, channel: Option<&str>) -> String {
+    with_paren_suffix(&format!("{platform} {os}"), channel)
 }
 
 #[cfg(test)]
@@ -249,6 +347,103 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn every_known_platform_round_trips_between_slug_and_artifact_name() {
+        // The two directions read one table, so the thing that can still drift is
+        // a row whose artifact name `parse_descriptor` no longer resolves back to
+        // that row (a typo'd or re-shaped name falls through to the titlecased
+        // Linux guess), a slug claimed by two rows (the first would silently win),
+        // or a slug that stops reaching its artifact.
+        let mut seen_slugs = std::collections::BTreeSet::new();
+        let mut seen_artifacts = std::collections::BTreeSet::new();
+        for k in KNOWN_PLATFORMS {
+            assert!(
+                k.artifact.starts_with("e2e-") && k.artifact.ends_with("-report"),
+                "{} is not an `e2e-*-report` artifact name",
+                k.artifact
+            );
+            assert!(
+                seen_artifacts.insert(k.artifact),
+                "duplicate {}",
+                k.artifact
+            );
+            // Artifact name -> platform/OS, bare and with a channel suffix (the
+            // bare mock artifact never carries one: its core is just `report`).
+            let core = artifact_core(k.artifact);
+            let mut names = vec![k.artifact.to_string()];
+            if core != "report" {
+                names.push(format!("e2e-{core}-nightly-report"));
+            }
+            for name in names {
+                let d = parse_descriptor(&name);
+                assert_eq!(
+                    (d.platform.as_str(), d.os.as_str()),
+                    (k.platform, k.os),
+                    "{name} must resolve to its own row, not the fallback guess"
+                );
+            }
+            // Slug -> artifact name, for every slug the row claims.
+            for slug in k.slugs {
+                assert!(seen_slugs.insert(*slug), "slug {slug} claimed twice");
+                assert_eq!(
+                    artifact_name_for_platform_slug(Some(slug)),
+                    k.artifact,
+                    "slug {slug}"
+                );
+            }
+        }
+        assert!(!seen_slugs.is_empty());
+    }
+
+    #[test]
+    fn platform_slugs_map_to_the_artifact_names_workflows_upload() {
+        // Pinned independently of the table so editing a row's artifact name or
+        // slug is a deliberate, visible change: these are the `platform_slug`
+        // values the harness writes and the artifact names the workflows upload.
+        for (slug, artifact) in [
+            ("mock", "e2e-report"),
+            ("mi300x", "e2e-gpu-report"),
+            ("gfx1201", "e2e-gpu-rad3-report"),
+            ("mi350p", "e2e-gpu-mi350p-report"),
+            ("gfx1100", "e2e-gpu-w7900-report"),
+            ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
+            ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
+            ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),
+            ("wsl", "e2e-gpu-strix-wsl-report"),
+        ] {
+            assert_eq!(artifact_name_for_platform_slug(Some(slug)), artifact);
+        }
+    }
+
+    #[test]
+    fn missing_or_unrecognized_slug_is_the_unknown_artifact_never_mock() {
+        for slug in [None, Some(""), Some("some-future-gpu"), Some("Mock")] {
+            let name = artifact_name_for_platform_slug(slug);
+            assert_eq!(name, "e2e-unknown-report", "{slug:?}");
+            let d = parse_descriptor(name);
+            assert_eq!((d.platform.as_str(), d.os.as_str()), ("Unknown", "Unknown"));
+        }
+    }
+
+    #[test]
+    fn full_platform_label_is_platform_os_and_optional_channel() {
+        assert_eq!(
+            full_platform_label("Strix Halo", "Windows", Some("nightly")),
+            "Strix Halo Windows (nightly)"
+        );
+        assert_eq!(
+            full_platform_label("Strix Halo", "Ubuntu", None),
+            "Strix Halo Ubuntu"
+        );
+        // The label a parsed artifact yields keeps the sdk_version leg inside the
+        // platform part, before the OS.
+        let d = parse_descriptor("e2e-gpu-strix-wsl-n-1-report");
+        assert_eq!(
+            full_platform_label(&d.platform, &d.os, d.channel_from_name),
+            "Strix Halo (n-1) WSL2"
+        );
     }
 
     #[test]

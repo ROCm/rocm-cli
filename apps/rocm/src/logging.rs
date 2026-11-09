@@ -34,6 +34,18 @@ const MAX_RETAINED_LOGS: usize = 7;
 /// else (dependency noise stays out of the file).
 const DEFAULT_FILTER: &str = "warn,rocm=info,rocm_dash_tui=info,rocm_dash_daemon=info";
 
+/// Whether this invocation opens the client log file at all.
+///
+/// `rocm uninstall` does not: it inspects and deletes the folders the logger
+/// would create, so starting the logger first made a dry run list a `logs`
+/// folder it had just made. In a direct invocation the subcommand is the first
+/// argument, because `rocm` has no global flags and does not abbreviate
+/// subcommand names; an uninstall reached from `rocm chat` or a freeform
+/// request runs under a logger that was already started.
+pub fn is_enabled_for(raw_args: &[String]) -> bool {
+    raw_args.first().is_none_or(|arg| arg != "uninstall")
+}
+
 /// Initialize the process-wide `tracing` subscriber, writing to a daily-
 /// rotated file under `paths.client_log_dir()`.
 ///
@@ -165,6 +177,25 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn uninstall_is_the_only_invocation_that_skips_the_log_file() {
+        // The scenario `uninstall-06` proves the behavior (a dry run creates and
+        // lists nothing); this pins which invocations that applies to.
+        assert!(!is_enabled_for(&args(&["uninstall"])));
+        assert!(!is_enabled_for(&args(&["uninstall", "--dry-run"])));
+        assert!(is_enabled_for(&args(&[])));
+        assert!(is_enabled_for(&args(&["examine"])));
+        assert!(is_enabled_for(&args(&["--help"])));
+        // `runtimes uninstall` removes one runtime, not the folders the logger
+        // writes to, and a longer word is not the subcommand.
+        assert!(is_enabled_for(&args(&["runtimes", "uninstall", "x"])));
+        assert!(is_enabled_for(&args(&["uninstall-all"])));
     }
 
     #[test]
