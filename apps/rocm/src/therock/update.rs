@@ -1333,10 +1333,12 @@ mod tests {
     /// unreachable index is what each error names), so the absences are not a
     /// check that stopped early. `runtime_update_plan` and a real
     /// `apply_runtime_update` do prepare one on the same host, which is also what
-    /// shows the stand-in `uv` is reachable. The choice between the two is pinned
-    /// on every platform by `a_dry_run_takes_the_check_and_an_apply_takes_the_plan`
-    /// in `update_cmd.rs`; the Gherkin scenarios `update-09` and `update-10` drive
-    /// the report and the preview through the built binary.
+    /// shows the stand-in `uv` is reachable. That a `--dry-run` takes the check and
+    /// an apply the plan is pinned on every platform by
+    /// `a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in `update_cmd.rs`;
+    /// which function is the check is pinned only here and by scenario `update-10`
+    /// on Linux, and no test on Windows pins it. The Gherkin scenarios `update-09`
+    /// and `update-10` drive the report and the preview through the built binary.
     #[cfg(unix)]
     #[test]
     fn the_update_checks_prepare_no_python_and_the_apply_plan_does() -> Result<()> {
