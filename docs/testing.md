@@ -62,8 +62,8 @@ cargo xtask check-architecture-doc
 ```
 
 It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
-does not link, and on a stale entry in the `EXEMPT` list in
-[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
+does not link, and there is no exemption list; see
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
