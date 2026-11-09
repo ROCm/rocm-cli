@@ -2450,30 +2450,42 @@ mod tests {
     }
 
     /// The two installer constants the current release key is pinned in, in the
-    /// shape the real installers embed them.
+    /// shape the real installers embed them, including the `readonly` line the
+    /// check requires after the assignments.
     fn install_sh(current: &str, extra: &str) -> String {
         format!(
             "#!/bin/sh\n{extra}PINNED_RELEASE_PUBLIC_KEY_CURRENT=\"{current}\"\n\
-             PINNED_RELEASE_PUBLIC_KEY_NEXT=\"\"\n"
+             PINNED_RELEASE_PUBLIC_KEY_NEXT=\"\"\n\
+             readonly PINNED_RELEASE_PUBLIC_KEY_CURRENT PINNED_RELEASE_PUBLIC_KEY_NEXT\n"
         )
     }
 
     fn install_ps1(current: &str, extra: &str) -> String {
-        format!(
-            "{extra}$PinnedReleasePublicKeyCurrent = @\"\n{current}\"@\n\
-             $PinnedReleasePublicKeyNext = \"\"\n"
-        )
+        // An empty slot is the one-line `""` form, as in a dormant installer; an
+        // empty here-string is a malformed key block, not an empty slot.
+        let slot = if current.is_empty() {
+            "$PinnedReleasePublicKeyCurrent = \"\"\n".to_owned()
+        } else {
+            format!("$PinnedReleasePublicKeyCurrent = @\"\n{current}\"@\n")
+        };
+        format!("{extra}{slot}$PinnedReleasePublicKeyNext = \"\"\n")
     }
 
     /// A repository root holding the real canonical current release key and the
     /// given installer sources, for running [`check_pinned_keys`] — the real
     /// comparison — end to end. The other canonical keys are absent, so their
-    /// entries are dormant.
+    /// entries are dormant; the check still reads the metadata key's Rust
+    /// source to confirm its slot is empty, so the layout holds one.
     fn release_layout(canonical: &str, sh: &str, ps1: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("docs/keys")).expect("create docs/keys");
         std::fs::write(dir.path().join(PINNED_KEYS[0].canonical), canonical)
             .expect("write canonical key");
+        let rust = dir.path().join(rs_path());
+        std::fs::create_dir_all(rust.parent().expect("a parent"))
+            .expect("create the Rust source dir");
+        std::fs::write(rust, "const PINNED_METADATA_PUBLIC_KEY_PEM: &str = \"\";\n")
+            .expect("write the dormant Rust source");
         std::fs::write(dir.path().join("install.sh"), sh).expect("write install.sh");
         std::fs::write(dir.path().join("install.ps1"), ps1).expect("write install.ps1");
         dir
@@ -2644,11 +2656,12 @@ mod tests {
     }
 
     /// A published canonical key whose pinned constant is empty, or missing
-    /// from the source altogether, is divergence — not a match and not a
-    /// dormant skip. Each case leaves exactly one entry wrong, so the error
-    /// must name that entry.
+    /// from the source altogether, is an error — not a match and not a dormant
+    /// skip. An empty constant is divergence; a missing one is reported as a
+    /// missing assignment. Each case leaves exactly one entry wrong, so the
+    /// error must name that entry.
     #[test]
-    fn an_empty_or_missing_constant_against_a_published_key_diverges() {
+    fn an_empty_or_missing_constant_against_a_published_key_is_an_error() {
         let canonical = canonical_release_key_text();
         let root = release_layout(
             &canonical,
@@ -2664,6 +2677,7 @@ mod tests {
                 install_ps1(&canonical, ""),
                 false,
                 "release-current",
+                "have diverged",
             ),
             (
                 "current empty in install.ps1",
@@ -2671,6 +2685,7 @@ mod tests {
                 install_ps1("", ""),
                 false,
                 "release-current",
+                "have diverged",
             ),
             (
                 "current constant missing from install.sh",
@@ -2678,6 +2693,7 @@ mod tests {
                 install_ps1(&canonical, ""),
                 false,
                 "release-current",
+                "has no assignment of PINNED_RELEASE_PUBLIC_KEY_CURRENT",
             ),
             // The rotation case: the next key's PEM is published (the same key
             // stands in for it) while the installers still carry `NEXT=""`.
@@ -2687,9 +2703,10 @@ mod tests {
                 install_ps1(&canonical, ""),
                 true,
                 "release-next",
+                "have diverged",
             ),
         ];
-        for (label, sh, ps1, publish_next, entry) in cases {
+        for (label, sh, ps1, publish_next, entry, reported_as) in cases {
             if publish_next {
                 std::fs::write(&next_canonical, &canonical).expect("write canonical next key");
             } else {
@@ -2697,14 +2714,17 @@ mod tests {
             }
             write_sources(root.path(), &sh, &ps1);
             let result = check_pinned_keys(root.path(), None);
+            let message = result
+                .as_ref()
+                .expect_err(&format!("{label}: expected an error, got {result:?}"))
+                .to_string();
             assert!(
-                diverges(&result),
-                "{label}: expected divergence, got {result:?}"
+                message.contains(reported_as),
+                "{label}: expected the error to say `{reported_as}`, got {message}"
             );
-            let message = result.expect_err("diverged").to_string();
             assert!(
                 message.starts_with(&format!("{entry}:")),
-                "{label}: the divergence must be reported for {entry}, got {message}"
+                "{label}: the error must be reported for {entry}, got {message}"
             );
         }
     }
@@ -2715,22 +2735,24 @@ mod tests {
     #[test]
     fn a_blank_canonical_key_is_dormant_and_a_missing_source_is_an_error() {
         let canonical = canonical_release_key_text();
-        let root = release_layout(
-            "  \n",
-            &install_sh(&canonical, ""),
-            &install_ps1(&canonical, ""),
-        );
+        // A dormant slot is empty in every installer; a key pasted into one is
+        // its own error (`a_dormant_slot_must_be_empty`).
+        let root = release_layout("  \n", &install_sh("", ""), &install_ps1("", ""));
         let messages =
             check_pinned_keys(root.path(), None).expect("a blank canonical key is dormant");
         assert!(
-            messages
-                .iter()
-                .any(|m| m == "release-current: no canonical key yet — skipped (dormant)"),
+            messages.iter().any(|m| m
+                == "release-current: no canonical key yet — slots empty in install.sh, \
+                        install.ps1 (dormant)"),
             "a blank canonical key must be reported dormant, got {messages:?}"
         );
 
+        // Publish the key and pin it in install.sh, so the missing install.ps1
+        // is the only fault left.
         std::fs::write(root.path().join(PINNED_KEYS[0].canonical), &canonical)
             .expect("write canonical key");
+        std::fs::write(root.path().join("install.sh"), install_sh(&canonical, ""))
+            .expect("pin the key in install.sh");
         std::fs::remove_file(root.path().join("install.ps1")).expect("remove install.ps1");
         let error = check_pinned_keys(root.path(), None)
             .expect_err("a missing pinned source must be an error");
@@ -2815,45 +2837,56 @@ mod tests {
         assert_ne!(left, right, "the fixture must actually differ");
     }
 
-    /// Characterization: the comparison reduces each key to its base64
-    /// alphabet, so characters *outside* that alphabet inserted into an
-    /// embedded key's body — whitespace or punctuation — are normalized away
-    /// and do not register as divergence.
+    /// A character outside the base64 alphabet inserted into an installer's
+    /// copy of the key — whitespace or punctuation — is refused as a malformed
+    /// key block, in either installer, and the error names the entry and the
+    /// file.
     ///
-    /// The two kinds differ for the installers that read the key. Whitespace
-    /// is harmless: OpenSSL, which install.sh calls, loads the key with a space
-    /// inserted, and `Convert.FromBase64String` (install.ps1) skips whitespace.
-    /// Punctuation is not: OpenSSL refuses to load the key with a `!` or `.`
-    /// inserted, and `FromBase64String` throws on any other character outside
-    /// the alphabet. Such an installer rejects every release signed with that
-    /// key — it fails closed, not open — while this check passes, which is the
-    /// drift between CI and the installers that the check exists to catch.
-    ///
-    /// Not changed here. Tightening means keeping every non-whitespace
-    /// character in the comparison while still dropping what each embedding's
-    /// quoting adds (the `\n` and `` `n `` escapes, a Rust string's `\` line
-    /// continuations); that change should turn the `!` and `.` cases below into
-    /// divergence and update this test.
+    /// The comparison itself only looks at the base64 alphabet, so this is the
+    /// well-formedness rule (`pinned_pem_body`) doing the work. It has to: an
+    /// installer that embeds such a key cannot load it (OpenSSL refuses a `!` or
+    /// `.`, and `Convert.FromBase64String` throws on anything outside the
+    /// alphabet), so it would reject every release signed with that key while a
+    /// comparison alone would pass.
     #[test]
-    fn non_base64_noise_in_an_embedded_key_is_normalized_away() {
+    fn non_base64_noise_in_an_embedded_key_is_refused_as_malformed() {
         let canonical = canonical_release_key_text();
         for noise in [" ", "!", "."] {
-            // At the start of the body, which every key has, rather than
-            // before a particular key type's leading bytes.
+            // After the first character of the body, which every key has, rather
+            // than at the start of a line: install.sh refuses a key line that
+            // starts with whitespace, and that is a separate rule.
+            let first = canonical
+                .strip_prefix(&format!("{PEM_BEGIN}\n"))
+                .and_then(|body| body.chars().next())
+                .expect("a body character after the BEGIN line");
             let noisy = canonical.replacen(
-                &format!("{PEM_BEGIN}\n"),
-                &format!("{PEM_BEGIN}\n{noise}"),
+                &format!("{PEM_BEGIN}\n{first}"),
+                &format!("{PEM_BEGIN}\n{first}{noise}"),
                 1,
             );
             assert_fixture_differs(&noisy, &canonical);
-            let root = release_layout(
-                &canonical,
-                &install_sh(&noisy, ""),
-                &install_ps1(&noisy, ""),
-            );
-            check_pinned_keys(root.path(), None).unwrap_or_else(|error| {
-                panic!("{noise:?} inside the body is expected to be normalized away: {error:#}")
-            });
+            for (file, sh, ps1) in [
+                (
+                    "install.sh",
+                    install_sh(&noisy, ""),
+                    install_ps1(&canonical, ""),
+                ),
+                (
+                    "install.ps1",
+                    install_sh(&canonical, ""),
+                    install_ps1(&noisy, ""),
+                ),
+            ] {
+                let root = release_layout(&canonical, &sh, &ps1);
+                let error = check_pinned_keys(root.path(), None)
+                    .expect_err("a key with stray characters in its body must be refused")
+                    .to_string();
+                assert!(
+                    error.starts_with(&format!("release-current: {file} "))
+                        && error.contains("is not one well-formed PUBLIC KEY PEM block"),
+                    "{noise:?} in {file}: expected a malformed-block error naming {file}, got {error}"
+                );
+            }
         }
     }
 }

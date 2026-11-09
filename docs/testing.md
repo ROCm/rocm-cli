@@ -2433,12 +2433,11 @@ that spells another catalog model's basename (`qwen3-32b`, an alias of
 `Qwen/Qwen3-32B-FP8` and the basename of `Qwen/Qwen3-32B`) reads as ready for
 that other model. The second is checked against a list of the catalog's
 current collisions, so a catalog change that adds one fails the test.
-The pinned-key tests likewise pin one looseness of the check itself: it
-compares only the base64 alphabet of each embedded key, so punctuation such as
-`!` or `.` inserted into an installer's copy is not reported, although OpenSSL
-then refuses to load that key and the installer rejects every release signed
-with it. `non_base64_noise_in_an_embedded_key_is_normalized_away` holds that
-behaviour, so a change that tightens the comparison has to update it.
+The pinned-key tests also pin that a character outside the base64 alphabet
+(a space, `!` or `.`) inserted into an installer's copy of the key is refused
+as a malformed key block, in either installer, rather than ignored by the
+comparison: an installer that embeds such a key cannot load it.
+`non_base64_noise_in_an_embedded_key_is_refused_as_malformed` holds that.
 
 Model recipe engine metadata checks:
 
