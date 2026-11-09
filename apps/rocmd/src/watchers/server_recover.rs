@@ -205,12 +205,13 @@ fn handle_server_recover_event_with_record(
             // Report it and stop, rather than letting a permanent failure
             // propagate out of `evaluate_watchers` and take the whole daemon —
             // and every other watcher — down on each 30s recovery tick.
-            if let Err(error) = crate::engine_ipc::ensure_public_service_has_endpoint_key(
+            if let Err(error) = rocm_core::ensure_public_service_has_endpoint_key(
                 &record.host,
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
                     .is_some(),
                 record.requires_api_key,
+                rocm_core::ServiceStart::Respawn,
             ) {
                 return crate::persistence::record_event(
                     paths,
@@ -917,6 +918,65 @@ mod tests {
         assert_eq!(proposals[0].action, "queue_restart_proposal");
         assert_eq!(proposals[0].service_id.as_deref(), Some("svc-1"));
         assert_eq!(proposals[0].status, "pending");
+        Ok(())
+    }
+
+    /// A public service whose key is gone is reported, not respawned, and the
+    /// report is the shared guard's refusal worded for a respawn — the same
+    /// text `rocm services restart` prints, bar the action.
+    #[test]
+    fn server_recover_refuses_a_keyless_public_service_in_the_guards_words() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-keyless-public");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-public-no-key",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "0.0.0.0",
+            11452,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Contained,
+            None,
+        )]);
+
+        evaluate_server_recover(&paths, WatcherMode::Contained, &mut state)?;
+        let reported = state.active_watchers[0].last_event.clone();
+        let reloaded = load_service_record(&paths, "svc-public-no-key");
+        fs::remove_dir_all(root).ok();
+
+        let expected = rocm_core::ensure_public_service_has_endpoint_key(
+            "0.0.0.0",
+            false,
+            false,
+            rocm_core::ServiceStart::Respawn,
+        )
+        .unwrap_err()
+        .to_string();
+        let reported = reported.expect("a refused recovery is reported");
+        assert!(
+            reported
+                .starts_with("cannot recover managed service svc-public-no-key on 0.0.0.0:11452"),
+            "{reported}"
+        );
+        assert!(
+            reported.ends_with(&expected),
+            "the report must carry the guard's own refusal: {reported}"
+        );
+        // The refusal came before any restart: the record was not touched.
+        let reloaded = reloaded?;
+        assert_eq!(reloaded.status, "failed");
+        assert_eq!(reloaded.last_restart_unix_ms, None);
         Ok(())
     }
 

@@ -1990,8 +1990,12 @@ cargo test -p rocm --bin rocm respawn_allows_loopback
 cargo test -p rocm --bin rocm restart_refuses_a_public_service
 cargo test -p rocm-core generate_endpoint_api_key
 cargo test -p rocm-engine-protocol endpoint_api_key
-cargo test -p rocm-engine-protocol is_public_bind_host
+cargo test -p rocm-core is_public_bind_host
+cargo test -p rocm-core endpoint_key
+cargo test -p rocm --bin rocm the_command_a_respawn_refusal_names_clears_the_refusal
 cargo test -p rocmd recovery_respawn_fails_closed
+cargo test -p rocmd supervising_a_
+cargo test -p rocmd server_recover_refuses_a_keyless_public_service
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
@@ -2029,7 +2033,13 @@ The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
 to respawn once its key is gone, rather than coming back unauthenticated. That
 covers `rocm services restart` and `rocmd`'s recovery supervisor, and the refusal
-happens before anything is stopped, so it cannot take down a running service. A
+happens before anything is stopped, so it cannot take down a running service.
+Both binaries apply the same guard, `rocm-core`'s
+`ensure_public_service_has_endpoint_key`, so the refusal reads the same for a
+launch, a restart and a daemon respawn bar the action it names; the unit tests
+check each caller's text against the guard's, and follow the `rocm serve
+<model> …` command it names through the real parser, `serve`'s own key policy
+and the key file it stores. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
@@ -2037,8 +2047,9 @@ that later observes the process dead. `service-stop-01`
 (`features/service_stop.feature`) covers `services stop` succeeding against a
 running record on the mock lane and the record being persisted as stopped, and
 `service-stop-02` covers the key being dropped once the daemon's `stop_server`
-confirms a stop. There is still no e2e coverage of `services restart`, which
-remains unit-tested only. Reusing a running service for a
+confirms a stop. `service-stop-09` covers a `services restart` of a public server whose key is
+gone being refused, naming a `rocm serve` command that `rocm` accepts, with the
+running server left running; a restart that goes ahead remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
 Linux-only since the Windows managed Lemonade spawn can't enforce the key)
@@ -2603,11 +2614,16 @@ stop report that outcome for the recorded process without signalling it: each
 checks the report on stderr, exit 1, the kept PID and stop request, and that no
 stop command is named. -03 and -04 plant an endpoint key and check that the
 `kept:` line names it and the key file is still there; -05 plants none and
-checks that the line omits it and no key file exists. Because the seam
+checks that the line omits it and no key file exists. `service-stop-09` plants a
+publicly bound server with no key file and runs `rocm services restart --yes`:
+it checks the refusal's text and exit status, that the `rocm serve` command it
+names parses (its `<model>` and `<port>` filled in, `--help` last, with a bogus flag as the
+negative control), and that the recorded process is still running and the
+record is not marked stopped. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
+"service-stop-0[1-689]"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 

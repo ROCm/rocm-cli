@@ -6,7 +6,6 @@
 //! attached serve paths: process and stdio plumbing, [`ManagedLaunchReport`] and
 //! [`ManagedSpawn`], and the serialized spawn transaction itself.
 
-use super::endpoint_auth::ensure_public_service_has_endpoint_key;
 use super::launch_transaction::{
     ManagedPortDecision, ManagedReuseRefusal, abandon_failed_managed_launch,
     managed_service_reuse_refusal, no_usable_gpu_refusal, resolve_managed_port_in_transaction,
@@ -468,10 +467,11 @@ fn launch_managed_engine_child_locked(
     //
     // The field is threaded, never derived from the key file. Deriving it marked
     // every public bind as having demanded auth — see the assignment above.
-    ensure_public_service_has_endpoint_key(
+    rocm_core::ensure_public_service_has_endpoint_key(
         host,
         endpoint_key_file.is_some(),
         record.requires_api_key,
+        rocm_core::ServiceStart::Launch,
     )?;
     // Hand the port over: close the probe socket immediately before the spawn,
     // still under the caller's launch lock, so no other ROCm transaction can
@@ -873,7 +873,7 @@ mod tests {
         // was launched with `--require-api-key`, and its key file is present but
         // invalid — so `requires_api_key` is true while `key_present` is false,
         // which is the only way to reach the first branch. A test calling
-        // `ensure_public_service_has_endpoint_key` directly cannot catch a
+        // `rocm_core::ensure_public_service_has_endpoint_key` directly cannot catch a
         // mis-wired call site, which is the defect that has occurred here twice.
         //
         // The flag is passed explicitly rather than inferred from the key file.
@@ -956,6 +956,24 @@ mod tests {
         assert!(
             message.contains("without authentication"),
             "the refusal must say what the risk is: {message}"
+        );
+        // The spawn's refusal is the shared guard's, worded for a launch — the
+        // same text `rocm services restart` and the daemon print, bar the
+        // action. A private copy here, or the wrong action passed, would differ.
+        assert_eq!(
+            message,
+            rocm_core::ensure_public_service_has_endpoint_key(
+                "127.0.0.1",
+                false,
+                true,
+                rocm_core::ServiceStart::Launch,
+            )
+            .unwrap_err()
+            .to_string()
+        );
+        assert!(
+            message.contains("launching it would open it without authentication"),
+            "{message}"
         );
         assert!(
             !manifest_path.exists(),

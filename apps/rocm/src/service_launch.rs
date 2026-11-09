@@ -61,8 +61,7 @@ mod test_support;
 pub(crate) use attach::run_attached_service;
 pub(crate) use endpoint_auth::{
     drop_orphaned_endpoint_key_on_already_running, ensure_public_bind_engine_supported,
-    ensure_public_service_has_endpoint_key, is_loopback_host, resolve_endpoint_auth,
-    validate_bind_host,
+    is_loopback_host, resolve_endpoint_auth, validate_bind_host,
 };
 pub(crate) use helper_autostart::{
     ensure_background_helper_running, ensure_background_helper_running_quiet,

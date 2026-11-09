@@ -237,7 +237,7 @@ pub(crate) enum ManagedReuseRefusal {
     /// builds — so a server started without one keeps serving anonymously no
     /// matter what is written afterwards. Upgrading the record would be worse
     /// than doing nothing: it would claim auth the live process does not
-    /// enforce, and `ensure_public_service_has_endpoint_key` would pass on the
+    /// enforce, and the endpoint-key respawn guard would pass on the
     /// strength of a key file nothing reads. `rocm remote serve` relies on this:
     /// it publishes a loopback port onto the tailnet and prints "the API key
     /// above is what stops anyone else calling it", which reusing an
