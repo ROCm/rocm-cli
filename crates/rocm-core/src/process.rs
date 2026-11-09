@@ -363,6 +363,85 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
     terminate_process(pid)
 }
 
+/// What one look at a PID could establish.
+///
+/// [`process_is_running`] answers a plain yes or no, so a process that is alive
+/// but cannot be queried reads the same as one that is gone. A stop that is about
+/// to report a process as exited must not make that mistake, so this keeps the
+/// third answer apart.
+// Only the Windows probe can fail to query a live process, so nothing builds
+// `Unqueryable` elsewhere; the decision on it is shared by every platform.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessProbe {
+    /// The PID names a process that has not exited.
+    Running,
+    /// The PID names no process, or one that has exited.
+    Gone,
+    /// The PID could not be queried, so it can be neither confirmed running nor
+    /// confirmed gone. On Windows that includes a live process the caller may not
+    /// open (`ERROR_ACCESS_DENIED`).
+    Unqueryable,
+}
+
+/// Windows `ERROR_INVALID_PARAMETER`: what `OpenProcess` sets for a PID that
+/// names no process.
+#[cfg(any(windows, test))]
+const ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// What a failed `OpenProcess` says about the PID, from its `GetLastError` code.
+///
+/// Only the code for "no such process" counts as gone. `ERROR_ACCESS_DENIED`
+/// (5), which a live process the caller may not open sets, and any other or
+/// missing code are [`ProcessProbe::Unqueryable`]: a failure to look is not an
+/// exit. Split out of the FFI so a test runs it on every host.
+#[cfg(any(windows, test))]
+pub(crate) const fn classify_open_failure(code: Option<i32>) -> ProcessProbe {
+    match code {
+        Some(ERROR_INVALID_PARAMETER) => ProcessProbe::Gone,
+        _ => ProcessProbe::Unqueryable,
+    }
+}
+
+/// Look at `pid`, keeping a process that cannot be queried apart from one that
+/// is gone. See [`ProcessProbe`].
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    if pid == 0 {
+        return ProcessProbe::Gone;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return classify_open_failure(std::io::Error::last_os_error().raw_os_error());
+    }
+    let mut exit_code = 0;
+    let queried = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
+    unsafe {
+        CloseHandle(handle);
+    }
+    match (queried, exit_code) {
+        (false, _) => ProcessProbe::Unqueryable,
+        // `STILL_ACTIVE`.
+        (true, 259) => ProcessProbe::Running,
+        (true, _) => ProcessProbe::Gone,
+    }
+}
+
+/// Look at `pid`. `kill(pid, 0)` already tells a live process the caller may
+/// not signal (`EPERM`, which counts as running) from one that is gone, so there
+/// is no third answer to keep apart here.
+#[cfg(not(windows))]
+pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
+    if process_is_running(pid) {
+        ProcessProbe::Running
+    } else {
+        ProcessProbe::Gone
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub fn process_is_running(pid: u32) -> bool {
@@ -1260,6 +1339,39 @@ mod tests {
     use super::*;
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
+
+    /// A failed `OpenProcess` is a gone process only for the code that means
+    /// "no such process". Access denied, which a live process the caller may not
+    /// open sets, and any code that is not known are not an exit.
+    #[test]
+    fn a_failed_open_is_gone_only_for_no_such_process() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        assert_eq!(classify_open_failure(Some(87)), ProcessProbe::Gone);
+        assert_eq!(
+            classify_open_failure(Some(ERROR_ACCESS_DENIED)),
+            ProcessProbe::Unqueryable
+        );
+        // The codes around the two that matter, and no code at all.
+        for code in [Some(0), Some(6), Some(31), Some(299), Some(-1), None] {
+            assert_eq!(
+                classify_open_failure(code),
+                ProcessProbe::Unqueryable,
+                "{code:?}"
+            );
+        }
+    }
+
+    /// Off Windows, a PID that is running (including one the caller may not
+    /// signal) probes as running and an absent one as gone, matching
+    /// [`process_is_running`].
+    #[cfg(not(windows))]
+    #[test]
+    fn the_probe_agrees_with_process_is_running_off_windows() {
+        let own = std::process::id();
+        assert_eq!(probe_process(own), ProcessProbe::Running);
+        assert_eq!(probe_process(0), ProcessProbe::Gone);
+        assert_eq!(probe_process(999_999_998), ProcessProbe::Gone);
+    }
 
     const LOCK_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_LOCK_PATH";
     const LOCK_CHILD_READY_ENV: &str = "ROCM_CORE_TEST_LOCK_READY";

@@ -1838,6 +1838,25 @@ Neither Windows-only test nor the Windows half of `service-stop-08` ran where
 this was written; the Windows CI jobs are what exercise them. A stop that cannot
 verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
 eq <pid>"` on Windows (`process_check_command`).
+Three further Windows paths of that stop are tested through injected functions
+that run on every host; no scenario forces their failure cases. A PID that cannot be
+queried (`ProcessProbe::Unqueryable`, which on Windows includes a live process
+the stop may not open) is `Indeterminate`, so the stop reports it unverified
+instead of already gone (`a_pid_that_cannot_be_queried_is_unverified_not_already_gone`,
+`a_stop_of_a_live_process_it_cannot_query_is_not_confirmed`, and
+`a_failed_open_is_gone_only_for_no_such_process` for the error codes). The PID is
+held open from before the identity read until the stop returns, so the creation
+time that was compared is that of the process the kill then reaches
+(`the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop`). And a
+`taskkill` that failed to start or exited nonzero leaves the stop unconfirmed,
+reported as `timed_out`, whatever the root's own termination says, because only
+the root's exit is watched on Windows
+(`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
+`only_a_clean_taskkill_exit_is_a_completed_tree_kill`); the report and the record
+a `timed_out` stop leaves are covered by
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. What no
+test here reaches is the Windows API itself: the handle hold, the open-failure
+codes and a real `taskkill` failing run only on the Windows lane.
 `service-stop-06` (Linux) is the same stop of a real recorded process through
 `rocm services stop`, checking the persisted state: the process exited and the
 record names none. Run the Windows scenario on a Windows host with

@@ -15,6 +15,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::process::ProcessProbe;
+
 /// How often the bounded waits poll for the target's exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -71,8 +73,10 @@ pub enum IdentityState {
     /// was recycled.
     Recycled,
     /// The PID is live and an identity was recorded, but the current start-time
-    /// cannot be read, so it can be neither confirmed nor refuted. The process
-    /// must not be signalled, and it must not be reported as stopped.
+    /// cannot be read, so it can be neither confirmed nor refuted; or the PID
+    /// cannot be queried at all (on Windows, a live process this one may not
+    /// open), so it cannot be told from a process that is gone. The process must
+    /// not be signalled, and it must not be reported as stopped.
     Indeterminate,
     /// The PID is not live (or is a not-yet-reaped zombie).
     Gone,
@@ -87,10 +91,34 @@ pub enum IdentityState {
 /// [`IdentityState::Matches`].
 #[must_use]
 pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
-    if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
-        return IdentityState::Gone;
+    identity_state_with(
+        id,
+        crate::process::probe_process,
+        process_has_exited,
+        process_start_ticks,
+    )
+}
+
+/// [`identity_state`] with its three system reads supplied by the caller: whether
+/// the PID can be queried and is running, whether it is a zombie, and its
+/// current start-time token. The liveness gate in front of every stop, so a test
+/// drives each answer a read can give on every host.
+///
+/// A PID that cannot be queried is [`IdentityState::Indeterminate`], not
+/// [`IdentityState::Gone`]: a failure to look is not an exit, and reading it as
+/// one would let a stop report a live process as stopped.
+fn identity_state_with(
+    id: &ProcessIdentity,
+    probe: impl Fn(u32) -> ProcessProbe,
+    has_exited: impl Fn(u32) -> bool,
+    start_ticks: impl Fn(u32) -> Option<u64>,
+) -> IdentityState {
+    match probe(id.pid) {
+        ProcessProbe::Gone => IdentityState::Gone,
+        ProcessProbe::Unqueryable => IdentityState::Indeterminate,
+        ProcessProbe::Running if has_exited(id.pid) => IdentityState::Gone,
+        ProcessProbe::Running => classify_live_identity(id.start_ticks, start_ticks(id.pid)),
     }
-    classify_live_identity(id.start_ticks, process_start_ticks(id.pid))
 }
 
 /// The identity verdict for a PID that is running: what its recorded token
@@ -466,38 +494,122 @@ pub fn terminate_recorded_service_pids(
 /// PID, and `taskkill /T /F` then takes that process and its subtree. A stop
 /// that confirms clears the record's PIDs, so that exposure shrinks to the
 /// records written before the token existed and not yet stopped.
+///
+/// On Windows the PID is held from before the identity check until the stop
+/// ends: a process's PID is not handed to another process while any handle to it
+/// is open, so the creation time that was compared is the creation time of the
+/// process `taskkill` and the root termination then reach by PID. Without the
+/// hold, the process could exit and an unrelated one take its PID between the
+/// check and the kill.
+///
+/// A tree kill that did not complete leaves the stop unconfirmed, whatever the
+/// root's own termination says: [`terminate_verified`] can only watch the root
+/// on Windows, so a descendant that `taskkill` did not take down is one this stop
+/// cannot see exit, and reporting the stop confirmed would clear the record and
+/// the endpoint key while a worker may still hold the device.
 pub fn terminate_recorded_pid(identity: &ProcessIdentity) -> TerminationOutcome {
-    terminate_recorded_pid_with(identity, platform_tree_kill(), identity_state, |identity| {
-        terminate_verified(identity, KillScope::Tree, MANAGED_STOP_GRACE, true)
-    })
+    terminate_recorded_pid_with(
+        identity,
+        platform_tree_kill(),
+        hold_pid,
+        identity_state,
+        |identity| terminate_verified(identity, KillScope::Tree, MANAGED_STOP_GRACE, true),
+    )
 }
 
-/// [`terminate_recorded_pid`] with its three platform and system touchpoints
-/// supplied by the caller, so a test drives the tree-kill step on every host:
-/// `tree_kill` takes one PID's descendants down (`None` where the platform
-/// needs no separate step), `state_of` reads the PID's identity, and `terminate`
-/// is the verified termination of the root.
-fn terminate_recorded_pid_with(
+/// Whether the separate descendant kill took the tree down.
+// Only Windows has the separate step, so nothing builds a value elsewhere; the
+// tests build both, and the decision on them is shared by every platform.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKill {
+    /// The kill ran and reported that every process it reached is terminated.
+    Completed,
+    /// The kill could not run, or reported that it did not take every process
+    /// down. Which descendants survive is not known.
+    Failed,
+}
+
+/// The verdict for a stop whose descendant kill ended as `tree` and whose root
+/// termination answered `outcome`. A failed tree kill turns any verdict that
+/// would confirm the stop into [`TerminationOutcome::TimedOut`]: the root was
+/// signalled, and it, or a process under it, is not confirmed exited. The
+/// verdicts that already deny the stop stay as they are.
+const fn after_tree_kill(tree: TreeKill, outcome: TerminationOutcome) -> TerminationOutcome {
+    match tree {
+        TreeKill::Completed => outcome,
+        TreeKill::Failed if outcome.stopped() => TerminationOutcome::TimedOut,
+        TreeKill::Failed => outcome,
+    }
+}
+
+/// [`terminate_recorded_pid`] with its platform and system touchpoints supplied
+/// by the caller, so a test drives the tree-kill step on every host:
+/// `tree_kill` takes one PID's descendants down (`None` where the platform needs
+/// no separate step), `hold` keeps the PID reserved and is dropped when the call
+/// returns, `state_of` reads the PID's identity, and `terminate` is the verified
+/// termination of the root.
+fn terminate_recorded_pid_with<Held>(
     identity: &ProcessIdentity,
-    tree_kill: Option<&dyn Fn(u32)>,
+    tree_kill: Option<&dyn Fn(u32) -> TreeKill>,
+    hold: impl FnOnce(&ProcessIdentity) -> Held,
     state_of: impl Fn(&ProcessIdentity) -> IdentityState,
     terminate: impl Fn(&ProcessIdentity) -> TerminationOutcome,
 ) -> TerminationOutcome {
+    // Before anything reads the identity, and until the end of the call.
+    let _hold = hold(identity);
     if let Some(tree_kill) = tree_kill
         && matches!(state_of(identity), IdentityState::Matches)
     {
         // Taken while the root is still alive: `taskkill /T` resolves children
         // through the live parent, so it cannot reach them once the root is gone.
-        tree_kill(identity.pid);
+        let tree = tree_kill(identity.pid);
         // `terminate` still owns the bounded wait and the verdict, but a root
         // the tree kill already took now reads back as `AlreadyGone` — which
         // would deny a stop this command did perform.
-        return match terminate(identity) {
+        let outcome = match terminate(identity) {
             TerminationOutcome::AlreadyGone => TerminationOutcome::Forced,
             outcome => outcome,
         };
+        return after_tree_kill(tree, outcome);
     }
     terminate(identity)
+}
+
+/// What keeps a PID reserved while a stop works on it: on Windows an open
+/// handle to the process, which stops the OS giving the PID to another process;
+/// nothing elsewhere, where the stop signals by PID and `terminate_verified`
+/// re-verifies it.
+#[cfg(windows)]
+struct PidHold {
+    _handle: Option<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(not(windows))]
+struct PidHold;
+
+/// Hold `identity`'s PID. A process that cannot be opened is not held, and the
+/// identity read that follows then refuses it as gone or unverifiable.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn hold_pid(identity: &ProcessIdentity) -> PidHold {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: a plain Win32 call; a non-null handle is owned by nothing else and
+    // is closed when the `OwnedHandle` drops.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
+    PidHold {
+        _handle: (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) }),
+    }
+}
+
+// The `cfg` sibling calls non-const code, so this arm cannot be `const` without
+// giving the two platforms different signatures.
+#[cfg(not(windows))]
+#[allow(clippy::missing_const_for_fn)]
+fn hold_pid(_identity: &ProcessIdentity) -> PidHold {
+    PidHold
 }
 
 /// The separate descendant kill this platform needs before the verified
@@ -506,7 +618,7 @@ fn terminate_recorded_pid_with(
 // The `cfg` arms differ in what they return, so the non-Windows arm cannot be a
 // `const fn` without giving the two platforms different signatures.
 #[allow(clippy::missing_const_for_fn)]
-fn platform_tree_kill() -> Option<&'static dyn Fn(u32)> {
+fn platform_tree_kill() -> Option<&'static dyn Fn(u32) -> TreeKill> {
     #[cfg(windows)]
     {
         Some(&taskkill_tree)
@@ -517,15 +629,31 @@ fn platform_tree_kill() -> Option<&'static dyn Fn(u32)> {
     }
 }
 
+/// The verdict on one `taskkill` run, from whether it started and the exit code
+/// it ended with. Only a clean exit (0) is a completed tree kill: a failed
+/// launch, a nonzero code (a process it could not terminate, or none found) and a
+/// run that ended without a code are all [`TreeKill::Failed`]. Split out of the
+/// process spawn so a test runs it on every host.
+#[cfg(any(windows, test))]
+fn classify_taskkill(run: std::io::Result<Option<i32>>) -> TreeKill {
+    match run {
+        Ok(Some(0)) => TreeKill::Completed,
+        Ok(_) | Err(_) => TreeKill::Failed,
+    }
+}
+
 #[cfg(windows)]
-fn taskkill_tree(pid: u32) {
+fn taskkill_tree(pid: u32) -> TreeKill {
     use std::process::{Command, Stdio};
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    classify_taskkill(
+        Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.code()),
+    )
 }
 
 /// Poll until every process in `members` has exited, or `grace` elapses.
@@ -1122,23 +1250,44 @@ mod tests {
     /// What one `terminate_recorded_pid_with` call did, in order.
     #[derive(Debug, PartialEq, Eq)]
     enum Step {
+        Hold(u32),
         TreeKill(u32),
         Terminate(u32),
+        Release,
+    }
+
+    /// A stand-in for the Windows PID hold: records that it was taken and, when
+    /// it is dropped, that it was released.
+    struct RecordedHold<'a>(&'a RefCell<Vec<Step>>);
+
+    impl Drop for RecordedHold<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(Step::Release);
+        }
     }
 
     /// Run `terminate_recorded_pid_with` for `pid`, with a tree-kill step
-    /// present or not, the identity in `state`, and the root's termination
-    /// answering `outcome`. Returns the verdict and the steps taken.
-    fn tree_kill_run(
+    /// present or not and ending as `tree`, the identity in `state`, and the
+    /// root's termination answering `outcome`. Returns the verdict and the steps
+    /// taken, the hold's release included.
+    fn tree_kill_run_with(
         has_tree_kill: bool,
+        tree: TreeKill,
         state: IdentityState,
         outcome: TerminationOutcome,
     ) -> (TerminationOutcome, Vec<Step>) {
         let steps = RefCell::new(Vec::new());
-        let tree_kill = |pid: u32| steps.borrow_mut().push(Step::TreeKill(pid));
+        let tree_kill = |pid: u32| {
+            steps.borrow_mut().push(Step::TreeKill(pid));
+            tree
+        };
         let verdict = terminate_recorded_pid_with(
             &ProcessIdentity::new(SUPERVISOR_PID, None),
-            has_tree_kill.then_some(&tree_kill as &dyn Fn(u32)),
+            has_tree_kill.then_some(&tree_kill as &dyn Fn(u32) -> TreeKill),
+            |identity| {
+                steps.borrow_mut().push(Step::Hold(identity.pid));
+                RecordedHold(&steps)
+            },
             |_| state,
             |identity| {
                 steps.borrow_mut().push(Step::Terminate(identity.pid));
@@ -1148,6 +1297,15 @@ mod tests {
         (verdict, steps.into_inner())
     }
 
+    /// [`tree_kill_run_with`] for a tree kill that completes.
+    fn tree_kill_run(
+        has_tree_kill: bool,
+        state: IdentityState,
+        outcome: TerminationOutcome,
+    ) -> (TerminationOutcome, Vec<Step>) {
+        tree_kill_run_with(has_tree_kill, TreeKill::Completed, state, outcome)
+    }
+
     #[test]
     fn the_tree_is_killed_before_the_root_is_terminated() {
         let (_, steps) = tree_kill_run(true, IdentityState::Matches, TerminationOutcome::Forced);
@@ -1155,8 +1313,10 @@ mod tests {
         assert_eq!(
             steps,
             vec![
+                Step::Hold(SUPERVISOR_PID),
                 Step::TreeKill(SUPERVISOR_PID),
-                Step::Terminate(SUPERVISOR_PID)
+                Step::Terminate(SUPERVISOR_PID),
+                Step::Release,
             ],
             "`taskkill /T` resolves children through the live parent, so the \
              tree kill has to come first"
@@ -1199,7 +1359,11 @@ mod tests {
 
             assert_eq!(
                 steps,
-                vec![Step::Terminate(SUPERVISOR_PID)],
+                vec![
+                    Step::Hold(SUPERVISOR_PID),
+                    Step::Terminate(SUPERVISOR_PID),
+                    Step::Release
+                ],
                 "{state:?}: a stranger's process tree must not be taken"
             );
             assert_eq!(
@@ -1218,7 +1382,14 @@ mod tests {
             TerminationOutcome::AlreadyGone,
         );
 
-        assert_eq!(steps, vec![Step::Terminate(SUPERVISOR_PID)]);
+        assert_eq!(
+            steps,
+            vec![
+                Step::Hold(SUPERVISOR_PID),
+                Step::Terminate(SUPERVISOR_PID),
+                Step::Release
+            ]
+        );
         assert_eq!(verdict, TerminationOutcome::AlreadyGone);
     }
 
@@ -1300,10 +1471,17 @@ mod tests {
         } in rows
         {
             let steps = RefCell::new(Vec::new());
-            let tree_kill = |pid: u32| steps.borrow_mut().push(Step::TreeKill(pid));
+            let tree_kill = |pid: u32| {
+                steps.borrow_mut().push(Step::TreeKill(pid));
+                TreeKill::Completed
+            };
             let verdict = terminate_recorded_pid_with(
                 &ProcessIdentity::new(SUPERVISOR_PID, recorded),
-                Some(&tree_kill as &dyn Fn(u32)),
+                Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
+                |id| {
+                    steps.borrow_mut().push(Step::Hold(id.pid));
+                    RecordedHold(&steps)
+                },
                 |id| classify_live_identity(id.start_ticks, live),
                 |id| {
                     steps.borrow_mut().push(Step::Terminate(id.pid));
@@ -1316,11 +1494,17 @@ mod tests {
             );
             let expected_steps = if tree_kill_runs {
                 vec![
+                    Step::Hold(SUPERVISOR_PID),
                     Step::TreeKill(SUPERVISOR_PID),
                     Step::Terminate(SUPERVISOR_PID),
+                    Step::Release,
                 ]
             } else {
-                vec![Step::Terminate(SUPERVISOR_PID)]
+                vec![
+                    Step::Hold(SUPERVISOR_PID),
+                    Step::Terminate(SUPERVISOR_PID),
+                    Step::Release,
+                ]
             };
             assert_eq!(steps.into_inner(), expected_steps, "{row}: steps");
             assert_eq!(verdict.as_str(), label, "{row}: verdict");
@@ -1345,6 +1529,149 @@ mod tests {
         // step they exercise is the one `terminate_recorded_pid` has on Windows
         // and does without elsewhere, where `terminate_verified` walks the tree.
         assert_eq!(platform_tree_kill().is_some(), cfg!(windows));
+    }
+
+    #[test]
+    fn the_pid_is_held_before_its_identity_is_read_and_released_after_the_stop() {
+        // The hold is what makes the creation time that was compared the
+        // creation time of the process the kill then reaches by PID: taken
+        // first, released last. `Hold` comes before anything else and `Release`
+        // after the root's termination, with the tree kill between.
+        let (_, steps) = tree_kill_run(true, IdentityState::Matches, TerminationOutcome::Forced);
+
+        assert_eq!(steps.first(), Some(&Step::Hold(SUPERVISOR_PID)));
+        assert_eq!(steps.last(), Some(&Step::Release));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, Step::Release))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed() {
+        use TerminationOutcome::{AlreadyGone, Forced, Graceful, TimedOut, Unverified};
+        // Every root verdict that would confirm the stop becomes the one that
+        // says a process under the root may still be running; the verdicts that
+        // already deny the stop are kept.
+        for (root, expected) in [
+            (Forced, TimedOut),
+            (Graceful, TimedOut),
+            (AlreadyGone, TimedOut),
+            (TimedOut, TimedOut),
+            (Unverified, Unverified),
+        ] {
+            let (verdict, steps) =
+                tree_kill_run_with(true, TreeKill::Failed, IdentityState::Matches, root);
+
+            assert_eq!(verdict, expected, "root {root:?}");
+            assert!(
+                !verdict.stopped(),
+                "root {root:?}: the stop is not confirmed"
+            );
+            assert!(
+                steps.contains(&Step::Terminate(SUPERVISOR_PID)),
+                "the root is still terminated, best effort: {steps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_completed_tree_kill_leaves_the_roots_verdict_alone() {
+        use TerminationOutcome::{Forced, Graceful, TimedOut, Unverified};
+        for outcome in [Forced, Graceful, TimedOut, Unverified] {
+            let (verdict, _) =
+                tree_kill_run_with(true, TreeKill::Completed, IdentityState::Matches, outcome);
+
+            assert_eq!(verdict, outcome);
+        }
+    }
+
+    #[test]
+    fn only_a_clean_taskkill_exit_is_a_completed_tree_kill() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(classify_taskkill(Ok(Some(0))), TreeKill::Completed);
+        // A process it could not terminate, or none found.
+        assert_eq!(classify_taskkill(Ok(Some(1))), TreeKill::Failed);
+        assert_eq!(classify_taskkill(Ok(Some(128))), TreeKill::Failed);
+        // Ended without an exit code.
+        assert_eq!(classify_taskkill(Ok(None)), TreeKill::Failed);
+        // Could not be started.
+        assert_eq!(
+            classify_taskkill(Err(Error::from(ErrorKind::NotFound))),
+            TreeKill::Failed
+        );
+    }
+
+    /// A PID that cannot be queried is neither gone nor a match, through the
+    /// same liveness gate every stop starts with.
+    #[test]
+    fn a_pid_that_cannot_be_queried_is_unverified_not_already_gone() {
+        use crate::process::ProcessProbe::{Gone, Running, Unqueryable};
+        let state = |probe, zombie, recorded, live| {
+            identity_state_with(
+                &ProcessIdentity::new(SUPERVISOR_PID, recorded),
+                |_| probe,
+                |_| zombie,
+                |_| live,
+            )
+        };
+        // Whatever token was recorded, and whatever can be read of the process.
+        for recorded in [None, Some(7)] {
+            for live in [None, Some(7), Some(8)] {
+                assert_eq!(
+                    state(Unqueryable, false, recorded, live),
+                    IdentityState::Indeterminate,
+                    "recorded {recorded:?}, live {live:?}"
+                );
+            }
+        }
+        assert_eq!(state(Gone, false, Some(7), Some(7)), IdentityState::Gone);
+        assert_eq!(state(Running, true, Some(7), Some(7)), IdentityState::Gone);
+        assert_eq!(
+            state(Running, false, Some(7), Some(7)),
+            IdentityState::Matches
+        );
+        assert_eq!(
+            state(Running, false, Some(7), Some(8)),
+            IdentityState::Recycled
+        );
+        assert_eq!(
+            state(Running, false, Some(7), None),
+            IdentityState::Indeterminate
+        );
+    }
+
+    /// The whole stop for a live process the caller may not query: not
+    /// signalled, no tree kill, and reported as unverified rather than as
+    /// stopped, so the record and the endpoint key are kept.
+    #[test]
+    fn a_stop_of_a_live_process_it_cannot_query_is_not_confirmed() {
+        use crate::process::ProcessProbe::Unqueryable;
+        let steps = RefCell::new(Vec::new());
+        let tree_kill = |pid: u32| {
+            steps.borrow_mut().push(Step::TreeKill(pid));
+            TreeKill::Completed
+        };
+        let state_of =
+            |id: &ProcessIdentity| identity_state_with(id, |_| Unqueryable, |_| false, |_| None);
+        let verdict = terminate_recorded_pid_with(
+            &ProcessIdentity::new(SUPERVISOR_PID, Some(7)),
+            Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
+            |_| (),
+            state_of,
+            // The verified termination's own gate, with the same read.
+            |id| refusal_before_signalling(state_of(id)).unwrap_or(TerminationOutcome::Forced),
+        );
+
+        assert_eq!(verdict, TerminationOutcome::Unverified);
+        assert!(!verdict.stopped());
+        assert!(
+            steps.into_inner().is_empty(),
+            "a process that cannot be told from a stranger is not tree-killed"
+        );
     }
 
     #[test]
