@@ -133,7 +133,7 @@ pub struct ManagedServiceRecord {
     /// and on records written before the endpoint existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_endpoint_url: Option<String>,
-    /// How [`Self::anthropic_endpoint_url`] is provided: `native` or `proxy`.
+    /// How [`Self::anthropic_endpoint_url`] is provided: `proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_endpoint_mode: Option<String>,
     pub manifest_path: PathBuf,

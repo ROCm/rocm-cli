@@ -2258,9 +2258,8 @@ the row also matches other Linux lemonade hosts, where a pass is tolerated).
 Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
 its HTTP front are tested in
 [anthropic_proxy.rs](../apps/rocmd/src/anthropic_proxy.rs) against a stand-in
-OpenAI engine, including both publishing paths (an engine without the route gets
-a proxy on its own port; one that has it is published as is). The route
-detection and the record's adoption of the published endpoint are tested in
+OpenAI engine, including an engine that has its own `/v1/messages` route, which is
+still fronted by the proxy so a Claude model name works. The record's adoption of the published endpoint are tested in
 [anthropic_endpoint.rs](../crates/rocm-core/src/anthropic_endpoint.rs) and
 [service_record.rs](../crates/rocm-core/src/service_record.rs).
 

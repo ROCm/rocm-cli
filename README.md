@@ -958,10 +958,10 @@ waits briefly for it; if it is not there yet, check `rocm services list`). It is
 a text-only, non-streaming endpoint. It is a base URL: point an
 Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
 if the service has one, as `x-api-key` (the translation front also accepts a
-bearer token). If the engine already serves
-`/v1/messages` itself, that is the endpoint listed; otherwise `rocm` runs a
+bearer token). `rocm` runs a
 translation front on its own port, inside the serving process, so it starts and
-stops with the service. Whatever model name the client sends, the served model
+stops with the service; it fronts the engine even when the engine has its own
+`/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
 answers, and the reply names it. The translation covers text turns, system
 prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
 streaming, tool use (`tools`, `tool_choice`), extended thinking and image or

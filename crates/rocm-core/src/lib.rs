@@ -70,8 +70,7 @@ pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
 pub use anthropic_endpoint::{
     ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    anthropic_endpoint_ready, anthropic_messages_native_probe,
-    wait_for_published_anthropic_endpoint,
+    anthropic_endpoint_ready, wait_for_published_anthropic_endpoint,
 };
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,

@@ -12,11 +12,11 @@
 //! adds no process of its own to track.
 //!
 //! [`spawn_alongside_engine`] first waits for the engine to list its model, then
-//! asks whether the engine serves `/v1/messages` natively. If it does, nothing is
-//! proxied and the engine's own endpoint is published. Otherwise the proxy binds
-//! a port of its own and publishes that. Either way the answer lands in the
-//! engine state file under the keys in `rocm_core::anthropic_endpoint`, which the
-//! service record adopts.
+//! binds a port of its own and publishes that address in the engine state file
+//! under the keys in `rocm_core::anthropic_endpoint`, which the service record
+//! adopts. The proxy fronts the engine even when the engine has a `/v1/messages`
+//! route of its own (vLLM, Lemonade): that route only accepts the served model's
+//! name, and an Anthropic client sends a Claude one.
 //!
 //! The translation is the text subset of the Messages API: system prompts and
 //! text turns, sampling parameters, stop sequences, usage and stop reasons.
@@ -37,8 +37,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rocm_core::{
     ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    anthropic_messages_native_probe, format_http_base_url, http_get_with_auth,
-    http_post_json_with_auth, merge_json_state_file, openai_models_endpoint_has_model,
+    format_http_base_url, http_get_with_auth, http_post_json_with_auth, merge_json_state_file,
+    openai_models_endpoint_has_model,
 };
 use serde_json::{Value, json};
 
@@ -96,24 +96,6 @@ pub fn spawn_alongside_engine(config: AnthropicProxyConfig) {
 fn run(config: &AnthropicProxyConfig) -> anyhow::Result<()> {
     let upstream = config.upstream_url();
     wait_for_engine_listing(config, &upstream)?;
-
-    // A failed probe is a connection problem, not an answer about the route.
-    // Proxying is the safe reading: it works whether or not the engine has one.
-    let native = anthropic_messages_native_probe(
-        &upstream,
-        config.probe_api_key.as_deref(),
-        Duration::from_secs(10),
-    )
-    .unwrap_or(false);
-    if native {
-        // `upstream` is the loopback form used for probing; what clients are
-        // told is the address the engine listens on, as for the OpenAI row.
-        return publish(
-            config,
-            &format_http_base_url(&config.host, config.engine_port),
-            AnthropicEndpointMode::Native,
-        );
-    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1109,33 +1091,27 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_that_serves_the_route_is_published_as_is_with_no_proxy() {
+    fn an_engine_that_serves_the_route_is_still_fronted_by_the_proxy() {
+        // vLLM and Lemonade answer `/v1/messages` themselves but reject any model
+        // name other than the one they serve; the proxy answers under any name.
         let engine = fake_engine_with(true);
         let (url, mode) = published_endpoint_for(&engine);
-        assert_eq!(mode, "native");
-        assert_eq!(url, format!("http://127.0.0.1:{}", engine.port));
-    }
-
-    #[test]
-    fn a_native_endpoint_is_published_on_the_bind_host_not_the_probe_loopback() {
-        let engine = fake_engine_with(true);
-        let dir = unique_temp_dir("native-host");
-        std::fs::create_dir_all(&dir).unwrap();
-        let state_path = dir.join("state.json");
-        // The wildcard host is probed over loopback (the fake engine only listens
-        // there) but must be advertised as the address the engine listens on.
-        spawn_alongside_engine(AnthropicProxyConfig {
-            host: "0.0.0.0".to_owned(),
-            engine_port: engine.port,
-            served_model: MODEL.to_owned(),
-            state_path: state_path.clone(),
-            probe_api_key: None,
-        });
-        let url =
-            rocm_core::wait_for_published_anthropic_endpoint(&state_path, Duration::from_secs(30))
-                .expect("no Anthropic endpoint was published");
-        let _ = std::fs::remove_dir_all(dir);
-        assert_eq!(url, format!("http://0.0.0.0:{}", engine.port));
+        assert_eq!(mode, "proxy");
+        assert_ne!(url, format!("http://127.0.0.1:{}", engine.port));
+        let (status, message) = post(
+            &url,
+            "/v1/messages",
+            None,
+            &json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        );
+        assert_eq!(
+            (status, message["content"][0]["text"].as_str()),
+            (200, Some("pong"))
+        );
     }
 
     #[test]
@@ -1151,13 +1127,13 @@ mod tests {
         publish(
             &config,
             "http://127.0.0.1:8000/v1",
-            AnthropicEndpointMode::Native,
+            AnthropicEndpointMode::Proxy,
         )
         .unwrap();
         let state: Value =
             serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
         assert_eq!(state["anthropic_endpoint_url"], "http://127.0.0.1:8000");
-        assert_eq!(state["anthropic_endpoint_mode"], "native");
+        assert_eq!(state["anthropic_endpoint_mode"], "proxy");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
