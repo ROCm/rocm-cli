@@ -47,20 +47,13 @@ fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
 
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
 ///
-/// Snapshots with no GPUs are skipped. Every `pick` here folds or sums over
-/// `gpus`, so a GPU-less snapshot yields 0, and the widget draws a baseline
-/// for every sample it is handed: a host with no GPU would read as one sitting
-/// at 0 °C and 0 W rather than as one with nothing to report.
+/// Delegates the GPU-less skip to [`crate::ui::widgets::gpu_history`], which
+/// owns that rule for every panel that draws a GPU series.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state: &AppState,
     pick: F,
 ) -> Vec<u64> {
-    state
-        .history
-        .iter()
-        .filter(|s| !s.gpus.is_empty())
-        .map(|s| pick(s).clamp(0.0, 100.0) as u64)
-        .collect()
+    crate::ui::widgets::gpu_history(state.history.iter(), pick)
 }
 
 /// Label for the node-load sparkline: no data → `—`; simulated telemetry is

@@ -323,20 +323,60 @@ mod tests {
     fn a_pegged_core_is_visible_even_when_cores_outnumber_columns() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
-        // Core 0 at full load with seven idle neighbours, in four columns.
-        // Showing one representative core per column used to drop core 0
-        // entirely, hiding the only core doing work.
+        // Peg core 1, the *second* member of column 0's group, and core 7, the
+        // last member of column 3's. A column that drew its first core rather
+        // than its busiest would miss both, so this fails for `values[lo]` as
+        // well as for dropping all but one core.
         let mut values = [0.0_f32; 8];
-        values[0] = 100.0;
+        values[1] = 100.0;
+        values[7] = 100.0;
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
         CoreBars::new(&values).max(100.0).render(buf.area, &mut buf);
         assert_eq!(
             buf.cell((0, 0)).unwrap().symbol(),
             "\u{28ff}",
-            "the pegged core did not reach the strip"
+            "column 0 missed the pegged core it shares with core 0"
         );
-        // Its idle neighbours still read as a baseline, not a full bar.
+        assert_eq!(
+            buf.cell((3, 0)).unwrap().symbol(),
+            "\u{28ff}",
+            "column 3 missed the pegged core at the end of its group"
+        );
+        // Columns whose cores are all idle still read as a baseline.
         assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "\u{28c0}");
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "\u{28c0}");
+    }
+
+    #[test]
+    fn a_pegged_core_survives_groups_of_uneven_size() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        // 10 cores into 4 columns: groups are uneven, so no fixed offset
+        // within a group is safe to pick. Column 1 covers cores 2, 3 and 4;
+        // core 3 is the middle one, which neither `values[lo]` (core 2) nor
+        // `values[hi - 1]` (core 4) would show.
+        let mut values = [0.0_f32; 10];
+        values[3] = 100.0;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        CoreBars::new(&values).max(100.0).render(buf.area, &mut buf);
+        assert_eq!(core_group(1, 10, 4), (2, 5), "group shape changed");
+        assert_eq!(
+            buf.cell((1, 0)).unwrap().symbol(),
+            "\u{28ff}",
+            "a pegged core in the middle of its group was not shown"
+        );
+    }
+
+    #[test]
+    fn two_columns_per_core_is_where_bars_separate() {
+        // The threshold `slot` switches on. At exactly two columns per core the
+        // bars must separate; one below, they tile and touch. Moving the test
+        // to `>= 3` or `>= 1` breaks one of these two.
+        assert_eq!(slot(0, 4, 8), (0, 1), "2 cols/core should leave a gutter");
+        assert_eq!(slot(1, 4, 8), (2, 3));
+        assert_eq!(touching_pairs(4, 8), 0, "2 cols/core should be separated");
+        // 7 columns for 4 cores is one short of the threshold.
+        assert_eq!(touching_pairs(4, 7), 3, "below it the strip is contiguous");
     }
 
     #[test]

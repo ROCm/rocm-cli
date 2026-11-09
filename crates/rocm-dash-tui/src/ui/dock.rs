@@ -264,20 +264,14 @@ pub fn context_rail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         }
     }
     // A small live trace so the rail has motion when telemetry is present.
-    // Snapshots with no GPUs are left out rather than folded to 0: the widget
-    // draws a baseline for every sample it is given, so a GPU-less host would
-    // get a flat "0% utilization" trace instead of an empty one.
-    let util_hist: Vec<u64> = state
-        .history
-        .iter()
-        .filter(|s| !s.gpus.is_empty())
-        .map(|s| {
-            s.gpus
-                .iter()
-                .map(|g| f64::from(g.gpu_utilization_pct))
-                .fold(0.0, f64::max) as u64
-        })
-        .collect();
+    // `gpu_history` owns the GPU-less skip: without it a host with no GPU
+    // draws a flat 0% trace instead of an empty one.
+    let util_hist: Vec<u64> = crate::ui::widgets::gpu_history(state.history.iter(), |s| {
+        s.gpus
+            .iter()
+            .map(|g| f64::from(g.gpu_utilization_pct))
+            .fold(0.0, f64::max)
+    });
     let body = inner.height.saturating_sub(lines.len() as u16);
     f.render_widget(Paragraph::new(lines), inner);
     if body >= 1 && !util_hist.is_empty() {

@@ -163,6 +163,25 @@ pub fn gpu_stats_line<'a>(g: &'a GpuMetrics, theme: &Theme) -> Line<'a> {
     ])
 }
 
+/// Map snapshots to a sparkline series, skipping those with no GPUs.
+///
+/// Every GPU `pick` folds or sums over `gpus`, so a GPU-less snapshot yields 0.
+/// The braille widgets draw a baseline for every sample they are handed, so
+/// letting those through paints a host with no GPU as one sitting at 0 — a
+/// measured zero rather than an absent reading. One rule, one place: `home`,
+/// `dock` and the GPU panels all go through here.
+pub fn gpu_history<'a, I, F>(snapshots: I, pick: F) -> Vec<u64>
+where
+    I: IntoIterator<Item = &'a Snapshot>,
+    F: Fn(&Snapshot) -> f64,
+{
+    snapshots
+        .into_iter()
+        .filter(|s| !s.gpus.is_empty())
+        .map(|s| pick(s).clamp(0.0, 100.0) as u64)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +365,32 @@ mod tests {
             |_| false
         ));
         assert_eq!(buf, "a");
+    }
+
+    #[test]
+    fn gpu_history_skips_snapshots_with_no_gpus() {
+        // One rule for home, dock and the GPU panels: a snapshot with no GPUs
+        // is absent from the series, not a measured zero. Every `pick` folds
+        // over `gpus`, so letting one through would draw a baseline for a host
+        // that reported nothing.
+        let with_gpu = |util: f32| Snapshot {
+            gpus: vec![GpuMetrics {
+                gpu_utilization_pct: util,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snaps = [Snapshot::default(), with_gpu(40.0), Snapshot::default()];
+        let series = gpu_history(snaps.iter(), |s| {
+            s.gpus
+                .iter()
+                .map(|g| f64::from(g.gpu_utilization_pct))
+                .fold(0.0, f64::max)
+        });
+        assert_eq!(series, vec![40], "a GPU-less snapshot reached the series");
+        assert!(
+            gpu_history([Snapshot::default()].iter(), |_| 0.0).is_empty(),
+            "a host with no GPU at all should draw nothing"
+        );
     }
 }

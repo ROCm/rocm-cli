@@ -315,14 +315,17 @@ fn sparkline_max(data: &[u64]) -> u64 {
     }
 }
 
-fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let n = state.bench_rows.len();
-    // Rows without a prompt_tps measurement are left out of the series rather
-    // than folded in as zero. The widget draws a baseline for every sample it
-    // is given, so a `unwrap_or(0.0)` here would render "not measured" as a
-    // measured zero; the title says how many of the rows actually carry one.
-    let data: Vec<u64> = state
-        .bench_rows
+/// The prompt_tps series and its panel title.
+///
+/// Rows without a measurement are left out of the series rather than folded in
+/// as zero: the widget draws a baseline for every sample it is handed, so a
+/// `unwrap_or(0.0)` would render "not measured" as a measured zero. The title
+/// then says how many of the rows actually carry one.
+///
+/// Shared with the tests so they exercise this, rather than a copy of it.
+fn prompt_tps_series(rows: &[BenchmarkRow]) -> (Vec<u64>, String) {
+    let n = rows.len();
+    let data: Vec<u64> = rows
         .iter()
         .filter_map(|r| r.prompt_tps)
         .map(|v| v.max(0.0) as u64)
@@ -332,6 +335,11 @@ fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     } else {
         format!("prompt_tps · {} of last {n} rows", data.len())
     };
+    (data, title)
+}
+
+fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let (data, title) = prompt_tps_series(state.bench_rows.as_slices().0);
     let inner = panel::bento(f, area, Some(&title), BoxRole::Success, false, theme);
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -370,6 +378,8 @@ mod tests {
 
     #[test]
     fn unmeasured_rows_stay_out_of_the_series_and_the_title_says_so() {
+        // Exercises `prompt_tps_series`, the same function `draw_sparkline`
+        // uses, so reverting it to `unwrap_or(0.0)` turns this red.
         // The widget draws a baseline for every sample it is handed, so a row
         // with no prompt_tps must not reach it as a zero: "not measured" and
         // "measured 0 tok/s" would become the same picture.
@@ -387,16 +397,20 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let data: Vec<u64> = rows
-            .iter()
-            .filter_map(|r| r.prompt_tps)
-            .map(|v| v.max(0.0) as u64)
-            .collect();
+        let (data, title) = prompt_tps_series(&rows);
         assert_eq!(data, vec![120, 90], "an unmeasured row reached the widget");
-        assert_eq!(
-            format!("prompt_tps · {} of last {} rows", data.len(), rows.len()),
-            "prompt_tps · 2 of last 3 rows"
-        );
+        assert_eq!(title, "prompt_tps · 2 of last 3 rows");
+
+        // With every row measured the title drops the qualifier.
+        let all_measured: Vec<BenchmarkRow> = (0..3)
+            .map(|_| BenchmarkRow {
+                prompt_tps: Some(50.0),
+                ..Default::default()
+            })
+            .collect();
+        let (data, title) = prompt_tps_series(&all_measured);
+        assert_eq!(data, vec![50, 50, 50]);
+        assert_eq!(title, "prompt_tps · last 3 rows");
     }
 
     #[test]

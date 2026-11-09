@@ -31,15 +31,19 @@ use crate::ui::widgets::{gpu_stats_line, instances_on_gpu, power_style, temperat
 
 /// Height of the overall-CPU box when the two CPU boxes are stacked: border
 /// (2) + `panel::padding_for`'s top pad (1, taken at height >= 5) + sparkline
-/// (4). Sized so the graph keeps the four rows it had when both charts shared
-/// one box, since stacking is the narrow-terminal path and the trend is what
-/// that panel is read for.
-const CPU_OVERALL_H: u16 = 7;
-/// Height of the per-core box when stacked: border (2) + bars (1). Below the
-/// height-5 threshold, so this box takes no top pad. The strip gives up rows
-/// rather than the graph: stacking only happens on a terminal too narrow to
-/// give each core two columns, where the strip is already a coarse glance.
-const CPU_CORES_H: u16 = 3;
+/// (3).
+///
+/// Two bordered boxes spend five of the slot's ten rows on chrome, so the
+/// charts share the remaining five and neither can have what it had when they
+/// shared one box (4 rows of graph, 3 of bars). This 3/2 split loses it evenly.
+/// The alternative, 4 rows of graph and 1 of bars, quantises the strip at 25%
+/// per dot, and stacking is not rare enough to accept that: a 120-column
+/// terminal with 32 cores leaves 55 columns a side, short of the 64 the strip
+/// needs, so an ordinary terminal stacks.
+const CPU_OVERALL_H: u16 = 6;
+/// Height of the per-core box when stacked: border (2) + bars (2). Below the
+/// height-5 threshold, so this box takes no top pad.
+const CPU_CORES_H: u16 = 4;
 /// Columns a `panel::bento` box spends on chrome: border (2) + left pad (2) +
 /// right pad (1), per `panel::padding_for`.
 const PANEL_CHROME_W: u16 = 5;
@@ -181,8 +185,12 @@ fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme:
 /// a stub, and the core strip **two** columns per core. One per core would fit
 /// the bars but not their gutters (see `core_bars::slot`), so the strip would
 /// come out as one fused block; a strip that cannot be read as separate cores
-/// is not worth halving the graph for. A high core count is what usually rules
-/// this out, and that is exactly the case where the strip needs full width.
+/// is not worth halving the graph for.
+///
+/// The core count rules this out more often than the terminal width does: at
+/// 120 columns a 32-core host already falls short (55 a side against the 64 it
+/// needs), so stacking is the ordinary case on a laptop-sized terminal rather
+/// than a narrow-terminal fallback.
 const fn cpu_fits_side_by_side(area: Rect, n_cores: usize) -> bool {
     let half_inner = (area.width / 2).saturating_sub(PANEL_CHROME_W);
     half_inner >= MIN_GRAPH_W && half_inner as usize >= 2 * n_cores
@@ -866,12 +874,16 @@ mod tests {
     }
 
     #[test]
-    fn the_stacked_graph_keeps_the_rows_it_had_before_the_split() {
-        // Stacking is the narrow-terminal path. The graph is what that panel
-        // is read for, so it keeps four sparkline rows; the box is sized
-        // border (2) + top pad (1) + 4.
-        assert_eq!(CPU_OVERALL_H, 7);
+    fn the_stacked_split_leaves_both_charts_more_than_one_row() {
+        // Five rows of chart after chrome, split so neither collapses: the
+        // graph gets 3 (box 6 = border 2 + top pad 1 + 3) and the strip 2 (box
+        // 4 is under the height-5 pad threshold). A 4/1 split would quantise
+        // the strip at 25% per dot on an ordinary 120-column terminal, which
+        // stacks at 32 cores.
+        assert_eq!(CPU_OVERALL_H, 6);
+        assert_eq!(CPU_CORES_H, 4);
         assert_eq!(CPU_OVERALL_H + CPU_CORES_H, 10, "CPU slot is 10 rows");
+        assert!(!cpu_fits_side_by_side(Rect::new(0, 0, 120, 10), 32));
     }
 
     #[test]
