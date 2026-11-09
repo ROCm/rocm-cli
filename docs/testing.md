@@ -2642,6 +2642,16 @@ bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
 ```
 
+The nightly stream canary has its own self-test, which checks each rule
+against a fixture plan without the network:
+
+```bash
+python scripts/nightly_canary.py --self-test
+```
+
+What the scheduled canary checks, who is told and how to rerun it are in
+[ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
+
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
 the test rather than slipping past a substring assertion — and then runs that
