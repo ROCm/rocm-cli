@@ -2240,6 +2240,21 @@ fn install_sdk_into(world: &mut E2eWorld, folder: &Path) {
 }
 
 fn run_sdk_install_into(world: &mut E2eWorld, folder: &Path, dry_run: bool) {
+    let launcher = root(world).join("fake-python").join("python3.14");
+    write_executable(
+        &launcher,
+        "#!/bin/sh\nif [ \"$1\" = -c ]; then echo cp314; fi\nexit 0\n",
+    );
+    run_sdk_install_into_with_python(world, folder, dry_run, &launcher);
+}
+
+/// [`run_sdk_install_into`], with `ROCM_CLI_PYTHON` naming `python`.
+fn run_sdk_install_into_with_python(
+    world: &mut E2eWorld,
+    folder: &Path,
+    dry_run: bool,
+    python: &Path,
+) {
     let uv = root(world).join("fake-uv").join("uv");
     write_executable(
         &uv,
@@ -2279,18 +2294,13 @@ exit 1
 "#
         ),
     );
-    let launcher = root(world).join("fake-python").join("python3.14");
-    write_executable(
-        &launcher,
-        "#!/bin/sh\nif [ \"$1\" = -c ]; then echo cp314; fi\nexit 0\n",
-    );
     let home = install_folder(world, USER_HOME_FOLDER);
     world
         .command_env
         .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
     world
         .command_env
-        .push(("ROCM_CLI_PYTHON", launcher.into_os_string()));
+        .push(("ROCM_CLI_PYTHON", python.as_os_str().to_owned()));
     world.command_env.push(("HOME", home.into_os_string()));
     // `command_env` is consumed by each command, so the fixture index the
     // `Given` pointed the CLI at has to be named again for every run here, or
@@ -2471,6 +2481,32 @@ async fn folder_with_someone_elses_venv(world: &mut E2eWorld) {
 async fn preview_sdk_install_into_cloned_venv(world: &mut E2eWorld) {
     let folder = install_folder(world, CLONED_VENV_FOLDER);
     run_sdk_install_into(world, &folder, true);
+}
+
+#[when(
+    "the user previews installing the SDK into that folder with that folder's Python as ROCM_CLI_PYTHON"
+)]
+async fn preview_sdk_install_with_python_from_folder(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    let python = folder.join("bin").join("python");
+    run_sdk_install_into_with_python(world, &folder, true, &python);
+}
+
+#[then("the preview stops without running that Python and says why")]
+async fn preview_stops_before_running_folder_python(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    let reported = reported(world);
+    assert_ne!(world.cli_rc, Some(0), "the preview succeeded:\n{reported}");
+    assert!(
+        reported.contains(&format!(
+            "this preview did not check the Python from ROCM_CLI_PYTHON at {}: it is inside the install folder {}, and a preview runs nothing from the install folder",
+            folder.join("bin").join("python").display(),
+            folder.display()
+        )),
+        "the preview did not say why it stopped:\n{reported}"
+    );
+    assert_no_prefix_python_ran(world, &reported);
+    assert!(folder.join("bin").join("python").is_file() && folder.join("pyvenv.cfg").is_file());
 }
 
 #[then(

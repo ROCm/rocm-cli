@@ -15,11 +15,11 @@
 
 use super::io::{linux_temp_dir, windows_temp_dir};
 use super::process::{
-    capture_python_stdout, progress_line, progress_output_suppressed, run_command,
+    capture_python_stdout, progress_line, progress_output_suppressed, run_command, run_command_in,
     run_command_with_env,
 };
 use super::source::SourceLayout;
-use super::venv_python_path;
+use super::{managed_format_root, venv_python_path};
 use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
@@ -212,8 +212,9 @@ fn existing_venv_reuse(install_root: &Path, python_launcher: &Path) -> Result<()
     let prefix = prefix.trim();
     if !paths_name_same_folder(Path::new(prefix), install_root) {
         return Err(format!(
-            "a Python at {} whose sys.prefix is {prefix}, not this folder",
-            env_python.display()
+            "a Python at {} whose sys.prefix is {}, not this folder",
+            env_python.display(),
+            shown_from_folder(prefix)
         ));
     }
     let existing = wheel_compatibility_for_python(&env_python).map_err(|_| {
@@ -300,7 +301,7 @@ fn uv_venv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
 /// part-way (a file it may not delete, a busy one on Windows) then leaves no
 /// Python behind, or a Python whose venv is still marked as one; either way the
 /// next run cannot mistake it for a working venv
-/// ([`existing_venv_is_reusable`]) and sends the folder back through
+/// ([`existing_venv_reuse`]) and sends the folder back through
 /// [`venv_folder_state`], which finishes the clear.
 ///
 /// `share` is deliberately absent: packages install data there, but so can a
@@ -481,8 +482,7 @@ fn paths_name_same_folder(left: &Path, right: &Path) -> bool {
 /// Strictly inside `<data_dir>/runtimes/wheel`, where every folder is one
 /// `install sdk` made for itself.
 fn install_root_is_in_managed_wheel_root(paths: &AppPaths, install_root: &Path) -> bool {
-    let managed =
-        rocm_core::resolve_path_through_symlinks(&paths.data_dir.join("runtimes").join("wheel"));
+    let managed = rocm_core::resolve_path_through_symlinks(&managed_format_root(paths, "wheel"));
     let root = rocm_core::resolve_path_through_symlinks(install_root);
     rocm_core::runtime_path_is_same_or_inside(&root, &managed)
         && !rocm_core::runtime_paths_equivalent(&root, &managed)
@@ -501,10 +501,13 @@ fn unowned_venv_rebuild_refusal(
         MarkerFinding::Unreadable => "a .rocm-cli-runtime.json ROCm CLI cannot read".to_owned(),
         MarkerFinding::NamesOtherFolder(other) => format!(
             "a .rocm-cli-runtime.json that belongs to {}",
-            other.display()
+            shown_from_folder(&other.display().to_string())
         ),
         MarkerFinding::OtherFormat(format) => {
-            format!("a .rocm-cli-runtime.json from a {format} install, not a Python environment")
+            format!(
+                "a .rocm-cli-runtime.json from a {} install, not a Python environment",
+                shown_from_folder(format)
+            )
         }
         // Unreachable for a refusal, but stated rather than hidden.
         MarkerFinding::WheelHere => "a .rocm-cli-runtime.json for this folder".to_owned(),
@@ -514,6 +517,26 @@ fn unowned_venv_rebuild_refusal(
         install_root.display(),
         found.join("; ")
     )
+}
+
+/// Text read from the install folder (a marker's recorded path or format, a
+/// Python's `sys.prefix`, the names of the entries kept), made safe to print.
+/// The folder may be anyone's, and these lines reach a terminal and, through
+/// `install_sdk_dry_run`, the assistant's model; a terminal control, format or
+/// line-separator character in them is shown as its `\u{..}` escape instead of
+/// acting, the same set the tool-argument check refuses.
+fn shown_from_folder(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if crate::shell_quote::has_terminal_control_character(
+                character.encode_utf8(&mut [0; 4]),
+            ) {
+                character.escape_unicode().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Remove one venv entry without following a link out of the folder: `lib64`
@@ -548,7 +571,7 @@ fn venv_rebuild_line(install_root: &Path, python_finding: &str, kept: &[String])
     let kept = if kept.is_empty() {
         "nothing else was in the folder".to_owned()
     } else {
-        format!("kept: {}", kept.join(", "))
+        format!("kept: {}", shown_from_folder(&kept.join(", ")))
     };
     format!(
         "Existing Python environment at {} cannot be used as it is (found {python_finding}); rebuilding only its venv files ({kept}).",
@@ -1540,16 +1563,22 @@ fn python_tag_for_version(version: &str) -> Option<String> {
     Some(format!("cp{major}{minor}"))
 }
 
+/// Runs `python -m venv` into a fresh folder of its own, started in that
+/// folder. `-m` puts the working directory first on `sys.path`, so started in
+/// the user's working directory (which a `--dry-run --prefix .` makes the
+/// install folder) a `venv.py` there would run in place of the standard
+/// library's.
 fn verify_python_can_create_venv(program: &Path) -> Result<()> {
     let probe_root = python_venv_probe_temp_root()?;
     let probe_dir = probe_root.join("env");
     let args = python_venv_args(&probe_dir);
-    let result = run_command(
+    let result = run_command_in(
         program,
         args.iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
+        Some(&probe_root),
         "probe Python virtual environment support",
     );
     let _ = fs::remove_dir_all(&probe_root);
@@ -4003,6 +4032,76 @@ exit 1
             assert!(!error.contains("does not match"), "{label}: {error}");
         }
         assert!(!uv_log.exists(), "uv must not run after a refusal");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// `python -m venv` puts its working directory first on `sys.path`, so the
+    /// venv-support probe a preview runs on the host Python starts in a folder
+    /// of its own, not in the user's working directory, which
+    /// `--dry-run --prefix .` makes the install folder and where a `venv.py`
+    /// would otherwise run in place of the standard library's.
+    #[test]
+    #[cfg(unix)]
+    fn the_venv_probe_runs_in_a_folder_of_its_own() {
+        let (root, _paths) = venv_rebuild_sandbox("probe-cwd");
+        let log = root.join("probe-cwd.log");
+        let python = root.join("python3");
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-m\" ]; then pwd -P >> \"{}\"; /bin/mkdir -p \"$3\"; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+
+        verify_python_can_create_venv(&python).unwrap();
+
+        let ran_in = fs::read_to_string(&log).unwrap();
+        let ran_in = Path::new(ran_in.trim());
+        let caller = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_ne!(
+            ran_in, caller,
+            "the probe ran in the caller's working directory"
+        );
+        assert!(
+            ran_in.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("rocm-cli-python-venv-probe-")),
+            "the probe ran in {}, not its own folder",
+            ran_in.display()
+        );
+        assert!(!ran_in.exists(), "the probe's folder is removed afterwards");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A marker in someone else's folder is text that folder chose, and the
+    /// refusal carries it to a terminal and, from a preview, to the
+    /// assistant's model. A control or bidi character in it is printed as an
+    /// escape, so it cannot clear the screen or reorder the line.
+    #[test]
+    #[cfg(unix)]
+    fn a_refusal_prints_marker_text_with_control_characters_escaped() {
+        let (root, paths) = venv_rebuild_sandbox("marker-text");
+        let folder = root.join("cloned");
+        plant_failing_venv_python(&folder);
+        write_runtime_marker(
+            &folder,
+            Path::new("/elsewhere/\u{1b}[2J\u{202e}gpj"),
+            "wheel",
+        );
+        let error = venv_folder_state(&paths, &folder, "files")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("belongs to /elsewhere/\\u{1b}[2J\\u{202e}gpj"),
+            "{error}"
+        );
+        assert!(
+            !crate::shell_quote::has_terminal_control_character(&error),
+            "{error:?}"
+        );
+        assert_eq!(shown_from_folder("C:\\envs\\rocm"), "C:\\envs\\rocm");
         fs::remove_dir_all(root).ok();
     }
 

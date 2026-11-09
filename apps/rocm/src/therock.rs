@@ -1011,11 +1011,13 @@ fn runtime_key(
 }
 
 fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> PathBuf {
-    paths
-        .data_dir
-        .join("runtimes")
-        .join(format)
-        .join(runtime_key)
+    managed_format_root(paths, format).join(runtime_key)
+}
+
+/// The folder every managed runtime of `format` is created in, one per
+/// runtime key.
+fn managed_format_root(paths: &AppPaths, format: &str) -> PathBuf {
+    paths.data_dir.join("runtimes").join(format)
 }
 
 /// Where to build a runtime, resolved to its real location on disk first.

@@ -698,3 +698,18 @@ Feature: Runtime configuration
     And the user's folder holds a Python environment ROCm CLI did not make
     When the user previews installing the SDK into that folder
     Then the preview says it cannot tell whether that environment is reused, runs nothing from the folder, and changes nothing
+
+  # The same rule for the Python a preview checks before anything else: when it
+  # is inside the install folder (here `ROCM_CLI_PYTHON` names the folder's own
+  # `bin/python`; the same holds for one found on `PATH`), the preview stops
+  # rather than run it, and says why. The planted Python records every run, and
+  # the Then checks the record together with the message. Same hermetic setup
+  # and Linux-only reason as runtime-29; the `PATH` and bare-name cases are unit
+  # tested by `a_dry_run_runs_no_python_from_the_install_folder_while_searching`.
+  @id:runtime-install-preview-stops-at-prefix-python @requires-os:linux
+  Scenario: runtime-32 - Previewing an SDK install whose Python is inside the install folder stops without running it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's folder holds a Python environment ROCm CLI did not make
+    When the user previews installing the SDK into that folder with that folder's Python as ROCM_CLI_PYTHON
+    Then the install fails
+    And the preview stops without running that Python and says why

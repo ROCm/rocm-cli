@@ -928,7 +928,9 @@ covers `PATH`, an absolute `ROCM_CLI_PYTHON` and a bare one resolved through
 by the preview and by the install, and the advised empty folder works),
 `runtime-30` (a rebuild of a folder ROCm CLI made keeps the ComfyUI data and
 says why the old venv was not reused) and `runtime-31` (a preview of a folder
-holding someone else's venv says it cannot tell and runs nothing) run the real
+holding someone else's venv says it cannot tell and runs nothing) and
+`runtime-32` (a preview whose `ROCM_CLI_PYTHON` is inside the folder stops
+without running it) run the real
 CLI with a loopback index, a fake `uv` and planted Pythons that record every
 run. They are Linux-only because those stand-ins are shell scripts; the guard
 code is platform-neutral and the Windows CI job builds it, but no Windows test
