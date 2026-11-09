@@ -1298,8 +1298,11 @@ serve_timeout_secs = 90
             // sides of it: a host that lists aim runs the scenario exactly when
             // Docker is reachable, and one that does not list aim skips on the
             // engine, never on the nightly opt-in.
+            // Real hardware too: they serve on the device, and every lane
+            // that runs them sets E2E_HARDWARE=real.
             let opted_in = Included {
                 nightly: true,
+                hardware: HardwareMode::Real,
                 ..Included::default()
             };
             let mut with_aim = cap("strix-ubuntu");
