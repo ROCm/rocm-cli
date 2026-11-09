@@ -460,17 +460,12 @@ fn resolve_latest_for_manifest(
             // a fresh host probe. Planning must predict the key an apply will
             // produce, and re-probing would disagree with the installed runtime on
             // any host whose GPU is absent, hidden, or simply a second card.
-            let device_target =
-                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
-                    || resolution.device_target.clone(),
-                    |target| {
-                        AggregateDeviceTarget::resolve(
-                            Some(target),
-                            &resolution.family,
-                            &resolution.published_device_targets,
-                        )
-                    },
-                );
+            let device_target = AggregateDeviceTarget::prefer_recorded(
+                &resolution.device_target,
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()),
+                &resolution.family,
+                &resolution.published_device_targets,
+            );
             // No exact target means no reproducible composition, so freshness
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.

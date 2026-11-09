@@ -22,6 +22,7 @@ mod source;
 mod test_support;
 mod update;
 mod version;
+mod wheel_plan;
 
 use self::consent::{
     SdkInstallApproval, active_default_runtime_relation, confirm_overwrite_existing_sdk,
@@ -43,8 +44,9 @@ use self::python::{
     ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
 };
 use self::resolve::{
-    AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
-    resolve_tarball_artifact, unverified_torchaudio_note, wheel_runtime_composition,
+    AggregateDeviceTarget, PipRuntimePlan, canonical_auto_select_needs_next_python,
+    preview_pip_runtime, resolve_pip_runtime, resolve_tarball_artifact, unverified_torchaudio_note,
+    wheel_runtime_composition,
 };
 pub(crate) use self::source::RuntimeVersionSelector;
 #[cfg(test)]
@@ -61,6 +63,10 @@ pub(crate) use self::version::runtime_version_display;
 use self::version::{
     parse_host_version, parse_version_for_ordering, runtime_version_build_date, version_relation,
 };
+use self::wheel_plan::{
+    PlanStack, ResolvedStack, UNRESOLVED_PROGRESS, UnresolvedPreview, WheelPlan,
+    unresolved_wheel_preview, write_dry_run_tail, write_wheel_plan,
+};
 #[cfg(test)]
 pub(crate) use crate::runtime_registry::RocmSdkLibraryProbe;
 #[cfg(test)]
@@ -73,12 +79,13 @@ use crate::runtime_registry::{
     ManifestOverwrite, runtime_manifest_path, wheel_composition_includes_devel,
     write_runtime_manifest,
 };
+#[cfg(test)]
 use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, detect_host_gpu_diagnostics, detect_legacy_rocm_summary, ensure_uv_binary,
     interactive_terminal, runtime_is_windows, runtime_python_executable_in_env, unix_time_millis,
-    uv_pip_install_base, uv_venv_args,
+    uv_pip_install_base,
 };
 #[cfg(test)]
 use rocm_core::{disk_space, managed_uv_cache_dir, normalize_therock_family};
@@ -384,24 +391,55 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    let resolution = resolve_pip_runtime(
-        paths,
-        channel,
-        recovered_family_override.as_deref(),
-        &wheel_compatibility,
-        version_selector,
-        layout_override,
-        include_devel,
-    )?;
-    let device_target = device_target_override.map_or_else(
-        || resolution.device_target.clone(),
-        |target| {
-            AggregateDeviceTarget::resolve(
-                Some(target),
-                &resolution.family,
-                &resolution.published_device_targets,
-            )
-        },
+    // A preview must not fetch `uv` either: on the ROCm 10 layout resolving the
+    // package versions runs `uv pip compile`, and a real install gets the managed
+    // `uv` for that by downloading it. A preview uses a `uv` that is already there
+    // and otherwise stops with what it can know without one, which says so. A real
+    // install and an update resolve, and so fetch, exactly as they always did.
+    let resolution = if dry_run {
+        match preview_pip_runtime(
+            paths,
+            channel,
+            recovered_family_override.as_deref(),
+            &wheel_compatibility,
+            version_selector,
+            layout_override,
+            include_devel,
+        )? {
+            PipRuntimePlan::Resolved(resolution) => resolution,
+            PipRuntimePlan::NeedsUv(unresolved) => {
+                progress_line(UNRESOLVED_PROGRESS);
+                let host_version_newer = host_rocm_version_newer_than(&unresolved.rocm_version);
+                return Ok(SdkInstallResult::plan(unresolved_wheel_preview(
+                    &UnresolvedPreview {
+                        channel,
+                        version_selector,
+                        unresolved: &unresolved,
+                        device_target_override,
+                        prefix: prefix.as_deref(),
+                        host_version_newer: host_version_newer.as_deref(),
+                        python: &python,
+                        wheel_compatibility: &wheel_compatibility,
+                    },
+                )));
+            }
+        }
+    } else {
+        resolve_pip_runtime(
+            paths,
+            channel,
+            recovered_family_override.as_deref(),
+            &wheel_compatibility,
+            version_selector,
+            layout_override,
+            include_devel,
+        )?
+    };
+    let device_target = AggregateDeviceTarget::prefer_recorded(
+        &resolution.device_target,
+        device_target_override,
+        &resolution.family,
+        &resolution.published_device_targets,
     );
     // The exact device payload, not the version alone, decides what this runtime
     // can run, so it is what identifies the runtime. A preview on a host with no
@@ -417,146 +455,41 @@ fn install_wheel_runtime(
     let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
-    let mut output = String::new();
-    let _ = writeln!(output, "sdk install");
-    let _ = writeln!(
-        output,
-        "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
-    );
-    render_canonical_provenance(
-        &mut output,
-        channel,
-        &resolution.index_url,
-        resolution.layout.generation(),
-        &resolution.latest_version,
-    );
-    let _ = writeln!(output, "  format: wheel");
-    if let Some(selector) = version_selector {
-        let _ = writeln!(output, "  requested: {}", selector.describe());
-    }
-    let _ = writeln!(output, "  target_family: {}", resolution.family);
-    let _ = writeln!(
-        output,
-        "  target_family_source: {}",
-        resolution.family_source
-    );
-    let _ = writeln!(output, "  device_target: {}", device_target.as_str());
-    if let Some(reason) = device_target.reason() {
-        let _ = writeln!(output, "  device_target_reason: {reason}");
-    }
-    let _ = writeln!(output, "  index_url: {}", resolution.index_url);
-    let _ = writeln!(
-        output,
-        "  latest_compatible_version: {}",
-        runtime_version_display(&resolution.latest_version)
-    );
     // Probed once and reused by the progress line below: each call is a full
     // filesystem scan for a legacy ROCm, and the summary block and the visible
     // note report the same answer about the same resolved version.
     let host_version_newer = host_rocm_version_newer_than(&resolution.latest_version);
-    if let Some(host_version) = host_version_newer.as_deref() {
-        let _ = writeln!(
-            output,
-            "  version_note: {}",
-            wheel_host_version_note(
-                host_version,
-                &runtime_version_display(&resolution.latest_version)
-            )
-        );
-    }
-    let _ = writeln!(
-        output,
-        "  compatibility_key: {}",
-        runtime_version_display(&resolution.package_versions.compatibility_key)
-    );
-    let _ = writeln!(output, "  target: {}", install_root.display());
-    let _ = writeln!(output, "  runtime_key: {runtime_key}");
-    let _ = writeln!(output, "  python_launcher: {}", python.launcher_display());
-    let _ = writeln!(output, "  python_source: {}", python.source().as_str());
-    if let Some(note) = python.note() {
-        let _ = writeln!(output, "  python_note: {note}");
-    }
-    let _ = writeln!(
-        output,
-        "  python_wheel_tag: {}",
-        wheel_compatibility.python_tag
-    );
-    let _ = writeln!(
-        output,
-        "  platform_wheel_tags: {}",
-        wheel_compatibility.platform_tags.join(",")
-    );
-    // What resolution asked for, printed beside what the install will ask for.
-    // The two are produced by different code paths from the same `include_devel`
-    // and must name the same extras; showing only the second would hide a
-    // resolve that constrained the version choice by a toolchain the user
-    // declined. Absent on the canonical layout, which resolves by scraping each
-    // package's index instead of compiling a requirement set.
-    if let Some(specs) = resolution.version_resolution_specs.as_ref() {
-        let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
-    }
-    // Printed from the same value that chose the pin, so the line cannot claim
-    // a verified build the requirements above do not name.
-    if let Some(pin) = resolution.torchaudio_pin.as_ref() {
-        let _ = writeln!(output, "  torchaudio_selection: {}", pin.describe());
-    }
-    let _ = writeln!(
-        output,
-        "  package_specs: {}",
-        wheel_composition.package_specs.join(" ")
-    );
-    let _ = writeln!(
-        output,
-        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
-    );
-    let no_wheel_warning = repo_version_without_wheels(
+    let no_wheel_warning = no_wheel_warning_for(
         resolution.newest_repo_version.as_deref(),
         &resolution.latest_version,
-    )
-    .map(|newest| {
-        no_wheel_warning_message(
-            &newest,
-            &runtime_version_display(&resolution.latest_version),
-        )
-    });
-    if let Some(warning) = no_wheel_warning.as_deref() {
-        let _ = writeln!(output, "  warning: {warning}");
-    }
+    );
+    let plan = WheelPlan {
+        channel,
+        version_selector,
+        index_url: &resolution.index_url,
+        layout_generation: resolution.layout.generation(),
+        latest_version: &resolution.latest_version,
+        family: &resolution.family,
+        family_source: &resolution.family_source,
+        device_target: &device_target,
+        host_version_newer: host_version_newer.as_deref(),
+        python: &python,
+        wheel_compatibility: &wheel_compatibility,
+        version_resolution_specs: resolution.version_resolution_specs.as_deref(),
+        torchaudio_pin: resolution.torchaudio_pin.as_ref(),
+        no_wheel_warning: no_wheel_warning.as_deref(),
+        stack: PlanStack::Resolved(ResolvedStack {
+            compatibility_key: &resolution.package_versions.compatibility_key,
+            install_root: &install_root,
+            runtime_key: &runtime_key,
+            package_specs: &wheel_composition.package_specs,
+            manifest_path: &manifest_path,
+        }),
+    };
+    let mut output = String::new();
+    write_wheel_plan(&mut output, &plan);
     if dry_run {
-        let env_python = venv_python_path(&install_root);
-        let mut install_args = uv_pip_install_base(&env_python);
-        install_args.extend(["--index-url".to_owned(), resolution.index_url.clone()]);
-        if matches!(channel, TheRockChannel::Nightly) {
-            install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
-        }
-        install_args.extend(wheel_composition.package_specs.iter().cloned());
-        let venv_args = uv_venv_args(&python.venv_python_arg(), &install_root);
-        // This line is offered as the command to run, so it has to be one a
-        // shell reads back as the argv it previews. The install root in it
-        // comes from a `--prefix` the local assistant can choose
-        // (`install_sdk_dry_run` is a model-callable tool), so a bare or
-        // double-quoted value here would be a model-chosen value in a line a
-        // user is invited to paste.
-        let venv_args_display = venv_args
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let install_args_display = install_args
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = writeln!(output, "  mode: dry-run");
-        let _ = writeln!(
-            output,
-            "  command: uv {venv_args_display} && uv {install_args_display}"
-        );
-        let _ = writeln!(
-            output,
-            "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
-        );
-        let _ = writeln!(output, "  manifest: {}", manifest_path.display());
+        write_dry_run_tail(&mut output, &plan);
         return Ok(SdkInstallResult::plan(output));
     }
 
@@ -815,6 +748,15 @@ fn no_wheel_warning_message(newest: &str, resolved_display: &str) -> String {
     format!(
         "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved_display} instead"
     )
+}
+
+/// The `warning` surfaced when the repository's newest version has no installable
+/// PyTorch wheels, or `None` when there is no such gap: [`repo_version_without_wheels`]
+/// decides whether there is one and [`no_wheel_warning_message`] words it. One call
+/// for a plan that is resolved and one that is not, so they cannot disagree.
+fn no_wheel_warning_for(newest_repo: Option<&str>, resolved_version: &str) -> Option<String> {
+    repo_version_without_wheels(newest_repo, resolved_version)
+        .map(|newest| no_wheel_warning_message(&newest, &runtime_version_display(resolved_version)))
 }
 
 /// The repo's newest version when it is strictly newer than the version we are

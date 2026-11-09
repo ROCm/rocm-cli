@@ -211,9 +211,12 @@ pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
 // `update_check` can also, on a host with no usable Python on PATH, download a
 // managed `uv` and Python into the data folder and record that Python in the
 // saved config; `install_sdk_dry_run` prepares no Python and saves no Python
-// path: on such a host it reports the Python a real install would prepare. (A
-// ROCm 10 preview still resolves package versions with `uv` and can fetch the
-// managed `uv` into the data folder.) The boundary type
+// path: on such a host it reports the Python a real install would prepare. It
+// fetches no `uv` either: a ROCm 10 preview runs a `uv` that is already
+// installed to resolve the package versions and, with none, prints the lines
+// that depend on them as not resolved, so it creates no `tools` folder in the
+// data folder. (`update_check` still resolves with `uv` and can fetch it.) The
+// boundary type
 // (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
 // `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
