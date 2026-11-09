@@ -218,7 +218,8 @@ pub(crate) fn run_internal_mcp_call(
                 rocm_core::service_log_tool_summary(&record.service_id, &log_tail),
                 serde_json::json!({
                     "service": record,
-                    "lines": lines,
+                    "lines": log_tail.lines.len(),
+                    "lines_requested": lines,
                     "newest_line_exceeds_read_bound": log_tail.newest_line_exceeds_the_read_bound(),
                     "tail": log_tail.lines.join("\n"),
                 }),
@@ -864,6 +865,55 @@ mod tests {
     use crate::tests::test_paths;
     use std::fs;
     use std::net::TcpListener;
+
+    /// The structured reply of the CLI's own `service_logs` tool for a service
+    /// whose log holds `log`, asking for `lines` lines.
+    fn service_logs_structured(label: &str, log: &[u8], lines: u64) -> serde_json::Value {
+        let (root, paths) = test_paths(label);
+        paths.ensure().expect("paths");
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-tail-count",
+            "llamacpp",
+            "a-model",
+            "a-model",
+            "127.0.0.1",
+            18080,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write().expect("record");
+        fs::write(&record.log_path, log).expect("log");
+        let reply = run_internal_mcp_call(
+            &paths,
+            "service_logs",
+            serde_json::json!({ "service_id": "svc-tail-count", "lines": lines }),
+            false,
+        )
+        .expect("service_logs ok");
+        let _ = fs::remove_dir_all(root);
+        reply["structuredContent"].clone()
+    }
+
+    #[test]
+    fn service_logs_report_the_lines_returned_and_the_lines_asked_for_apart() {
+        // Asking for 50 lines of a four-line log returns four.
+        let content = service_logs_structured("service-logs-count", b"a\nb\nc\nd\n", 50);
+        assert_eq!(content["lines"], 4, "{content}");
+        assert_eq!(content["lines_requested"], 50, "{content}");
+        assert_eq!(content["tail"], "a\nb\nc\nd", "{content}");
+        // A log with more lines than asked for returns exactly what was asked.
+        let content = service_logs_structured("service-logs-count-cut", b"a\nb\nc\nd\n", 2);
+        assert_eq!(content["lines"], 2, "{content}");
+        assert_eq!(content["lines_requested"], 2, "{content}");
+        // An empty log returned none, whatever was asked for.
+        let content = service_logs_structured("service-logs-count-empty", b"", 50);
+        assert_eq!(content["lines"], 0, "{content}");
+        assert_eq!(content["lines_requested"], 50, "{content}");
+    }
 
     #[test]
     fn mcp_tool_result_text_joins_text_content_items() {

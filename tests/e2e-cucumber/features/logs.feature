@@ -127,3 +127,12 @@ Feature: Log inspection
     Given a recorded command log whose only line is longer than the log view reads
     When the user lists the recorded logs
     Then the CLI lists that log as having output it could not show instead of saying no logs were found
+
+  # The structured reply's `lines` is how many lines the tool returned, not how
+  # many it was asked for: asking for 50 lines of a three-line log returns three,
+  # and the number asked for is reported separately as `lines_requested`.
+  @id:logs-service-logs-tool-reports-lines-returned
+  Scenario: logs-16 - The service_logs tool reports the lines it returned, not the number it was asked for
+    Given a local server record whose log holds three short lines
+    When a tool-using client asks the service_logs tool for 50 lines of that server's log
+    Then the tool reports the three lines it returned and the 50 lines it was asked for

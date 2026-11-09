@@ -634,7 +634,8 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 rocm_core::service_log_tool_summary(&record.service_id, &log_tail),
                 json!({
                     "service": record,
-                    "lines": lines,
+                    "lines": log_tail.lines.len(),
+                    "lines_requested": lines,
                     "newest_line_exceeds_read_bound": log_tail.newest_line_exceeds_the_read_bound(),
                     "tail": log_tail.lines.join("\n"),
                 }),
@@ -942,6 +943,15 @@ mod tests {
     /// file at all for `None`), and return the tool's reply with the log's size
     /// on disk, so a claim the reply makes can be checked against the file.
     fn service_logs_reply(label: &str, log: Option<&[u8]>) -> Result<(Value, Option<u64>)> {
+        service_logs_reply_for(label, log, None)
+    }
+
+    /// [`service_logs_reply`], asking for `lines` lines when given.
+    fn service_logs_reply_for(
+        label: &str,
+        log: Option<&[u8]>,
+        lines: Option<u64>,
+    ) -> Result<(Value, Option<u64>)> {
         let (root, paths) = temp_app_paths(label);
         paths.ensure()?;
         let service_id = format!("svc-{label}");
@@ -967,9 +977,13 @@ mod tests {
             }
             None => None,
         };
+        let mut arguments = json!({ "service_id": service_id });
+        if let Some(lines) = lines {
+            arguments["lines"] = json!(lines);
+        }
         let reply = handle_mcp_tool_call(
             &paths,
-            &json!({"name": "service_logs", "arguments": {"service_id": service_id}}),
+            &json!({"name": "service_logs", "arguments": arguments}),
         );
         let _ = fs::remove_dir_all(root);
         Ok((reply?, size))
@@ -1046,6 +1060,28 @@ mod tests {
         let error = service_logs_reply("service-logs-absent", None)
             .expect_err("a missing log must not read as empty");
         assert!(format!("{error:#}").contains("failed to read"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn service_logs_report_the_lines_returned_and_the_lines_asked_for_apart() -> Result<()> {
+        // Asking for 50 lines of a four-line log returns four, and says so in
+        // the structured reply as well as in the summary.
+        let (reply, _) =
+            service_logs_reply_for("service-logs-count", Some(b"a\nb\nc\nd\n"), Some(50))?;
+        let content = &reply["structuredContent"];
+        assert_eq!(content["lines"], 4, "{reply}");
+        assert_eq!(content["lines_requested"], 50, "{reply}");
+        assert_eq!(content["tail"], "a\nb\nc\nd", "{reply}");
+        // A log with more lines than asked for returns exactly what was asked.
+        let (reply, _) =
+            service_logs_reply_for("service-logs-count-cut", Some(b"a\nb\nc\nd\n"), Some(2))?;
+        assert_eq!(reply["structuredContent"]["lines"], 2, "{reply}");
+        assert_eq!(reply["structuredContent"]["lines_requested"], 2, "{reply}");
+        // An empty log returned none, whatever was asked for.
+        let (reply, _) = service_logs_reply_for("service-logs-count-empty", Some(b""), Some(50))?;
+        assert_eq!(reply["structuredContent"]["lines"], 0, "{reply}");
+        assert_eq!(reply["structuredContent"]["lines_requested"], 50, "{reply}");
         Ok(())
     }
 

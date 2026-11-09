@@ -137,6 +137,11 @@ async fn server_with_an_oversize_line(world: &mut E2eWorld) {
     plant_server_record_with_log(world, &vec![b'x'; OVERSIZE_LINE_BYTES]);
 }
 
+#[given("a local server record whose log holds three short lines")]
+async fn server_with_three_lines(world: &mut E2eWorld) {
+    plant_server_record_with_log(world, b"first line\nsecond line\nthird line\n");
+}
+
 #[given("a local server record whose log file is empty")]
 async fn server_with_an_empty_log(world: &mut E2eWorld) {
     plant_server_record_with_log(world, b"");
@@ -153,6 +158,20 @@ async fn read_server_log(world: &mut E2eWorld) {
             "logs",
             crate::e2e::service_cleanup_steps::SERVICE_ID,
         ],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("a tool-using client asks the service_logs tool for 50 lines of that server's log")]
+async fn read_fifty_lines_through_the_tool(world: &mut E2eWorld) {
+    let arguments = serde_json::json!({
+        "service_id": crate::e2e::service_cleanup_steps::SERVICE_ID,
+        "lines": 50,
+    })
+    .to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["mcp-call", "service_logs", "--arguments-json", &arguments],
     );
     record(world, stdout, stderr, rc);
 }
@@ -349,6 +368,25 @@ async fn tool_says_the_line_is_too_long(world: &mut E2eWorld) {
         "the log on disk should be one line past the bound, is {} bytes",
         on_disk.len()
     );
+}
+
+#[then("the tool reports the three lines it returned and the 50 lines it was asked for")]
+async fn tool_reports_returned_and_requested_counts(world: &mut E2eWorld) {
+    let reply = service_logs_tool_reply(world);
+    let text = reply["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("Read the last 3 line(s) from service"),
+        "{reply}"
+    );
+    let content = &reply["structuredContent"];
+    assert_eq!(content["lines"], 3, "{reply}");
+    assert_eq!(content["lines_requested"], 50, "{reply}");
+    // The claim and the state it describes: the log on disk holds exactly the
+    // three lines the reply returned.
+    let on_disk =
+        std::fs::read_to_string(server_log_path(world)).expect("the server log is still there");
+    assert_eq!(on_disk.lines().count(), 3, "{on_disk}");
+    assert_eq!(content["tail"], on_disk.trim_end_matches('\n'), "{reply}");
 }
 
 #[then("the tool says the server has no log output yet and does not flag an over-long line")]
