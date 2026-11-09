@@ -622,19 +622,25 @@ mod tests {
         assert_eq!(name.as_deref(), Some("Fallback 1.2"));
     }
 
-    // Characterisation of the two kernel-release reads, the second pair of
-    // `docs/host-probing.md` ("Kernel version"): `detect_kernel_version` in the
-    // summary stack (`uname -r`, 1.5 s, strict UTF-8, `None` on any failure or
-    // non-zero exit) and `probe_os` here in the examination stack (`uname -r`,
-    // 5 s, lossy, exit code ignored, empty on failure). Each case plants a fake
-    // `uname` first on `PATH` and asks both in a child copy of this test binary,
-    // because the lookup of `uname` follows the process's own `PATH`, which a
-    // test thread cannot change without disturbing every other test. The
-    // child's entry point, [`kernel_pair_child_reports_both_answers`], does
-    // nothing in a normal run. Linux only: that is where `uname -r` is read, and
-    // the fake is a shell script.
+    // The kernel-release read, the second pair of `docs/host-probing.md`
+    // ("Kernel version"). It used to be two readers: `detect_kernel_version` in
+    // the summary stack (1.5 s, strict UTF-8, `None` on any failure or non-zero
+    // exit) and `probe_os` here (5 s, lossy, exit code ignored, empty on
+    // failure). `probe_os` now calls `detect_kernel_version`, so these tests pin
+    // the one reader's behaviour through both entry points: a release is read
+    // as printed, a non-zero exit, output that is not UTF-8, a silent `uname`
+    // and one that never answers read as nothing, an answer within the 5 s
+    // limit is read, and a failed read leaves no `probe_failures` entry. Each
+    // case plants a fake `uname` first on `PATH` and asks both entry points in
+    // a child copy of this test binary, because the lookup of `uname` follows
+    // the process's own `PATH`, which a test thread cannot change without
+    // disturbing every other test. The child's entry point,
+    // [`kernel_pair_child_reports_both_answers`], does nothing in a normal run.
+    // Linux only, because `probe_os` reads `uname -r` only when
+    // `runtime_is_linux()`, and the fake is a shell script; other Unix hosts are
+    // not supported platforms.
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     mod kernel_pair {
         use super::*;
         use std::process::Command;
