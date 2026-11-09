@@ -4,9 +4,11 @@
 
 //! Chat tab — a TUI-local conversation surface.
 //!
-//! Phase 1 is render-only with a local echo backend; later phases wire a Rig-built agent behind the
-//! `AgentClient` trait. The transcript and input buffer are plain TUI state on
-//! `AppState` (`rocm-dash-core` carries no chat types).
+//! Until the user accepts the detected endpoint (`ChatConsent`), the tab shows a
+//! consent gate or an empty state; once accepted it draws the transcript and
+//! the input line of the real chat, whose backend sits behind the `AgentClient`
+//! trait. The transcript and input buffer are plain TUI state on `AppState`
+//! (`rocm-dash-core` carries no chat types).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

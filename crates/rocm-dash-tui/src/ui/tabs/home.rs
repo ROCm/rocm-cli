@@ -11,9 +11,7 @@
 //! with a hint at the tab/key that would produce something, so no tile is a
 //! dead end.
 //!
-//! ponytail: Home is added behind the existing default this phase (P2). It is
-//! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
-//! the default and folds the telemetry tabs into Observe.
+//! Home is the default tab (`ActiveTab::Home`) and is reachable by Tab / digit `1`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
