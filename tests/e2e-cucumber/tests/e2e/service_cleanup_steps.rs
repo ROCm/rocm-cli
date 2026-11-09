@@ -2,16 +2,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm services remove` / `rocm services prune`.
+//! Steps for managed-service record cleanup and liveness reconciliation.
 //!
 //! Black-box: each scenario plants a managed-service record as plain JSON in its
 //! own isolated data dir — the same on-disk shape `rocm serve --managed` writes —
-//! then runs the real binary and asserts on the files that survive. Asserting on
-//! the filesystem rather than the command's summary line is deliberate: the bug
-//! this feature exists to fix is a file being *left behind*, which a summary
-//! claiming success cannot reveal. No GPU, no network — mock lane.
+//! then runs the real binary. Cleanup scenarios assert on the files that survive;
+//! the liveness scenario asserts on CLI output, the persisted record, and the
+//! decoy process. No GPU or network — mock lane.
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use cucumber::{given, then, when};
 
@@ -193,6 +193,58 @@ async fn record_still_running(world: &mut E2eWorld) {
     );
 }
 
+/// A live process standing in for a PID that the service used to own.
+///
+/// The record deliberately carries a different start-time token, so listing it
+/// must reconcile the service to stopped without touching the decoy. The alias
+/// case is a real transition shape: both roles name one PID, the supervisor has
+/// a refutable token, and the legacy engine entry has none.
+#[given(
+    expr = "a starting local server record whose {string} has the wrong start time for a live decoy"
+)]
+async fn starting_record_with_recycled_pid(world: &mut E2eWorld, recorded_process: String) {
+    let decoy = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the decoy process");
+    let pid = decoy.id();
+    world.recorded_process = Some(decoy);
+    let actual_ticks = rocm_core::process_start_ticks(pid)
+        .unwrap_or_else(|| panic!("failed to read the decoy process {pid}'s start time"));
+    let wrong_ticks = actual_ticks.wrapping_add(1);
+
+    plant_record(world, "starting");
+    let manifest = services_dir(world).join(format!("{SERVICE_ID}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest).expect("failed to read planted service record"),
+    )
+    .expect("planted service record is not JSON");
+    match recorded_process.as_str() {
+        "supervisor" => {
+            record["supervisor_pid"] = pid.into();
+            record["supervisor_start_ticks"] = wrong_ticks.into();
+        }
+        "engine" => {
+            record["engine_pid"] = pid.into();
+            record["engine_start_ticks"] = wrong_ticks.into();
+        }
+        "supervisor with a legacy engine alias" => {
+            record["supervisor_pid"] = pid.into();
+            record["supervisor_start_ticks"] = wrong_ticks.into();
+            record["engine_pid"] = pid.into();
+        }
+        other => panic!("unknown recorded process shape: {other}"),
+    }
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize service record"),
+    )
+    .expect("failed to write service record with recycled PID");
+}
+
 /// A record still claiming `ready` whose server is long gone, and whose files
 /// have not been touched since.
 ///
@@ -338,6 +390,12 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
+#[when("the user lists running local servers")]
+async fn list_running_servers(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "list"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user removes that local server record")]
 async fn remove_record(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "remove", SERVICE_ID, "--yes"]);
@@ -404,6 +462,48 @@ async fn run_prune_any_age(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the CLI no longer lists that record as running")]
+async fn recycled_record_not_listed_as_running(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let output = combined_output(world);
+    assert!(
+        !lists_live_server_row(&output),
+        "a recycled PID must not keep the record in the live list:\n{output}"
+    );
+    assert!(
+        output.contains("1 not running"),
+        "the list must count the reconciled record as not running:\n{output}"
+    );
+}
+
+#[then("that record is persisted as stopped")]
+async fn recycled_record_persisted_stopped(world: &mut E2eWorld) {
+    let manifest = services_dir(world).join(format!("{SERVICE_ID}.json"));
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest).expect("failed to read reconciled service record"),
+    )
+    .expect("reconciled service record is not JSON");
+    assert_eq!(
+        record["status"], "stopped",
+        "the liveness correction must be persisted: {record}"
+    );
+}
+
+#[then("the decoy process is still alive")]
+async fn decoy_still_alive(world: &mut E2eWorld) {
+    let decoy = world
+        .recorded_process
+        .as_mut()
+        .expect("scenario has no decoy process");
+    assert!(
+        decoy
+            .try_wait()
+            .expect("failed to check the decoy process")
+            .is_none(),
+        "listing a recycled PID must not terminate the process now using it"
+    );
+}
 
 #[then("the CLI names the log file before deleting it")]
 async fn names_the_log(world: &mut E2eWorld) {

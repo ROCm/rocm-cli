@@ -1,8 +1,10 @@
 Feature: Local server record cleanup
 
   # `rocm services remove` / `rocm services prune` delete the records a managed
-  # serve leaves behind. Every scenario plants the records rather than failing a
-  # real serve, so none needs a GPU and all run on the mock lane every PR.
+  # serve leaves behind. The final Linux scenario covers the liveness refresh
+  # that decides whether a record is still running; it does not exercise prune.
+  # Every scenario plants the records rather than failing a real serve, so none
+  # needs a GPU and all run on the mock lane every PR.
   #
   # A record owns FOUR files, and only two of them sit in the services folder:
   # the details file and the log live there, the engine state file lives under
@@ -118,3 +120,38 @@ Feature: Local server record cleanup
     Then the prune did not return before the staged hold elapsed
     And every file belonging to that record is gone
     And the endpoint key file of the starting server is still there
+
+  # Listing refreshes a starting record against the process identities it
+  # captured at launch. A live process with the same numeric PID but a different
+  # start time is a decoy, not evidence that the service is still running. The
+  # alias example covers the transition shape where the engine and supervisor
+  # names are the same PID but only the supervisor carries a token.
+  #
+  # Linux-only: start-time identity comes from `/proc/<pid>/stat`. The process
+  # is an ordinary `sleep`, so no model, engine, GPU, or network is involved.
+  @id:service-cleanup-recycled-pid-does-not-keep-a-record-running
+  @requires-os:linux
+  Scenario: service-cleanup-08 - A recycled supervisor PID does not keep a starting record running
+    Given a starting local server record whose "supervisor" has the wrong start time for a live decoy
+    When the user lists running local servers
+    Then the CLI no longer lists that record as running
+    And that record is persisted as stopped
+    And the decoy process is still alive
+
+  @id:service-cleanup-recycled-engine-pid-does-not-keep-a-record-running
+  @requires-os:linux
+  Scenario: service-cleanup-09 - A recycled engine PID does not keep a starting record running
+    Given a starting local server record whose "engine" has the wrong start time for a live decoy
+    When the user lists running local servers
+    Then the CLI no longer lists that record as running
+    And that record is persisted as stopped
+    And the decoy process is still alive
+
+  @id:service-cleanup-recycled-supervisor-with-legacy-engine-alias
+  @requires-os:linux
+  Scenario: service-cleanup-10 - An unknown engine token cannot mask a recycled supervisor PID
+    Given a starting local server record whose "supervisor with a legacy engine alias" has the wrong start time for a live decoy
+    When the user lists running local servers
+    Then the CLI no longer lists that record as running
+    And that record is persisted as stopped
+    And the decoy process is still alive

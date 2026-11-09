@@ -1078,8 +1078,11 @@ fn record_still_live(record: &ManagedServiceRecord, pid_alive: impl Fn(u32) -> b
     if !crate::managed_service_status::managed_service_is_live(record) {
         return false;
     }
-    let pids = crate::managed_service_status::recorded_service_pids(record);
-    pids.is_empty() || pids.into_iter().any(pid_alive)
+    let identities = crate::managed_service_status::recorded_service_pids(record);
+    identities.is_empty()
+        || identities
+            .into_iter()
+            .any(|identity| pid_alive(identity.pid))
 }
 
 /// [`record_still_live`] over the manifest on disk, so a `rocm services stop`

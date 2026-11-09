@@ -1812,6 +1812,24 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
 "service-stop"`.
 
+`features/service_record_cleanup.feature` (`service-cleanup-08` through
+`service-cleanup-10`, Linux, mock lane) covers service liveness when a recorded
+PID has been recycled. The scenarios record a real live decoy as the supervisor,
+as the engine, and as both through a known supervisor token plus a legacy
+tokenless engine alias.
+Each stores a deliberately wrong start time, runs the real `rocm services
+list`, and checks that the live-only output hides the record, the manifest is
+persisted as `stopped`, and the decoy remains alive. Run only these scenarios
+with:
+
+```bash
+ROCM_CLI_BINARY=target/debug/rocm cargo test -p e2e-cucumber --test e2e -- -n "service-cleanup-(08|09|10)"
+```
+
+These scenarios exercise liveness reconciliation, not record pruning or the
+existing bare-PID prune behavior. Unit tests cover matching tokens remaining
+live and tokenless legacy records retaining PID-only behavior.
+
 Manual restricted-tool smoke:
 
 ```bash

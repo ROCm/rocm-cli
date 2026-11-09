@@ -1231,6 +1231,14 @@ rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
+On Linux, managed supervisor and engine PIDs are recorded with their process
+start times. A live numeric PID counts as the recorded service only when a
+recorded start time still matches; a mismatch means the PID was recycled, so
+`services list` persists the record as stopped without touching the unrelated
+process now using that PID. If the start time cannot currently be read, the
+service remains conservatively live. Records created before start times were
+stored retain their legacy PID-only behavior.
+
 `stop` reports a server stopped only once every recorded process is confirmed
 gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the

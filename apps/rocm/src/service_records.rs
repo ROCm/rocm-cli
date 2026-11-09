@@ -169,7 +169,7 @@ fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
     managed_service_is_live(record)
         || recorded_service_pids(record)
             .iter()
-            .any(|pid| process_is_running(*pid))
+            .any(|identity| process_is_running(identity.pid))
 }
 
 /// Remove one non-running local server record and everything it owns.
