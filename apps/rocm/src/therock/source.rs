@@ -597,6 +597,26 @@ mod tests {
             "{nightly_error}"
         );
 
+        // A line pin's refusals name its own major, not the ROCm 10 floor.
+        let later_line = RuntimeVersionSelector::version("11.2").unwrap();
+        let later_nightly_error =
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&later_line))
+                .expect_err("an 11.2 line pin has no nightly stream")
+                .to_string();
+        assert!(
+            later_nightly_error.starts_with("ROCm 11 and newer is published only"),
+            "{later_nightly_error}"
+        );
+
+        // A component past u32 is not a line pin. Truncating 2^32 + 10 would
+        // read it as the ROCm 10 line and leave the canonical index.
+        let overflowing = RuntimeVersionSelector::version("4294967306.1").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&overflowing)).unwrap(),
+            SourceLayout::Canonical
+        );
+        assert!(!overflowing.matches_version("10.1.0"));
+
         // Routes that already worked must not move.
         let exact_next = RuntimeVersionSelector::version("10.1.0").unwrap();
         assert_eq!(

@@ -551,6 +551,21 @@ mod tests {
             .map(|(_, version)| version),
             Some("10.1.0".to_owned())
         );
+
+        // Unpinned, the same catalog keeps "newest upload wins": 10.0.0 was
+        // uploaded after both 10.1 releases, so it is the pick even though
+        // its version is lower. Only a line pin orders by version first.
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Next,
+                "gfx120X-all",
+                None,
+            )
+            .map(|(_, version)| version),
+            Some("10.0.0".to_owned())
+        );
     }
 
     #[test]
