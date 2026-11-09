@@ -26,6 +26,13 @@
 //! platform and publish by `rename`; two `ReplaceFileW` publishes of one file in
 //! flight at once are not exercised by any test.
 //!
+//! A publish by `rename` leaves the destination with the staged file's
+//! attributes and the ACL its directory hands down, where `ReplaceFileW` carries
+//! over those of the file it replaces. No caller of this module sets a hidden or
+//! read-only flag or a custom ACL on a file it writes, so nothing is lost today.
+//! A file that must keep such settings across a rewrite should not rely on this
+//! writer to carry them over.
+//!
 //! The fallback is the one path that can leave the destination absent:
 //! Microsoft documents that `ReplaceFileW`, called without a backup name, can
 //! fail after it has already moved the old file off the destination name
@@ -686,14 +693,33 @@ mod tests {
 
     /// A reader that polls the destination while a writer replaces it over and
     /// over must never find it missing: that is what a lock-free reader of the
-    /// config or an automation store would read as an empty store. Runs on the
-    /// native Windows job as well as Unix, where `publish_temp_file` is the
-    /// rename-first path. A transient permission error while a replace is in
-    /// flight is tolerated; an absent destination is not.
+    /// config or an automation store would read as an empty store. A transient
+    /// permission error while a replace is in flight is tolerated; an absent
+    /// destination is not.
+    ///
+    /// This is a Windows-lane check. On Linux `rename` replaces atomically, so
+    /// the test passes with either publish order and would not notice the order
+    /// being reversed; it only discriminates on Windows, where a publish that
+    /// removes the destination before putting the new file in place leaves a
+    /// window the reader can fall into. What it still does not cover is the
+    /// `ReplaceFileW` fallback, which runs only when the rename fails and is the
+    /// one path that can leave the destination absent: it is reached by no test
+    /// that races a reader, and its order is pinned only by the injected-step
+    /// tests above.
     #[test]
     fn a_reader_never_finds_the_destination_absent_while_it_is_replaced() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Tells the reader to stop when dropped, so a writer that panics
+        /// through `unwrap` still ends the polling thread instead of leaving it
+        /// to spin until the process exits.
+        struct StopReader(Arc<AtomicBool>);
+        impl Drop for StopReader {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
 
         let root = scratch_dir("atomic-reader-gap");
         fs::create_dir_all(&root).unwrap();
@@ -728,13 +754,14 @@ mod tests {
         // reader cannot miss every replacement and fail on timing alone. A
         // reader that exits before its first read (the destination was absent)
         // disconnects the channel; that is reported from its outcome below.
+        let stop_reader = StopReader(Arc::clone(&done));
         let started = reader_started.recv_timeout(std::time::Duration::from_secs(30));
         if started.is_ok() {
             for round in 1..=300u32 {
                 write_file_atomically(&destination, round.to_string().as_bytes()).unwrap();
             }
         }
-        done.store(true, Ordering::Relaxed);
+        drop(stop_reader);
         let outcome = reader.join().unwrap();
         let _ = fs::remove_dir_all(&root);
         let reads = outcome.expect("the destination was absent while it was being replaced");
