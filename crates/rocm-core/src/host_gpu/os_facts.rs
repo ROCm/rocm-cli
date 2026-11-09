@@ -8,20 +8,23 @@
 use super::capture::{
     OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
 };
-use crate::probe_exec::SHORT;
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
 use std::time::Duration;
 
 /// How long `uname -r` may take.
 ///
-/// The longer of the two limits the summary and the examination used to apply
-/// separately (1.5 s and 5 s). The release is a few bytes read from the kernel,
-/// so a `uname` that takes more than a moment is a stalled host, where waiting
-/// longer costs little and a spurious "unknown" costs more: `kernel_release`
-/// feeds the WSL version check and the kernel-dependent diagnoses, which read
-/// an empty value as "nothing to report".
-const KERNEL_RELEASE_TIMEOUT: Duration = SHORT;
+/// 5 s, the longer of the two limits the summary (1.5 s) and the examination
+/// (5 s) used to apply separately. The release is a few bytes read from the
+/// kernel, so a `uname` that takes more than a moment is a stalled host, where
+/// waiting longer costs little and a spurious "unknown" costs more:
+/// `kernel_release` feeds the WSL version check and the kernel-dependent
+/// diagnoses, which read an empty value as "nothing to report".
+///
+/// Written out rather than borrowed from another module's constant, so a change
+/// to that constant cannot move this limit unnoticed;
+/// `the_kernel_release_timeout_is_five_seconds` pins it.
+const KERNEL_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The running kernel, as the text of `rocm examine` and `summary.kernel` show it
 /// and as `kernel_release` in the examination reports it.
@@ -249,5 +252,13 @@ mod tests {
             }),
             "Linux (/usr/lib/os-release line 2 is not a plain assignment: \"unset ID\")"
         );
+    }
+
+    /// The decision recorded in `docs/host-probing.md`: one 5 s limit for the
+    /// kernel read. The timeout behaviour itself is exercised, with a stand-in
+    /// `uname`, by the `kernel_pair` tests in `examine/host_env.rs`.
+    #[test]
+    fn the_kernel_release_timeout_is_five_seconds() {
+        assert_eq!(KERNEL_RELEASE_TIMEOUT, Duration::from_secs(5));
     }
 }
