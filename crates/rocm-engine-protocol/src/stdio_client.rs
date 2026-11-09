@@ -205,10 +205,10 @@ fn exit_note(status: ExitStatus) -> String {
 fn unparseable_answer_message(status: ExitStatus, stderr: &str) -> String {
     let mut message = "failed to parse engine response envelope".to_owned();
     if !status.success() {
-        message.push_str(&format!(" ({})", exit_note(status)));
+        message = format!("{message} ({})", exit_note(status));
     }
     if !stderr.is_empty() {
-        message.push_str(&format!("; stderr: {stderr}"));
+        message = format!("{message}; stderr: {stderr}");
     }
     message
 }
@@ -244,7 +244,7 @@ fn abandon_unwritten_request(
     let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
     let mut message = format!("failed to write engine request: {write_error}");
     if !stderr.is_empty() {
-        message.push_str(&format!("; stderr: {stderr}"));
+        message = format!("{message}; stderr: {stderr}");
     }
     anyhow::anyhow!(message)
 }
