@@ -20,7 +20,7 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::app::{ScrollTarget, ScrollbarHandle};
 use crate::ui::exec::display_args;
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::{Theme, readable_text_on};
 
 /// What a console keypress means to the owning screen.

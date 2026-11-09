@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Assert the release/metadata public keys pinned in the installers and
-//! `apps/rocm/src/therock.rs` match the canonical published keys under
+//! `apps/rocm/src/therock/fetch.rs` match the canonical published keys under
 //! `docs/keys/`.
 //!
 //! This closes the gap where CI verifies release artifacts against the public key
@@ -113,7 +113,7 @@ const PINNED_KEYS: &[PinnedKey] = &[
         name: "metadata",
         canonical: "docs/keys/rocm-cli-metadata-public.pem",
         sources: &[Source {
-            path: "apps/rocm/src/therock.rs",
+            path: "apps/rocm/src/therock/fetch.rs",
             token: "PINNED_METADATA_PUBLIC_KEY_PEM",
             embedding: Embedding::Rust,
         }],

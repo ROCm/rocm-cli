@@ -61,8 +61,9 @@ rand.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile = "3"
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
 toml = "1.1"
 # `ServeDir` backs the install scenario's loopback download server (see
 # `src/loopback_http.rs`), so the E2E suite does not hand-roll HTTP framing,
@@ -70,9 +71,13 @@ toml = "1.1"
 # already pulls in, so this adds no second copy to the tree.
 tower-http = { version = "0.7", features = ["fs"] }
 url = "2"
-vt100 = "0.16"
+vt100 = "0.18"
 
 [dev-dependencies]
+# Reads a printed command line back the way a POSIX shell splits words, so a
+# scenario can assert what a `tool_call:` line denotes rather than one spelling
+# of it.
+shlex.workspace = true
 # `FileLock`, so the service-cleanup lane can hold the managed-launch lock that a
 # real `rocm serve` holds and watch a real `rocm services prune` *process* block
 # on it. Using the production type rather than a hand-rolled `flock` is the

@@ -30,8 +30,6 @@ use crate::ui::widgets::{
     gpu_stats_line, instances_on_gpu, node_efficiency, power_style, temperature_style, trunc,
 };
 
-/// Rows consumed above the GPU section in [`draw`] (CPU 10 + mem/swap 3 + I/O 3).
-const ROWS_ABOVE_GPUS: u16 = 16;
 /// Height of the GPU-section summary header (partition + efficiency).
 const GPU_HEADER_H: u16 = 1;
 /// Minimum slot height for a "full" GPU panel: border (2) + stats (1) +
@@ -332,20 +330,6 @@ fn plan_gpu_rows(section_h: u16, n: usize) -> (bool, usize) {
     }
 }
 
-/// Visible compact-row count for the Hardware Observe sub-panel given the full body height.
-///
-/// Used by `AppState` to keep `gpu_scroll` in sync on navigation. Accounts for
-/// both the rows above the GPU section and the section's own header row.
-pub fn gpu_visible_count(body_h: u16, n: usize) -> usize {
-    let section = body_h.saturating_sub(ROWS_ABOVE_GPUS);
-    let panels = if section >= 2 {
-        section - GPU_HEADER_H
-    } else {
-        section
-    };
-    plan_gpu_rows(panels, n).1
-}
-
 /// Advance/clamp a scroll offset so index `sel` lies within
 /// `[scroll, scroll + visible)`.
 pub const fn scroll_to_show(sel: usize, scroll: usize, visible: usize) -> usize {
@@ -409,7 +393,7 @@ pub fn gpu_compact_line(
         ),
         Span::styled(
             format!("{:>4.0} W", g.power_w),
-            power_style(g.power_w, theme),
+            power_style(g.power_w, g.power_limit_w, theme),
         ),
     ];
     let base_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -689,6 +673,7 @@ mod tests {
             gpu_utilization_pct: util,
             temperature_c: temp,
             power_w: power,
+            power_limit_w: None,
             clock_mhz: Some(1850.0),
         }
     }
@@ -728,17 +713,12 @@ mod tests {
         assert_eq!(scroll_to_show(9, 4, 0), 0);
     }
 
-    // ponytail: P3 folds Hardware into Observe; the main selection model now
-    // drives the instances list rather than per-GPU scroll, so the former
-    // `appstate_navigation_advances_gpu_scroll` test is removed.
-    // `scroll_to_show` / `gpu_visible_count` stay unit-tested above and are
-    // reused by Observe's GPU panel.
-
     #[test]
     fn gpu_compact_line_colors_and_truncates() {
         let theme = Theme::default_dark();
         // hot + high power → err color on both temp and power spans
-        let hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        let mut hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        hot.power_limit_w = Some(750.0);
         let line = gpu_compact_line(&hot, &theme, 120, true);
         let temp_span = line
             .spans
@@ -748,6 +728,15 @@ mod tests {
         let pow_span = line.spans.iter().find(|s| s.content.contains('W')).unwrap();
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
+        // same draw but no known power limit → power is not judged (plain fg)
+        hot.power_limit_w = None;
+        let unjudged = gpu_compact_line(&hot, &theme, 120, true);
+        let pow = unjudged
+            .spans
+            .iter()
+            .find(|s| s.content.contains('W'))
+            .unwrap();
+        assert_eq!(pow.style.fg, Some(theme.fg));
         // wide → vram segment included
         assert!(line.spans.iter().any(|s| s.content.contains("GiB")));
         // narrow → vram segment dropped (truncation by omission)

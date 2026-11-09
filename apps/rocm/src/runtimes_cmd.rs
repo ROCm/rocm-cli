@@ -2,24 +2,34 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `rocm runtimes` command: activate/rollback/uninstall/import/adopt, and
-//! runtime manifest validation/registry.
+//! `rocm runtimes` command: its dispatch, activate/rollback, and the runtime
+//! list rendering. Import and adopt (and recovering the runtime `rocm setup`
+//! created) live in `runtime_adopt.rs`, and uninstall in
+//! `runtime_uninstall.rs`. Registry selection and manifest validation live in
+//! `runtime_registry.rs`; the names other modules import from here
+//! (`current_runtime_manifest`, `select_runtime_manifest`,
+//! `validate_runtime_manifest_for_activation`, `runtime_usability_status`,
+//! and the registry path helpers) are re-exported from this module.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`runtimes(command)`,
 //! re-imported via `use crate::runtimes_cmd::{runtimes, ...};`).
-//! `RuntimesCommand` remains in the crate root (part of the `Command`/`Cli`
-//! clap definition) and is reached via `use crate::RuntimesCommand`, the same
-//! way `EnginesCommand` stayed behind when `engines()` moved to
-//! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` and
-//! `ActiveRuntimeMarker` stay `pub(crate)`: the former is read by
-//! `append_update_activate_summary` in `update_cmd.rs`'s
-//! `apply_runtime_update` flow, the latter by `storage.rs`. `select_runtime_manifest`,
-//! `validate_runtime_manifest_for_activation`, `normalize_path_for_compare`,
-//! `recover_setup_runtime_registration`, `active_runtime_marker_path`,
-//! `should_remove_runtime_install_root`, and `runtime_usability_status` are
-//! also `pub(crate)` and read from `engines_cmd.rs`, `storage.rs`, and
-//! `comfyui.rs`. The SDK-install-finalization/torch-alignment/dependency bundle
+//! `RuntimesCommand` lives in `cli.rs` (part of the `Command`/`Cli` clap
+//! definition) and is reached via `use crate::RuntimesCommand`, a re-import in
+//! `main.rs`, the same way `engines_cmd.rs` reaches `EnginesCommand`.
+//! `RuntimeActivationResult` stays
+//! `pub(crate)`: it is read by `append_update_activate_summary` in
+//! `update_cmd.rs`'s `apply_runtime_update` flow. The uninstall plan and apply
+//! code lives in `runtime_uninstall.rs`, and the active-runtime marker model in
+//! `runtime_registry.rs`; `uninstall_runtime`,
+//! `should_remove_runtime_install_root`, `InstallRootDecision`,
+//! `ActiveRuntimeMarker` and `active_runtime_marker_path` are re-exported from
+//! here for `storage.rs` and `main.rs`.
+//! `recover_setup_runtime_registration`, `newest_installed_runtime_manifest`
+//! and `setup_runtime_paths` (from `runtime_adopt.rs`) and
+//! `normalize_path_for_compare` (from `runtime_registry.rs`) are re-exported
+//! from here for the modules that import them from this one. The
+//! SDK-install-finalization/torch-alignment/dependency bundle
 //! (`finish_sdk_install` and friends) lives in the sibling
 //! `runtime_install_finalize.rs`, which calls into this module (for
 //! `activate_runtime`, `newest_installed_runtime_manifest` and
@@ -28,15 +38,29 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{
-    AppPaths, RocmCliConfig, interactive_terminal, managed_pip_cache_dir,
-    runtime_install_root_is_protected, runtime_python_executable_in_env,
+use anyhow::{Context, Result};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
+
+use crate::runtime_adopt::{
+    AdoptRuntimeOptions, adopt_runtime_from_python_options, import_runtime_manifest,
 };
-use serde::{Deserialize, Serialize};
-
+pub(crate) use crate::runtime_adopt::{
+    newest_installed_runtime_manifest, recover_setup_runtime_registration, setup_runtime_paths,
+};
+pub(crate) use crate::runtime_registry::{
+    ActiveRuntimeMarker, active_runtime_marker_path, current_runtime_manifest,
+    default_runtime_id_matches, normalize_path_for_compare, runtime_keys_text,
+    runtime_manifest_path, runtime_registry_dir, runtime_usability_status, select_runtime_manifest,
+    validate_runtime_manifest_for_activation,
+};
+pub(crate) use crate::runtime_uninstall::{
+    InstallRootDecision, should_remove_runtime_install_root, uninstall_runtime,
+};
+use crate::runtime_uninstall::{
+    RuntimeUninstallConfirmation, apply_runtime_uninstall,
+    confirm_and_revalidate_runtime_uninstall, plan_runtime_uninstall, print_runtime_uninstall_plan,
+};
 use crate::therock;
 use crate::uninstall_plan::confirm_uninstall;
 use crate::{
@@ -189,12 +213,9 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
-            let plan = if yes {
+            let plan = if require_yes_or_interactive(yes, "runtimes uninstall")? {
                 plan
             } else {
-                if !interactive_terminal() {
-                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
-                }
                 match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
                     RuntimeUninstallConfirmation::Cancelled => {
                         println!("runtime uninstall cancelled");
@@ -347,17 +368,6 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ActiveRuntimeMarker {
-    runtime_id: String,
-    pub(crate) runtime_key: String,
-    manifest_path: PathBuf,
-    install_root: PathBuf,
-    previous_runtime_id: Option<String>,
-    pub(crate) previous_runtime_key: Option<String>,
-    activated_at_unix_ms: u128,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeActivationResult {
     pub(crate) runtime_id: String,
@@ -463,12 +473,8 @@ impl ActivationSnapshot {
             // failed, so it is the write least able to afford leaving a
             // truncated marker behind — which runtime resolution and the
             // storage retention holds would both read as "nothing is active".
+            // The helper creates the `runtimes` folder when it is missing.
             MarkerSnapshot::Contents(bytes) => {
-                let parent = path
-                    .parent()
-                    .context("active runtime marker path has no parent directory")?;
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
                 rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
@@ -517,11 +523,11 @@ fn restore_after_failed_activation(
     error: anyhow::Error,
 ) -> anyhow::Error {
     match snapshot.restore(paths, config) {
-        Ok(()) => error.context(
+        Ok(()) => discard_failed_marker_replacement(error).context(
             "failed to record the active ROCm runtime; the previously active runtime is still \
              the active one",
         ),
-        Err(restore_error) => error.context(format!(
+        Err(restore_error) => discard_failed_marker_replacement(error).context(format!(
             "failed to record the active ROCm runtime, and restoring the previous state failed \
              too ({restore_error:#}); the ROCm CLI config and the active runtime marker may now \
              disagree. Run `rocm runtimes list` to see both, then re-run `rocm runtimes activate \
@@ -530,16 +536,36 @@ fn restore_after_failed_activation(
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeUninstallResult {
-    pub(crate) runtime_id: String,
-    pub(crate) runtime_key: String,
-    registry_path: PathBuf,
-    pub(crate) removed_install_root: Option<PathBuf>,
-    read_only: bool,
-    manifest_mismatch: bool,
-    was_active: bool,
-    default_runtime_cleared: bool,
+/// Drop the marker a failed activation left behind, and the advice to use it.
+///
+/// On Windows a marker publish can fail after taking the old marker away, and
+/// the shared writer then keeps the new marker in its temp file and advises
+/// renaming it into place (`rocm_core::atomic_write::KeptReplacement`). The
+/// activation is being rolled back, so that file holds the marker of an
+/// activation that failed, and renaming it would install that marker over
+/// whatever the rollback restored. So the file is removed, and the error is
+/// rebuilt without the advice. If the file cannot be removed, the error names
+/// it and says to delete it instead.
+fn discard_failed_marker_replacement(error: anyhow::Error) -> anyhow::Error {
+    let Some(kept) = error.downcast_ref::<rocm_core::atomic_write::KeptReplacement>() else {
+        return error;
+    };
+    let failure = format!(
+        "failed to write active runtime marker {}: {}",
+        kept.destination().display(),
+        kept.cause()
+    );
+    match fs::remove_file(kept.kept()) {
+        Ok(()) => anyhow::anyhow!(failure),
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!(failure)
+        }
+        Err(remove_error) => anyhow::anyhow!(
+            "{failure}; {} holds the marker of the activation that failed and could not be \
+             removed ({remove_error}): delete it, do not rename it into place",
+            kept.kept().display()
+        ),
+    }
 }
 
 /// Marker shown beside the active runtime in `rocm runtimes list`. Every
@@ -645,11 +671,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            ACTIVE_RUNTIME_MARKER
+            Some(ACTIVE_RUNTIME_MARKER)
         } else if rollback {
-            ROLLBACK_RUNTIME_MARKER
+            Some(ROLLBACK_RUNTIME_MARKER)
         } else {
-            " "
+            None
         };
         let status = runtime_usability_status(&manifest);
         let mode = if manifest.read_only {
@@ -661,17 +687,21 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         // says, so an install missing it should not be silent about that.
         // `rocm examine` reports the same thing for the active runtime.
         let toolchain = toolchain_state_text(manifest.includes_devel());
-        let _ = writeln!(
-            output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
-            manifest.runtime_key,
-            manifest.runtime_id,
-            therock::runtime_version_display(&manifest.version),
-            manifest.format,
-            manifest.family,
-            mode,
-            status,
-            toolchain
+        cli_report::write_marked_row(
+            &mut output,
+            "  ",
+            marker,
+            format_args!(
+                "{} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
+                manifest.runtime_key,
+                manifest.runtime_id,
+                therock::runtime_version_display(&manifest.version),
+                manifest.format,
+                manifest.family,
+                mode,
+                status,
+                toolchain
+            ),
         );
         let _ = writeln!(
             output,
@@ -827,882 +857,6 @@ fn rollback_runtime(
     })
 }
 
-/// A runtime's install folder is only ever removed when ROCm CLI is confident
-/// it owns that folder; `ReadOnly` and `ManifestMismatch` are distinct reasons
-/// for leaving it alone, surfaced separately so a real problem (a stale or
-/// corrupt local manifest) doesn't look identical to an intentional no-op.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InstallRootDecision {
-    Remove,
-    ReadOnly,
-    ManifestMismatch,
-}
-
-impl InstallRootDecision {
-    pub(crate) const fn should_remove(self) -> bool {
-        matches!(self, Self::Remove)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeUninstallPlan {
-    manifest: therock::InstalledRuntimeManifest,
-    registry_path: PathBuf,
-    was_active: bool,
-    /// Whether applying this plan will clear `config.default_runtime_id`.
-    /// This is true when the config's default still points at this
-    /// manifest's `runtime_id` and either this manifest was the active one,
-    /// or it is the last remaining install sharing that `runtime_id` (the
-    /// id is shared across side-by-side installs, so removing one sibling
-    /// does not by itself orphan the default while others remain).
-    clears_default_runtime: bool,
-    install_root_decision: InstallRootDecision,
-}
-
-impl RuntimeUninstallPlan {
-    fn will_remove_install_root(&self) -> bool {
-        self.install_root_decision.should_remove() && self.manifest.install_root.exists()
-    }
-}
-
-fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
-    let install_folder = if plan.will_remove_install_root() {
-        format!(
-            "{} (would be removed)",
-            plan.manifest.install_root.display()
-        )
-    } else {
-        match plan.install_root_decision {
-            InstallRootDecision::Remove => "not present, nothing to remove".to_owned(),
-            InstallRootDecision::ReadOnly => {
-                "left untouched (external/read-only runtime)".to_owned()
-            }
-            InstallRootDecision::ManifestMismatch => {
-                "left untouched (local runtime manifest did not match the registry)".to_owned()
-            }
-        }
-    };
-
-    let mut report = cli_report::ActionReport::new("runtime uninstall plan")
-        .detail("runtime_id", &plan.manifest.runtime_id)
-        .detail("runtime_key", &plan.manifest.runtime_key)
-        .detail("registry_entry", plan.registry_path.display())
-        .detail("install_folder", install_folder);
-    if plan.clears_default_runtime {
-        report = report.detail("default_runtime", "would be cleared");
-    }
-    print!("{}", report.render());
-}
-
-fn plan_runtime_uninstall(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    selector: &str,
-) -> Result<RuntimeUninstallPlan> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let manifest = select_runtime_manifest(&manifests, selector)?.clone();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    let was_active = current_runtime_manifest(config, &manifests)
-        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let clears_default_runtime = config
-        .default_runtime_id
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
-        && (was_active
-            || !manifests.iter().any(|other| {
-                other.runtime_key != manifest.runtime_key
-                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
-            }));
-    let install_root_decision = should_remove_runtime_install_root(&manifest)?;
-    Ok(RuntimeUninstallPlan {
-        manifest,
-        registry_path,
-        was_active,
-        clears_default_runtime,
-        install_root_decision,
-    })
-}
-
-/// Re-derives the uninstall plan from disk and refuses to proceed if it no
-/// longer matches what the user approved. The interactive confirmation this
-/// guards can wait indefinitely; if another process activates a different
-/// runtime or replaces the install folder while the prompt is open, applying
-/// the stale plan could clear the wrong `active_runtime_key` or recursively
-/// delete a folder that is no longer the one that was vetted as safe to
-/// remove.
-fn revalidate_runtime_uninstall_plan(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    plan: RuntimeUninstallPlan,
-) -> Result<RuntimeUninstallPlan> {
-    let fresh = plan_runtime_uninstall(paths, config, &plan.manifest.runtime_key)?;
-    if fresh.manifest.runtime_id != plan.manifest.runtime_id
-        || fresh.manifest.install_root != plan.manifest.install_root
-        || fresh.was_active != plan.was_active
-        || fresh.clears_default_runtime != plan.clears_default_runtime
-        || fresh.install_root_decision != plan.install_root_decision
-    {
-        bail!(
-            "runtime state for {} changed while waiting for confirmation; re-run `rocm runtimes uninstall {}` to review the current plan before approving it",
-            plan.manifest.runtime_key,
-            plan.manifest.runtime_key
-        );
-    }
-    Ok(fresh)
-}
-
-enum RuntimeUninstallConfirmation {
-    Cancelled,
-    // `RuntimeUninstallPlan`/`RocmCliConfig` are large; box them so the two
-    // variants stay a similar size (clippy::large_enum_variant).
-    Confirmed {
-        plan: Box<RuntimeUninstallPlan>,
-        config: Box<RocmCliConfig>,
-    },
-}
-
-/// Runs the confirm-then-revalidate sequence used by an interactive
-/// `runtimes uninstall`: waits for the caller-supplied confirmation, then
-/// reloads config from disk and re-derives the plan against it, so a state
-/// change that happened while the (potentially indefinite) prompt was open
-/// cannot be applied against stale data.
-fn confirm_and_revalidate_runtime_uninstall(
-    paths: &AppPaths,
-    plan: RuntimeUninstallPlan,
-    confirm: impl FnOnce() -> Result<bool>,
-) -> Result<RuntimeUninstallConfirmation> {
-    if !confirm()? {
-        return Ok(RuntimeUninstallConfirmation::Cancelled);
-    }
-    let config = RocmCliConfig::load(paths)?;
-    let plan = revalidate_runtime_uninstall_plan(paths, &config, plan)?;
-    Ok(RuntimeUninstallConfirmation::Confirmed {
-        plan: Box::new(plan),
-        config: Box::new(config),
-    })
-}
-
-pub(crate) fn uninstall_runtime(
-    paths: &AppPaths,
-    config: &mut RocmCliConfig,
-    selector: &str,
-) -> Result<RuntimeUninstallResult> {
-    let plan = plan_runtime_uninstall(paths, config, selector)?;
-    apply_runtime_uninstall(paths, config, plan)
-}
-
-fn apply_runtime_uninstall(
-    paths: &AppPaths,
-    config: &mut RocmCliConfig,
-    plan: RuntimeUninstallPlan,
-) -> Result<RuntimeUninstallResult> {
-    let RuntimeUninstallPlan {
-        manifest,
-        registry_path,
-        was_active,
-        clears_default_runtime,
-        install_root_decision,
-    } = plan;
-
-    let mut removed_install_root = None;
-    if install_root_decision.should_remove() && manifest.install_root.exists() {
-        fs::remove_dir_all(&manifest.install_root).with_context(|| {
-            format!(
-                "failed to remove runtime folder {} - the runtime registry entry has not \
-                 been removed yet, so `rocm runtimes list` will still show this runtime as \
-                 installed and pointing at this (now possibly partially deleted) folder \
-                 until the removal succeeds",
-                manifest.install_root.display()
-            )
-        })?;
-        removed_install_root = Some(manifest.install_root.clone());
-    }
-
-    if registry_path.exists() {
-        fs::remove_file(&registry_path).with_context(|| {
-            format!(
-                "failed to remove runtime registry entry {}",
-                registry_path.display()
-            )
-        })?;
-    }
-
-    let mut config_changed = false;
-    if config
-        .active_runtime_key
-        .as_deref()
-        .is_some_and(|runtime_key| runtime_key.eq_ignore_ascii_case(&manifest.runtime_key))
-    {
-        config.active_runtime_key = None;
-        config_changed = true;
-    }
-    if config
-        .previous_runtime_key
-        .as_deref()
-        .is_some_and(|runtime_key| runtime_key.eq_ignore_ascii_case(&manifest.runtime_key))
-    {
-        config.previous_runtime_key = None;
-        config_changed = true;
-    }
-    if clears_default_runtime {
-        config.default_runtime_id = None;
-        config_changed = true;
-    }
-    if config
-        .setup
-        .therock_venv
-        .as_ref()
-        .is_some_and(|path| paths_equivalent(path, &manifest.install_root))
-    {
-        config.setup.therock_venv = None;
-        config.setup.completed = false;
-        config.onboarding_dismissed = false;
-        config_changed = true;
-    }
-    if config_changed {
-        config.save(paths)?;
-    }
-
-    if active_runtime_marker_matches(paths, &manifest.runtime_key)? {
-        let marker_path = active_runtime_marker_path(paths);
-        if marker_path.exists() {
-            fs::remove_file(&marker_path).with_context(|| {
-                format!(
-                    "failed to remove active runtime marker {}",
-                    marker_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(RuntimeUninstallResult {
-        runtime_id: manifest.runtime_id,
-        runtime_key: manifest.runtime_key,
-        registry_path,
-        removed_install_root,
-        read_only: manifest.read_only,
-        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
-        was_active,
-        default_runtime_cleared: clears_default_runtime,
-    })
-}
-
-pub(crate) fn should_remove_runtime_install_root(
-    manifest: &therock::InstalledRuntimeManifest,
-) -> Result<InstallRootDecision> {
-    if manifest.read_only || manifest.imported_from.is_some() {
-        return Ok(InstallRootDecision::ReadOnly);
-    }
-    if !local_runtime_manifest_matches(manifest)? {
-        return Ok(InstallRootDecision::ManifestMismatch);
-    }
-    ensure_runtime_install_root_is_safe_to_remove(&manifest.install_root)?;
-    Ok(InstallRootDecision::Remove)
-}
-
-fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) -> Result<bool> {
-    let local_path = manifest.install_root.join(".rocm-cli-runtime.json");
-    if !local_path.is_file() {
-        return Ok(false);
-    }
-    let bytes = fs::read(&local_path)
-        .with_context(|| format!("failed to read {}", local_path.display()))?;
-    let local: therock::InstalledRuntimeManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", local_path.display()))?;
-    Ok(local.runtime_key == manifest.runtime_key
-        && local.runtime_id == manifest.runtime_id
-        && paths_equivalent(&local.install_root, &manifest.install_root))
-}
-
-fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
-        bail!(
-            "refusing to remove unsafe runtime folder {}",
-            path.display()
-        );
-    }
-    // Belt and braces: a hand-edited or corrupted registry entry could point
-    // `install_root` at a protected system location while still carrying a
-    // matching in-tree `.rocm-cli-runtime.json`, slipping past
-    // `local_runtime_manifest_matches`. `prune` already refuses these before
-    // ever calling this function (see storage.rs); check it here too so the
-    // single source of truth for "may ROCm CLI delete this folder?" refuses
-    // it for every caller, including a direct `runtimes uninstall <key>`.
-    if runtime_install_root_is_protected(path) {
-        bail!(
-            "refusing to remove runtime folder {} in a protected system location",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn active_runtime_marker_matches(paths: &AppPaths, runtime_key: &str) -> Result<bool> {
-    let marker_path = active_runtime_marker_path(paths);
-    if !marker_path.is_file() {
-        return Ok(false);
-    }
-    let bytes = fs::read(&marker_path)
-        .with_context(|| format!("failed to read {}", marker_path.display()))?;
-    let marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
-    Ok(marker.runtime_key.eq_ignore_ascii_case(runtime_key))
-}
-
-fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    let left = normalize_path_for_compare(left);
-    let right = normalize_path_for_compare(right);
-    rocm_core::runtime_paths_equivalent(&left, &right)
-}
-
-pub(crate) fn normalize_path_for_compare(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-}
-
-fn import_runtime_manifest(
-    paths: &AppPaths,
-    manifest_path: &Path,
-    replace: bool,
-) -> Result<therock::InstalledRuntimeManifest> {
-    let bytes = fs::read(manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let mut manifest: therock::InstalledRuntimeManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-    if manifest.runtime_key.trim().is_empty() {
-        bail!(
-            "runtime manifest {} has an empty runtime_key",
-            manifest_path.display()
-        );
-    }
-    if manifest.runtime_id.trim().is_empty() {
-        bail!(
-            "runtime manifest {} has an empty runtime_id",
-            manifest_path.display()
-        );
-    }
-
-    manifest.read_only = true;
-    manifest.imported_from = Some(
-        manifest_path
-            .canonicalize()
-            .unwrap_or_else(|_| manifest_path.to_path_buf()),
-    );
-    validate_runtime_manifest_for_activation(&manifest)
-        .with_context(|| format!("imported runtime `{}` is not usable", manifest.runtime_key))?;
-
-    write_runtime_registry_manifest(paths, &manifest, replace)?;
-
-    Ok(manifest)
-}
-
-pub(crate) fn newest_installed_runtime_manifest(
-    paths: &AppPaths,
-) -> Result<Option<therock::InstalledRuntimeManifest>> {
-    // `load_runtime_manifests` already returns newest install first with ties
-    // broken on the runtime key, so re-sorting here would be a no-op.
-    Ok(therock::load_runtime_manifests(paths)?.into_iter().next())
-}
-
-#[derive(Debug, Clone)]
-struct AdoptRuntimeRequest {
-    python_executable: PathBuf,
-    install_root: PathBuf,
-    runtime_id: String,
-    runtime_key: String,
-    replace: bool,
-}
-
-#[derive(Debug, Clone)]
-struct AdoptRuntimeOptions {
-    python_input: PathBuf,
-    install_root: Option<PathBuf>,
-    runtime_id: Option<String>,
-    runtime_key: Option<String>,
-    channel: Option<String>,
-    replace: bool,
-}
-
-fn adopt_runtime_from_python_options(
-    paths: &AppPaths,
-    options: AdoptRuntimeOptions,
-) -> Result<therock::InstalledRuntimeManifest> {
-    let (python_executable, inferred_root) = resolve_adopt_python_input(&options.python_input)?;
-    let probe = therock::probe_rocm_sdk_runtime(&python_executable)
-        .with_context(|| format!("failed to probe {}", python_executable.display()))?;
-    let request = infer_adopt_runtime_request(
-        python_executable,
-        options.install_root.or(inferred_root),
-        options.runtime_id,
-        options.runtime_key,
-        options.channel,
-        options.replace,
-        &probe,
-    )?;
-    adopt_runtime_from_probe(paths, request, probe)
-}
-
-fn infer_adopt_runtime_request(
-    python_executable: PathBuf,
-    install_root: Option<PathBuf>,
-    runtime_id: Option<String>,
-    runtime_key: Option<String>,
-    channel: Option<String>,
-    replace: bool,
-    probe: &therock::RocmSdkPythonProbe,
-) -> Result<AdoptRuntimeRequest> {
-    let install_root = install_root.with_context(|| {
-        format!(
-            "could not infer the Python environment folder from {}; pass --root",
-            python_executable.display()
-        )
-    })?;
-    let runtime_id = match runtime_id {
-        Some(value) if !value.trim().is_empty() => {
-            if let Some(channel) = channel.as_deref() {
-                let (parsed_channel, _) = parse_therock_runtime_id(&value)?;
-                let requested_channel = normalize_adopt_channel(channel)?;
-                if parsed_channel != requested_channel {
-                    bail!(
-                        "--channel {requested_channel} does not match runtime id channel {parsed_channel}"
-                    );
-                }
-            }
-            value
-        }
-        Some(_) => bail!("runtime_id must not be empty"),
-        None => {
-            let channel = normalize_adopt_channel(channel.as_deref().unwrap_or("release"))?;
-            let family = probe
-                .resolved_target_family
-                .as_deref()
-                .or(probe.default_target_family.as_deref())
-                .filter(|value| !value.trim().is_empty())
-                .context(
-                    "rocm_sdk probe did not report a GPU package; pass --runtime-id explicitly",
-                )?;
-            format!("therock-{channel}:{family}")
-        }
-    };
-    let runtime_key = match runtime_key {
-        Some(value) if !value.trim().is_empty() => value,
-        Some(_) => bail!("runtime_key must not be empty"),
-        None => {
-            let (channel, family) = parse_therock_runtime_id(&runtime_id)?;
-            let version = probe
-                .rocm_sdk_version
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .context("rocm_sdk probe did not report a version; cannot name adopted runtime")?;
-            format!(
-                "adopted-{channel}-pip-{}-{}",
-                runtime_key_component(&family),
-                runtime_key_component(version)
-            )
-        }
-    };
-    Ok(AdoptRuntimeRequest {
-        python_executable,
-        install_root,
-        runtime_id,
-        runtime_key,
-        replace,
-    })
-}
-
-fn normalize_adopt_channel(channel: &str) -> Result<String> {
-    match channel.trim().to_ascii_lowercase().as_str() {
-        "release" => Ok("release".to_owned()),
-        "nightly" => Ok("nightly".to_owned()),
-        other => bail!("adopt channel must be release or nightly, got `{other}`"),
-    }
-}
-
-fn runtime_key_component(value: &str) -> String {
-    let mut output = String::new();
-    let mut last_dash = false;
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            output.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            output.push('-');
-            last_dash = true;
-        }
-    }
-    let trimmed = output.trim_matches('-').to_owned();
-    if trimmed.is_empty() {
-        "runtime".to_owned()
-    } else {
-        trimmed
-    }
-}
-
-fn resolve_adopt_python_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
-    let absolute = if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("failed to resolve current directory")?
-            .join(input)
-    };
-    if absolute.is_dir() {
-        let env_root = absolute.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve Python environment folder {}",
-                absolute.display()
-            )
-        })?;
-        let python = runtime_python_executable_in_env(&env_root);
-        if !python.is_file() {
-            bail!(
-                "Python executable is missing in {}",
-                python.parent().unwrap_or(env_root.as_path()).display()
-            );
-        }
-        return Ok((python, Some(env_root)));
-    }
-    if absolute.is_file() {
-        let inferred_root = infer_python_env_root(&absolute);
-        return Ok((absolute, inferred_root));
-    }
-    bail!(
-        "Python executable or folder is missing: {}",
-        absolute.display()
-    );
-}
-
-fn infer_python_env_root(python_executable: &Path) -> Option<PathBuf> {
-    let bin_dir = python_executable.parent()?;
-    let bin_name = bin_dir.file_name()?.to_string_lossy();
-    if bin_name.eq_ignore_ascii_case("Scripts") || bin_name == "bin" {
-        return bin_dir.parent().map(Path::to_path_buf);
-    }
-    bin_dir.parent().map(Path::to_path_buf)
-}
-
-fn adopt_runtime_from_probe(
-    paths: &AppPaths,
-    request: AdoptRuntimeRequest,
-    probe: therock::RocmSdkPythonProbe,
-) -> Result<therock::InstalledRuntimeManifest> {
-    if request.runtime_key.trim().is_empty() {
-        bail!("runtime_key must not be empty");
-    }
-    if request.runtime_id.trim().is_empty() {
-        bail!("runtime_id must not be empty");
-    }
-    let python_executable = absolute_existing_file_path_preserving_symlink(
-        &request.python_executable,
-        "runtime Python executable",
-    )?;
-    let install_root = request.install_root.canonicalize().with_context(|| {
-        format!(
-            "runtime install root is missing: {}",
-            request.install_root.display()
-        )
-    })?;
-    if !install_root.is_dir() {
-        bail!(
-            "runtime install root is missing: {}",
-            install_root.display()
-        );
-    }
-    let (channel, family) = parse_therock_runtime_id(&request.runtime_id)?;
-    therock::validate_rocm_sdk_runtime_probe(&probe)?;
-    let version = probe
-        .rocm_sdk_version
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .context("rocm_sdk probe did not report a version; cannot adopt runtime explicitly")?
-        .to_owned();
-
-    let manifest = therock::InstalledRuntimeManifest {
-        runtime_key: request.runtime_key,
-        runtime_id: request.runtime_id,
-        channel,
-        format: "wheel".to_owned(),
-        family,
-        family_source: "runtime_id".to_owned(),
-        version,
-        install_root: install_root.clone(),
-        selected_artifact_url: "adopted-read-only".to_owned(),
-        source_layout_generation: None,
-        index_url: None,
-        tarball_file_name: None,
-        python_launcher: None,
-        python_executable: Some(python_executable.display().to_string()),
-        pip_cache_dir: None,
-        // The probe only reports a CMake path when the `devel` packages are
-        // present, so it tells us what this pre-existing environment has.
-        devel: probe.cmake_path.is_some(),
-        rocm_sdk: Some(probe),
-        // Adoption does not install torch, so the build is derived from the SDK
-        // version instead.
-        sdk_torch: None,
-        wheel_composition: None,
-        read_only: true,
-        imported_from: Some(install_root),
-        installed_at_unix_ms: rocm_core::unix_time_millis(),
-    };
-    validate_runtime_manifest_for_activation(&manifest)
-        .with_context(|| format!("adopted runtime `{}` is not usable", manifest.runtime_key))?;
-    write_runtime_registry_manifest(paths, &manifest, request.replace)?;
-    Ok(manifest)
-}
-
-fn absolute_existing_file_path_preserving_symlink(path: &Path, label: &str) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("failed to resolve current directory")?
-            .join(path)
-    };
-    if !absolute.is_file() {
-        bail!("{label} is missing: {}", absolute.display());
-    }
-    Ok(absolute)
-}
-
-fn parse_therock_runtime_id(runtime_id: &str) -> Result<(String, String)> {
-    let (prefix, family) = runtime_id.split_once(':').with_context(|| {
-        format!("runtime_id `{runtime_id}` must include a TheRock family suffix after ':'")
-    })?;
-    let family = family.trim();
-    if family.is_empty() {
-        bail!("runtime_id `{runtime_id}` has an empty TheRock family suffix");
-    }
-    let channel = match prefix.trim() {
-        "therock-release" => "release",
-        "therock-nightly" => "nightly",
-        other => bail!(
-            "runtime_id `{runtime_id}` must start with therock-release: or therock-nightly:, got `{other}`"
-        ),
-    };
-    Ok((channel.to_owned(), family.to_owned()))
-}
-
-fn write_runtime_registry_manifest(
-    paths: &AppPaths,
-    manifest: &therock::InstalledRuntimeManifest,
-    replace: bool,
-) -> Result<()> {
-    let manifest = manifest.clone().normalize_storage_paths();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    if registry_path.exists() && !replace {
-        bail!(
-            "runtime registry entry already exists: {}; pass --replace to overwrite it",
-            registry_path.display()
-        );
-    }
-    fs::create_dir_all(
-        registry_path
-            .parent()
-            .context("runtime registry path has no parent directory")?,
-    )?;
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&manifest)
-            .context("failed to serialize runtime registry manifest")?,
-    )
-    .with_context(|| format!("failed to write {}", registry_path.display()))?;
-    Ok(())
-}
-
-pub(crate) fn recover_setup_runtime_registration(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<Option<String>> {
-    let Some(setup_root) = config
-        .setup
-        .therock_venv
-        .as_deref()
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
-        return Ok(None);
-    };
-    if !setup_root.is_dir() {
-        return Ok(None);
-    }
-
-    let local_manifest_path = setup_root.join(".rocm-cli-runtime.json");
-    if !local_manifest_path.is_file() {
-        return Ok(None);
-    }
-
-    let bytes = fs::read(&local_manifest_path)
-        .with_context(|| format!("failed to read {}", local_manifest_path.display()))?;
-    let manifest: therock::InstalledRuntimeManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", local_manifest_path.display()))?;
-    if manifest.runtime_key.trim().is_empty() {
-        bail!(
-            "setup runtime manifest {} has an empty runtime_key",
-            local_manifest_path.display()
-        );
-    }
-    if !paths_equivalent(&manifest.install_root, setup_root) {
-        bail!(
-            "setup runtime manifest {} points at {}, but setup is configured for {}",
-            local_manifest_path.display(),
-            manifest.install_root.display(),
-            setup_root.display()
-        );
-    }
-    validate_runtime_manifest_for_activation(&manifest).with_context(|| {
-        format!(
-            "setup runtime `{}` from {} is not usable",
-            manifest.runtime_key,
-            local_manifest_path.display()
-        )
-    })?;
-
-    if !runtime_manifest_path(paths, &manifest.runtime_key).is_file() {
-        write_runtime_registry_manifest(paths, &manifest, false).with_context(|| {
-            format!(
-                "failed to restore setup runtime `{}` into {}",
-                manifest.runtime_key,
-                runtime_registry_dir(paths).display()
-            )
-        })?;
-    }
-    Ok(Some(manifest.runtime_key))
-}
-
-/// The folder setup was configured for and its pip cache — the pair both
-/// `examine` forms report. Shared so the two cannot name different folders.
-///
-/// An empty configured path counts as unset, matching
-/// `recover_setup_runtime_registration`'s own guard: `config.json` is
-/// hand-editable, and `managed_pip_cache_dir("")` is a bogus relative path.
-pub(crate) fn setup_runtime_paths(config: &RocmCliConfig) -> Option<(&Path, PathBuf)> {
-    let root = config
-        .setup
-        .therock_venv
-        .as_deref()
-        .filter(|path| !path.as_os_str().is_empty())?;
-    Some((root, managed_pip_cache_dir(root)))
-}
-
-pub(crate) fn current_runtime_manifest<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Option<&'a therock::InstalledRuntimeManifest> {
-    if let Some(active_key) = config.active_runtime_key.as_deref()
-        && let Some(manifest) = manifests
-            .iter()
-            .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(active_key))
-    {
-        return Some(manifest);
-    }
-
-    let matches = default_runtime_id_matches(config, manifests);
-    match matches.as_slice() {
-        [manifest] => Some(*manifest),
-        _ => None,
-    }
-}
-
-pub(crate) fn default_runtime_id_matches<'a>(
-    config: &RocmCliConfig,
-    manifests: &'a [therock::InstalledRuntimeManifest],
-) -> Vec<&'a therock::InstalledRuntimeManifest> {
-    let Some(default_runtime_id) = config.default_runtime_id.as_deref() else {
-        return Vec::new();
-    };
-    manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id))
-        .collect()
-}
-
-pub(crate) fn runtime_keys_text(manifests: &[&therock::InstalledRuntimeManifest]) -> String {
-    manifests
-        .iter()
-        .map(|manifest| manifest.runtime_key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Resolves a user-typed selector to the one installed runtime it names.
-///
-/// Matching a `runtime_key` regardless of letter case is a deliberate
-/// convenience, but it only names one runtime while no two installed keys
-/// differ just in case — and they can. Generated keys are slugified to lower
-/// case, while `runtimes adopt --runtime-key` takes the key the user typed and
-/// `runtimes import` takes it from the supplied manifest; neither slugifies,
-/// so the key is stored verbatim. The registry keeps one file per key, so
-/// `ABC.json` and `abc.json` are two entries on a case-sensitive filesystem
-/// and nothing rejects the pair.
-///
-/// So an exact key match is taken first and wins outright: it is the one
-/// reading of the selector that cannot be mistaken. The case-insensitive
-/// fallback applies only when it lands on a single record; two case twins are
-/// reported as the ambiguity they are, the same way a `runtime_id` naming
-/// several installs already is.
-///
-/// Callers rely on that being a function of the key alone, because several of
-/// them resolve the same key more than once and must land on the same record
-/// every time: `storage remove-old-installs` decides about a manifest and then
-/// names it to the deleter by key, and the uninstall revalidation re-derives
-/// its plan from disk after the confirmation prompt. Resolving by "newest
-/// case-insensitive match" made that decide about one install and act on
-/// another.
-pub(crate) fn select_runtime_manifest<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    selector: &str,
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        bail!("runtime selector must not be empty");
-    }
-
-    if let Some(manifest) = manifests
-        .iter()
-        .find(|manifest| manifest.runtime_key == selector)
-    {
-        return Ok(manifest);
-    }
-
-    let key_matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-        .collect::<Vec<_>>();
-    match key_matches.as_slice() {
-        [manifest] => return Ok(manifest),
-        [] => {}
-        _ => bail!(
-            "runtime selector `{selector}` matches several installed runtime keys that differ only in letter case; name one of them exactly: {}",
-            runtime_keys_text(&key_matches)
-        ),
-    }
-
-    let id_matches = manifests
-        .iter()
-        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
-        .collect::<Vec<_>>();
-    match id_matches.as_slice() {
-        [manifest] => Ok(manifest),
-        [] => bail!("installed runtime not found: {selector}"),
-        _ => bail!(
-            "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {}",
-            runtime_keys_text(&id_matches)
-        ),
-    }
-}
-
-pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManifest) -> String {
-    match validate_runtime_manifest_for_activation(manifest) {
-        Ok(()) => "ready".to_owned(),
-        Err(error) => format!("unusable ({error})"),
-    }
-}
-
 /// How the CLI names the toolchain state of a runtime.
 ///
 /// `rocm runtimes list` reports it per runtime and `rocm examine` reports it
@@ -1717,95 +871,20 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
     }
 }
 
-pub(crate) fn validate_runtime_manifest_for_activation(
-    manifest: &therock::InstalledRuntimeManifest,
-) -> Result<()> {
-    if manifest.runtime_key.trim().is_empty() {
-        bail!("manifest runtime_key is empty");
-    }
-    if manifest.runtime_id.trim().is_empty() {
-        bail!("manifest runtime_id is empty");
-    }
-    if !manifest.install_root.is_dir() {
-        bail!(
-            "install root is missing: {}",
-            manifest.install_root.display()
-        );
-    }
-    let local_manifest = manifest.install_root.join(".rocm-cli-runtime.json");
-    if !manifest.read_only && !local_manifest.is_file() {
-        bail!(
-            "local runtime manifest is missing: {}",
-            local_manifest.display()
-        );
-    }
-
-    match manifest.format.as_str() {
-        "wheel" => validate_wheel_runtime_manifest(manifest),
-        "tarball" => validate_tarball_runtime_manifest(manifest),
-        other => bail!("unsupported runtime format in manifest: {other}"),
-    }
-}
-
-fn validate_wheel_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
-    let python_executable = manifest
-        .python_executable
-        .as_deref()
-        .context("pip runtime manifest is missing python_executable")?;
-    if !Path::new(python_executable).is_file() {
-        bail!("runtime Python executable is missing: {python_executable}");
-    }
-    let probe = manifest
-        .rocm_sdk
-        .as_ref()
-        .context("pip runtime manifest is missing rocm_sdk probe data")?;
-    therock::validate_rocm_sdk_runtime_probe(probe)?;
-    Ok(())
-}
-
-fn validate_tarball_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
-    if runtime_install_root_has_payload(&manifest.install_root)? {
-        Ok(())
-    } else {
-        bail!(
-            "tarball runtime install root has no payload files: {}",
-            manifest.install_root.display()
-        )
-    }
-}
-
-fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with('.') {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn runtime_registry_dir(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("runtimes").join("registry")
-}
-
-pub(crate) fn runtime_manifest_path(paths: &AppPaths, runtime_key: &str) -> PathBuf {
-    runtime_registry_dir(paths).join(format!("{runtime_key}.json"))
-}
-
-pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("runtimes").join("active.json")
-}
-
 /// Replace the active-runtime marker in one step.
 ///
 /// Two `rocm` processes can activate a runtime against the same data
 /// directory at once (two terminals, a script), so the write goes through the
 /// shared atomic writer: each writer stages into its own exclusively created
 /// temp file, and the marker is replaced rather than removed first, so a
-/// reader always finds a complete marker. On Windows the replace is a
-/// `rename`, falling back to `ReplaceFileW` only when that fails, and two
-/// replacements in flight at once through the fallback are not tested. It does not order the two activations: the last one to publish
-/// wins, as before.
+/// reader always finds a complete marker: on Windows the publish renames first,
+/// which replaces in one step. Only when that rename fails, because another
+/// process holds the marker open without delete sharing, does it fall back to
+/// `ReplaceFileW`, and a `ReplaceFileW` that fails part-way can leave the marker
+/// missing, which the writer repairs with a plain rename when that succeeds
+/// (see `rocm_core::atomic_write`); two replacements in flight at once through
+/// the fallback are not tested. It does not order the two activations: the last
+/// one to publish wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
     // The shared helper rather than a local temp-file-and-rename: it is the same
@@ -1817,8 +896,12 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
-    // the folder `rocm runtimes` reads. It also creates the `runtimes` folder
-    // when it is missing.
+    // the folder `rocm runtimes` reads. The one exception is a Windows publish
+    // that took the old marker away and could not put the new one in place:
+    // the temp file is then the only copy, so it is kept and the error names
+    // it; a failed activation removes it again once the restore has put the
+    // previous marker back (`discard_failed_marker_replacement`). It also
+    // creates the `runtimes` folder when it is missing.
     let bytes =
         serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
     rocm_core::atomic_write::write_file_atomically(&path, &bytes)
@@ -1827,12 +910,16 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use crate::append_examine_runtime_state;
     use crate::engine_runtime_select::resolve_runtime_selector_to_exact_key;
+    use crate::runtime_adopt::{AdoptRuntimeRequest, adopt_runtime_from_probe};
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
+    use crate::runtime_registry::{ManifestOverwrite, write_runtime_manifest};
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
@@ -2036,6 +1123,38 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn render_runtimes_text_keeps_every_row_in_the_marker_layout() -> Result<()> {
+        let (root, paths) = test_paths("runtime-row-layout");
+        for (key, version, build) in [
+            ("rt-active", "7.13.0", 30),
+            ("rt-rollback", "7.12.0", 20),
+            ("rt-idle", "7.11.0", 10),
+        ] {
+            write_test_pip_runtime(&paths, key, "therock-release:gfx120X-all", version, build)?;
+        }
+        let config = RocmCliConfig {
+            active_runtime_key: Some("rt-active".to_owned()),
+            previous_runtime_key: Some("rt-rollback".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let _ = fs::remove_dir_all(root);
+
+        for expected in [
+            format!("  {ACTIVE_RUNTIME_MARKER} rt-active runtime_id="),
+            format!("  {ROLLBACK_RUNTIME_MARKER} rt-rollback runtime_id="),
+            "    rt-idle runtime_id=".to_owned(),
+        ] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether a runtime carries the compiler toolchain is otherwise invisible,
     /// and `rocm update` reinstalls whatever the runtime recorded — so a user
     /// who installed without it has no way to see that, or to understand why a
@@ -2116,6 +1235,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn test_active_runtime_marker(paths: &AppPaths, runtime_key: &str) -> ActiveRuntimeMarker {
         ActiveRuntimeMarker {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
@@ -2128,6 +1248,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn leftover_marker_temp_files(paths: &AppPaths) -> Result<Vec<String>> {
         let dir = active_runtime_marker_path(paths)
             .parent()
@@ -2141,101 +1262,6 @@ pub(crate) mod tests {
             }
         }
         Ok(leftovers)
-    }
-
-    /// The marker is staged through `rocm_core::atomic_write`, the writer this
-    /// change makes `rocm` and `rocmd` share (rocmd's own copy is gone), so it
-    /// never writes through a temp file another writer reserved. #605 reported
-    /// the marker staged at `active.json.tmp-<millis>` with a truncating write,
-    /// where a writer that drew another activation's millisecond wrote into
-    /// *that* writer's temp file and moved it into place; #424 fixed that on
-    /// its own, and this test keeps the marker from going back to it.
-    ///
-    /// Pre-creating a file at every name that scheme could pick while this
-    /// test runs stands in for the other writer deterministically: the write
-    /// has to succeed without touching any of them. This guards against a
-    /// return to that millis-only scheme specifically. The shared writer's own
-    /// names (`{name}.tmp-{pid}-{millis}-{attempt}`) cannot match these by
-    /// construction, so collision safety under the current scheme is covered
-    /// by `concurrent_active_runtime_marker_writes_keep_a_complete_marker_published`
-    /// and by `rocm_core::atomic_write`'s own concurrency tests.
-    ///
-    /// The pre-created names only cover the milliseconds they were made for, so
-    /// a write that lands after them proves nothing. The window starts at 2 s
-    /// and, when a slow or scanned filesystem lets the write miss it, is
-    /// retried at four times what the pre-creation and write took (up to
-    /// 16 s). Where creating the names is itself slower than one per
-    /// millisecond no window can cover the write, and where every try misses,
-    /// the test says it is inconclusive on stderr and passes rather than
-    /// failing code that is correct.
-    #[test]
-    fn active_runtime_marker_write_never_reuses_another_writers_temp_file() -> Result<()> {
-        const FOREIGN: &[u8] = b"another writer's staged marker";
-        const ATTEMPTS: usize = 3;
-        const MAX_WINDOW_MS: u128 = 16_000;
-        let (root, paths) = test_paths("marker-temp-collision");
-        write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "previous"))?;
-        let marker_path = active_runtime_marker_path(&paths);
-
-        let mut window_ms: u128 = 2_000;
-        for attempt in 1..=ATTEMPTS {
-            let start = rocm_core::unix_time_millis();
-            let foreign: Vec<PathBuf> = (start..start + window_ms)
-                .map(|millis| marker_path.with_extension(format!("json.tmp-{millis}")))
-                .collect();
-            for path in &foreign {
-                fs::write(path, FOREIGN)?;
-            }
-            let setup_ms = rocm_core::unix_time_millis() - start;
-
-            write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "next"))?;
-            let finished = rocm_core::unix_time_millis();
-
-            for path in &foreign {
-                assert_eq!(
-                    fs::read(path).ok().as_deref(),
-                    Some(FOREIGN),
-                    "{} belongs to another writer but was written through or moved",
-                    path.display()
-                );
-            }
-            for path in &foreign {
-                fs::remove_file(path)?;
-            }
-            if finished < start + window_ms {
-                let published: ActiveRuntimeMarker =
-                    serde_json::from_slice(&fs::read(&marker_path)?)?;
-                assert_eq!(published.runtime_key, "next");
-                assert_eq!(leftover_marker_temp_files(&paths)?, Vec::<String>::new());
-                let _ = fs::remove_dir_all(root);
-                return Ok(());
-            }
-            // Missed: the names ran out before the write ran. One name covers
-            // one millisecond, so when creating them is slower than one per
-            // millisecond no window can be wide enough; otherwise size the
-            // next one from what this pre-creation and write took.
-            let next_ms = 4 * (finished - start);
-            if setup_ms * 2 >= window_ms || next_ms > MAX_WINDOW_MS {
-                eprintln!(
-                    "inconclusive: pre-creating {window_ms} names took {setup_ms} ms and the \
-                     write finished after them; this filesystem is too slow for the test \
-                     to say anything, so it is skipped"
-                );
-                let _ = fs::remove_dir_all(root);
-                return Ok(());
-            }
-            window_ms = window_ms.max(next_ms);
-            eprintln!(
-                "attempt {attempt}/{ATTEMPTS}: the write finished after the pre-created \
-                 names ran out; retrying with a {window_ms} ms window"
-            );
-        }
-        eprintln!(
-            "inconclusive: on every attempt the write ran after the window of pre-created \
-             names, so this host is too slow for this test to say anything"
-        );
-        let _ = fs::remove_dir_all(root);
-        Ok(())
     }
 
     /// Two activations writing the marker at once must both succeed, and a
@@ -2453,10 +1479,10 @@ pub(crate) mod tests {
     }
 
     /// Replace the active-runtime marker with a NON-EMPTY directory, so the
-    /// next `write_active_runtime_marker` fails at a predictable point: its
-    /// `create_dir_all` of the parent succeeds, and the final `fs::rename` of
-    /// the temp file onto a non-empty directory fails on both supported
-    /// platforms without needing privileges or a real full disk.
+    /// next `write_active_runtime_marker` fails at a predictable point: the
+    /// temp file is staged beside it, and publishing that file onto a
+    /// non-empty directory fails on both supported platforms without needing
+    /// privileges or a real full disk.
     fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
         let marker = active_runtime_marker_path(paths);
         let _ = fs::remove_file(&marker);
@@ -3148,6 +2174,198 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The Windows partial-replace failure during activation: the marker publish
+    /// took the old marker away and kept the new one in its temp file. Once the
+    /// restore has put the previous marker back, the kept file holds the failed
+    /// activation's marker, so it is removed, and the error no longer tells the
+    /// user to rename it into place. Driven through the shared writer's publish
+    /// seam, so it runs on every platform.
+    #[test]
+    fn a_restored_activation_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+
+        let marker_path = active_runtime_marker_path(&paths);
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(
+            !marker_temp_file_names(&paths)?.is_empty(),
+            "the shared writer keeps the new marker when the old one is gone"
+        );
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(&marker_path)?;
+        let leftovers = marker_temp_file_names(&paths)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(restored_marker, previous_marker);
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        assert!(
+            leftovers.is_empty(),
+            "the failed activation's marker was left beside the restored one: {leftovers:?}"
+        );
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// Produce the error the shared writer returns when a marker publish took
+    /// the old marker away and kept the new one, through its publish seam.
+    /// `prepare_kept` runs on the kept temp file before the error is returned.
+    fn partial_replace_marker_error(
+        paths: &AppPaths,
+        prepare_kept: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> anyhow::Error {
+        let marker_path = active_runtime_marker_path(paths);
+        rocm_core::atomic_write::write_file_atomically_with_publish(
+            &marker_path,
+            b"{\"runtime_key\":\"new\"}",
+            |attempt| std::ffi::OsString::from(format!("partial-{attempt}")),
+            || {},
+            |tmp, path| {
+                fs::remove_file(path)?;
+                prepare_kept(tmp)?;
+                Err(rocm_core::atomic_write::destination_removed_error(
+                    std::io::Error::from_raw_os_error(1176),
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                ))
+            },
+        )
+        .expect_err("the simulated partial replace fails the write")
+        .context(format!(
+            "failed to write active runtime marker {}",
+            marker_path.display()
+        ))
+    }
+
+    /// When the kept marker cannot be removed, the error names it and says to
+    /// delete it, and nothing in it still says to rename it into place. The
+    /// kept path is made a non-empty directory, which `remove_file` refuses on
+    /// every platform.
+    #[test]
+    fn a_kept_marker_that_cannot_be_removed_is_named_with_delete_advice_only() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-stuck");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        let write_error = partial_replace_marker_error(&paths, |tmp| {
+            fs::remove_file(tmp)?;
+            fs::create_dir(tmp)?;
+            fs::write(tmp.join("occupied.txt"), "stuck")
+        });
+        let kept = marker_temp_file_names(&paths)?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(active_runtime_marker_path(&paths))?;
+        let still_there = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(still_there, kept, "the stuck file is left where it was");
+        assert_eq!(restored_marker, previous_marker);
+        assert!(
+            rendered.contains(&kept[0]),
+            "the stuck file is named:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("delete it, do not rename it"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A kept marker that is already gone by the time the rollback looks for it
+    /// is as good as removed: the error neither names it nor tells the user to
+    /// delete or rename it.
+    #[test]
+    fn a_kept_marker_already_gone_is_treated_as_removed() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-gone");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        let kept = marker_temp_file_names(&paths)?;
+        let runtimes_dir = active_runtime_marker_path(&paths)
+            .parent()
+            .context("active runtime marker path has no parent directory")?
+            .to_path_buf();
+        for name in &kept {
+            fs::remove_file(runtimes_dir.join(name))?;
+        }
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&kept[0]), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(!rendered.contains("delete it"), "{rendered}");
+        Ok(())
+    }
+
+    /// When the rollback itself fails as well, the kept marker is still the
+    /// failed activation's, so it goes too, and the error keeps the rollback's
+    /// own recovery advice without the advice to rename it. The config path is
+    /// made a non-empty directory so the restore's config save fails.
+    #[test]
+    fn a_failed_rollback_still_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-double-fault");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(!marker_temp_file_names(&paths)?.is_empty());
+        let config_path = paths.config_path();
+        let _ = fs::remove_file(&config_path);
+        fs::create_dir_all(&config_path)?;
+        fs::write(config_path.join("occupied.txt"), "not a config")?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let leftovers = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("restoring the previous state failed too"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rocm runtimes list"), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        Ok(())
+    }
+
     // A restore that fails too must say so and name the way out, rather than
     // claim the previous runtime is still the active one. The marker's parent is
     // made a regular file, so writing the captured bytes back fails at
@@ -3393,71 +2611,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Matching a key regardless of case is a convenience for a user who typed
-    /// the wrong one; it must not quietly pick between two installs whose keys
-    /// differ only in case. `runtimes adopt --runtime-key` stores the key
-    /// verbatim while generated keys are lower-cased, so such a pair is
-    /// reachable, and a caller that resolves the same key twice — prune decides
-    /// about a manifest and then names it to the deleter by key — has to get
-    /// the same install both times.
-    ///
-    /// No registry is involved here: the manifests are handed straight to the
-    /// resolver, so this holds on every platform even though only a
-    /// case-sensitive filesystem can store such a pair.
-    #[test]
-    fn runtime_selector_prefers_the_exact_key_over_a_case_twin() -> Result<()> {
-        let (root, paths) = test_paths("runtime-case-twin");
-        let base = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        // Newest first, as `load_runtime_manifests` hands them over. The
-        // adopted twin is stamped with the moment it was adopted, so it leads.
-        let manifests = vec![
-            therock::InstalledRuntimeManifest {
-                runtime_key: "RELEASE-PIP-GFX120X-ALL-7-13-0".to_owned(),
-                installed_at_unix_ms: 99,
-                read_only: true,
-                ..base.clone()
-            },
-            base.clone(),
-        ];
-
-        let exact = select_runtime_manifest(&manifests, &base.runtime_key)?;
-        assert_eq!(
-            exact.runtime_key, base.runtime_key,
-            "the key as stored resolves to its own record, not to the newer twin"
-        );
-        let twin = select_runtime_manifest(&manifests, "RELEASE-PIP-GFX120X-ALL-7-13-0")?;
-        assert_eq!(twin.runtime_key, "RELEASE-PIP-GFX120X-ALL-7-13-0");
-
-        // Neither key matches exactly, so the selector genuinely names both.
-        // Reported as the ambiguity it is, like a runtime_id naming several.
-        let error = select_runtime_manifest(&manifests, "Release-Pip-Gfx120X-All-7-13-0")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("differ only in letter case"),
-            "an ambiguous selector must be refused, not silently resolved: {error}"
-        );
-        assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
-        assert!(error.contains("RELEASE-PIP-GFX120X-ALL-7-13-0"));
-
-        // The convenience itself is untouched: with one candidate, any casing
-        // still resolves.
-        let only = vec![base.clone()];
-        assert_eq!(
-            select_runtime_manifest(&only, "Release-Pip-Gfx120X-All-7-13-0")?.runtime_key,
-            base.runtime_key
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
     #[test]
     fn runtime_activation_rejects_unusable_manifest() -> Result<()> {
         let (root, paths) = test_paths("runtime-unusable");
@@ -3531,33 +2684,14 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn runtime_import_refuses_to_overwrite_without_replace() -> Result<()> {
-        let (root, paths) = test_paths("runtime-import-replace");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "external-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let exported_manifest = root.join("external-runtime.json");
-        fs::write(&exported_manifest, serde_json::to_vec_pretty(&manifest)?)?;
-
-        let error = import_runtime_manifest(&paths, &exported_manifest, false)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("already exists"));
-        import_runtime_manifest(&paths, &exported_manifest, true)?;
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt");
+    /// A Python environment outside ROCm CLI's folders that `rocm runtimes adopt`
+    /// accepts: an interpreter, the SDK libraries the probe names, and the probe
+    /// that reports them. Returns the environment folder, the request that adopts
+    /// it, and the probe.
+    fn adoptable_environment(
+        root: &Path,
+        replace: bool,
+    ) -> Result<(PathBuf, AdoptRuntimeRequest, therock::RocmSdkPythonProbe)> {
         let external_root = root.join("external-therock-venv");
         let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -3586,37 +2720,43 @@ pub(crate) mod tests {
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root.clone(),
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
+        let request = AdoptRuntimeRequest {
+            python_executable,
+            install_root: external_root.clone(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+            replace,
+        };
+        let probe = therock::RocmSdkPythonProbe {
+            import_ok: true,
+            rocm_sdk_version: Some("7.13.0".to_owned()),
+            root_path: Some(sdk_root.clone()),
+            bin_path: Some(sdk_bin.clone()),
+            runtime_roots: vec![sdk_root],
+            bin_paths: vec![sdk_bin.clone()],
+            library_paths: vec![sdk_bin],
+            resolved_libraries: vec![
+                therock::RocmSdkLibraryProbe {
+                    shortname: "amdhip64".to_owned(),
+                    paths: vec![amdhip],
+                },
+                therock::RocmSdkLibraryProbe {
+                    shortname: "hipblas".to_owned(),
+                    paths: vec![hipblas],
+                },
+            ],
+            resolved_target_family: Some("gfx120X-all".to_owned()),
+            ..therock::RocmSdkPythonProbe::default()
+        };
+        Ok((external_root, request, probe))
+    }
+
+    #[test]
+    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+
+        let adopted = adopt_runtime_from_probe(&paths, request, probe)?;
 
         assert!(adopted.read_only);
         assert_eq!(adopted.channel, "release");
@@ -3651,157 +2791,305 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The other half of the same derivation: an adopted environment that does
-    /// expose a CMake path has the toolchain, and the manifest must say so or
-    /// the next `rocm update` would quietly reinstall without it.
-    #[test]
-    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-devel");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python_executable = scripts_dir.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
-        let sdk_root = external_root
-            .join("Lib")
-            .join("site-packages")
-            .join("rocm_sdk");
-        let sdk_bin = sdk_root.join("bin");
-        let cmake_path = sdk_root.join("lib").join("cmake");
-        fs::create_dir_all(&scripts_dir)?;
-        fs::create_dir_all(&sdk_bin)?;
-        fs::create_dir_all(&cmake_path)?;
-        let amdhip = sdk_bin.join(if cfg!(windows) {
-            "amdhip64_7.dll"
-        } else {
-            "libamdhip64.so"
-        });
-        let hipblas = sdk_bin.join(if cfg!(windows) {
-            "hipblas.dll"
-        } else {
-            "libhipblas.so"
-        });
-        fs::write(&python_executable, "python")?;
-        fs::write(&amdhip, "amdhip")?;
-        fs::write(&hipblas, "hipblas")?;
+    /// Which of the two files a registered runtime can have exist: its registry
+    /// entry, and the `.rocm-cli-runtime.json` ROCm CLI keeps in the install
+    /// root as proof that it owns the folder.
+    fn registered_files(paths: &AppPaths, install_root: &Path, runtime_key: &str) -> (bool, bool) {
+        (
+            runtime_manifest_path(paths, runtime_key).is_file(),
+            install_root.join(".rocm-cli-runtime.json").is_file(),
+        )
+    }
 
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root,
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                cmake_path: Some(cmake_path),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
+    /// A runtime ROCm CLI installed itself, with both of its manifest files
+    /// deleted so a test sees only what the write under test creates.
+    fn installed_runtime_without_manifest_files(
+        paths: &AppPaths,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let manifest = write_test_pip_runtime(
+            paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
         )?;
+        fs::remove_file(runtime_manifest_path(paths, &manifest.runtime_key))?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        assert_eq!(
+            registered_files(paths, &manifest.install_root, &manifest.runtime_key),
+            (false, false)
+        );
+        Ok(manifest)
+    }
+
+    /// Registering a runtime whose registry entry exists is refused until the
+    /// caller asks to replace it. `register(replace)` makes the attempt; the
+    /// message and the entry on disk are asserted together, and the same call
+    /// with `replace` set is what clears the refusal.
+    fn assert_duplicate_registration_needs_replace(
+        paths: &AppPaths,
+        runtime_key: &str,
+        register: impl Fn(bool) -> Result<()>,
+    ) -> Result<()> {
+        let entry = runtime_manifest_path(paths, runtime_key);
+        fs::write(&entry, "stale entry")?;
+
+        let error = register(false).unwrap_err().to_string();
 
         assert!(
-            adopted.devel,
-            "a probe reporting a CMake path must record the toolchain"
+            error.contains("already exists") && error.contains("--replace"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "stale entry",
+            "a refused registration must leave the existing entry alone"
+        );
+        register(true)?;
+        let replaced: therock::InstalledRuntimeManifest =
+            serde_json::from_slice(&fs::read(&entry)?)?;
+        assert_eq!(replaced.runtime_key, runtime_key);
+        Ok(())
+    }
+
+    /// Installing writes both files, and a second install of the same key
+    /// overwrites both without being asked: it is the same runtime again.
+    #[test]
+    fn runtime_install_writes_the_registry_entry_and_the_install_root_manifest() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-install");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        let reinstalled = therock::InstalledRuntimeManifest {
+            version: "7.14.0".to_owned(),
+            ..manifest.clone()
+        };
+        write_runtime_manifest(&paths, &reinstalled, ManifestOverwrite::Replace)?;
+        for path in [
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+        ] {
+            let written: therock::InstalledRuntimeManifest =
+                serde_json::from_slice(&fs::read(&path)?)?;
+            assert_eq!(written.version, "7.14.0", "{}", path.display());
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Importing registers a folder somebody else owns, so it writes the
+    /// registry entry and nothing into that folder, and refuses to replace an
+    /// existing entry unless asked.
+    #[test]
+    fn runtime_import_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-import");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+        let exported_manifest = root.join("external-runtime.json");
+        fs::write(&exported_manifest, serde_json::to_vec_pretty(&manifest)?)?;
+
+        import_runtime_manifest(&paths, &exported_manifest, false)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false)
+        );
+        assert_duplicate_registration_needs_replace(&paths, &manifest.runtime_key, |replace| {
+            import_runtime_manifest(&paths, &exported_manifest, replace).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false),
+            "replacing an import must not start writing into the folder either"
         );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
+    /// Adopting has the same contract as importing: registry entry only, and a
+    /// duplicate needs `--replace`.
     #[test]
-    fn runtime_adopt_request_infers_ids_from_probe() -> Result<()> {
-        let (root, _) = test_paths("runtime-adopt-infer");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python_executable = scripts_dir.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
-        fs::create_dir_all(&scripts_dir)?;
-        fs::write(&python_executable, "python")?;
+    fn runtime_adopt_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+        let runtime_key = request.runtime_key.clone();
 
-        let request = infer_adopt_runtime_request(
-            python_executable.clone(),
-            Some(external_root.clone()),
-            None,
-            None,
-            None,
-            false,
-            &therock::RocmSdkPythonProbe {
-                rocm_sdk_version: Some("7.13.0a20260423".to_owned()),
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
+        adopt_runtime_from_probe(&paths, request.clone(), probe.clone())?;
 
-        assert_eq!(request.python_executable, python_executable);
-        assert_eq!(request.install_root, external_root);
-        assert_eq!(request.runtime_id, "therock-release:gfx120X-all");
         assert_eq!(
-            request.runtime_key,
-            "adopted-release-pip-gfx120x-all-7-13-0a20260423"
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false)
         );
-        assert!(!request.replace);
+        assert_duplicate_registration_needs_replace(&paths, &runtime_key, |replace| {
+            let request = AdoptRuntimeRequest {
+                replace,
+                ..request.clone()
+            };
+            adopt_runtime_from_probe(&paths, request, probe.clone()).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false),
+            "replacing an adoption must not start writing into the environment either"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
+    /// Recovering the runtime `rocm setup` created restores its registry entry
+    /// from the manifest in its folder, leaves that manifest in place, and does
+    /// not replace an entry that is already there.
     #[test]
-    fn runtime_adopt_request_honors_nightly_channel() -> Result<()> {
-        let (root, _) = test_paths("runtime-adopt-infer-nightly");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python_executable = scripts_dir.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
-        fs::create_dir_all(&scripts_dir)?;
-        fs::write(&python_executable, "python")?;
-
-        let request = infer_adopt_runtime_request(
-            python_executable,
-            Some(external_root),
-            None,
-            None,
-            Some("nightly".to_owned()),
-            true,
-            &therock::RocmSdkPythonProbe {
-                rocm_sdk_version: Some("7.14.0a20260531".to_owned()),
-                default_target_family: Some("gfx1151".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
+    fn setup_recovery_restores_the_registry_entry_and_keeps_the_install_root_manifest() -> Result<()>
+    {
+        let (root, paths) = test_paths("runtime-files-recovery");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
         )?;
-
-        assert_eq!(request.runtime_id, "therock-nightly:gfx1151");
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        fs::remove_file(&entry)?;
         assert_eq!(
-            request.runtime_key,
-            "adopted-nightly-pip-gfx1151-7-14-0a20260531"
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (false, true)
         );
-        assert!(request.replace);
+
+        let recovered = recover_setup_runtime_registration(&paths, &config)?;
+
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        fs::write(&entry, "entry written since")?;
+        recover_setup_runtime_registration(&paths, &config)?;
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "entry written since",
+            "recovery only fills a missing entry"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Rewrite a manifest file as an older rocm-cli wrote it: without the keys
+    /// that hold no value, which a newer binary reads back as their defaults and
+    /// writes out as explicit `null`s. Returns the bytes now on disk.
+    fn rewrite_as_legacy_shaped(path: &Path) -> Result<Vec<u8>> {
+        let mut document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let object = document
+            .as_object_mut()
+            .context("a manifest is a JSON object")?;
+        let empty: Vec<String> = object
+            .iter()
+            .filter(|(_, value)| value.is_null())
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert!(
+            !empty.is_empty(),
+            "the fixture must hold a null-valued key for this to mean anything"
+        );
+        for key in empty {
+            object.remove(&key);
+        }
+        let legacy = serde_json::to_vec_pretty(&document)?;
+        fs::write(path, &legacy)?;
+        Ok(legacy)
+    }
+
+    /// Recovering the setup runtime from a manifest an older binary wrote, in a
+    /// folder the user cannot write to: the file decodes to the very manifest the
+    /// recovery would write, so it is already current and is left alone. Judging
+    /// it by bytes would read the missing keys as a change, write the registry
+    /// entry, and then fail on the read-only file. The registry entry and the
+    /// file's bytes are asserted together. (Where the file stays writable
+    /// regardless, as for an administrator, the unchanged bytes still prove the
+    /// file was not rewritten.)
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn setup_recovery_leaves_a_read_only_legacy_shaped_install_root_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-recovery-legacy");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let local = manifest.install_root.join(".rocm-cli-runtime.json");
+        fs::remove_file(&entry)?;
+        let legacy = rewrite_as_legacy_shaped(&local)?;
+        let mut permissions = fs::metadata(&local)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&local, permissions.clone())?;
+
+        let recovered = recover_setup_runtime_registration(&paths, &config);
+
+        permissions.set_readonly(false);
+        fs::set_permissions(&local, permissions)?;
+        let recovered = recovered
+            .context("a usable manifest in a folder that cannot be written is recovered")?;
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert!(entry.is_file(), "the registry entry is restored");
+        assert_eq!(
+            fs::read(&local)?,
+            legacy,
+            "the install root manifest is already current and must not be rewritten"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The writer gives a runtime a manifest in its folder exactly when
+    /// uninstall, which prune asks the same question of, may delete that folder.
+    /// The two are written in different modules; this is what ties them.
+    #[test]
+    fn a_runtime_gets_an_install_root_manifest_exactly_when_uninstall_may_remove_its_folder()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-ownership");
+        for (label, read_only, imported) in [
+            ("owned", false, false),
+            ("read-only", true, false),
+            ("imported", false, true),
+        ] {
+            let mut manifest = write_test_pip_runtime(
+                &paths,
+                &format!("release-pip-{label}"),
+                "therock-release:gfx120X-all",
+                "7.13.0",
+                20,
+            )?;
+            manifest.read_only = read_only;
+            manifest.imported_from = imported.then(|| PathBuf::from("elsewhere/manifest.json"));
+            fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+
+            write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+
+            let has_manifest = manifest
+                .install_root
+                .join(".rocm-cli-runtime.json")
+                .is_file();
+            let may_remove =
+                should_remove_runtime_install_root(&manifest)? == InstallRootDecision::Remove;
+            assert_eq!(has_manifest, may_remove, "{label}");
+            assert_eq!(has_manifest, manifest.owns_install_root(), "{label}");
+        }
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -3838,718 +3126,6 @@ pub(crate) mod tests {
         assert_eq!(config.default_runtime_id, None);
         assert_eq!(config.setup.therock_venv, None);
         assert!(!config.setup.completed);
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_unregisters_read_only_runtime_without_deleting_external_root() -> Result<()>
-    {
-        let (root, paths) = test_paths("runtime-uninstall-read-only");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "external-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let exported_manifest = root.join("external-runtime.json");
-        fs::write(&exported_manifest, serde_json::to_vec_pretty(&manifest)?)?;
-        fs::remove_file(runtime_manifest_path(&paths, &manifest.runtime_key))?;
-        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
-        import_runtime_manifest(&paths, &exported_manifest, false)?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert_eq!(removed.runtime_key, manifest.runtime_key);
-        assert!(removed.read_only);
-        assert_eq!(removed.removed_install_root, None);
-        assert!(manifest.install_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_removes_rocm_cli_managed_custom_prefix_root() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-prefix");
-        let mut manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let prefix_root = root.join("user-chosen-prefix");
-        fs::rename(&manifest.install_root, &prefix_root)?;
-        manifest.install_root = prefix_root.clone();
-        let python = prefix_root
-            .join(if cfg!(windows) { "Scripts" } else { "bin" })
-            .join(if cfg!(windows) {
-                "python.exe"
-            } else {
-                "python"
-            });
-        manifest.python_executable = Some(python.display().to_string());
-        fs::write(
-            runtime_manifest_path(&paths, &manifest.runtime_key),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        fs::write(
-            prefix_root.join(".rocm-cli-runtime.json"),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert_eq!(
-            removed.removed_install_root.as_deref(),
-            Some(prefix_root.as_path())
-        );
-        assert!(!prefix_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_leaves_folder_on_local_manifest_mismatch() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert!(removed.manifest_mismatch);
-        assert!(!removed.read_only);
-        assert_eq!(removed.removed_install_root, None);
-        assert!(manifest.install_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn ensure_runtime_install_root_rejects_protected_system_path() {
-        // `prune` (storage.rs) refuses a runtime whose folder sits in a
-        // protected system location before it ever calls
-        // `should_remove_runtime_install_root`. A hand-edited or corrupted
-        // registry entry could point a direct `runtimes uninstall <key>`
-        // manifest's `install_root` at the same kind of path while still
-        // carrying a matching in-tree `.rocm-cli-runtime.json`, slipping past
-        // `local_runtime_manifest_matches`. The single source of truth for
-        // "may ROCm CLI delete this folder?" must refuse it too, regardless
-        // of caller.
-        let protected = if cfg!(windows) {
-            PathBuf::from("C:/Windows/rocm-cli-test-runtime")
-        } else {
-            PathBuf::from("/etc/rocm-cli-test-runtime")
-        };
-
-        let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
-            .expect_err("protected system path must be refused");
-        assert!(err.to_string().contains("protected system location"));
-    }
-
-    /// The gate above is the last thing between a registry entry and
-    /// `fs::remove_dir_all`, and the path it is handed is text somebody else
-    /// wrote. One folder has many spellings, so the refusal has to survive all
-    /// of them — a trailing separator, a doubled one, a `.`, or a `..` that
-    /// walks back out of the user's home directory. Each of these names `/etc`.
-    #[test]
-    #[cfg(unix)]
-    fn ensure_runtime_install_root_rejects_every_spelling_of_a_protected_path() {
-        let home = rocm_core::runtime_home_dir().expect("a home directory");
-        let home = home.display().to_string();
-        let spellings = [
-            "/etc/".to_owned(),
-            "//etc".to_owned(),
-            "/./etc".to_owned(),
-            "/etc/.".to_owned(),
-            format!("{home}/../../etc"),
-        ];
-
-        let accepted: Vec<String> = spellings
-            .into_iter()
-            .filter(|text| ensure_runtime_install_root_is_safe_to_remove(Path::new(text)).is_ok())
-            .collect();
-
-        assert!(
-            accepted.is_empty(),
-            "accepted as safe to recursively delete: {accepted:?}"
-        );
-    }
-
-    #[test]
-    fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-
-        assert!(plan.will_remove_install_root());
-        assert!(manifest.install_root.exists());
-        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_revalidation_detects_install_root_change() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-        assert!(plan.will_remove_install_root());
-
-        // Simulate another process relocating this runtime's install root
-        // while the uninstall confirmation prompt was waiting on the user.
-        let relocated_root = paths
-            .data_dir
-            .join("runtimes")
-            .join("wheel")
-            .join("relocated-install-root");
-        fs::rename(&manifest.install_root, &relocated_root)?;
-        let mut relocated_manifest = manifest.clone();
-        relocated_manifest.install_root = relocated_root.clone();
-        fs::write(
-            relocated_root.join(".rocm-cli-runtime.json"),
-            serde_json::to_vec_pretty(&relocated_manifest)?,
-        )?;
-        fs::write(
-            runtime_manifest_path(&paths, &manifest.runtime_key),
-            serde_json::to_vec_pretty(&relocated_manifest)?,
-        )?;
-
-        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
-        assert!(
-            result.is_err(),
-            "revalidation should refuse a plan whose install_root moved since it was shown"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_revalidation_detects_runtime_id_change() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-revalidate-runtime-id");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-        assert!(plan.will_remove_install_root());
-
-        // Simulate another process re-registering this runtime_key under a
-        // different runtime_id while the uninstall confirmation prompt was
-        // waiting on the user. Both the registry entry and the local marker
-        // are updated together so `install_root_decision` stays `Remove` and
-        // only `runtime_id` differs from the plan the user approved.
-        let mut relabeled_manifest = manifest.clone();
-        relabeled_manifest.runtime_id = "therock-release:gfx120X-all-relabeled".to_owned();
-        fs::write(
-            manifest.install_root.join(".rocm-cli-runtime.json"),
-            serde_json::to_vec_pretty(&relabeled_manifest)?,
-        )?;
-        fs::write(
-            runtime_manifest_path(&paths, &manifest.runtime_key),
-            serde_json::to_vec_pretty(&relabeled_manifest)?,
-        )?;
-
-        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
-        assert!(
-            result.is_err(),
-            "revalidation should refuse a plan whose runtime_id changed since it was shown"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_revalidation_detects_was_active_change() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-revalidate-was-active");
-        let target = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let other = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx110x-all-7-12-0",
-            "therock-release:gfx110X-all",
-            "7.12.0",
-            10,
-        )?;
-        let mut config = RocmCliConfig {
-            active_runtime_key: Some(other.runtime_key),
-            ..RocmCliConfig::default()
-        };
-
-        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
-        assert!(!plan.was_active);
-
-        // Simulate another process activating the target runtime while the
-        // uninstall confirmation prompt was waiting on the user.
-        config.active_runtime_key = Some(target.runtime_key);
-        config.save(&paths)?;
-
-        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
-        assert!(
-            result.is_err(),
-            "revalidation should refuse a plan whose was_active changed since it was shown"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_revalidation_detects_clears_default_runtime_change() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-revalidate-clears-default");
-        let shared_runtime_id = "therock-release:gfx120X-all";
-        let target = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            shared_runtime_id,
-            "7.13.0",
-            20,
-        )?;
-        let other = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx110x-all-7-12-0",
-            "therock-release:gfx110X-all",
-            "7.12.0",
-            10,
-        )?;
-        let config = RocmCliConfig {
-            default_runtime_id: Some(shared_runtime_id.to_owned()),
-            active_runtime_key: Some(other.runtime_key),
-            ..RocmCliConfig::default()
-        };
-
-        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
-        assert!(!plan.was_active);
-        assert!(
-            plan.clears_default_runtime,
-            "target is the only install with the stale default runtime_id"
-        );
-
-        // Simulate another process installing a sibling that shares the
-        // target's runtime_id while the uninstall confirmation prompt was
-        // waiting on the user; the default would then survive on that
-        // sibling instead of being cleared.
-        write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-1",
-            shared_runtime_id,
-            "7.13.1",
-            30,
-        )?;
-
-        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
-        assert!(
-            result.is_err(),
-            "revalidation should refuse a plan whose clears_default_runtime changed since it was shown"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_revalidation_detects_install_root_decision_change() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root-decision");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-        assert_eq!(plan.install_root_decision, InstallRootDecision::Remove);
-
-        // Simulate another process overwriting the in-tree marker with one
-        // for a different install while the uninstall confirmation prompt
-        // was waiting on the user; the registry entry (and thus runtime_id
-        // and install_root) is left untouched, so only install_root_decision
-        // should differ from the plan the user approved.
-        let mut mismatched_marker = manifest.clone();
-        mismatched_marker.runtime_key = "some-other-runtime-key".to_owned();
-        fs::write(
-            manifest.install_root.join(".rocm-cli-runtime.json"),
-            serde_json::to_vec_pretty(&mismatched_marker)?,
-        )?;
-
-        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
-        assert!(
-            result.is_err(),
-            "revalidation should refuse a plan whose install_root_decision changed since it was shown"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn confirm_and_revalidate_runtime_uninstall_refuses_state_changed_during_confirmation()
-    -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-confirm-and-revalidate-wiring");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-        config.save(&paths)?;
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-        assert!(plan.will_remove_install_root());
-
-        // The injected "confirm" closure plays the role of the user
-        // approving the prompt; it relocates the install root before
-        // returning, simulating another process racing the confirmation
-        // exactly as `runtime_uninstall_revalidation_detects_install_root_change`
-        // does for the leaf function. This exercises the actual
-        // confirm -> reload-config -> revalidate wiring, not just the
-        // revalidation function in isolation: if the reload/revalidate
-        // calls were ever dropped from `confirm_and_revalidate_runtime_uninstall`,
-        // the call would silently succeed on the stale plan and this
-        // test's `result.is_err()` assertion below would fail, catching
-        // the regression.
-        let relocated_root = paths
-            .data_dir
-            .join("runtimes")
-            .join("wheel")
-            .join("relocated-install-root");
-        let install_root = manifest.install_root.clone();
-        let runtime_key = manifest.runtime_key.clone();
-        let paths_for_confirm = paths.clone();
-        let result = confirm_and_revalidate_runtime_uninstall(&paths, plan, move || {
-            fs::rename(&install_root, &relocated_root)?;
-            let mut relocated_manifest = manifest.clone();
-            relocated_manifest.install_root = relocated_root.clone();
-            fs::write(
-                relocated_root.join(".rocm-cli-runtime.json"),
-                serde_json::to_vec_pretty(&relocated_manifest)?,
-            )?;
-            fs::write(
-                runtime_manifest_path(&paths_for_confirm, &runtime_key),
-                serde_json::to_vec_pretty(&relocated_manifest)?,
-            )?;
-            Ok(true)
-        });
-
-        assert!(
-            result.is_err(),
-            "confirm_and_revalidate_runtime_uninstall must refuse to proceed when the runtime \
-             state changed while the confirmation callback was running"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_clears_default_runtime_id_for_last_sibling_even_when_not_active()
-    -> Result<()> {
-        // `runtime_id` is shared across side-by-side installs of the same
-        // release, while `runtime_key` is unique per install and
-        // `config.default_runtime_id` tracks by the shared `runtime_id`,
-        // independently of `config.active_runtime_key`. A stale
-        // `default_runtime_id` left over from before a *different* runtime
-        // was activated must still be cleared once its last remaining
-        // sibling is uninstalled — even though that sibling is not, and
-        // never was, the active runtime (`was_active` is pinned to the
-        // unrelated active runtime and never falls back to the
-        // default-id-uniqueness check while that active runtime is still
-        // installed).
-        let (root, paths) = test_paths("runtime-uninstall-shared-default-id");
-        let shared_runtime_id = "therock-release:gfx120X-all";
-        let manifest_a = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0-a",
-            shared_runtime_id,
-            "7.13.0",
-            20,
-        )?;
-        let manifest_b = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0-b",
-            shared_runtime_id,
-            "7.13.0",
-            21,
-        )?;
-        let active_manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx1151-7-14-0",
-            "therock-release:gfx1151",
-            "7.14.0",
-            22,
-        )?;
-        // `default_runtime_id` is stale, left over from before
-        // `active_manifest` was activated; `active_runtime_key` now points
-        // at a manifest with a completely different `runtime_id`.
-        let mut config = RocmCliConfig {
-            default_runtime_id: Some(shared_runtime_id.to_owned()),
-            active_runtime_key: Some(active_manifest.runtime_key.clone()),
-            ..RocmCliConfig::default()
-        };
-        config.save(&paths)?;
-
-        // Removing the first sibling leaves the other one behind, so the
-        // stale default (which still resolves to a real, remaining install)
-        // must not be cleared.
-        let plan_b = plan_runtime_uninstall(&paths, &config, &manifest_b.runtime_key)?;
-        assert!(!plan_b.was_active);
-        assert!(!plan_b.clears_default_runtime);
-        let removed_b = uninstall_runtime(&paths, &mut config, &manifest_b.runtime_key)?;
-        assert!(!removed_b.was_active);
-        assert!(!removed_b.default_runtime_cleared);
-        assert_eq!(
-            config.default_runtime_id.as_deref(),
-            Some(shared_runtime_id)
-        );
-
-        // Removing the last remaining sibling must clear the stale default
-        // even though this install was never the active one, and
-        // `active_runtime_key` still points at the unrelated, still-installed
-        // `active_manifest` throughout.
-        let plan_a = plan_runtime_uninstall(&paths, &config, &manifest_a.runtime_key)?;
-        assert!(!plan_a.was_active);
-        assert!(plan_a.clears_default_runtime);
-        let removed_a = uninstall_runtime(&paths, &mut config, &manifest_a.runtime_key)?;
-        assert!(!removed_a.was_active);
-        assert!(removed_a.default_runtime_cleared);
-        assert_eq!(config.default_runtime_id, None);
-        assert_eq!(
-            config.active_runtime_key.as_deref(),
-            Some(active_manifest.runtime_key.as_str())
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runtime_adopt_preserves_venv_python_symlink_path() -> Result<()> {
-        use std::os::unix::fs::symlink;
-
-        let (root, paths) = test_paths("runtime-adopt-python-symlink");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join("bin");
-        let system_python = root.join("python3.12");
-        let python_executable = scripts_dir.join("python");
-        let sdk_root = external_root.join("rocm_sdk");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&scripts_dir)?;
-        fs::create_dir_all(&sdk_bin)?;
-        let amdhip = sdk_bin.join("libamdhip64.so");
-        let hipblas = sdk_bin.join("libhipblas.so");
-        fs::write(&system_python, "python")?;
-        fs::write(&amdhip, "amdhip")?;
-        fs::write(&hipblas, "hipblas")?;
-        symlink(&system_python, &python_executable)?;
-
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable: python_executable.clone(),
-                install_root: external_root,
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-symlink-python".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
-
-        assert_eq!(
-            adopted.python_executable.as_deref(),
-            Some(python_executable.as_path().to_string_lossy().as_ref())
-        );
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_adopt_rejects_runtime_id_without_family() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-no-family");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python_executable = scripts_dir.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
-        let sdk_root = external_root.join("rocm_sdk");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&scripts_dir)?;
-        fs::create_dir_all(&sdk_bin)?;
-        fs::write(&python_executable, "python")?;
-
-        let error = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root,
-                runtime_id: "therock-release".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root),
-                bin_path: Some(sdk_bin),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("must include a TheRock family suffix"));
-        assert!(!runtime_registry_dir(&paths).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_adopt_refuses_to_overwrite_without_replace() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt-replace");
-        let external_root = root.join("external-therock-venv");
-        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
-        let python_executable = scripts_dir.join(if cfg!(windows) {
-            "python.exe"
-        } else {
-            "python"
-        });
-        let sdk_root = external_root.join("rocm_sdk");
-        let sdk_bin = sdk_root.join("bin");
-        fs::create_dir_all(&scripts_dir)?;
-        fs::create_dir_all(&sdk_bin)?;
-        let amdhip = sdk_bin.join(if cfg!(windows) {
-            "amdhip64_7.dll"
-        } else {
-            "libamdhip64.so"
-        });
-        let hipblas = sdk_bin.join(if cfg!(windows) {
-            "hipblas.dll"
-        } else {
-            "libhipblas.so"
-        });
-        fs::write(&python_executable, "python")?;
-        fs::write(&amdhip, "amdhip")?;
-        fs::write(&hipblas, "hipblas")?;
-
-        let probe = therock::RocmSdkPythonProbe {
-            import_ok: true,
-            rocm_sdk_version: Some("7.13.0".to_owned()),
-            root_path: Some(sdk_root.clone()),
-            bin_path: Some(sdk_bin.clone()),
-            runtime_roots: vec![sdk_root],
-            bin_paths: vec![sdk_bin.clone()],
-            library_paths: vec![sdk_bin],
-            resolved_libraries: vec![
-                therock::RocmSdkLibraryProbe {
-                    shortname: "amdhip64".to_owned(),
-                    paths: vec![amdhip],
-                },
-                therock::RocmSdkLibraryProbe {
-                    shortname: "hipblas".to_owned(),
-                    paths: vec![hipblas],
-                },
-            ],
-            ..therock::RocmSdkPythonProbe::default()
-        };
-        let request = AdoptRuntimeRequest {
-            python_executable: python_executable.clone(),
-            install_root: external_root.clone(),
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-            replace: false,
-        };
-
-        adopt_runtime_from_probe(&paths, request.clone(), probe.clone())?;
-        let error = adopt_runtime_from_probe(&paths, request, probe.clone())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("already exists"));
-
-        adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root,
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: true,
-            },
-            probe,
-        )?;
 
         let _ = fs::remove_dir_all(root);
         Ok(())

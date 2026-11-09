@@ -25,7 +25,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
 /// A request to approve or deny a CLI-side action. Carries display data only;

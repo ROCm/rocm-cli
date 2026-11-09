@@ -235,9 +235,12 @@ def main() -> int:
         env=env,
         expect_failure=True,
     )
+    # Native Windows refuses vLLM before it looks for a runtime.
     assert_contains(
         engine_install,
-        "no active ROCm runtime is configured",
+        "vLLM is not supported on native Windows"
+        if platform.system() == "Windows"
+        else "no active ROCm runtime is configured",
         "rocm engines install requires exact runtime",
     )
 
@@ -431,7 +434,13 @@ def main() -> int:
         env=env,
         expect_failure=True,
     )
-    assert_contains(vllm_gpu_required, "gpu_required", "vllm reject required gpu")
+    assert_contains(
+        vllm_gpu_required,
+        "vLLM is not supported on native Windows"
+        if platform.system() == "Windows"
+        else "gpu_required",
+        "vllm reject required gpu",
+    )
     assert_not_contains(
         vllm_gpu_required,
         "CPU fallback",
@@ -457,7 +466,9 @@ def main() -> int:
     )
     assert_contains(
         vllm_cpu_serve,
-        "CPU mode is not a fallback path",
+        "vLLM is not supported on native Windows"
+        if platform.system() == "Windows"
+        else "CPU mode is not a fallback path",
         "rocm vllm reject cpu serve",
     )
 

@@ -1,6 +1,6 @@
 Feature: Model catalog listing
 
-  # ROCMAI-555: the AIM engine recipe (aim-qwen3.5-9b) is curated out of the
+  # ROCMAI-555: the AIM engine recipe (Qwen/Qwen3.5-9B) is curated out of the
   # default `rocm model` view (it is not `featured`), so only `--verbose`
   # actually lists it. `model` and its `models` alias share one parser branch,
   # so exercising `model --verbose` covers the epic's "rocm model or rocm
@@ -13,8 +13,9 @@ Feature: Model catalog listing
   # The epic names two reasons a listed AIM image can be unusable: an
   # unsupported GPU family, or no Docker. Only the Docker check runs at the
   # catalog layer today (see `engine_ruled_out_by_platform` in main.rs);
-  # GPU-family fit is a `rocm serve`/`rocm diagnose --model` readiness check,
-  # not a catalog property. This plants a `docker` that always fails so the
+  # GPU-family fit is a property of the entry (`supported_gfx_families`, shown by
+  # `--verbose`) but is only enforced by `rocm serve`, not by the listing.
+  # This plants a `docker` that always fails so the
   # unavailable branch is exercised deterministically on every host, including
   # ones where Docker really is reachable (an earlier variant compared against
   # the host's real Docker state, which asserted a different outcome per host).
@@ -25,3 +26,14 @@ Feature: Model catalog listing
     Given no Docker daemon is reachable
     When the user asks for the model catalog in verbose detail
     Then the catalog's AIM entry is flagged unavailable for lack of Docker
+
+  # ROCMAI-556: an AIM entry pins an image that may since have been withdrawn, so
+  # `rocm model --verbose` warns once the entry was last verified more than 180
+  # days ago. The entry is shipped with a verification timestamp; this plants a
+  # signed catalog whose timestamp is decades old, so the warning is exercised
+  # without depending on the date the suite runs.
+  @id:model-catalog-warns-on-stale-aim-entry
+  Scenario: model-catalog-03 - A stale AIM catalog entry is flagged in rocm model --verbose
+    Given a recipe catalog whose AIM entry was last verified long ago
+    When the user asks for the model catalog in verbose detail
+    Then the catalog warns that the AIM entry may no longer be current

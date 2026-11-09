@@ -6,9 +6,12 @@ Feature: Automation watchers
   # per-entry approve/reject controls are gated on "pending"). This feature
   # pins the enable/disable/mode-confirmation slice, the proposal-history
   # listing's unit formatting, the bare listing's tolerance of a torn
-  # audit-log tail, and how the audit log and proposal history are kept
-  # bounded; the watcher/daemon trigger behaviour itself is covered
-  # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
+  # audit-log tail, how the next write repairs one, and how the audit log
+  # and proposal history are kept
+  # bounded, and that a repeated GPU thermal alert does not queue a second stop
+  # request; the rest of the watcher/daemon trigger behaviour is covered
+  # elsewhere. No GPU and no network (the one daemon-driven scenario takes its
+  # alerts from the daemon's loopback webhook), so it runs on the mock lane
   # every PR.
 
   @id:automations-enable-confirms-mode
@@ -117,7 +120,7 @@ Feature: Automation watchers
   # automations-07 only exercises a single rollover: a live file at the cap
   # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
   # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
-  # pinned only by unit tests in `automation.rs`. This seeds a full chain of
+  # pinned only by unit tests in `jsonl_store.rs`. This seeds a full chain of
   # four already-rotated generations plus a live file at the cap, forces one
   # more rotation, and checks the whole chain shifted down by one and the
   # oldest generation's content is gone, not just that `.1` exists.
@@ -127,3 +130,70 @@ Feature: Automation watchers
     When the user selects a permissions mode
     Then each rotated generation holds what the previous one held
     And the oldest previous generation is gone
+
+  # A write that was cut off leaves a torn last line, and the next append
+  # repairs it by writing a clean copy of the audit log beside it and renaming
+  # that over the original. When the copy cannot be made — a full disk, or on
+  # Windows another program holding the log open without delete sharing — the
+  # repair used to give up: the debris stayed, the CLI warned that it failed to
+  # write the audit event on every command that records one, and the event was
+  # lost. The repair now falls back to cutting the debris in place. A directory
+  # that takes no new files is the same failure without filling a disk, so this
+  # drives it through `rocm config set-permissions`, a command the CLI audits.
+  # The fault is a directory permission, which does not bind root (the
+  # self-hosted WSL2 guest runs the suite as root), so `@requires-dir-permissions`
+  # skips it there rather than let it pass without testing anything. The unit
+  # tests in `jsonl_store.rs` cover the other triggers (an injected failure of
+  # each step, and on Windows a handle without delete sharing).
+  @id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced @requires-os:linux @requires-dir-permissions
+  Scenario: automations-10 - A command still records its audit event when the torn audit log cannot be replaced
+    Given the audit event log ends in a torn, unterminated line
+    And the audit log's directory takes no new files
+    When the user selects a permissions mode
+    Then the CLI confirms the permissions mode
+    And the CLI prints no warning about the audit log
+    And the audit log keeps its earlier record, drops the torn line and records the permissions change
+
+  # The background helper's lifecycle (ROCMAI-827). Enabling a watcher starts a
+  # detached `rocm daemon`; it used to run forever after that, so a helper
+  # started by `serve` or `automations enable` outlived every service and every
+  # watcher. It now exits on its own once no watcher is enabled. This drives the
+  # real spawn — no suppression marker — and checks the `helper:` line the
+  # enable prints together with the process it claims to have started, then
+  # that disabling the only watcher makes that process exit. The other half,
+  # that `serve` with no watcher enabled starts no helper at all, needs a real
+  # serve and is `serve-stop-leaves-no-background-helper` on the GPU lane.
+  # Config-only — no GPU or network — so it runs on the mock lane every PR.
+  @id:automations-helper-stops-when-no-watcher-is-enabled
+  Scenario: automations-11 - The background helper stops on its own once no watcher is enabled
+    Given no automation watcher is enabled
+    When the user enables an automation watcher in observe mode
+    Then the CLI reports starting the background helper and it is running
+    When the user disables the watcher
+    Then the CLI confirms the watcher is disabled
+    And the background helper stops on its own
+
+  # The gpu-thermal-protect watcher queues a request to stop the hot server and
+  # waits for a person to review it. While that request is waiting, the same
+  # alert arriving again must not queue another, or the review list fills with
+  # copies of one request. The check for a waiting request once read only the
+  # most recent proposals, so a stop request with enough newer proposals queued
+  # behind it was missed and a second one was queued. This drives the real
+  # daemon: the alerts reach it through its loopback webhook (`rocmd run
+  # --local-webhook-port`), the same dispatch a telemetry alert takes, and the
+  # proposals are read back from the store `rocm automations` lists. The
+  # newer proposals are seeded directly, one more than the store keeps of
+  # reviewed ones, so they sit beyond a recent-window read of that size.
+  @id:automations-thermal-stop-not-requeued-behind-newer-proposals
+  @requires-os:linux
+  Scenario: automations-12 - A repeated thermal alert queues no second stop request while the first waits behind newer proposals
+    Given a fresh CLI configuration
+    And the GPU thermal-protection watcher is enabled in propose mode
+    And a ready managed model server
+    And the automation daemon is running with its local webhook
+    When a GPU thermal alert for the server reaches the daemon
+    Then one stop request for the server is waiting for review
+    When more proposals for other servers are queued after it than the history keeps
+    And a GPU thermal alert for the server reaches the daemon again
+    Then the daemon records that a stop request is already waiting for the server
+    And only one stop request for the server is waiting for review

@@ -41,6 +41,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod service_stop_steps;
+    pub mod service_unknown_id_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
@@ -66,6 +67,13 @@ pub struct E2eWorld {
     /// so the port keeps answering, as a started ComfyUI's does, for the rest
     /// of the scenario.
     pub comfyui_port_listener: Option<std::net::TcpListener>,
+    /// Listener that deliberately occupies the default serve port while a real
+    /// `rocm serve` invocation proves automatic allocation advances past it.
+    pub automatic_port_guard: Option<std::net::TcpListener>,
+    /// How many requests a stand-in Hugging Face endpoint has answered, for
+    /// scenarios that must show the CLI did or did not reach out.
+    /// The serving thread stops once the World drops its handle.
+    pub hub_requests: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -75,6 +83,9 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// One entry per `rocm serve` run a scenario made, with the stderr and exit
+    /// code `cli_outputs` has no room for (see `e2e_cucumber::serve_plan`).
+    pub serve_runs: Option<Vec<e2e_cucumber::serve_plan::ServeRun>>,
     /// Wall-clock time the last measured `rocm` invocation took, for scenarios
     /// where the *duration* bounds the behaviour under test —
     /// `service-cleanup-07`, where a prune that returned while the managed-launch
@@ -168,6 +179,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The background helper (`rocm daemon`) a scenario saw running, captured
+    /// while it was known live, so `Drop` can stop it by a verified identity if
+    /// an earlier step failed before the scenario disabled the watcher.
+    pub helper_identity: Option<rocm_core::ProcessIdentity>,
     /// A live process a scenario recorded as a managed server's own, so a stop
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
@@ -184,6 +199,10 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// The `rocmd run` a daemon-driven automations scenario started, with the
+    /// local webhook it listens on. Held here so `Drop` can kill and reap it
+    /// whatever the scenario's outcome.
+    pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -311,6 +330,8 @@ impl Default for E2eWorld {
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
+            automatic_port_guard: None,
+            hub_requests: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
@@ -319,6 +340,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            serve_runs: None,
             cli_elapsed: None,
             remote_env: Vec::new(),
             launch_release: None,
@@ -337,8 +359,10 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            helper_identity: None,
             recorded_process: None,
             dash_report_refused: None,
+            automation_daemon: None,
         }
     }
 }
@@ -601,10 +625,17 @@ impl E2eWorld {
     /// on every platform, instead of depending on an ambient system `/opt/rocm`
     /// that exists on the MI300X box but not on the Strix Windows runner.
     pub fn plant_unmanaged_rocm(&mut self) {
+        self.plant_unmanaged_rocm_reporting("6.0.0");
+    }
+
+    /// [`Self::plant_unmanaged_rocm`], with the version its `.info/version`
+    /// reports chosen by the scenario — for the install preview's note about a
+    /// host ROCm newer than the SDK it selects.
+    pub fn plant_unmanaged_rocm_reporting(&mut self, version: &str) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let rocm = root.path().join("legacy-rocm");
         std::fs::create_dir_all(rocm.join(".info")).expect("failed to create legacy rocm dir");
-        std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
+        std::fs::write(rocm.join(".info").join("version"), format!("{version}\n"))
             .expect("failed to write legacy rocm marker");
         self.legacy_rocm_path = Some(rocm);
     }
@@ -657,6 +688,11 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        // Stop the automation daemon before the isolated directory it writes its
+        // state and logs into is removed, so it never outlives the scenario.
+        if let Some(daemon) = self.automation_daemon.take() {
+            drop(daemon);
+        }
         // Let `service-cleanup-07`'s staged launch finish and join it, so its last
         // write lands while the isolated root still exists rather than panicking
         // in a detached thread after the TempDir below is gone. Dropping the
@@ -672,6 +708,16 @@ impl Drop for E2eWorld {
         if let Some(mut process) = self.recorded_process.take() {
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // A scenario that enabled a watcher started a real detached `rocm daemon`,
+        // which only exits once the watcher is disabled. If a step failed first,
+        // nothing else would stop it, and it would keep polling a config dir
+        // that is about to be deleted.
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::stop_leftover_helper(
+                &self.app_paths(),
+                self.helper_identity.take(),
+            );
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();
@@ -689,6 +735,12 @@ impl Drop for E2eWorld {
         // failed stop changes the next attempt's meaning, does read it.
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
+        }
+        // A scenario that made the audit directory read-only must give it back
+        // before the TempDir below tries to remove it, even if a step panicked.
+        #[cfg(unix)]
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -745,7 +797,7 @@ fn stop_managed_services(root: &std::path::Path) -> String {
             Ok(out) => format!(
                 "{service_id}: STOP FAILED (rc={}) {}",
                 out.status.code().unwrap_or(-1),
-                last_line(&String::from_utf8_lossy(&out.stderr))
+                e2e_cucumber::stop_failure_summary(&String::from_utf8_lossy(&out.stderr))
             ),
             Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
         });
@@ -754,21 +806,6 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         return format!("no services recorded in {}", services_dir.display());
     }
     outcomes.join("; ")
-}
-
-/// The last non-blank line of `text`, clipped, for a one-line failure summary.
-fn last_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > 200 {
-        format!("{}…", line.chars().take(200).collect::<String>())
-    } else {
-        line.to_owned()
-    }
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────
@@ -938,10 +975,27 @@ pub fn run_rocm_with_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (String, String, i32) {
+    run_rocm_with_env_and_unset(world, args, envs, &[])
+}
+
+/// Like [`run_rocm_with_env`], but first removes each of `unset` from the env.
+///
+/// For a scenario about what the CLI resolves when one of the
+/// `ROCM_CLI_*_DIR` settings is left out. Everything the scenario keeps set
+/// still points inside its isolated root.
+pub fn run_rocm_with_env_and_unset(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    unset: &[&str],
+) -> (String, String, i32) {
     let binary = rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -1283,7 +1337,7 @@ async fn main() {
     // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
     // at one persistent dir (see `isolate_env`): readers extracting an archive
     // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
-    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // runtime tree after another scenario's extract (`uv.rs`, `therock/process.rs`,
     // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
     // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
     // lane actually exports (e.g. a missing GPU driver reads `false` while a
@@ -1320,9 +1374,7 @@ async fn main() {
                 // genuinely slow serve, e.g. a large model) takes precedence;
                 // otherwise fall back to any xfail matrix override (fail-fast for
                 // a known-bug serve). Absent both → the step default.
-                world.serve_timeout_override = decl
-                    .serve_timeout_secs
-                    .or_else(|| matrix.serve_timeout_for(id, cap, engine));
+                world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
             Box::pin(async {})

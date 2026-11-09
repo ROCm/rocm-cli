@@ -13,8 +13,12 @@ The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
 `vllm` command visible to ROCm CLI.
 
-Native Windows vLLM serving is skipped in this adapter. Use WSL or Linux for vLLM
-ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
+Native Windows vLLM serving is skipped in this adapter. On native Windows,
+`rocm serve --engine vllm`, `rocm engines install vllm` and
+`rocm engines shell vllm` refuse up front with a non-zero exit, before any
+runtime check, download, or launch; `rocm engines list` shows the same decision
+as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
+serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
@@ -290,14 +294,39 @@ a tiny model. ROCm CLI helps in three ways:
   mode. For vLLM, the note also points at `--gpu-memory-utilization` as the fix.
 - **OOM failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
-  reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
-  GPU with `--gpu <index>`. It also points at
-  `rocm diagnose --symptom '<the error>'` for the full conditional remediation
-  (busy GPU versus a model that does not fit). The printed command quotes your
-  actual failing line when it can be rendered as one intact single-quoted
-  argument. A line carrying an apostrophe or terminal control bytes falls back to
-  the canonical symptom below instead of handing you a command whose quoting the
-  log text broke.
+  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
+  with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
+  for the full conditional remediation (busy GPU vs. a model that does not fit).
+  "Shows an out-of-memory error" means a line carrying an allocator-shaped
+  signature — `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
+  or a `torch.OutOfMemoryError` corroborated by an allocator message. A bare
+  `HIP error: out of memory`, a kernel OOM-killer line, or vLLM's generic
+  `EngineCore` wrapper deliberately gets no memory hint: each of those also
+  appears for failures that have nothing to do with memory, and the same
+  threshold governs `rocm diagnose`, so hinting here would contradict the
+  diagnosis there.
+
+  The printed command quotes your actual failing line when it can be rendered as
+  one intact single-quoted argument; a line carrying an apostrophe or terminal
+  control bytes falls back to the canonical symptom below rather than handing you
+  a command whose quoting the log text broke. The `rocm serve` summary's
+  out-of-memory note applies that same guard, from the same shared helper, to the
+  same engine log — so neither surface can hand you a half-quoted command the
+  other would reject.
+
+  Sharing the guard is not the same as the two always printing the *same*
+  command, and for a **colourised** line they do not. The engine reads the log
+  first, refuses the raw escape-bearing line, and prints the canonical symptom.
+  Its failure message then echoes the log tail back into that same shared file as
+  the rows a terminal would have drawn, and the serve summary reads afterwards —
+  so the note quotes that rendered row instead. Both arguments are sound: the row
+  is text the terminal really printed, it carries no control bytes, and anything
+  the guard accepts is diagnosable. They are two reads of a file that changed in
+  between, not a disagreement about the rule. Lines rocm-cli wrote into that log
+  itself are skipped when picking the line, so the note quotes *your* error
+  rather than the hint printed above it: the supervisor and the engine share one
+  log file, and the engine's failure — hint included — is appended to it after
+  the error that caused it.
 
 Explicitly, the workaround for an OOM on a shared card is:
 

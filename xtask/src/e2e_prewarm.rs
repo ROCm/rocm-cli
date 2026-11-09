@@ -581,7 +581,7 @@ fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
     }
     // Runtime keys only ever carry the YYYYMMDD order; reorder an MMDDYYYY
     // pin before comparing (same digit-position heuristic as
-    // `normalize_requested_build_date` in `apps/rocm/src/therock.rs`).
+    // `normalize_requested_build_date` in `apps/rocm/src/therock/version.rs`).
     let yyyymmdd = if digits_only.starts_with("20") {
         digits_only
     } else if digits_only[4..].starts_with("20") {

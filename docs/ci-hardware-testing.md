@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # CI hardware (GPU / WSL) testing
 
-The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
+The hosted CI (`ubuntu-24.04` and `ubuntu-26.04`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
 dedicated hardware layer covers that gap by running the same cucumber-rs E2E
 suite on dedicated self-hosted runners with real AMD GPUs.
@@ -61,7 +61,7 @@ separate tier flag or tag filter to maintain.
 
 | Job | Workflow | Platform | Runner labels |
 |---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
+| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
@@ -165,8 +165,9 @@ command under test exists to reach. That costs no coverage today, because
 way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
-`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
-entry must be present too. `rocm examine` reports the verdict as
+`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` must be present and
+the loader must be able to find it (an `ldconfig` entry, a directory on
+`LD_LIBRARY_PATH`, or the directory of the runtime that opens it) too. `rocm examine` reports the verdict as
 `driver_status: wsl_rocdxg_ready`; anything else (`wsl_rocdxg_missing`,
 `wsl_gpu_plumbing_missing`) means the runtime cannot reach the device even
 though `detected_gfx_target` still names it, because that target is read from
@@ -191,10 +192,32 @@ one channel's result silently overwriting the other.
 On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
 wiki, overwriting it each night (the page header names the run, commit and
-date). It skips cancelled runs and runs that consolidated no platforms. One-time
+date). It skips cancelled runs and runs that consolidated no platforms. It also
+skips (silently, leaving the previous page in place) when `e2e-report-nightly`
+fails, which includes any lane's `release` or `nightly` leg dying before it
+uploads its report. One-time
 setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
+
+`nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
+via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
+build results, the consolidated E2E failure total, and the `e2e-report-nightly`
+job's own result (so a lane that dies before uploading a report still fails
+the gate), and buckets commits since the last release tag into
+features/fixes/breaking changes. Unlike the wiki-publish jobs above, the
+`release-readiness-nightly` and `release-readiness-narrative` jobs have no
+`main`/repo guard — they run on any branch this workflow is dispatched on.
+The narrative job drafts prose from those facts via `actions/ai-inference`
+(needs a Copilot-licensed PAT in the `COPILOT_PAT` repo secret; allowed to
+fail without blocking the table). `publish-release-readiness-wiki` then
+publishes the verdict table, plus the narrative if one was produced, to the
+`Release-Readiness` wiki page, gated on `main`/repo like `publish-e2e-wiki`
+and sharing its one-time wiki setup and skip-on-degenerate-table guard — but
+unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
+"evidence unavailable" notice) when `release-readiness-nightly` fails
+outright, instead of leaving the wiki showing a stale verdict with no sign
+it's stale.
 
 The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
 `e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
@@ -295,8 +318,12 @@ ordinary PR run is unaffected. Each leg uploads its own artifact (the
 versions share one pre-warmed runtime tree rather than needing separate ones.
 `e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
 pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
-release-branch push runs all six `channel` × `sdk_version` combinations on
-that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+release-branch push runs four of the six `channel` × `sdk_version`
+combinations on that lane: the `nightly` channel is excluded from `n-1`/`n-2`,
+because it only carries the latest (pre-)release builds and cannot resolve the
+pinned released versions (`rocm install sdk` fails with "no mutually compatible
+TheRock ... versions"); those versions are covered by the `release` channel.
+`rad3`/`mi350p` are nightly-only (above) and don't run this matrix
 at all.
 
 `serve` is narrower than `heavy`: it matches only
@@ -466,6 +493,18 @@ consolidated report, are in the required list anymore (`ci.yml`'s own mock
 prefixed but distinct from the self-hosted names above, so no name string
 actually collides). An offline or unclaimed self-hosted runner can no longer
 block a merge.
+
+**Hosted Ubuntu images.** `build-and-test`, `test`, `e2e` and `remote-ssh`
+each run on both `ubuntu-24.04` and `ubuntu-26.04`. The 24.04 legs keep the
+check names these jobs always had, and three of those are required
+(`build-and-test`, `Test (affected crates)`, `E2E tests`);
+`remote control channel (containerised)` is not required on either image. The
+26.04 legs report with an `(ubuntu-26.04)` suffix, and none of those names is a
+required check yet (confirmed 2026-11-02), so a failure that occurs only on
+26.04 shows red but does not block a merge. Making 26.04 blocking takes an
+admin adding `build-and-test (ubuntu-26.04)`,
+`Test (affected crates) (ubuntu-26.04)` and `E2E tests (ubuntu-26.04)` to the
+required list.
 
 ## Fork safety
 
