@@ -33,8 +33,8 @@ use std::time::Duration;
 /// reserved/in use, range exhausted, other bind error) — such a failure
 /// returns before `abandon_failed_managed_launch` ever runs, so nothing else
 /// would clear it. Scoped to the spawn call only, mirroring
-/// [`run_attached_service`](super::run_attached_service)'s identical guard: a later failure (the readiness
-/// wait, `record.write()`) leaves a record a live child actually owns, so it
+/// [`run_attached_service`](super::run_attached_service)'s identical guard: a later
+/// failure (the readiness wait, `record.write()`) leaves a record a live child actually owns, so it
 /// must not also wipe that key.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(

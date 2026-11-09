@@ -142,10 +142,10 @@ pub(crate) struct ManagedLaunchReport {
 /// Either an already-live service (nothing spawned) or a freshly spawned engine
 /// child that is `running` but not yet HTTP-ready.
 ///
-/// Split out of [`start_managed_service`](super::start_managed_service) so the attached (`--verbose` /
-/// `--foreground`) serve path can spawn the very same detached child and stream
-/// its log live from the first line — including startup — instead of blocking on
-/// the readiness wait before any output appears.
+/// Split out of [`start_managed_service`](super::start_managed_service) so the
+/// attached (`--verbose` / `--foreground`) serve path can spawn the very same
+/// detached child and stream its log live from the first line — including
+/// startup — instead of blocking on the readiness wait before any output appears.
 pub(super) enum ManagedSpawn {
     AlreadyRunning(ManagedLaunchReport),
     // `ManagedServiceRecord` is large; box it so the two variants stay a similar
@@ -159,8 +159,8 @@ pub(super) enum ManagedSpawn {
 /// Spawn the detached engine child shared by the managed (background) and
 /// attached (`--verbose`/`--foreground`) serve paths. Returns before the HTTP
 /// readiness wait; callers decide whether to block on readiness
-/// ([`start_managed_service`](super::start_managed_service)) or start tailing the log immediately
-/// ([`run_attached_service`](super::run_attached_service)).
+/// ([`start_managed_service`](super::start_managed_service)) or start tailing the
+/// log immediately ([`run_attached_service`](super::run_attached_service)).
 ///
 /// The whole body is one serialized transaction under the shared allocation
 /// lock: duplicate detection, live-reservation refresh, candidate leasing,

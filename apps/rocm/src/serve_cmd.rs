@@ -1290,7 +1290,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 notes,
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
-            // in service_launch/start.rs; see its rationale for why the tag below is currently inert.
+            // in service_launch/start.rs; see its rationale for why the tag below is
+            // currently inert.
             // codeql[rust/cleartext-logging]
             print!("{}", serve_summary::render_summary(&summary));
         } else {

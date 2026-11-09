@@ -233,9 +233,9 @@ pub(crate) fn resolve_serve_port(
             if let Some(owner) = reserved.iter().find(|entry| entry.port == port) {
                 // The "stop it" advice below is proven, not just worded: see
                 // `stopping_the_reserving_record_frees_its_explicit_port_for_reuse`
-                // in `service_launch/launch_transaction.rs`, which recreates the exact on-disk status
-                // transition `rocm services stop` performs and confirms the same
-                // explicit port then resolves. A full CLI-level E2E for this needs
+                // in `service_launch/launch_transaction.rs`, which recreates the exact
+                // on-disk status transition `rocm services stop` performs and confirms
+                // the same explicit port then resolves. A full CLI-level E2E for this needs
                 // a real GPU, since reaching this branch requires a completed
                 // model/engine resolution first.
                 bail!("{}", reserved_message(DEFAULT_LOCAL_HOST, port, owner));
