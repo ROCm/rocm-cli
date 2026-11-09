@@ -397,7 +397,7 @@ pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    publish_rename_first(tmp, path, fs::rename, replace_file_windows)
+    publish_rename_first(tmp, path, rename_file, replace_file_windows)
 }
 
 /// The Windows publish order, with both steps passed in so a test can check it
@@ -464,7 +464,9 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
 }
 
 /// `fs::rename` with both paths borrowed, the shape `recover_partial_replace`
-/// takes.
+/// and `publish_rename_first` take. `fs::rename` itself is generic over
+/// `AsRef<Path>`, so passed directly it is pinned to one lifetime per argument
+/// and does not satisfy their `FnOnce(&Path, &Path)` bounds.
 #[cfg(windows)]
 fn rename_file(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
