@@ -21,22 +21,26 @@
 //! describe the `uninstall` command's own, exclusive logic.
 //!
 //! This module owns: the plan types (`UninstallOptions`, `UninstallPlan`,
-//! `UninstallPlanEntry`), building the plan (`build_uninstall_plan`,
+//! `UninstallPlanEntry`), the `PlanAudience` a rendered plan is written for
+//! (a person at a terminal, a captured caller, or the assistant's preview),
+//! which decides what the dry-run footer says comes next, building the plan (`build_uninstall_plan`,
 //! `plan_installed_binaries`, and the installed-binary/shared-cache
 //! discovery helpers behind them), rendering it (`render_uninstall_dry_run`,
 //! `render_uninstall_plan`), the `[y/N]` confirmation prompt
 //! (`confirm_uninstall`), and the filesystem removal primitive both
 //! `uninstall.rs` and `storage.rs` call to carry a plan out (`remove_path`,
 //! and the entry-resolution helpers behind it). `uninstall.rs` calls into it
-//! for `UninstallOptions`/`UninstallPlan`/`build_uninstall_plan`/
+//! for `PlanAudience`/`UninstallOptions`/`UninstallPlan`/`build_uninstall_plan`/
 //! `confirm_uninstall`/`is_rocm_install_entry_name`/`remove_path`/
 //! `render_uninstall_plan`; `storage.rs` calls into it for
 //! `UninstallPlan`/`UninstallPlanEntry`/`confirm_uninstall`; `runtimes_cmd.rs`
 //! calls into it for `confirm_uninstall` (the same `[y/N]` prompt, reused for
 //! `rocm runtimes uninstall`); `chat/mcp_bridge.rs` calls into it for
 //! `render_uninstall_dry_run` (the deterministic uninstall-preview tool
-//! result); `deletion_properties.rs`'s recursive-deletion property tests call
-//! into it for `UninstallOptions`/`build_uninstall_plan`/`remove_path`/
+//! result, which renders for `PlanAudience::Assistant` itself and so does not
+//! import the type); `deletion_properties.rs`'s recursive-deletion property
+//! tests call into it for `PlanAudience` (the `uninstall_case` property renders
+//! as `Captured`)/`UninstallOptions`/`build_uninstall_plan`/`remove_path`/
 //! `render_uninstall_plan`.
 
 use std::fmt::Write as _;
