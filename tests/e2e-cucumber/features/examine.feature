@@ -548,3 +548,53 @@ Feature: GPU detection and system inspection
     Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
     And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
     And the inspection's driver detail does not send the user to register the library with ldconfig
+
+  # `rocm examine --json` asks twice whether `rocminfo` is installed on WSL: the
+  # host summary (`summary.wsl.rocminfo`) and the examination (`wsl.rocminfo`).
+  # They used to use two different PATH lookups and could disagree; they now use
+  # one, and these scenarios hold the two answers level on the cases where
+  # the old lookups differed. The planted WSL machine is the one `examine-32` uses
+  # (a simulated host root with `/dev/dxg`); the runner's own PATH entries that
+  # hold a `rocminfo` are left out, so a runner with ROCm installed cannot be the
+  # reason a tool reads as found. The stand-in `rocminfo` prints nothing, so the
+  # scenarios are about whether the tool is found, not whether it sees a GPU.
+  #
+  # The control: a `rocminfo` in a PATH directory is found by both.
+  @id:examine-rocminfo-on-path-is-found-by-both-reports @requires-os:linux
+  Scenario: examine-35 - Both reports find a rocminfo that sits in a PATH directory
+    Given a WSL machine whose rocminfo is in a PATH directory
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # An empty PATH entry is not the current directory for this lookup: a file named
+  # `rocminfo` in the directory the command runs from is not "installed". The
+  # summary's old lookup read the entry as the current directory and said it was,
+  # while the examination's said it was not. The cost is that a program the CLI
+  # starts by bare name can still resolve from the current directory through the
+  # operating system, which the lookup does not follow.
+  @id:examine-rocminfo-in-working-directory-is-not-installed @requires-os:linux
+  Scenario: examine-36 - Neither report reads an empty PATH entry as the working directory
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is not installed
+
+  # A PATH that is not valid Unicode is searched. The examination's old lookup read
+  # PATH as a `String`, which fails on it, and so found no tool at all while the
+  # summary's old lookup still searched it.
+  @id:examine-rocminfo-on-a-path-that-is-not-unicode-is-found @requires-os:linux
+  Scenario: examine-37 - Both reports search a PATH that is not valid Unicode
+    Given a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # The control for `examine-36`: the same machine, with `.` as the first PATH
+  # entry instead of an empty one. A `.` entry is an ordinary directory, so the
+  # lookup finds the stand-in in the working directory. That only happens if the
+  # `rocm` child really runs from it, so this scenario fails when the harness does
+  # not apply the working directory, and `examine-36`'s "not installed" is then
+  # meaningful: the two differ in nothing but the entry.
+  @id:examine-rocminfo-in-working-directory-named-on-path-is-found @requires-os:linux
+  Scenario: examine-38 - Both reports find a rocminfo in the working directory when PATH names it
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
