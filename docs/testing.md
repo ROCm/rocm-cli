@@ -370,7 +370,16 @@ write is collected by a thread that starts before the request is written and is
 waited for with one deadline (`StderrCollector::finish`), returning what had
 arrived when it passes; `a_collector_stops_waiting_at_its_deadline_and_keeps_collecting`
 and `an_expired_deadline_returns_what_is_collected_without_waiting` run that on
-every platform.
+every platform. It publishes each chunk as it arrives, not each complete line, so
+a diagnostic with no trailing newline that arrived before the deadline is
+reported (`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` uses
+`printf` without a newline for that reason). When the request has failed and the
+collector is dropped, the capture is marked abandoned: what it held is released,
+and the thread, which must keep draining the pipe so a surviving descendant is not
+sent a SIGPIPE, discards and no longer forwards what arrives later, in chunks of
+a fixed size, so a long-lived daemon does not grow with every failed request
+(`an_abandoned_collector_releases_what_it_held_and_discards_what_arrives_later`,
+red without the drop handling).
 
 Starting the collector before the write also means an engine that fills its
 stderr pipe before it has drained a request larger than a pipe buffer cannot

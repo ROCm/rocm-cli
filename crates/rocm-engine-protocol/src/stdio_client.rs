@@ -70,7 +70,7 @@
 //! deadlock the write.
 
 use std::ffi::OsStr;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -332,31 +332,45 @@ fn abandon_unwritten_request(
 
 /// A child's stderr being collected on a thread of its own, from the moment it
 /// is started, whatever the main thread is doing meanwhile.
+///
+/// The thread outlives the collector when a request fails and a descendant of
+/// the engine still holds the pipe: nobody will read what it collects, but it
+/// must keep draining the pipe (closing it would hand that descendant a SIGPIPE
+/// it did not get before). So dropping the collector marks the capture
+/// abandoned, which releases what was retained and makes the thread discard
+/// whatever arrives later, in chunks of a fixed size, so a long-lived daemon does
+/// not grow with every failed request.
 struct StderrCollector {
-    /// Everything read so far, appended line by line as it arrives.
-    collected: Arc<Mutex<Vec<u8>>>,
+    shared: Arc<Mutex<Captured>>,
     /// Receives one message when the stderr has been read to its end.
     finished: mpsc::Receiver<()>,
 }
 
+/// What the collecting thread has read, and whether anyone still wants it.
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    /// Set when the collector is dropped. Read and written under the same lock as
+    /// `bytes`, so "emptied and marked" is one step as far as the reader is
+    /// concerned and the buffer cannot grow after the drop returns.
+    abandoned: bool,
+}
+
 impl StderrCollector {
-    /// Start reading `stderr`, forwarding each line to `forward` when there is
+    /// Start reading `stderr`, forwarding what arrives to `forward` when there is
     /// one (see [`collect_stderr_into`]).
     fn start(
         stderr: impl Read + Send + 'static,
         forward: Option<impl Write + Send + 'static>,
     ) -> Self {
-        let collected = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Mutex::new(Captured::default()));
         let (done, finished) = mpsc::channel();
-        let sink = Arc::clone(&collected);
+        let sink = Arc::clone(&shared);
         thread::spawn(move || {
             collect_stderr_into(stderr, forward, &sink);
             let _ = done.send(());
         });
-        Self {
-            collected,
-            finished,
-        }
+        Self { shared, finished }
     }
 
     /// What was collected, once the stderr has ended, or what has arrived by
@@ -374,11 +388,20 @@ impl StderrCollector {
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()));
             }
         }
-        self.collected
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        lock(&self.shared).bytes.clone()
     }
+}
+
+impl Drop for StderrCollector {
+    fn drop(&mut self) {
+        let mut captured = lock(&self.shared);
+        captured.abandoned = true;
+        captured.bytes = Vec::new();
+    }
+}
+
+fn lock(shared: &Mutex<Captured>) -> std::sync::MutexGuard<'_, Captured> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Read the child's whole answer from `stdout`.
@@ -409,49 +432,52 @@ fn read_response(child: &mut Child, mut stdout: impl Read) -> Result<Vec<u8>> {
 /// collection and is itself recorded as the last line.
 #[cfg(test)]
 fn collect_stderr(stderr: impl Read, forward: Option<impl Write>) -> Vec<u8> {
-    let collected = Mutex::new(Vec::new());
-    collect_stderr_into(stderr, forward, &collected);
-    collected
+    let shared = Mutex::new(Captured::default());
+    collect_stderr_into(stderr, forward, &shared);
+    shared
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
+        .bytes
 }
 
-/// [`collect_stderr`], appending to `collected` as each line arrives so a caller
-/// that stops waiting still has what was read.
+/// [`collect_stderr`], publishing into `shared` as each chunk arrives, not when a
+/// line is complete, so a caller that stops waiting has everything that had been
+/// written (a diagnostic with no trailing newline included) and not only the
+/// complete lines. Once the capture is abandoned the thread keeps reading, so the
+/// pipe stays drained, but keeps and forwards nothing.
 fn collect_stderr_into(
-    stderr: impl Read,
+    mut stderr: impl Read,
     mut forward: Option<impl Write>,
-    collected: &Mutex<Vec<u8>>,
+    shared: &Mutex<Captured>,
 ) {
-    let mut reader = io::BufReader::new(stderr);
-    let mut line = Vec::new();
+    let mut chunk = [0_u8; 4096];
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        let bytes: Vec<u8> = match stderr.read(&mut chunk) {
             Ok(0) => break,
-            Ok(_) => {
-                if let Some(sink) = forward.as_mut() {
-                    forward_best_effort(sink, &line);
-                }
-                append(collected, &line);
-            }
+            Ok(read) => chunk[..read].to_vec(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                let message = format!("failed to read engine progress: {error}\n");
-                if let Some(sink) = forward.as_mut() {
-                    forward_best_effort(sink, message.as_bytes());
-                }
-                append(collected, message.as_bytes());
+                let message = format!("failed to read engine progress: {error}\n").into_bytes();
+                publish(shared, forward.as_mut(), &message);
                 break;
             }
-        }
+        };
+        publish(shared, forward.as_mut(), &bytes);
     }
 }
 
-fn append(collected: &Mutex<Vec<u8>>, bytes: &[u8]) {
-    collected
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .extend_from_slice(bytes);
+/// Keep `bytes` and forward them, unless the capture has been abandoned.
+fn publish(shared: &Mutex<Captured>, forward: Option<&mut impl Write>, bytes: &[u8]) {
+    {
+        let mut captured = lock(shared);
+        if captured.abandoned {
+            return;
+        }
+        captured.bytes.extend_from_slice(bytes);
+    }
+    if let Some(sink) = forward {
+        forward_best_effort(sink, bytes);
+    }
 }
 
 /// Write `bytes` to the forwarding sink and drop the result: a sink that has
@@ -643,6 +669,81 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "failed to decode engine response payload"
+        );
+    }
+
+    /// A source fed by the test, one chunk per message, that says when it is
+    /// dropped (the collecting thread has ended).
+    struct Fed {
+        chunks: mpsc::Receiver<Vec<u8>>,
+        dropped: mpsc::Sender<()>,
+    }
+    impl Read for Fed {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.chunks.recv() {
+                Ok(chunk) => {
+                    buffer[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+    impl Drop for Fed {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// After a request has failed and its collector is gone, a descendant that
+    /// still writes to the pipe must not make the daemon grow: what was retained
+    /// is released at once, and what arrives later is drained and discarded (and
+    /// not forwarded), in chunks of a fixed size. The test keeps a handle on the
+    /// shared buffer to see that.
+    #[test]
+    fn an_abandoned_collector_releases_what_it_held_and_discards_what_arrives_later() {
+        let (feed, chunks) = mpsc::channel();
+        let (dropped, ended) = mpsc::channel();
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let forwarded = Arc::clone(&forwarded);
+            FnSink(move |bytes: &[u8]| {
+                forwarded.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+        };
+        let collector = StderrCollector::start(Fed { chunks, dropped }, Some(sink));
+        let shared = Arc::clone(&collector.shared);
+
+        feed.send(b"before the failure\n".to_vec()).unwrap();
+        // Wait for the thread to have published it, not for the stderr to end.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&shared).bytes.is_empty() {
+            assert!(Instant::now() < deadline, "the chunk was never published");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(lock(&shared).bytes, b"before the failure\n");
+
+        drop(collector);
+        assert!(lock(&shared).bytes.is_empty(), "what was held is released");
+        assert!(lock(&shared).abandoned);
+
+        for _ in 0..50 {
+            feed.send(vec![b'x'; 4096]).unwrap();
+        }
+        drop(feed);
+        ended
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the thread kept draining until the pipe closed");
+        let retained = lock(&shared).bytes.len();
+        assert_eq!(
+            retained, 0,
+            "bytes retained after the capture was abandoned"
+        );
+        assert_eq!(
+            forwarded.lock().unwrap().as_slice(),
+            b"before the failure\n",
+            "nothing is forwarded after the request has ended"
         );
     }
 
@@ -1092,11 +1193,13 @@ mod tests {
 
         /// A grandchild that holds the child's stderr open past its exit cannot
         /// make the error path wait for it: what had been written is reported
-        /// and the rest is not waited for.
+        /// and the rest is not waited for. The diagnostic has no trailing newline,
+        /// as an engine's last words often do not, and is still reported: the
+        /// collector publishes what has arrived, not only complete lines.
         #[test]
         fn the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace() {
             let mut child = Command::new("sh")
-                .args(["-c", "echo said >&2; sleep 5 & exit 3"])
+                .args(["-c", "printf said >&2; sleep 5 & exit 3"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
