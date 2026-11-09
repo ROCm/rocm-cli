@@ -1849,6 +1849,24 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
 "service-stop"`.
 
+`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
+covers how the daemon reads an engine child's answer, through the same
+`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
+directory and puts a stand-in `rocm` shell script beside it, which is the
+executable the standalone daemon runs for an engine request; the stand-in
+records its argv and the request it was sent, and prints what the scenario
+says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+report carries the engine's answer (not an error built from the exit status).
+`engine-ipc-02` has it print something that is not an answer, write to stderr
+and exit non-zero: the report's engine error is the parse failure with that
+stderr. Both check the report together with the server's process, record and
+endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
+one `stop` request line. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
+decides the confirmation (`aim`) is not staged here, because teardown would
+then run the real engine's stop. Run them with a hooks build and `-n
+"engine-ipc"`.
+
 Manual restricted-tool smoke:
 
 ```bash
