@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! What a Lemonade install costs on disk.
+//! What a Lemonade install costs on disk, and where its trees live.
 //!
 //! A fresh install is a multi-gigabyte download and a tree several times that
 //! size: on a Windows gfx1151 host, Lemonade's `llamacpp:rocm` backend fetched
@@ -14,9 +14,12 @@
 //! renders what will be installed, where, how big it is, and refuses up front
 //! when the drive cannot hold even the download.
 //!
-//! Everything here is decided before the install writes a byte, so the notice
-//! and the refusal come first.
+//! The second half is the read-only view `apps/rocm` needs to report Lemonade
+//! trees (`rocm storage`) and to forget an install record whose tree a runtime
+//! uninstall just deleted. The record and the tree layout belong to this crate,
+//! so the knowledge of both stays here rather than being re-parsed by the CLI.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rocm_core::{
@@ -24,7 +27,7 @@ use rocm_core::{
 };
 
 use crate::install::{
-    installed_runtime_version, lemonade_root, lemond_path_in, needs_extraction, read_manifest,
+    installed_runtime_version, lemonade_root, lemond_path_in, manifest_path, needs_extraction,
     runtime_dir_in,
 };
 
@@ -63,6 +66,11 @@ pub(crate) struct InstallPreflight {
     /// for a record whose folder no longer holds an install, because nothing is
     /// installed there to be "not reused".
     pub(crate) other_install: Option<PathBuf>,
+    /// Whether `rocm storage` lists `other_install`, so the notice may point at
+    /// it. Storage lists only the data folder's tree and trees inside registered
+    /// ROCm installs; a recorded install anywhere else is announced but not
+    /// listed, and a pointer to it would be false.
+    pub(crate) other_install_listed: bool,
     /// Bytes the install deletes before it extracts: the existing runtime
     /// folder when this install replaces it (`--reinstall`, a new Lemonade
     /// version, or a missing server binary), whose space is free by the time
@@ -106,6 +114,9 @@ pub(crate) fn plan_install_preflight(
     }
     let other_install = recorded_install_dir(paths)
         .filter(|recorded| !runtime_path_is_same_or_inside(recorded, &target_root));
+    let other_install_listed = other_install
+        .as_deref()
+        .is_some_and(|other| storage_lists(paths, other));
     // `prepare_embeddable` removes the whole runtime folder, backends included,
     // before it extracts whenever `needs_extraction` says so, so that is the
     // space the install frees first.
@@ -118,6 +129,7 @@ pub(crate) fn plan_install_preflight(
     Some(InstallPreflight {
         target_root,
         other_install,
+        other_install_listed,
         replaced_bytes,
         available,
     })
@@ -175,8 +187,13 @@ impl InstallPreflight {
             ));
         }
         if let Some(other) = self.other_install.as_ref() {
+            let pointer = if self.other_install_listed {
+                " See `rocm storage`."
+            } else {
+                ""
+            };
             lines.push(format!(
-                "  Lemonade is already installed at {}; that copy is not reused for this location.",
+                "  Lemonade is already installed at {}; that copy is not reused for this location.{pointer}",
                 other.display()
             ));
         }
@@ -266,20 +283,177 @@ pub(crate) fn available_space_for_install(path: &Path) -> Option<u64> {
 #[cfg(feature = "e2e-test-hooks")]
 const FREE_SPACE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES";
 
+/// The folder a Lemonade install for `env_root` lives in: `<env_root>/lemonade`,
+/// or `<data>/engines/lemonade` when there is none.
+pub fn install_tree_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
+    lemonade_root(paths, env_root)
+}
+
+/// The parts of a Lemonade tree that make up the install itself.
+///
+/// That is the extracted runtime with its backends, the cached archive, and
+/// leftover extraction scratch. Deliberately not the whole folder: under
+/// `<data>/engines/lemonade` the same folder also holds the install record, logs
+/// and server state.
+pub fn install_tree_dirs(tree_root: &Path) -> [PathBuf; 3] {
+    [
+        runtime_dir_in(tree_root),
+        tree_root.join("downloads"),
+        tree_root.join("extract"),
+    ]
+}
+
+/// What Lemonade's install record says, as far as the CLI can tell.
+///
+/// Three states rather than an `Option`, because they call for different
+/// reporting: a record that cannot be read is not the same as no record, and a
+/// record whose folder no longer holds an install means nothing is in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallRecord {
+    /// No record: Lemonade has never been installed by ROCm CLI, or its record
+    /// was cleared.
+    NotRecorded,
+    /// A record file exists but could not be read or parsed.
+    Unreadable(String),
+    /// The record names `runtime_dir`; `holds_install` is whether the server
+    /// binary is still there.
+    Recorded {
+        runtime_dir: PathBuf,
+        holds_install: bool,
+    },
+}
+
+/// Read Lemonade's install record.
+pub fn install_record(paths: &AppPaths) -> InstallRecord {
+    let record = manifest_path(paths);
+    match fs::read(&record) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => InstallRecord::NotRecorded,
+        Err(error) => InstallRecord::Unreadable(format!("{}: {error}", record.display())),
+        Ok(bytes) => {
+            match serde_json::from_slice::<crate::install::LemonadeInstallManifest>(&bytes) {
+                Ok(manifest) => InstallRecord::Recorded {
+                    holds_install: lemond_path_in(&manifest.runtime_dir).is_file(),
+                    runtime_dir: manifest.runtime_dir,
+                },
+                Err(error) => InstallRecord::Unreadable(format!("{}: {error}", record.display())),
+            }
+        }
+    }
+}
+
+/// The runtime folder the install record points at, if there is a readable one.
+pub fn recorded_runtime_dir(paths: &AppPaths) -> Option<PathBuf> {
+    match install_record(paths) {
+        InstallRecord::Recorded { runtime_dir, .. } => Some(runtime_dir),
+        InstallRecord::NotRecorded | InstallRecord::Unreadable(_) => None,
+    }
+}
+
 /// The runtime folder Lemonade's record points at, only when it still holds an
 /// install.
 fn recorded_install_dir(paths: &AppPaths) -> Option<PathBuf> {
-    read_manifest(paths)
-        .ok()
-        .map(|manifest| manifest.runtime_dir)
-        .filter(|runtime_dir| lemond_path_in(runtime_dir).is_file())
+    match install_record(paths) {
+        InstallRecord::Recorded {
+            runtime_dir,
+            holds_install: true,
+        } => Some(runtime_dir),
+        InstallRecord::Recorded { .. }
+        | InstallRecord::NotRecorded
+        | InstallRecord::Unreadable(_) => None,
+    }
+}
+
+/// The install roots of the ROCm installs registered with ROCm CLI, read from
+/// the runtime registry the same way storage finds its runtimes. Best effort: an
+/// unreadable entry is skipped.
+fn registered_install_roots(paths: &AppPaths) -> Vec<PathBuf> {
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let Ok(entries) = fs::read_dir(registry) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter_map(|record| record.get("install_root")?.as_str().map(PathBuf::from))
+        .collect()
+}
+
+/// Whether `rocm storage` lists the Lemonade install at `runtime_dir`: it lists
+/// the data folder's tree and the tree inside each registered ROCm install, and
+/// nothing else. Both use [`install_tree_root`], so the two cannot drift apart.
+fn storage_lists(paths: &AppPaths, runtime_dir: &Path) -> bool {
+    runtime_path_is_same_or_inside(runtime_dir, &install_tree_root(paths, None))
+        || registered_install_roots(paths).iter().any(|root| {
+            runtime_path_is_same_or_inside(
+                runtime_dir,
+                &install_tree_root(paths, Some(&root.join("engines"))),
+            )
+        })
+}
+
+/// What [`forget_install_record_inside`] did, so a caller can report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordCleanup {
+    /// The record does not name anything inside the removed folder, or there is
+    /// no record. Nothing to report.
+    NotAffected,
+    /// The record named this runtime folder and has been removed.
+    Cleared(PathBuf),
+    /// The record names a folder that was removed, but deleting the record
+    /// failed: Lemonade still points at files that are gone.
+    Failed {
+        runtime_dir: PathBuf,
+        record: PathBuf,
+        error: String,
+    },
+    /// The record could not be read, so it could not be compared with the
+    /// removed folder.
+    Unreadable(String),
+}
+
+/// Forget the install record when the tree it points at was inside `removed_root`,
+/// which the caller has just deleted.
+///
+/// Leaving the record would point Lemonade at files that no longer exist. Without
+/// it Lemonade reports itself as not installed, which is the true state. Every
+/// outcome that leaves the user with something to know is returned rather than
+/// printed, so the uninstall report can carry it.
+pub fn forget_install_record_inside(paths: &AppPaths, removed_root: &Path) -> RecordCleanup {
+    forget_install_record_inside_with(paths, removed_root, |record| fs::remove_file(record))
+}
+
+/// [`forget_install_record_inside`] with the deletion injectable, so the failure
+/// outcome can be tested without a file the OS refuses to delete.
+fn forget_install_record_inside_with(
+    paths: &AppPaths,
+    removed_root: &Path,
+    remove_record: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> RecordCleanup {
+    let runtime_dir = match install_record(paths) {
+        InstallRecord::NotRecorded => return RecordCleanup::NotAffected,
+        InstallRecord::Unreadable(error) => return RecordCleanup::Unreadable(error),
+        InstallRecord::Recorded { runtime_dir, .. } => runtime_dir,
+    };
+    if !runtime_path_is_same_or_inside(&runtime_dir, removed_root) {
+        return RecordCleanup::NotAffected;
+    }
+    let record = manifest_path(paths);
+    match remove_record(&record) {
+        Ok(()) => RecordCleanup::Cleared(runtime_dir),
+        Err(error) => RecordCleanup::Failed {
+            runtime_dir,
+            record,
+            error: error.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::install::{LemonadeInstallManifest, write_manifest};
-    use std::fs;
 
     fn paths_in(root: &Path) -> AppPaths {
         AppPaths {
@@ -324,7 +498,7 @@ mod tests {
     fn a_new_location_is_announced_with_the_install_it_does_not_reuse() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
-        let base = lemonade_root(&paths, None);
+        let base = install_tree_root(&paths, None);
         plant_current_tree(&base);
         record_install_at(&paths, &runtime_dir_in(&base));
         let runtime_engines = temp.path().join("runtimes").join("key").join("engines");
@@ -335,6 +509,10 @@ mod tests {
 
         assert_eq!(preflight.target_root, runtime_engines.join("lemonade"));
         assert_eq!(preflight.other_install, Some(runtime_dir_in(&base)));
+        assert!(
+            preflight.other_install_listed,
+            "the data folder's tree is listed"
+        );
         let notice = preflight.notice_lines().join("\n");
         assert!(
             notice.contains(&preflight.target_root.display().to_string()),
@@ -367,7 +545,7 @@ mod tests {
     fn a_current_tree_is_not_announced() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
-        let base = lemonade_root(&paths, None);
+        let base = install_tree_root(&paths, None);
         plant_current_tree(&base);
 
         assert_eq!(plan_install_preflight(&paths, None, false, |_| None), None);
@@ -389,7 +567,7 @@ mod tests {
     fn a_tree_without_a_backend_is_announced() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
-        let base = lemonade_root(&paths, None);
+        let base = install_tree_root(&paths, None);
         plant_current_tree(&base);
         fs::remove_dir_all(runtime_dir_in(&base).join("bin")).unwrap();
 
@@ -404,7 +582,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
         let gone = temp.path().join("runtimes").join("removed").join("engines");
-        record_install_at(&paths, &runtime_dir_in(&lemonade_root(&paths, Some(&gone))));
+        record_install_at(
+            &paths,
+            &runtime_dir_in(&install_tree_root(&paths, Some(&gone))),
+        );
+        assert!(
+            matches!(
+                install_record(&paths),
+                InstallRecord::Recorded {
+                    holds_install: false,
+                    ..
+                }
+            ),
+            "the fixture must be a dangling record"
+        );
 
         let preflight = plan_install_preflight(&paths, None, false, |_| Some(100 * GIB))
             .expect("an empty data folder needs a full install");
@@ -419,6 +610,7 @@ mod tests {
         InstallPreflight {
             target_root: PathBuf::from("/data/engines/lemonade"),
             other_install: None,
+            other_install_listed: false,
             replaced_bytes,
             available,
         }
@@ -522,7 +714,7 @@ mod tests {
     fn a_reinstall_counts_the_space_of_the_install_it_replaces() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths_in(temp.path());
-        let tree = lemonade_root(&paths, None);
+        let tree = install_tree_root(&paths, None);
         plant_current_tree(&tree);
         let payload = runtime_dir_in(&tree)
             .join("bin")
@@ -569,6 +761,250 @@ mod tests {
         assert!(
             warning.contains("3.0 GiB will be free on the drive holding /data/engines/lemonade once the existing install there is replaced"),
             "{warning}"
+        );
+    }
+
+    /// The notice points at `rocm storage` only for a copy storage lists: the
+    /// data folder's tree and trees inside registered ROCm installs. A recorded
+    /// install anywhere else is announced without the pointer, which would be
+    /// false for it.
+    #[test]
+    fn the_storage_pointer_is_only_given_for_a_copy_storage_lists() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let target = temp.path().join("target").join("engines");
+        let notice_for = |paths: &AppPaths| {
+            let preflight = plan_install_preflight(paths, Some(&target), false, |_| None).unwrap();
+            (
+                preflight.other_install_listed,
+                preflight.notice_lines().join("\n"),
+            )
+        };
+
+        // 1. In the data folder: listed.
+        let base = install_tree_root(&paths, None);
+        plant_current_tree(&base);
+        record_install_at(&paths, &runtime_dir_in(&base));
+        let (listed, notice) = notice_for(&paths);
+        assert!(
+            listed
+                && notice
+                    .contains("that copy is not reused for this location. See `rocm storage`."),
+            "{notice}"
+        );
+
+        // 2. Inside a registered ROCm install: listed.
+        let registered = temp.path().join("runtimes").join("registered");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        fs::write(
+            registry.join("registered.json"),
+            serde_json::json!({ "runtime_key": "registered", "install_root": registered })
+                .to_string(),
+        )
+        .unwrap();
+        let in_runtime = install_tree_root(&paths, Some(&registered.join("engines")));
+        plant_current_tree(&in_runtime);
+        record_install_at(&paths, &runtime_dir_in(&in_runtime));
+        let (listed, notice) = notice_for(&paths);
+        assert!(listed && notice.contains("See `rocm storage`."), "{notice}");
+
+        // 3. Anywhere else: announced, not pointed at.
+        let elsewhere =
+            install_tree_root(&paths, Some(&temp.path().join("custom").join("engines")));
+        plant_current_tree(&elsewhere);
+        record_install_at(&paths, &runtime_dir_in(&elsewhere));
+        let (listed, notice) = notice_for(&paths);
+        assert!(!listed, "{notice}");
+        assert!(
+            notice.contains(&format!(
+                "Lemonade is already installed at {}",
+                runtime_dir_in(&elsewhere).display()
+            )),
+            "{notice}"
+        );
+        assert!(!notice.contains("rocm storage"), "{notice}");
+    }
+
+    /// A runtime uninstall deletes the runtime's folder, Lemonade tree included.
+    /// The record pointing into it is forgotten; one pointing elsewhere is kept.
+    #[test]
+    fn the_record_is_forgotten_only_when_its_tree_was_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let runtime_root = temp.path().join("runtimes").join("key");
+        let per_runtime = install_tree_root(&paths, Some(&runtime_root.join("engines")));
+        record_install_at(&paths, &runtime_dir_in(&per_runtime));
+
+        let other_runtime = temp.path().join("runtimes").join("other");
+        assert_eq!(
+            forget_install_record_inside(&paths, &other_runtime),
+            RecordCleanup::NotAffected
+        );
+        assert!(recorded_runtime_dir(&paths).is_some());
+
+        assert_eq!(
+            forget_install_record_inside(&paths, &runtime_root),
+            RecordCleanup::Cleared(runtime_dir_in(&per_runtime))
+        );
+        assert_eq!(recorded_runtime_dir(&paths), None);
+        assert!(!manifest_path(&paths).exists());
+        // Nothing recorded: nothing to forget.
+        assert_eq!(
+            forget_install_record_inside(&paths, &runtime_root),
+            RecordCleanup::NotAffected
+        );
+    }
+
+    /// The folder is already gone when the record is cleared, so a failed
+    /// deletion leaves Lemonade pointing at nothing. That has to come back to
+    /// the caller with the record's path, not vanish into a log line.
+    #[test]
+    fn a_record_that_cannot_be_deleted_is_reported_not_swallowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let runtime_root = temp.path().join("runtimes").join("key");
+        let per_runtime = install_tree_root(&paths, Some(&runtime_root.join("engines")));
+        record_install_at(&paths, &runtime_dir_in(&per_runtime));
+
+        let outcome = forget_install_record_inside_with(&paths, &runtime_root, |_| {
+            Err(std::io::Error::other("sharing violation"))
+        });
+
+        assert_eq!(
+            outcome,
+            RecordCleanup::Failed {
+                runtime_dir: runtime_dir_in(&per_runtime),
+                record: manifest_path(&paths),
+                error: "sharing violation".to_owned(),
+            }
+        );
+        assert!(manifest_path(&paths).exists(), "the record was not deleted");
+
+        // The uninstall report tells the user to delete that record. Doing so must
+        // clear the condition: Lemonade is then simply not recorded.
+        fs::remove_file(manifest_path(&paths)).unwrap();
+        assert_eq!(install_record(&paths), InstallRecord::NotRecorded);
+        assert_eq!(recorded_runtime_dir(&paths), None);
+    }
+
+    /// An unparseable record is not "no record": it may well name the removed
+    /// folder, and the caller must be told it could not be checked.
+    #[test]
+    fn an_unreadable_record_is_distinct_from_no_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        assert_eq!(install_record(&paths), InstallRecord::NotRecorded);
+
+        let record = manifest_path(&paths);
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, b"{ not json").unwrap();
+
+        let InstallRecord::Unreadable(error) = install_record(&paths) else {
+            panic!("a corrupt record must not read as NotRecorded");
+        };
+        assert!(error.contains("runtime.json"), "{error}");
+        assert_eq!(recorded_runtime_dir(&paths), None);
+        assert!(matches!(
+            forget_install_record_inside(&paths, temp.path()),
+            RecordCleanup::Unreadable(_)
+        ));
+        assert!(record.exists(), "an unreadable record must be left alone");
+    }
+
+    /// A record whose runtime folder lost its server binary names an install
+    /// that is not there; `holds_install` is what lets the storage report say so.
+    #[test]
+    fn a_record_reports_whether_its_folder_still_holds_an_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let tree = install_tree_root(&paths, None);
+        record_install_at(&paths, &runtime_dir_in(&tree));
+        assert_eq!(
+            install_record(&paths),
+            InstallRecord::Recorded {
+                runtime_dir: runtime_dir_in(&tree),
+                holds_install: false
+            }
+        );
+        plant_current_tree(&tree);
+        assert_eq!(
+            install_record(&paths),
+            InstallRecord::Recorded {
+                runtime_dir: runtime_dir_in(&tree),
+                holds_install: true
+            }
+        );
+    }
+
+    /// `rocm runtimes uninstall` tells a user whose install record cannot be read
+    /// to run a plain `rocm engines install lemonade`. That is only true if the
+    /// install path overwrites the record without reading it and keeps the
+    /// current tree, so this runs the real record-writing sequence
+    /// (`install_and_record`, with nothing to download) over a corrupt record and
+    /// asserts the state it leaves: a readable record naming an install that is
+    /// there, and the tree untouched (a `--reinstall` would have wiped it).
+    #[test]
+    fn a_plain_install_replaces_a_corrupt_record_and_keeps_the_current_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let tree = install_tree_root(&paths, None);
+        plant_current_tree(&tree);
+        let runtime_dir = runtime_dir_in(&tree);
+        fs::write(
+            crate::install::lemonade_path_in(&runtime_dir),
+            b"fake lemonade",
+        )
+        .unwrap();
+        let sentinel = runtime_dir
+            .join("bin")
+            .join("llamacpp")
+            .join("backend.sentinel");
+        fs::write(&sentinel, b"a backend already installed").unwrap();
+
+        let record = crate::install::manifest_path(&paths);
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, b"{ not json").unwrap();
+        assert!(matches!(
+            install_record(&paths),
+            InstallRecord::Unreadable(_)
+        ));
+
+        let archive = b"never parsed: the tree is current, so nothing is extracted";
+        let sha256 = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(archive));
+        let (manifest, _) = crate::install_and_record(
+            &paths,
+            None,
+            false,
+            |paths, env_root, reinstall| {
+                crate::install::prepare_embeddable_with(
+                    paths,
+                    env_root,
+                    reinstall,
+                    rocm_deps::LEMONADE_VERSION,
+                    &sha256,
+                    |_, destination| {
+                        fs::write(destination, archive)?;
+                        Ok(())
+                    },
+                )
+            },
+            |_, _| Ok(None),
+        )
+        .expect("a plain install over a corrupt record succeeds");
+
+        assert_eq!(
+            install_record(&paths),
+            InstallRecord::Recorded {
+                runtime_dir: runtime_dir.clone(),
+                holds_install: true
+            },
+            "the corrupt record was not replaced"
+        );
+        assert_eq!(manifest.runtime_dir, runtime_dir);
+        assert!(
+            sentinel.is_file(),
+            "a plain install must keep the current tree"
         );
     }
 }

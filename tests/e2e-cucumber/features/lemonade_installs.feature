@@ -6,7 +6,8 @@ Feature: Lemonade installs on disk
   # `rocm install sdk`, then `rocm serve` after it, leaves two full copies of
   # roughly 25 GiB each, and the second one used to arrive silently from
   # `rocm serve` (ROCMAI-825). These scenarios cover what the user is now told
-  # about that, starting with what an install needs before it starts.
+  # about that: what an install needs before it starts, both copies in the disk
+  # report, and the install record when a runtime holding a copy is removed.
   #
   # A new feature file rather than appended scenarios: these are about one
   # behaviour area, Lemonade's footprint on disk, which spans `engines install`,
@@ -33,3 +34,31 @@ Feature: Lemonade installs on disk
     When the user serves a model with Lemonade
     Then the Lemonade install is refused before anything is downloaded
     And the user is told what the Lemonade install needs and where it would go
+
+  @id:lemonade-installs-storage-lists-both-copies
+  Scenario: lemonade-installs-03 - The disk report lists both Lemonade copies and flags the unused one
+    Given Lemonade was installed in the data folder and again inside a ROCm install
+    When the user asks what ROCm CLI is keeping on disk
+    Then the report lists both Lemonade installs with their sizes
+    And the report flags the data folder's Lemonade install as unused
+
+  @id:lemonade-installs-runtime-uninstall-clears-record
+  Scenario: lemonade-installs-04 - Removing the ROCm install that held Lemonade clears its install record
+    Given Lemonade was installed in the data folder and again inside a ROCm install
+    When the user uninstalls the ROCm install holding Lemonade
+    Then the CLI says Lemonade's install was removed with that ROCm install
+    And Lemonade is no longer recorded as installed
+
+  @id:lemonade-installs-dangling-record-keeps-the-survivor
+  Scenario: lemonade-installs-05 - A record naming a folder with no install does not make the surviving copy reclaimable
+    Given the ROCm install that held Lemonade is gone and only the data folder's copy is left
+    When the user asks what ROCm CLI is keeping on disk
+    Then the report does not call the surviving Lemonade copy unused or reclaimable
+
+  @id:lemonade-installs-read-only-runtime-keeps-its-copy
+  Scenario: lemonade-installs-06 - Uninstalling a read-only ROCm install leaves its Lemonade copy, and the report says so
+    Given a read-only ROCm install holds a Lemonade copy
+    When the user asks what ROCm CLI is keeping on disk
+    Then the report does not say that copy is removed with its ROCm install
+    When the user uninstalls the ROCm install holding Lemonade
+    Then that Lemonade copy is still on disk

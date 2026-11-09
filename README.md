@@ -754,6 +754,28 @@ being followed. The two archive rows the report prints are tagged
 `note: can be downloaded again; safe to remove`, so it is visible which rows
 `remove-downloads` acts on.
 
+The report also lists `Engine installs`: each Lemonade copy on disk and its
+size. Lemonade installs into the active ROCm runtime's own folder when one is
+active and into the data folder otherwise, so a machine that installed
+Lemonade before its first SDK can hold two full copies (about 25 GiB each). The
+copy Lemonade runs from is `in use`. A copy it is not using right now is marked
+`not used right now`, which is not a promise it stays unused: Lemonade installs
+into the active ROCm runtime's folder, so a copy inside a ROCm install is reused
+as soon as that install becomes active, and is never marked reclaimable. Only
+the data folder's copy, which no ROCm install owns, is marked reclaimable, and
+nothing removes it automatically: delete its `runtime`, `downloads` and `extract`
+folders to free the space. A copy is only called unused when Lemonade's install
+record points at another copy that is really there: if the record names a folder
+with no install, or cannot be read, the report says so and marks no copy
+reclaimable. A copy inside a runtime folder
+also counts toward that runtime's size. `rocm runtimes uninstall` removes it
+with the runtime and clears Lemonade's install record, so Lemonade is no longer
+recorded as installed; it says so when the record could not be cleared, and when
+it could not be read it names `rocm engines install lemonade`, which rewrites
+the record and keeps a current install.
+For an external or imported runtime, uninstall only unregisters it, so its
+Lemonade copy stays and the report does not say otherwise.
+
 The report also lists `local server records`: one JSON record plus the engine's
 log for each `rocm serve --managed` launch, kept after the server stops.
 `rocm services list --all` lists them, and no `rocm storage` command removes
