@@ -621,8 +621,10 @@ Feature: Runtime configuration
   #
   # Linux only, for the same empty-`PATH` host as runtime-23. The decision is
   # unit-tested for every combination of layout, who may fetch `uv` and whether one
-  # is present in `apps/rocm/src/therock/resolve/wheel.rs`, and the plan's
-  # wording in `apps/rocm/src/therock/wheel_plan.rs`, on every platform.
+  # is present by `the_version_step_is_decided_by_layout_access_and_a_present_uv_alone`
+  # in `apps/rocm/src/therock/resolve/uv_access.rs`, and the plan's wording (written
+  # by `apps/rocm/src/therock/wheel_plan.rs`) by the tests in
+  # `apps/rocm/src/therock/resolve/wheel.rs`, on every platform.
   @id:runtime-install-preview-of-rocm-10-fetches-no-uv @requires-os:linux
   Scenario: runtime-28 - Previewing a ROCm 10 SDK install on a host with no uv fetches none and says what it did not resolve
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
