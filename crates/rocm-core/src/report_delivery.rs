@@ -171,13 +171,15 @@ fn choose(url: String, sending: bool, env: &dyn Fn(&str) -> Option<String>) -> D
     }
 }
 
-/// Percent-encode for a query-string value.
+/// Percent-encode for a query-string value or one URL path segment.
 ///
 /// Written out rather than taken from a crate: this is the only encoding this
 /// binary needs, and a signed artifact is not worth a dependency for fifteen
 /// lines. Everything outside the unreserved set of RFC 3986 is escaped, which
-/// is stricter than necessary and wrong in no case.
-fn percent_encode(value: &str) -> String {
+/// is stricter than necessary and wrong in no case; that also makes it right
+/// for a path segment, where `/` must be escaped too. The GGUF header reader
+/// sends hub file names through it, one segment at a time.
+pub(crate) fn percent_encode(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
