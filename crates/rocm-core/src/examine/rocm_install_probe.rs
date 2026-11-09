@@ -192,6 +192,12 @@ mod tests {
         // fix-7/fix-12 quarantine advice produces) through the directory scan
         // `probe_rocm_install` runs, closing the gap where only the live file
         // being listed first would still pass if the `.bak` skip were deleted.
+        //
+        // The scan reads through `host_path`, so a test that has a simulated
+        // host root set would re-root this temp directory away.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(dir.path().join("amdgpu.list"), "deb ...\n").expect("write live repo");
         std::fs::write(dir.path().join("amdgpu.list.bak"), "deb ...\n")
@@ -222,6 +228,12 @@ mod tests {
         // helpers in isolation) across temp directories standing in for all
         // three package families, including the zypp one a mutation run
         // showed was silently unscanned by every pre-existing test.
+        //
+        // The scan reads through `host_path`, so a test that has a simulated
+        // host root set would re-root these temp directories away.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let apt_dir = tempfile::tempdir().expect("create apt temp dir");
         let yum_dir = tempfile::tempdir().expect("create yum temp dir");
         let zypp_dir = tempfile::tempdir().expect("create zypp temp dir");
