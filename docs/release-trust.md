@@ -381,9 +381,12 @@ Those trust roots are pinned copies of the published keys: the
 [install.sh](../install.sh), `$PinnedReleasePublicKeyCurrent`/`Next` in
 [install.ps1](../install.ps1), and
 `PINNED_METADATA_PUBLIC_KEY_PEM` in
-[fetch.rs](../apps/rocm/src/therock/fetch.rs). CI and the release and nightly
-workflows run `cargo xtask verify-pinned-keys`, which fails when a pinned copy
-differs from its canonical file under `docs/keys/`. It reads the one assignment
+[fetch.rs](../apps/rocm/src/therock/fetch.rs). `cargo xtask verify-pinned-keys`
+fails when a pinned copy differs from its canonical file under `docs/keys/`. The
+release and nightly workflows always run it; pull-request CI runs it when a
+change matches the `heavy` path filter in
+[ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
+installers, every Rust source and `xtask/`. It reads the one assignment
 the installer actually uses, so each slot must be assigned exactly once as a
 plain declaration, a slot whose key is not published yet must stay `""`, and
 `install.sh` must mark both of its slots `readonly`. The full rules, and what a
