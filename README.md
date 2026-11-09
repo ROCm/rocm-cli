@@ -1236,8 +1236,9 @@ gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
 processes, and any endpoint key, which the server may still be enforcing. It
 names each process that, or a process under it, did not exit after it was
-signaled; for a process it could not verify as the server's, it signals nothing
-and names an operating-system command to check on it. It does not suggest
+signaled; for a process it could not verify as the server's (its recorded
+start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
+all), it signals nothing and names an operating-system command to check on it. It does not suggest
 running the stop again: when only a process under the recorded one survived, a
 second stop can report the server stopped while that process still runs.
 
@@ -1256,7 +1257,11 @@ bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
-alone, and additionally clears leftover files whose record is already gone.
+alone, and additionally clears leftover files whose record is already gone. A
+server counts as running while any process it recorded may be running, which on
+Windows includes one `rocm` cannot query (a live process the account may not
+open): `remove` and `prune` refuse such a record until that process is gone.
+`docs/manual-testing.md` describes clearing one by hand.
 
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is

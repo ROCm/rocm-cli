@@ -378,6 +378,17 @@ pub enum ProcessProbe {
     /// The PID could not be queried, so it can be neither confirmed running nor
     /// confirmed gone. On Windows that includes a live process the caller may not
     /// open (`ERROR_ACCESS_DENIED`).
+    ///
+    /// The cost of reading this as "may be running" is that a stopped service's
+    /// recorded PID, taken since by a process the caller cannot open, keeps its
+    /// record live: the record never reconciles to `stopped`, `services remove`
+    /// and `prune` refuse it, and a stop reports it unverified. That is the safe
+    /// direction (the alternative deletes the key and record under a process that
+    /// may be serving), and there is no better evidence to be had: the creation
+    /// time that would tell the two processes apart is read with the same access
+    /// right, so a process that cannot be opened has no readable token to
+    /// compare. The record can be cleared by hand; see `docs/manual-testing.md`,
+    /// "A record that stays unverified".
     Unqueryable,
 }
 

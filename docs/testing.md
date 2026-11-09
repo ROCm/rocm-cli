@@ -1788,7 +1788,9 @@ and its neighbours) and, against a real tree, by a Windows-only scenario
 that each reaches the routine and reports what it returns
 (`cargo test -p rocm --bin rocm service_control::tests::a_stop_` and
 `cargo test -p rocmd service::tests::a_stop_`), and each carries a source check
-that no private copy of the routine or its constant has come back. A confirmed
+that no private copy of the routine or its constant has come back. Those checks
+pin names only: they are a tripwire for a copy returning under the same name, not
+coverage of what either stop does. A confirmed
 stop also clears the PIDs and start-time tokens it stopped from the record
 (`ManagedServiceRecord::clear_recorded_processes`, one call from both
 binaries), and an unconfirmed one keeps them; a PID recorded without a token is
@@ -1852,7 +1854,14 @@ time that was compared is that of the process the kill then reaches
 reported as `timed_out`, whatever the root's own termination says, because only
 the root's exit is watched on Windows
 (`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
-`only_a_clean_taskkill_exit_is_a_completed_tree_kill`). That `taskkill` runs under
+`only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
+`taskkill` that exits 128 (process not found) is judged by the root's own re-read:
+with the root gone it exited by itself and the stop is reported as for any
+recorded process already gone, so the record is not kept for nothing; with the
+root still there the kill counts as failed
+(`a_tree_kill_that_found_no_process_is_a_stop_when_the_root_is_gone`,
+`a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill`,
+`a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed`). That `taskkill` runs under
 a deadline of `MANAGED_STOP_GRACE`: one that stalls is killed and reaped and
 counts as a failed tree kill, so it cannot hang `rocm services stop`, `restart`
 or the attached Ctrl-C stop
@@ -1861,7 +1870,13 @@ child under a 200 ms deadline on every host and asserts the error, the bounded
 elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_time_gives_its_exit_code`
 and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
 a `timed_out` stop leaves are covered by
-`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. What no
+`an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. A readable
+recorded token that differs outranks a failed query
+(`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
+the query are read with the same access right, so on Windows this only reaches a
+process that opens and then fails the exit-code query; a process that cannot be
+opened has no readable token, stays unverifiable, and is cleared by hand (see
+"A record that stays unverified" in [manual-testing.md](manual-testing.md)). What no
 test here reaches is the Windows API itself: the handle hold, the open-failure
 codes and a real `taskkill` failing run only on the Windows lane.
 
@@ -1876,6 +1891,17 @@ drives the refresh with an unqueryable PID and then a confirmed-gone one,
 an unverified stop and then the refresh over the record it wrote, and
 `a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
 removal guard; each takes the probe as an argument, so they run on every host.
+Two gaps in the scenario coverage are deliberate. `service-stop-07` records no
+token, so the path a record written by this version takes on Windows (a token
+recorded, matching, with the tree kill then running) has no scenario; it rests on
+`what_a_stop_does_for_each_recorded_and_live_token` and the other injected tests,
+and on the Windows unit tests that stop a real process with its true token. And
+the `self` row that `rocm` now puts in `pid_outcomes` has no scenario: it appears
+only in the JSON answer of the hidden `sandbox-run stop_server` and the sandbox
+tool, never in the text of `rocm services stop`, and it names the stopping
+process's own PID, which a scenario cannot plant in a record before the process
+that will read it exists. `a_stop_reports_its_own_pid_as_self` and
+`a_self_row_adds_no_line_to_an_unconfirmed_report` cover the answer and the report.
 `service-stop-06` (Linux) is the same stop of a real recorded process through
 `rocm services stop`, checking the persisted state: the process exited and the
 record names none. Run the Windows scenario on a Windows host with

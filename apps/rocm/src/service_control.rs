@@ -142,7 +142,8 @@ fn stop_recorded_processes(record: &ManagedServiceRecord) -> Vec<rocm_core::Reco
 ///
 /// Neither outcome can be staged from outside the binary: `TimedOut` needs a
 /// process that survives `SIGKILL`, and `Unverified` one whose recorded
-/// start-time cannot be read back. Without this seam the "stop not confirmed"
+/// start-time cannot be read back, or (on Windows) that cannot be queried at
+/// all. Without this seam the "stop not confirmed"
 /// report, its exit status and what it keeps on disk have no live coverage.
 /// The recorded process is left untouched. Compiled only into the
 /// `e2e-test-hooks` binary; production builds never see it.

@@ -1831,4 +1831,42 @@ mod tests {
         }));
         Ok(())
     }
+
+    /// The way out `docs/manual-testing.md` gives for a record whose process
+    /// `rocm` cannot query: the record is refused while that process may be
+    /// running, and deleting its `<service-id>.json` by hand and running
+    /// `prune --any-age` leaves nothing behind (log, key and engine state all
+    /// swept), with the endpoint key among the files removed.
+    #[test]
+    fn a_record_held_by_an_unqueryable_process_can_be_cleared_by_hand_and_prune() -> Result<()> {
+        let (root, paths) = test_paths("services-unqueryable-way-out");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stuck", "stopped", 999_999_999)?;
+        let refused = managed_service_record_is_in_use_with(&record, |_| ProcessProbe::Unqueryable);
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-stuck");
+        assert!(key.exists(), "the planted record has its key");
+
+        fs::remove_file(&record.manifest_path)?;
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let leftovers = [&record.log_path, &record.engine_state_path, &key]
+            .iter()
+            .filter(|path| path.exists())
+            .count();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            refused,
+            "a record whose process cannot be queried is in use"
+        );
+        assert_eq!(leftovers, 0, "prune swept every leftover file");
+        assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
 }

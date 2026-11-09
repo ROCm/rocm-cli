@@ -106,7 +106,17 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
 ///
 /// A PID that cannot be queried is [`IdentityState::Indeterminate`], not
 /// [`IdentityState::Gone`]: a failure to look is not an exit, and reading it as
-/// one would let a stop report a live process as stopped.
+/// one would let a stop report a live process as stopped. That is one of the two
+/// routes to [`IdentityState::Indeterminate`] and so to an `unverified` stop; the
+/// other is a recorded token that cannot be read back from a running process
+/// ([`classify_live_identity`]).
+///
+/// A token that was recorded and can still be read, and that differs, outranks
+/// the failed query: it proves a different process holds the PID, so the
+/// recorded one is gone. On Windows this narrows to the case where the process
+/// opens but the exit-code query fails: the token and the probe both open the
+/// PID with `PROCESS_QUERY_LIMITED_INFORMATION`, so a process that cannot be
+/// opened has no readable token either, and stays [`IdentityState::Indeterminate`].
 fn identity_state_with(
     id: &ProcessIdentity,
     probe: impl Fn(u32) -> ProcessProbe,
@@ -115,7 +125,10 @@ fn identity_state_with(
 ) -> IdentityState {
     match probe(id.pid) {
         ProcessProbe::Gone => IdentityState::Gone,
-        ProcessProbe::Unqueryable => IdentityState::Indeterminate,
+        ProcessProbe::Unqueryable => match (id.start_ticks, start_ticks(id.pid)) {
+            (Some(recorded), Some(live)) if recorded != live => IdentityState::Recycled,
+            _ => IdentityState::Indeterminate,
+        },
         ProcessProbe::Running if has_exited(id.pid) => IdentityState::Gone,
         ProcessProbe::Running => classify_live_identity(id.start_ticks, start_ticks(id.pid)),
     }
@@ -176,6 +189,15 @@ pub enum TerminationOutcome {
     AlreadyGone,
     /// The PID now belongs to a different process (recycled), so the recorded
     /// process has already exited; nothing was signalled.
+    ///
+    /// Counted as stopped, on every platform, because a token that is recorded
+    /// and readable and differs is positive evidence of a different process. The
+    /// engine's own token comes from the same [`process_start_ticks`] that reads
+    /// it back here, taken for that PID's process when it was spawned or reported
+    /// (a creation time does not change over a process's life), so a mismatch for
+    /// the real engine is not an expected outcome. It stays visible as
+    /// `identity_mismatch` in the report rather than as a signal sent to a
+    /// process nobody could prove was the server's.
     IdentityMismatch,
     /// The recorded PID is live but its identity could not be confirmed, so it
     /// was deliberately left untouched and its state is unknown.
@@ -529,6 +551,10 @@ pub fn terminate_recorded_pid(identity: &ProcessIdentity) -> TerminationOutcome 
 enum TreeKill {
     /// The kill ran and reported that every process it reached is terminated.
     Completed,
+    /// The kill ran and reported that it found no such process (`taskkill` exits
+    /// 128): the root was gone by the time it looked. Not by itself a failure,
+    /// and not a success either; the root's own verdict decides which.
+    NotFound,
     /// The kill could not run, or reported that it did not take every process
     /// down. Which descendants survive is not known.
     Failed,
@@ -539,11 +565,22 @@ enum TreeKill {
 /// would confirm the stop into [`TerminationOutcome::TimedOut`]: the root was
 /// signalled, and it, or a process under it, is not confirmed exited. The
 /// verdicts that already deny the stop stay as they are.
+///
+/// A kill that found no such process ([`TreeKill::NotFound`]) is judged by the
+/// root's own re-read, which `outcome` carries: when the root is gone
+/// ([`TerminationOutcome::AlreadyGone`]) it exited on its own between the
+/// identity check and the kill, and that is what the stop reports, as for any
+/// recorded process that is already gone. When the root is still there, "no such
+/// process" contradicts what the termination found, so the kill is treated as
+/// failed.
 const fn after_tree_kill(tree: TreeKill, outcome: TerminationOutcome) -> TerminationOutcome {
-    match tree {
-        TreeKill::Completed => outcome,
-        TreeKill::Failed if outcome.stopped() => TerminationOutcome::TimedOut,
-        TreeKill::Failed => outcome,
+    match (tree, outcome) {
+        (TreeKill::Completed, outcome) => outcome,
+        (TreeKill::NotFound, TerminationOutcome::AlreadyGone) => TerminationOutcome::AlreadyGone,
+        (TreeKill::NotFound | TreeKill::Failed, outcome) if outcome.stopped() => {
+            TerminationOutcome::TimedOut
+        }
+        (TreeKill::NotFound | TreeKill::Failed, outcome) => outcome,
     }
 }
 
@@ -568,12 +605,15 @@ fn terminate_recorded_pid_with<Held>(
         // Taken while the root is still alive: `taskkill /T` resolves children
         // through the live parent, so it cannot reach them once the root is gone.
         let tree = tree_kill(identity.pid);
-        // `terminate` still owns the bounded wait and the verdict, but a root
-        // the tree kill already took now reads back as `AlreadyGone` — which
-        // would deny a stop this command did perform.
-        let outcome = match terminate(identity) {
-            TerminationOutcome::AlreadyGone => TerminationOutcome::Forced,
-            outcome => outcome,
+        // `terminate` still owns the bounded wait and the verdict. A root the
+        // tree kill already took now reads back as `AlreadyGone`, which would
+        // deny a stop this command did perform, so it counts as forced; but when
+        // the kill found no such process the root went by itself, and
+        // `AlreadyGone` is the truth.
+        let outcome = match (tree, terminate(identity)) {
+            (TreeKill::NotFound, outcome) => outcome,
+            (_, TerminationOutcome::AlreadyGone) => TerminationOutcome::Forced,
+            (_, outcome) => outcome,
         };
         return after_tree_kill(tree, outcome);
     }
@@ -633,17 +673,23 @@ fn platform_tree_kill() -> Option<&'static dyn Fn(u32) -> TreeKill> {
     }
 }
 
+/// `taskkill`'s exit code for "the process was not found".
+#[cfg(any(windows, test))]
+const TASKKILL_PROCESS_NOT_FOUND: i32 = 128;
+
 /// The verdict on one `taskkill` run, from whether it started and the exit code
-/// it ended with. Only a clean exit (0) is a completed tree kill: a failed
-/// launch, a run that did not finish within its deadline
-/// ([`std::io::ErrorKind::TimedOut`], see [`run_to_exit_code`]), a nonzero code
-/// (a process it could not terminate, or none found) and a run that ended
-/// without a code are all [`TreeKill::Failed`]. Split out of the process spawn
-/// so a test runs it on every host.
+/// it ended with. A clean exit (0) is a completed tree kill and 128 is
+/// [`TreeKill::NotFound`], left to the root's re-read to judge. A failed launch,
+/// a run that did not finish within its deadline
+/// ([`std::io::ErrorKind::TimedOut`], see [`run_to_exit_code`]), any other
+/// nonzero code (a process it could not terminate) and a run that ended without
+/// a code are all [`TreeKill::Failed`]. Split out of the process spawn so a test
+/// runs it on every host.
 #[cfg(any(windows, test))]
 fn classify_taskkill(run: std::io::Result<Option<i32>>) -> TreeKill {
     match run {
         Ok(Some(0)) => TreeKill::Completed,
+        Ok(Some(TASKKILL_PROCESS_NOT_FOUND)) => TreeKill::NotFound,
         Ok(_) | Err(_) => TreeKill::Failed,
     }
 }
@@ -1635,6 +1681,89 @@ mod tests {
         }
     }
 
+    /// `taskkill` answering "no such process" is judged by the root's own
+    /// re-read. The root that went away by itself between the identity check and
+    /// the kill is a stop that happened: nothing is left to wait for, and
+    /// reporting it unconfirmed would keep a record, a stop request and a key for
+    /// a service that is gone.
+    #[test]
+    fn a_tree_kill_that_found_no_process_is_a_stop_when_the_root_is_gone() {
+        let (verdict, steps) = tree_kill_run_with(
+            true,
+            TreeKill::NotFound,
+            IdentityState::Matches,
+            TerminationOutcome::AlreadyGone,
+        );
+
+        assert_eq!(
+            verdict,
+            TerminationOutcome::AlreadyGone,
+            "the root exited on its own: the truth, not a kill this stop performed"
+        );
+        assert!(verdict.stopped());
+        assert!(
+            steps.contains(&Step::Terminate(SUPERVISOR_PID)),
+            "the root is re-read by the termination: {steps:?}"
+        );
+    }
+
+    /// "No such process" while the root is still there is a contradiction, so it
+    /// is a failed kill and the stop stays unconfirmed, as for any other nonzero
+    /// exit.
+    #[test]
+    fn a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill() {
+        use TerminationOutcome::{Forced, Graceful, TimedOut, Unverified};
+        for (root, expected) in [
+            (Forced, TimedOut),
+            (Graceful, TimedOut),
+            (TimedOut, TimedOut),
+            (Unverified, Unverified),
+        ] {
+            let (verdict, _) =
+                tree_kill_run_with(true, TreeKill::NotFound, IdentityState::Matches, root);
+
+            assert_eq!(verdict, expected, "root {root:?}");
+            assert!(!verdict.stopped(), "root {root:?}");
+        }
+    }
+
+    /// Any other nonzero exit with the root gone still leaves the stop
+    /// unconfirmed: unlike "not found", it says a process could not be
+    /// terminated, so a descendant may survive the root.
+    #[test]
+    fn a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed() {
+        let (verdict, _) = tree_kill_run_with(
+            true,
+            TreeKill::Failed,
+            IdentityState::Matches,
+            TerminationOutcome::AlreadyGone,
+        );
+
+        assert_eq!(verdict, TerminationOutcome::TimedOut);
+    }
+
+    /// A recorded token that can be read and differs proves another process
+    /// holds the PID, even when the rest of the query failed; without a readable
+    /// token the PID stays unverifiable.
+    #[test]
+    fn a_readable_token_mismatch_outranks_a_failed_query() {
+        use crate::process::ProcessProbe::Unqueryable;
+        let state = |recorded, live| {
+            identity_state_with(
+                &ProcessIdentity::new(SUPERVISOR_PID, recorded),
+                |_| Unqueryable,
+                |_| false,
+                |_| live,
+            )
+        };
+
+        assert_eq!(state(Some(7), Some(8)), IdentityState::Recycled);
+        assert_eq!(state(Some(7), Some(7)), IdentityState::Indeterminate);
+        assert_eq!(state(Some(7), None), IdentityState::Indeterminate);
+        assert_eq!(state(None, Some(8)), IdentityState::Indeterminate);
+        assert_eq!(state(None, None), IdentityState::Indeterminate);
+    }
+
     #[test]
     fn a_completed_tree_kill_leaves_the_roots_verdict_alone() {
         use TerminationOutcome::{Forced, Graceful, TimedOut, Unverified};
@@ -1741,12 +1870,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_clean_taskkill_exit_is_a_completed_tree_kill() {
+    fn only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found() {
         use std::io::{Error, ErrorKind};
         assert_eq!(classify_taskkill(Ok(Some(0))), TreeKill::Completed);
-        // A process it could not terminate, or none found.
+        // A process it could not terminate.
         assert_eq!(classify_taskkill(Ok(Some(1))), TreeKill::Failed);
-        assert_eq!(classify_taskkill(Ok(Some(128))), TreeKill::Failed);
+        assert_eq!(classify_taskkill(Ok(Some(5))), TreeKill::Failed);
+        // No such process: not a failure by itself, the root's re-read decides.
+        assert_eq!(classify_taskkill(Ok(Some(128))), TreeKill::NotFound);
         // Ended without an exit code.
         assert_eq!(classify_taskkill(Ok(None)), TreeKill::Failed);
         // Could not be started, or did not finish before its deadline.
@@ -1773,15 +1904,20 @@ mod tests {
                 |_| live,
             )
         };
-        // Whatever token was recorded, and whatever can be read of the process.
-        for recorded in [None, Some(7)] {
-            for live in [None, Some(7), Some(8)] {
-                assert_eq!(
-                    state(Unqueryable, false, recorded, live),
-                    IdentityState::Indeterminate,
-                    "recorded {recorded:?}, live {live:?}"
-                );
-            }
+        // Whatever token was recorded, and whatever can be read of the process,
+        // short of a readable token that differs (`a_readable_token_mismatch_...`).
+        for (recorded, live) in [
+            (None, None),
+            (None, Some(7)),
+            (None, Some(8)),
+            (Some(7), None),
+            (Some(7), Some(7)),
+        ] {
+            assert_eq!(
+                state(Unqueryable, false, recorded, live),
+                IdentityState::Indeterminate,
+                "recorded {recorded:?}, live {live:?}"
+            );
         }
         assert_eq!(state(Gone, false, Some(7), Some(7)), IdentityState::Gone);
         assert_eq!(state(Running, true, Some(7), Some(7)), IdentityState::Gone);

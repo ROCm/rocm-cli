@@ -507,6 +507,39 @@ line.
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
 
+On Windows the stop takes the engine's process tree down with the recorded
+process (`taskkill /T /F`, which has to finish within the stop's grace period of
+10 seconds, or the stop is not confirmed), and it checks the recorded process
+against the creation time written when the server started, so a process that has
+since taken the same PID is left alone and reported as `identity_mismatch`. A
+process it cannot verify, on either platform, is not signalled and is named with
+the check the host has: `ps -p <pid> -o pid,args` on Linux and WSL, and
+`tasklist /FI "PID eq <pid>"` on Windows. There are two ways to be unverifiable:
+the recorded start-time can no longer be read back from a running process, or
+(Windows only) the PID cannot be queried at all, as for a live process the
+account may not open. The text of `rocm services stop` does not list a per-process
+outcome for the stopping process itself; the JSON answer of the sandbox
+`stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
+as stopped).
+
+#### A record that stays unverified
+
+If the server is gone but its recorded PID has been taken by a process this
+account cannot open, `rocm` cannot tell the two apart, and it treats that as
+possibly running, which is the safe direction: the record never reconciles to
+`stopped`, `rocm services remove` and `rocm services prune` refuse it, and
+`rocm services stop` keeps reporting `unverified`. To clear it:
+
+1. Run the check command the stop printed. If the process is this server's, end it
+   yourself (from an elevated prompt if the account may not), then run
+   `rocm services`; the record reconciles and its endpoint key is dropped.
+2. If it is an unrelated process, `rocm` has no command that clears the record.
+   Delete the record's `<service-id>.json` by hand from the folder that
+   `rocm storage report` lists under `local server records`, then run
+   `rocm services prune --any-age --yes`, which sweeps the log, the endpoint key
+   and the engine state file that are left with no record. The server can no
+   longer be restarted afterwards.
+
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
 up: section 3 serves Lemonade and then stops it on both of its branches, the

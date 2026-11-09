@@ -1019,8 +1019,11 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 /// - a process that was signalled and that, or a process under it, outlived
 ///   the deadline (`timed_out`);
 /// - a process that was not signalled because its identity could not be
-///   verified (`unverified`), with how to look at it. It may have exited
-///   meanwhile: the identity read can fail because the process is going away;
+///   verified (`unverified`), with how to look at it. There are two routes to
+///   it: a recorded start-time that can no longer be read back from a running
+///   process, and, on Windows, a PID that cannot be queried at all. It may have
+///   exited meanwhile: the identity read can fail because the process is going
+///   away;
 /// - the record changed while the stop ran, typically because a restart
 ///   recorded new processes, so the stop's verdict says nothing about what the
 ///   record names now.
@@ -1140,10 +1143,12 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
 /// stop left alone because it could not verify it. Not a `rocm` command: the
 /// CLI deliberately does not act on that process, so the user decides.
 ///
-/// Linux and Windows can both produce that outcome: it needs a recorded
-/// start-time that can no longer be read back, and `rocm_core::process_start_ticks`
-/// records one on both. So the command is the one the host has: `ps` on Linux,
-/// `tasklist` on Windows.
+/// Linux and Windows can both produce that outcome, by two routes. On both, a
+/// recorded start-time that can no longer be read back from a running process
+/// (`rocm_core::process_start_ticks` records one on both). On Windows also, a PID
+/// that cannot be queried at all, such as a live process this one may not open,
+/// which reads as unverifiable with or without a recorded token. So the command
+/// is the one the host has: `ps` on Linux, `tasklist` on Windows.
 pub(crate) fn process_check_command(pid: u64) -> String {
     process_check_command_for(cfg!(windows), pid)
 }
