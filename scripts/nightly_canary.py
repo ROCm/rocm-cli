@@ -122,7 +122,34 @@ def check_plan(
                 f"selected build {version} is {age} days old "
                 f"(limit {max_age_days}); the stream may have moved on"
             )
+    failures += mixed_build_ids(plan)
     return failures
+
+
+def mixed_build_ids(plan: dict[str, str]) -> list[str]:
+    """Package specs that name a ROCm build other than the selected one.
+
+    The plan's ``package_specs`` line pins ``rocm`` and each framework package's
+    ``+rocm<build>`` label; all of them must be the one selected build, or the
+    install would mix builds. A plan without the line (a layout that does not
+    pin the stack in the preview) is not judged here.
+    """
+    selected = plan.get("selected_rocm_version")
+    specs = plan.get("package_specs", "").split()
+    problems = []
+    for spec in specs:
+        if spec.startswith("rocm[") or spec.startswith("rocm=="):
+            build = spec.rsplit("==", 1)[-1]
+        elif "+rocm" in spec:
+            build = spec.rsplit("+rocm", 1)[-1]
+        else:
+            continue
+        if build != selected:
+            problems.append(
+                f"package spec {spec!r} names ROCm build {build!r}, "
+                f"not the selected {selected!r}"
+            )
+    return problems
 
 
 def newest_listed_version(listing_html: str) -> str | None:
@@ -191,6 +218,7 @@ SAMPLE_PLAN = """sdk install
   format: wheel
   device_target: <undetermined>
   index_url: https://rocm.nightlies.amd.com/whl-multi-arch
+  package_specs: rocm[libraries,device-<undetermined>]==7.14.0a20260601 torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260601 torchaudio==2.11.0+rocm7.14.0a20260601
   mode: dry-run
 """
 SAMPLE_SOURCE = """
@@ -230,7 +258,18 @@ def self_test() -> None:
     assert any(
         "days old" in f for f in failures(selected_rocm_version="7.14.0a20260520")
     )
-    assert failures(selected_rocm_version="7.14.0a20260530") == []
+    assert failures(selected_rocm_version="7.14.0a20260530") != [], (
+        "the specs still name the 0601 build, so a different selection is a mix"
+    )
+    mixed = SAMPLE_PLAN.replace(
+        "torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260601",
+        "torch[device-<undetermined>]==2.11.0+rocm7.14.0a20260515",
+    )
+    mixed_failures = check_plan(
+        parse_plan(mixed), constants, today, DEFAULT_MAX_AGE_DAYS
+    )
+    assert any("names ROCm build" in f for f in mixed_failures), mixed_failures
+    assert failures(package_specs=None) == [], "no package_specs line: not judged"
     try:
         read_constants('const OTHER: &str = "x";')
     except CanaryError:

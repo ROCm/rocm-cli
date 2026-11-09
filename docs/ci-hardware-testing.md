@@ -70,6 +70,8 @@ plan with [`nightly_canary.py`](../scripts/nightly_canary.py):
 - the selected version is a dated nightly and its build is at most three days
   old, which is how a stream that stopped publishing, or a resolver stuck on an
   old train, shows up. No expected version is hard-coded;
+- when the plan pins the package stack, `rocm` and every framework package's
+  `+rocm` label name the one selected build, so a mixed-build stack fails;
 - the dry run itself succeeds, so an unknown layout, a redirect or a missing or
   incomplete build fails with the resolver's own message.
 
@@ -79,8 +81,7 @@ not complete yet.
 
 What it does not cover: the periodic hardware lane that installs the resolved
 nightly and runs a real GPU operation (the per-channel legs of `nightly.yml`
-are the closest thing today), a check that the framework stack shares one ROCm
-build identifier, and whether a newer listed build is complete.
+are the closest thing today), and whether a newer listed build is complete.
 
 **Who is told.** A failed scheduled run emails the person who last changed the
 workflow's schedule and shows red on the Actions tab; nothing else routes the
