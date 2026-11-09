@@ -1628,8 +1628,11 @@ non-zero too, after printing its log.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
+do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
+Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
+exits with code 0. Any other answer cancels the same way, after a line saying
+that the answer was not understood and is treated as no. Use `--dry-run` to only
+list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
 is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
