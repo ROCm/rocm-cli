@@ -2353,6 +2353,42 @@ flaky = true
         ));
     }
 
+    /// The two rows for Lemonade 11.5.1's failed backend alignment apply to native
+    /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
+    /// default engine is vLLM, where the engine named is what decides), and they are not
+    /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets
+    /// `serve_timeout_secs`: serve-06's own `@serve-timeout` tag takes precedence over a
+    /// row, so one would change nothing.
+    #[test]
+    fn lemonade_alignment_rows_apply_only_to_native_windows_with_lemonade() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        for id in [
+            "runtime-lemonade-backend-alignment-reported",
+            "serve-large-model-inference",
+        ] {
+            assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
+            for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
+                assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
+            }
+            // Same Windows host, other engine: the row is about lemonade.
+            assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
+            let entries = m.entries_for(id);
+            assert_eq!(entries.len(), 1, "{id}");
+            assert!(!entries[0].flaky, "{id} is deterministic");
+            assert_eq!(entries[0].serve_timeout_secs, None, "{id}");
+        }
+        // The row cannot shorten serve-06's wait: its own tag wins, so the harness
+        // still hands the 2400s the feature file asks for.
+        let tags = feature_tags(
+            include_str!("../features/model_serving.feature"),
+            "serve-large-model-inference",
+        );
+        assert_eq!(
+            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            Some(2400)
+        );
+    }
+
     /// serve-40 serves through the same lemonade managed serve as the other
     /// lemonade serve rows, so its row is scoped the same way: xfail on a
     /// lemonade Linux host, with a 90s serve wait, and not an expected failure

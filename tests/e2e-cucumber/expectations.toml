@@ -174,3 +174,39 @@ bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
+
+# --- Lemonade 11.5.1 cannot align its llama.cpp backend to a ROCm 7.14.x SDK ---
+# `rocm engines install lemonade` tries to align Lemonade's `llamacpp:rocm`
+# backend with the active ROCm SDK. Lemonade 11.5.1, the pin in
+# `runtime-deps.toml`, downloads the TheRock tarball it pairs with the backend
+# only from https://repo.amd.com/rocm/tarball/, a path the 7.14.x tarballs are not
+# published to (AMD's 7.14 install guide uses /rocm/tarball-multi-arch/), so the
+# download answers HTTP 403 for `therock-dist-<os>-<family>-7.14.1.tar.gz`. The
+# pinned llama.cpp build has no ROCm 7.14 asset either (HTTP 404), so every tier
+# of the alignment fails and the CLI reverts to Lemonade's pinned ROCm 7.13
+# backend. Reproduced on a Strix Halo Linux box with an isolated root, not only on
+# the CI runners, so the failed alignment is not specific to Windows; the scenarios
+# below only fail there (runtime-16 is `@requires-os:windows`, and serve-06 passed on
+# the W7900 and MI300X lanes of the 2026-11-05 run).
+#
+# runtime-16 asserts the alignment succeeded, which it cannot while the 7.14.x
+# tarball is unreachable. serve-06 serves a 35B model through the Windows lane's
+# 7.13 backend against the SDK's 7.14.1 libraries and the server crashes in the
+# SDK's Tensile library on the first inference request (access violation in the
+# lane's service log). The mismatch between the backend and the SDK is the
+# suspected cause; it has NOT been reproduced off Windows, so the row names both
+# facts. Both rows are deterministic (both scenarios failed on each Windows lane
+# run examined: 2026-10-28, 2026-11-05 and 2026-11-06), so neither is `flaky`: an
+# XPASS means the cause is gone and the row should be deleted. Neither row sets
+# `serve_timeout_secs`: serve-06's own `@serve-timeout:2400` tag takes precedence
+# over a row, so a shorter wait here would have no effect, and the failing
+# serve-06 still holds the Windows lane for the full 2400s wait.
+[["runtime-lemonade-backend-alignment-reported"]]
+when = { effective_engine = "lemonade", os = "windows" }
+bug = "ROCMAI-899"
+reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend cannot be aligned to a 7.14.x SDK and the install reverts to the pinned 7.13 backend."
+
+[["serve-large-model-inference"]]
+when = { effective_engine = "lemonade", os = "windows" }
+bug = "ROCMAI-900"
+reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
