@@ -34,10 +34,7 @@ use rocm_dash_tui::app::{ActiveTab, AppState, ConnState, Modal};
 use rocm_dash_tui::ui;
 
 #[derive(Parser)]
-#[command(
-    name = "gen_screenshots",
-    about = "Render TUI views to SVG for marketing"
-)]
+#[command(name = "gen_screenshots", about = "Render TUI views to SVG")]
 struct Args {
     /// Session NDJSON recording to render (`PersistedEntry` lines).
     #[arg(long)]
