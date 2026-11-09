@@ -265,7 +265,13 @@ runs the whole client against a fake that exits without reading;
 `the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
 grandchild keeps the pipe open. The last two run the step on a real child with an
 injected write error, because whether a real write fails before the child has
-closed its stdin is a race.
+closed its stdin is a race. The bound compares the deadline with the clock
+before every receive and receives nothing once it has passed, because a receive
+with an expired timeout still returns output that is already queued, which would
+let a backlog or a descendant that keeps writing hold the error path past it;
+`collecting_stops_at_the_deadline_even_with_output_queued` and
+`collecting_returns_at_the_deadline_while_output_keeps_arriving` run that
+collection directly, on every platform.
 
 One wait is deliberately not bounded and has no test: after the child exits, the
 answer is read to the end of its stdout and its stderr collector is joined, so an

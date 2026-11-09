@@ -267,11 +267,26 @@ fn read_available(mut source: impl Read + Send + 'static, grace: Duration) -> Ve
             }
         }
     });
-    let deadline = Instant::now() + grace;
+    collect_until(&receiver, Instant::now() + grace)
+}
+
+/// Gather what arrives on `receiver` until it closes or `deadline` passes.
+///
+/// The deadline is compared with the clock before every receive, and nothing is
+/// received once it has passed: `recv_timeout` with an expired timeout still
+/// hands back a message that is already queued, so a backlog, or a descendant
+/// that keeps writing, would otherwise keep this collecting past the bound.
+fn collect_until(receiver: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
     let mut collected = Vec::new();
-    while let Ok(chunk) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        collected.extend(chunk);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match receiver.recv_timeout(deadline - now) {
+            Ok(chunk) => collected.extend(chunk),
+            Err(_) => break,
+        }
     }
     collected
 }
@@ -550,6 +565,54 @@ mod tests {
             collected,
             "failed to read engine progress: pipe went away\n"
         );
+    }
+
+    /// Output already queued when the deadline has passed is not collected:
+    /// `recv_timeout(Duration::ZERO)` would still return it, one message after
+    /// another, for as long as the queue stays non-empty.
+    #[test]
+    fn collecting_stops_at_the_deadline_even_with_output_queued() {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..100_000 {
+            sender.send(vec![b'x'; 16]).unwrap();
+        }
+        let started = Instant::now();
+        let collected = collect_until(&receiver, Instant::now());
+        assert!(
+            collected.is_empty(),
+            "collected {} bytes after the deadline",
+            collected.len()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // Before the deadline, queued output is collected, and a closed channel
+        // ends the collection early.
+        drop(sender);
+        let collected = collect_until(&receiver, Instant::now() + Duration::from_secs(30));
+        assert_eq!(collected.len(), 100_000 * 16);
+    }
+
+    /// A producer that keeps writing (a descendant holding the pipe) cannot hold
+    /// the collection past its deadline.
+    #[test]
+    fn collecting_returns_at_the_deadline_while_output_keeps_arriving() {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let producer = thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until {
+                if sender.send(vec![b'y'; 1024]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let started = Instant::now();
+        let collected = collect_until(&receiver, Instant::now() + Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        drop(receiver);
+        producer.join().unwrap();
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(!collected.is_empty(), "what arrived in time is kept");
     }
 
     #[test]
