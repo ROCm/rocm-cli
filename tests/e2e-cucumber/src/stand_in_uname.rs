@@ -13,11 +13,18 @@
 
 use std::path::Path;
 
+/// `value` as one single-quoted shell word: each embedded single quote closes the
+/// quotes, is written escaped and reopens them. (`rocm_core::quoting` has the same
+/// quoting, but `rocm-core` is only a dev-dependency of this library.)
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// The text of the stand-in `uname`: log the arguments to `log`, answer `-v`, and
 /// otherwise run `release_body` (a shell fragment).
 #[must_use]
 pub fn stand_in_uname_script(release_body: &str, log: &Path) -> String {
-    let log = rocm_core::quoting::posix_shell_quote(&log.to_string_lossy());
+    let log = single_quoted(&log.to_string_lossy());
     format!(
         "#!/bin/sh\necho \"$*\" >> {log}\nif [ \"$1\" = -v ]; then echo '#1 SMP stand-in'; exit 0; fi\n{release_body}\n"
     )
