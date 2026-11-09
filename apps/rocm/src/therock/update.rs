@@ -4,14 +4,20 @@
 
 //! Whether an installed runtime has something newer to offer, and the bounded
 //! startup check that asks. `runtime_update_plan` resolves the latest source for
-//! one runtime (`resolve_latest_for_manifest`, which re-resolves a wheel
-//! runtime through `resolve_pip_runtime_with_timeout` and a tarball one through
+//! one runtime, and `runtime_update_check` does the same for a caller that
+//! changes nothing (the report, the JSON, the startup check and an apply's
+//! preview). They differ in `PythonAccess`: given a wheel runtime that records
+//! no usable Python, the plan prepares a managed Python (an apply needs one),
+//! while the check works the wheel tag out from the interpreter the layout
+//! requires and carries a `python_note` saying the preparation was left undone
+//! (`resolve_latest_for_manifest` re-resolves a wheel runtime through
+//! `resolve_pip_runtime_with_timeout` and a tarball one through
 //! `resolve_tarball_artifact_with_timeout`, on the layout the runtime was
 //! installed from) and `runtime_freshness` classifies it (`RuntimeFreshness`:
 //! up to date, update available, repair available, or ahead of the index) into
 //! a `RuntimeUpdatePlan`. `render_update_report` and `render_update_json` show
 //! the plans for `rocm update` (the JSON form is what the dashboard's update
-//! check parses), and `maybe_refresh_startup_update_check` keeps one
+//! check parses and carries no `python_note`), and `maybe_refresh_startup_update_check` keeps one
 //! `StartupUpdateCheckRecord` in the cache so the check runs at most once an
 //! interval and is bounded by a short download timeout.
 //!
