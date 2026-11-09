@@ -79,9 +79,6 @@ const EXEMPT: &[&str] = &[
     "crates/rocm-dash-collectors/src/host.rs",
     "crates/rocm-dash-collectors/src/lemonade.rs",
     "crates/rocm-dash-collectors/src/parallel.rs",
-    "crates/rocm-dash-collectors/src/proc_scan.rs",
-    "crates/rocm-dash-collectors/src/sysfs.rs",
-    "crates/rocm-dash-collectors/src/vllm_log.rs",
     "crates/rocm-dash-collectors/src/vllm_prom.rs",
     "crates/rocm-dash-core/src/bench_rollup.rs",
     "crates/rocm-dash-core/src/bench_schema.rs",
@@ -110,7 +107,6 @@ const EXEMPT: &[&str] = &[
     "crates/rocm-dash-tui/src/tool_exec.rs",
     "crates/rocm-dash-tui/src/transport.rs",
     "crates/rocm-dash-tui/src/ui/automations_manager.rs",
-    "crates/rocm-dash-tui/src/ui/bench.rs",
     "crates/rocm-dash-tui/src/ui/bench_run.rs",
     "crates/rocm-dash-tui/src/ui/command_screen.rs",
     "crates/rocm-dash-tui/src/ui/config_manager.rs",
@@ -122,7 +118,6 @@ const EXEMPT: &[&str] = &[
     "crates/rocm-dash-tui/src/ui/format.rs",
     "crates/rocm-dash-tui/src/ui/gradient.rs",
     "crates/rocm-dash-tui/src/ui/install_manager.rs",
-    "crates/rocm-dash-tui/src/ui/instance_list.rs",
     "crates/rocm-dash-tui/src/ui/launcher.rs",
     "crates/rocm-dash-tui/src/ui/logs_view.rs",
     "crates/rocm-dash-tui/src/ui/model_picker.rs",
@@ -150,7 +145,7 @@ const EXEMPT: &[&str] = &[
 /// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
 /// not raise it to make the check pass, since a file with no entry in the module
 /// map should get one. Raising it is the visible, reviewed way to grow the list.
-const EXEMPT_CEILING: usize = 76;
+const EXEMPT_CEILING: usize = 71;
 
 /// Whether `path` is a tracked-file path this check covers: a `.rs` file under
 /// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
