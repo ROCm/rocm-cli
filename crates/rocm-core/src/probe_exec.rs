@@ -144,29 +144,30 @@ pub(crate) fn read_host_text(path: &str) -> String {
 ///
 /// - An empty `PATH` entry is skipped, not read as the current directory as a
 ///   shell or `execvp` would. A file named like the tool in the directory the
-///   CLI was started from therefore never reads as the tool being installed,
-///   which matters for the checks that gate a privileged step (`sudo`,
-///   `usermod`). The cost is that a program the CLI later starts by bare name
-///   can still resolve from the current directory when `PATH` has an empty
-///   entry, because the operating system resolves it, not this lookup.
+///   CLI was started from therefore does not read as the tool being installed
+///   through an empty entry, which matters for the checks that gate a
+///   privileged step (`sudo`, `usermod`). An explicit `.` or other relative
+///   entry is an ordinary directory and is searched. The cost is that a
+///   program the CLI later starts by bare name can still resolve from the
+///   current directory when `PATH` has an empty entry, because the operating
+///   system resolves it, not this lookup.
 /// - A `PATH` that is not valid Unicode is searched: it is split as an
 ///   `OsString`, and the entries that are not Unicode are looked in as they are.
 /// - The directories are split the way [`std::env::split_paths`] splits them on
 ///   this platform, so on Windows an entry may be quoted to hold a `;`.
 /// - On Windows a program without an extension is tried with every `PATHEXT`
 ///   entry in both cases, and `cmd`, `pnputil`, `powershell` and `pwsh` are
-///   also found at their fixed System32 locations. An absolute candidate
-///   ignores the directory it is joined onto, so it is found whenever `PATH`
-///   lists at least one directory, on `PATH` or not. No caller asks for those
-///   four today; they stay in the shared candidate list because the capture
-///   runner needs them and one list cannot drift from the other.
+///   also found at their fixed System32 locations. An absolute candidate is
+///   tested once as it is, not joined onto each `PATH` directory, so it is found
+///   whether or not `PATH` is set, on `PATH` or not: the lookup then agrees with
+///   what the capture runner, which starts those locations, can run. No caller
+///   asks for those four today; they stay in the shared candidate list because
+///   the runner needs them and one list cannot drift from the other.
 pub(crate) fn which(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    found_in(&path_dirs(&path), &tool_path_candidates(program), |file| {
-        file.is_file()
-    })
+    let dirs = std::env::var_os("PATH")
+        .map(|path| path_dirs(&path))
+        .unwrap_or_default();
+    found_in(&dirs, &tool_path_candidates(program), Path::is_file)
 }
 
 /// The directories of a `PATH` value, empty entries dropped.
@@ -176,16 +177,26 @@ fn path_dirs(path: &OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether any of `candidates`, joined onto any of `dirs`, is a file according
-/// to `is_file`. Directories are tried in order, and within a directory the
-/// candidates in order. `is_file` is injected so a test can say which files
-/// exist without a file system.
+/// Whether any of `candidates` is a file according to `is_file`.
+///
+/// A relative candidate is joined onto each of `dirs`: directories are tried in
+/// order, and within a directory the candidates in order. An absolute candidate
+/// names its own location, so it is tested once as it is, after the directories,
+/// and does not depend on `dirs` at all. `is_file` is injected so a test can say
+/// which files exist without a file system.
 fn found_in(dirs: &[PathBuf], candidates: &[String], is_file: impl Fn(&Path) -> bool) -> bool {
-    dirs.iter().any(|dir| {
+    let in_a_dir = dirs.iter().any(|dir| {
         candidates
             .iter()
+            .filter(|candidate| !Path::new(candidate).is_absolute())
             .any(|candidate| is_file(&dir.join(candidate)))
-    })
+    });
+    in_a_dir
+        || candidates
+            .iter()
+            .map(Path::new)
+            .filter(|candidate| candidate.is_absolute())
+            .any(is_file)
 }
 
 /// The spellings of `program` to try, in the order to try them.
@@ -498,23 +509,49 @@ mod path_lookup_tests {
     }
 
     #[test]
-    fn found_in_asks_about_an_absolute_candidate_as_it_is_whatever_the_directory() {
-        // This is why a System32 location is found "without being on PATH": the
-        // join ignores the directory, so one listed directory is enough.
+    fn found_in_asks_about_an_absolute_candidate_once_as_it_is_whatever_the_directories() {
+        // This is why a System32 location is found "without being on PATH", and
+        // found even when PATH is unset or all empty: it is tested on its own,
+        // once, not joined onto each directory.
         let absolute = std::env::temp_dir().join("rocm-core-absolute-candidate");
-        let asked = RefCell::new(Vec::new());
+        let candidates = [absolute.to_string_lossy().into_owned()];
 
-        let found = found_in(
-            &[PathBuf::from("anywhere")],
-            &[absolute.to_string_lossy().into_owned()],
-            |file| {
+        for dirs in [
+            Vec::new(),
+            vec![PathBuf::from("anywhere")],
+            vec![PathBuf::from("anywhere"), PathBuf::from("elsewhere")],
+        ] {
+            let asked = RefCell::new(Vec::new());
+            let found = found_in(&dirs, &candidates, |file| {
                 asked.borrow_mut().push(file.to_owned());
                 true
-            },
-        );
+            });
+            // With directories listed the absolute candidate is never joined
+            // onto them, so the only thing asked about is the candidate itself.
+            assert!(found, "{} directories", dirs.len());
+            assert_eq!(
+                asked.into_inner(),
+                vec![absolute.clone()],
+                "{} directories",
+                dirs.len()
+            );
+        }
+        assert!(!found_in(&[], &candidates, |_| false));
+    }
 
-        assert!(found);
-        assert_eq!(asked.into_inner(), vec![absolute]);
+    #[test]
+    fn found_in_still_tries_relative_candidates_in_directories_beside_an_absolute_one() {
+        let absolute = std::env::temp_dir().join("rocm-core-absolute-candidate");
+        let candidates = [
+            absolute.to_string_lossy().into_owned(),
+            "tool.exe".to_owned(),
+        ];
+        let dirs = [PathBuf::from("first")];
+
+        assert!(found_in(&dirs, &candidates, |file| file
+            == Path::new("first").join("tool.exe")));
+        assert!(!found_in(&[], &candidates, |file| file
+            == Path::new("first").join("tool.exe")));
     }
 
     /// The child's side of [`ask_for`]: print the answer for the program named in
@@ -713,5 +750,7 @@ mod path_lookup_tests {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let empty = empty_dir(scratch.path(), "empty");
         assert!(ask_for("cmd", Some(&join(&[&empty])), scratch.path(), &[]));
+        // And with no PATH at all, as the capture runner could still start it.
+        assert!(ask_for("cmd", None, scratch.path(), &[]));
     }
 }
