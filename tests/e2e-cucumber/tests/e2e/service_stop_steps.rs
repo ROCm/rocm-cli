@@ -221,8 +221,10 @@ fn descendant_pid_path(world: &E2eWorld) -> PathBuf {
 }
 
 /// A ready, publicly bound server whose recorded supervisor is a parent process
-/// that has started a child of its own, recorded the way Windows records it:
-/// the PID alone, with no start-time token (there is none to read there).
+/// that has started a child of its own, recorded the way a Windows record was
+/// before Windows recorded a creation time: the PID alone, with no start-time
+/// token. (A record written now carries one; this scenario plants the tokenless
+/// shape on purpose, the one a PID cannot be refuted by.)
 ///
 /// The parent is PowerShell, the child `ping` for five minutes: both ship with
 /// Windows, need nothing installed, and are disposable. PowerShell starts the

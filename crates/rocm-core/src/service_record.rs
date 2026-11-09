@@ -740,7 +740,8 @@ mod tests {
     /// been recycled. One live process stands in for both roles, as it does for
     /// a `rocm serve --background` launch.
     ///
-    /// Linux-only: `process_start_ticks` reads `/proc`, and is `None` elsewhere.
+    /// Linux-only here, because it spawns `sleep`: `process_start_ticks` gives a
+    /// token on Linux and on Windows (the creation time) and is `None` elsewhere.
     #[cfg(target_os = "linux")]
     #[test]
     fn recording_a_process_identity_writes_the_pid_with_its_own_token() {
