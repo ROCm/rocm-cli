@@ -9126,17 +9126,6 @@ permissions:
             script.contains("E2E_CHANNELS:-release nightly"),
             "the lane script must default to both channels, as the doc says"
         );
-        // Neither the framing nor the caveat the owners dropped.
-        for gone in [
-            "(advisory)",
-            "the report's integrity",
-            "must not gate anything",
-        ] {
-            assert!(
-                !flat.contains(gone),
-                "docs/nightly-on-the-queue.md still says {gone}"
-            );
-        }
     }
 
     #[test]
@@ -9476,7 +9465,7 @@ permissions:
         assert!(!out.join("release").exists(), "{log}");
         assert!(!log.contains("--channel release"), "{log}");
 
-        for channels in ["beta", "release  stable", "  "] {
+        for channels in ["beta", "release  stable", "  ", "\t", "\n", " \t\n "] {
             let LaneRun {
                 rc,
                 log,

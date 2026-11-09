@@ -43,7 +43,10 @@ for channel in ${channels}; do
       ;;
   esac
 done
-if [[ -z "${channels// /}" ]]; then
+# Words, not characters: a tab or a newline alone is no channel either.
+# shellcheck disable=SC2086
+set -- ${channels}
+if [[ "$#" -eq 0 ]]; then
   echo "E2E_CHANNELS names no channel" >&2
   exit 2
 fi

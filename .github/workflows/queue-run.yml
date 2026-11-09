@@ -17,7 +17,7 @@ on:
         description: "The branch of this repository to test"
         type: string
         default: main
-  # Gating nothing until the published verdict can be trusted (see the doc).
+  # Whether this is a required check is a repository setting, not set here.
   schedule:
     - cron: "17 2 * * *"
 

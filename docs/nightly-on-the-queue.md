@@ -109,6 +109,11 @@ nightly`), each with its own runtimes and its own suite run, so a lane takes
 about twice as long as one channel would. Both always run, so a failing
 channel does not hide the other, and the lane fails if either did.
 
+The queue's results are an additional signal, not a replacement: the lanes
+write only into the queue artifact, and the `e2e-gpu-<channel>-report`
+artifacts that `nightly.yml`'s consolidated report reads are not produced from
+them.
+
 ## Output
 
 **A lane must write everything it wants reported directly into `/out`.** The
@@ -221,8 +226,13 @@ credential and sends nothing to the queue: the runner, which sits next to the
 queue side, asks it for a run of a branch, and the queue side starts it with
 its own credential. It believes the request because of where it comes from,
 which is why the runner is set up to run only these two workflows from `main`
-(a setting outside this repository). The worst a
-request can do is start a run of a branch already in this repository.
+(a setting outside this repository). A request can start a run of a branch
+already in this repository, and that branch's lane command then runs in the
+lane pods. The lane spec gives those pods no queue or cluster credential and
+mounts neither the results volume nor the runner's files, so the command can
+publish only what it writes to `/out`, through the scan above. What else a pod
+can reach is set by the queue's own isolation, which this repository cannot
+verify.
 
 **Only `/out` is published, and a missing run is never green.** Publishing by
 origin is the main control on what reaches public results, with the scan
