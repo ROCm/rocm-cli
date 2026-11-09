@@ -81,7 +81,9 @@ pub use automation::{
     load_recent_automation_events, load_recent_automation_proposals,
     update_automation_proposal_status,
 };
-pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
+pub use binary_paths::{
+    daemon_binary_path, engine_binary_path, sibling_binary_path, sibling_binary_path_from,
+};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
