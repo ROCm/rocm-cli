@@ -797,9 +797,27 @@ mod tests {
 
         /// A `uname` that never answers is read as nothing by both, each after
         /// the one timeout. `exec` leaves no grandchild holding the pipe.
+        ///
+        /// The stand-in would exit successfully with nothing after 30 s, which is
+        /// also what a read with no timeout would turn into `None`, so the
+        /// answers alone cannot tell a timeout from no timeout. The elapsed time
+        /// can: the child reads twice in a row, each bounded by the 5 s limit, so
+        /// it takes about 10 s, and at least 9 s shows the stand-in really hung.
+        /// With the limit raised past the stand-in's 30 s it takes 60 s and the
+        /// upper bound fails.
         #[test]
-        fn a_uname_that_never_answers_reads_as_nothing_in_both() {
+        fn a_uname_that_never_answers_reads_as_nothing_in_both_within_the_timeout() {
+            let started = Instant::now();
             assert_eq!(ask("exec sleep 30"), pair(None, ""));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= std::time::Duration::from_secs(9),
+                "two reads of a hung uname returned after {elapsed:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(25),
+                "the reads outlived the timeout: {elapsed:?}"
+            );
         }
     }
 }
