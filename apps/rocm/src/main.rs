@@ -533,8 +533,10 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
     /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. Inspect or stop servers later with
-    /// `rocm services`.
+    /// noting on stderr if that signal fails too. If instead the server dies on its own
+    /// while you are attached, the command exits non-zero, names the crash and quotes the
+    /// end of the service log, and leaves the service marked `failed`. Inspect or stop
+    /// servers later with `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
     /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
