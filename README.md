@@ -1578,6 +1578,27 @@ rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
 
+Settings live in `config.json` in the config directory and are replaced in one
+step, so an interrupted save leaves the previous file rather than a truncated
+one. On Windows, a replace that fails part-way can instead leave the new
+settings in a `config.json.tmp-*` file beside it, which the error names: rename
+it back to `config.json` before running another command. If the file exists
+but cannot be read — a bad hand edit, for example —
+rocm-cli reports it and does not save over it, so the settings in it are never
+replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
+where runtimes are kept; when it is too damaged to read even that, commands stop
+and say how to recover (`rocm diagnose` still runs). Repairing the file
+restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
+when the file still shows it) points commands back at your runtimes' folder
+meanwhile; until the file is repaired, any command that changes settings still
+stops on it, and other commands either stop too or run on default settings.
+To start over instead, rename the file yourself: the error names the exact
+file it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give
+it, `config.json.broken` beside it, and rocm-cli does not rename or move it for
+you. That resets every setting to its default, and runtimes in a custom folder
+then need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded
+that folder.
+
 ### Setup
 
 ```
