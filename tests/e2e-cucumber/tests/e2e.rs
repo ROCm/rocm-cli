@@ -32,6 +32,7 @@ mod e2e {
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod host_guard;
+    pub mod lemonade_install_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
     pub mod model_catalog_steps;
@@ -150,6 +151,11 @@ pub struct E2eWorld {
     /// records a behavioral precondition here; the When step remains a plain user
     /// action and consumes the fixture without exposing its mechanism in Gherkin.
     pub command_env: Vec<(&'static str, std::ffi::OsString)>,
+    /// The working directory for this scenario's next `rocm` invocation, for a
+    /// scenario whose subject is what the CLI finds in the directory it is run
+    /// from. Consumed by [`run_rocm_with_scenario_env`] like `command_env`; `None`
+    /// leaves the harness's own working directory.
+    pub command_dir: Option<PathBuf>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -361,6 +367,7 @@ impl Default for E2eWorld {
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),
+            command_dir: None,
             tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
@@ -1041,11 +1048,25 @@ pub fn run_rocm_with_env_and_unset(
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
     let binary = rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
+    // A binary given as a relative path was meant relative to this process's
+    // directory, not to the scenario's, so it is made absolute before the child
+    // moves. A bare name (`rocm`, found on `PATH`) stays as it is, even if the
+    // harness's directory happens to hold a file of that name.
+    let program = if world.command_dir.is_some() {
+        e2e_cucumber::binary_path::program_for_moved_child(&binary, |path| {
+            std::fs::canonicalize(path)
+        })
+    } else {
+        PathBuf::from(&binary)
+    };
+    let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
     for (key, value) in std::mem::take(&mut world.command_env) {
         cmd.env(key, value);
+    }
+    if let Some(dir) = world.command_dir.take() {
+        cmd.current_dir(dir);
     }
     let output = cmd
         .output()
