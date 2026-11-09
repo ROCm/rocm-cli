@@ -139,26 +139,42 @@ where
 fn rocm_executable() -> Result<PathBuf> {
     let current =
         std::env::current_exe().context("failed to resolve current rocm executable path")?;
-    rocm_executable_from(current, || rocm_core::sibling_binary_path("rocm"))
+    rocm_executable_from(current, cfg!(windows), || {
+        rocm_core::sibling_binary_path("rocm")
+    })
 }
 
-/// [`rocm_executable`] given this process's executable and the way to find a
-/// sibling `rocm`, so the choice can be tested without either.
+/// [`rocm_executable`] given this process's executable, whether it runs on
+/// Windows, and the way to find a sibling `rocm`, so the choice can be tested
+/// without any of them.
 fn rocm_executable_from(
     current: PathBuf,
+    windows: bool,
     sibling_rocm: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
     let current = without_deleted_marker(current);
-    // Exactly `rocmd` (or `rocmd.exe`). A renamed or test binary is not known to
-    // lack the verb, and has no `rocm` beside it to prefer: it runs itself, so a
-    // standalone `rocmd` shipped under another name still answers an engine
-    // request with "unrecognized subcommand".
-    if current.file_stem().is_some_and(|stem| stem == "rocmd") {
+    // The whole file name is `rocmd`, or `rocmd.exe` on Windows: not `rocmd.bak`,
+    // not `rocmd-0.3`. A renamed or test binary is not known to lack the verb, and
+    // has no `rocm` beside it to prefer: it runs itself, so a standalone `rocmd`
+    // shipped under another name still answers an engine request with
+    // "unrecognized subcommand".
+    if current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| is_standalone_rocmd_name(name, windows))
+    {
         return sibling_rocm().context(
             "the standalone rocmd needs the rocm executable beside it to reach an engine",
         );
     }
     Ok(current)
+}
+
+/// Whether `name`, a file name, is the standalone daemon's: exactly `rocmd`, plus
+/// `rocmd.exe` (in any case) where `windows` says the platform names executables
+/// that way. The platform is a parameter so both spellings are tested everywhere.
+fn is_standalone_rocmd_name(name: &str, windows: bool) -> bool {
+    name == "rocmd" || (windows && name.eq_ignore_ascii_case("rocmd.exe"))
 }
 
 /// What Linux appends to the name `current_exe()` reports when the running
@@ -407,32 +423,45 @@ mod tests {
 
         // The standalone binary has no `__engine-stdio` verb, so it must not
         // re-execute itself.
-        for standalone in ["/opt/rocm-cli/bin/rocmd", "C:/rocm-cli/bin/rocmd.exe"] {
+        for (standalone, windows) in [
+            ("/opt/rocm-cli/bin/rocmd", false),
+            ("/opt/rocm-cli/bin/rocmd", true),
+            ("C:/rocm-cli/bin/rocmd.exe", true),
+            ("C:/rocm-cli/bin/ROCMD.EXE", true),
+        ] {
             assert_eq!(
-                rocm_executable_from(PathBuf::from(standalone), beside).unwrap(),
+                rocm_executable_from(PathBuf::from(standalone), windows, beside).unwrap(),
                 Path::new("/opt/rocm-cli/bin/rocm"),
-                "{standalone}"
+                "{standalone} (windows: {windows})"
             );
         }
 
-        // Embedded as `rocm daemon`, this process is `rocm`; a test binary
-        // or a renamed copy has no `rocm` beside it to prefer.
-        for own in [
-            "/opt/rocm-cli/bin/rocm",
-            "C:/rocm-cli/bin/rocm.exe",
-            "/work/target/debug/deps/rocmd-0f3a9c1d",
-            "/opt/rocm-cli/bin/rocm-0.3",
+        // Embedded as `rocm daemon`, this process is `rocm`; a test binary, a
+        // renamed copy or a backup of the daemon has no `rocm` beside it to
+        // prefer, and only the whole name `rocmd` counts: a file stem would also
+        // match `rocmd.bak`. `rocmd.exe` is the daemon's name only on Windows.
+        for (own, windows) in [
+            ("/opt/rocm-cli/bin/rocm", false),
+            ("C:/rocm-cli/bin/rocm.exe", true),
+            ("/work/target/debug/deps/rocmd-0f3a9c1d", false),
+            ("/opt/rocm-cli/bin/rocm-0.3", false),
+            ("/opt/rocm-cli/bin/rocmd.bak", false),
+            ("/opt/rocm-cli/bin/rocmd.old", false),
+            ("C:/rocm-cli/bin/rocmd.bak", true),
+            ("/opt/rocm-cli/bin/rocmd.exe", false),
+            ("/opt/rocm-cli/bin/rocmd.bak (deleted)", false),
         ] {
-            let chosen = rocm_executable_from(PathBuf::from(own), || {
+            let chosen = rocm_executable_from(PathBuf::from(own), windows, || {
                 panic!("{own} has no use for a sibling")
             })
             .unwrap();
-            assert_eq!(chosen, Path::new(own));
+            let expected = own.strip_suffix(" (deleted)").unwrap_or(own);
+            assert_eq!(chosen, Path::new(expected), "{own} (windows: {windows})");
         }
 
         // A standalone `rocmd` with no `rocm` beside it fails with a message that
         // says why, rather than running something that cannot serve the verb.
-        let error = rocm_executable_from(PathBuf::from("/opt/rocm-cli/bin/rocmd"), || {
+        let error = rocm_executable_from(PathBuf::from("/opt/rocm-cli/bin/rocmd"), false, || {
             anyhow::bail!("unable to locate sibling binary rocm")
         })
         .unwrap_err();
@@ -453,12 +482,12 @@ mod tests {
         let beside = || Ok(PathBuf::from("/usr/bin/rocm"));
 
         let chosen =
-            rocm_executable_from(PathBuf::from("/usr/bin/rocmd (deleted)"), beside).unwrap();
+            rocm_executable_from(PathBuf::from("/usr/bin/rocmd (deleted)"), false, beside).unwrap();
         assert_eq!(chosen, Path::new("/usr/bin/rocm"));
 
         // Embedded `rocm daemon`: run the file now at that path, not the
         // marker-suffixed name, which no file has.
-        let chosen = rocm_executable_from(PathBuf::from("/usr/bin/rocm (deleted)"), || {
+        let chosen = rocm_executable_from(PathBuf::from("/usr/bin/rocm (deleted)"), false, || {
             panic!("an embedded rocm has no use for a sibling")
         })
         .unwrap();
