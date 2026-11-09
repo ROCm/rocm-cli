@@ -1161,14 +1161,20 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        // The MCP summary prefixes the command output. The version line is
-        // the same string `rocm version` prints. Its tag / `main` / unknown
-        // shapes are `format_cli_version_reports_a_release_tag_without_its_leading_v`,
-        // `format_cli_version_reports_main_as_a_dev_build`, and
-        // `format_cli_version_falls_back_to_the_package_version_only_when_the_ref_is_unknown`
-        // in `build.rs` (run via `tests/build_metadata.rs`).
+        // The MCP summary prefixes the command output. The expected line is
+        // assembled from the build script's separate exports rather than from
+        // `cli_version_string()`, the function the handler itself calls, so a
+        // regression in that function's content fails here too. Which leading
+        // version a tag, `main`, or an unknown ref produces is the
+        // `format_cli_version_*` tests in `build.rs` (run via
+        // `tests/build_metadata.rs`).
         let text = mcp_tool_result_text(&result);
-        let version_line = format!("rocm-cli {}", cli_version_string());
+        let version_line = format!(
+            "rocm-cli {} ({}, {})",
+            env!("ROCM_CLI_VERSION_NUMBER"),
+            env!("ROCM_CLI_VERSION_REF"),
+            env!("ROCM_CLI_GIT_HASH")
+        );
         assert!(text.lines().any(|line| line == version_line), "{text}");
     }
 

@@ -3898,11 +3898,15 @@ verifying it needs a lane whose GPU architecture is on the allowlist.
 `vX.Y.Z` tag build, `0.0.0-dev` for any other ref), never the ref and hash
 after it (a release suffix outside letters, digits, `.`, `-` and `+`, or a
 version over 64 characters, is published as `unknown`). Scenario
-`diagnose-48` in
+`diagnose-58` in
 [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) checks that
-on a simulated host whose planted GPU is on the allowlist, so it prepares a
-report on every Linux lane, GPU or not; on real hardware, compare the field with
-the first word after `rocm-cli` in `rocm version`.
+the field equals that leading version and that the version is the one the ref
+calls for, on a simulated host whose planted GPU is on the allowlist, so it
+prepares a report on every Linux lane, GPU or not. Those lanes build from a
+branch, so they check the `0.0.0-dev` half; the tag half is checked on the
+shipped binaries by the "Check the release binary's version" steps in
+[release.yml](../.github/workflows/release.yml). On real hardware, compare the
+field with the first word after `rocm-cli` in `rocm version`.
 
 Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
 answer with a word rather than a value, and the words are not interchangeable.

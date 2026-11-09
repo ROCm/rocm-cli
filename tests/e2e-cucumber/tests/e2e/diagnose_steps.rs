@@ -4077,16 +4077,29 @@ async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
     let (version_out, version_err, version_rc) = crate::run_rocm(world, &["version"]);
     assert_eq!(version_rc, 0, "{version_out}\n{version_err}");
     let first_line = version_out.lines().next().unwrap_or_default().trim();
-    let leading = first_line
+    let (leading, reference) = first_line
         .strip_prefix("rocm-cli ")
         .and_then(|rest| rest.split_once(" ("))
-        .map_or_else(
-            || panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"),
-            |(version, _)| version,
-        );
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, _hash)| (version, reference))
+        })
+        .unwrap_or_else(|| panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"));
     assert_eq!(
         reported, leading,
         "the report's cli_version is not the version `rocm version` leads with \
          ({first_line}):\n{report:#}"
+    );
+    // Agreement alone would also hold if both surfaces regressed to the same
+    // wrong value (the frozen workspace version, say), so the version is also
+    // checked against the one the ref calls for, worked out independently.
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {first_line}"
+    );
+    assert_eq!(
+        reported,
+        super::examine_steps::expected_leading_version(reference),
+        "the report's cli_version does not follow from the ref ({first_line})"
     );
 }

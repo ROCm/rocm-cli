@@ -92,6 +92,10 @@ def assert_not_contains(text: str, needle: str, label: str) -> None:
         fail(f"{label} contained unexpected text: {needle}\n{text}")
 
 
+# A release tag as apps/rocm/build.rs's release_version reads one.
+RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+].+)?")
+
+
 def assert_version_string(text: str, label: str) -> None:
     match = re.fullmatch(r"rocm-cli (\S+) \((\S+), ([0-9a-f]+)\)", text.strip())
     if match is None:
@@ -101,16 +105,15 @@ def assert_version_string(text: str, label: str) -> None:
         fail(
             f"{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}"
         )
-    # Same contract as format_cli_version in apps/rocm/build.rs: a tag vX.Y.Z
-    # is reported with that one leading v removed; every other resolved ref,
-    # including main, is 0.0.0-dev rather than the workspace package version.
-    if ref.startswith("v") and ref[1:] == version:
-        if not version[:1].isdigit():
-            fail(f"{label} release version does not start with a digit:\n{text}")
-    elif version != "0.0.0-dev":
+    # Same contract as format_cli_version in apps/rocm/build.rs: an exact tag
+    # vX.Y.Z (optional non-empty -pre or +build suffix) is reported with that
+    # one leading v removed; every other resolved ref, including main, is
+    # 0.0.0-dev rather than the workspace package version. The expected value
+    # comes from the ref alone, so a tag build that printed 0.0.0-dev fails.
+    expected = ref[1:] if RELEASE_TAG.fullmatch(ref) else "0.0.0-dev"
+    if version != expected:
         fail(
-            f"{label} reported {version!r} for ref {ref!r}; "
-            "a non-release build must report 0.0.0-dev:\n"
+            f"{label} reported {version!r} for ref {ref!r}; expected {expected!r}:\n"
             f"{text}"
         )
 

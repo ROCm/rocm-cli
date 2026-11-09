@@ -149,6 +149,28 @@ jobs:
               cargo build --release -p rocm -p rocmd -p xtask
             '
 
+      # The tag shape of `rocm version` (`X.Y.Z (vX.Y.Z, <hash>)`) is otherwise
+      # unit-tested only: every PR and nightly build resolves a branch, which
+      # reports `0.0.0-dev`. Run the binary this release ships and check that it
+      # leads with the tag's own version. A tag that is not `vX.Y.Z` (optional
+      # `-pre` or `+build` suffix) would ship as `0.0.0-dev`, so it fails here
+      # too. Same rule as `release_version` in apps/rocm/build.rs.
+      - name: Check the release binary's version
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
+            echo "release tag must be vX.Y.Z with an optional -pre or +build suffix, got: ${VERSION}" >&2
+            exit 1
+          fi
+          OUTPUT="$(target/release/rocm --version)"
+          EXPECTED_PREFIX="rocm-cli ${VERSION#v} (${VERSION}, "
+          if [[ "${OUTPUT}" != "${EXPECTED_PREFIX}"*")" ]]; then
+            echo "release binary reports '${OUTPUT}', expected '${EXPECTED_PREFIX}<hash>)'" >&2
+            exit 1
+          fi
+          echo "release binary reports: ${OUTPUT}"
+
       - name: Package release bundle
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
@@ -242,6 +264,23 @@ jobs:
         env:
           ROCM_CLI_RELEASE_REF: ${{ needs.release.outputs.version }}
         run: cargo build --release -p rocm -p rocmd -p xtask
+
+      # See the Linux job's "Check the release binary's version" step.
+      - name: Check the release binary's version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          if ($version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$') {
+            throw "release tag must be vX.Y.Z with an optional -pre or +build suffix, got: $version"
+          }
+          $output = (& .\target\release\rocm.exe --version | Out-String).Trim()
+          $prefix = "rocm-cli $($version.Substring(1)) ($version, "
+          if (-not ($output.StartsWith($prefix, [StringComparison]::Ordinal) -and $output.EndsWith(')', [StringComparison]::Ordinal))) {
+            throw "release binary reports '$output', expected '$prefix<hash>)'"
+          }
+          Write-Host "release binary reports: $output"
 
       - name: Package Windows bundle
         shell: pwsh

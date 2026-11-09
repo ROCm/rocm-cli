@@ -850,12 +850,18 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI about a quantization the repository does not hold
     Then the CLI says nothing matches and lists the model and the projector, marked as a projector
 
-  # A report names the CLI that wrote it with the version `rocm version` leads
-  # with (`X.Y.Z` for a release tag, `0.0.0-dev` for any other ref), not the
-  # frozen workspace package version. Only that one token: the ref and hash
-  # after it can carry a local branch name. The host is simulated as in
-  # diagnose-40, with a released GPU instead, so a report is prepared on every
-  # Linux lane rather than only on one whose own GPU is on the matrix.
+  # A report names the CLI that wrote it with the same leading version
+  # `rocm version` prints, and only that one token: the ref and hash after it
+  # can carry a local branch name. The step also checks that version against
+  # the one `rocm version`'s ref calls for (`X.Y.Z` for a `vX.Y.Z` tag,
+  # `0.0.0-dev` for any other ref), so both surfaces regressing to the same
+  # frozen workspace version would fail too. A CI lane resolves a branch, never
+  # a tag, so only the `0.0.0-dev` half runs here; the tag half is checked on the
+  # release binaries by release.yml's "Check the release binary's version" steps
+  # and by the `format_cli_version_*` unit tests in apps/rocm/build.rs. The host
+  # is simulated as in diagnose-40, with a released GPU instead, so a report is
+  # prepared on every Linux lane rather than only on one whose own GPU is on the
+  # matrix.
   @id:diagnose-report-names-the-cli-version @requires-os:linux
   Scenario: diagnose-58 - A problem report names the CLI version that rocm version prints
     Given a simulated Linux machine whose only GPU is a released one
