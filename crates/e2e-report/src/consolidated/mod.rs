@@ -1764,12 +1764,14 @@ mod tests {
     fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
         // What this proves, and what it does not. The rendered text is pinned
         // verbatim by `summary_explanation_paragraphs_are_unchanged` (markdown)
-        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML); those
-        // catch any edit to the wording, but a renderer that re-typed the literal
-        // with identical words would still pass them and would silently stop
-        // following `MOCK_GATES_PR` / `OTHER_LANES_NON_BLOCKING`. This test
-        // closes that gap by reading each renderer's non-test source: it must
-        // name both constants and must not spell either phrase out itself.
+        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML), and
+        // each of those also asserts that the rendered output contains
+        // `MOCK_GATES_PR` and `OTHER_LANES_NON_BLOCKING`; together they catch a
+        // renderer that hardcodes the words while a constant's value moves on.
+        // What they cannot catch is a renderer that re-types the CURRENT words
+        // with identical text, which renders the same bytes. This test closes
+        // that gap by reading each renderer's non-test source: it must not
+        // spell either phrase out itself.
         for (name, source) in [
             ("markdown.rs", include_str!("markdown.rs")),
             ("html.rs", include_str!("html.rs")),
@@ -1782,10 +1784,6 @@ mod tests {
                 ("MOCK_GATES_PR", MOCK_GATES_PR),
                 ("OTHER_LANES_NON_BLOCKING", OTHER_LANES_NON_BLOCKING),
             ] {
-                assert!(
-                    production.contains(constant),
-                    "{name} must build its gating sentence from `{constant}`"
-                );
                 assert!(
                     !production.contains(phrase),
                     "{name} re-types {phrase:?} instead of using `{constant}`"
