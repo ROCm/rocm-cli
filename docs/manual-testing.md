@@ -532,6 +532,40 @@ Expected result:
   with `the server exited before it became ready` and a `rocm logs --service`
   pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
+- The log views tell an empty log from one they could not show, and each view
+  reads its own files, so check each separately. In a Linux or WSL shell,
+  `head -c 5000000 /dev/zero | tr '\0' x > <file>` makes a file that is one line
+  of more than 4 MiB without a line break:
+  - A server's log. Write that file over the log file named on the `Log file:`
+    line of `rocm services logs <service-id>` (by default `services/<service-id>.log`
+    under the data folder), then run `rocm services logs <service-id>` or
+    `rocm logs --service <service-id>`: both print `Recent output: none shown;
+    the newest line is longer than the 4 MiB a log view reads`, not `no output
+    yet`. Truncate the file to nothing and both print `Recent output: no output
+    yet` again.
+  - The `rocm logs` browser, which does not read a server's log: it lists the
+    activity log and the files under `logs/cli/` and `logs/tui/` in the data
+    folder (the `Folder:` and `Command logs:` lines of `rocm logs` name them).
+    Write that file to `logs/cli/probe.log` there, run `rocm logs`, and expect
+    `command log probe.log: <no output shown from CLI action log: the newest line
+    is longer than the 4 MiB a log view reads>` in the `Lines:` list, not `No logs
+    found yet.`. The same file written over the activity log instead gives
+    `Recent activity: none shown; the newest line is longer than the 4 MiB a log
+    view reads`, not `no activity yet`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
+    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
+    newest line is longer than the 4 MiB a log view reads.`; an empty file there
+    gives `The saved log is empty.`.
+  - A stray byte that is not valid text in any of these logs shows the readable
+    lines with a replacement character, not a `failed to read` line.
+- The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
+  '{"service_id":"<service-id>","lines":50}'`) reads the same server log as
+  `rocm services logs` and answers with one of three summaries: `has no log
+  output yet` for an empty log, `has log output, but none is shown` with the same
+  4 MiB clause for the over-long line above, or `Read the last N line(s)`. Its
+  structured reply carries `lines` (the number returned, such as 3 for a
+  three-line log), `lines_requested` (the 50 asked for) and
+  `newest_line_exceeds_read_bound`.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
   row's note points at `rocm services prune` to reclaim the space.
