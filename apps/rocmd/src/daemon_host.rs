@@ -42,6 +42,11 @@ pub(crate) struct DaemonHost {
     /// and no sibling is ever looked for.
     #[cfg(test)]
     test_binary_has_every_command: bool,
+    /// Unit tests only: a host that stands in for one binary looks for no
+    /// sibling, so asking it for the other is an error and not a lookup that
+    /// could find, and run, a build of the other binary beside the test binary.
+    #[cfg(test)]
+    test_looks_for_no_sibling: bool,
 }
 
 impl DaemonHost {
@@ -76,6 +81,8 @@ impl DaemonHost {
             embedded_in_rocm,
             #[cfg(test)]
             test_binary_has_every_command: false,
+            #[cfg(test)]
+            test_looks_for_no_sibling: false,
         }
     }
 
@@ -99,6 +106,10 @@ impl DaemonHost {
         }
         if !self.embedded_in_rocm {
             return Ok(self.current_exe.clone());
+        }
+        #[cfg(test)]
+        {
+            self.refuse_sibling_lookup(ROCMD_BINARY)?;
         }
         sibling(&self.current_exe, ROCMD_BINARY).context(
             "the daemon runs inside `rocm`, which has no `supervise` command, \
@@ -126,10 +137,27 @@ impl DaemonHost {
         if self.embedded_in_rocm {
             return Ok(self.current_exe.clone());
         }
+        #[cfg(test)]
+        {
+            self.refuse_sibling_lookup(ROCM_BINARY)?;
+        }
         sibling(&self.current_exe, ROCM_BINARY).context(
             "the `rocmd` binary has no engine commands, and a managed service's engine \
              runs through the `rocm` binary installed next to it",
         )
+    }
+
+    /// The error a test stand-in answers with when asked for the binary it does
+    /// not stand in for.
+    #[cfg(test)]
+    fn refuse_sibling_lookup(&self, binary: &str) -> Result<()> {
+        if self.test_looks_for_no_sibling {
+            anyhow::bail!(
+                "this test host stands in for one binary and looks for no sibling, \
+                 so it cannot name `{binary}`"
+            );
+        }
+        Ok(())
     }
 
     /// A host whose own executable is taken to have every command, so a test
@@ -137,10 +165,12 @@ impl DaemonHost {
     /// binary was chosen here.
     #[cfg(test)]
     pub(crate) fn test_binary_standing_in_for_rocm() -> Self {
-        Self::new(
+        let mut host = Self::new(
             std::env::current_exe().expect("the test binary has a path"),
             true,
-        )
+        );
+        host.test_looks_for_no_sibling = true;
+        host
     }
 
     /// The same for a test that restarts a service: the test binary is the
@@ -148,10 +178,12 @@ impl DaemonHost {
     #[cfg(test)]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn test_binary_standing_in_for_rocmd() -> Self {
-        Self::new(
+        let mut host = Self::new(
             std::env::current_exe().expect("the test binary has a path"),
             false,
-        )
+        );
+        host.test_looks_for_no_sibling = true;
+        host
     }
 }
 
@@ -278,6 +310,35 @@ mod tests {
         let chosen = DaemonHost::new(rocm, true).rocmd_binary();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(chosen.unwrap(), rocmd);
+    }
+
+    /// A stand-in host names only the binary it stands in for. Asked for the
+    /// other it fails, and it never starts the real sibling lookup, which would
+    /// find the other binary in the build directory and let a test run it.
+    #[test]
+    fn a_stand_in_host_looks_for_no_sibling() {
+        let this = std::env::current_exe().unwrap();
+        let rocm = DaemonHost::test_binary_standing_in_for_rocm();
+        assert_eq!(rocm.rocm_binary().unwrap(), this);
+        let error = rocm
+            .rocmd_binary_via(|_, _| panic!("a stand-in host must not look for a sibling"))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("looks for no sibling"),
+            "{error:#}"
+        );
+        assert!(rocm.rocmd_binary().is_err());
+
+        let rocmd = DaemonHost::test_binary_standing_in_for_rocmd();
+        assert_eq!(rocmd.rocmd_binary().unwrap(), this);
+        let error = rocmd
+            .rocm_binary_via(|_, _| panic!("a stand-in host must not look for a sibling"))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("looks for no sibling"),
+            "{error:#}"
+        );
+        assert!(rocmd.rocm_binary().is_err());
     }
 
     /// A process that did not enter through `run_from_args` is not embedded.
