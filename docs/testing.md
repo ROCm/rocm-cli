@@ -2247,11 +2247,13 @@ re-executing its own: the recovery restart runs `supervise` on `rocmd`, and the
 supervisor starts its engine, polls its readiness and asks it to stop through
 `rocm`, each the current executable when the daemon is that binary and the
 sibling installed beside it otherwise, named in the error when there is none.
-`rocmd`'s unit tests never reach the real host: `DaemonHost::detect` refuses to
-run under test, each test passes the code under test a host of its own, and a
-test that needs a binary writes a stand-in script (its shell and `sleep` found
-on `PATH` once and asserted by name), so no `rocm` that happens to sit in the
-build directory can run. `run_from_args_marks_the_process_as_embedded_in_rocm`
+`rocmd`'s unit tests never reach the real host: under test `DaemonHost::detect`
+returns the test binary for both commands and looks for no sibling, the two
+stand-in hosts name only the binary they stand in for and fail when asked for
+the other, each test that needs a different host passes the code under test one
+of its own, and a test that needs a binary writes a stand-in script (its shell
+and `sleep` found on `PATH` once and asserted by name), so none of them can run
+a `rocm` or `rocmd` that happens to sit in the build directory. `run_from_args_marks_the_process_as_embedded_in_rocm`
 checks the embedded marking in a child run of the test binary, because the flag
 is process-wide.
 
