@@ -251,3 +251,66 @@ mod tests {
         assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
     }
 }
+
+/// Tests that run a script they just wrote take this lock. Writing an
+/// executable while another thread forks can leave the new file "text file
+/// busy" at its first exec; the lock keeps these tests from doing it to each
+/// other, and each retries for the forks it cannot see.
+#[cfg(unix)]
+static SCRIPT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+pub(crate) fn lock_script_tests() -> std::sync::MutexGuard<'static, ()> {
+    SCRIPT_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The tools a stand-in script needs, each found once on `PATH` as an absolute
+/// path. A missing one fails the test by name, rather than being skipped or
+/// surfacing as a confusing exec error.
+#[cfg(unix)]
+pub(crate) struct ScriptTools {
+    pub(crate) sh: PathBuf,
+    pub(crate) sleep: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(unix)]
+pub(crate) fn script_tools() -> ScriptTools {
+    let find = |name: &str| {
+        find_on_path(name)
+            .unwrap_or_else(|| panic!("this test needs `{name}` on PATH to stand in for a binary"))
+    };
+    ScriptTools {
+        sh: find("sh"),
+        sleep: find("sleep"),
+    }
+}
+
+/// Write `body` as a script for `tools.sh` at `path` and make it executable.
+/// Every writer is closed before this returns, so the first exec cannot find
+/// the file open for writing. The script may use the shell's own commands and
+/// the tools in `tools`.
+#[cfg(unix)]
+pub(crate) fn write_executable_script(
+    path: &std::path::Path,
+    tools: &ScriptTools,
+    body: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = fs::File::create(path)?;
+    write!(file, "#!{}\n{body}", tools.sh.display())?;
+    file.set_permissions(fs::Permissions::from_mode(0o755))?;
+    file.sync_all()?;
+    Ok(())
+}

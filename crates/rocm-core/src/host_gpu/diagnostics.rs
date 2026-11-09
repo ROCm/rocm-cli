@@ -5,8 +5,6 @@
 //! The text `rocm install sdk` prints when it cannot resolve a GPU: what the
 //! detection saw, and on Windows the raw output of each inventory query.
 
-#[cfg(windows)]
-use super::capture::tool_path_candidates;
 use super::detect_host_gpu_summary;
 use super::linux::{detect_linux_primary_gpu_name, detect_linux_sysfs_gfx_target};
 #[cfg(windows)]
@@ -21,6 +19,8 @@ use crate::gfx_target::{
     amd_pci_device_id_from_pnp_id, gfx_target_from_amd_marketing_name,
     gfx_target_from_amd_pci_device_id,
 };
+#[cfg(windows)]
+use crate::probe_exec::tool_path_candidates;
 use crate::{runtime_is_linux, runtime_is_windows, runtime_os_name};
 #[cfg(windows)]
 use std::io::Read;
