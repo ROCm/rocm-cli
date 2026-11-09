@@ -1005,9 +1005,14 @@ An endpoint bound to a public interface (`--allow-public-bind`), or served with
 `--require-api-key`, only answers clients that present its API key as an
 `Authorization: Bearer` header. With the vLLM engine that holds on every route
 the server answers, not just the OpenAI `/v1` API — including vLLM's own
-`/invocations`, `/tokenize` and `/metrics` — with one exception: the `/health`
-liveness check stays open. Because `/metrics` is covered too, `rocm dash`
-cannot show engine metrics for a key-protected vLLM server.
+`/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
+CORS preflights: the `/health` liveness check stays open. Because `/metrics`
+is covered too, `rocm dash` cannot read engine metrics from a key-protected
+vLLM server: it leaves that server's KV-cache, queue, throughput and latency
+figures empty and keeps showing a warning such as
+`vllm scrape: 1 failed (last: transport: GET http://<host>:<port>/metrics: status 401 Unauthorized)`.
+`rocm bench load` sends no API key, so it cannot benchmark a key-protected
+endpoint.
 
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to

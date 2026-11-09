@@ -11,7 +11,8 @@
 //! key is in force, the server is additionally started with
 //! `--middleware rocm_cli_vllm_auth.RequireEndpointApiKey`: a small ASGI
 //! middleware, shipped inside this binary and written next to the engine's
-//! data at launch, that requires the key on every route except `GET /health`.
+//! data at launch, that requires the key on every route except
+//! `GET`/`HEAD /health` and CORS preflights.
 //!
 //! vLLM imports the middleware by module path, so the directory it is written
 //! to is prepended to the server's `PYTHONPATH`. A failed import aborts vLLM's
@@ -132,17 +133,20 @@ fn command_env(command: &ProcessCommand, key: &str) -> EnvOverride {
         })
 }
 
+/// The value `command` sets `key` to, if it sets one. Shared by this module's
+/// tests and the launch-command tests in `process.rs`.
+#[cfg(test)]
+pub(crate) fn env_of(command: &ProcessCommand, key: &str) -> Option<OsString> {
+    match command_env(command, key) {
+        EnvOverride::Set(value) => Some(value),
+        EnvOverride::Inherited | EnvOverride::Removed => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Stdio;
-
-    fn env_of(command: &ProcessCommand, key: &str) -> Option<OsString> {
-        match command_env(command, key) {
-            EnvOverride::Set(value) => Some(value),
-            EnvOverride::Inherited | EnvOverride::Removed => None,
-        }
-    }
 
     fn entries(value: &OsString) -> Vec<PathBuf> {
         std::env::split_paths(value).collect()
@@ -247,7 +251,8 @@ mod tests {
     /// way vLLM's `--middleware` loader mounts it (`app.add_middleware(cls)`
     /// wraps the app in `cls(app)`). Proves the routes vLLM leaves outside its
     /// own key check — `/invocations`, `/tokenize`, ... — answer 401 without
-    /// the key, and that only `GET /health` stays open.
+    /// the key, and that only `GET`/`HEAD /health` and CORS preflights stay
+    /// open.
     ///
     /// Needs `python3` on PATH and fails loudly without it rather than passing
     /// vacuously. Linux-only: vLLM serving is Linux/WSL-only in rocm-cli, so
@@ -362,10 +367,16 @@ CASES = [
     ("POST", "/health", (), 401),
     ("GET", "/health/", (), 401),
     ("GET", "/healthz", (), 401),
-    # A non-preflight OPTIONS is not exempt; a CORS preflight is.
+    # A CORS preflight (OPTIONS carrying both Origin and
+    # Access-Control-Request-Method) is the only other keyless request. Each
+    # part alone is not one, and neither are those headers on another method.
     ("OPTIONS", "/invocations", (), 401),
     ("OPTIONS", "/invocations",
      [("Origin", "http://x"), ("Access-Control-Request-Method", "POST")], 200),
+    ("OPTIONS", "/invocations", [("Origin", "http://x")], 401),
+    ("OPTIONS", "/invocations", [("Access-Control-Request-Method", "POST")], 401),
+    ("POST", "/invocations",
+     [("Origin", "http://x"), ("Access-Control-Request-Method", "POST")], 401),
     # The right key opens every route, with any bearer-scheme casing.
     ("POST", "/invocations", GOOD, 200),
     ("POST", "/tokenize", GOOD, 200),
@@ -391,6 +402,13 @@ async def main():
     got = await call(app, None, "/v1/realtime", GOOD, kind="websocket")
     if got != "websocket.accept":
         failures.append(f"websocket with key: want accept, got {got}")
+    # The /health exemption is for HTTP GET/HEAD only, not a WebSocket there.
+    # This catches an exemption keyed on the path alone (for any scope type).
+    # Dropping only the scope-type guard in `_exempt` would still pass here,
+    # because a WebSocket scope carries no method for the GET/HEAD check.
+    got = await call(app, None, "/health", kind="websocket")
+    if got != "websocket.close":
+        failures.append(f"websocket /health without key: want close, got {got}")
     # Lifespan events pass straight through.
     seen = []
     async def lifespan_inner(scope, receive, send):

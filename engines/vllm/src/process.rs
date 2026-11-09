@@ -241,27 +241,13 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
     // `endpoint_auth` installs: vLLM's own `VLLM_API_KEY` check alone leaves
     // routes such as `/invocations` open.
     let api_key = rocm_engine_protocol::resolve_endpoint_api_key();
-    let mut command = ProcessCommand::new(&runtime.command);
-    command
-        .args(vllm_serve_args(
-            &request.model_ref,
-            &request.host,
-            request.port,
-            vllm_enforce_eager_enabled(),
-            request.engine_recipe.as_ref(),
-            api_key.is_some(),
-        ))
-        .stdin(Stdio::null());
-    apply_therock_env(&mut command, runtime)?;
-    // After `apply_therock_env`, which may set its own `PYTHONPATH` entry.
-    if let Some(api_key) = api_key.as_deref() {
-        crate::endpoint_auth::protect_endpoint(
-            &mut command,
-            api_key,
-            &crate::endpoint_auth::module_dir(&AppPaths::discover()?),
-        )?;
-    }
-    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
+    let mut command = vllm_server_command(
+        request,
+        runtime,
+        api_key.as_deref(),
+        || Ok(crate::endpoint_auth::module_dir(&AppPaths::discover()?)),
+        vllm_enforce_eager_enabled(),
+    )?;
     if let Some(log_path) = log_path {
         let log = fs::File::create(log_path)
             .with_context(|| format!("failed to create {}", log_path.display()))?;
@@ -281,6 +267,40 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             None => base,
         }
     })
+}
+/// The `vllm serve` command for `request`, short of where its output goes:
+/// argv, TheRock environment and GPU visibility, plus, with an `api_key`, the
+/// endpoint-key protection: the `--middleware` argument, `VLLM_API_KEY`, and
+/// the middleware module written to `module_dir()` and put at the front of
+/// `PYTHONPATH`. `--middleware` depends on the other two: vLLM has to import
+/// the module from `PYTHONPATH`, and the middleware refuses to construct
+/// without `VLLM_API_KEY`. So all three are built in one place and asserted
+/// together by one test. `module_dir` is consulted only for a keyed launch.
+fn vllm_server_command(
+    request: &ServeHttpRequest,
+    runtime: &VllmRuntime,
+    api_key: Option<&str>,
+    module_dir: impl FnOnce() -> Result<PathBuf>,
+    enforce_eager: bool,
+) -> Result<ProcessCommand> {
+    let mut command = ProcessCommand::new(&runtime.command);
+    command
+        .args(vllm_serve_args(
+            &request.model_ref,
+            &request.host,
+            request.port,
+            enforce_eager,
+            request.engine_recipe.as_ref(),
+            api_key.is_some(),
+        ))
+        .stdin(Stdio::null());
+    apply_therock_env(&mut command, runtime)?;
+    // After `apply_therock_env`, which may set its own `PYTHONPATH` entry.
+    if let Some(api_key) = api_key {
+        crate::endpoint_auth::protect_endpoint(&mut command, api_key, &module_dir()?)?;
+    }
+    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
+    Ok(command)
 }
 /// Explain a spawn that failed on a script whose `#!` interpreter is gone.
 ///
@@ -524,7 +544,8 @@ fn apply_vllm_rocm10_discover_env(
     command.env("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE");
     Ok(())
 }
-/// Full argument vector for `vllm serve`, as spawned by [`spawn_vllm_server`].
+/// Full argument vector for `vllm serve`, as built into the launch command by
+/// [`vllm_server_command`].
 ///
 /// Kept as a pure function so the exact argv can be asserted in tests: memory
 /// and graph-mode flags materially change how much VRAM vLLM claims, and a
@@ -901,6 +922,124 @@ mod tests {
             "an unkeyed endpoint must not load the middleware, which refuses to construct \
              without a key: {args:?}"
         );
+    }
+    fn keyed_launch_request() -> ServeHttpRequest {
+        ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "0.0.0.0".to_owned(),
+            port: 8000,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: vec![1],
+            runtime_id: None,
+            env_id: None,
+            state_path: PathBuf::from("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        }
+    }
+    #[test]
+    fn keyed_vllm_server_command_installs_middleware_key_and_pythonpath_together() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let module_dir = temp.path().join("python");
+        // A ROCm 10 discover runtime, whose TheRock environment sets its own
+        // `PYTHONPATH` entry (`amd_smi` in the venv). The middleware directory
+        // has to be prepended after that, or the TheRock value replaces it.
+        let venv = temp.path().join("venv");
+        let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+        fs::create_dir_all(&site_packages)?;
+        let runtime = test_vllm_runtime(
+            Some(venv.join("bin").join("python")),
+            Some("10.0.0".to_owned()),
+        );
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &runtime,
+            Some("secret-key"),
+            || Ok(module_dir.clone()),
+            false,
+        )?;
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let position = args
+            .iter()
+            .position(|arg| arg == "--middleware")
+            .expect("a keyed launch must pass the auth middleware to vllm serve");
+        assert_eq!(
+            args.get(position + 1).map(String::as_str),
+            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("secret-key")),
+            "the key must never reach argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--enforce-eager"),
+            "enforce_eager was false: {args:?}"
+        );
+        assert_eq!(
+            crate::endpoint_auth::env_of(&command, "VLLM_API_KEY"),
+            Some("secret-key".into()),
+            "the middleware and vLLM's own check both read the key from VLLM_API_KEY"
+        );
+        let pythonpath = crate::endpoint_auth::env_of(&command, "PYTHONPATH")
+            .expect("a keyed launch must put the middleware directory on PYTHONPATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&pythonpath).collect();
+        let amd_smi = site_packages
+            .join("_rocm_sdk_core")
+            .join("share")
+            .join("amd_smi");
+        assert_eq!(
+            entries.get(..2),
+            Some(&[module_dir.clone(), amd_smi][..]),
+            "vLLM imports the middleware by module name, so its directory goes first, \
+             ahead of the runtime's own entry, which is kept: {entries:?}"
+        );
+        assert_eq!(
+            crate::endpoint_auth::env_of(&command, "HIP_VISIBLE_DEVICES"),
+            Some("1".into()),
+            "the GPU the request selected must still be applied to a keyed launch"
+        );
+        assert!(
+            module_dir.join("rocm_cli_vllm_auth.py").is_file(),
+            "the middleware module must be written where PYTHONPATH points"
+        );
+        Ok(())
+    }
+    #[test]
+    fn vllm_server_command_forwards_enforce_eager() -> Result<()> {
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &VllmRuntime::for_test(),
+            None,
+            || panic!("an unkeyed launch must not need the middleware directory"),
+            true,
+        )?;
+        assert!(
+            command.get_args().any(|arg| arg == "--enforce-eager"),
+            "enforce_eager was true: {:?}",
+            command.get_args().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+    #[test]
+    fn unkeyed_vllm_server_command_carries_no_key_protection() -> Result<()> {
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &VllmRuntime::for_test(),
+            None,
+            || panic!("an unkeyed launch must not need the middleware directory"),
+            false,
+        )?;
+        assert!(
+            !command.get_args().any(|arg| arg == "--middleware"),
+            "an unkeyed launch must not load the middleware, which refuses to start without a key"
+        );
+        assert_eq!(crate::endpoint_auth::env_of(&command, "VLLM_API_KEY"), None);
+        Ok(())
     }
     #[test]
     fn resolve_model_echoes_matching_engine_recipe() -> Result<()> {

@@ -815,12 +815,16 @@ Feature: Model serving
   # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
   # API: vLLM's own key check guards a fixed set of path prefixes, while the
   # server also answers inference and tokenizer routes outside them. rocm-cli
-  # starts vLLM with a middleware that demands the key on every route except the
-  # health check. The middleware itself is unit-tested on every PR
-  # (`endpoint_auth` in the vLLM engine crate); this proves it is actually wired
-  # into a real vLLM server. A full extra vLLM serve, so it runs in the merge
-  # queue rather than on every PR.
-  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @merge-queue
+  # starts vLLM with a middleware that demands the key on every route except
+  # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
+  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
+  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # serve, so `@nightly` rather than per-PR: it runs after merge on the nightly
+  # MI300X and MI350P lanes (`nightly.yml`), which serve with vLLM.
+  # Not `@merge-queue`: the merge queue runs only the Strix Halo
+  # and W7900 lanes, where vLLM is not the engine, so under that tag it skipped
+  # everywhere.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @nightly
   Scenario: serve-50 - A key-protected vLLM endpoint refuses keyless requests on every route
     Given a managed runtime is active
     And a model is being served on GPU behind an API key

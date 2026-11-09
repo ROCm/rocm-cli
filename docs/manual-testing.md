@@ -1005,11 +1005,13 @@ Expected result:
 - The `/invocations` and `/tokenize` calls print `401`.
 - Repeating them with `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"` prints
   `200`.
-- The `/health` call prints `200` without the key.
+- The `/health` call prints `200` without the key. `GET`/`HEAD /health` and
+  CORS preflights are the only requests the server answers without it.
 
 Stop the service afterwards (`rocm services stop <service-id> --yes`). The
-automated scenario is `serve-vllm-key-guards-every-route` in
-[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+automated scenario is the `@nightly` `serve-vllm-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs after merge on the nightly MI300X and MI350P lanes.
 
 ## 8. ComfyUI Verification
 

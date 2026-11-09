@@ -1540,11 +1540,13 @@ variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
 which is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
-audit log. Verifying that the running server actually *rejects* an
-unauthenticated request requires a live engine; that end-to-end assertion is a
-deferred follow-up and is **not yet** exercised by the GPU acceptance scripts
-(`scripts/vllm_therock_gpu_test.py`). The unit tests cover key policy,
-generation, the 0600 key file, and key-file resolution.
+audit log. The unit tests cover key policy, generation, the 0600 key file, and
+key-file resolution. Verifying that the running server actually *rejects* an
+unauthenticated request requires a live engine. For vLLM that is the `@nightly`
+GPU scenario `serve-vllm-key-guards-every-route` (serve-50), which runs on the
+nightly MI300X and MI350P lanes (see "vLLM endpoint-key coverage"
+below). For the other engines, AIM included, no test yet asserts that the
+running server refuses a keyless request.
 
 The same requirement holds across respawns, because the invariant belongs to the
 recorded *host*, not to the key file: a service recorded on a public host refuses
@@ -1698,9 +1700,36 @@ cargo test -p rocm-engine-vllm vllm_serve_args
 The `endpoint_auth` tests run the shipped middleware under `python3` with a
 standard-library ASGI harness (they fail, rather than skip, when `python3` is
 missing on Linux), so the per-route behavior is covered on every PR without a
-GPU. That it is actually wired into a real vLLM server is covered by the
-`@merge-queue` GPU scenario `serve-vllm-key-guards-every-route`
-([model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)).
+GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
+gets the `--middleware` argument, `VLLM_API_KEY`, and the middleware directory
+at the front of `PYTHONPATH` ahead of the runtime's own entry, together, and
+that an unkeyed launch gets none of them:
+
+```bash
+cargo test -p rocm-engine-vllm vllm_server_command
+```
+
+What no unit test covers is the call in `spawn_vllm_server` that hands the
+resolved endpoint key to `vllm_server_command`: that spawn path probes the host
+(OpenMPI, libatomic, libnuma) before it builds the command, so only a real
+launch exercises it.
+
+That a real vLLM server loads the middleware and refuses keyless calls is
+covered by the `@nightly` GPU scenario `serve-vllm-key-guards-every-route`
+([model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)),
+which runs on the nightly MI300X and MI350P lanes
+([nightly.yml](../.github/workflows/nightly.yml)), the lanes that serve with
+vLLM. Those jobs run after merge, not per PR. The scenario used to be tagged `@merge-queue`, which gave it
+no coverage at all: the merge queue runs only the Strix Halo and W7900 lanes,
+where vLLM is not the engine, so it skipped everywhere. To run it on a branch
+before merge, dispatch `e2e-selfhosted.yml` on the MI300X lane with a
+`name_filter`, which bypasses the harness's tag gates (`@nightly` included), so
+the scenario runs without `include_nightly`:
+
+```bash
+gh workflow run e2e-selfhosted.yml --ref <branch> \
+  -f platform=app-dev-gpu -f name_filter='^serve-50 '
+```
 
 Engine recipe adapter contract focused tests:
 
