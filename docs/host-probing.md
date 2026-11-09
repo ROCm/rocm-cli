@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # Host probing: which stack owns each fact
 
-Status: proposal, with the first pair delivered. This note changes no code and no behaviour itself, and what it proposes for a pair is decided by the change that converges that pair, which then records the decision here (the PATH lookup, pair 1, has: see "PATH lookup"). It lists the host facts that `rocm-core` reads twice (on the hosts each is read on, see "Which host reads which fact"), says how the two reads differ, and proposes which one should survive and in what order a later series of changes could remove the other. Each pair is meant to be a separate change with its own review.
+Status: proposal, with the first two pairs delivered. This note changes no code and no behaviour itself, and what it proposes for a pair is decided by the change that converges that pair, which then records the decision here (the PATH lookup, pair 1, and the kernel release, pair 2, have: see "PATH lookup" and "Kernel version"). It lists the host facts that `rocm-core` reads twice (on the hosts each is read on, see "Which host reads which fact"), says how the two reads differ, and proposes which one should survive and in what order a later series of changes could remove the other. Each pair is meant to be a separate change with its own review.
 
 This note is a snapshot of `main` at the time of writing, not maintained documentation. It is to be retired (the file deleted, together with its entry in [architecture.md](architecture.md)) when the convergence tickets for these pairs close, so the inventory does not keep pointing at a stale design record.
 
@@ -18,7 +18,7 @@ For each pair, the proposed survivor and the biggest difference a user can see t
 
 | Pair | Proposed survivor | Biggest user-visible difference today |
 |---|---|---|
-| [Kernel version](#kernel-version) | `detect_kernel_version`, called by `probe_os` for `kernel_release` on Linux (the timeout is open) | where `uname` is slow or fails, `kernel:` and `kernel_release` can disagree (UNCONFIRMED); on Windows `kernel_release` is always empty |
+| [Kernel version](#kernel-version) | delivered: `detect_kernel_version`, called by `probe_os` for `kernel_release` on Linux; one 5 s limit and a strict read | before the change, where `uname` was slow or failed, `kernel:` and `kernel_release` could disagree (UNCONFIRMED on a real host); on Windows `kernel_release` is still always empty (out of this pair) |
 | [CPU model](#cpu-model) | one reader in `os_facts` returning model and vendor, called by `probe_cpu_linux` and `probe_cpu_windows` | on WSL the text shows the CPU while `cpu_model` is empty and `cpu_vendor` is `unknown`; the change leaves that as it is (option (a)) |
 | [Windows GPU query](#windows-gpu-query) | the summary stack's inventory, with `probe_gpus_windows` building `gpus[]` from it and NVIDIA kept in the JSON | an NVIDIA-only host reads "AMD GPU not detected yet" in the text beside `has_nvidia_gpu: true` in the JSON |
 | [Marketing name to gfx target](#marketing-name-to-gfx-target) | the `AMD_MARKETING_GFX_TARGETS` table, gaining the codenames `classify_amd_marketing_name` knows (finish [#521](https://github.com/ROCm/rocm-cli/pull/521)) | on Windows without a HIP SDK an RX 7900 XTX has an empty `gpus[].gfx_target` while `summary.detected_gfx_target` is `gfx1100` |
@@ -46,7 +46,7 @@ Every pair below is read on a subset of the hosts, and the subset decides which 
 
 | Fact | Native Linux | WSL (probing inside the distro) | Native Windows | Windows host inspecting a WSL distro (`probe_wsl_distro_from_host`) |
 |---|---|---|---|---|
-| Kernel version | both, `uname -r` | both: `probe_os` runs before the WSL branch returns | summary `kernel` from `cmd /C ver`; `kernel_release` stays empty | examination only, from `uname -r` run inside the distro by a shell script (`WSL_REMOTE_PROBE`), a third implementation |
+| Kernel version | both, through `detect_kernel_version` (before the change each ran `uname -r` itself) | both: `probe_os` runs before the WSL branch returns | summary `kernel` from `cmd /C ver`; `kernel_release` stays empty | examination only, from `uname -r` run inside the distro by a shell script (`WSL_REMOTE_PROBE`), a third implementation |
 | CPU model and vendor | both | summary only: the examination returns before `probe_cpu_linux`, so `cpu_model` is empty and `cpu_vendor` is `unknown` | both, plus the inventory row | neither: `cpu_model` empty |
 | Windows adapter list | not applicable | examination `gpus[]` stays empty (the WSL branch skips the GPU probes); the summary asks the Windows host for the display target only | both | not collected here; the host driver is read through the summary's inventory (`detect_local_windows_host_driver`) |
 | Marketing name to gfx target | examination only (the `lspci` scan); the summary reads sysfs and KFD, not names | summary only, through the Windows host's display name | both | not collected |
@@ -57,7 +57,7 @@ A pair that one host reads with only one stack cannot disagree on that host, but
 
 ## Kernel version
 
-Verdict: confirmed duplicate for `uname -r`. `uname -v` in `probe_os` has no twin.
+Verdict: confirmed duplicate for `uname -r`, now converged (see "Decided and delivered" below). `uname -v` in `probe_os` has no twin. The comparison that follows is how the two copies differed before that change, kept as the record of what it moved.
 
 | | Summary | Examination |
 |---|---|---|
@@ -72,6 +72,31 @@ Verdict: confirmed duplicate for `uname -r`. `uname -v` in `probe_os` has no twi
 What a user can see: on a native Linux or WSL host where `uname` is slow or fails, `kernel:` can read `<unknown>` while `kernel_release` is filled in, or the reverse. UNCONFIRMED on a real host; the code allows it. `kernel_release` also feeds `is_wsl1_kernel` for the WSL facts, so its empty-versus-populated behaviour is not cosmetic.
 
 Proposal: `detect_kernel_version` survives and `probe_os` calls it for `kernel_release` on Linux, keeping `uname -v` where it is. Calling it on Windows too would populate `kernel_release` there, which is a visible change to the JSON; decide that separately. The timeout is open (1.5 s or 5 s): the characterisation test should pin both before one is chosen. Hosts the test covers: native Linux and WSL (one code path, since `probe_os` runs before the WSL branch returns), with a fake `uname` that succeeds, exits non-zero with stdout, times out, and prints nothing; plus a WSL 1 style and a WSL 2 style string through `probe_wsl`, because `is_wsl1_kernel` reads the field. Windows is covered only by a unit test behind an injectable runner, which pins that `kernel_release` stays empty unless that change is decided. The distro probe's shell `uname -r` has no twin to compare and is out of this pair.
+
+### Decided and delivered
+
+The change took the proposed survivor: `detect_kernel_version` in [os_facts.rs](../crates/rocm-core/src/host_gpu/os_facts.rs) is the one `uname -r` read, and `probe_os` in [host_env.rs](../crates/rocm-core/src/examine/host_env.rs) calls it for `kernel_release` on Linux, native and WSL alike, with a failed read left empty. `uname -v` stays in `probe_os`. Windows is out of this change: the examination still leaves `kernel_release` empty there and the summary still reads `cmd /C ver` under the shorter optional-command timeout; whether `kernel_release` should be filled on Windows stays open, and so does the Windows unit test the proposal mentioned, because the Windows branches did not change.
+
+The four open questions are decided as follows.
+
+- Timeout: 5 s, the longer of the two old limits (`KERNEL_RELEASE_TIMEOUT`, which is `SHORT`). `uname -r` is a few bytes the kernel hands over, so a read that takes seconds is a stalled host, where waiting costs little and a spurious "unknown" costs more: `kernel_release` feeds the WSL version check and the kernel-dependent diagnoses, which read an empty value as nothing to report. The cost is that the text of `rocm examine` can wait up to 5 s instead of 1.5 s on a host whose `uname` hangs.
+- Failure: `None` in the summary (`<unknown>` in the text, null in the JSON) and an empty `kernel_release` in the examination, with no `probe_failures` entry, as before. Adding an entry would change `status` to degraded on a host without a usable `uname`, such as a minimal container, which is a bigger change than the pair warrants. An empty `kernel_release` reads as WSL 2 in `is_wsl1_kernel`, as before.
+- Non-zero exit with output: dropped by both. The examination used to keep what a failing `uname` printed; the summary dropped it. A release from a `uname` that failed is not trustworthy.
+- Decoding: strict UTF-8 for both. The examination used to decode lossily. A release is ASCII in practice, so the only input that moves is one that is not UTF-8 at all, and a string with replacement characters in it would reach the diagnoses and the WSL check as if it were a release.
+
+The answers that moved, each with the test that pins it:
+
+| Difference | Before | Now | Pinned by |
+|---|---|---|---|
+| `uname` prints a release and exits non-zero | summary: none; examination: the release | none in both | `a_non_zero_exit_with_output_is_dropped_by_both`, scenario `examine-40` |
+| `uname` output that is not UTF-8 | summary: none; examination: the release with the bad byte replaced | none in both | `output_that_is_not_utf8_is_dropped_by_both` |
+| `uname` that answers after 3 s | summary: none (1.5 s); examination: the release (5 s) | the release in both | `an_answer_after_three_seconds_is_read_by_both` |
+| `uname` that never answers | none in both | none in both, after the one 5 s limit each | `a_uname_that_never_answers_reads_as_nothing_in_both` |
+| `uname` that prints nothing | none in both | unchanged | `a_silent_uname_reads_as_nothing_in_both` |
+| WSL 1 and WSL 2 style releases | read as printed by both | unchanged; `probe_wsl` makes version 1 of the first and version 2 of the second, of an empty one and of the original `-microsoft-standard` form | `both_read_wsl_style_releases_as_printed`, `probe_wsl_reads_the_wsl_version_from_the_kernel_release` |
+| A failed read and `probe_failures` | no entry | no entry | the check in the same tests that no case leaves a `probe_failures` entry about the kernel, and scenario `examine-40` |
+
+The scenarios `examine-39` and `examine-40` in [examine.feature](../tests/e2e-cucumber/features/examine.feature) drive the observable answer on the Linux lane, native and WSL: with a stand-in `uname` first on `PATH`, one `rocm examine --json` run holds `summary.kernel` and `kernel_release` level on a specific release, and, for a `uname` that prints a release and then fails, holds both empty with no kernel `probe_failures` entry. The unit tests plant the same stand-in in a child copy of the test binary with its own `PATH`, because a test thread cannot change `PATH` without disturbing every other test.
 
 ## CPU model
 
@@ -205,7 +230,7 @@ Proposal: `run_with_timeout` survives as the one bounded executor, with `Command
 One pair per change. Each begins with a commit that adds a characterisation test and is green against the code as it is: it pins what both copies return for the same input, and where they differ it pins each copy's answer, with a comment naming the pair. The convergence commit then flips the assertions that are meant to change and the PR text lists each one as a user-visible difference. Tests that need a program on `PATH` use the fake-executable helper in [fake_executable.rs](../crates/rocm-core/src/fake_executable.rs); Windows-only logic goes behind an injectable function so a unit test runs on the Windows job, as the inventory already does with `WindowsInventorySources`.
 
 1. PATH lookup (delivered: see "Decided and delivered" under "PATH lookup"). Smallest, and it settles where `tool_path_candidates` lives before the runner work needs it. It is not output-preserving: the differences listed under "PATH lookup" change which tools are reported as present, and its PR text lists each one as intentional, with the characterisation test that pins it. Hosts covered: Linux, which is also WSL's code path, for the empty entry, the non-UTF-8 `PATH` (set through an `OsString` environment value) and the current-directory file; Windows through an injectable resolver for the `PATHEXT` spellings, the System32 candidates and the `;` splitting, since the Linux lane cannot run them.
-2. Kernel version. A single command; settles the timeout and the empty-versus-`None` question. Hosts covered as set out under "Kernel version".
+2. Kernel version (delivered: see "Decided and delivered" under "Kernel version"). A single command; it settled the timeout and the empty-versus-`None` question. Hosts covered as set out under "Kernel version".
 3. CPU model. Adds the model-and-vendor reader; needs the Windows inventory row, which already exists. Its PR says which WSL option under "CPU model" it takes, (a) or (b); a PR that does not is not ready.
 4. Marketing name to gfx target, by finishing [#521](https://github.com/ROCm/rocm-cli/pull/521). It must land before the next item, so that `gpus[]` is not rebuilt on top of two name tables.
 5. Windows GPU query. The riskiest: it needs an answer on NVIDIA and on adapter names, and a Windows lane. Scenario `examine-windows-driver-version-date-and-age` already runs there; a new scenario should compare the text's `detected_gfx_target` with the JSON `gpus[]` on a named adapter. Native Windows only; no scenario can run this on the Linux or WSL lanes.
@@ -221,7 +246,7 @@ No item is output-preserving without qualification, and the PR for each says whi
 - Whether one `rocm examine --json` run shares answers between the stacks (a single WSL summary and a single `ldconfig -p`, one inventory including its failure) or keeps calling shared code that asks again.
 - What an absent Windows inventory does once there is one inventory: remember the absence for the run, or drop the per-fact fallbacks.
 - Whether `gpus[].name` should come from `pnputil` or from WMI.
-- Which timeout wins for the kernel and CPU reads, and whether `kernel_release` should be filled on Windows.
+- Which timeout wins for the CPU read, and whether `kernel_release` should be filled on Windows (the kernel timeout is decided, see "Kernel version").
 - Whether the typed outcome belongs on `CommandCapture` or beside it.
 - Whether CPU facts should be collected on WSL at all (option (b) under "CPU model"), and if so how the Windows-hosted distro probe obtains them.
 - Whether the adapters over `run_with_timeout` take a per-call drain grace, so that a probe whose tool is known to leave a late-writing descendant keeps its output, or whether the 200 ms grace is accepted for every probe.
