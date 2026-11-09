@@ -1934,31 +1934,53 @@ esac
         command
     }
 
+    /// How long each attempt at the timeout test lets the helper child run before the
+    /// probe's timeout fires. The first is short, so a healthy run is quick; the
+    /// later ones are generous and matter only when the child was too slow to start
+    /// and print its pid inside the earlier one (a loaded runner, a cold test
+    /// binary), which is a slow start and not a failure of the probe.
+    const CHILD_START_ATTEMPTS: [u64; 3] = [5, 20, 60];
+
     /// One run of the timeout path against a helper child that libtest runs with
     /// `test_threads` test threads: the child is still running when the timeout
     /// fires, so the report must say so, return promptly, and leave no process
     /// behind. `process_is_running` is false only once the child has been killed
     /// and reaped, so a probe that merely abandoned it turns this red.
+    ///
+    /// The pid is read back from the report, so an attempt whose child had not
+    /// started before the timeout (no pid line) is retried with a longer timeout
+    /// rather than failed; only an attempt that did report a pid is asserted on.
     async fn assert_timeout_kills_and_reaps(test_threads: &str) {
-        let start = Instant::now();
-        let mut command = probe_child_command("sleep");
-        command.env("RUST_TEST_THREADS", test_threads);
-        let report = run_probe(command, Duration::from_secs(5)).await;
-        assert!(report.starts_with("probe timed out after 5s"), "{report}");
-        assert!(!report.contains("kill/reap failed"), "{report}");
-        assert!(start.elapsed() < Duration::from_secs(20), "{report}");
-        let pid = report
-            .lines()
-            .find_map(|line| line.strip_prefix("pid:"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "the child did not report its pid before the timeout \
-                     (test threads {test_threads}): {report}"
-                )
-            })
-            .parse::<u32>()
-            .unwrap();
-        assert!(!rocm_core::process_is_running(pid), "{report}");
+        let mut last = String::new();
+        for seconds in CHILD_START_ATTEMPTS {
+            let start = Instant::now();
+            let mut command = probe_child_command("sleep");
+            command.env("RUST_TEST_THREADS", test_threads);
+            let report = run_probe(command, Duration::from_secs(seconds)).await;
+            assert!(
+                report.starts_with(&format!("probe timed out after {seconds}s")),
+                "{report}"
+            );
+            assert!(!report.contains("kill/reap failed"), "{report}");
+            assert!(
+                start.elapsed() < Duration::from_secs(seconds + 15),
+                "{report}"
+            );
+            let Some(pid) = report
+                .lines()
+                .find_map(|line| line.strip_prefix("pid:"))
+                .map(|pid| pid.parse::<u32>().unwrap())
+            else {
+                last = report;
+                continue;
+            };
+            assert!(!rocm_core::process_is_running(pid), "{report}");
+            return;
+        }
+        panic!(
+            "the child never reported its pid, even with {CHILD_START_ATTEMPTS:?} seconds \
+             (test threads {test_threads}): {last}"
+        );
     }
 
     /// The timeout path on every platform, with the child run both on one test
