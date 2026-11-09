@@ -125,11 +125,6 @@ pub fn detect_system_ram_gib() -> Option<f64> {
         return Some(kib / 1024.0 / 1024.0);
     }
 
-    if cfg!(target_os = "macos") {
-        return capture_optional_command("sysctl", &["-n", "hw.memsize"])
-            .and_then(|value| bytes_text_to_gib(&value));
-    }
-
     None
 }
 
