@@ -58,16 +58,19 @@ when = {}
 bug = "EAI-7219"
 reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
 
-# ROCm/rocm-cli#897 tracks multiple Strix Halo Ubuntu Lemonade serve signatures:
+# ROCMAI-898 tracks multiple Strix Halo Ubuntu Lemonade serve signatures (first
+# tracked as GitHub issue ROCm/rocm-cli#897, since closed; ROCMAI-898 is the open
+# ticket and what the rows below name):
 # the child rejects --no-mmap (41984921053), backend readiness on :8001 without
 # the model appearing on :11435 (41984503055), and backend download failure
 # (41986772728). A backend ready line does not prove a later shutdown.
 # EAI-7423 described only the earlier ready-then-unavailable symptom.
 # Retain flaky=true because historical runs also passed intermittently; do not
 # infer a fix from a single XPASS. The flag is per-row and is NOT derived from
-# `bug`, so a new #897 row needs `flaky = true` added explicitly. Failed serves
-# now capture configured pins, candidate executable paths and fingerprints
-# before stopping the service, and each candidate's --version/--help after it.
+# `bug`, so a new ROCMAI-898 row needs `flaky = true` added explicitly.
+# Failed serves now capture configured pins, candidate executable paths and
+# fingerprints before stopping the service, and each candidate's --version/--help
+# after it.
 # Revisit under EAI-7853 before deleting any of these rows: which lemonade build
 # a given run used could not be read back from this lane, and until a failed run
 # there has carried that evidence, an XPASS streak is not by itself evidence that
@@ -76,7 +79,7 @@ reason = "A vLLM serve of a short name does not resolve to lemonade's full model
 # os=linux: native Windows passed (29338475133 Strix-Windows).
 [["serve-default-engine-working-endpoint"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -84,7 +87,7 @@ flaky = true
 # The same serve precondition blocks inference; native Windows passed.
 [["serve-default-engine-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -92,7 +95,7 @@ flaky = true
 # The readiness contract depends on the same real Lemonade serve.
 [["serve-readiness-contract"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -100,7 +103,7 @@ flaky = true
 # Explicit Lemonade serving shares the same failure on the Ubuntu lane.
 [["serve-lemonade-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -114,16 +117,18 @@ flaky = true
 # the scenario with lemonade (the MI300X and W7900 lanes had not reported in that
 # run); whether lemonade serves there is not verified, and `flaky = true` tolerates
 # a pass on such a host. The cause on the Strix Halo Ubuntu lanes is not settled
-# and varies between runs (#897), so this row names that issue rather than EAI-7423
+# and varies between runs (ROCMAI-898), so this row names that ticket rather than
+# EAI-7423
 # and carries `flaky = true` like its siblings. While it is in place the
 # scenario's own check (serve starts no background helper when no watcher is
 # enabled) is not exercised on the hosts it matches, and a genuine failure of that
 # check there would also read as a failure that was expected. `flaky` also means a
-# fixed #897 is not flagged as a stale row, so delete the row by hand when #897 is
+# fixed ROCMAI-898 is not flagged as a stale row, so delete the row by hand when
+# ROCMAI-898 is
 # closed.
 [["serve-stop-leaves-no-background-helper"]]
 when = { effective_engine = "lemonade", os = "linux" }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade serving fails on the Strix Halo Ubuntu lanes, so the model never appears on /v1/models and the helper check is never reached."
 serve_timeout_secs = 90
 flaky = true
@@ -138,7 +143,7 @@ serve_timeout_secs = 90
 # Chat's mock lane must remain expect-pass: only a real GPU serve is affected.
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
@@ -148,16 +153,16 @@ flaky = true
 # scenario exercises the CLI `rocm chat --prompt` path (which correctly discovers the
 # model via /v1/models). Verified expect-pass on MI300X vLLM (XPASS on run 29322186691,
 # then 3/3 green re-runs), so there is NO vLLM xfail for this scenario — the CLI chat
-# path works. Only the real Lemonade Linux serve stays xfail under #897;
+# path works. Only the real Lemonade Linux serve stays xfail under ROCMAI-898;
 # the no-GPU MockServer path and native Windows remain expect-pass.
 [["chat-end-to-end-local-model"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true
 
-# Bench's real-serve precondition is blocked by #897 on the same Linux hosts.
+# Bench's real-serve precondition is blocked by ROCMAI-898 on the same Linux hosts.
 #
 # This does NOT weaken the coverage the bench fix relies on: the five
 # MockServer-backed bench scenarios (bench-01 to bench-05) run unxfail'd on
@@ -165,7 +170,7 @@ flaky = true
 # failure reporting, the CSV columns, and the rollup-split warning.
 [["bench-load-real-serve"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
-bug = "#897"
+bug = "ROCMAI-898"
 reason = "Lemonade managed serve never exposes the model: observed backend argument rejection, backend download failure, or backend-ready/router-unavailable."
 serve_timeout_secs = 90
 flaky = true

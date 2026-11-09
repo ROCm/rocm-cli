@@ -1128,10 +1128,10 @@ is the `kill/reap failed` branch, which needs an operating system that refuses t
 kill a child it just started.
 
 Use the evidence to distinguish backend startup, download, and router readiness
-failures; [issue #897](https://github.com/ROCm/rocm-cli/issues/897) tracks the
-Strix Halo Ubuntu investigation. A backend's ready line does not establish that
-the router serves the requested model, and a readiness timeout alone does not
-establish a shutdown. Diagnostics do not change the CLI's asynchronous
+failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
+as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+backend's ready line does not establish that the router serves the requested
+model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
 managed-launch contract or imply a backend fix.
 
 Exercise the diagnostics and expectation scoping without a GPU:
@@ -2128,7 +2128,7 @@ exit) and `serve-40` in
 (GPU lane: serving with no watcher enabled starts no helper; on a Linux host
 that runs it with lemonade it is an expected failure in
 [expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
 

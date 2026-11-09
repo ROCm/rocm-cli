@@ -839,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn lemonade_serve_failures_track_897_without_xfailing_mock_or_windows() {
+    fn lemonade_serve_failures_track_rocmai_898_without_xfailing_mock_or_windows() {
         let matrix = Expectations::parse(include_str!("../expectations.toml")).unwrap();
         for id in [
             "bench-load-real-serve",
@@ -852,7 +852,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve(&scenario, &cap("strix-ubuntu"), &matrix, Included::default()),
-                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "#897"
+                    Expectation::ExpectXfail { bug, flaky: true, .. } if bug == "ROCMAI-898"
                 ),
                 "{id}"
             );
@@ -927,7 +927,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve(&scenario, &linux_lemonade, &matrix, Included::default()),
-                    Expectation::ExpectXfail { bug, .. } if bug == "#897"
+                    Expectation::ExpectXfail { bug, .. } if bug == "ROCMAI-898"
                 ),
                 "{id} on a real GPU host",
             );
@@ -2356,8 +2356,8 @@ flaky = true
     /// serve-40 serves through the same lemonade managed serve as the other
     /// lemonade serve rows, so its row is scoped the same way: xfail on a
     /// lemonade Linux host, with a 90s serve wait, and not an expected failure
-    /// on native Windows. The row must stay `flaky` (a fixed #897 would
-    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name #897.
+    /// on native Windows. The row must stay `flaky` (a fixed ROCMAI-898 would
+    /// otherwise turn the Ubuntu lanes red as a stale XPASS) and must name ROCMAI-898.
     #[test]
     fn serve_40_row_is_scoped_like_the_other_lemonade_serve_rows() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
@@ -2371,7 +2371,7 @@ flaky = true
         let entries = m.entries_for(id);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].flaky);
-        assert_eq!(entries[0].bug, "#897");
+        assert_eq!(entries[0].bug, "ROCMAI-898");
     }
 
     /// The row's 90s only matters if the harness hands it to the serve steps:
