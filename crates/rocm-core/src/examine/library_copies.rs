@@ -167,7 +167,7 @@ pub(super) fn probe_comgr(e: &mut Examination, interpreter: Option<&FrameworkInt
 ///
 /// This is the one place the conflict rule is stated. `probe_comgr` reports the
 /// result as `comgr_matches_runtime` and `check_18_comgr_conflict` in
-/// `diagnose.rs` turns a `Some(false)` into the finding; both call this function
+/// `diagnose/engine.rs` turns a `Some(false)` into the finding; both call this function
 /// rather than restating the rule, so the two surfaces of one question cannot
 /// disagree about the same machine.
 ///

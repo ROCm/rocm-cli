@@ -11,8 +11,9 @@
 //! on-disk format at runtime, through its own `ServiceRecord` mirror struct
 //! in `registry.rs` rather than this type, and the serde test guards that
 //! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
-//! a doc comment — `rocm-dash-core` and `rocm-dash-collectors` do not depend
-//! on `rocm-core` at all.
+//! a doc comment. `rocm-dash-core` does not depend on `rocm-core` at all;
+//! `rocm-dash-collectors` does since EAI-8457, but only for the shared bounded
+//! `/dev/kfd` probe, and it never reads this on-disk format either.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -435,6 +436,52 @@ impl ManagedServiceRecord {
         Ok(self.status != previous)
     }
 
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
+    /// Mark a launch the CLI has just abandoned — its child terminated, the
+    /// error already reported to the user — as over, while keeping the record
+    /// and log for `rocm services`/`rocm logs` to show.
+    ///
+    /// The status is `stopped`, not `failed`, on purpose: `rocmd`'s recovery
+    /// scan restarts a managed `failed` record that carries no stop marker, so
+    /// a `failed` record here could be respawned after the CLI reported the
+    /// launch as failed. A stop marker would not hold either, because the
+    /// liveness refresh clears it as soon as the recorded PIDs are gone.
+    /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    pub fn mark_launch_abandoned(&mut self) {
+        self.status = "stopped".to_owned();
+    }
+
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
+    }
+
     fn with_storage_paths(&self) -> Self {
         let mut record = self.clone();
         record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);
@@ -559,6 +606,22 @@ mod tests {
         );
         assert_eq!(record.restart_count, 3);
         assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    #[test]
+    fn blocks_port_needs_a_live_record_on_that_exact_port() {
+        let mut record = probe_test_record(11435);
+        record.status = "running".to_owned();
+        assert!(record.blocks_port(11435));
+        assert!(
+            !record.blocks_port(11436),
+            "a different port is not blocked"
+        );
+        record.status = "stopped".to_owned();
+        assert!(
+            !record.blocks_port(11435),
+            "a stopped record blocks nothing"
+        );
     }
 
     /// Writes `state` as the record's engine state file and runs the refresh.

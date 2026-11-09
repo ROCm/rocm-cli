@@ -25,7 +25,6 @@ use gpu_metrics::{
 };
 use gpu_thermal_protect::{gpu_thermal_protect_due, handle_gpu_thermal_protect_event};
 pub(crate) use server_recover::find_recoverable_service;
-#[cfg(test)]
 pub(crate) use server_recover::stop_requested;
 use server_recover::{
     handle_server_recover_event, server_recover_due, service_recovery_event_kind,

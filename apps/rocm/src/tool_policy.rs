@@ -18,8 +18,8 @@
 //! `rocm_chat_tool_requested_command` turn a tool call into the argv and the
 //! one-line command it stands for.
 //!
-//! The module was relocated verbatim from `chat.rs`, which calls into it and
-//! re-exports the items other modules reach as `chat::<item>`. It calls
+//! The module was relocated verbatim from `chat.rs`, whose child modules call
+//! into it and which re-exports the items other modules reach as `chat::<item>`. It calls
 //! nothing in `chat.rs` and nothing in `freeform_planner.rs`, which is what
 //! lets the planner call into it without importing `chat`.
 
@@ -378,6 +378,20 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
+    }
+    // A malformed `port` must be rejected here, not silently dropped by the
+    // argv builder and left to fall through to automatic port selection.
+    let port = rocm_core::launch_port_argument(object.get("port"))
+        .map_err(|reason| anyhow::anyhow!("ROCm tool `launch_server` argument `port` {reason}"))?;
+    // `rocm serve` proves a port is free only on the exact default host; every
+    // other spelling (including the loopback aliases `localhost`/`::1` this
+    // check still accepts) needs an explicit port or the CLI call refuses
+    // later with a less actionable error. See `is_canonical_loopback_host`.
+    if port.is_none() && !rocm_core::is_canonical_loopback_host(&host) {
+        bail!(
+            "local assistant must supply an explicit `port` for host `{host}`; automatic port \
+             selection is only supported on the default host {DEFAULT_LOCAL_HOST}"
+        );
     }
     if object
         .get("device")
@@ -835,24 +849,52 @@ fn canonicalize_chat_rocm_command(args: &mut [String]) -> Result<()> {
     Ok(())
 }
 
+/// The rules a model-proposed `rocm serve` must satisfy, whoever proposes it.
+///
+/// Four, checked in this order and reported first-failure-wins: no
+/// `--allow-public-bind`, no CPU device, a loopback `--host` if one is given,
+/// and `--managed` without `--foreground`. `args` is the whole argv, starting
+/// at `serve`; the caller has already decided it is one.
+///
+/// `actor` names who proposed the call and opens every refusal (`{actor}
+/// cannot request ...`), so each surface keeps saying who was refused while the
+/// rules, their order and the rest of the wording stay in this one place. The
+/// chat policy passes `local assistant`; the provider-assisted planner passes
+/// `provider planner`. Deleting a rule here removes it from both.
+pub(crate) fn validate_serve_command_safety(args: &[String], actor: &str) -> Result<()> {
+    if chat_cli_has_flag(args, "--allow-public-bind") {
+        bail!("{actor} cannot request public network binding");
+    }
+    if serve_args_request_cpu_device(args) {
+        bail!("{actor} cannot request CPU execution; ROCm GPU execution is required");
+    }
+    if let Some(host) = chat_cli_arg_value(args, "--host")
+        && !is_loopback_host(host)
+    {
+        bail!("{actor} cannot request non-local host `{host}`");
+    }
+    if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
+        bail!("{actor} must request managed serving with --managed");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
     if let Some(first) = args.first()
         && first.eq_ignore_ascii_case("serve")
     {
-        if chat_cli_has_flag(args, "--allow-public-bind") {
-            bail!("local assistant cannot request public network binding");
-        }
-        if serve_args_request_cpu_device(args) {
-            bail!("local assistant cannot request CPU execution; ROCm GPU execution is required");
-        }
-        if let Some(host) = chat_cli_arg_value(args, "--host")
-            && !is_loopback_host(host)
-        {
-            bail!("local assistant cannot request non-local host `{host}`");
-        }
-        if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
-            bail!("local assistant must request managed serving with --managed");
-        }
+        validate_serve_command_safety(args, "local assistant")?;
+        // The same rule `rocm serve` applies, so an approval card is never offered
+        // for a command the CLI then refuses. Only the chat policy applies it; the
+        // provider-assisted planner's check has no port rule.
+        let port = chat_cli_arg_value(args, "--port")
+            .map(crate::serve_port::parse_serve_port)
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        crate::serve_port::validate_port_request(
+            chat_cli_arg_value(args, "--host").unwrap_or(rocm_core::DEFAULT_LOCAL_HOST),
+            crate::serve_port::PortRequest::from_flag(port),
+        )?;
     }
     if args
         .first()
@@ -1074,7 +1116,7 @@ mod tests {
         // `comfyui install`'s selection errors steer the user to `rocm runtimes`
         // and say "ROCm runtime". Running a mutating `rocm runtimes …` from chat
         // raises an approval modal whose title is written here, not by clap, so
-        // `main.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
+        // `cli.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
         // covers `--help` text) cannot reach it. It said "Change ROCm install"
         // until this rename.
         let action = chat_rocm_command_action_from_args(vec![
@@ -2210,6 +2252,26 @@ mod tests {
             .to_string();
         assert!(error.contains("public network binding"));
 
+        let no_port_on_custom_host = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--managed"]
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port_on_custom_host)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit `--port"), "{error}");
+        validate_chat_tool_call(&providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--port", "8000", "--managed"]
+            }),
+        })
+        .expect("an explicit port on a loopback host is allowed");
+
         let foreground = providers::ChatToolCall {
             id: None,
             name: "rocm_command".to_owned(),
@@ -2363,6 +2425,92 @@ mod tests {
     }
 
     #[test]
+    fn chat_tool_call_requires_an_explicit_port_for_non_canonical_loopback_hosts() {
+        let no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost"
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port).unwrap_err().to_string();
+        assert!(
+            error.contains("explicit `port`"),
+            "unexpected error: {error}"
+        );
+
+        let with_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": 11999
+            }),
+        };
+        validate_chat_tool_call(&with_port).expect("explicit port on localhost is allowed");
+
+        let canonical_no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1"
+            }),
+        };
+        validate_chat_tool_call(&canonical_no_port)
+            .expect("automatic port selection still works on the canonical loopback host");
+    }
+
+    #[test]
+    fn chat_tool_call_rejects_a_malformed_port_instead_of_letting_it_fall_through() {
+        // A non-integer `port` must not be treated as "no port supplied" here:
+        // the argv builder (`object.get("port").and_then(as_u64)`) would drop
+        // it just as silently, so without this check a malformed port on a
+        // non-canonical host would sail past validation only to fall through
+        // to automatic port selection the host doesn't support.
+        let string_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": "11999"
+            }),
+        };
+        let error = validate_chat_tool_call(&string_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be an integer"),
+            "unexpected error: {error}"
+        );
+
+        let out_of_range_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1",
+                "port": 70000
+            }),
+        };
+        let error = validate_chat_tool_call(&out_of_range_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("between 1 and 65535"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn chat_tool_call_rejects_bad_install_suggestions() {
         for (arguments, expected) in [
             (
@@ -2498,5 +2646,189 @@ mod tests {
             accepted.is_empty(),
             "accepted as a user install folder: {accepted:?}"
         );
+    }
+
+    /// The serve safety rules as the chat assistant meets them: every refusal in
+    /// the shared table, through the safety check itself and through the two
+    /// entry points a model's `rocm_command` call goes by. A refused call yields
+    /// no `ChatRocmCommandAction`, so no approval card is built and nothing runs.
+    ///
+    /// The planner suite (`freeform_planner`) runs the same table.
+    #[test]
+    fn chat_refuses_each_unsafe_serve_and_proposes_nothing() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let context = format!("{}: {:?}", case.rule, case.args);
+            let error = validate_chat_rocm_command_safety(&owned_argv(case.args))
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+
+            let call = rocm_command_call(case.args);
+            let error = chat_rocm_command_action(&call)
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+            let error = validate_chat_tool_call(&call)
+                .expect_err(&context)
+                .to_string();
+            assert_eq!(error, case.chat_error, "{context}");
+        }
+
+        // `--foreground` refuses even next to `--managed`. The chat check is the
+        // only one that sees this pair; the planner's clap parse refuses it first.
+        let error = validate_chat_rocm_command_safety(&owned_argv(
+            crate::test_support::SERVE_FOREGROUND_AND_MANAGED,
+        ))
+        .expect_err("foreground serving is refused even with --managed")
+        .to_string();
+        assert_eq!(
+            error,
+            "local assistant must request managed serving with --managed"
+        );
+    }
+
+    #[test]
+    fn chat_proposes_a_safe_serve_for_approval_with_its_argv_unchanged() {
+        use crate::test_support::{SERVE_SAFETY_ACCEPTED, owned_argv};
+
+        for args in SERVE_SAFETY_ACCEPTED {
+            let argv = owned_argv(args);
+            validate_chat_rocm_command_safety(&argv)
+                .unwrap_or_else(|error| panic!("{args:?} must pass the safety check: {error}"));
+            let action = chat_rocm_command_action(&rocm_command_call(args))
+                .unwrap_or_else(|error| panic!("{args:?} must be proposed: {error}"));
+            // A serve starts a server, so it is never read-only.
+            assert_eq!(
+                action,
+                ChatRocmCommandAction::Approval {
+                    args: argv,
+                    pending_title: "Start local model server".to_owned(),
+                    command_title: "Serve".to_owned(),
+                },
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The chat policy also applies `rocm serve`'s port rule, which the planner's
+    /// check does not: a loopback host other than `127.0.0.1` needs an explicit
+    /// `--port`. Each argv is refused with the exact message and proposes nothing,
+    /// and the same argv with a port is accepted (the shared accepted table).
+    /// `planner_accepts_a_loopback_host_without_a_port` holds the planner side.
+    #[test]
+    fn chat_requires_a_port_on_a_loopback_host_other_than_the_default() {
+        use crate::test_support::{SERVE_PORT_RULE_CHAT_ONLY, owned_argv};
+
+        for (args, expected) in SERVE_PORT_RULE_CHAT_ONLY {
+            let error = validate_chat_rocm_command_safety(&owned_argv(args))
+                .expect_err("a non-default host needs a port")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+            let call = rocm_command_call(args);
+            let error = chat_rocm_command_action(&call)
+                .expect_err("no approval card for a command the CLI refuses")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+            let error = validate_chat_tool_call(&call)
+                .expect_err("the tool-call entry refuses it too")
+                .to_string();
+            assert_eq!(error, *expected, "{args:?}");
+        }
+    }
+
+    /// The rules fire in a fixed order, so an argv that breaks several reports
+    /// the first one: public bind, then CPU, then host, then managed.
+    #[test]
+    fn chat_reports_the_first_broken_serve_rule() {
+        use crate::test_support::owned_argv;
+
+        for (args, expected) in [
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--allow-public-bind",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "local assistant cannot request public network binding",
+            ),
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "local assistant cannot request CPU execution; ROCm GPU execution is required",
+            ),
+            (
+                &["serve", "qwen", "--host", "0.0.0.0", "--foreground"][..],
+                "local assistant cannot request non-local host `0.0.0.0`",
+            ),
+            (
+                &["serve", "qwen", "--foreground"][..],
+                "local assistant must request managed serving with --managed",
+            ),
+        ] {
+            let error = validate_chat_rocm_command_safety(&owned_argv(args))
+                .expect_err("unsafe")
+                .to_string();
+            assert_eq!(error, expected, "{args:?}");
+        }
+    }
+
+    /// The shared serve check opens every refusal with the actor its caller
+    /// names, so each surface keeps saying who it refused.
+    #[test]
+    fn serve_safety_refusals_open_with_the_actor_the_caller_names() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let error = validate_serve_command_safety(&owned_argv(case.args), "some caller")
+                .expect_err(case.rule)
+                .to_string();
+            assert_eq!(
+                error,
+                case.chat_error
+                    .replacen("local assistant", "some caller", 1),
+                "{}: {:?}",
+                case.rule,
+                case.args
+            );
+        }
+    }
+
+    /// The chat check matches the `serve` word without regard to case, so a
+    /// model that writes `SERVE` does not step around the rules.
+    #[test]
+    fn chat_enforces_the_serve_rules_whatever_the_case_of_the_serve_word() {
+        use crate::test_support::owned_argv;
+
+        for word in ["Serve", "SERVE"] {
+            let error = validate_chat_rocm_command_safety(&owned_argv(&[
+                word,
+                "qwen",
+                "--device",
+                "cpu",
+                "--managed",
+            ]))
+            .expect_err("a CPU serve is refused in any case")
+            .to_string();
+            assert_eq!(
+                error,
+                "local assistant cannot request CPU execution; ROCm GPU execution is required"
+            );
+            validate_chat_rocm_command_safety(&owned_argv(&[word, "qwen", "--managed"]))
+                .expect("a managed serve passes in any case");
+        }
     }
 }
