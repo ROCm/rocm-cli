@@ -21,6 +21,7 @@ use rocm_core::{AppPaths, EndpointReadiness, ManagedServiceRecord};
 #[cfg(feature = "e2e-oom-fault-injection")]
 use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
 use std::fmt::Write as _;
+#[cfg(any(target_os = "linux", feature = "e2e-oom-fault-injection", test))]
 use std::fs;
 use std::time::Duration;
 
@@ -349,7 +350,9 @@ mod tests {
     use super::*;
     use crate::service_launch::test_support::reusable_record;
     use crate::tests::test_paths;
+    #[cfg(target_os = "linux")]
     use rocm_core::process_is_running;
+    #[cfg(target_os = "linux")]
     use std::thread;
 
     #[test]
