@@ -1057,8 +1057,9 @@ under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
 `bin/llamacpp`, down to three directory levels below each; the cpu backend is not
 searched. The search is bounded as a whole, not per directory: it reads at most
 128 directories and 2048 directory entries across all four backend directories,
-stops as soon as it has eight candidates, and stops when the inventory's time is
-up, checking the clock at every directory and entry. Siblings are visited in
+stops as soon as it finds a ninth candidate (it lists the first eight and says the
+list is cut; exactly eight is not reported as cut), and stops when the
+inventory's time is up, checking the clock at every directory and entry. Siblings are visited in
 sorted order, so a search that finishes inside its limits is deterministic.
 Symlinks are never followed: only real directories are entered and only a regular
 file named `llama-server` counts, so a link cycle ends and a link out of the

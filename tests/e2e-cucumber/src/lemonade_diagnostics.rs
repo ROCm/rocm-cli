@@ -415,12 +415,16 @@ async fn take_inventory_with(
         );
     }
     let mut servers = Vec::new();
+    // Said once: when the search itself ended on the clock the line is already in.
+    let budget_noted = matches!(discovery.stop, Some(Stop::Deadline));
     for server in &discovery.candidates {
         if Instant::now() >= deadline {
-            let _ = writeln!(
-                report,
-                "remaining evidence skipped: evidence budget exhausted"
-            );
+            if !budget_noted {
+                let _ = writeln!(
+                    report,
+                    "remaining evidence skipped: evidence budget exhausted"
+                );
+            }
             return Inventory { report, servers };
         }
         let _ = writeln!(
@@ -441,7 +445,7 @@ async fn take_inventory_with(
         let _ = writeln!(
             report,
             "backend inventory truncated after {MAX_CANDIDATES} candidates \
-             (the search stops there; more may exist)"
+             (a further one was found and is not listed)"
         );
     }
     Inventory { report, servers }
@@ -471,7 +475,8 @@ struct SearchLimits {
     dirs: usize,
     /// Directory entries read, in total.
     entries: usize,
-    /// Candidates collected; the search stops as soon as it has this many.
+    /// Candidates kept. The search stops as soon as it finds one more than this,
+    /// which is how it knows the list is cut; the extra one is dropped.
     candidates: usize,
 }
 
@@ -537,6 +542,7 @@ fn discover_candidates(
             break;
         }
     }
+    search.out.candidates.truncate(limits.candidates);
     search.out
 }
 
@@ -570,7 +576,9 @@ impl Search<'_> {
         if std::fs::symlink_metadata(&direct).is_ok_and(|meta| meta.is_file()) {
             self.out.candidates.push(direct);
         }
-        if self.out.candidates.len() >= self.limits.candidates {
+        // One more than the cap: finding it is what shows the list is cut, so
+        // exactly `candidates` of them is a complete list and not a truncated one.
+        if self.out.candidates.len() > self.limits.candidates {
             self.stop(Stop::Candidates);
             return;
         }
@@ -1171,9 +1179,10 @@ mod tests {
         );
     }
 
-    /// The candidate cap ends the walk as soon as it is reached, instead of the walk
-    /// finishing and the list being cut afterwards: with twenty candidate
-    /// directories only the root and the first eight are entered, in sorted order.
+    /// The candidate cap ends the walk as soon as it is certain the list is cut,
+    /// instead of the walk finishing and the list being cut afterwards: with twenty
+    /// candidate directories only the root and the first nine (eight kept, one more
+    /// to show there are further ones) are entered, in sorted order.
     #[test]
     fn the_candidate_cap_stops_the_walk_when_it_is_reached() {
         let root = tempfile::tempdir().unwrap();
@@ -1184,7 +1193,73 @@ mod tests {
         let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
         assert_eq!(found.stop, Some(Stop::Candidates));
         assert_eq!(found.candidates, wanted[..MAX_CANDIDATES]);
-        assert_eq!(found.dirs_visited, 1 + MAX_CANDIDATES, "{found:?}");
+        assert_eq!(found.dirs_visited, 1 + MAX_CANDIDATES + 1, "{found:?}");
+    }
+
+    /// Exactly the cap is a complete list, not a truncated one: no stop, and the
+    /// report prints no truncation note. A ninth candidate makes it truncated, and
+    /// then the note is printed. Counting the cap itself as "truncated" turns the
+    /// first half red.
+    #[tokio::test]
+    async fn exactly_the_cap_is_not_reported_as_truncated() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = root.path().join("bin/llamacpp/rocm-stable");
+        for i in 0..MAX_CANDIDATES {
+            touch_server(&backend.join(format!("{i:02}")));
+        }
+        let found = discover_candidates(root.path(), SEARCH_LIMITS, &|| false);
+        assert_eq!(found.stop, None, "{found:?}");
+        assert_eq!(found.candidates.len(), MAX_CANDIDATES);
+        let report = evidence(&write_manifest(root.path())).await;
+        assert!(!report.contains("truncated"), "{report}");
+        assert_eq!(
+            report
+                .matches("candidate (not proof of selection):")
+                .count(),
+            MAX_CANDIDATES,
+            "{report}"
+        );
+
+        touch_server(&backend.join(format!("{MAX_CANDIDATES:02}")));
+        let report = evidence(&write_manifest(root.path())).await;
+        assert!(
+            report.contains("backend inventory truncated after 8 candidates"),
+            "{report}"
+        );
+    }
+
+    /// When the search ends on the clock after finding candidates, and the hashing
+    /// deadline has passed too, "remaining evidence skipped" is said once, not once
+    /// by the search and again by the candidate loop.
+    #[tokio::test]
+    async fn the_budget_exhausted_line_is_printed_once() {
+        let root = tempfile::tempdir().unwrap();
+        for backend in BACKEND_DIRS {
+            touch_server(&root.path().join("bin/llamacpp").join(backend));
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let calls = std::sync::Arc::new(calls);
+        let counter = calls.clone();
+        let inventory = take_inventory_with(
+            &write_manifest(root.path()),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a second before now"),
+            SEARCH_LIMITS,
+            std::sync::Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+            }),
+        )
+        .await;
+        let report = &inventory.report;
+        assert_eq!(
+            report
+                .matches("remaining evidence skipped: evidence budget exhausted")
+                .count(),
+            1,
+            "{report}"
+        );
+        assert!(!report.contains("candidate (not proof"), "{report}");
     }
 
     /// A symlink is neither entered nor read as a candidate. The tree holds a link
