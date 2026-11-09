@@ -185,3 +185,32 @@ Feature: Chat and endpoint detection
     When the user asks the CLI to plan a vague request
     Then the planning assistant was asked exactly once
     And the CLI plans the request itself and says the planning assistant's plan "must request managed serving with --managed"
+
+  # A reply is model output, and model output is not trusted: it may carry
+  # terminal escape sequences that conceal part of a line, retitle the window
+  # or write the clipboard. `rocm chat --prompt` prints the reply to a terminal,
+  # so what reaches it must be what the user sees: the concealed part shown in
+  # plain text, the sequences and their payloads gone. Runs on mock (no GPU).
+  @id:chat-cli-reply-escapes-stripped
+  Scenario: chat-18 - The chat CLI shows a reply's hidden text instead of passing on its escape sequences
+    Given a local chat assistant whose reply hides part of itself with terminal escape sequences
+    When the user sends a one-shot chat prompt through the CLI
+    Then the CLI output carries no terminal escape sequence
+    And the hidden part of the reply is shown in plain text
+
+  # The command lines the chat prints for the user to approve or paste are
+  # POSIX-quoted, which Windows shells do not read the same way: `cmd.exe`
+  # gives `&` its meaning even inside single quotes. So a value the assistant
+  # chose may not carry one, and the user is told to supply it themselves; the
+  # same folder from the user is theirs to use, and the install preview they
+  # run keeps it as one argument. The pip index fixture is therock-next-15's,
+  # so the preview resolves without network or GPU. Runs on mock (no GPU).
+  @id:chat-assistant-value-unsafe-to-paste-refused
+  Scenario: chat-19 - A folder the chat assistant chose that a Windows shell would split is refused, not offered to paste
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a local chat assistant that asks to install ROCm into a folder whose name holds an ampersand
+    When the user asks the chat assistant with ROCm tools a question in one-shot chat
+    Then the CLI refuses the assistant's folder and tells the user to supply it themselves
+    And no command line holding that folder is offered to paste, and nothing is installed
+    When the user previews that install into the same folder themselves
+    Then the dry-run command line names the folder with an ampersand as a single argument

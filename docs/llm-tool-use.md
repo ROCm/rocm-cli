@@ -22,12 +22,40 @@ rocm-cli local assistants use structured tools, not shell commands.
   Bash, `cmd`, `git`, or arbitrary package-manager commands.
 - A tool call is refused if its name or any string in its arguments carries a
   terminal control or format character (an escape sequence, a carriage return,
-  a bidi override, a zero-width character). Those values are printed — in the
-  approval card, the request plan, tool output and error messages — and a
-  terminal acts on such a character instead of showing it. This applies to
-  every tool; `rocm_command` checks each `args` entry itself, after trimming it.
-  The provider-assisted planner's argv is held to the same rule, and a planner
-  note carrying such a character is left out and counted.
+  a bidi override, a zero-width character, or any other character Unicode
+  marks default-ignorable, such as the invisible tag characters). Those values
+  are printed — in the approval card, the request plan, tool output and error
+  messages — and a terminal acts on such a character, or shows nothing for it,
+  instead of showing it. This applies to every tool; `rocm_command` checks each
+  `args` entry itself, after trimming it. The provider-assisted planner's argv
+  is held to the same rule, and a planner note carrying such a character is
+  left out and counted.
+- The command lines shown for a model's request (the approval card, the
+  `advanced manual command:` line, the install preview's `command:` line, the
+  request plan's `tool_call:` line) quote every argument for a POSIX shell, so
+  each reads back as one word in `sh`, bash or WSL. Windows shells read such a
+  line differently, so a value the model chose is refused if it carries a
+  character they treat as syntax even inside single quotes: a single quote
+  (straight or typographic), which PowerShell reads as the end of the string,
+  or any of `& | < > ^ % " !`, which `cmd.exe` acts on because it gives single
+  quotes no meaning. The refusal names the character and tells the user to
+  supply the value themselves by running the `rocm` command it belongs to.
+  Values the user typed are never refused for this: an install folder named in
+  the prompt is rendered as typed. `cmd.exe` still splits a quoted value at a
+  space, so such a line does not paste there as one argument, but nothing in a
+  model-chosen value can run as a command of its own.
+- A `rocm serve` the model requests — through `launch_server`, `rocm_command`
+  or the provider-assisted planner — may only name its model and option values
+  with letters, digits and `. _ - / : @ + \`, not starting with `-`; anything
+  else, such as a model file whose path contains a space, is for the user to
+  run with `rocm serve` directly.
+- Prose that cannot be refused — the model's reply, tool results, an error
+  message quoting either — is printed by `rocm chat --prompt` with terminal
+  escape sequences (CSI, OSC including clipboard writes, DCS, APC, and their
+  8-bit forms) and invisible characters removed and line breaks kept, so text a
+  reply tries to conceal is shown in plain sight instead. The dashboard chat
+  draws through its terminal UI library, which drops control characters but
+  not the other invisible ones.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready. Keeping some of a model's layers
   in system RAM on a GPU that is ready (llama.cpp's `--n-gpu-layers`), which

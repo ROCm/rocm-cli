@@ -61,6 +61,25 @@ impl RocmToolExecutor for BinToolExecutor {
         }
     }
 
+    /// The dashboard agent's own tool calls. The approval body built by
+    /// [`Self::execute`] shows the command line, which the operator may copy,
+    /// so a model-chosen value is held to `validate_model_chosen_tool_call`
+    /// first; a slash command the operator typed goes to [`Self::execute`]
+    /// directly and is not.
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: name.to_owned(),
+            arguments: args.clone(),
+        };
+        if let Err(e) = chat::validate_chat_tool_call(&call)
+            .and_then(|()| chat::validate_model_chosen_tool_call(&call))
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        self.execute(name, args)
+    }
+
     fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
         // Replay the approved mutating call via the captured-subprocess path
         // (`allow_mutation = true`). `run_internal_mcp_call` re-validates the
@@ -155,6 +174,38 @@ mod tests {
                 assert_eq!(intent.arguments["channel"], "release");
             }
             other => panic!("expected ApprovalRequired for `install_sdk`, got {other:?}"),
+        }
+    }
+
+    /// The dashboard agent's own call is held to the model-only rules, so a
+    /// folder with `&` in it never reaches the approval body the operator may
+    /// copy; the same folder typed by the operator (`/install <prefix>`, which
+    /// goes through `execute`) is theirs and is staged for approval.
+    #[test]
+    fn seam_refuses_a_model_chosen_value_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({
+            "channel": "release",
+            "format": "wheel",
+            "prefix": "/tmp/rocm-seam R&D",
+        });
+        match exec.execute_model_call("install_sdk", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.contains("supply it yourself by running `rocm install sdk`"),
+                "{error}"
+            ),
+            other => panic!("a model-chosen `&` must be refused, got {other:?}"),
+        }
+        match exec.execute("install_sdk", &args) {
+            RocmToolOutcome::ApprovalRequired(intent) => assert!(
+                intent
+                    .body
+                    .iter()
+                    .any(|line| line.contains("--prefix '/tmp/rocm-seam R&D'")),
+                "{:?}",
+                intent.body
+            ),
+            other => panic!("the operator's own folder must be staged, got {other:?}"),
         }
     }
 

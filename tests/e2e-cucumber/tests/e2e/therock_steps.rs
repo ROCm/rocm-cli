@@ -1060,10 +1060,27 @@ const QUOTED_FOLDER_NAME: &str = "it's-here";
     "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
 )]
 async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
-    let prefix = root(world)
-        .join(QUOTED_FOLDER_NAME)
-        .to_string_lossy()
-        .into_owned();
+    preview_unpinned_wheel_install_into(world, QUOTED_FOLDER_NAME);
+}
+
+/// The install folder chat-19's assistant asks for, inside the scenario's root:
+/// `&` starts a second command when a line holding it is pasted into `cmd.exe`,
+/// even inside the POSIX single quotes the CLI renders it in.
+pub(crate) const AMPERSAND_FOLDER_NAME: &str = "R&D-rocm";
+
+/// Where chat-19's folder lives, so the assistant's step and the user's own
+/// preview name the same one.
+pub(crate) fn ampersand_folder(world: &E2eWorld) -> std::path::PathBuf {
+    root(world).join(AMPERSAND_FOLDER_NAME)
+}
+
+#[when("the user previews that install into the same folder themselves")]
+async fn preview_install_into_the_ampersand_folder(world: &mut E2eWorld) {
+    preview_unpinned_wheel_install_into(world, AMPERSAND_FOLDER_NAME);
+}
+
+fn preview_unpinned_wheel_install_into(world: &mut E2eWorld, folder_name: &str) {
+    let prefix = root(world).join(folder_name).to_string_lossy().into_owned();
     preview_ok(
         world,
         &[
@@ -1084,6 +1101,15 @@ async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld)
 
 #[then("the dry-run command line names that folder as a single argument")]
 async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    assert_dry_run_command_names_folder(world, QUOTED_FOLDER_NAME);
+}
+
+#[then("the dry-run command line names the folder with an ampersand as a single argument")]
+async fn assert_dry_run_command_keeps_ampersand_folder_whole(world: &mut E2eWorld) {
+    assert_dry_run_command_names_folder(world, AMPERSAND_FOLDER_NAME);
+}
+
+fn assert_dry_run_command_names_folder(world: &E2eWorld, folder_name: &str) {
     let output = stdout(world);
     let line = output
         .lines()
@@ -1095,9 +1121,9 @@ async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) 
     // through symlinks, so the folder's parent may be spelled differently from
     // the one this step built. What must hold is that one whole word names it.
     assert!(
-        words.iter().any(|word| {
-            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
-        }),
+        words
+            .iter()
+            .any(|word| { Path::new(word).file_name() == Some(std::ffi::OsStr::new(folder_name)) }),
         "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
     );
 }

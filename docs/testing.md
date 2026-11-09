@@ -1437,6 +1437,50 @@ cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_withou
 cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
+What the chat prints from a model, and what it offers to paste, is covered by
+two more mock-lane scenarios in the same feature file (steps in
+[chat_steps.rs](../tests/e2e-cucumber/tests/e2e/chat_steps.rs)):
+
+- `chat-18` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
+  a line with SGR 8, retitles the window and writes the clipboard (OSC 52, and
+  an 8-bit OSC) reaches stdout of `rocm chat --prompt` with no control
+  character and no sequence payload, and the concealed text printed where it
+  was.
+- `chat-19` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
+  asks `install_sdk` for a folder whose name holds `&`, which `cmd.exe` acts
+  on even inside the single quotes the line is rendered in. The CLI exits
+  non-zero, asked the assistant once, offers no command line naming the
+  folder and installs nothing, and its message names the character and says
+  to run `rocm install sdk` with the value; the user's own
+  `rocm install sdk --dry-run` into that folder (therock-next-15's pip index
+  fixture) is accepted and names it as one argument.
+
+```bash
+cargo xtask e2e -- -n "chat-18"
+cargo xtask e2e -- -n "chat-19"
+```
+
+The unit tests behind them: `sanitize_terminal_text` and
+`is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
+(`cargo test -p rocm-core terminal::`), the paste-unsafe set in
+[shell_quote.rs](../apps/rocm/src/shell_quote.rs), the model-only refusals and
+the serve character set in [tool_policy.rs](../apps/rocm/src/tool_policy.rs)
+(including that the same value passes `validate_chat_tool_call`), the
+model-versus-user split in `chat/turn.rs`
+(`a_model_chosen_folder_a_windows_shell_would_split_is_never_offered_to_paste`,
+`a_folder_the_user_typed_is_rendered_whatever_it_holds`) and in
+[dash_seam.rs](../apps/rocm/src/dash_seam.rs)
+(`seam_refuses_a_model_chosen_value_but_not_the_operators_own`), the planner's
+in `provider_planner_refuses_values_unsafe_to_paste`, and the error report in
+`an_error_quoting_untrusted_text_is_printed_without_its_escapes`:
+
+```bash
+cargo test -p rocm-core terminal::
+cargo test -p rocm --bin rocm paste
+cargo test -p rocm --bin rocm serve_reference
+cargo test -p rocm --bin rocm escape
+```
+
 Log browser smoke:
 
 ```bash

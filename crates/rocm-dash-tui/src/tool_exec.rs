@@ -48,6 +48,16 @@ pub trait RocmToolExecutor: std::fmt::Debug + Send + Sync {
     /// (Return value carries `#[must_use]` via the `RocmToolOutcome` enum.)
     fn execute(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;
 
+    /// [`Self::execute`] for a call the chat *model* chose, as opposed to one
+    /// built from what the operator typed (a slash command). The bin holds a
+    /// model's values to stricter rules than the operator's own — a value the
+    /// operator typed is theirs to use — so the agent's tools call this and the
+    /// slash commands call [`Self::execute`]. The default applies no extra
+    /// rules, for executors that have none (test doubles).
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
+        self.execute(name, args)
+    }
+
     /// Run an *approved* mutating action via the bin's captured-subprocess path
     /// (piped stdout/stderr → JSON; no printing to the TUI terminal, so it is
     /// TUI-safe). Called only after the operator approves the modal, with the
