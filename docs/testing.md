@@ -1433,6 +1433,40 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Lemonade Installs On Disk
+
+`features/lemonade_installs.feature` covers what a user is told about the
+Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
+
+- `lemonade-installs-01` and `-02` reach the engine's pre-install free-space
+  refusal from `rocm engines install lemonade` and from `rocm serve`, with 1 MiB
+  reported free (below what any Lemonade install needs). Room for Lemonade but
+  not for the multi-gigabyte ROCm backend only warns, which the unit tests cover
+  because a scenario would have to start the download. They use
+  `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
+  `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
+  disk that nothing was downloaded. That variable also waives serve's no-GPU
+  refusal, as serve-18's failure hook does.
+- `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
+  and checks `rocm storage report` lists both and flags the unused one.
+- `lemonade-installs-04` uninstalls that runtime and checks the install record
+  is cleared.
+- `lemonade-installs-05` and `-06` cover the two cases the report must not
+  overstate: a record naming a folder with no install (the surviving copy is
+  not offered for deletion) and a read-only runtime (its copy is not said to be
+  removed with it, and uninstall then leaves it). A copy inside a registered
+  runtime is never marked reclaimable, because it is reused when that runtime
+  becomes active; two registered runtimes are covered by a unit test.
+
+Run them alone with `cargo xtask e2e -- -n "lemonade-installs-"`.
+
+The Windows console fix for the backend download's progress is unit-tested
+through the real command builder (`backend_install_command` in
+[process.rs](../engines/lemonade/src/process.rs)), which receives the console
+state and the hide step, so a dropped or unconditional hide turns the test red.
+Whether the output actually reaches a real console is a manual check in
+[manual-testing.md](manual-testing.md).
+
 ## Uninstall And Download Removal
 
 `rocm uninstall` and `rocm storage remove-downloads` both end in the same
@@ -1455,9 +1489,18 @@ The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
 anything is removed, and a dry run on a machine ROCm CLI never touched
-(`uninstall-06`) reporting nothing to remove and creating no folder. The
-`uninstall` command does not start the file logger, which would otherwise create
-the data folder's `logs` folder before the plan is built:
+(`uninstall-06`) reporting nothing to remove and creating no folder. At a
+terminal (a pseudo-terminal on the Linux lane), a dry run that lists something
+ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
+and checks the listed folder goes; a run whose stdin or stdout is not a terminal, and an
+empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
+mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
+is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
+its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+ends differently, since it has no flag to offer: it says removal needs approval,
+which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
+The `uninstall` command does not start the file logger, which would otherwise
+create the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"
@@ -2293,6 +2336,29 @@ serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper che
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
 
+Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
+its HTTP front are tested in
+[anthropic_proxy.rs](../apps/rocmd/src/anthropic_proxy.rs) against a stand-in
+OpenAI engine, including an engine that has its own `/v1/messages` route, which is
+still fronted by the proxy so a Claude model name works. The record's adoption of the published endpoint are tested in
+[anthropic_endpoint.rs](../crates/rocm-core/src/anthropic_endpoint.rs) and
+[service_record.rs](../crates/rocm-core/src/service_record.rs).
+
+```bash
+cargo test -p rocmd --lib anthropic_proxy
+cargo test -p rocm-core --lib anthropic_endpoint
+cargo test -p rocm-core --lib engine_refresh_adopts_the_published_anthropic_endpoint
+cargo test -p rocm --bin rocm anthropic_endpoint
+```
+
+The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
+(a real Messages request is answered by the served model) and `serve-52`
+(`services list` reports both endpoints healthy) in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+serves with. Streaming and tool use are not translated yet, so no scenario
+covers them; a request for either is refused, and the unit tests above pin that.
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -2611,6 +2677,14 @@ cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
 cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
 cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
 cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
+cargo test -p rocmd daemon_host
+cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
+cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
+cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
+cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
+cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
+cargo test -p rocm-core sibling_binary_path_from
 cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
 cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
 cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
@@ -2634,6 +2708,24 @@ sandbox tool) starts a new engine only after its stop is confirmed; otherwise
 it reports the unconfirmed stop and starts nothing. Its own later writes are
 applied to the record as it is on disk, and only while it still reads as the
 restart left it, so a stop asked for during the restart keeps its marker.
+
+The daemon runs as the `rocmd` binary or embedded in `rocm` (`rocm daemon`),
+and each binary has commands the other lacks: `supervise` is `rocmd`'s, and the
+hidden engine commands (`__engine-serve-http`, `__engine-stdio`) are `rocm`'s.
+Every daemon spawn therefore asks `DaemonHost` for the binary instead of
+re-executing its own: the recovery restart runs `supervise` on `rocmd`, and the
+supervisor starts its engine, polls its readiness and asks it to stop through
+`rocm`, each the current executable when the daemon is that binary and the
+sibling installed beside it otherwise, named in the error when there is none.
+`rocmd`'s unit tests never reach the real host: under test `DaemonHost::detect`
+returns the test binary for both commands and looks for no sibling, the two
+stand-in hosts name only the binary they stand in for and fail when asked for
+the other, each test that needs a different host passes the code under test one
+of its own, and a test that needs a binary writes a stand-in script (its shell
+and `sleep` found on `PATH` once and asserted by name), so none of them can run
+a `rocm` or `rocmd` that happens to sit in the build directory. `run_from_args_marks_the_process_as_embedded_in_rocm`
+checks the embedded marking in a child run of the test binary, because the flag
+is process-wide.
 
 Automation GPU-metrics event tests:
 

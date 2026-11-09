@@ -323,6 +323,7 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
+- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. A request with `"stream":true` or `tools` is refused with an `invalid_request_error`.
 
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
@@ -346,6 +347,36 @@ ROCm backend directory under `bin/llamacpp/`, and run
   packaged backend.
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
+
+To check what a Lemonade install says about its size (no download needed for
+the refusal): with a debug build, set
+`ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
+folder run `rocm engines install lemonade --yes`. Expected result:
+
+- Before anything else it prints `Installing Lemonade <version> into <folder>`
+  and a line giving the ROCm backend's download (up to about 4.4 GiB), disk use
+  (up to about 25 GiB) and the free space on that drive.
+- It then fails with `not enough free disk space to install Lemonade: ...
+  Nothing was downloaded.`, and `<folder>` has no `downloads` or `runtime`
+  subfolder.
+- With `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=2147483648` (2 GiB) instead, it
+  warns that only 2.0 GiB is free for a backend of up to about 4.4 GiB and
+  carries on: Lemonade picks the backend after this point and a smaller one may
+  fit. (Stop it before the download if you do not want one.)
+
+With room to spare, on Windows from an interactive console: install Lemonade
+with no runtime active, then `rocm install sdk`, then `rocm serve <gguf-model>`.
+Expected result:
+
+- The serve prints the install notice for the runtime's own
+  `engines\lemonade` folder, and says the data folder's copy is not reused.
+- Lemonade's own backend download progress (`[1/2] ...`, `Total: ...`) appears
+  in the console instead of a silent wait.
+- `rocm storage report` lists both copies under `Engine installs`, with the data
+  folder's one `not used right now` (and reclaimable) and the runtime's one `in use`.
+- `rocm runtimes uninstall <runtime-key>` says Lemonade's install was inside the
+  runtime and removed with it, and a following `rocm storage report` shows the
+  remaining copy as `not recorded as installed`.
 
 While the log stream is attached, verify detach and stop behave differently:
 
@@ -1144,7 +1175,12 @@ Expected result:
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
   as the command exits) and, under
   `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  terminal ends with `Nothing was removed. To remove these items, run it again
+  without --dry-run.` Running the same command again without `--dry-run` asks
+  `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
+  its output piped to a file or another command, or its input redirected, it
+  lists the same items and omits that last line (scenario `uninstall-08`).
 - After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
@@ -1156,7 +1192,14 @@ Expected result:
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
-  on that folder.
+  on that folder. It adds no line about how to remove anything (scenario
+  `uninstall-09`).
+- Passing `--force` to `rocm uninstall` is refused with a message that says it
+  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  unknown-argument error (exit 2). Neither
+  suggests `--force-dev-binaries` (scenario `uninstall-10`).
+  `rocm uninstall --help` ends with examples that start with a dry run
+  (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no

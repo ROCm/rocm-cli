@@ -68,7 +68,7 @@ pub(crate) struct LemonadeInstallManifest {
 ///
 /// Pure so the upgrade case is testable without a real archive. `installed`
 /// is the version recorded for the tree already on disk, if any.
-fn needs_extraction(
+pub(crate) fn needs_extraction(
     reinstall: bool,
     installed: Option<&str>,
     wanted: &str,
@@ -78,7 +78,7 @@ fn needs_extraction(
 }
 
 /// The Lemonade runtime version last extracted into `runtime_dir`, if any.
-fn installed_runtime_version(runtime_dir: &Path) -> Option<String> {
+pub(crate) fn installed_runtime_version(runtime_dir: &Path) -> Option<String> {
     fs::read_to_string(runtime_dir.join(RUNTIME_VERSION_MARKER))
         .ok()
         .map(|s| s.trim().to_owned())
@@ -89,7 +89,7 @@ fn installed_runtime_version(runtime_dir: &Path) -> Option<String> {
 /// part of the same wipe that removes the tree it describes — "marker present
 /// implies extraction completed" holds by construction, with no separate
 /// bookkeeping to keep in sync.
-fn record_runtime_version(runtime_dir: &Path, version: &str) -> Result<()> {
+pub(crate) fn record_runtime_version(runtime_dir: &Path, version: &str) -> Result<()> {
     fs::write(runtime_dir.join(RUNTIME_VERSION_MARKER), version).with_context(|| {
         format!(
             "failed to record installed Lemonade runtime version under {}",
@@ -117,7 +117,7 @@ pub(crate) fn prepare_embeddable(
 /// sha256, and the download step all injectable — the seam a test uses to
 /// exercise the real decision of which source `installed_version` trusts,
 /// rather than reimplementing that decision inline.
-fn prepare_embeddable_with<F>(
+pub(crate) fn prepare_embeddable_with<F>(
     paths: &AppPaths,
     env_root: Option<&Path>,
     reinstall: bool,
@@ -195,18 +195,18 @@ where
     })
 }
 
-fn manifest_path(paths: &AppPaths) -> PathBuf {
+pub(crate) fn manifest_path(paths: &AppPaths) -> PathBuf {
     paths.engine_install_manifest_path(ENGINE_NAME)
 }
 
-fn lemonade_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
+pub(crate) fn lemonade_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
     env_root.map_or_else(
         || paths.engine_dir(ENGINE_NAME),
         |root| normalize_runtime_path_for_host(root).join(ENGINE_NAME),
     )
 }
 
-fn runtime_dir_in(root: &Path) -> PathBuf {
+pub(crate) fn runtime_dir_in(root: &Path) -> PathBuf {
     root.join("runtime")
 }
 
@@ -451,11 +451,11 @@ impl PinFileBackup {
     }
 }
 
-fn lemond_path_in(runtime_dir: &Path) -> PathBuf {
+pub(crate) fn lemond_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(platform_binary_name("lemond"))
 }
 
-fn lemonade_path_in(runtime_dir: &Path) -> PathBuf {
+pub(crate) fn lemonade_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(platform_binary_name("lemonade"))
 }
 

@@ -5,12 +5,16 @@
 //! `rocm runtimes uninstall`: planning the removal of a registered runtime,
 //! re-validating that plan after the confirmation prompt, and applying it
 //! (unregistering the runtime, clearing the active and default state that named
-//! it, and removing its install root when ROCm CLI owns it).
+//! it, and removing its install root when ROCm CLI owns it). When that root
+//! holds the Lemonade install its record points at (a self-managed engine
+//! installs inside the active runtime's folder), the plan says so and applying
+//! it clears the record, so Lemonade does not keep naming deleted files.
 //!
-//! Relocated from `runtimes_cmd.rs` with no behavior change. `runtimes_cmd.rs`
-//! calls into this module from `runtimes()` and re-exports `uninstall_runtime`,
-//! `should_remove_runtime_install_root` and `InstallRootDecision` for
-//! `storage.rs`. The active-runtime marker check this module makes
+//! Relocated from `runtimes_cmd.rs`; the Lemonade record handling is new.
+//! `runtimes_cmd.rs` calls into this module from `runtimes()` and re-exports
+//! `uninstall_runtime`, `should_remove_runtime_install_root`,
+//! `InstallRootDecision` and `lemonade_record_report_line` for `storage.rs`.
+//! The active-runtime marker check this module makes
 //! (`active_runtime_marker_matches`, over the `ActiveRuntimeMarker` the
 //! activation writes) and the path comparison it needs live in
 //! `runtime_registry.rs`, so this module does not depend on `runtimes_cmd.rs`.
@@ -20,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, RocmCliConfig, runtime_install_root_is_protected};
+use rocm_engine_lemonade::RecordCleanup;
 
 use crate::cli_report;
 use crate::runtime_registry::{
@@ -34,6 +39,9 @@ pub(crate) struct RuntimeUninstallResult {
     pub(crate) runtime_key: String,
     pub(crate) registry_path: PathBuf,
     pub(crate) removed_install_root: Option<PathBuf>,
+    /// What happened to Lemonade's install record once the folder was removed:
+    /// cleared, left dangling because deleting it failed, or not checkable.
+    pub(crate) lemonade_record: RecordCleanup,
     pub(crate) read_only: bool,
     pub(crate) manifest_mismatch: bool,
     pub(crate) was_active: bool,
@@ -70,11 +78,53 @@ pub(crate) struct RuntimeUninstallPlan {
     /// does not by itself orphan the default while others remain).
     clears_default_runtime: bool,
     install_root_decision: InstallRootDecision,
+    /// Lemonade's runtime folder when its install record points inside this
+    /// runtime's folder: a self-managed engine installs there while the runtime
+    /// is active, so removing the folder removes that engine too.
+    lemonade_install_inside: Option<PathBuf>,
+    /// Whether this runtime's folder holds a Lemonade tree at all, installed or
+    /// partly installed. Only then can an unreadable install record matter to
+    /// this uninstall.
+    holds_lemonade_tree: bool,
 }
 
 impl RuntimeUninstallPlan {
     fn will_remove_install_root(&self) -> bool {
         self.install_root_decision.should_remove() && self.manifest.install_root.exists()
+    }
+}
+
+/// The line `runtimes uninstall` (and `storage remove-old-installs`, which
+/// delegates to it) report about Lemonade's install record, or `None` when the
+/// removed runtime had nothing to do with it.
+///
+/// Built from the outcome the record handling returned, so each claim is the one
+/// that happened: "no longer recorded" only follows a record that was deleted,
+/// and a record that could not be deleted or read says so and how to fix it.
+pub(crate) fn lemonade_record_report_line(outcome: &RecordCleanup) -> Option<String> {
+    match outcome {
+        RecordCleanup::NotAffected => None,
+        RecordCleanup::Cleared(lemonade) => Some(format!(
+            "its install at {} was inside this runtime and was removed with it; \
+             Lemonade is no longer recorded as installed",
+            lemonade.display()
+        )),
+        RecordCleanup::Failed {
+            runtime_dir,
+            record,
+            error,
+        } => Some(format!(
+            "its install at {} was inside this runtime and was removed with it, but \
+             Lemonade's install record could not be deleted ({error}); delete {} \
+             so Lemonade is not left pointing at files that are gone",
+            runtime_dir.display(),
+            record.display()
+        )),
+        RecordCleanup::Unreadable(error) => Some(format!(
+            "Lemonade's install record could not be read ({error}), so it was not \
+             checked against this runtime; `rocm engines install lemonade` rewrites it \
+             and keeps a current Lemonade install"
+        )),
     }
 }
 
@@ -104,6 +154,17 @@ pub(crate) fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
     if plan.clears_default_runtime {
         report = report.detail("default_runtime", "would be cleared");
     }
+    if plan.will_remove_install_root()
+        && let Some(lemonade) = plan.lemonade_install_inside.as_ref()
+    {
+        report = report.detail(
+            "lemonade",
+            format!(
+                "its install at {} is inside this runtime folder and would be removed with it",
+                lemonade.display()
+            ),
+        );
+    }
     print!("{}", report.render());
 }
 
@@ -127,12 +188,23 @@ pub(crate) fn plan_runtime_uninstall(
                     && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
             }));
     let install_root_decision = should_remove_runtime_install_root(&manifest)?;
+    let holds_lemonade_tree =
+        rocm_engine_lemonade::install_tree_dirs(&rocm_engine_lemonade::install_tree_root(
+            paths,
+            Some(&manifest.install_root.join("engines")),
+        ))
+        .iter()
+        .any(|part| part.exists());
+    let lemonade_install_inside = rocm_engine_lemonade::recorded_runtime_dir(paths)
+        .filter(|dir| rocm_core::runtime_path_is_same_or_inside(dir, &manifest.install_root));
     Ok(RuntimeUninstallPlan {
         manifest,
         registry_path,
         was_active,
         clears_default_runtime,
         install_root_decision,
+        lemonade_install_inside,
+        holds_lemonade_tree,
     })
 }
 
@@ -215,6 +287,8 @@ pub(crate) fn apply_runtime_uninstall(
         was_active,
         clears_default_runtime,
         install_root_decision,
+        lemonade_install_inside: _,
+        holds_lemonade_tree,
     } = plan;
 
     let mut removed_install_root = None;
@@ -288,11 +362,27 @@ pub(crate) fn apply_runtime_uninstall(
         }
     }
 
+    // Decided from the folder actually removed, not from the plan: the record
+    // is only stale once its files are gone.
+    let lemonade_record = removed_install_root
+        .as_deref()
+        .map_or(RecordCleanup::NotAffected, |removed| {
+            rocm_engine_lemonade::forget_install_record_inside(paths, removed)
+        });
+    // An unreadable record says nothing about this runtime unless the runtime
+    // could have held Lemonade; otherwise the line would repeat on every runtime
+    // uninstall for as long as the record stays unreadable.
+    let lemonade_record = match lemonade_record {
+        RecordCleanup::Unreadable(_) if !holds_lemonade_tree => RecordCleanup::NotAffected,
+        other => other,
+    };
+
     Ok(RuntimeUninstallResult {
         runtime_id: manifest.runtime_id,
         runtime_key: manifest.runtime_key,
         registry_path,
         removed_install_root,
+        lemonade_record,
         read_only: manifest.read_only,
         manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
         was_active,
@@ -356,6 +446,180 @@ mod tests {
     use crate::runtime_adopt::import_runtime_manifest;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::test_paths;
+
+    /// While a runtime is active, `rocm serve` installs Lemonade inside that
+    /// runtime's folder and records it there. Uninstalling the runtime deletes
+    /// the folder; the record must go with it, or Lemonade keeps pointing at
+    /// files that no longer exist. A record pointing elsewhere is left alone.
+    #[test]
+    fn runtime_uninstall_clears_a_lemonade_record_pointing_into_the_removed_folder() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-lemonade");
+        let held = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-1",
+            "therock-release:gfx1151",
+            "7.14.1",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-13-0",
+            "therock-release:gfx1151",
+            "7.13.0",
+            10,
+        )?;
+        let tree = rocm_engine_lemonade::install_tree_root(
+            &paths,
+            Some(&held.install_root.join("engines")),
+        );
+        crate::test_support::plant_lemonade_tree(&tree, 16)?;
+        crate::test_support::record_lemonade_install(&paths, &tree)?;
+        let mut config = RocmCliConfig::default();
+
+        // Removing a runtime that does not hold the tree keeps the record.
+        let removed = uninstall_runtime(&paths, &mut config, &other.runtime_key)?;
+        assert_eq!(removed.lemonade_record, RecordCleanup::NotAffected);
+        assert_eq!(
+            rocm_engine_lemonade::recorded_runtime_dir(&paths),
+            Some(tree.join("runtime"))
+        );
+
+        let plan = plan_runtime_uninstall(&paths, &config, &held.runtime_key)?;
+        assert_eq!(plan.lemonade_install_inside, Some(tree.join("runtime")));
+        let removed = apply_runtime_uninstall(&paths, &mut config, plan)?;
+
+        assert_eq!(
+            removed.lemonade_record,
+            RecordCleanup::Cleared(tree.join("runtime"))
+        );
+        assert!(!tree.exists());
+        assert_eq!(rocm_engine_lemonade::recorded_runtime_dir(&paths), None);
+        let line = lemonade_record_report_line(&removed.lemonade_record).unwrap();
+        assert!(
+            line.contains(&tree.join("runtime").display().to_string())
+                && line.ends_with("Lemonade is no longer recorded as installed"),
+            "{line}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A record that cannot be read may well name the runtime being removed, so
+    /// the uninstall cannot tell whether it is left dangling. When the runtime
+    /// held a Lemonade tree it must say so rather than treat the record as
+    /// absent, name the cheap command that rewrites it (a plain
+    /// `rocm engines install lemonade`, shown to do so by
+    /// `a_plain_install_replaces_a_corrupt_record_and_keeps_the_current_tree` in
+    /// the engine), not the wiping `--reinstall`, and leave the file alone.
+    #[test]
+    fn runtime_uninstall_reports_a_lemonade_record_it_could_not_read() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-lemonade-unreadable");
+        let held = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-1",
+            "therock-release:gfx1151",
+            "7.14.1",
+            20,
+        )?;
+        crate::test_support::plant_lemonade_tree(
+            &rocm_engine_lemonade::install_tree_root(
+                &paths,
+                Some(&held.install_root.join("engines")),
+            ),
+            16,
+        )?;
+        let record = paths.engine_manifests_dir("lemonade").join("runtime.json");
+        fs::create_dir_all(record.parent().expect("record has a parent"))?;
+        fs::write(&record, b"{ not json")?;
+        let mut config = RocmCliConfig::default();
+
+        let removed = uninstall_runtime(&paths, &mut config, &held.runtime_key)?;
+
+        assert!(
+            matches!(removed.lemonade_record, RecordCleanup::Unreadable(_)),
+            "{:?}",
+            removed.lemonade_record
+        );
+        let line = lemonade_record_report_line(&removed.lemonade_record).unwrap();
+        assert!(line.contains("could not be read"), "{line}");
+        assert!(
+            line.contains("`rocm engines install lemonade` rewrites it"),
+            "{line}"
+        );
+        assert!(!line.contains("--reinstall"), "{line}");
+        assert!(record.exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The same unreadable record must not be reported on a runtime that never
+    /// held Lemonade: nothing about that uninstall depends on it, and the line
+    /// would otherwise repeat on every runtime uninstall.
+    #[test]
+    fn an_unreadable_lemonade_record_is_not_reported_for_a_runtime_without_lemonade() -> Result<()>
+    {
+        let (root, paths) = test_paths("runtime-uninstall-lemonade-unrelated");
+        let runtime = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-1",
+            "therock-release:gfx1151",
+            "7.14.1",
+            20,
+        )?;
+        let record = paths.engine_manifests_dir("lemonade").join("runtime.json");
+        fs::create_dir_all(record.parent().expect("record has a parent"))?;
+        fs::write(&record, b"{ not json")?;
+        let mut config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &runtime.runtime_key)?;
+        assert!(!plan.holds_lemonade_tree);
+        let removed = apply_runtime_uninstall(&paths, &mut config, plan)?;
+
+        assert_eq!(removed.lemonade_record, RecordCleanup::NotAffected);
+        assert_eq!(lemonade_record_report_line(&removed.lemonade_record), None);
+        assert!(
+            removed.removed_install_root.is_some(),
+            "the runtime was removed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Each outcome's line says only what happened. A failed deletion must
+    /// name the record to delete and must not claim Lemonade is no longer
+    /// recorded; no outcome for an unrelated runtime prints anything. (That
+    /// deleting the named record really clears the condition is shown by
+    /// `a_record_that_cannot_be_deleted_is_reported_not_swallowed` in the
+    /// engine.)
+    #[test]
+    fn the_lemonade_record_line_matches_what_happened() {
+        assert_eq!(
+            lemonade_record_report_line(&RecordCleanup::NotAffected),
+            None
+        );
+        let cleared =
+            lemonade_record_report_line(&RecordCleanup::Cleared(PathBuf::from("/rt/lemonade")))
+                .unwrap();
+        assert!(
+            cleared.contains("no longer recorded as installed"),
+            "{cleared}"
+        );
+        let failed = lemonade_record_report_line(&RecordCleanup::Failed {
+            runtime_dir: PathBuf::from("/rt/lemonade"),
+            record: PathBuf::from("/data/engines/lemonade/manifests/runtime.json"),
+            error: "sharing violation".to_owned(),
+        })
+        .unwrap();
+        assert!(failed.contains("sharing violation"), "{failed}");
+        assert!(
+            failed.contains("delete /data/engines/lemonade/manifests/runtime.json"),
+            "{failed}"
+        );
+        assert!(!failed.contains("no longer recorded"), "{failed}");
+    }
 
     #[test]
     fn runtime_uninstall_unregisters_read_only_runtime_without_deleting_external_root() -> Result<()>
