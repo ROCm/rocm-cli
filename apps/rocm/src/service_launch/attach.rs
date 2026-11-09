@@ -45,8 +45,8 @@ enum AttachOutcome {
 /// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
 ///
 /// `stop_service` is how Ctrl-C stops the server: the caller passes the managed
-/// stop, so this module does not import the stop path, which itself imports this
-/// module's spawn helpers. It returns the same `stop_server` answer
+/// stop, so the `service_launch` module does not import the stop path, which
+/// itself imports its spawn helpers. It returns the same `stop_server` answer
 /// [`finish_attached_stop`] reads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_attached_service(
@@ -142,7 +142,8 @@ pub(crate) fn run_attached_service(
     println!("  endpoint: {endpoint}");
     if let Some(key) = endpoint_api_key {
         // Same intentional one-time key display as `print_managed_launch_plain`
-        // above; see its rationale for why the tag below is currently inert.
+        // in `service_launch/start.rs`; see its rationale for why the tag below is
+        // currently inert.
         // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }

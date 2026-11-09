@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 /// A record with every reuse-relevant field set to the "reusable" value, so
-/// each test below breaks exactly one term and nothing else.
+/// each test that uses it breaks exactly one term and nothing else.
 pub(super) fn reusable_record(paths: &AppPaths) -> ManagedServiceRecord {
     let mut record = ManagedServiceRecord::new(
         paths,

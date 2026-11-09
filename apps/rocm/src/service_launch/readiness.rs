@@ -6,6 +6,13 @@
 //! liveness of the tracked process, how a wait ends, and the end-to-end OOM
 //! fault-injection seam that fabricates a launch that never became ready.
 
+// There is deliberately no `use std::fs`, `use std::thread` or
+// `use rocm_core::process_is_running` here: this file names them by full path.
+// Their use sites sit under different `cfg` combinations (the Linux-only zombie
+// probe, the OOM fault-injection seam, one Linux-only test), so any single import
+// would be unused in some build, and a gate on it would have to be kept in step
+// with every use site. Keep the full paths. The tests module imports `fs` for
+// itself because its tests use it on every platform.
 use super::spawn::ManagedLaunchReport;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use crate::device_policy_name;

@@ -223,8 +223,9 @@ pub(crate) enum ManagedReuseRefusal {
 /// The `rocm serve` no-usable-GPU refusal, worded once.
 ///
 /// Two places raise it and they must say the same thing: `serve()`'s fail-fast
-/// pre-flight, and the spawn below when the reuse that waived that pre-flight
-/// turns out not to be available after all.
+/// pre-flight, and [`spawn_managed_engine_child`](super::spawn::spawn_managed_engine_child)
+/// when the reuse that waived that pre-flight turns out not to be available after
+/// all.
 pub(crate) fn no_usable_gpu_refusal(device_policy: &DevicePolicy) -> String {
     // Keyed on the same `is_wsl_host()` the usable-GPU probe branches on, so the
     // advice follows the platform whose answer produced the refusal.
