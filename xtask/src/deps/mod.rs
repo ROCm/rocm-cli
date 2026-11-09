@@ -17,6 +17,7 @@ mod mise_lock;
 mod pins_gen;
 mod profiles;
 mod pylock;
+mod verify;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -57,6 +58,9 @@ pub(crate) enum DepsCommand {
     },
     /// Verify, offline, that every runtime lock is complete and consistent.
     Check,
+    /// Download every binary `runtimes/mise.lock` records without a build
+    /// attestation (Lemonade) and check its SHA-256 against the lock (network).
+    VerifyDownloads,
     /// Print a Markdown table of versions changed since a git revision.
     Diff {
         /// Revision to compare against.
@@ -78,6 +82,7 @@ pub(crate) fn run(command: DepsCommand) -> Result<()> {
         }),
         DepsCommand::Check => check::run(),
         DepsCommand::Diff { base } => diff::run(&base),
+        DepsCommand::VerifyDownloads => verify::run(),
     }
 }
 

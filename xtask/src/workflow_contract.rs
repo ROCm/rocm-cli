@@ -1133,6 +1133,7 @@ mod tests {
                 "rm -rf runtimes/locks",
                 "cp -r \"$RUNNER_TEMP/update/locks\" runtimes/locks",
                 "cargo xtask deps check",
+                "cargo xtask deps verify-downloads",
                 "cargo xtask deps diff --base HEAD | cmp - \"$RUNNER_TEMP/update/summary.md\"",
             ],
             "the check must validate the artifact, run deps check on it, and recompute its summary"
@@ -1245,6 +1246,12 @@ mod tests {
                 "set -euo pipefail",
                 "base_sha=\"$BASE_SHA\"",
                 "if gh api \"repos/$REPO/git/ref/heads/$BRANCH\" >/dev/null 2>&1; then",
+                "  others=$(gh api \"repos/$REPO/compare/$base_sha...$BRANCH\" \\",
+                "    --jq '[.commits[] | select(.author.login != \"github-actions[bot]\")] | length')",
+                "  if [ \"$others\" != \"0\" ]; then",
+                "    echo \"::error::$BRANCH has $others commit(s) this workflow did not make. Merge or close its pull request, or move the fixups to main, before the next update.\"",
+                "    exit 1",
+                "  fi",
                 "  gh api -X PATCH \"repos/$REPO/git/refs/heads/$BRANCH\" -f sha=\"$base_sha\" -F force=true >/dev/null",
                 "else",
                 "  gh api -X POST \"repos/$REPO/git/refs\" -f ref=\"refs/heads/$BRANCH\" -f sha=\"$base_sha\" >/dev/null",
@@ -1390,9 +1397,18 @@ mod tests {
                 "",
                 "Free disk space for wheel downloads",
                 "Re-lock at the committed pins",
+                "Check unattested downloads against the lock",
                 "Fail if any lock changed",
                 "Upload the re-locked files"
             ]
+        );
+        assert_eq!(
+            run_lines(pinned_step(
+                &steps,
+                "Check unattested downloads against the lock",
+                ""
+            )),
+            ["cargo xtask deps verify-downloads"]
         );
         assert!(has_line(
             &steps[0].1,

@@ -18,7 +18,10 @@ lockfile = true
 # rocm-cli supports Linux and Windows only; lock exactly those.
 lockfile_platforms = ["linux-x64", "windows-x64"]
 # Same cooldown as .github/dependabot.yml: let a bad release be found and
-# pulled before it is adopted. Applies to `mise upgrade` and `mise lock`.
+# pulled before it is adopted. Applies to `mise upgrade` and `mise lock`, and
+# (as `--cooldown-days` below) to PyPI packages in the Python locks. It does
+# not hold back AMD-only packages (rocm, torch, vllm, ...): AMD's indexes
+# publish no upload times, so those move as soon as AMD publishes them.
 minimum_release_age = "7d"
 
 [tools]

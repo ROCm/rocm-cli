@@ -183,6 +183,12 @@ fn package_problems(
         if !wheel_fits_os(file, os) {
             out.push(format!("{name}: {file} is not a wheel for {os}"));
         }
+        if !wheel_fits_python(file, &profile.python) {
+            out.push(format!(
+                "{name}: {file} is not a wheel for Python {}",
+                profile.python
+            ));
+        }
     }
     for artifact in package.artifacts() {
         let url = artifact.url.as_deref().unwrap_or_default();
@@ -245,6 +251,42 @@ fn wheel_fits_os(file: &str, os: &str) -> bool {
         }
         ("windows", tag) => tag == "win_amd64",
         _ => false,
+    })
+}
+
+/// Whether a wheel file name's Python and ABI tags can install on CPython
+/// `python` (`3.14`): a pure-Python tag (`py3`, or `py3X` up to that minor),
+/// that CPython's own tag and ABI (`cp314-cp314`), or a stable-ABI wheel
+/// built for that minor or an older one (`cp312-abi3`). Not a wheel for
+/// another CPython (`cp312-cp312`) or a free-threaded one (`cp314t`).
+fn wheel_fits_python(file: &str, python: &str) -> bool {
+    let Some(stem) = file.strip_suffix(".whl") else {
+        return false;
+    };
+    let mut tags = stem.rsplit('-');
+    let (Some(_platform), Some(abi), Some(pythons)) = (tags.next(), tags.next(), tags.next())
+    else {
+        return false;
+    };
+    let Some(minor) = python
+        .strip_prefix("3.")
+        .and_then(|minor| minor.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let cp_minor = |tag: &str| tag.strip_prefix("cp3").and_then(|m| m.parse::<u32>().ok());
+    pythons.split('.').any(|tag| {
+        if tag == "py3" {
+            return true;
+        }
+        if let Some(m) = tag.strip_prefix("py3").and_then(|m| m.parse::<u32>().ok()) {
+            return m <= minor && abi == "none";
+        }
+        match cp_minor(tag) {
+            Some(m) if abi == "abi3" => m <= minor,
+            Some(m) => m == minor && (abi == tag || abi == "none"),
+            None => false,
+        }
     })
 }
 
@@ -707,6 +749,43 @@ linux = "x86_64-manylinux_2_28"
                 .iter()
                 .any(|p| p.contains("is not a wheel for windows")),
             "{found:?}"
+        );
+    }
+
+    #[test]
+    fn wheels_must_fit_the_profiles_python() {
+        for fits in [
+            "x-1-py3-none-any.whl",
+            "x-1-py2.py3-none-any.whl",
+            "x-1-py39-none-any.whl",
+            "x-1-py314-none-any.whl",
+            "x-1-cp314-cp314-linux_x86_64.whl",
+            "x-1-cp312-abi3-linux_x86_64.whl",
+            "x-1-cp37-abi3-linux_x86_64.whl",
+        ] {
+            assert!(wheel_fits_python(fits, "3.14"), "{fits}");
+        }
+        for misfit in [
+            "x-1-cp312-cp312-linux_x86_64.whl",
+            "x-1-cp314-cp314t-linux_x86_64.whl",
+            "x-1-cp315-cp315-linux_x86_64.whl",
+            "x-1-cp315-abi3-linux_x86_64.whl",
+            "x-1-py315-none-any.whl",
+            "x-1-py2-none-any.whl",
+        ] {
+            assert!(!wheel_fits_python(misfit, "3.14"), "{misfit}");
+        }
+    }
+
+    #[test]
+    fn a_wheel_for_another_python_in_a_lock_is_reported() {
+        let text = lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com")
+            .replace("numpy-2.3.0-cp314-cp314-", "numpy-2.3.0-cp312-cp312-");
+        assert_eq!(
+            problems_of(&text),
+            [
+                "numpy: numpy-2.3.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl is not a wheel for Python 3.14"
+            ]
         );
     }
 

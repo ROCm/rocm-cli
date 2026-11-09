@@ -45,8 +45,9 @@ with `--cd runtimes`.
 | Command | Does |
 |---|---|
 | `runtimes/bin/mise run --cd runtimes lock` | Re-lock binaries at the current pins and every Python profile at the cutoff its lock records (network; see below) |
-| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown, then re-lock |
+| `runtimes/bin/mise run --cd runtimes update` | Move pins to the newest releases past the cooldown (AMD-only Python packages are not held back; see *Cooldown*), then re-lock |
 | `cargo xtask deps check` | Verify every lock, offline (also run by `cargo test -p xtask`) |
+| `cargo xtask deps verify-downloads` | Download every binary locked without a build attestation (Lemonade) and check its SHA-256 against `mise.lock` (network) |
 | `cargo xtask deps diff --base <rev>` | Markdown table of versions changed since `<rev>`. Every row carries a short digest after the version (of the asset for a binary, of all its artifacts' hashes for a Python package), so an artifact re-uploaded at the same version shows up too |
 
 The mise tasks install the pinned tools first, Lemonade included, so even
@@ -73,10 +74,12 @@ no attestation, the lock records `checksum_source = "mise-versions"`: the
 digest is the one mise's own version index lists for that release asset, not
 one GitHub signed. That digest is what
 [`install.rs`](../engines/lemonade/src/install.rs) checks a download against,
-so trusting it is a decision this repository makes: a bump of Lemonade is
-reviewed in its pull request like any other pin change, and
-`cargo xtask deps check` (below) ties the URL to Lemonade's own release for
-that version. `deps check` does not read `checksum_source`; it does require
+so it is not taken on trust: `cargo xtask deps verify-downloads` downloads
+every locked asset without a build attestation and compares its SHA-256 with
+the lock. The weekly update's read-only `check` job runs it before a pull
+request is opened, and the `runtime-locks` job runs it on any pull request
+that changes `runtimes/`. `cargo xtask deps check` (below) ties the URL to
+Lemonade's own release for that version. `deps check` does not read `checksum_source`; it does require
 uv's `provenance = "github-attestations"`, ties `url_api` (which mise downloads
 through when set) to the same repository as `url`, and refuses any lock field
 it does not know.
@@ -221,6 +224,11 @@ an artifact whose summary differs; only then does a third, holding the write tok
 and commit through `createCommitOnBranch`, which GitHub signs, as the
 `commit-signatures` gate requires. A pull request opened with
 `GITHUB_TOKEN` does not trigger CI: close and reopen it to run the checks.
+
+The update branch is rebuilt from the base commit on every run, but never
+over someone else's work: while it holds a commit the workflow did not make, a
+maintainer's fixup for example, the run fails instead of resetting it. Merge or
+close the pull request, or move the fixup to `main`.
 
 **Prerequisite:** the repository setting "Allow GitHub Actions to create and
 approve pull requests" (Settings → Actions → General) must be on. While it is

@@ -1830,6 +1830,12 @@ jobs:
       - name: Re-lock at the committed pins
         run: runtimes/bin/mise run --cd runtimes lock
 
+      # Lemonade's digests come from mise's version index, not a build
+      # attestation, and the Lemonade adapter trusts them: re-hash each such
+      # download against the lock, so a pin bump is checked on its own PR.
+      - name: Check unattested downloads against the lock
+        run: cargo xtask deps verify-downloads
+
       - name: Fail if any lock changed
         run: |
           git add -N runtimes
