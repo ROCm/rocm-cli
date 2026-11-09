@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod amd_smi;
 #[cfg(all(test, unix))]
 mod archive_props;
+pub mod atomic_write;
 pub mod automation;
 pub mod binary_paths;
 pub mod browser;
@@ -27,6 +28,9 @@ pub mod examine;
 pub mod fake_executable;
 pub mod fix;
 mod gfx_target;
+pub mod gguf;
+pub mod gguf_fit;
+pub mod gguf_source;
 pub mod hardware_root;
 pub mod host_gpu;
 mod jsonl_store;

@@ -34,7 +34,6 @@ pub(crate) use self::consent::{
 use self::family::{family_override_or_recovered_arch, resolve_family};
 pub(crate) use self::fetch::truthy_env;
 use self::fetch::{download_file, preflight_tarball_space};
-pub(crate) use self::io::write_file_atomically;
 use self::probe::probe_rocm_sdk_runtime_for_target;
 pub(crate) use self::probe::{
     RuntimeDeviceProbe, TorchAlignmentProbe, install_pinned_package, probe_rocm_sdk_runtime,
@@ -1101,17 +1100,6 @@ mod tests {
             "extraction must reserve headroom beyond the archive: {estimate} vs {archive}"
         );
         assert_eq!(estimate, archive * disk_space::EXTRACTED_SIZE_MULTIPLIER);
-    }
-
-    #[test]
-    fn write_file_atomically_reports_a_full_disk_clearly() {
-        // Exercise the mapping the write path uses, without filling a disk.
-        let error = disk_space::map_write_error(
-            std::io::Error::from(std::io::ErrorKind::StorageFull),
-            Path::new("/cache/rocm.tar.gz.tmp"),
-        );
-        let text = format!("{error:#}");
-        assert!(text.contains("ran out of disk space"), "{text}");
     }
 
     #[test]
