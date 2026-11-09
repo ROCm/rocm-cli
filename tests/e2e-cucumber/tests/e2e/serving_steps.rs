@@ -2223,9 +2223,12 @@ async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
     let budget = Duration::from_secs(crate::inference_timeout_for(world));
     // Sent under a Claude model name on purpose: an Anthropic client names a
     // Claude model, and the endpoint answers for the model that is served.
+    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
+    // before it answers: at 32 tokens the whole reply was spent on reasoning
+    // and the text block came back empty with `stop_reason: max_tokens`.
     let body = serde_json::json!({
         "model": "claude-sonnet-4-5",
-        "max_tokens": 32,
+        "max_tokens": 1024,
         "messages": [{"role": "user", "content": "Hello"}],
     });
     let reply = tokio::spawn(async move {
