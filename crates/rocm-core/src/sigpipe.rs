@@ -12,13 +12,19 @@
 //! the child exited, so code that writes to a child's stdin wraps the write in
 //! [`with_sigpipe_ignored`].
 
-/// Run `f` with SIGPIPE ignored, restoring the previous disposition afterwards.
+/// Run `f` with SIGPIPE ignored, putting the previous disposition back afterwards.
 ///
 /// A write that reaches a closed pipe inside `f` then returns an `EPIPE` error
 /// instead of delivering a signal. Where the disposition was already ignored
 /// (Rust's startup default) this changes nothing. The disposition is
 /// process-wide, so keep `f` to the write itself. Windows has no SIGPIPE and
 /// runs `f` as is.
+///
+/// The disposition is read and put back with `signal()`, which reports only the
+/// handler (`SIG_DFL`, `SIG_IGN` or a function address). One that was installed
+/// with `sigaction()` and carries flags or a signal mask would come back without
+/// them. That is not a case here: this process only ever sets `SIG_DFL` (`rocm`
+/// at startup) and `SIG_IGN` (this guard) for SIGPIPE.
 ///
 /// Guarded regions may overlap, on one thread or on several (the stderr
 /// forwarder of one engine request runs while another request writes to its
