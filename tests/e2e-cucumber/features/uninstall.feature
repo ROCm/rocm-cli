@@ -81,6 +81,82 @@ Feature: Uninstall
     And the uninstall reports that nothing would be removed
     And ROCm CLI has still not created its folders
 
+  # A dry run run by a person at a terminal ends by saying to run it again
+  # without `--dry-run`. It once said "Choose Review uninstall", a control the
+  # command line does not have. The promise is the line and the state together:
+  # the dry run removes nothing, and running the same command again, as the
+  # line says and answering its prompt, removes what was listed.
+  @id:uninstall-dry-run-at-a-terminal-says-to-run-it-again-to-remove @requires-os:linux
+  Scenario: uninstall-07 - At a terminal, a dry run removes nothing and running it again without --dry-run removes what it listed
+    Given the config folder holds the user's files
+    When the user dry-runs an uninstall of only the config at a terminal
+    Then the uninstall succeeds
+    And the dry run says to run it again without --dry-run
+    And the config folder still holds the user's files
+    When the user runs it again without --dry-run at a terminal and answers yes
+    Then the uninstall succeeds
+    And the config folder is gone
+
+  # A run whose stdin or stdout is not a terminal (a script, the dashboard's
+  # `/uninstall`, the daemon's `rocm_command` tool) has no one to tell to run it
+  # again: the real step belongs to whatever drives it. It lists what it would
+  # remove, offers no step, and removes nothing.
+  @id:uninstall-dry-run-outside-a-terminal-offers-no-next-step
+  Scenario: uninstall-08 - Outside a terminal, a dry run lists what it would remove and offers no step to remove it
+    Given the config folder holds the user's files
+    When the user dry-runs an uninstall of only the config
+    Then the uninstall succeeds
+    And the dry run lists the config folder
+    And the dry run offers no step to remove anything
+    And the config folder still holds the user's files
+
+  # With nothing to remove there is nothing to approve, so even a person at a
+  # terminal is offered no step. A config folder that is kept and still holds
+  # the user's files shows the "nothing to remove" is true.
+  @id:uninstall-dry-run-with-nothing-to-remove-offers-no-next-step @requires-os:linux
+  Scenario: uninstall-09 - At a terminal, a dry run with nothing to remove offers no step to remove it
+    Given the config folder holds the user's files
+    When the user dry-runs an uninstall that keeps everything at a terminal
+    Then the uninstall succeeds
+    And the uninstall reports that nothing would be removed
+    And the dry run offers no step to remove anything
+    And the config folder still holds the user's files
+
+  # `--force` is a natural guess for skipping the confirmation, and the nearest
+  # real flag by name is `--force-dev-binaries`, which removes the binaries of a
+  # development build. `--force` is refused with the flag to use instead, a near
+  # miss of it never suggests the destructive flag, and nothing is removed.
+  @id:uninstall-mistyped-force-is-not-answered-with-a-destructive-flag
+  Scenario: uninstall-10 - A mistyped --force is refused without pointing at the flag that removes development binaries
+    Given the config folder holds the user's files
+    When the user uninstalls the config with --force
+    Then the uninstall is refused and told to use --yes instead
+    And the config folder still holds the user's files
+    When the user uninstalls the config with a near miss of --force
+    Then the error does not point at the flag that removes development binaries
+    And the config folder still holds the user's files
+
+  @id:uninstall-help-shows-a-dry-run-before-the-real-run
+  Scenario: uninstall-11 - The uninstall help shows a dry run before the real run
+    When the user asks for the uninstall help
+    Then the help shows a dry run before the real run
+
+  # The assistant's uninstall preview (the `rocm_command` tool of the chat
+  # assistant and the dashboard, called here without a model through the hidden
+  # `rocm mcp-call`) renders the same plan as a dry run, but it has no flag to
+  # offer, so it says that removal needs approval. It is the one run here that
+  # cannot pass --keep-binaries: the preview takes no flags and removes nothing,
+  # and it is made without --allow-mutation, so a call that would remove
+  # something is refused.
+  @id:uninstall-assistant-preview-says-removal-needs-approval
+  Scenario: uninstall-12 - The assistant's uninstall preview lists what it would remove, says removal needs approval, and removes nothing
+    Given the config folder holds the user's files
+    When the assistant previews an uninstall
+    Then the preview succeeds
+    And the preview lists the config folder
+    And the preview says removal needs approval
+    And the config folder still holds the user's files
+
   # The `[y/N]` prompt is shared with `rocm fix` and the SDK-overwrite prompt;
   # `rocm uninstall` is the one that is cheap to isolate, so the shared helper's
   # behaviour is pinned here. A prompt is only reached on a real terminal (without
@@ -89,7 +165,7 @@ Feature: Uninstall
   # no sign it was not understood, and ending the input (Ctrl-D) left the
   # cancellation on the prompt line because no newline had been echoed.
   @id:uninstall-unrecognized-answer-is-declined-and-said-so @requires-os:linux
-  Scenario: uninstall-07 - An answer that is neither yes nor no is declined, and the user is told so
+  Scenario: uninstall-13 - An answer that is neither yes nor no is declined, and the user is told so
     Given the config folder holds the user's files
     When the user is asked to confirm an uninstall on a real terminal and types an answer that is neither yes nor no
     Then the user is told the answer was not understood and is treated as no
@@ -97,15 +173,15 @@ Feature: Uninstall
     And the config folder still holds the user's files
 
   @id:uninstall-end-of-input-cancels-on-a-fresh-line @requires-os:linux
-  Scenario: uninstall-08 - Ending the input at the confirmation prompt cancels on a fresh line
+  Scenario: uninstall-14 - Ending the input at the confirmation prompt cancels on a fresh line
     Given the config folder holds the user's files
     When the user is asked to confirm an uninstall on a real terminal and ends the input instead of answering
     Then the cancellation is reported on its own line, not on the prompt line
     And the config folder still holds the user's files
 
-  # The other side of uninstall-07: a deliberate no is not an error to explain.
+  # The other side of uninstall-13: a deliberate no is not an error to explain.
   @id:uninstall-plain-no-is-declined-without-complaint @requires-os:linux
-  Scenario: uninstall-09 - Answering no is declined without any complaint
+  Scenario: uninstall-15 - Answering no is declined without any complaint
     Given the config folder holds the user's files
     When the user is asked to confirm an uninstall on a real terminal and types no
     Then the uninstall is reported as cancelled

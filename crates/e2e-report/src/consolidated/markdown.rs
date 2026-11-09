@@ -393,6 +393,17 @@ mod tests {
             md.contains(expected),
             "summary explanation text changed:\n{md}"
         );
+        // The pin above would still pass if the paragraph hardcoded the words
+        // while a shared constant's value moved on; these tie the rendered text
+        // to the constants themselves.
+        assert!(
+            md.contains(MOCK_GATES_PR),
+            "summary must render MOCK_GATES_PR ({MOCK_GATES_PR:?}):\n{md}"
+        );
+        assert!(
+            md.contains(OTHER_LANES_NON_BLOCKING),
+            "summary must render OTHER_LANES_NON_BLOCKING ({OTHER_LANES_NON_BLOCKING:?}):\n{md}"
+        );
     }
 
     #[test]

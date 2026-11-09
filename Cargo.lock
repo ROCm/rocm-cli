@@ -1284,6 +1284,7 @@ dependencies = [
  "rocm-core",
  "serde",
  "serde_json",
+ "sha2",
  "shlex",
  "tempfile",
  "tokio",
@@ -3741,7 +3742,6 @@ dependencies = [
  "unicode-width",
  "ureq",
  "windows-native-keyring-store",
- "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
 ]
 
@@ -3780,7 +3780,6 @@ dependencies = [
  "bollard",
  "chrono",
  "csv",
- "regex",
  "reqwest 0.12.28",
  "rocm-core",
  "rocm-dash-core",
@@ -3937,7 +3936,6 @@ dependencies = [
  "sha2",
  "tokio",
  "ureq",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

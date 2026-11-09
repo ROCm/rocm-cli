@@ -18,10 +18,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, require_yes_or_interactive};
+use rocm_core::{AppPaths, interactive_terminal, require_yes_or_interactive};
 
 use crate::uninstall_plan::{
-    UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
+    PlanAudience, UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
     is_rocm_install_entry_name, remove_path, render_uninstall_plan,
 };
 
@@ -63,10 +63,31 @@ impl PathEdit {
     }
 }
 
+/// `rocm uninstall` has no `--force`; the flag is declared (hidden) only so this
+/// can answer it. Left undeclared, clap's nearest-name guess for `--force` is
+/// `--force-dev-binaries`, which removes development binaries, and a near miss
+/// such as `--forc` gets that same suggestion. Declared, those guesses land here
+/// instead, before anything is planned or removed.
+pub(crate) fn reject_force(force: bool) -> Result<()> {
+    if force {
+        bail!(
+            "`--force` is not an option of `rocm uninstall`; use `--yes` to skip the confirmation"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     let paths = AppPaths::discover()?;
     let plan = build_uninstall_plan(&paths, &options)?;
-    print!("{}", render_uninstall_plan(&plan, &options));
+    print!(
+        "{}",
+        render_uninstall_plan(
+            &plan,
+            &options,
+            PlanAudience::for_command(interactive_terminal())
+        )
+    );
 
     if plan_is_empty(&plan) || options.dry_run {
         return Ok(());
@@ -837,7 +858,8 @@ mod tests {
             self_delete: Some(PathBuf::from("/opt/bin/rocm.exe")),
             ..UninstallPlan::default()
         };
-        let output = render_uninstall_plan(&plan, &UninstallOptions::default());
+        let output =
+            render_uninstall_plan(&plan, &UninstallOptions::default(), PlanAudience::Captured);
         for expected in [
             "2 item(s) would be removed:",
             "  - install record: /opt/bin/.rocm-cli-path-edit",
