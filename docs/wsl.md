@@ -57,6 +57,16 @@ SHA-256 digest for each published ROCDXG release and checks the `.deb` against
 it; on a mismatch the plan stops before `apt install` runs the package's
 maintainer scripts as root. Nothing needs to be set for this.
 
+The check covers the exact file root installs. The `.deb` is downloaded without
+`sudo`, as whoever runs `rocm`, into a private `mktemp -d` directory, copied by
+root into `/var/cache/rocm-cli/rocdxg/` (which only root can write), checked
+there, then installed from there and removed. It is never staged under a fixed
+name in a shared directory such as `/tmp`, where another local user could
+replace it between the check and the install. A package that fails the check,
+or that `apt` fails to install, is left in that root-only directory; the next
+run for the same version replaces it, and `sudo rm -f
+/var/cache/rocm-cli/rocdxg/*.deb` clears what an abandoned version left.
+
 To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
 Because ROCm CLI has no digest for a release it predates, supply one:
 
@@ -81,7 +91,9 @@ unverified.
 
 The equivalent manual steps, for reference or for a host where the CLI is not
 installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
-the package's maintainer scripts as root. `rocm install driver` checks the
+the package's maintainer scripts as root, and run it on the root-owned copy
+rather than on a file in `/tmp` that another user could swap after it is
+checked. `rocm install driver` checks the
 download against a digest pinned in the ROCm CLI source
 (`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_plan/rocdxg.rs`), which also
 catches a replaced release asset. A digest read from the release page at
@@ -94,11 +106,17 @@ ROCDXG_VERSION=<version>
 ROCDXG_SHA256=<64-hex-sha256>
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
-curl -L -o "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" \
-  "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
-printf '%s  %s\n' "${ROCDXG_SHA256}" \
-  "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" | sha256sum -c -
-sudo apt install -y "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
+ROCDXG_DEB="rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
+ROCDXG_STAGED="/var/cache/rocm-cli/rocdxg/${ROCDXG_DEB}"
+sudo install -d -m 0755 -o root -g root /var/cache/rocm-cli /var/cache/rocm-cli/rocdxg
+d="$(mktemp -d)"
+curl -L --fail -o "$d/${ROCDXG_DEB}" \
+  "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/${ROCDXG_DEB}"
+sudo install -m 0644 "$d/${ROCDXG_DEB}" "${ROCDXG_STAGED}"
+rm -rf "$d"
+printf '%s  %s\n' "${ROCDXG_SHA256}" "${ROCDXG_STAGED}" | sha256sum -c -
+sudo apt install -y "${ROCDXG_STAGED}"
+sudo rm -f "${ROCDXG_STAGED}"
 sudo ldconfig
 ```
 

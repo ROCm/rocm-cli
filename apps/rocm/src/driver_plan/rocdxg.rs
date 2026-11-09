@@ -115,6 +115,20 @@ const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `concat!` takes only literals, so the parent path is a macro to let
+/// `ROCDXG_STAGING_DIR` be derived from it rather than repeat it.
+macro_rules! rocdxg_staging_parent {
+    () => {
+        "/var/cache/rocm-cli"
+    };
+}
+
+/// Root-only directory the ROCDXG package is placed in before it is verified
+/// and installed. `/var/cache` is writable only by root, so no other user can
+/// create, replace or redirect anything under it; see `wsl_rocdxg_driver_plan`.
+const ROCDXG_STAGING_PARENT: &str = rocdxg_staging_parent!();
+pub(super) const ROCDXG_STAGING_DIR: &str = concat!(rocdxg_staging_parent!(), "/rocdxg");
+
 /// Whether a resolved ROCDXG version is safe to place in the plan's commands.
 ///
 /// The driver plan is a list of shell lines run through `sh -c`, and the
@@ -143,8 +157,8 @@ fn sha256_digest_is_well_formed(digest: &str) -> bool {
 /// installed as root.
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum RocdxgVerification {
-    /// Check the download against this digest and abort the install on a
-    /// mismatch.
+    /// Check the root-placed copy against this digest and abort the install
+    /// on a mismatch.
     Digest(String),
     /// Install without checking, because the caller explicitly asked for it.
     OptedOut,
@@ -256,7 +270,17 @@ pub(crate) fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverI
     let sudo = escalation.prefix();
     let deb = format!("rocdxg-roct_{version}_amd64.deb");
     let url = format!("https://github.com/ROCm/librocdxg/releases/download/v{version}/{deb}");
-    let deb_path = format!("/tmp/{deb}");
+    // Where root installs the package from. Never a fixed name in a shared,
+    // world-writable directory such as `/tmp`: another local user could
+    // pre-create that file, let the genuine download land in it so it passes
+    // the digest check, then replace its contents before `apt-get install`
+    // reads it — and the maintainer scripts run as root. A directory only root
+    // can write closes that: once the file is in place, nothing but root can
+    // change it between the check and the install, so the bytes checked are
+    // the bytes installed. A fixed name is fine there for the same reason, and
+    // it lets each step below name the file without passing state between
+    // separate shell invocations.
+    let deb_path = format!("{ROCDXG_STAGING_DIR}/{deb}");
     // `version` is validated above and the digest is hex, so neither can carry
     // shell metacharacters; the quotes keep that guarantee local to the command
     // rather than resting on a check several functions away.
@@ -325,18 +349,46 @@ pub(crate) fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverI
                 DriverCommandPhase::Prepare,
                 &format!("{sudo}apt-get install -y ca-certificates curl"),
             ),
+            // Re-asserted on every run rather than trusted from a previous
+            // one: `install -d` also resets the owner and mode of a directory
+            // that already exists.
             driver_command(
                 DriverCommandPhase::Execute,
-                &format!("curl -L --fail --show-error --output '{deb_path}' '{url}'"),
+                &format!(
+                    "{sudo}install -d -m 0755 -o root -g root '{ROCDXG_STAGING_PARENT}' '{ROCDXG_STAGING_DIR}'"
+                ),
+            ),
+            // The download runs without `sudo` — with the privileges of
+            // whoever runs the plan, so as root only when the CLI itself is
+            // root — into a fresh `mktemp -d` directory (unpredictable name,
+            // mode 0700, removed on exit), never a shared location. Only a
+            // root `install` copies it into the root-only directory.
+            // One shell line because each plan step is its own `sh -c`, and the
+            // temporary directory's name exists only in this one.
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!(
+                    "d=\"$(mktemp -d)\" && trap 'rm -rf \"$d\"' EXIT && curl -L --fail --show-error --output \"$d/{deb}\" '{url}' && {sudo}install -m 0644 \"$d/{deb}\" '{deb_path}'"
+                ),
             ),
             // Authenticating the download is the whole trust anchor for this
             // plan: everything after it runs the package's maintainer scripts
             // as root. `sha256sum -c -` exits non-zero on a mismatch, which
-            // aborts the plan before the install step.
+            // aborts the plan before the install step. It checks the root-owned
+            // copy, not the download, so what passed is what root installs.
             verify_download,
             driver_command(
                 DriverCommandPhase::Execute,
                 &format!("{sudo}apt-get install -y '{deb_path}'"),
+            ),
+            // Reached only after a successful install: the executor stops at
+            // the first failing step, so a package rejected by the digest
+            // check or by `apt-get` stays in the root-only directory, out of
+            // reach of other users, until the next run of the same version
+            // replaces it (the file name carries the version).
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("{sudo}rm -f '{deb_path}'"),
             ),
             driver_command(DriverCommandPhase::Execute, &format!("{sudo}ldconfig")),
             driver_command(
@@ -386,8 +438,11 @@ mod tests {
     use crate::tests::test_paths;
     #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Stdio;
 
     #[test]
     fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
@@ -402,7 +457,9 @@ mod tests {
         // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
         assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
         assert!(commands.contains("rocdxg-roct_"));
-        assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
+        assert!(commands.contains(&format!(
+            "sudo apt-get install -y '{ROCDXG_STAGING_DIR}/rocdxg-roct_"
+        )));
         assert!(commands.contains("sudo ldconfig"));
 
         // And in that order. `ldconfig` refreshes the cache from what is on
@@ -416,7 +473,7 @@ mod tests {
         let steps = plan.execution_commands();
         let install = steps
             .iter()
-            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .position(|c| c.contains(&format!("apt-get install -y '{ROCDXG_STAGING_DIR}/")))
             .expect("plan installs the package");
         let publish = steps
             .iter()
@@ -512,9 +569,105 @@ mod tests {
             .expect("plan verifies the download");
         let install = commands
             .iter()
-            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .position(|c| c.contains(&format!("apt-get install -y '{ROCDXG_STAGING_DIR}/")))
             .expect("plan installs the package");
         assert!(check < install, "digest must be checked before install");
+    }
+
+    /// The single-quoted path `apt-get install -y` is handed in a ROCDXG plan.
+    fn rocdxg_installed_path(commands: &[String]) -> String {
+        let install = commands
+            .iter()
+            .find(|c| c.contains("apt-get install -y '") && c.contains("rocdxg-roct_"))
+            .expect("plan installs the package");
+        install
+            .split('\'')
+            .nth(1)
+            .expect("installed path is single-quoted")
+            .to_owned()
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_never_installs_from_a_path_another_user_can_write() {
+        // `apt-get install` runs the package's maintainer scripts as root, and
+        // the digest check is the only thing authenticating those bytes. If the
+        // file lives somewhere another local user can create or replace it —
+        // a fixed name in the world-writable `/tmp` — they can pre-create it,
+        // let the genuine download land in it and pass the check, then swap
+        // the contents before root installs it. So the file root installs must
+        // sit in a directory only root can write, and be the very file that
+        // was checked.
+        let _env = scoped_rocdxg_env();
+        for escalation in [PrivilegeEscalation::Sudo, PrivilegeEscalation::AlreadyRoot] {
+            let plan = wsl_rocdxg_driver_plan(escalation);
+            let commands = plan.execution_commands();
+            let joined = commands.join("\n");
+            assert!(
+                !joined.contains("/tmp/") && !joined.contains("/tmp'"),
+                "{escalation:?}: the plan stages the package in shared /tmp:\n{joined}"
+            );
+
+            let installed = rocdxg_installed_path(&commands);
+            let staging_dir = Path::new(&installed)
+                .parent()
+                .expect("installed path has a directory")
+                .display()
+                .to_string();
+            let sudo = escalation.prefix();
+
+            // The directory is (re)asserted root-only before anything is
+            // placed in it, by a privileged command.
+            let make_dir = commands
+                .iter()
+                .position(|c| {
+                    c.starts_with(&format!("{sudo}install -d -m 0755 -o root -g root "))
+                        && c.contains(&format!("'{staging_dir}'"))
+                })
+                .unwrap_or_else(|| panic!("{escalation:?}: no root-only staging dir:\n{joined}"));
+            // The download itself is unprivileged, into a private `mktemp -d`
+            // directory, and only a root `install` places it at the final path.
+            let stage = commands
+                .iter()
+                .position(|c| c.contains("curl "))
+                .expect("plan downloads the package");
+            assert!(
+                commands[stage].contains("mktemp -d")
+                    && !commands[stage].contains(&format!("--output '{installed}'"))
+                    && commands[stage].contains(&format!("{sudo}install -m 0644 "))
+                    && commands[stage].ends_with(&format!("'{installed}'")),
+                "{escalation:?}: download is not staged through a private dir:\n{}",
+                commands[stage]
+            );
+            // The digest is checked on the copy root will install, after it is
+            // in place, and before the install.
+            let check = commands
+                .iter()
+                .position(|c| c.contains("sha256sum -c -"))
+                .expect("plan verifies the download");
+            assert!(
+                commands[check].contains(&format!("'{installed}'")),
+                "{escalation:?}: the checked file is not the installed file:\n{joined}"
+            );
+            let install = commands
+                .iter()
+                .position(|c| c.contains("apt-get install -y '"))
+                .expect("plan installs the package");
+            assert!(
+                make_dir < stage && stage < check && check < install,
+                "{escalation:?}: steps out of order:\n{joined}"
+            );
+        }
+
+        // And the plan `--dry-run` shows the user is the same one.
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let rendered = render_driver_install_plan(&plan, false, true);
+        assert!(rendered.contains("dry_run: true"), "{rendered}");
+        assert!(rendered.contains("sha256sum -c -"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("apt-get install -y '{ROCDXG_STAGING_DIR}/")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/tmp/"), "{rendered}");
     }
 
     #[test]
@@ -668,7 +821,10 @@ mod tests {
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::AlreadyRoot);
         let joined = plan.execution_commands().join("\n");
         assert!(!joined.contains("sudo "), "{joined}");
-        assert!(joined.contains("apt-get install -y '/tmp/"), "{joined}");
+        assert!(
+            joined.contains(&format!("apt-get install -y '{ROCDXG_STAGING_DIR}/")),
+            "{joined}"
+        );
         // And it must not demand a binary it no longer uses.
         assert!(!joined.contains("command -v sudo"), "{joined}");
         assert!(
@@ -679,6 +835,23 @@ mod tests {
             "{:?}",
             plan.preflight_checks
         );
+    }
+
+    /// The SHA-256 of `path` as `sha256sum` prints it, so the ROCDXG tests
+    /// compare against the same tool the plan runs.
+    #[cfg(unix)]
+    fn sha256sum_of(path: &Path) -> String {
+        let out = std::process::Command::new("sha256sum")
+            .arg(path)
+            .output()
+            .expect("sha256sum runs");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .split_whitespace()
+            .next()
+            .expect("digest field")
+            .to_owned()
     }
 
     /// Runs the digest step the plan actually generates, rather than asserting
@@ -711,7 +884,7 @@ mod tests {
                 (*pinned_version == version.as_str()).then_some(*digest)
             })
             .expect("the default version is pinned");
-        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let deb_path = format!("{ROCDXG_STAGING_DIR}/rocdxg-roct_{version}_amd64.deb");
         let generated = plan
             .execution_commands()
             .into_iter()
@@ -731,20 +904,7 @@ mod tests {
         let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
         fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
 
-        let digest_of = |path: &Path| -> String {
-            let out = Command::new("sha256sum")
-                .arg(path)
-                .output()
-                .expect("sha256sum runs");
-            assert!(out.status.success());
-            String::from_utf8(out.stdout)
-                .expect("utf8")
-                .split_whitespace()
-                .next()
-                .expect("digest field")
-                .to_owned()
-        };
-        let good = digest_of(&payload);
+        let good = sha256sum_of(&payload);
 
         // The command under test is the generated one; the only edits are the
         // digest being checked and the path being checked, so a regression in
@@ -770,6 +930,208 @@ mod tests {
         );
         assert!(!step("deadbeef"), "a malformed digest must fail the step");
         assert!(!step(""), "an empty digest must fail the step");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Runs the plan's generated Execute steps, each as its own `sh -c` exactly
+    /// as `run_driver_shell_command` does, against stand-ins for `sudo`,
+    /// `curl`, `install`, `apt-get` and `ldconfig`.
+    ///
+    /// The private-staging step depends on shell state (the `mktemp -d` name)
+    /// never having to cross from one step to the next, which only executing
+    /// the steps separately can show. The `curl` stand-in refuses to run under
+    /// `sudo` and refuses any `--output` that is not in a 0700 directory
+    /// directly under `$TMPDIR`, and records that directory so the test can
+    /// check it is gone afterwards — so a plan that downloaded as root, or
+    /// straight into the staging directory, fails here. Only the root-only
+    /// staging path and the digest are redirected; every other byte of each
+    /// command is production's.
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rocdxg_generated_steps_install_exactly_the_verified_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(version, digest)| (*version == plan.repo_version_expr).then_some(*digest))
+            .expect("the default version is pinned");
+
+        let (root, _paths) = test_paths("wsl-rocdxg-staging");
+        let bin = root.join("bin");
+        let tmp = root.join("tmp");
+        let staging_parent = root.join("var-cache-rocm-cli");
+        let log = root.join("apt.log");
+        let download_dirs = root.join("download-dirs.log");
+        // While this file exists the `apt-get` stand-in fails the install.
+        let apt_fails = root.join("apt-fails");
+        let installed_copy = root.join("installed.deb");
+        let served = root.join("served.deb");
+        for dir in [&bin, &tmp] {
+            fs::create_dir_all(dir).expect("test dir");
+        }
+        let shim = |name: &str, body: &str| {
+            let path = bin.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shim");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+        };
+        // Not root here, so `sudo` just runs the command — marking it, so the
+        // `curl` stand-in can tell it was elevated — and `install` drops the
+        // ownership flags it could not honour; everything else is real.
+        shim("sudo", "ROCDXG_TEST_UNDER_SUDO=1 exec \"$@\"");
+        shim(
+            "install",
+            "args=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o|-g) shift 2 ;;\n    *) args=\"$args '$1'\"; shift ;;\n  esac\ndone\neval \"exec /usr/bin/install $args\"",
+        );
+        shim(
+            "curl",
+            &[
+                r#"[ -z "$ROCDXG_TEST_UNDER_SUDO" ] || { echo 'curl ran under sudo' >&2; exit 1; }"#,
+                "while [ $# -gt 0 ]; do",
+                r#"  if [ "$1" = --output ]; then"#,
+                r#"    d="$(dirname "$2")""#,
+                r#"    [ "$(dirname "$d")" = "$TMPDIR" ] || { echo "download not in a private directory: $2" >&2; exit 1; }"#,
+                r#"    [ "$(stat -c %a "$d")" = 700 ] || { echo "download directory is not 0700: $d" >&2; exit 1; }"#,
+                &format!(r#"    echo "$d" >> '{}'"#, download_dirs.display()),
+                &format!(r#"    cp '{}' "$2"; exit $?"#, served.display()),
+                "  fi",
+                "  shift",
+                "done",
+                "exit 1",
+            ]
+            .join("\n"),
+        );
+        shim(
+            "apt-get",
+            &format!(
+                "for last; do :; done\necho \"$last\" >> '{}'\n[ ! -e '{}' ] || exit 100\ncp \"$last\" '{}'",
+                log.display(),
+                apt_fails.display(),
+                installed_copy.display()
+            ),
+        );
+        shim("ldconfig", "exit 0");
+
+        let run_plan = |payload: &[u8], digest: &str| -> bool {
+            fs::write(&served, payload).expect("write payload");
+            let _ = fs::remove_file(&log);
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            plan.commands
+                .iter()
+                .filter(|c| c.phase == DriverCommandPhase::Execute)
+                .all(|c| {
+                    let command = c
+                        .command
+                        .replace(ROCDXG_STAGING_PARENT, &staging_parent.display().to_string())
+                        .replace(pinned, digest);
+                    Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .env("PATH", &path)
+                        .env("TMPDIR", &tmp)
+                        .stdin(Stdio::null())
+                        .output()
+                        .expect("sh runs")
+                        .status
+                        .success()
+                })
+        };
+        let genuine = b"genuine package\n";
+        let genuine_digest = {
+            let file = root.join("digest-input");
+            fs::write(&file, genuine).expect("write digest input");
+            sha256sum_of(&file)
+        };
+        assert!(
+            run_plan(genuine, &genuine_digest),
+            "a genuine package must install"
+        );
+        // The same substitution `run_plan` makes in each command.
+        let staging_dir = PathBuf::from(
+            ROCDXG_STAGING_DIR
+                .replace(ROCDXG_STAGING_PARENT, &staging_parent.display().to_string()),
+        );
+        let staged = staging_dir.join(format!("rocdxg-roct_{}_amd64.deb", plan.repo_version_expr));
+        assert_eq!(
+            fs::read_to_string(&log).expect("apt-get ran").trim(),
+            staged.display().to_string(),
+            "apt-get must install the staged copy"
+        );
+        assert_eq!(fs::read(&installed_copy).expect("installed"), genuine);
+        assert!(
+            !staged.exists(),
+            "the staged package is removed after install"
+        );
+        // Ownership needs root and is pinned as a string elsewhere; the mode
+        // is what `install -d -m 0755` sets here too.
+        for dir in [&staging_parent, &staging_dir] {
+            assert_eq!(
+                fs::metadata(dir).expect("staging dir").permissions().mode() & 0o777,
+                0o755,
+                "{} must be writable only by its owner",
+                dir.display()
+            );
+        }
+        let recorded = fs::read_to_string(&download_dirs).expect("curl ran");
+        let recorded: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one download, into a private directory: {recorded:?}"
+        );
+        assert!(
+            !Path::new(recorded[0]).exists(),
+            "the private download directory is removed"
+        );
+        assert_eq!(fs::read_dir(&tmp).expect("tmp").count(), 0);
+
+        // A download that does not match stops the plan before apt-get.
+        assert!(!run_plan(b"tampered\n", &genuine_digest));
+        assert!(
+            !log.exists(),
+            "apt-get must not run after a digest mismatch"
+        );
+        assert_eq!(fs::read_dir(&tmp).expect("tmp").count(), 0);
+        // The plan stops at the failing step, so the rejected package stays
+        // in the root-only directory; the next run replaces it.
+        assert_eq!(
+            fs::read(&staged).expect("a package the check rejected stays staged"),
+            b"tampered\n"
+        );
+
+        // The same holds when `apt-get` itself fails the install.
+        fs::write(&apt_fails, b"").expect("apt-get failure marker");
+        assert!(
+            !run_plan(genuine, &genuine_digest),
+            "an apt-get failure must fail the plan"
+        );
+        assert_eq!(
+            fs::read_to_string(&log).expect("apt-get ran").trim(),
+            staged.display().to_string()
+        );
+        assert_eq!(
+            fs::read(&staged).expect("a package apt-get rejected stays staged"),
+            genuine
+        );
+        assert_eq!(fs::read_dir(&tmp).expect("tmp").count(), 0);
+
+        // And the next run replaces what was left and cleans up after itself.
+        fs::remove_file(&apt_fails).expect("clear apt-get failure marker");
+        fs::write(&staged, b"left over\n").expect("leftover staged package");
+        let _ = fs::remove_file(&installed_copy);
+        assert!(
+            run_plan(genuine, &genuine_digest),
+            "a run after a failed one must install"
+        );
+        assert_eq!(fs::read(&installed_copy).expect("installed"), genuine);
+        assert!(!staged.exists());
 
         let _ = fs::remove_dir_all(&root);
     }

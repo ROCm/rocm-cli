@@ -15,6 +15,7 @@ Feature: Driver installation planning
     Then the driver plan is supported and mutating
     And the dry-run driver plan requires no approval and previews no execution
     And the driver plan verifies the download before installing it
+    And the driver plan installs only a package no other local user could have replaced
     And the driver plan does not direct the user to the removed WSL setup script
 
   @id:driver-install-wsl-review-requires-approval @requires-wsl

@@ -688,7 +688,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         verify_linux: None,
         notes: &[
             "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. `rocm install driver` prints the plan first so the URL and the package are reviewable before anything runs.",
-            "The download is checked against a digest pinned for that ROCDXG release. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
+            "The package is checked against a digest pinned for that ROCDXG release, on the copy root installs from a directory only root can write. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_WSL,
@@ -1421,6 +1421,22 @@ mod tests {
             .iter()
             .flat_map(|r| r.applies_on.iter().map(|p| (r.fix_id, p.os, p.class)))
             .collect()
+    }
+
+    #[test]
+    fn rocdxg_missing_note_says_the_checked_copy_is_the_installed_one() {
+        // Pins the wording only. That the plan really checks the copy root
+        // installs, from a directory only root can write, is proved by
+        // `wsl_rocdxg_generated_steps_install_exactly_the_verified_file` in
+        // `apps/rocm/src/driver_plan/rocdxg.rs`, which executes the generated
+        // steps.
+        let recipe = find_recipe("fix-wsl-3-rocdxg-missing").expect("recipe exists");
+        assert!(
+            recipe.notes.iter().any(|n| n.contains("digest")
+                && n.contains("on the copy root installs from a directory only root can write")),
+            "{:?}",
+            recipe.notes
+        );
     }
 
     // Ubuntu 26.04 gets the DKMS driver plan (`dkms_driver_plan_is_supported`),

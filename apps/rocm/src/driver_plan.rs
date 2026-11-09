@@ -1156,7 +1156,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use std::process::Command as ProcessCommand;
 
-    use super::rocdxg::scoped_rocdxg_env;
+    use super::rocdxg::{ROCDXG_STAGING_DIR, scoped_rocdxg_env};
     use super::*;
     use crate::tests::ScopedTestEnv;
 
@@ -3060,7 +3060,7 @@ VERSION_ID="41"
         // assertions below hold against a plan that installs nothing at all.
         // Only a real install plan carries this command.
         assert!(
-            rendered.contains("apt-get install -y '/tmp/"),
+            rendered.contains(&format!("apt-get install -y '{ROCDXG_STAGING_DIR}/")),
             "expected a real install plan, got:\n{rendered}"
         );
         assert!(rendered.contains("post_install_checks:"));
