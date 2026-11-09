@@ -63,7 +63,7 @@ cargo xtask check-architecture-doc
 
 It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
 does not link, and on a stale entry in the `EXEMPT` list in
-[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
@@ -763,12 +763,47 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview. A preview
-of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still
-need `uv`: it resolves the published package versions with `uv pip compile`, so
-on a clean host it can download the managed `uv` and create the data folder's
-`tools` folder, although it still prepares no Python. The "no `uv`, no `tools`
-folder" guarantee is therefore the canonical layout's only.
+a real install prepares. That scenario is a canonical-layout preview.
+
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
+to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+is the one step that chooses the `torch` and `torchvision` versions (the CLI
+picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
+previous install left) and, with none, stops before that step. It then prints
+what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
+would be asked about), marks `target`, `runtime_key`, `package_specs`, `command`
+and `manifest` as `not resolved by this preview`, and says why in a
+`resolution_note:` line and a progress line, in the voice of `python_note:`. It
+cannot say whether the published stack installs together either. A real install
+and `rocm update` still fetch `uv` as before, and a preview made after either
+has run is the complete plan. Scenario `runtime-28` checks the note against the
+state it left on a host with no `uv`: no managed-tools folder, no tool archive in
+its own cache folder (here the real detector, since no stand-in `uv` is named),
+no saved config, and no `torch` or `torchvision` version anywhere in the output.
+`runtime-27` is the other polarity: with a `uv` present (the recording stand-in,
+which answers `uv pip compile` with the fixture's four pins, drains its stdin
+under `FAKE_UV_DRAIN_STDIN`, and logs its arguments under `FAKE_UV_LOG`), the
+preview runs it exactly once, for the compile, and prints the resolved plan. The
+`therock-next` scenarios that print resolved package specs start from `And a uv
+is already installed`, which installs the managed `uv` into the scenario's data
+folder the way a real install would have.
+The decision is unit-tested on every platform, Windows included
+(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
+[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
+both layouts, a preview or an install, and a `uv` present or not), as are the
+plan's whole text and its key order against a resolved plan's
+(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
+`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
+`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
+real resolution against a served index and a stand-in `uv`, counting what each
+row looked for, acquired and ran. What no test reaches without the network is the
+real download a real install makes when no `uv` is installed, and that the public
+entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
+first is a network call, and the second is held only by the types (those entry
+points return a resolved plan and refuse the unresolved one) and by the lanes
+that install a ROCm 10 runtime for real.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -803,6 +838,9 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
+The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
+previews in this sense: they resolve with `uv` and can fetch it, and prepare a
+managed Python too.
 
 Then it verifies:
 

@@ -807,6 +807,11 @@ rocm install sdk --devel")]
         #[arg(long)]
         devel: bool,
         /// Resolve the install plan without changing files.
+        ///
+        /// Downloads no uv and prepares no Python. For ROCm 10 and newer on a
+        /// host with no uv installed, the plan marks the package versions it
+        /// would need uv to choose, and everything made from them, as not
+        /// resolved.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and

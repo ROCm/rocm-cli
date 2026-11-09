@@ -169,18 +169,25 @@ Expected result:
   plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
   interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
   resolves `3.12` itself and may pick a different Python 3.12 than the managed
-  one a real install prepares. This holds for the canonical layout. A preview
-  pinned to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) still needs
-  `uv` to resolve the package versions, so on a clean host it can download the
-  managed `uv` and create the `tools` folder, although it prepares no Python and
-  saves no Python path.
+  one a real install prepares. This holds for every layout. A preview pinned
+  to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) needs `uv` to choose
+  the `torch` and `torchvision` versions, so on a host with no `uv` installed it
+  stops before that step: the data folder still has no `tools` folder, a
+  `resolution_note:` line says why, and `target:`, `runtime_key:`,
+  `package_specs:`, `command:` and `manifest:` read `not resolved by this
+  preview`. Run the real install (or any command that fetches `uv`), then the
+  preview again, and it prints the complete plan; so does a preview with
+  `ROCM_CLI_UV_BINARY` naming a `uv`.
 - On the same host, with a wheel runtime registered whose manifest records no
   usable Python, `rocm update` (also `--json`, `--dry-run`, and the check the
   CLI runs at startup) still reports. The text report gives the runtime's
   verdict and a `python_note:` line saying an update would use `uv` to install
   the managed Python, which the check did not do. Afterwards the data folder has
-  no `tools` folder and the config folder has no `config.json`. `rocm update
-  --apply` on the same host does prepare the Python, since the install needs it.
+  no `tools` folder and the config folder has no `config.json`. That holds for a
+  canonical-layout runtime; for a ROCm 10 or newer runtime the check still
+  resolves the package versions with `uv` and can fetch the managed `uv` into the
+  data folder, though never a Python. `rocm update --apply` on the same host does
+  prepare the Python, since the install needs it.
 - With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
   `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
   (such as `3.13` for the canonical layout), on the same host the preview fails

@@ -212,9 +212,12 @@ pub const TELEMETRY_TOOL_NAMES: [&str; 4] = [
 // Python on PATH they report the Python a real update or install would prepare
 // (`update_check` runs `rocm update`, whose text report then carries a
 // `python_note:` line saying so), and only a real apply or install, which these
-// tools never run, prepares it. (A ROCm 10 or newer check or preview still
-// resolves package versions with `uv` and can fetch the managed `uv` into the
-// data folder, though never a Python.) The boundary type
+// tools never run, prepares it. `install_sdk_dry_run` fetches no `uv` either: a
+// ROCm 10 preview runs a `uv` that is already installed to resolve the package
+// versions and, with none, prints the lines that depend on them as not resolved,
+// so it creates no `tools` folder in the data folder. (`update_check` on a ROCm
+// 10 or newer runtime still resolves with `uv` and can fetch the managed `uv`
+// into the data folder, though never a Python.) The boundary type
 // (`SharedRocmToolExecutor`) is plain data — importing it does NOT pull
 // `rocm-core` into this crate; the `agent` module stays the sole `rig` namer.
 // ---------------------------------------------------------------------------
