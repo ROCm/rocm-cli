@@ -673,6 +673,7 @@ fn uninstall_case(
                 dry_run: true,
                 ..options
             },
+            crate::uninstall_plan::PlanAudience::Captured,
         );
         let planned: BTreeSet<PathBuf> = plan.actions.iter().map(|e| e.path.clone()).collect();
         prop_assert_eq!(&listed_in_render(&rendered), &planned, "{}", rendered);
