@@ -23,6 +23,16 @@ use std::path::{Path, PathBuf};
 /// The program the runner's entries are checked for.
 pub const PLANTED_TOOL: &str = "rocminfo";
 
+/// Whether `dir` would make [`PLANTED_TOOL`] resolve.
+///
+/// It holds a regular file of that name, as the shared `which` lookup in
+/// `rocm-core` requires. A directory called `rocminfo` does not, so it must not
+/// get its `PATH` entry dropped.
+#[must_use]
+pub fn dir_holds_tool(dir: &Path) -> bool {
+    dir.join(PLANTED_TOOL).is_file()
+}
+
 /// The entries of the planted `PATH`, in order: `fixture` exactly as written,
 /// then `fake_bin`, then each non-empty entry of `inherited` that holds no
 /// [`PLANTED_TOOL`].
@@ -142,5 +152,28 @@ mod tests {
                 abs("fake-bin")
             ]
         );
+    }
+
+    #[test]
+    fn a_directory_named_like_the_tool_does_not_hold_it_and_a_file_does() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let with_dir = scratch.path().join("with-dir");
+        let with_file = scratch.path().join("with-file");
+        std::fs::create_dir_all(with_dir.join(PLANTED_TOOL)).expect("plant a directory");
+        std::fs::create_dir_all(&with_file).expect("create the directory");
+        std::fs::write(with_file.join(PLANTED_TOOL), "").expect("plant a file");
+
+        assert!(!dir_holds_tool(&with_dir));
+        assert!(dir_holds_tool(&with_file));
+        // Through the planting itself: the entry with only a directory of that
+        // name is kept, the entry with a file is dropped.
+        let entries = planted_path_entries(
+            &[],
+            &abs("fake-bin"),
+            &joined(&[with_dir.clone(), with_file]),
+            &abs("harness"),
+            dir_holds_tool,
+        );
+        assert_eq!(entries, vec![abs("fake-bin"), with_dir]);
     }
 }

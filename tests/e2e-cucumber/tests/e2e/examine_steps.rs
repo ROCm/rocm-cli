@@ -2403,7 +2403,7 @@ fn set_planted_wsl_path(world: &mut E2eWorld, entries: &[PathBuf]) {
         &root.join("fake-bin"),
         &std::env::var_os("PATH").unwrap_or_default(),
         &std::env::current_dir().expect("the harness has a working directory"),
-        |dir| dir.join(e2e_cucumber::planted_path::PLANTED_TOOL).exists(),
+        e2e_cucumber::planted_path::dir_holds_tool,
     ))
     .expect("PATH entries cannot hold a separator");
     world.command_env.retain(|(key, _)| *key != "PATH");
