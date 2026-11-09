@@ -785,6 +785,28 @@ async fn force_remove_unqueryable(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user prunes every record whatever its age while its process cannot be queried")]
+async fn prune_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "prune", "--any-age", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI leaves the record alone and names the forced removal")]
+async fn prune_leaves_and_names_force(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&format!(
+            "{SERVICE_ID} is "
+        )) && combined.contains(&format!(
+            "process {UNQUERYABLE_PID} it recorded could not be queried - remove it with `rocm services remove {SERVICE_ID} --force --yes`"
+        )),
+        "{combined}"
+    );
+}
+
 #[when("the user force-removes that local server record")]
 async fn force_remove(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(

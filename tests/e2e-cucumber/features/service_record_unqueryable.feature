@@ -12,6 +12,10 @@ Feature: A local server record held by a process rocm cannot query
   # "cannot be queried" for the PIDs it lists; production builds never read it.
   # The records are planted as plain JSON, so no scenario needs a GPU.
   #
+  # `service-unqueryable-01` has no OS tag and the hook works on Windows too,
+  # but no CI job runs this feature on Windows: the Windows job does not run
+  # scenarios. It has run on Linux only.
+  #
   # A new feature file, as `service_record_cleanup.feature` explains for its
   # own: indexes must be sequential per file, and several open branches claim the
   # next ones in the files that exist.
@@ -24,6 +28,9 @@ Feature: A local server record held by a process rocm cannot query
     And every file belonging to that record is still there
     When the user removes that local server record while its process cannot be queried
     Then the CLI refuses the removal and names the forced removal
+    And every file belonging to that record is still there
+    When the user prunes every record whatever its age while its process cannot be queried
+    Then the CLI leaves the record alone and names the forced removal
     And every file belonging to that record is still there
     When the user force-removes that local server record while its process cannot be queried
     Then the CLI removes the record and says its process could not be queried

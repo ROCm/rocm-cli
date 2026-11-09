@@ -562,6 +562,18 @@ outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
 
+#### Windows host check
+
+The Windows-only parts of the stop (the `OpenProcess` failure codes, the
+creation-time token, the PID hold, `taskkill /T /F` and its exit codes, and the
+`System32` resolution) are executed by no CI job, and were not run on a Windows
+host when they were written. On a Windows host with a `--features
+rocm/e2e-test-hooks` debug build, run
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[1-8]"` and
+`-n "service-unqueryable-0"` with `ROCM_CLI_BINARY` set (`service-stop-07` and
+the Windows half of `service-stop-08` run only there; `service-unqueryable-02`
+is Linux-only), and record the result.
+
 #### A record that stays unverified
 
 If the server is gone but its recorded PID has been taken by a process this
@@ -581,7 +593,8 @@ possibly running, which is the safe direction: the record never reconciles to
    command says which process could not be queried and that, if it is still
    running, it keeps running, and it deletes the record, its log, its engine
    state and its endpoint key. The server can no longer be restarted afterwards.
-   `rocm services prune` has no `--force`: it leaves such a record alone.
+   `rocm services prune` has no `--force`: it leaves such a record alone and lists it
+   under `Left alone` with this exact command.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either

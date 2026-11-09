@@ -410,6 +410,24 @@ impl ProcessProbe {
 #[cfg(any(windows, test))]
 const ERROR_INVALID_PARAMETER: i32 = 87;
 
+/// Windows `STILL_ACTIVE`: the exit code `GetExitCodeProcess` reports for a
+/// process that has not exited.
+#[cfg(any(windows, test))]
+const STILL_ACTIVE: u32 = 259;
+
+/// What `GetExitCodeProcess` on a handle that opened says about the process:
+/// still active is running, any other exit code is gone, and a failed query is
+/// neither. Split out of the FFI, with the open-failure mapping above, so a test
+/// runs the whole decision on every host.
+#[cfg(any(windows, test))]
+pub(crate) const fn classify_exit_query(queried: bool, exit_code: u32) -> ProcessProbe {
+    match (queried, exit_code) {
+        (false, _) => ProcessProbe::Unqueryable,
+        (true, STILL_ACTIVE) => ProcessProbe::Running,
+        (true, _) => ProcessProbe::Gone,
+    }
+}
+
 /// What a failed `OpenProcess` says about the PID, from its `GetLastError` code.
 ///
 /// Only the code for "no such process" counts as gone. `ERROR_ACCESS_DENIED`
@@ -488,12 +506,7 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
     unsafe {
         CloseHandle(handle);
     }
-    match (queried, exit_code) {
-        (false, _) => ProcessProbe::Unqueryable,
-        // `STILL_ACTIVE`.
-        (true, 259) => ProcessProbe::Running,
-        (true, _) => ProcessProbe::Gone,
-    }
+    classify_exit_query(queried, exit_code)
 }
 
 /// Look at `pid`. `kill(pid, 0)` already tells a live process the caller may
@@ -1448,6 +1461,17 @@ mod tests {
                 "{code:?}"
             );
         }
+    }
+
+    /// An opened handle's exit code: still active is running, any other code is
+    /// gone, and a failed query (whatever the code it left behind) is neither.
+    #[test]
+    fn an_exit_code_query_is_running_gone_or_unqueryable() {
+        assert_eq!(classify_exit_query(true, 259), ProcessProbe::Running);
+        assert_eq!(classify_exit_query(true, 0), ProcessProbe::Gone);
+        assert_eq!(classify_exit_query(true, 1), ProcessProbe::Gone);
+        assert_eq!(classify_exit_query(false, 0), ProcessProbe::Unqueryable);
+        assert_eq!(classify_exit_query(false, 259), ProcessProbe::Unqueryable);
     }
 
     /// Off Windows, a PID that is running (including one the caller may not

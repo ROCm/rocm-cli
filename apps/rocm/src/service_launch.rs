@@ -476,6 +476,17 @@ fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord
         // the pid is unverifiable and nothing is signalled (`terminate_verified`
         // alone would "best-effort proceed"). A token that was captured is
         // verified by `terminate_verified` on both.
+        //
+        // The tradeoff on Windows, chosen deliberately: a child whose creation
+        // time could not be read at capture is not killed, so if `OpenProcess`
+        // failed for a child that is in fact alive (it is this account's own
+        // fresh child, so that is not expected), a failed launch leaves its
+        // engine running and the audit event says `unverified`. The alternative
+        // is a forced tree kill of a pid that may by now belong to another
+        // process, which cannot be undone. The spawn primitive returns only the
+        // pid and closes its handle, so a handle-based identity would mean
+        // changing it; that is not done here, and this path is not executed on
+        // Windows by any CI job.
         let outcome = if let Some(refusal) =
             launch_cleanup_refusal(record.engine_start_ticks, host_records_start_tokens())
         {

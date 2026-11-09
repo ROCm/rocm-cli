@@ -2051,7 +2051,7 @@ runs the real routine with the per-PID signal injected, and asserts the
 persisted record after the first stop and that a second stop signals nothing;
 `an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop` is the
 other direction. `service-stop-07`
-(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill:
+(`@requires-os:windows`, no GPU) is the live coverage of the Windows tree kill when it is run on a Windows host, which no CI job does:
 it records a PowerShell parent that has started a `ping` child, runs `rocm
 services stop --yes`, and asserts that both processes are gone together with the
 report (`Local server stopped`, `stopped processes: 1`) and the record (stopped,
@@ -2086,8 +2086,16 @@ repeats it against a bystander on Windows only and then stops that bystander
 with its true token. `service-stop-08` is the live version on every OS: it
 records a running process under a token no live process has, stops the server,
 and asserts that the process is still running and the record names no process.
-Neither Windows-only test nor the Windows half of `service-stop-08` ran where
-this was written; the Windows CI jobs are what exercise them. A stop that cannot
+None of the Windows-only paths has been executed on a Windows host for this
+change, and no CI job executes them: the Windows build-and-test job runs clippy,
+the build, the unit tests and the harness self-tests, not the `service-stop-*`
+or `service-unqueryable-*` scenarios. `service-stop-07` (`@requires-os:windows`)
+and the Windows half of `service-stop-08` can run only through the harness on a
+Windows host, which is a manual step (see "Windows host check" in
+[manual-testing.md](manual-testing.md)); on the Linux e2e jobs `-07` is skipped
+and `-08` runs its Linux half. The Windows unit tests (`#[cfg(windows)]`) run on
+the Windows unit-test job; they were written without a Windows host to run them
+on. A stop that cannot
 verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
 eq <pid>"` on Windows (`process_check_command`).
 Three further Windows paths of that stop are tested through injected functions
@@ -2154,13 +2162,24 @@ in [manual-testing.md](manual-testing.md); the unit tests
 `force_removes_a_record_held_by_an_unqueryable_process_and_says_so`,
 `a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal`,
 `force_is_refused_for_a_running_process_and_without_a_requested_stop` and
-`force_on_a_record_that_is_not_running_is_an_ordinary_removal` cover it with the
+`force_on_a_record_that_is_not_running_is_an_ordinary_removal`,
+`a_forced_removal_missing_yes_names_the_command_that_completes_it` and
+`prune_names_the_forced_removal_for_a_record_held_by_an_unqueryable_process` (prune
+lists the record with the command, and running that command clears it) cover it with the
 probe injected, and `service-unqueryable-01` and `-02` drive the stop, the
 refusal naming `--force`, and the forced removal through the real binary, with
 the `e2e-test-hooks` variable `ROCM_E2E_UNQUERYABLE_PIDS` making the listed PIDs
 read as unqueryable; `-02` is Linux-only because it starts a real process). What no
-test here reaches is the Windows API itself: the handle hold, the open-failure
-codes and a real `taskkill` failing run only on the Windows lane.
+test here reaches is the Windows API itself: the handle hold, the `OpenProcess`
+failure codes, `GetProcessTimes` and a real `taskkill` (its exit 128 included)
+are executed by no CI job and were not run on a Windows host. What was moved
+out of the FFI so that it is unit-tested on Linux and on the Windows unit-test
+job: the open-failure code mapping (`classify_open_failure`), the exit-code query
+mapping (`classify_exit_query`), the `taskkill` result and arguments
+(`classify_taskkill`, `taskkill_args`), the `System32` path building, the
+FILETIME join, and the deadline wait (a real child). The ordering of the hold,
+the identity read, the tree kill and the termination is tested through injected
+functions.
 
 The same unqueryable-process rule holds wherever a service's liveness decides
 something destructive. The deferred key cleanup and the reconciliation to

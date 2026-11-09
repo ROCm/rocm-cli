@@ -548,16 +548,25 @@ pub fn terminate_recorded_service_pids(
     stops
 }
 
-/// Whether `stop` is a recorded process that is confirmed gone: stopped, or a
-/// root that exited by itself ([`TerminationOutcome::ExitedBeforeTreeKill`]).
-/// The stopping process's own PID is not a service process and never counts.
+/// Whether `stop` vouches for what was under another recorded root: a recorded
+/// process this stop took down ([`Graceful`](TerminationOutcome::Graceful),
+/// [`Forced`](TerminationOutcome::Forced)), found already gone
+/// ([`AlreadyGone`](TerminationOutcome::AlreadyGone)), or a root that exited by
+/// itself ([`TerminationOutcome::ExitedBeforeTreeKill`]). Not
+/// [`IdentityMismatch`](TerminationOutcome::IdentityMismatch): it says a stranger
+/// holds that PID now, which is "gone" for that process but is no evidence about
+/// what was under a different root. The stopping process's own PID is not a
+/// service process and never counts.
 const fn recorded_process_is_gone(stop: RecordedPidStop) -> bool {
-    match stop.outcome {
-        RecordedPidOutcome::OwnProcess => false,
-        RecordedPidOutcome::Terminated(outcome) => {
-            outcome.stopped() || matches!(outcome, TerminationOutcome::ExitedBeforeTreeKill)
-        }
-    }
+    matches!(
+        stop.outcome,
+        RecordedPidOutcome::Terminated(
+            TerminationOutcome::Graceful
+                | TerminationOutcome::Forced
+                | TerminationOutcome::AlreadyGone
+                | TerminationOutcome::ExitedBeforeTreeKill
+        )
+    )
 }
 
 /// Turn each [`TerminationOutcome::ExitedBeforeTreeKill`] into
@@ -709,9 +718,15 @@ fn terminate_recorded_pid_with<Held>(
 ) -> TerminationOutcome {
     // Before anything reads the identity, and until the end of the call.
     let _hold = hold(identity);
-    if let Some(tree_kill) = tree_kill
-        && matches!(state_of(identity), IdentityState::Matches)
-    {
+    if let Some(tree_kill) = tree_kill {
+        // The identity read that decides about the tree kill also decides about
+        // the stop. A refusal here (gone, recycled, unverifiable) is the verdict:
+        // the root is not handed to `terminate`, which re-reads the identity and
+        // could find a process that was unverifiable a moment ago verifiable now,
+        // and then stop the root alone with the tree kill skipped.
+        if let Some(refusal) = refusal_before_signalling(state_of(identity)) {
+            return refusal;
+        }
         // Taken while the root is still alive: `taskkill /T` resolves children
         // through the live parent, so it cannot reach them once the root is gone.
         let tree = tree_kill(identity.pid);
@@ -859,12 +874,24 @@ fn wait_for_exit_code(
     }
 }
 
+/// The arguments that take `pid` and everything under it down: by PID, with its
+/// tree (`/T`), forced (`/F`). Split out so a test pins them on every host.
+#[cfg(any(windows, test))]
+fn taskkill_args(pid: u32) -> [String; 4] {
+    [
+        "/PID".to_owned(),
+        pid.to_string(),
+        "/T".to_owned(),
+        "/F".to_owned(),
+    ]
+}
+
 #[cfg(windows)]
 fn taskkill_tree(pid: u32) -> TreeKill {
     use std::process::{Command, Stdio};
     classify_taskkill(run_to_exit_code(
         Command::new(crate::windows_system_tool("taskkill.exe"))
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .args(taskkill_args(pid))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -1599,17 +1626,18 @@ mod tests {
 
             assert_eq!(
                 steps,
-                vec![
-                    Step::Hold(SUPERVISOR_PID),
-                    Step::Terminate(SUPERVISOR_PID),
-                    Step::Release
-                ],
-                "{state:?}: a stranger's process tree must not be taken"
+                vec![Step::Hold(SUPERVISOR_PID), Step::Release],
+                "{state:?}: a stranger's process tree must not be taken, and the root \
+                 is not handed to the termination, which would re-read the identity"
             );
+            let expected = match state {
+                IdentityState::Gone => TerminationOutcome::AlreadyGone,
+                IdentityState::Recycled => TerminationOutcome::IdentityMismatch,
+                _ => TerminationOutcome::Unverified,
+            };
             assert_eq!(
-                verdict,
-                TerminationOutcome::AlreadyGone,
-                "{state:?}: and the verdict is the termination's, unmapped"
+                verdict, expected,
+                "{state:?}: the initial refusal is the verdict"
             );
         }
     }
@@ -1740,11 +1768,8 @@ mod tests {
                     Step::Release,
                 ]
             } else {
-                vec![
-                    Step::Hold(SUPERVISOR_PID),
-                    Step::Terminate(SUPERVISOR_PID),
-                    Step::Release,
-                ]
+                // Refused on the initial read: not handed to the termination.
+                vec![Step::Hold(SUPERVISOR_PID), Step::Release]
             };
             assert_eq!(steps.into_inner(), expected_steps, "{row}: steps");
             assert_eq!(verdict.as_str(), label, "{row}: verdict");
@@ -1846,6 +1871,67 @@ mod tests {
             steps.contains(&Step::Terminate(SUPERVISOR_PID)),
             "the root is re-read by the termination: {steps:?}"
         );
+    }
+
+    /// The identity read that gates the tree kill is the one that decides the
+    /// stop. If it is unverifiable and a second read, inside the termination,
+    /// would find the process verifiable, the root must not be stopped alone with
+    /// the tree kill skipped: the initial refusal is the verdict and the
+    /// termination is never called.
+    #[test]
+    fn an_unverifiable_first_read_is_not_overtaken_by_a_verifiable_second_read() {
+        use std::cell::Cell;
+        let reads = Cell::new(0_u32);
+        let terminated = Cell::new(false);
+        let tree_killed = Cell::new(false);
+        let tree_kill = |_pid: u32| {
+            tree_killed.set(true);
+            TreeKill::Completed
+        };
+
+        let verdict = terminate_recorded_pid_with(
+            &ProcessIdentity::new(SUPERVISOR_PID, Some(7)),
+            Some(&tree_kill as &dyn Fn(u32) -> TreeKill),
+            |_| (),
+            |_| {
+                // Indeterminate the first time, matching from then on.
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    IdentityState::Indeterminate
+                } else {
+                    IdentityState::Matches
+                }
+            },
+            |_| {
+                terminated.set(true);
+                TerminationOutcome::Forced
+            },
+        );
+
+        assert_eq!(verdict, TerminationOutcome::Unverified);
+        assert!(!verdict.stopped());
+        assert!(!terminated.get(), "the root is not stopped alone");
+        assert!(!tree_killed.get());
+        assert_eq!(reads.get(), 1, "the initial read is the only one");
+    }
+
+    /// A sibling whose PID a stranger now holds ([`IdentityMismatch`]) says
+    /// nothing about what was under this root, so it does not corroborate it.
+    #[test]
+    fn an_identity_mismatch_sibling_does_not_corroborate_a_root_that_exited_alone() {
+        use TerminationOutcome::{ExitedBeforeTreeKill, IdentityMismatch};
+        let record = record_naming(SUPERVISOR_PID, None, Some(ENGINE_PID), None);
+
+        let verdicts = settled(
+            &record,
+            &[
+                (SUPERVISOR_PID, ExitedBeforeTreeKill),
+                (ENGINE_PID, IdentityMismatch),
+            ],
+        );
+
+        assert_eq!(verdicts, vec![ExitedBeforeTreeKill, IdentityMismatch]);
+        assert!(!verdicts[0].stopped());
     }
 
     /// What the record's processes say together about a root that exited by
@@ -2141,6 +2227,11 @@ mod tests {
             "the helper was killed, not left running"
         );
         assert_eq!(classify_taskkill(Err(error)), TreeKill::Failed);
+    }
+
+    #[test]
+    fn taskkill_is_asked_for_the_pid_its_tree_and_force() {
+        assert_eq!(taskkill_args(4242), ["/PID", "4242", "/T", "/F"]);
     }
 
     #[test]

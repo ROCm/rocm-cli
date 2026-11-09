@@ -170,12 +170,10 @@ fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result
 /// A recorded process that could not be queried (on Windows, a live one this
 /// process may not open) counts as running: deleting the record and its key on
 /// the strength of a failed look is the mistake this guard exists to prevent.
-fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
-    managed_service_record_is_in_use_with(record, rocm_core::probe_process)
-}
-
-/// [`managed_service_record_is_in_use`] with the read of each recorded PID
-/// supplied by the caller.
+///
+/// The read of each recorded PID is supplied by the caller, so a test drives an
+/// unqueryable process on every host; production passes
+/// [`rocm_core::probe_process`].
 fn managed_service_record_is_in_use_with(
     record: &ManagedServiceRecord,
     probe: impl Fn(u32) -> ProcessProbe,
@@ -297,10 +295,15 @@ pub(crate) fn remove_managed_service_record_with(
         }
     }
     if !yes {
-        bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+        // The command that completes this removal, not a neighbour of it: a
+        // forced removal that is missing `--yes` is told to add it, not to drop
+        // the `--force` it asked for.
+        let hint = if forced_over.is_some() {
+            service_hints::service_forced_remove_hint(service_id)
+        } else {
             service_hints::service_action_hint("remove", service_id)
-        );
+        };
+        bail!("Removing local server record `{service_id}` requires --yes.\n\nTry: {hint}");
     }
 
     let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
@@ -527,6 +530,7 @@ fn build_service_prune_plan(
     min_age: Duration,
     hours: u64,
     now: SystemTime,
+    probe: &impl Fn(u32) -> ProcessProbe,
 ) -> Result<ServicePrunePlan> {
     let mut plan = ServicePrunePlan::default();
     // Taken first, because `load_managed_services` below rewrites the manifest of
@@ -538,14 +542,28 @@ fn build_service_prune_plan(
     // the real processes before returning it, so liveness below is read from the
     // refreshed view, never from the manifest as it was on disk.
     for record in load_managed_services(paths)? {
-        if managed_service_record_is_in_use(&record) {
+        if managed_service_record_is_in_use_with(&record, probe) {
             plan.skipped_live += 1;
-            plan.skipped.push(format!(
-                "{} is {} - stop it first with `{}`",
-                record.service_id,
-                record.status,
-                service_hints::service_stop_hint(&record.service_id)
-            ));
+            // A record held only by a process `rocm` cannot query, after a stop
+            // was requested, is the one `remove --force` exists for: say so and
+            // name it, instead of advising a stop that can only report the same
+            // thing again. `prune` itself never forces.
+            let skipped = match forceable_unqueryable_pids(&record, probe) {
+                Some(pids) => format!(
+                    "{} is {} and {} it recorded could not be queried - remove it with `{}`",
+                    record.service_id,
+                    record.status,
+                    named_processes(&pids),
+                    service_hints::service_forced_remove_hint(&record.service_id)
+                ),
+                None => format!(
+                    "{} is {} - stop it first with `{}`",
+                    record.service_id,
+                    record.status,
+                    service_hints::service_stop_hint(&record.service_id)
+                ),
+            };
+            plan.skipped.push(skipped);
             continue;
         }
         let artifacts = match service_record_artifacts(paths, &record.service_id, &record.engine) {
@@ -690,10 +708,22 @@ pub(crate) struct ServicePruneOutcome {
 /// was built. That window is the only reason the liveness re-check below exists,
 /// and no test driving `prune` end to end can open it: one call builds the plan
 /// and applies it, so a record is either live for both halves or dead for both.
+#[cfg(test)]
 fn apply_service_prune_plan(
     paths: &AppPaths,
     plan: &ServicePrunePlan,
     outcome: &mut ServicePruneOutcome,
+) {
+    apply_service_prune_plan_with(paths, plan, outcome, &rocm_core::probe_process);
+}
+
+/// [`apply_service_prune_plan`] with the read of each recorded PID supplied by
+/// the caller.
+fn apply_service_prune_plan_with(
+    paths: &AppPaths,
+    plan: &ServicePrunePlan,
+    outcome: &mut ServicePruneOutcome,
+    probe: &impl Fn(u32) -> ProcessProbe,
 ) {
     for entry in &plan.remove {
         // Liveness was snapshotted while the plan was built. A
@@ -703,7 +733,7 @@ fn apply_service_prune_plan(
         // `remove` narrows the same window by loading the record it deletes.
         // Neither closes it: the check and the delete are not atomic either way.
         if load_managed_service(paths, &entry.service_id)
-            .is_ok_and(|record| managed_service_record_is_in_use(&record))
+            .is_ok_and(|record| managed_service_record_is_in_use_with(&record, probe))
         {
             outcome.skipped_live += 1;
             let _ = writeln!(
@@ -830,6 +860,18 @@ pub(crate) fn prune_managed_service_records(
     dry_run: bool,
     yes: bool,
 ) -> Result<ServicePruneOutcome> {
+    prune_managed_service_records_with(paths, hours, dry_run, yes, &rocm_core::probe_process)
+}
+
+/// [`prune_managed_service_records`] with the read of each recorded PID supplied
+/// by the caller.
+fn prune_managed_service_records_with(
+    paths: &AppPaths,
+    hours: u64,
+    dry_run: bool,
+    yes: bool,
+    probe: &impl Fn(u32) -> ProcessProbe,
+) -> Result<ServicePruneOutcome> {
     if !dry_run && !yes {
         bail!(
             "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
@@ -853,7 +895,7 @@ pub(crate) fn prune_managed_service_records(
         rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?
     };
     let min_age = Duration::from_secs(hours.saturating_mul(3600));
-    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
+    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now(), probe)?;
     let mut outcome = ServicePruneOutcome {
         text: render_service_prune_plan(&plan, hours, dry_run),
         skipped_live: plan.skipped_live,
@@ -864,7 +906,7 @@ pub(crate) fn prune_managed_service_records(
         return Ok(outcome);
     }
 
-    apply_service_prune_plan(paths, &plan, &mut outcome);
+    apply_service_prune_plan_with(paths, &plan, &mut outcome, probe);
 
     let _ = writeln!(outcome.text);
     let _ = write!(
@@ -2137,6 +2179,93 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(left, 3, "nothing was removed");
+        Ok(())
+    }
+
+    /// A forced removal that is missing `--yes` is told to add `--yes`, not to
+    /// drop the `--force` it asked for: the command it names completes the
+    /// removal, which is asserted by running it.
+    #[test]
+    fn a_forced_removal_missing_yes_names_the_command_that_completes_it() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-needs-yes");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let unqueryable = |_: u32| ProcessProbe::Unqueryable;
+
+        let error =
+            remove_managed_service_record_with(&paths, "svc-held", false, true, unqueryable)
+                .map(|removed| removed.text)
+                .expect_err("a forced removal without --yes is refused");
+        let message = format!("{error:#}");
+        let left_before = files_left(&paths, "svc-held");
+        // The named command, run as named, removes the record.
+        let named = service_hints::service_forced_remove_hint("svc-held");
+        let completed =
+            remove_managed_service_record_with(&paths, "svc-held", true, true, unqueryable)?;
+        let left_after = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(message.contains("requires --yes"), "{message}");
+        assert!(message.contains(&format!("Try: {named}")), "{message}");
+        assert_eq!(left_before, 3, "the refusal removed nothing");
+        assert!(completed.forced);
+        assert_eq!(left_after, 0, "the command it named cleared the record");
+        // An ordinary removal still names the plain command.
+        let plain = service_hints::service_action_hint("remove", "svc-held");
+        assert!(
+            !named.eq(&plain) && named.contains("--force"),
+            "{named} / {plain}"
+        );
+        Ok(())
+    }
+
+    /// `prune` never forces, and says what does: a record held only by an
+    /// unqueryable process, after a stop was requested, is reported with the
+    /// exact `remove --force --yes` command, and that command, run, clears the
+    /// record. A record with a process confirmed running keeps the stop advice.
+    #[test]
+    fn prune_names_the_forced_removal_for_a_record_held_by_an_unqueryable_process() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-names-force");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let unqueryable = |_: u32| ProcessProbe::Unqueryable;
+
+        let outcome = prune_managed_service_records_with(&paths, 0, false, true, &unqueryable)?;
+        let left_after_prune = files_left(&paths, "svc-held");
+        let named = service_hints::service_forced_remove_hint("svc-held");
+        // Run exactly what prune named.
+        let removed =
+            remove_managed_service_record_with(&paths, "svc-held", true, true, unqueryable)?;
+        let left_after_named = files_left(&paths, "svc-held");
+
+        held_record(&paths, "svc-running", true)?;
+        let running =
+            prune_managed_service_records_with(&paths, 0, true, false, &|_| ProcessProbe::Running)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.text.contains(&format!(
+                "svc-held is starting and process {} it recorded could not be queried - remove it with `{named}`",
+                std::process::id()
+            )),
+            "{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0, "prune itself never forces");
+        assert_eq!(left_after_prune, 3, "and left every file alone");
+        assert!(removed.forced);
+        assert_eq!(
+            left_after_named, 0,
+            "the command prune named clears the record"
+        );
+        assert!(
+            running.text.contains(
+                "svc-running is starting - stop it first with `rocm services stop svc-running --yes`"
+            ),
+            "{}",
+            running.text
+        );
+        assert!(!running.text.contains("--force"), "{}", running.text);
         Ok(())
     }
 }

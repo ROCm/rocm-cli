@@ -1331,7 +1331,8 @@ open): `remove` and `prune` refuse such a record until that process is gone.
 removes the record when a stop was requested, no recorded process is confirmed
 running, and at least one could not be queried, says which one, and never
 removes a record whose process `rocm` can see running. `prune` has no
-`--force`. `docs/manual-testing.md` walks through it.
+`--force`, but when it leaves such a record alone it lists it with the exact
+`remove --force --yes` command. `docs/manual-testing.md` walks through it.
 
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is

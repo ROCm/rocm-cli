@@ -1193,8 +1193,10 @@ pub(crate) enum ServicesCommand {
     },
     /// Delete local server records that are no longer running.
     ///
-    /// Running servers are always left alone. Leftover files whose record is
-    /// already gone are cleaned up too.
+    /// Running servers are always left alone; a record held only by a process
+    /// `rocm` cannot query (on Windows) is listed with the `remove --force`
+    /// command that clears it. Leftover files whose record is already gone are
+    /// cleaned up too.
     ///
     /// Waits for a managed launch already under way to publish its record
     /// before reading the directory, and waits as long as that launch takes.
