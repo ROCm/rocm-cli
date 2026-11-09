@@ -374,6 +374,67 @@ struct ServerState {
     /// `Some` only when started via [`MockServer::start_with_chat_script`]; the
     /// replies to hand out, in request order. `None` keeps the fixed stub reply.
     chat_script: Option<Arc<Vec<Value>>>,
+    /// `Some` only when started via [`MockServer::start_with_tool_call`]; makes
+    /// the chat route answer one user turn with a tool call instead of text.
+    tool_call: Option<Arc<ScriptedToolCall>>,
+}
+
+/// A tool call the mock model makes in reply to a user turn containing
+/// `trigger` (case-insensitive). Once the client answers with the tool's
+/// result, the mock goes back to its canned text reply, so the client's tool
+/// loop ends after one round.
+///
+/// Keyed on the user's words rather than on the request's position (as
+/// [`MockServer::start_with_chat_script`] is) because an interactive chat
+/// sends other completions first — the local-endpoint detection probe — and
+/// their number is not this harness's to fix.
+#[derive(Debug)]
+struct ScriptedToolCall {
+    trigger: String,
+    name: String,
+    arguments: Value,
+}
+
+impl ScriptedToolCall {
+    /// Whether `body`'s newest message is a user turn asking for this call.
+    fn fires_for(&self, body: &Value) -> bool {
+        let Some(last) = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.last())
+        else {
+            return false;
+        };
+        last.get("role").and_then(Value::as_str) == Some("user")
+            && chat_message_text(last.get("content").unwrap_or(&Value::Null))
+                .to_lowercase()
+                .contains(&self.trigger)
+    }
+}
+
+/// The text of one OpenAI-format message `content`.
+///
+/// A bare string, or an array of typed parts whose `text` fields are joined.
+/// `content` is a bare string on the turns the TUI builds, but an array of
+/// typed parts on the system message the chat client emits — read both, or
+/// text looks absent when it is simply wrapped.
+#[must_use]
+pub fn chat_message_text(content: &Value) -> String {
+    content.as_str().map_or_else(
+        || {
+            content
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        },
+        str::to_owned,
+    )
 }
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
@@ -478,6 +539,7 @@ impl MockServer {
             chat_paths: Arc::clone(&chat_paths),
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
+            tool_call: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -522,6 +584,7 @@ impl MockServer {
             chat_paths: Arc::clone(&chat_paths),
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
+            tool_call: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -565,7 +628,38 @@ impl MockServer {
             .failure_count()
     }
 
+    /// Like [`Self::start`], but a user turn containing `trigger`
+    /// (case-insensitive) is answered with one call to the tool `name` with
+    /// `arguments`, as a model using the client's tools would. The client's
+    /// follow-up request carries the tool's result; it gets the canned text
+    /// reply, so the scenario can assert on what the client reported back.
+    pub async fn start_with_tool_call(
+        model_name: &str,
+        trigger: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Self {
+        Self::spawn_with(
+            model_name,
+            false,
+            Some(Arc::new(ScriptedToolCall {
+                trigger: trigger.to_lowercase(),
+                name: name.to_string(),
+                arguments,
+            })),
+        )
+        .await
+    }
+
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
+        Self::spawn_with(model_name, with_metrics, None).await
+    }
+
+    async fn spawn_with(
+        model_name: &str,
+        with_metrics: bool,
+        tool_call: Option<Arc<ScriptedToolCall>>,
+    ) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
         let completion_requests = Arc::new(Mutex::new(Vec::new()));
@@ -577,6 +671,7 @@ impl MockServer {
             chat_paths: Arc::clone(&chat_paths),
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
+            tool_call,
         };
 
         let mut app = Router::new()
@@ -624,6 +719,7 @@ impl MockServer {
             chat_paths: Arc::clone(&chat_paths),
             completion_requests: Arc::clone(&completion_requests),
             chat_script: Some(Arc::new(script)),
+            tool_call: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -1021,6 +1117,12 @@ async fn handle_chat(
         .unwrap_or("<missing>")
         .to_string();
 
+    let tool_call_reply = state
+        .tool_call
+        .as_ref()
+        .filter(|tool_call| tool_call.fires_for(&body))
+        .map(|tool_call| chat_tool_call_reply(&model, &tool_call.name, &tool_call.arguments));
+
     // Record the request body so scenarios can assert on exactly what the CLI
     // sent (see `MockServer::last_chat_request` / `wait_for_chat_request`) —
     // the canned reply below never varies with the prompt, so without this a
@@ -1059,6 +1161,10 @@ async fn handle_chat(
             },
             |reply| (StatusCode::OK, Json(reply.clone())),
         );
+    }
+
+    if let Some(reply) = tool_call_reply {
+        return (StatusCode::OK, Json(reply));
     }
 
     // Tests assert on the request contract, not the reply text, so the default
@@ -1237,6 +1343,48 @@ mod chat_script_tests {
             serde_json::from_str(call["arguments"].as_str().expect("arguments not a string"))
                 .expect("arguments not JSON");
         assert_eq!(arguments["request"], "serve a model");
+    }
+
+    #[tokio::test]
+    async fn a_scripted_tool_call_answers_only_the_triggering_user_turn() {
+        let mock = MockServer::start_with_tool_call(
+            "m",
+            "Start A Server",
+            "launch_server",
+            json!({"model": "shown/model"}),
+        )
+        .await;
+
+        // An unrelated turn gets the canned text, not the tool call.
+        let (_, body) = post_chat(&mock, "hello").await;
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+
+        // The trigger matches case-insensitively and yields the scripted call.
+        let (_, body) = post_chat(&mock, "please start a server now").await;
+        let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "launch_server");
+        let arguments: Value =
+            serde_json::from_str(call["arguments"].as_str().expect("arguments not a string"))
+                .expect("arguments not JSON");
+        assert_eq!(arguments, json!({"model": "shown/model"}));
+
+        // The follow-up carrying the tool's result ends the loop with text,
+        // even though the triggering user turn is still in the history.
+        let response = client()
+            .post(format!("{}/chat/completions", mock.base_url()))
+            .json(&json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "please start a server now"},
+                    {"role": "tool", "content": "refused"}
+                ]
+            }))
+            .send()
+            .await
+            .expect("chat request failed");
+        let body: Value = response.json().await.expect("non-JSON chat reply");
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+        assert!(!reply_text(&body).is_empty());
     }
 
     #[tokio::test]

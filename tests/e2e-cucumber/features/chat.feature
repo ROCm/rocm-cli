@@ -185,3 +185,21 @@ Feature: Chat and endpoint detection
     When the user asks the CLI to plan a vague request
     Then the planning assistant was asked exactly once
     And the CLI plans the request itself and says the planning assistant's plan "must request managed serving with --managed"
+
+  # The approval card is the user's only say over what an assistant tool call
+  # does, so the card and the command its approval runs must be the same one.
+  # A tool call carrying a second set of arguments nested inside the first is
+  # ambiguous about which it means: it is refused before any card is shown,
+  # and the model is told why, instead of showing one command and running the
+  # other.
+  @id:chat-ambiguous-tool-call-refused-before-approval @requires-os:linux
+  Scenario: chat-17 - A tool call carrying two sets of arguments is refused before any approval prompt
+    Given a running managed model answers a request to start a server with a tool call carrying two sets of arguments
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user accepts the local endpoint
+    And the user asks the managed model to start a model server
+    Then the model is told the tool call was refused
+    And no tool approval prompt is displayed
+    When the user quits interactive chat
+    Then interactive chat exits successfully

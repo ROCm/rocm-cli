@@ -170,6 +170,15 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
     if !call.arguments.is_object() {
         bail!("ROCm tool `{}` arguments must be a JSON object", call.name);
     }
+    // No ROCm tool takes a parameter called `arguments`. A call that carries
+    // one holds a second payload next to the first, and the approval card and
+    // the command it approves must never be able to read different ones.
+    if call.arguments.get("arguments").is_some() {
+        bail!(
+            "ROCm tool `{}` arguments must not contain a nested `arguments` field",
+            call.name
+        );
+    }
     reject_control_characters_in_tool_arguments(&call.name, &call.arguments)?;
     match call.name.as_str() {
         "examine"
@@ -1108,6 +1117,49 @@ mod tests {
             id: Some("test".to_owned()),
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({ "args": args }),
+        }
+    }
+
+    #[test]
+    fn validate_chat_tool_call_refuses_a_nested_arguments_field_for_every_tool() {
+        // Every name `validate_chat_tool_call` accepts (its first `match`
+        // arm), so a future change that scoped the nested-`arguments` refusal
+        // to only some tools would be caught here for all of them, not just
+        // the mutating ones.
+        for name in [
+            "examine",
+            "doctor",
+            "bridge_snapshot",
+            "gpu_snapshot",
+            "engines",
+            "services",
+            "service_logs",
+            "automations",
+            "natural_language_plan",
+            "path_exists",
+            "port_status",
+            "rocm_command",
+            "update_check",
+            "install_sdk_dry_run",
+            "install_sdk",
+            "install_engine",
+            "launch_server",
+            "stop_server",
+            "watcher_enable",
+            "watcher_disable",
+            "proposal_action",
+        ] {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: name.to_owned(),
+                arguments: serde_json::json!({ "arguments": {} }),
+            };
+            let err = validate_chat_tool_call(&call)
+                .expect_err("a nested arguments field must be refused");
+            assert!(
+                err.to_string().contains("nested `arguments`"),
+                "`{name}`: unexpected error: {err}"
+            );
         }
     }
 

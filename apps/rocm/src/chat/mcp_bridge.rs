@@ -142,13 +142,8 @@ pub(crate) fn run_internal_mcp_call(
     arguments: serde_json::Value,
     allow_mutation: bool,
 ) -> Result<serde_json::Value> {
-    let arguments = internal_mcp_arguments(arguments);
-    let call = providers::ChatToolCall {
-        id: None,
-        name: name.to_owned(),
-        arguments: serde_json::Value::Object(arguments.clone()),
-    };
-    validate_chat_tool_call(&call)?;
+    let call = internal_mcp_tool_call(name, arguments)?;
+    let arguments = call.arguments.as_object().cloned().unwrap_or_default();
     if !chat_tool_call_is_read_only(&call) && !allow_mutation {
         bail!(
             "MCP tool `{name}` changes local ROCm state; rerun `rocm mcp-call {name}` with --allow-mutation only after explicit user approval"
@@ -389,14 +384,56 @@ pub(crate) fn run_internal_mcp_call(
     }
 }
 
-fn internal_mcp_arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    if let Some(arguments) = value
+/// The validated tool call `run_internal_mcp_call` executes for `arguments`.
+///
+/// `arguments` is used exactly as given: it is the object the dash approval
+/// card was rendered from (`dash_seam::BinToolExecutor`), so validating and
+/// running anything else — such as an object nested inside it — would run a
+/// command the user never saw. `validate_chat_tool_call` refuses a nested
+/// `arguments` key outright, so no such object reaches either side.
+pub(crate) fn internal_mcp_tool_call(
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<providers::ChatToolCall> {
+    let call = providers::ChatToolCall {
+        id: None,
+        name: name.to_owned(),
+        arguments,
+    };
+    validate_chat_tool_call(&call)?;
+    Ok(call)
+}
+
+/// The tool arguments for `rocm mcp-call <name> --arguments-json <json>`.
+///
+/// Besides a bare arguments object, the hidden command accepts a pasted MCP
+/// `tools/call` params envelope — `{"name": ..., "arguments": {...}}` — and
+/// unwraps it here, at the CLI boundary, where the JSON is the operator's own.
+/// Only a pure envelope is unwrapped: an object that mixes tool fields with an
+/// `arguments` key is passed through whole, so validation refuses it rather
+/// than silently picking one of the two payloads.
+pub(crate) fn mcp_call_cli_arguments(
+    name: &str,
+    value: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let Some(object) = value.as_object() else {
+        return Ok(value);
+    };
+    let is_envelope = object
         .get("arguments")
-        .and_then(serde_json::Value::as_object)
-    {
-        return arguments.clone();
+        .is_some_and(serde_json::Value::is_object)
+        && object.keys().all(|key| key == "name" || key == "arguments");
+    if !is_envelope {
+        return Ok(value);
     }
-    value.as_object().cloned().unwrap_or_default()
+    if let Some(envelope_name) = object.get("name")
+        && envelope_name.as_str() != Some(name)
+    {
+        bail!(
+            "arguments JSON names tool {envelope_name}, but `rocm mcp-call` was asked to run `{name}`"
+        );
+    }
+    Ok(object["arguments"].clone())
 }
 
 fn internal_mcp_tool_success(text: String, structured: serde_json::Value) -> serde_json::Value {
@@ -736,8 +773,11 @@ pub(super) fn run_chat_read_only_tool(
             ))
         }
         "install_sdk_dry_run" => {
-            let arguments = internal_mcp_arguments(call.arguments.clone());
-            let args = internal_mcp_install_sdk_args(&arguments, true)?;
+            let arguments = call
+                .arguments
+                .as_object()
+                .context("install_sdk_dry_run arguments must be a JSON object")?;
+            let args = internal_mcp_install_sdk_args(arguments, true)?;
             let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
             Ok(internal_mcp_tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
@@ -866,6 +906,68 @@ mod tests {
     use crate::tests::test_paths;
     use std::fs;
     use std::net::TcpListener;
+
+    #[test]
+    fn mcp_call_cli_unwraps_only_a_pure_params_envelope() {
+        // A pasted `tools/call` params object is unwrapped to its arguments.
+        assert_eq!(
+            mcp_call_cli_arguments(
+                "stop_server",
+                serde_json::json!({
+                    "name": "stop_server",
+                    "arguments": { "service_id": "svc-1" },
+                }),
+            )
+            .expect("envelope unwraps"),
+            serde_json::json!({ "service_id": "svc-1" })
+        );
+        assert_eq!(
+            mcp_call_cli_arguments(
+                "stop_server",
+                serde_json::json!({ "arguments": { "service_id": "svc-1" } }),
+            )
+            .expect("envelope without a name unwraps"),
+            serde_json::json!({ "service_id": "svc-1" })
+        );
+        // A bare arguments object passes through untouched.
+        let bare = serde_json::json!({ "service_id": "svc-1" });
+        assert_eq!(
+            mcp_call_cli_arguments("stop_server", bare.clone()).expect("bare passes"),
+            bare
+        );
+        // An envelope naming a different tool is refused rather than run as
+        // the tool on the command line.
+        assert!(
+            mcp_call_cli_arguments(
+                "stop_server",
+                serde_json::json!({
+                    "name": "launch_server",
+                    "arguments": { "service_id": "svc-1" },
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_call_refuses_tool_fields_mixed_with_a_nested_arguments_object() {
+        // Mixed objects are not an envelope: they reach validation whole, and
+        // validation refuses them instead of choosing one of the two payloads.
+        let mixed = serde_json::json!({
+            "service_id": "shown-service",
+            "arguments": { "service_id": "other-service" },
+        });
+        let passed = mcp_call_cli_arguments("stop_server", mixed.clone()).expect("passes through");
+        assert_eq!(passed, mixed);
+        let (root, paths) = test_paths("mcp-call-nested-arguments");
+        let err = run_internal_mcp_call(&paths, "stop_server", passed, true)
+            .expect_err("a nested arguments object must be refused before running");
+        assert!(
+            err.to_string().contains("nested `arguments`"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn mcp_tool_result_text_joins_text_content_items() {
