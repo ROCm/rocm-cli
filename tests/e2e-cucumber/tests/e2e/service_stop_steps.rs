@@ -399,6 +399,13 @@ async fn tool_reports_stopped(world: &mut E2eWorld) {
 /// no engine verb of its own), so its `Stop` request is answered rather than
 /// failing with the standalone binary's "unrecognized subcommand". The report
 /// carries the engine's answer or the error that took its place.
+///
+/// The answer is `stopped: false`, and that is the right one here, not a gap: the
+/// planted record names no engine state with a process id, so the real `vllm`
+/// engine has nothing it can confirm stopping (`stop_service` answers `false`
+/// when no PID is recorded). The recorded supervisor, which the daemon itself
+/// signals, is what the other steps check. Asserting the whole answer, not just
+/// that it is a boolean, is what tells it from an engine that was never reached.
 #[then("the tool asked the engine to stop and the engine answered")]
 async fn engine_answered_the_stop(world: &mut E2eWorld) {
     let stdout = world.cli_output.as_deref().unwrap_or_default();
@@ -410,7 +417,11 @@ async fn engine_answered_the_stop(world: &mut E2eWorld) {
         engine_stop.get("error").is_none(),
         "the engine's answer was an error instead: {report}"
     );
-    assert!(engine_stop["stopped"].is_boolean(), "{report}");
+    assert_eq!(
+        *engine_stop,
+        serde_json::json!({"attempted": true, "stopped": false, "graceful": false}),
+        "{report}"
+    );
 }
 
 /// The stop report `rocmd sandbox-tool stop_server` printed, with the tool's own
