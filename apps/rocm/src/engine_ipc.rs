@@ -557,7 +557,6 @@ mod tests {
             let done = Arc::new(AtomicBool::new(false));
             let flipper = {
                 let done = Arc::clone(&done);
-                let paths = paths.clone();
                 std::thread::spawn(move || {
                     while !done.load(Ordering::Relaxed) {
                         with_scoped_builtin_engine_env(Some(&paths), None, || {
