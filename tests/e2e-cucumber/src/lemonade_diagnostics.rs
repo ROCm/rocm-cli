@@ -79,20 +79,35 @@ impl Probe for RealProbe {
 /// binary, and llama.cpp builds commonly initialise a GPU backend even for
 /// `--version`, so running one next to a still-live router on a shared-memory
 /// device could change the very state being diagnosed. Reading files cannot.
-/// `manifest_path` is only called for Lemonade.
+///
+/// `manifest_path` is only called for Lemonade, and nothing it does may keep the
+/// stop from running: it returns `Err(reason)` when there is no manifest to look
+/// for (the report then says `unavailable: <reason>`), and a panic inside it is
+/// caught and reported the same way, so the stop still runs exactly once and the
+/// failure report survives. The report is the one thing a failed serve has left.
 ///
 /// The report says `engine unknown` when no engine was determined, so a skipped
 /// inventory stays visible, and returns no evidence for another engine.
 pub async fn backend_evidence_around_stop(
-    manifest_path: impl FnOnce() -> PathBuf + Send,
+    manifest_path: impl FnOnce() -> Result<PathBuf, String> + Send,
     engine: Option<&str>,
     stop: impl FnOnce() -> String + Send,
 ) -> (String, Option<String>) {
     match engine {
         Some("lemonade") => {
-            let (stop_status, evidence) =
-                evidence_around_stop(&manifest_path(), DEFAULT_BUDGETS, &RealProbe, stop).await;
-            (stop_status, Some(evidence))
+            let manifest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(manifest_path))
+                .unwrap_or_else(|_| Err("finding the runtime manifest failed".to_owned()));
+            match manifest {
+                Ok(manifest) => {
+                    let (stop_status, evidence) =
+                        evidence_around_stop(&manifest, DEFAULT_BUDGETS, &RealProbe, stop).await;
+                    (stop_status, Some(evidence))
+                }
+                Err(reason) => (
+                    stop(),
+                    Some(format!("backend evidence unavailable: {reason}")),
+                ),
+            }
         }
         Some(_) => (stop(), None),
         None => (stop(), Some(ENGINE_UNKNOWN_EVIDENCE.to_owned())),
@@ -1487,7 +1502,8 @@ mod tests {
             stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             "stopped".to_owned()
         };
-        let no_manifest = || -> PathBuf { panic!("the manifest is only read for lemonade") };
+        let no_manifest =
+            || -> Result<PathBuf, String> { panic!("the manifest is only read for lemonade") };
 
         assert_eq!(
             backend_evidence_around_stop(no_manifest, Some("vllm"), stop).await,
@@ -1504,10 +1520,49 @@ mod tests {
 
         let (_root, manifest, _server) = lemonade_data_dir_with_candidate();
         let (status, evidence) =
-            backend_evidence_around_stop(|| manifest, Some("lemonade"), stop).await;
+            backend_evidence_around_stop(|| Ok(manifest), Some("lemonade"), stop).await;
         assert_eq!(status, "stopped");
         assert!(evidence.unwrap().contains("manifest: "));
         assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A Lemonade serve with nothing to look the manifest up in (the scenario has no
+    /// isolated root) used to panic before the stop, so the stop never ran and the
+    /// whole failure report was lost. The lookup now fails soft, whether it says so
+    /// (`Err`) or panics, and the stop still runs exactly once. Removing the panic
+    /// guard turns the second case red.
+    #[tokio::test]
+    async fn a_failing_manifest_lookup_still_runs_the_stop_once_and_reports_why() {
+        let stops = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "stopped".to_owned()
+        };
+        let (status, evidence) = backend_evidence_around_stop(
+            || Err("the scenario has no isolated root".to_owned()),
+            Some("lemonade"),
+            stop,
+        )
+        .await;
+        assert_eq!(status, "stopped");
+        assert_eq!(
+            evidence.as_deref(),
+            Some("backend evidence unavailable: the scenario has no isolated root")
+        );
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (status, evidence) = backend_evidence_around_stop(
+            || -> Result<PathBuf, String> { panic!("no isolated root") },
+            Some("lemonade"),
+            stop,
+        )
+        .await;
+        assert_eq!(status, "stopped");
+        assert_eq!(
+            evidence.as_deref(),
+            Some("backend evidence unavailable: finding the runtime manifest failed")
+        );
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

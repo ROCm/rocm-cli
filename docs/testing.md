@@ -1112,7 +1112,12 @@ report's `stop` section says so, and the probes still run. No lane has shown
 whether a probe initialises a GPU backend, which is why they are kept off the
 router's side of the stop. The order is fixed in one function,
 `backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
-to show the fingerprint was read before it and the probes came after it.
+to show the fingerprint was read before it and the probes came after it. Nothing
+before the stop may keep it from running: a serve with no isolated scenario root
+has no manifest to look for, so the report says `backend evidence unavailable:
+the scenario has no isolated root` (and the stop's own status says it was not
+attempted), and a panic while looking the manifest up is caught and reported the
+same way, so the stop runs exactly once and the failure report is not lost.
 
 The probe's timeout, kill and reap path is tested on every platform, Windows
 included: the unit tests re-run the test binary itself as the child (an ignored

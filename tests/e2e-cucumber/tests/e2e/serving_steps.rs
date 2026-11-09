@@ -171,8 +171,8 @@ async fn serve_failure_evidence(
         e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
             move || {
                 app_paths
-                    .expect("a Lemonade serve runs in an isolated scenario root")
-                    .engine_install_manifest_path("lemonade")
+                    .map(|paths| paths.engine_install_manifest_path("lemonade"))
+                    .ok_or_else(|| "the scenario has no isolated root".to_owned())
             },
             engine,
             move || stop_services_in(isolated_root.as_deref()),
