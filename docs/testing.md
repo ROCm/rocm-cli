@@ -249,6 +249,20 @@ read step on a real child with a reader that fails and checks that the child's
 `/proc` entry is gone: a killed child that was never waited on would keep it as a
 zombie.
 
+A request that cannot be written (the engine exited, or closed its stdin, before
+reading it) is reported with what the engine wrote to stderr, since that is
+usually the explanation, after the child has been killed and reaped. The child is
+killed whether or not a `try_wait` would show it gone, because its pipe closes
+while it is still exiting; the read of its stderr is bounded (a grandchild that
+holds the pipe cannot hold the error path). `a_request_to_an_engine_that_exited_reports_what_it_said_on_stderr`
+runs the whole client against a fake that exits without reading;
+`a_request_that_cannot_be_written_kills_and_reaps_a_child_that_is_still_running`
+(Linux only) checks the `/proc` entry of one that is still running, and
+`the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
+grandchild keeps the pipe open. The last two run the step on a real child with an
+injected write error, because whether a real write fails before the child has
+closed its stdin is a race.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the

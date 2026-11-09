@@ -23,7 +23,9 @@ use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, ENGINE_ENVS_ROOT_ENV, with_sigpipe_ignored};
@@ -136,16 +138,15 @@ where
     // SIGPIPE (`rocm` runs that way, and so does the daemon hosted in it);
     // ignored, the write returns EPIPE and fails as an ordinary error.
     let written = with_sigpipe_ignored(|| {
-        serde_json::to_writer(&mut stdin, envelope).context("failed to write engine request")?;
-        stdin.write_all(b"\n")?;
-        Ok::<(), anyhow::Error>(())
+        serde_json::to_writer(&mut stdin, envelope).map_err(io::Error::from)?;
+        stdin.write_all(b"\n")
     });
     if let Err(error) = written {
-        // The engine will never get its request, so do not leave it running or
-        // unreaped: a long-lived caller would collect one zombie per failure.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        return Err(abandon_unwritten_request(
+            child,
+            &error,
+            EXITED_STDERR_GRACE,
+        ));
     }
     // End of the request: the engine reads to EOF before it answers.
     drop(stdin);
@@ -194,6 +195,69 @@ fn unparseable_answer_message(status: ExitStatus, stderr: &str) -> String {
         message.push_str(&format!("; stderr: {stderr}"));
     }
     message
+}
+
+/// How long the stderr of a child that was killed, or had exited, is waited for
+/// when its request could not be written.
+const EXITED_STDERR_GRACE: Duration = Duration::from_secs(1);
+
+/// The request could not be written to `child`'s stdin, so it will never answer:
+/// do not leave it running or unreaped (a long-lived caller would collect one
+/// zombie per failure), and report why it was not listening.
+///
+/// The child is killed (nothing to do for one that has already exited) and
+/// waited for, then whatever it wrote to stderr is added to the error: an engine
+/// that exits at once usually says why there, and that is the explanation the
+/// caller wants. The kill does not wait on `try_wait` showing an exit first,
+/// because the pipe closes while the process is still exiting, so a check made
+/// right after the failed write can still see it running. The read is bounded
+/// by `grace`: a grandchild that inherited the pipe keeps it open past the exit,
+/// and this error path must not block on it.
+fn abandon_unwritten_request(
+    mut child: Child,
+    write_error: &io::Error,
+    grace: Duration,
+) -> anyhow::Error {
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| read_available(stderr, grace))
+        .unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+    let mut message = format!("failed to write engine request: {write_error}");
+    if !stderr.is_empty() {
+        message.push_str(&format!("; stderr: {stderr}"));
+    }
+    anyhow::anyhow!(message)
+}
+
+/// Read `source` to its end, or for at most `grace` if it does not end, and
+/// return what arrived. The reading thread is left to finish by itself when the
+/// pipe closes.
+fn read_available(mut source: impl Read + Send + 'static, grace: Duration) -> Vec<u8> {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match source.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let deadline = Instant::now() + grace;
+    let mut collected = Vec::new();
+    while let Ok(chunk) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        collected.extend(chunk);
+    }
+    collected
 }
 
 /// Read the child's whole answer from `stdout`.
@@ -657,6 +721,122 @@ mod tests {
                 error.to_string(),
                 "failed to parse engine response envelope"
             );
+        }
+
+        /// Runs `work` on its own thread and fails the test if it has not finished
+        /// within `limit`, so a step that should not block turns red instead of
+        /// hanging the run.
+        fn finishes_within<T: Send + 'static>(
+            limit: Duration,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = sender.send(work());
+            });
+            receiver
+                .recv_timeout(limit)
+                .unwrap_or_else(|_| panic!("did not finish within {limit:?}"))
+        }
+
+        /// A request that cannot be written because the engine is gone reports
+        /// what the engine said on stderr, not only that the write failed: the
+        /// engine's own words are the explanation. The request is larger than a
+        /// pipe buffer, so the write reaches the closed read end.
+        #[test]
+        fn a_request_to_an_engine_that_exited_reports_what_it_said_on_stderr() {
+            let engine = FakeEngine::new("client-no-listen", false, "echo 'no thanks' >&2\nexit 3");
+            let envelope =
+                engine_request_envelope(EngineMethod::Stop, &json!({"blob": "x".repeat(1 << 20)}))
+                    .unwrap();
+            let error = run_engine_stdio(
+                engine.path(),
+                ["stdio"],
+                &EngineStdioOptions::default(),
+                &envelope,
+            )
+            .expect_err("the engine never read its request");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("failed to write engine request: "),
+                "{message}"
+            );
+            assert!(message.ends_with("; stderr: no thanks"), "{message}");
+        }
+
+        /// The child of a failed write is killed and reaped when it is still
+        /// running, which a failed write does not show it to have stopped.
+        /// Linux-only for the `/proc` entry, which a zombie keeps until waited on.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_request_that_cannot_be_written_kills_and_reaps_a_child_that_is_still_running() {
+            let child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let proc_entry = format!("/proc/{}", child.id());
+            assert!(Path::new(&proc_entry).exists(), "the child is running");
+
+            let error = finishes_within(Duration::from_secs(10), move || {
+                abandon_unwritten_request(
+                    child,
+                    &io::Error::from(io::ErrorKind::BrokenPipe),
+                    Duration::from_secs(1),
+                )
+            });
+
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to write engine request: "),
+                "{error}"
+            );
+            assert!(
+                !error.to_string().contains("stderr"),
+                "a child that said nothing adds no stderr: {error}"
+            );
+            assert!(
+                !Path::new(&proc_entry).exists(),
+                "the child must be killed and reaped, not left running or as a zombie"
+            );
+        }
+
+        /// A grandchild that holds the child's stderr open past its exit cannot
+        /// make the error path wait for it: what had been written is reported
+        /// and the rest is not waited for.
+        #[test]
+        fn the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace() {
+            let mut child = Command::new("sh")
+                .args(["-c", "echo said >&2; sleep 5 & exit 3"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // The engine has said its piece and exited before the failure is
+            // handled, as it has in the case this bounds.
+            while child.try_wait().unwrap().is_none() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = Instant::now();
+
+            let error = finishes_within(Duration::from_secs(4), move || {
+                abandon_unwritten_request(
+                    child,
+                    &io::Error::from(io::ErrorKind::BrokenPipe),
+                    Duration::from_millis(300),
+                )
+            });
+
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "waited for the grandchild: {:?}",
+                started.elapsed()
+            );
+            assert!(error.to_string().ends_with("; stderr: said"), "{error}");
         }
 
         /// An answer whose read fails kills the child and reaps it, so a daemon
