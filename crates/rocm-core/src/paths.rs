@@ -39,6 +39,14 @@ pub struct AppPaths {
 /// that must install into a particular root.
 pub const ENGINE_ENVS_ROOT_ENV: &str = "ROCM_CLI_ENGINE_ENVS_ROOT";
 
+/// The variable that moves the config root.
+pub const CONFIG_DIR_ENV: &str = "ROCM_CLI_CONFIG_DIR";
+/// The variable that moves the data root (and, unless it is set too, the cache
+/// root that follows it).
+pub const DATA_DIR_ENV: &str = "ROCM_CLI_DATA_DIR";
+/// The variable that moves the cache root.
+pub const CACHE_DIR_ENV: &str = "ROCM_CLI_CACHE_DIR";
+
 impl AppPaths {
     /// The three `ROCM_CLI_*_DIR` variables that make a child process run on
     /// these roots, in the order config, data, cache. [`Self::discover`] reads
@@ -46,17 +54,17 @@ impl AppPaths {
     /// parent was given.
     pub fn env_vars(&self) -> [(&'static str, &Path); 3] {
         [
-            ("ROCM_CLI_CONFIG_DIR", self.config_dir.as_path()),
-            ("ROCM_CLI_DATA_DIR", self.data_dir.as_path()),
-            ("ROCM_CLI_CACHE_DIR", self.cache_dir.as_path()),
+            (CONFIG_DIR_ENV, self.config_dir.as_path()),
+            (DATA_DIR_ENV, self.data_dir.as_path()),
+            (CACHE_DIR_ENV, self.cache_dir.as_path()),
         ]
     }
 
     pub fn discover() -> Result<Self> {
-        let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
-        let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
+        let data_dir_override = env_path_override(DATA_DIR_ENV);
+        let cache_dir_override = env_path_override(CACHE_DIR_ENV);
         let paths = Self::from_overrides(PathOverrides {
-            config: env_path_override("ROCM_CLI_CONFIG_DIR"),
+            config: env_path_override(CONFIG_DIR_ENV),
             data: data_dir_override.clone(),
             cache: cache_dir_override.clone(),
         })?;
@@ -375,8 +383,11 @@ mod tests {
 
     use crate::test_support::temp_app_paths;
 
+    /// `env_vars` and `discover` share one constant per name, so they cannot
+    /// disagree; the names themselves are what a child process and a user's
+    /// shell see, so they are pinned here.
     #[test]
-    fn env_vars_name_the_three_roots_discover_reads_back() {
+    fn env_vars_pair_each_root_with_its_public_variable_name() {
         let (_root, paths) = temp_app_paths("env-vars");
         assert_eq!(
             paths.env_vars(),
@@ -386,15 +397,6 @@ mod tests {
                 ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
             ]
         );
-        // `discover` reads these same names; a rename in one place must not
-        // leave the other behind.
-        let source = include_str!("paths.rs");
-        for (name, _) in paths.env_vars() {
-            assert!(
-                source.contains(&format!("env_path_override(\"{name}\")")),
-                "{name} is not read by AppPaths::discover"
-            );
-        }
     }
 
     #[test]
