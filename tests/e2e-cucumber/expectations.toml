@@ -100,6 +100,29 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
+# The Anthropic-endpoint scenarios start from `a model is being served on GPU`
+# like the rows above, so they hit the same Linux lemonade serve failure.
+[["serve-anthropic-endpoint-advertised"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so no endpoint is left to advertise."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-messages-inference"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the Anthropic request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
+[["serve-anthropic-endpoint-readiness"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so readiness never covers the Anthropic endpoint."
+serve_timeout_secs = 90
+flaky = true
+
 # Explicit Lemonade serving shares the same failure on the Ubuntu lane.
 [["serve-lemonade-inference"]]
 when = { effective_engine = "lemonade", os = "linux" }
