@@ -2535,6 +2535,181 @@ async fn assert_rocdxg_detail_names_the_cache(world: &mut E2eWorld) {
     );
 }
 
+// ── Both reports agree whether `rocminfo` is installed ─────────────
+
+/// Plant a stand-in `rocminfo` in `dir`. It prints nothing and succeeds, so the
+/// probe finds the tool installed and, having seen no agent in its output, does
+/// not claim the GPU works: the scenarios turn on whether it is found, not on
+/// what it says.
+fn plant_stand_in_rocminfo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("failed to create the stand-in rocminfo directory");
+    rocm_core::fake_executable::write_fake_executable(&dir.join("rocminfo"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the stand-in rocminfo");
+}
+
+/// Replace the `PATH` the planted WSL machine gives the next `rocm` run with
+/// `entries`, then the machine's `fake-bin` (its stand-in `ldconfig`), then the
+/// runner's own entries that hold no `rocminfo`, so a runner with ROCm installed
+/// cannot be the reason the tool reads as found. How the runner's entries are
+/// resolved and filtered is [`e2e_cucumber::planted_path::planted_path_entries`].
+///
+/// An entry that is an empty path is how a test writes the empty `PATH` entry
+/// the shell reads as the current directory.
+fn set_planted_wsl_path(world: &mut E2eWorld, entries: &[PathBuf]) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // The runner's relative entries are resolved from this process's directory
+    // before they are checked, because the child may run from another one.
+    let path = std::env::join_paths(e2e_cucumber::planted_path::planted_path_entries(
+        entries,
+        &root.join("fake-bin"),
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &std::env::current_dir().expect("the harness has a working directory"),
+        e2e_cucumber::planted_path::dir_holds_tool,
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a WSL machine whose rocminfo is in a PATH directory")]
+async fn wsl_machine_with_rocminfo_on_path(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let tools = root.join("rocminfo-bin");
+    plant_stand_in_rocminfo(&tools);
+    set_planted_wsl_path(world, &[tools]);
+}
+
+/// The machine of `examine-36` and `examine-38`: the only `rocminfo` is in
+/// `work`, the directory `rocm` is started from, and `path_entry` is the first
+/// entry of its `PATH`. The two scenarios differ in nothing else, so the answer
+/// can only turn on whether that entry names the working directory: `.` does,
+/// and an empty entry does not (the lookup skips it). That is also what shows
+/// `command_dir` reaches the `rocm` child: with `.` the stand-in is found only
+/// if `rocm` really runs from `work`.
+fn plant_wsl_machine_with_rocminfo_only_in_the_working_directory(
+    world: &mut E2eWorld,
+    path_entry: PathBuf,
+) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let work = root.join("work");
+    plant_stand_in_rocminfo(&work);
+    set_planted_wsl_path(world, &[path_entry]);
+    // A "not installed" answer would also come out if the stand-in could not be
+    // reached at all, so show it can: started by bare name from `work` with this
+    // PATH, it must run, which only an entry that names `work` (or the empty
+    // entry, which `execvp` reads as `work`) makes possible.
+    let path = world
+        .command_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "PATH").then(|| value.clone()))
+        .expect("the planted PATH was just set");
+    let reached = std::process::Command::new("rocminfo")
+        .env("PATH", path)
+        .current_dir(&work)
+        .status()
+        .expect("the stand-in must resolve through the first PATH entry");
+    assert!(reached.success(), "the stand-in rocminfo failed: {reached}");
+    world.command_dir = Some(work);
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_behind_an_empty_path_entry(world: &mut E2eWorld) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::new());
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_on_a_path_entry_naming_the_working_directory(
+    world: &mut E2eWorld,
+) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::from("."));
+}
+
+/// A directory name that is not valid Unicode: the byte 0xff is never UTF-8.
+#[cfg(unix)]
+fn directory_name_that_is_not_unicode() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    std::ffi::OsStr::from_bytes(b"rocminfo-bin-\xff").to_owned()
+}
+
+/// Windows file names are UTF-16 and a lone surrogate would stand in for the
+/// byte; the scenario that asks for this name is `@requires-os:linux`, so
+/// reaching this is a harness mistake.
+#[cfg(not(unix))]
+fn directory_name_that_is_not_unicode() -> std::ffi::OsString {
+    panic!("a directory name that is not valid Unicode is planted on Linux only")
+}
+
+#[given(
+    "a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode"
+)]
+async fn wsl_machine_with_rocminfo_in_a_directory_that_is_not_unicode(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let tools = root.join(directory_name_that_is_not_unicode());
+    plant_stand_in_rocminfo(&tools);
+    set_planted_wsl_path(world, &[tools]);
+}
+
+/// Both reports of one `rocm examine --json` run say whether `rocminfo` is
+/// installed: `summary.wsl.rocminfo` from the host summary and `wsl.rocminfo`
+/// from the examination. Asked together so the pair cannot disagree unseen.
+fn rocminfo_answers(world: &E2eWorld) -> (bool, bool) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let answer = |pointer: &str| {
+        json.pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
+    };
+    (answer("/summary/wsl/rocminfo"), answer("/wsl/rocminfo"))
+}
+
+#[then("both reports say rocminfo is installed")]
+async fn assert_rocminfo_installed_in_both_reports(world: &mut E2eWorld) {
+    assert_eq!(
+        rocminfo_answers(world),
+        (true, true),
+        "(host summary, examination)"
+    );
+}
+
+#[then("both reports say rocminfo is not installed")]
+async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
+    assert_eq!(
+        rocminfo_answers(world),
+        (false, false),
+        "(host summary, examination)"
+    );
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]

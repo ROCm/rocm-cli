@@ -549,12 +549,62 @@ Feature: GPU detection and system inspection
     And the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH
     And the inspection's driver detail does not send the user to register the library with ldconfig
 
+  # `rocm examine --json` asks twice whether `rocminfo` is installed on WSL: the
+  # host summary (`summary.wsl.rocminfo`) and the examination (`wsl.rocminfo`).
+  # They used to use two different PATH lookups and could disagree; they now use
+  # one, and these scenarios hold the two answers level on the cases where
+  # the old lookups differed. The planted WSL machine is the one `examine-32` uses
+  # (a simulated host root with `/dev/dxg`); the runner's own PATH entries that
+  # hold a `rocminfo` are left out, so a runner with ROCm installed cannot be the
+  # reason a tool reads as found. The stand-in `rocminfo` prints nothing, so the
+  # scenarios are about whether the tool is found, not whether it sees a GPU.
+  #
+  # The control: a `rocminfo` in a PATH directory is found by both.
+  @id:examine-rocminfo-on-path-is-found-by-both-reports @requires-os:linux
+  Scenario: examine-35 - Both reports find a rocminfo that sits in a PATH directory
+    Given a WSL machine whose rocminfo is in a PATH directory
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # An empty PATH entry is not the current directory for this lookup: a file named
+  # `rocminfo` in the directory the command runs from is not "installed". The
+  # summary's old lookup read the entry as the current directory and said it was,
+  # while the examination's said it was not. The cost is that a program the CLI
+  # starts by bare name can still resolve from the current directory through the
+  # operating system, which the lookup does not follow.
+  @id:examine-rocminfo-in-working-directory-is-not-installed @requires-os:linux
+  Scenario: examine-36 - Neither report reads an empty PATH entry as the working directory
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is not installed
+
+  # A PATH that is not valid Unicode is searched. The examination's old lookup read
+  # PATH as a `String`, which fails on it, and so found no tool at all while the
+  # summary's old lookup still searched it.
+  @id:examine-rocminfo-on-a-path-that-is-not-unicode-is-found @requires-os:linux
+  Scenario: examine-37 - Both reports search a PATH that is not valid Unicode
+    Given a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
+  # The control for `examine-36`: the same machine, with `.` as the first PATH
+  # entry instead of an empty one. A `.` entry is an ordinary directory, so the
+  # lookup finds the stand-in in the working directory. That only happens if the
+  # `rocm` child really runs from it, so this scenario fails when the harness does
+  # not apply the working directory, and `examine-36`'s "not installed" is then
+  # meaningful: the two differ in nothing but the entry.
+  @id:examine-rocminfo-in-working-directory-named-on-path-is-found @requires-os:linux
+  Scenario: examine-38 - Both reports find a rocminfo in the working directory when PATH names it
+    Given a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH
+    When the user inspects that machine in machine-readable form
+    Then both reports say rocminfo is installed
+
   # kfd is linked into `amdgpu` (`HSA_AMD` is a `bool` Kconfig option), so a
   # healthy machine never lists an `amdkfd` module. The report used to read
   # that as "kfd missing". Each scenario plants a module list naming `amdgpu`
   # only, so the answer can come only from the kernel's kfd interfaces.
   @id:examine-reports-kfd-built-into-the-kernel @requires-os:linux
-  Scenario: examine-35 - The inspection reports kfd on a machine whose module list has no amdkfd
+  Scenario: examine-39 - The inspection reports kfd on a machine whose module list has no amdkfd
     Given a machine whose kernel exposes kfd but lists no amdkfd module
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as loaded
@@ -562,7 +612,7 @@ Feature: GPU detection and system inspection
   # A negative control for examine-35, not proof of the fix: it passes with
   # the fix reverted too, and fails if the kfd check reports true regardless.
   @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
-  Scenario: examine-36 - The inspection reports kfd as not loaded on a machine without it
+  Scenario: examine-40 - The inspection reports kfd as not loaded on a machine without it
     Given a machine whose kernel has no kfd and lists no amdkfd module
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as not loaded
@@ -574,7 +624,7 @@ Feature: GPU detection and system inspection
   # and Secure Boot enabled, so the evidence lines are reachable if the flag
   # regresses.
   @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
-  Scenario: examine-37 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+  Scenario: examine-41 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
     Given a machine whose kernel has amdgpu built in and lists no amdgpu module
     When the user inspects and diagnoses that machine
     Then the inspection reports amdgpu as loaded
@@ -584,7 +634,7 @@ Feature: GPU detection and system inspection
   # the kernel's kfd interfaces still answer: kfd is linked into amdgpu, so
   # `/dev/kfd` reports both drivers as loaded rather than leaving them unknown.
   @id:examine-reports-drivers-from-kfd-without-a-module-list @requires-os:linux
-  Scenario: examine-38 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
+  Scenario: examine-42 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
     Given a machine whose kernel exposes kfd but whose module list cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as loaded

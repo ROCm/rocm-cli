@@ -318,8 +318,12 @@ ordinary PR run is unaffected. Each leg uploads its own artifact (the
 versions share one pre-warmed runtime tree rather than needing separate ones.
 `e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
 pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
-release-branch push runs all six `channel` × `sdk_version` combinations on
-that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+release-branch push runs four of the six `channel` × `sdk_version`
+combinations on that lane: the `nightly` channel is excluded from `n-1`/`n-2`,
+because it only carries the latest (pre-)release builds and cannot resolve the
+pinned released versions (`rocm install sdk` fails with "no mutually compatible
+TheRock ... versions"); those versions are covered by the `release` channel.
+`rad3`/`mi350p` are nightly-only (above) and don't run this matrix
 at all.
 
 `serve` is narrower than `heavy`: it matches only

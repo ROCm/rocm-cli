@@ -36,6 +36,15 @@ pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The temp name the retired `rocm_core::write_atomic` picked when it
+/// replaced `backend_versions.json`: `with_extension("pins.tmp-<millis>-<pid>")`
+/// swapped the `json` extension for `pins`, so the name was
+/// `backend_versions.pins.tmp-<millis>-<pid>`, with this process's pid. It was
+/// fixed by the clock and the pid alone, so a test can occupy it ahead of time.
+pub(crate) fn retired_pin_temp_path(pin_file: &Path, millis: u128) -> PathBuf {
+    pin_file.with_extension(format!("pins.tmp-{millis}-{}", std::process::id()))
+}
+
 mod tests {
     use super::*;
 

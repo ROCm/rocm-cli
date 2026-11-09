@@ -121,6 +121,11 @@ ultUtiz4emTfXDCb2RptOgoydBA+mu9z6O4eVF8S5dVr/S834SK6dD2fWHNnT0dc
 JwIDAQAB
 -----END PUBLIC KEY-----"
 PINNED_RELEASE_PUBLIC_KEY_NEXT=""
+# Keep each slot to the single assignment above: `cargo xtask verify-pinned-keys`
+# compares exactly that assignment with docs/keys/ and requires this readonly
+# line, which makes any later write fail instead of silently replacing the
+# trust root.
+readonly PINNED_RELEASE_PUBLIC_KEY_CURRENT PINNED_RELEASE_PUBLIC_KEY_NEXT
 
 has_pinned_release_keys() {
   [ -n "${PINNED_RELEASE_PUBLIC_KEY_CURRENT}" ] || [ -n "${PINNED_RELEASE_PUBLIC_KEY_NEXT}" ]

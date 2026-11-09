@@ -63,7 +63,7 @@ cargo xtask check-architecture-doc
 
 It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
 does not link, and on a stale entry in the `EXEMPT` list in
-[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
+[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
@@ -190,6 +190,70 @@ import. If one of them moves or is renamed, update `GUARDED` in the test; the
 test fails on a path that no longer exists rather than dropping it from the
 guard. When the planner needs something that lives in `chat.rs`, move it into
 a leaf module and import it from there.
+
+### Dash-TUI text fields go through `apply_char_key`
+
+A dash-TUI form edits its `String` through `apply_char_key` /
+`apply_char_key_filtered` in
+[`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs), not through its
+own "`Char` appends, `Backspace` pops one char" code. As with the other module
+rules above, a test enforces it rather than an `xtask` subcommand:
+`the_dash_tui_has_no_hand_rolled_text_edit_outside_the_helper` in `xtask`
+([`dash_text_edit_contract.rs`](../xtask/src/dash_text_edit_contract.rs)) scans
+the non-test code of every file under `crates/rocm-dash-tui/src/` and fails,
+naming each hit as `file:line` with a pointer to the helper. Run it on its own
+with:
+
+```bash
+cargo test -p xtask dash_text_edit_contract
+```
+
+It is per file, not per `match` arm, because the copies the helper replaced were
+not all arms (one had its `push` in a `type_char` method the arm called). In a
+file other than `ui/widgets.rs` it reports a no-argument `.pop()` when the file
+names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)`,
+`.push(x.method())` and `.push(x as char)`, each with or without a trailing
+comma) when `x` is a name the file binds as a key character
+(`KeyCode::Char(x)`, `KeyCode::Char(mut x)`) or declares as `x: char`, in a file
+that names `KeyCode::Char(`. A `#[cfg(test)] mod name { .. }` block is skipped,
+so a unit test may drive a buffer by hand; a `#[cfg(test)]` on anything else
+skips nothing, and an out-of-line test module (`#[cfg(test)] mod name;`) is a
+file of its own, scanned in full.
+
+What it does not see: it matches the shape, not the type, so a `let top =
+stack.pop()` in a file that handles `Backspace` is a false alarm, and an
+unrelated `out.push(c)` is reported when the same file binds `KeyCode::Char(c)`
+elsewhere. A push is read only when its argument is that name alone in one of the
+spellings above: `.push((x))`, `.push(char::from(x))`, a `.push(if ..)` of the
+name, and a call with a gap before the paren (`.push (x)`, which rustfmt never
+writes) are not seen. Only `#[cfg(test)]` exactly is read as a test gate (a
+`#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
+`use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
+from one file to a method in another is not followed. Only `.pop()` and
+`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`,
+`.remove(..)` and `replace_range(..)` are not scanned, partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
+[`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
+the append-only helper and is a different thing. A `Backspace` arm that never
+pops, such as the folder browser's "go to the parent directory", is not a text
+edit and is not reported.
+
+The one file with its own `push` and `pop` is the Chat input in
+[`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs), whose keys are
+mapped to a `KeyAction` by a separately tested table. It is listed in `ALLOWED`
+in the test with its reason and the number of offenses it is expected to carry
+(its one push and its one pop). The test fails when the file carries a different
+number, so a further hand-rolled field added there is caught, as is an entry that
+stops being needed, or whose file moves. A new field reuses the helper; a new
+exception is a reviewed entry in that list.
+
+Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
+for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
+every pull request that changes Rust, and the merge queue and post-merge runs
+test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
+selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
+a file it reads, so a pull request that touches nothing but
+`crates/rocm-dash-tui` does not run this test on Linux. The module-import
+contract above has the same property.
 
 ### Tests that run a fake executable
 
@@ -763,12 +827,47 @@ download could start. The printed `command:` line then shows
 `uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
 so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
 with a different Python 3.12 it can choose that one rather than the managed one
-a real install prepares. That scenario is a canonical-layout preview. A preview
-of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) does still
-need `uv`: it resolves the published package versions with `uv pip compile`, so
-on a clean host it can download the managed `uv` and create the data folder's
-`tools` folder, although it still prepares no Python. The "no `uv`, no `tools`
-folder" guarantee is therefore the canonical layout's only.
+a real install prepares. That scenario is a canonical-layout preview.
+
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
+to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+is the one step that chooses the `torch` and `torchvision` versions (the CLI
+picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
+previous install left) and, with none, stops before that step. It then prints
+what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
+would be asked about), marks `target`, `runtime_key`, `package_specs`, `command`
+and `manifest` as `not resolved by this preview`, and says why in a
+`resolution_note:` line and a progress line, in the voice of `python_note:`. It
+cannot say whether the published stack installs together either. A real install
+and `rocm update` still fetch `uv` as before, and a preview made after either
+has run is the complete plan. Scenario `runtime-28` checks the note against the
+state it left on a host with no `uv`: no managed-tools folder, no tool archive in
+its own cache folder (here the real detector, since no stand-in `uv` is named),
+no saved config, and no `torch` or `torchvision` version anywhere in the output.
+`runtime-27` is the other polarity: with a `uv` present (the recording stand-in,
+which answers `uv pip compile` with the fixture's four pins, drains its stdin
+under `FAKE_UV_DRAIN_STDIN`, and logs its arguments under `FAKE_UV_LOG`), the
+preview runs it exactly once, for the compile, and prints the resolved plan. The
+`therock-next` scenarios that print resolved package specs start from `And a uv
+is already installed`, which installs the managed `uv` into the scenario's data
+folder the way a real install would have.
+The decision is unit-tested on every platform, Windows included
+(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
+[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
+both layouts, a preview or an install, and a `uv` present or not), as are the
+plan's whole text and its key order against a resolved plan's
+(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
+`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
+`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
+real resolution against a served index and a stand-in `uv`, counting what each
+row looked for, acquired and ran. What no test reaches without the network is the
+real download a real install makes when no `uv` is installed, and that the public
+entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
+first is a network call, and the second is held only by the types (those entry
+points return a resolved plan and refuse the unresolved one) and by the lanes
+that install a ROCm 10 runtime for real.
 
 The preview does not announce a Python the install would refuse either, and it
 prints nothing that predicts what a real install would do on a path that ends in
@@ -803,6 +902,9 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
+The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
+previews in this sense: they resolve with `uv` and can fetch it, and prepare a
+managed Python too.
 
 Then it verifies:
 
@@ -1139,6 +1241,111 @@ Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
 relying on this coverage.
 
+### Lemonade managed-serve failure evidence
+
+On a failed serve, the shared serve steps preserve the full service log under
+`service-logs/` in the E2E results artifact before stopping the service. The engine
+is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
+neither names one, the report says `engine unknown: backend evidence skipped`. A
+value that starts with `--` (as in `serve m --engine --managed`) is another flag, not
+an engine, and counts as no engine named.
+Lemonade failures also include the installed runtime manifest's version/backend, configured
+`backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
+and `version.txt`,
+and each candidate's `--version` and `--help` output. Candidates are searched
+under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
+`bin/llamacpp`, down to three directory levels below each; the cpu backend is not
+searched. The search is bounded as a whole, not per directory: it reads at most
+128 directories and 2048 directory entries across all four backend directories,
+stops as soon as it finds a ninth candidate (it lists the first eight and says the
+list is cut; exactly eight is not reported as cut), and stops when the
+inventory's time is up, checking the clock at every directory and entry. Siblings are visited in
+sorted order, so a search that finishes inside its limits is deterministic.
+Symlinks are never followed: only real directories are entered and only a regular
+file named `llama-server` counts, so a link cycle ends and a link out of the
+backend directory is not read; the report says how many symlinked entries it
+declined to follow. The same rule covers every file the report reads: the
+manifest, the pins file, `version.txt` and a candidate's fingerprint target are
+refused when the last path component is a symlink, and the report says `symlink
+not followed` in place of the content. On unix the refusal is made by the open
+itself (`O_NOFOLLOW`), so a path swapped for a link after an earlier check is still
+refused; on Windows it is a metadata check followed by an open, so a swap between
+the two is not caught (read-only evidence, and the swap needs write access to the
+backend directory). Only the last component is checked: a link in a parent
+directory is followed. When a limit or the clock ends the search early the report
+says which, and does not claim an empty result. When nothing is found, the report
+lists the searched locations and what `bin/llamacpp` holds (the first 16 names
+out of at most 64 entries read, with a count of those omitted), and does not
+guess at the cause: an interrupted download, a layout outside the search and a
+build that was never installed look the same. The manifest and pin reads, the
+search and each candidate's fingerprint run on blocking threads, never on an
+async worker, and the search carries its own deadline because a timeout around a
+blocking task would only drop its handle.
+At most eight candidates
+are hashed and probed, with two read-only probes per candidate. Each probe retains
+up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
+marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
+output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
+Each probe has a five-second timeout. The inventory has a 20-second budget that
+starts when it is entered and covers the manifest and pin reads, the search and
+the hashing; the probes have their own 20-second budget, which starts
+when the service stop returns; hashing runs off the async executor, rejects files
+over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
+one buffer whatever the size. The cap sits well above a dynamically linked
+`llama-server`: the `rocm-stable` build b12109 on the Strix Halo Ubuntu lanes
+was fingerprinted under the former 32 MiB cap, so current builds fit with room to
+spare. The larger cap is margin for a statically linked multi-target build,
+which is an assumption about future builds, not a measured size, and a larger
+file is a finding in its own right. A candidate over the size cap gets no fingerprint, and
+its entry says so with `sha256 unavailable: executable exceeds 512 MiB hash
+limit`; it is still listed and probed. Filesystem
+operations and process cleanup are not preemptible, so this is not a hard
+wall-clock limit on the entire report.
+A candidate or configured build pin is **not proof** of which binary the router
+launched; a failed probe is retained as evidence, not treated as an identity.
+Probes inherit the harness environment rather than reconstructing the engine's
+managed library paths, so a probe loader error alone does not establish why the
+serve failed. The report reads files first and executes a backend second. The
+manifest, pins, candidate paths, fingerprints and `version.txt` are read once the
+serve has exited non-zero or its readiness wait has timed out and the log has
+been read and archived, but before the service is stopped, so they describe the state being
+diagnosed. The `--version` and `--help` probes run after the stop returns, in the
+report's "probes, run after the service stop was attempted" section: llama.cpp
+builds commonly initialise a GPU backend even for `--version`, and doing that next
+to a still-running router on a shared-memory device could change the state being
+diagnosed. A stop that fails or finds no record can leave the router running; the
+report's `stop` section says so, and the probes still run. No lane has shown
+whether a probe initialises a GPU backend, which is why they are kept off the
+router's side of the stop. The order is fixed in one function,
+`backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
+to show the fingerprint was read before it and the probes came after it. Nothing
+before the stop may keep it from running: a serve with no isolated scenario root
+has no manifest to look for, so the report says `backend evidence unavailable:
+the scenario has no isolated root` (and the stop's own status says it was not
+attempted), and a panic while looking the manifest up is caught and reported the
+same way, so the stop runs exactly once and the failure report is not lost.
+
+The probe's timeout, kill and reap path is tested on every platform, Windows
+included: the unit tests re-run the test binary itself as the child (an ignored
+helper test selected by an environment variable), let the probe time out, and
+require that the child is gone afterwards. The shell-script `llama-server`
+stand-ins used by the other probe tests exist on unix only. Not covered anywhere
+is the `kill/reap failed` branch, which needs an operating system that refuses to
+kill a child it just started.
+
+Use the evidence to distinguish backend startup, download, and router readiness
+failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
+as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+backend's ready line does not establish that the router serves the requested
+model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
+managed-launch contract or imply a backend fix.
+
+Exercise the diagnostics and expectation scoping without a GPU:
+
+```bash
+cargo test -p e2e-cucumber --lib lemonade
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
@@ -1290,6 +1497,40 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Lemonade Installs On Disk
+
+`features/lemonade_installs.feature` covers what a user is told about the
+Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
+
+- `lemonade-installs-01` and `-02` reach the engine's pre-install free-space
+  refusal from `rocm engines install lemonade` and from `rocm serve`, with 1 MiB
+  reported free (below what any Lemonade install needs). Room for Lemonade but
+  not for the multi-gigabyte ROCm backend only warns, which the unit tests cover
+  because a scenario would have to start the download. They use
+  `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
+  `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
+  disk that nothing was downloaded. That variable also waives serve's no-GPU
+  refusal, as serve-18's failure hook does.
+- `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
+  and checks `rocm storage report` lists both and flags the unused one.
+- `lemonade-installs-04` uninstalls that runtime and checks the install record
+  is cleared.
+- `lemonade-installs-05` and `-06` cover the two cases the report must not
+  overstate: a record naming a folder with no install (the surviving copy is
+  not offered for deletion) and a read-only runtime (its copy is not said to be
+  removed with it, and uninstall then leaves it). A copy inside a registered
+  runtime is never marked reclaimable, because it is reused when that runtime
+  becomes active; two registered runtimes are covered by a unit test.
+
+Run them alone with `cargo xtask e2e -- -n "lemonade-installs-"`.
+
+The Windows console fix for the backend download's progress is unit-tested
+through the real command builder (`backend_install_command` in
+[process.rs](../engines/lemonade/src/process.rs)), which receives the console
+state and the hide step, so a dropped or unconditional hide turns the test red.
+Whether the output actually reaches a real console is a manual check in
+[manual-testing.md](manual-testing.md).
+
 ## Uninstall And Download Removal
 
 `rocm uninstall` and `rocm storage remove-downloads` both end in the same
@@ -1312,9 +1553,18 @@ The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
 anything is removed, and a dry run on a machine ROCm CLI never touched
-(`uninstall-06`) reporting nothing to remove and creating no folder. The
-`uninstall` command does not start the file logger, which would otherwise create
-the data folder's `logs` folder before the plan is built:
+(`uninstall-06`) reporting nothing to remove and creating no folder. At a
+terminal (a pseudo-terminal on the Linux lane), a dry run that lists something
+ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
+and checks the listed folder goes; a run whose stdin or stdout is not a terminal, and an
+empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
+mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
+is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
+its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+ends differently, since it has no flag to offer: it says removal needs approval,
+which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
+The `uninstall` command does not start the file logger, which would otherwise
+create the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"
@@ -2146,9 +2396,32 @@ exit) and `serve-40` in
 (GPU lane: serving with no watcher enabled starts no helper; on a Linux host
 that runs it with lemonade it is an expected failure in
 [expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
+
+Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
+its HTTP front are tested in
+[anthropic_proxy.rs](../apps/rocmd/src/anthropic_proxy.rs) against a stand-in
+OpenAI engine, including an engine that has its own `/v1/messages` route, which is
+still fronted by the proxy so a Claude model name works. The record's adoption of the published endpoint are tested in
+[anthropic_endpoint.rs](../crates/rocm-core/src/anthropic_endpoint.rs) and
+[service_record.rs](../crates/rocm-core/src/service_record.rs).
+
+```bash
+cargo test -p rocmd --lib anthropic_proxy
+cargo test -p rocm-core --lib anthropic_endpoint
+cargo test -p rocm-core --lib engine_refresh_adopts_the_published_anthropic_endpoint
+cargo test -p rocm --bin rocm anthropic_endpoint
+```
+
+The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
+(a real Messages request is answered by the served model) and `serve-52`
+(`services list` reports both endpoints healthy) in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+serves with. Streaming and tool use are not translated yet, so no scenario
+covers them; a request for either is refused, and the unit tests above pin that.
 
 Natural-language plan handoff tests:
 
@@ -2433,6 +2706,14 @@ cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
 cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
 cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
 cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
+cargo test -p rocmd daemon_host
+cargo test -p rocmd restart_runs_supervise_on_the_rocmd_it_is_given
+cargo test -p rocmd restart_without_a_rocmd_to_run_changes_nothing
+cargo test -p rocmd supervise_runs_the_engine_on_the_rocm_beside_rocmd
+cargo test -p rocmd supervise_without_a_rocm_beside_rocmd_changes_nothing
+cargo test -p rocmd engine_request_runs_the_stdio_command_on_the_rocm_beside_rocmd
+cargo test -p rocmd engine_request_without_a_rocm_beside_rocmd_names_it
+cargo test -p rocm-core sibling_binary_path_from
 cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
 cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
 cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
@@ -2456,6 +2737,24 @@ sandbox tool) starts a new engine only after its stop is confirmed; otherwise
 it reports the unconfirmed stop and starts nothing. Its own later writes are
 applied to the record as it is on disk, and only while it still reads as the
 restart left it, so a stop asked for during the restart keeps its marker.
+
+The daemon runs as the `rocmd` binary or embedded in `rocm` (`rocm daemon`),
+and each binary has commands the other lacks: `supervise` is `rocmd`'s, and the
+hidden engine commands (`__engine-serve-http`, `__engine-stdio`) are `rocm`'s.
+Every daemon spawn therefore asks `DaemonHost` for the binary instead of
+re-executing its own: the recovery restart runs `supervise` on `rocmd`, and the
+supervisor starts its engine, polls its readiness and asks it to stop through
+`rocm`, each the current executable when the daemon is that binary and the
+sibling installed beside it otherwise, named in the error when there is none.
+`rocmd`'s unit tests never reach the real host: under test `DaemonHost::detect`
+returns the test binary for both commands and looks for no sibling, the two
+stand-in hosts name only the binary they stand in for and fail when asked for
+the other, each test that needs a different host passes the code under test one
+of its own, and a test that needs a binary writes a stand-in script (its shell
+and `sleep` found on `PATH` once and asserted by name), so none of them can run
+a `rocm` or `rocmd` that happens to sit in the build directory. `run_from_args_marks_the_process_as_embedded_in_rocm`
+checks the embedded marking in a child run of the test binary, because the flag
+is process-wide.
 
 Automation GPU-metrics event tests:
 
@@ -3096,6 +3395,12 @@ cache nor the variable involved, which is the layout of a TheRock tarball
 (ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
 is what the verdict turns on.
+
+`examine-35`, `examine-36`, `examine-37` and `examine-38` hold the two answers `rocm examine --json` gives to "is `rocminfo` installed" level on that same planted WSL machine: `summary.wsl.rocminfo` from the host summary and `wsl.rocminfo` from the examination, which share one `PATH` lookup. They plant a stand-in `rocminfo` that prints nothing, and build the `PATH` from the machine's stand-in directory followed by the runner's own entries that hold no `rocminfo`, so a runner with ROCm installed cannot be why the tool reads as found. `examine-35` is the control: the tool in a `PATH` directory is found by both. `examine-36` puts it only in the directory the command runs from, with an empty entry first on `PATH`: neither report finds it, because an empty entry is skipped and not read as the current directory (the harness's `command_dir` sets that directory). `examine-38` is its control: the same machine with `.` as the first entry instead, which both reports find, so it fails if `rocm` does not really run from that directory and `examine-36`'s answer cannot come from a harness that ignored `command_dir`. `examine-37` puts it in a `PATH` directory whose name is not valid Unicode: both find it, because a `PATH` that is not Unicode is still searched. The Windows spellings of the lookup (`PATHEXT`, a quoted entry holding a `;`, the System32 locations) cannot run on the Linux lane and are covered by the unit tests in `probe_exec.rs`, which the Windows job runs.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
+```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 

@@ -4,7 +4,6 @@
 
 pub mod approval;
 pub mod automations_manager;
-pub mod bench;
 pub mod bench_run;
 pub mod command_screen;
 pub mod config_manager;
@@ -21,7 +20,6 @@ mod header;
 mod help_modal;
 pub mod install_manager;
 mod instance_detail;
-pub mod instance_list;
 pub mod job_console;
 pub mod launcher;
 pub mod logs_view;
