@@ -54,7 +54,10 @@ pub(crate) fn unique_suffix() -> String {
 // `rocm-core`, its integration tests and the Lemonade engine rather than copied.
 #[path = "../../../crates/rocm-core/tests/common/proptest_cases.rs"]
 mod proptest_cases;
-pub(crate) use proptest_cases::{case_count_from_env, proptest_cases};
+pub(crate) use proptest_cases::proptest_cases;
+// Only the Unix-only uninstall properties read their own knob.
+#[cfg(unix)]
+pub(crate) use proptest_cases::case_count_from_env;
 
 /// Split `bytes` at the given (unsorted, possibly duplicated) offsets, each
 /// taken modulo `bytes.len() + 1`.
