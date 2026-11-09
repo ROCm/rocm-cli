@@ -175,16 +175,22 @@ fn render_logs_browser_page_text_with_options(
     if query.is_some() {
         let _ = writeln!(output, "Recent activity: filtered by search");
     } else {
-        let recent_lines = read_optional_tail_lines(&lifecycle_path, 8, "CLI lifecycle log");
-        if recent_lines.is_empty() {
+        let recent = read_optional_log_tail(&lifecycle_path, 8, "CLI lifecycle log");
+        if recent.newest_line_exceeds_the_read_bound() {
+            let _ = writeln!(
+                output,
+                "Recent activity: none shown; {}",
+                rocm_core::newest_line_exceeds_bound_notice()
+            );
+        } else if recent.lines.is_empty() {
             let _ = writeln!(output, "Recent activity: no activity yet");
         } else {
             let _ = writeln!(
                 output,
                 "Recent activity: last {} line(s)",
-                recent_lines.len()
+                recent.lines.len()
             );
-            for line in recent_lines {
+            for line in recent.lines {
                 let _ = writeln!(output, "  {}", format_cli_lifecycle_tail_line(&line));
             }
         }
@@ -248,7 +254,15 @@ struct LogBrowserEntry {
 fn collect_log_browser_entries(paths: &AppPaths) -> Vec<LogBrowserEntry> {
     let lifecycle_path = cli_lifecycle_log_path(paths);
     let mut entries = Vec::new();
-    for line in read_optional_tail_lines(&lifecycle_path, 8, "CLI lifecycle log") {
+    let lifecycle = read_optional_log_tail(&lifecycle_path, 8, "CLI lifecycle log");
+    if lifecycle.newest_line_exceeds_the_read_bound() {
+        // Not a lifecycle record, so it is not formatted as one.
+        entries.push(LogBrowserEntry {
+            source: "lifecycle".to_owned(),
+            line: omitted_output_placeholder("CLI lifecycle log"),
+        });
+    }
+    for line in lifecycle.lines {
         entries.push(LogBrowserEntry {
             source: "lifecycle".to_owned(),
             line: format_cli_lifecycle_tail_line(&line),
@@ -1252,8 +1266,27 @@ fn list_log_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
     paths.into_iter().take(limit).collect()
 }
 
+/// The last `limit` lines of a log that may not exist. A log that has content
+/// but none of it fits the read budget comes back as one
+/// [`omitted_output_placeholder`] line, like a read error comes back as one
+/// `<failed to read ...>` line, so a caller that lists the lines never takes a
+/// log with content for an empty one. A missing or empty log is an empty list.
 pub(crate) fn read_optional_tail_lines(path: &Path, limit: usize, label: &str) -> Vec<String> {
-    read_optional_log_tail(path, limit, label).lines
+    let tail = read_optional_log_tail(path, limit, label);
+    if tail.newest_line_exceeds_the_read_bound() {
+        vec![omitted_output_placeholder(label)]
+    } else {
+        tail.lines
+    }
+}
+
+/// The line that stands in for a log whose newest line is longer than the
+/// budget a log view reads, so nothing of it could be shown.
+fn omitted_output_placeholder(label: &str) -> String {
+    format!(
+        "<no output shown from {label}: {}>",
+        rocm_core::newest_line_exceeds_bound_notice()
+    )
 }
 
 /// [`read_optional_tail_lines`], keeping what the byte budget left unread so
@@ -2602,6 +2635,124 @@ pub(crate) mod tests {
         assert!(size.is_some_and(|size| size > bound));
         assert!(rendered.contains("TAIL-MARKER"), "{rendered}");
         assert!(!rendered.contains(notice), "{rendered}");
+        Ok(())
+    }
+
+    /// One newline-terminated line longer than the budget a log view reads.
+    fn line_longer_than_the_read_bound() -> Result<Vec<u8>> {
+        let mut bytes = vec![b'x'; usize::try_from(rocm_core::LOG_VIEW_MAX_TAIL_READ)? + 1024];
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    #[test]
+    fn read_optional_tail_lines_names_a_log_it_could_not_show_instead_of_returning_nothing()
+    -> Result<()> {
+        let over = tail_fixture(
+            "services-optional-over",
+            &line_longer_than_the_read_bound()?,
+        )?;
+        let empty = tail_fixture("services-optional-empty", b"")?;
+
+        assert_eq!(
+            read_optional_tail_lines(&over, 5, "CLI action log"),
+            vec![
+                "<no output shown from CLI action log: the newest line is longer than the 4 MiB a log view reads>"
+            ]
+        );
+        // An empty log has nothing to show and stays an empty list.
+        assert!(read_optional_tail_lines(&empty, 5, "CLI action log").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_logs_browser_does_not_call_a_log_with_an_oversized_line_absent() -> Result<()> {
+        let over = line_longer_than_the_read_bound()?;
+        // Each log holds the one oversized line and nothing else, in turn.
+        for (name, relative) in [
+            ("logs-over-action", "logs/cli/probe-action.log"),
+            ("logs-over-screen", "logs/tui/probe-screen.log"),
+        ] {
+            let (root, paths) = test_paths(name);
+            let path = paths.data_dir.join(relative);
+            fs::create_dir_all(path.parent().expect("a log has a directory"))?;
+            fs::write(&path, &over)?;
+
+            let rendered = render_logs_text(&paths);
+            let _ = fs::remove_dir_all(root);
+
+            let label = if relative.contains("cli") {
+                "CLI action log"
+            } else {
+                "screen command log"
+            };
+            assert!(
+                !rendered.contains("No logs found yet."),
+                "{name}: {rendered}"
+            );
+            assert!(
+                rendered.contains("  Lines: 1 of 1 recent line(s)"),
+                "{name}: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "<no output shown from {label}: the newest line is longer than the 4 MiB a log view reads>"
+                )),
+                "{name}: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_recent_activity_summary_does_not_call_an_oversized_lifecycle_entry_no_activity()
+    -> Result<()> {
+        let (root, paths) = test_paths("logs-over-lifecycle");
+        let lifecycle = cli_lifecycle_log_path(&paths);
+        fs::create_dir_all(lifecycle.parent().expect("a log has a directory"))?;
+        fs::write(&lifecycle, line_longer_than_the_read_bound()?)?;
+
+        let rendered = render_logs_text(&paths);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(!rendered.contains("no activity yet"), "{rendered}");
+        assert!(
+            rendered.contains("  Lines: 1 of 1 recent line(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Recent activity: none shown; the newest line is longer than the 4 MiB a log view reads"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("No logs found yet."), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_startup_failure_detail_does_not_call_a_log_with_an_oversized_line_empty() -> Result<()> {
+        let over = tail_fixture("startup-detail-over", &line_longer_than_the_read_bound()?)?;
+        let empty = tail_fixture("startup-detail-empty", b"")?;
+
+        let detail =
+            crate::service_launch::managed_engine_startup_failure_detail(" with status 1", &over);
+        assert!(
+            detail.ends_with(
+                "recent startup log output:\n<no output shown from service log: the newest line is longer than the 4 MiB a log view reads>"
+            ),
+            "{detail}"
+        );
+        // A log that really is empty still gets the short form.
+        let detail =
+            crate::service_launch::managed_engine_startup_failure_detail(" with status 1", &empty);
+        assert_eq!(
+            detail,
+            format!(
+                "managed engine exited immediately with status 1; inspect {}",
+                empty.display()
+            )
+        );
         Ok(())
     }
 

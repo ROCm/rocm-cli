@@ -105,6 +105,26 @@ async fn comfyui_with_an_oversize_line(world: &mut E2eWorld) {
     plant_comfyui_log(world, &vec![b'x'; OVERSIZE_LINE_BYTES]);
 }
 
+/// The one command log the logs-browser scenario plants.
+fn action_log_path(world: &E2eWorld) -> std::path::PathBuf {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    root.path()
+        .join("data")
+        .join("logs")
+        .join("cli")
+        .join("e2e-oversize.log")
+}
+
+#[given("a recorded command log whose only line is longer than the log view reads")]
+async fn command_log_with_an_oversize_line(world: &mut E2eWorld) {
+    let log = action_log_path(world);
+    std::fs::create_dir_all(log.parent().expect("log has a parent"))
+        .expect("failed to create the cli logs dir");
+    let mut bytes = vec![b'x'; OVERSIZE_LINE_BYTES];
+    bytes.push(b'\n');
+    std::fs::write(&log, bytes).expect("failed to write the command log");
+}
+
 #[given("a ComfyUI log file that is empty")]
 async fn comfyui_with_an_empty_log(world: &mut E2eWorld) {
     plant_comfyui_log(world, b"");
@@ -154,6 +174,12 @@ async fn read_server_log_through_the_tool(world: &mut E2eWorld) {
 #[when("the user reads the ComfyUI logs")]
 async fn read_comfyui_logs(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "logs"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user lists the recorded logs")]
+async fn list_logs(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -234,6 +260,33 @@ async fn comfyui_says_the_line_is_too_long(world: &mut E2eWorld) {
     let on_disk = std::fs::read(comfyui_log_path(world)).expect("the ComfyUI log is still there");
     assert!(
         on_disk.len() > LOG_VIEW_BOUND_BYTES && !on_disk.contains(&b'\n'),
+        "the log on disk should be one line past the bound, is {} bytes",
+        on_disk.len()
+    );
+}
+
+#[then(
+    "the CLI lists that log as having output it could not show instead of saying no logs were found"
+)]
+async fn lists_the_log_as_not_shown(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(
+            "<no output shown from CLI action log: the newest line is longer than the 4 MiB a log view reads>"
+        ),
+        "expected the log to be listed with the too-long notice, got:\n{out}"
+    );
+    assert!(
+        !out.contains("No logs found yet."),
+        "a log with content must not be reported as absent:\n{out}"
+    );
+    // The claim and the state it describes: the log on disk holds exactly one
+    // line, longer than the bound the notice names.
+    let on_disk = std::fs::read(action_log_path(world)).expect("the command log is still there");
+    assert!(
+        on_disk.len() > LOG_VIEW_BOUND_BYTES
+            && on_disk.ends_with(b"\n")
+            && !on_disk[..on_disk.len() - 1].contains(&b'\n'),
         "the log on disk should be one line past the bound, is {} bytes",
         on_disk.len()
     );

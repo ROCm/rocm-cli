@@ -116,3 +116,14 @@ Feature: Log inspection
     Given a local server record whose log file is empty
     When a tool-using client reads that server's log through the service_logs tool
     Then the tool says the server has no log output yet and does not flag an over-long line
+
+  # `rocm logs` lists the last lines of each command log it finds. A command log
+  # whose only line is longer than the 4 MiB a log view reads has content but no
+  # line the read can return whole; listing nothing made the view print "No logs
+  # found yet." although the file is on disk. It is listed with a line that says
+  # why nothing is shown.
+  @id:logs-command-log-longer-than-the-read-bound-is-not-called-absent
+  Scenario: logs-15 - A command log whose only line is longer than the read bound is not reported as no logs found
+    Given a recorded command log whose only line is longer than the log view reads
+    When the user lists the recorded logs
+    Then the CLI lists that log as having output it could not show instead of saying no logs were found
