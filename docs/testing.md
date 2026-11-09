@@ -1426,6 +1426,28 @@ that run one shared table of refused and accepted `serve` argvs are
 `planner_refuses_each_unsafe_serve_and_plans_nothing`; deleting a rule from the
 shared check fails both.
 
+The approval card for a mutating assistant tool call and the command its
+approval runs are built from the same argument object. No tool takes a
+parameter named `arguments`, so a call whose arguments carry a nested
+`arguments` field is refused by `validate_chat_tool_call` in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) before any card is shown, on
+the dash, chat and `rocm mcp-call` paths alike; the hidden `rocm mcp-call`
+command still unwraps a pasted, pure `{"name", "arguments"}` params envelope at
+its own boundary. `chat-17` (`chat-ambiguous-tool-call-refused-before-approval`
+in the same feature file, Linux mock lane, no GPU) drives it through the
+interactive chat: a mock model answers with a two-payload `launch_server` call,
+the model is told the call was refused for its nested field, and no approval
+prompt appears.
+
+```bash
+cargo xtask e2e -- -n "chat-17"
+cargo test -p rocm --bin rocm nested_arguments
+cargo test -p rocm --bin rocm seam_approval_card_matches
+cargo test -p rocm --bin rocm mcp_call_
+cargo test -p rocm --bin rocm no_rocm_tool_declares_an_arguments_parameter
+cargo test -p rocm-dash-tui no_rocm_tool_declares_an_arguments_parameter
+```
+
 Focused coverage:
 
 ```bash

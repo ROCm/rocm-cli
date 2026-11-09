@@ -16,6 +16,10 @@ rocm-cli local assistants use structured tools, not shell commands.
   model.
 - Installs, starts, stops, updates, deletes, settings changes, and other
   mutations must pause on the TUI approval screen.
+- The approval card and the command its approval runs are built from the same
+  argument object. No tool takes a parameter named `arguments`, so a tool call
+  whose arguments carry a nested `arguments` field is refused before any card is
+  shown.
 - The model should inspect first, then request a change only when the inspection
   result shows it is useful.
 - The model must use argv-style `rocm` arguments. It must not invent PowerShell,

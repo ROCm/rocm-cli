@@ -15,7 +15,7 @@
 //!
 //! Callers in other modules, production and test-only, reach the moved items
 //! through the `chat::` module boundary, so this module re-exports each one
-//! another module reads (`run_internal_mcp_call`,
+//! another module reads (`run_internal_mcp_call`, `mcp_call_cli_arguments`,
 //! `rocm_chat_tool_system_prompt_for_host`, the tool-policy items, `any_substring`
 //! and `ensure_flag`, and the test-only ones under `#[cfg(test)]`).
 
@@ -32,8 +32,13 @@ mod turn;
 #[cfg(all(test, unix))]
 pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 // `run_internal_mcp_call` lives in `mcp_bridge.rs` and stays reachable here as
-// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
-pub(crate) use self::mcp_bridge::run_internal_mcp_call;
+// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`;
+// `mcp_call_cli_arguments` likewise for `main.rs`'s `rocm mcp-call` dispatch.
+// `internal_mcp_tool_call` is read only by `dash_seam.rs`'s tests, so its
+// re-export is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) use self::mcp_bridge::internal_mcp_tool_call;
+pub(crate) use self::mcp_bridge::{mcp_call_cli_arguments, run_internal_mcp_call};
 // `rocm_chat_tool_system_prompt_for_host` lives in `turn.rs` and stays
 // reachable here as `chat::rocm_chat_tool_system_prompt_for_host` for `dash.rs`.
 use self::turn::render_chat_prompt_result_with_progress;

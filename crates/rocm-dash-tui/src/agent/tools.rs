@@ -878,6 +878,73 @@ mod tests {
         }
     }
 
+    /// The bin's `validate_chat_tool_call` refuses any ROCm tool call that
+    /// carries an `arguments` field, so the approval card and the approved
+    /// command cannot read different payloads. That is only safe while no ROCm
+    /// tool here declares a parameter of that name.
+    #[tokio::test]
+    async fn no_rocm_tool_declares_an_arguments_parameter() {
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        macro_rules! read_def {
+            ($ty:ident) => {
+                $ty {
+                    executor: None,
+                    fired: fired.clone(),
+                }
+                .definition(String::new())
+                .await
+            };
+        }
+        macro_rules! mutating_def {
+            ($ty:ident) => {
+                $ty {
+                    executor: None,
+                    approval_tx: None,
+                    fired: fired.clone(),
+                }
+                .definition(String::new())
+                .await
+            };
+        }
+        let defs = [
+            read_def!(DoctorRocmTool),
+            read_def!(ExamineRocmTool),
+            read_def!(EnginesRocmTool),
+            read_def!(ServicesRocmTool),
+            read_def!(ServiceLogsRocmTool),
+            read_def!(BridgeSnapshotRocmTool),
+            read_def!(GpuSnapshotRocmTool),
+            read_def!(AutomationsRocmTool),
+            read_def!(PathExistsRocmTool),
+            read_def!(PortStatusRocmTool),
+            read_def!(UpdateCheckRocmTool),
+            read_def!(InstallSdkDryRunRocmTool),
+            read_def!(RocmCommandRocmTool),
+            read_def!(NaturalLanguagePlanRocmTool),
+            mutating_def!(InstallSdkRocmTool),
+            mutating_def!(InstallEngineRocmTool),
+            mutating_def!(LaunchServerRocmTool),
+            mutating_def!(StopServerRocmTool),
+            mutating_def!(WatcherEnableRocmTool),
+            mutating_def!(WatcherDisableRocmTool),
+        ];
+        assert_eq!(
+            defs.len(),
+            ROCM_READ_TOOL_NAMES.len() + ROCM_MUTATING_TOOL_NAMES.len(),
+            "every ROCm tool is checked"
+        );
+        for def in defs {
+            assert!(
+                def.parameters
+                    .get("properties")
+                    .and_then(|p| p.get("arguments"))
+                    .is_none(),
+                "ROCm tool `{}` declares an `arguments` parameter",
+                def.name
+            );
+        }
+    }
+
     /// Minimal executor that echoes a fixed JSON value for any tool call.
     #[derive(Debug)]
     struct FakeExec(serde_json::Value);

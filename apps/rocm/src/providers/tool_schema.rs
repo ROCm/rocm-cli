@@ -189,3 +189,31 @@ pub(super) fn rocm_anthropic_tool_definitions() -> Vec<serde_json::Value> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `validate_chat_tool_call` refuses any tool call carrying an `arguments`
+    /// field, which is only safe while no tool declares one.
+    #[test]
+    fn no_rocm_tool_declares_an_arguments_parameter() {
+        let tools = rocm_openai_tool_definitions();
+        assert!(!tools.is_empty(), "the tool catalog is not empty");
+        for tool in tools {
+            let function = &tool["function"];
+            assert!(
+                function["parameters"]["properties"].is_object(),
+                "tool {} has a properties object",
+                function["name"]
+            );
+            assert!(
+                function["parameters"]["properties"]
+                    .get("arguments")
+                    .is_none(),
+                "tool {} declares an `arguments` parameter",
+                function["name"]
+            );
+        }
+    }
+}
