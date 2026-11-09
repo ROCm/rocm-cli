@@ -16,10 +16,9 @@
 //! `torchaudio_pin` pins a torchaudio first (the hardware-verified release when
 //! it is published) and `resolve_published_pip_package_versions` has
 //! `uv pip compile` choose the rest. That compile is the one step that may fetch
-//! `uv`: a real install and an update (`resolve_pip_runtime`) acquire it, and a
-//! preview (`preview_pip_runtime`) runs one that is already present and
-//! otherwise stops with an `UnresolvedPipRuntime`, which is decided in
-//! `plan_version_resolution` (in `uv_access`). `wheel_runtime_composition` turns a
+//! `uv`: a real install and an update acquire it; a preview
+//! (`preview_pip_runtime`) runs a present one or stops with an
+//! `UnresolvedPipRuntime`, as `uv_access` decides. `wheel_runtime_composition` turns a
 //! resolution into the exact package specs (`therock_pip_package_specs`) an
 //! install gives `uv` and records in the manifest, and
 //! `canonical_auto_select_needs_next_python` peeks at the channel's own `rocm`
@@ -200,14 +199,10 @@ impl AggregateDeviceTarget {
         Self::Exact(target)
     }
 
-    /// The device payload to plan for when the caller may already know the exact
-    /// target: an update apply's recorded arch, or the one a runtime's manifest was
-    /// built with. A recorded target wins over `detected` (the resolution's own
-    /// answer, from a probe of this host), and is checked against the targets the
-    /// source publishes exactly as a detected one is; with none recorded the
-    /// detected answer stands as it is, `Undetermined` included. The one place
-    /// that rule is written: a plan, a preview and an update's plan all call it, so
-    /// they cannot disagree about which target a runtime is for.
+    /// A recorded target (an update apply's, or a runtime manifest's) wins over
+    /// `detected` and is checked against what the source publishes; with none the
+    /// detected answer stands, `Undetermined` included. The one place this rule is
+    /// written, so a plan, a preview and an update's plan cannot disagree.
     pub(in crate::therock) fn prefer_recorded(
         detected: &Self,
         recorded: Option<&str>,
@@ -517,17 +512,11 @@ pub(in crate::therock) enum PipRuntimePlan {
     NeedsUv(UnresolvedPipRuntime),
 }
 
-/// A ROCm 10 resolution stopped before `uv pip compile`: everything chosen without
-/// `uv`, and none of what depends on it.
-///
-/// Known: the family, the device target, the index, the `rocm` version and the
-/// torchaudio pin, and the requirement lines `uv` would be asked to resolve. Not
-/// known: the `torch` and `torchvision` versions, which only `uv pip compile`
-/// produces, nor whether the published stack is jointly installable. Everything
-/// built from them (the package specs, the runtime key, the install folder and
-/// manifest the key names) is therefore unknown too, which is why this carries no
-/// [`TheRockPipPackageVersions`]: a value that cannot be made cannot be mistaken
-/// for one.
+/// A ROCm 10 resolution stopped before `uv pip compile`: what was chosen without
+/// `uv` (family, device target, index, `rocm` version, torchaudio pin, the
+/// requirements `uv` would be given) and nothing made from the `torch` and
+/// `torchvision` versions only `uv` produces. It carries no
+/// [`TheRockPipPackageVersions`], so such a value cannot be mistaken for one.
 #[derive(Debug, Clone)]
 pub(in crate::therock) struct UnresolvedPipRuntime {
     pub(in crate::therock) family: String,
@@ -684,9 +673,8 @@ pub(in crate::therock) fn resolve_pip_runtime(
 /// `layout_override` is how an update keeps a runtime on the stream it was
 /// installed from; a fresh install passes `None` and lets the request decide.
 ///
-/// Always [`UvAccess::Acquire`]: a real install and an update take the managed `uv`
-/// when the ROCm 10 layout needs one, as they always have. A preview asks
-/// [`preview_pip_runtime`] instead.
+/// Always [`UvAccess::Acquire`], as a real install and an update always were; a
+/// preview asks [`preview_pip_runtime`].
 #[allow(clippy::too_many_arguments)]
 pub(in crate::therock) fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
@@ -710,18 +698,16 @@ pub(in crate::therock) fn resolve_pip_runtime_with_timeout(
         UvAccess::Acquire,
     )? {
         PipRuntimePlan::Resolved(resolution) => Ok(resolution),
-        // `plan_version_resolution` answers `Skip` only to `UvAccess::PresentOnly`,
-        // and a test holds it to that, so this is a broken invariant, not a state.
+        // `Skip` is only ever answered to `PresentOnly` (a test holds it to that).
         PipRuntimePlan::NeedsUv(_) => {
             bail!("internal error: a resolution that may acquire uv stopped for want of one")
         }
     }
 }
 
-/// [`resolve_pip_runtime`] for a preview: it never downloads `uv` or creates the
-/// folders that hold it. A `uv` that is already there is used, so the answer is the
-/// resolution a real install would reach; with none, a ROCm 10 request comes back as
-/// [`PipRuntimePlan::NeedsUv`], holding what `uv` is not needed for.
+/// [`resolve_pip_runtime`] for a preview: never downloads `uv` or creates the
+/// folders that hold it. A `uv` that is already there is used; with none, a ROCm 10
+/// request comes back as [`PipRuntimePlan::NeedsUv`].
 pub(in crate::therock) fn preview_pip_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
