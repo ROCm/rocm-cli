@@ -18,6 +18,22 @@
 //!
 //! The request and the child's lifetime are not bounded by a timeout: an engine
 //! install legitimately runs for minutes, and no caller has ever set one.
+//!
+//! Nor is the wait for the pipes after the child has exited, and that is a known
+//! limit rather than an oversight. The answer is read to the end of the child's
+//! stdout, and the stderr collector is joined, so an engine that leaves a
+//! grandchild holding either pipe open makes the request wait for that grandchild
+//! to exit. Both clients this one replaces behaved the same way (`rocm` read
+//! stdout to the end then joined its stderr thread; `rocmd` used
+//! `wait_with_output`), so nothing new is exposed to it, but the daemon is long
+//! lived and a hung request holds its caller. Bounding it exactly would mean
+//! reading both pipes on their own threads, waiting for the child itself without a
+//! limit and for the pipes only up to a deadline after it exits, and choosing what
+//! to report when the deadline passes (an answer already complete? a partial
+//! one?). That is a timeout policy for an engine contract nothing here sets, so
+//! this change leaves it to be decided on its own. The one wait this client adds
+//! itself, for the stderr of a child whose request could not be written, is
+//! bounded by `EXITED_STDERR_GRACE`.
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};

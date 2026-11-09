@@ -263,6 +263,14 @@ grandchild keeps the pipe open. The last two run the step on a real child with a
 injected write error, because whether a real write fails before the child has
 closed its stdin is a race.
 
+One wait is deliberately not bounded and has no test: after the child exits, the
+answer is read to the end of its stdout and its stderr collector is joined, so an
+engine that leaves a grandchild holding either pipe makes the request wait for
+it. The clients this one replaced had the same exposure, and bounding it would
+mean reading both pipes on their own threads and choosing what to report when a
+deadline passes, which is a timeout policy the engine contract does not have
+today. The module comment in `stdio_client.rs` states the limit and its tradeoff.
+
 ### Advised commands must parse
 
 `apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
