@@ -3927,6 +3927,7 @@ name = "rocmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "clap",
  "rocm-core",

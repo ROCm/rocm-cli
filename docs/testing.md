@@ -2311,10 +2311,14 @@ cargo test -p rocm --bin rocm anthropic_endpoint
 The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
 (a real Messages request is answered by the served model) and `serve-52`
 (`services list` reports both endpoints healthy) in
-[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
-They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
-serves with. Streaming and tool use are not translated yet, so no scenario
-covers them; a request for either is refused, and the unit tests above pin that.
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature);
+`serve-53` (`@id:serve-anthropic-messages-streaming`) sends `stream: true` and
+checks the reply is an event stream that reassembles into text, with usage in
+`message_delta`. They run on the GPU lanes (`@requires-gpu`), with whichever
+engine the host serves with. The proxy's unit tests cover the event sequence, a
+stream that ends early, and an engine refusal before the first byte. Tool use is
+not translated yet, so no scenario covers it; a request for it is refused, and
+the unit tests above pin that.
 
 Natural-language plan handoff tests:
 
