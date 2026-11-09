@@ -85,10 +85,35 @@ if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]
 fi
 
 if ! command -v cargo >/dev/null; then
+  # A pinned rustup-init, checked against the SHA-256 recorded here, not a
+  # script piped into a shell. To move to a newer rustup, replace the version
+  # and both sums with those published beside its rustup-init.
+  rustup_version="1.29.3"
+  case "$(uname -m)" in
+    x86_64)
+      rustup_triple="x86_64-unknown-linux-gnu"
+      rustup_sha256="b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
+      ;;
+    aarch64 | arm64)
+      rustup_triple="aarch64-unknown-linux-gnu"
+      rustup_sha256="9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282"
+      ;;
+    *)
+      echo "no pinned rustup-init for $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+  rustup_init="${work}/rustup-init"
+  curl --proto '=https' --tlsv1.2 -sSf -o "${rustup_init}" \
+    "https://static.rust-lang.org/rustup/archive/${rustup_version}/${rustup_triple}/rustup-init"
+  if ! echo "${rustup_sha256}  ${rustup_init}" | sha256sum -c --quiet -; then
+    echo "rustup-init ${rustup_version} does not match its recorded SHA-256" >&2
+    exit 1
+  fi
+  chmod +x "${rustup_init}"
   # No default toolchain: rust-toolchain.toml pins it, and the first cargo
   # call in this checkout installs that one.
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-    sh -s -- -y --profile minimal --default-toolchain none
+  "${rustup_init}" -y --profile minimal --default-toolchain none
   # shellcheck source=/dev/null
   . "${HOME}/.cargo/env"
 fi

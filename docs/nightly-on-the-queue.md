@@ -39,8 +39,8 @@ repository.
 Dispatch `queue-run.yml` with the branch to test (`main` by default); it also
 runs every night at 02:17 UTC on `main`. The job asks the queue side for a run
 of that branch, named for the job's run id and attempt, so re-running the job
-starts a new run. It waits for every lane to finish, up to about five hours,
-then publishes the run as below. The job log starts with the run's inputs
+starts a new run. It waits for every lane to finish, up to 4 h 10 min (15000 s, the run's
+wait limit below), then publishes the run as below. The job log starts with the run's inputs
 (below). Only one run goes at a time: a second
 dispatch waits for the first, and the queue side refuses one while another,
 however started, is unfinished. GitHub keeps at most one job waiting, so a
@@ -54,7 +54,8 @@ Dispatch `nightly-queue.yml` with a run's `request_id` — the id its
 `queue-run.yml` job printed — to publish that run again, for instance when that
 job was cancelled while the run went on. Such a run was never finished, so if
 its lanes are done the queue side finishes it first. Do that within a day of
-its lanes finishing: the queue keeps them no longer. It never starts a run,
+its lanes finishing: the queue keeps a lane's files for about a day, and a run
+not finished by then loses them. It never starts a run,
 and there is no default: a run that did not happen cannot be published in its
 place. It
 fails, rather than reporting green, when:
@@ -63,9 +64,9 @@ fails, rather than reporting green, when:
 - the run failed, could not start, was cancelled before it finished, or
   discovered no lanes at all
 
-Each new run removes results older than two weeks, so an older `request_id`
-may no longer be publishable; an uploaded artifact follows this repository's
-own artifact retention.
+A finished run's results are kept for two weeks: each new run removes older
+ones, so a finished run's `request_id` can be published again until then. An
+uploaded artifact follows this repository's own artifact retention.
 
 ## What a run executes
 
@@ -165,7 +166,7 @@ rather than at a regression.
 - a self-hosted Linux runner registered with the `queue-report` label alone,
   without GitHub's default `self-hosted`, OS and architecture labels, so only a
   job naming `queue-report` lands on it, providing
-  `/opt/queue/bin/queue-publish` and read access to the queue side's results
+  the queue side's publish command and read access to the queue side's results
 - a registered runner name and host name that do not identify internal
   infrastructure, since GitHub prints both into every job log
 
@@ -178,9 +179,11 @@ That test reads the workflow files on `main`. A workflow on another branch of
 this repository can still name the runner's label, which is one reason the
 runner holds no credential, below. On `main`, the tests also refuse any
 other workflow that names the `queue-report` label or these workflows, so none
-sends a job to the runner or waits on them by mistake. The runner itself
-refuses, before any step runs, every job that is not one of these two
-workflows as it is on `main`. Whether this
+sends a job to the runner or waits on them by mistake. The runner is set up to
+run only these two workflows as they are on `main`, by a check on the runner
+that runs before any step. That check lives outside this repository, so
+nothing here can verify it; the runner is still treated as untrusted, as above
+and below. Whether this
 workflow's check is required before merging is a repository setting the test
 cannot see. It must not be: a manual-only workflow never reports on a pull
 request, so requiring it would block every merge.
@@ -217,7 +220,8 @@ file.
 credential and sends nothing to the queue: the runner, which sits next to the
 queue side, asks it for a run of a branch, and the queue side starts it with
 its own credential. It believes the request because of where it comes from,
-which is why the runner runs only these two workflows from `main`. The worst a
+which is why the runner is set up to run only these two workflows from `main`
+(a setting outside this repository). The worst a
 request can do is start a run of a branch already in this repository.
 
 **Only `/out` is published, and a missing run is never green.** Publishing by

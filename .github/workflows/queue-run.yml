@@ -2,11 +2,12 @@
 #
 # This job runs on the queue-report runner, which sits next to the queue. It asks
 # for a run of one branch of this repository (main when scheduled), waits for
-# every lane to finish (up to about five hours), then prints the run's report and
+# every lane to finish (up to 4 h 10 min), then prints the run's report and
 # lane matrix, uploads the lanes' files, and passes or fails with the run's
 # verdict. It needs no credential and no permission: the runner asks from where
-# it stands, and runs only this workflow and nightly-queue.yml as they are on
-# main. What that protects is in docs/nightly-on-the-queue.md.
+# it stands. The runner is set up to run only this workflow and nightly-queue.yml
+# as they are on main; that is enforced on the runner, outside this repository.
+# What that protects is in docs/nightly-on-the-queue.md.
 name: E2E on the queue
 
 on:
@@ -33,7 +34,8 @@ jobs:
   run:
     name: Run and publish
     runs-on: [queue-report]
-    # The wait for the run (5 h 20 min at most) plus publishing.
+    # The lanes' wait is at most 15000 s (4 h 10 min); finishing and publishing
+    # the run can take 30 min more, and the rest is margin.
     timeout-minutes: 330
     steps:
       - name: Run on the queue and publish

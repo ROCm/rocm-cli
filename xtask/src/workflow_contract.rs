@@ -8812,6 +8812,31 @@ permissions:
             );
         }
 
+        // Inputs reach a shell only through `env:`: an expression inside a
+        // `run:` script is substituted into the script text before the shell
+        // reads it, so a dispatched branch name could then be code. A script's
+        // comments count, as above.
+        let lines: Vec<&str> = text.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            let key = line.trim_start().trim_start_matches('-').trim_start();
+            // A step's key sits at least six deep; a job may itself be called `run`.
+            let Some(inline) = key.strip_prefix("run:").filter(|_| indent_of(line) >= 6) else {
+                continue;
+            };
+            let mut body = vec![inline];
+            body.extend(
+                lines[at + 1..]
+                    .iter()
+                    .take_while(|next| next.trim().is_empty() || indent_of(next) > indent_of(line))
+                    .copied(),
+            );
+            assert!(
+                !body.iter().any(|l| l.contains("${{")),
+                "{file} evaluates an expression inside a `run:` script: pass it \
+                 through `env:` and read the variable instead"
+            );
+        }
+
         // Keys, by contrast, are only keys outside comments.
         let keys = flatten(&without_comments(&text));
         for (start, _) in keys.match_indices("uses:") {
@@ -9144,7 +9169,7 @@ permissions:
     /// directory that becomes the whole `PATH`, so a test decides what is
     /// missing.
     #[cfg(unix)]
-    const LANE_TOOLS: [&str; 6] = ["bash", "dirname", "mkdir", "cp", "cat", "rm"];
+    const LANE_TOOLS: [&str; 7] = ["bash", "dirname", "mkdir", "cp", "cat", "rm", "chmod"];
 
     /// One run of the lane script against stubbed tools: how often
     /// `apt-get update` fails first, what the suite exits with (on the nightly
@@ -9157,6 +9182,10 @@ permissions:
         suite_rc: i32,
         nightly_rc: Option<i32>,
         channels: Option<&'static str>,
+        /// What `uname -m` says, and whether the downloaded rustup-init
+        /// matches the sum the script records.
+        machine: &'static str,
+        checksum_ok: bool,
         cargo_installed: bool,
         out_blocked: bool,
     }
@@ -9169,6 +9198,8 @@ permissions:
                 suite_rc: 0,
                 nightly_rc: None,
                 channels: None,
+                machine: "x86_64",
+                checksum_ok: true,
                 cargo_installed: true,
                 out_blocked: false,
             }
@@ -9258,12 +9289,28 @@ permissions:
             &tools.join("curl"),
             format!(
                 "#!/bin/bash\necho \"curl $*\" >&2\n\
-                 echo 'echo \"rustup-init $*\"; mkdir -p \"$HOME/.cargo\"; \
-                 echo \"export PATH={bin}:\\$PATH\" > \"$HOME/.cargo/env\"'\n",
+                 while [ $# -gt 0 ]; do [ \"$1\" = -o ] && {{ dest=$2; shift; }}; shift; done\n\
+                 printf '%s\\n' '#!/bin/bash' \
+                 'echo \"rustup-init $*\"; mkdir -p \"$HOME/.cargo\"; \
+                 echo \"export PATH={bin}:\\$PATH\" > \"$HOME/.cargo/env\"' > \"$dest\"\n",
                 bin = home.join(".cargo/bin").display()
             ),
         )
         .expect("stub curl");
+        write_fake_executable(
+            &tools.join("uname"),
+            format!("#!/bin/sh\necho {}\n", case.machine),
+        )
+        .expect("stub uname");
+        // Logs the line it is asked to check, which holds the recorded sum.
+        write_fake_executable(
+            &tools.join("sha256sum"),
+            format!(
+                "#!/bin/bash\nread -r line\necho \"sha256sum $* <<< $line\" >&2\n{}\n",
+                if case.checksum_ok { "exit 0" } else { "exit 1" }
+            ),
+        )
+        .expect("stub sha256sum");
         write_fake_executable(
             &cargo_bin.join("cargo"),
             format!(
@@ -9479,8 +9526,19 @@ permissions:
             ..LaneCase::default()
         });
         assert_eq!(rc, 0, "{log}");
+        // A pinned rustup-init over TLS, not a script piped into a shell, and
+        // checked against the sum recorded for this machine before it runs.
         assert!(
-            log.contains("curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs"),
+            log.contains(
+                "curl --proto =https --tlsv1.2 -sSf -o "
+            ) && log.contains(
+                "https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("sh.rustup.rs"), "{log}");
+        assert!(
+            log.contains("b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  "),
             "{log}"
         );
         // No default toolchain: rust-toolchain.toml picks it.
@@ -9490,6 +9548,47 @@ permissions:
         );
         assert!(log.contains("cargo xtask e2e\n"), "{log}");
         assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_init_that_does_not_match_its_sum_is_never_run() {
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            checksum_ok: false,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(log.contains("does not match its recorded SHA-256"), "{log}");
+        assert!(!log.contains("rustup-init -y"), "{log}");
+        assert!(!log.contains("cargo"), "nothing is built:\n{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rustup_pin_follows_the_machine() {
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            machine: "aarch64",
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("1.29.3/aarch64-unknown-linux-gnu/rustup-init"),
+            "{log}"
+        );
+        assert!(
+            log.contains("9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282  "),
+            "{log}"
+        );
+
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            cargo_installed: false,
+            machine: "riscv64",
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(log.contains("no pinned rustup-init for riscv64"), "{log}");
     }
 
     #[cfg(unix)]
