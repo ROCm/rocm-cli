@@ -81,9 +81,30 @@ pub(super) struct PlatformVersions {
     /// managed runtime was active — those render as a single unlabelled column.
     #[serde(default)]
     pub(super) channel: Option<String>,
+    /// Exact GFX target the active runtime was installed for. `None` on
+    /// artifacts predating the field or for a runtime that records none.
+    #[serde(default)]
+    pub(super) gfx_target: Option<String>,
+    /// Package source the active runtime was installed from: index URL plus
+    /// source layout generation, as the runtime's own record has it.
+    #[serde(default)]
+    pub(super) source: Option<String>,
 }
 
 impl PlatformVersions {
+    /// "target gfx1100 · source <url> (<generation>)" for the summary-matrix
+    /// Platform cell, skipping what is unknown. Empty when neither is known.
+    pub(super) fn provenance(&self) -> String {
+        [
+            self.gfx_target.as_deref().map(|v| format!("target {v}")),
+            self.source.as_deref().map(|v| format!("source {v}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
     /// Rendered "os X · ROCm Y · vLLM Z · lemonade W" line for a column heading,
     /// skipping absent components. Empty when nothing is known.
     pub(super) fn summary(&self) -> String {

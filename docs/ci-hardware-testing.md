@@ -262,6 +262,22 @@ setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
 
+Each row of that page is one lane and package channel. Its Platform cell lists
+the ROCm, vLLM and lemonade versions the run served on, then the exact GFX
+target and the package source (index URL and source layout generation) the
+active runtime was installed from. Both are read from that runtime's own
+registry record by the harness (`collect_versions` in
+[`capability.rs`](../tests/e2e-cucumber/src/capability.rs)), never from a
+workflow label, so a lane running on a legacy or different source shows that
+source instead of the one the workflow meant. A row without
+them has no managed runtime, or its runtime's record predates the fields. What
+a lane skips on a given platform follows from the `@requires-*` tags above.
+
+To reproduce a lane's result locally, install the same runtime
+(`rocm install sdk --channel release|nightly --family <family>`) and run the
+scenario with `cargo xtask e2e -- -n "<scenario id>"`; the scenario ids are the
+anchors in the report.
+
 `nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
 via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
 build results, the consolidated E2E failure total, and the `e2e-report-nightly`

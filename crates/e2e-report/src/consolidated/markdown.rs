@@ -60,6 +60,12 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
             s if s.is_empty() => plat_base,
             s => format!("{plat_base}<br><sub>{s}</sub>"),
         };
+        // Exact target and package source on their own line, so a reader can see
+        // what the run installed from, not only which versions it ended up with.
+        let plat_cell = match r.versions.provenance() {
+            p if p.is_empty() => plat_cell,
+            p => format!("{plat_cell}<br><sub>{p}</sub>"),
+        };
         let os_cell = match r.versions.os.as_deref() {
             Some(v) if v != r.desc.os => format!("{}<br><sub>{}</sub>", r.desc.os, v),
             _ => r.desc.os.clone(),
@@ -788,6 +794,44 @@ mod tests {
         ] {
             assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }
+    }
+
+    #[test]
+    fn matrix_cell_names_the_exact_target_and_package_source() {
+        // platform.json carries the runtime's exact GFX target and package source;
+        // the matrix Platform cell shows both so a reader can tell what the run
+        // installed from. A platform.json without them shows neither.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let with = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"rocm":"7.14.0a20260601","channel":"nightly","gfx_target":"gfx942",
+                         "source":"https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"},
+            "expectations": [{"id":"serve-x","effective_engine":"vllm","expected":"pass"}]
+        }"#;
+        let (_d, path) = write_platform(&report, with);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
+        assert!(
+            md.contains(
+                "target gfx942 · source https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)"
+            ),
+            "target and source missing from the Platform cell:\n{md}"
+        );
+
+        let without = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"rocm":"7.14.0"},
+            "expectations": [{"id":"serve-x","effective_engine":"vllm","expected":"pass"}]
+        }"#;
+        let (_d, path) = write_platform(&report, without);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mi300x".to_string(), path)]));
+        assert!(
+            !md.contains("target gfx") && !md.contains("source http"),
+            "{md}"
+        );
     }
 
     #[test]

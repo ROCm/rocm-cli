@@ -1757,6 +1757,8 @@ jobs:
             echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
             echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
             echo
+            echo "Each row is one lane and package channel. Its Platform cell lists the ROCm and engine versions the run served on, plus the exact GFX target and the package source the runtime was installed from, read from the runtime's own record (a row without them has no managed runtime or an older record). What a lane skips on a given platform, and the commands to reproduce a lane, are in [docs/ci-hardware-testing.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/docs/ci-hardware-testing.md)."
+            echo
             cat consolidated/support-matrix.md
           } > "/tmp/${page}"
 

@@ -231,6 +231,17 @@ pub struct PlatformVersions {
     /// a mislabeled `--channel` flag can't misreport what's actually installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// Exact GFX target the active runtime was installed for, e.g. "gfx1100",
+    /// from its recorded wheel composition. `None` for a runtime that records
+    /// none (a tarball or legacy install).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gfx_target: Option<String>,
+    /// Where the active runtime's packages came from, as recorded in its
+    /// registry record: the index URL and, in parentheses, the source layout
+    /// generation, e.g. "https://repo.amd.com/rocm/whl-multi-arch (multi-arch-v2)".
+    /// Read from the runtime, never from a workflow-passed label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Collect component versions for the report from the installed managed runtime.
@@ -258,20 +269,32 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // ROCm/vLLM/lemonade versions come from the installed managed runtime. Only
     // available when CI provides a persistent runtimes dir (E2E_SHARED_RUNTIMES_DIR)
     // — mock has no runtime, and per-scenario isolated installs are gone by now.
-    if let Some((rocm, channel, root)) = runtimes_dir.and_then(active_runtime_install_root) {
-        v.rocm = Some(rocm);
-        v.channel = channel;
+    if let Some(runtime) = runtimes_dir.and_then(active_runtime_install_root) {
+        v.rocm = Some(runtime.version);
+        v.channel = runtime.channel;
+        v.gfx_target = runtime.gfx_target;
+        v.source = runtime.source;
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
-        v.vllm = vllm_version_from_venv(&root);
+        v.vllm = vllm_version_from_venv(&runtime.root);
         // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
-        v.lemonade = lemonade_version(&root);
+        v.lemonade = lemonade_version(&runtime.root);
     }
 
     v
 }
 
-/// Read the active managed runtime's `(version, channel, install_root)` from the
-/// runtimes registry. Returns `None` when the tree names no single runtime.
+/// What the report reads from the active managed runtime's registry record.
+#[derive(Debug)]
+struct ActiveRuntime {
+    version: String,
+    channel: Option<String>,
+    root: std::path::PathBuf,
+    gfx_target: Option<String>,
+    source: Option<String>,
+}
+
+/// Read the active managed runtime's version, channel, install root, exact GFX
+/// target and package source from the runtimes registry. Returns `None` when the tree names no single runtime.
 /// `channel` is `None` for a registry record predating the field.
 ///
 /// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
@@ -301,9 +324,7 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 /// fallback yields an in-tree path or nothing. Where every entry is such a
 /// corpse this returns `None` and the report simply omits the version — absent
 /// reads as unknown, which is the honest outcome; a wrong version reads as fact.
-fn active_runtime_install_root(
-    runtimes_dir: &std::path::Path,
-) -> Option<(String, Option<String>, std::path::PathBuf)> {
+fn active_runtime_install_root(runtimes_dir: &std::path::Path) -> Option<ActiveRuntime> {
     let key = crate::shared_runtime::runtime_key_to_activate(runtimes_dir)?;
     let manifest = runtimes_dir.join("registry").join(format!("{key}.json"));
     let json: serde_json::Value =
@@ -321,7 +342,29 @@ fn active_runtime_install_root(
     } else {
         std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
-    Some((version, channel, root))
+    let gfx_target = json
+        .pointer("/wheel_composition/rocm_sdk_target")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let source = json
+        .get("index_url")
+        .and_then(serde_json::Value::as_str)
+        .map(|url| {
+            match json
+                .get("source_layout_generation")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(generation) => format!("{url} ({generation})"),
+                None => url.to_owned(),
+            }
+        });
+    Some(ActiveRuntime {
+        version,
+        channel,
+        root,
+        gfx_target,
+        source,
+    })
 }
 
 /// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
@@ -1210,14 +1253,62 @@ Local model engines
         )
         .expect("write marker");
 
-        let (version, channel, root) =
-            active_runtime_install_root(dir).expect("a runtime is named");
-        assert_eq!(version, "7.14.0");
-        assert_eq!(channel.as_deref(), Some("nightly"));
+        let runtime = active_runtime_install_root(dir).expect("a runtime is named");
+        assert_eq!(runtime.version, "7.14.0");
+        assert_eq!(runtime.channel.as_deref(), Some("nightly"));
         assert_eq!(
-            root,
+            runtime.root,
             dir.join("wheel").join("release-wheel-multi-arch-7-14-0")
         );
+    }
+
+    /// The matrix names the exact target and package source the run served on,
+    /// read from the runtime's own record. A record that predates either field
+    /// reports none: absent reads as unknown, a guess reads as fact.
+    #[test]
+    fn reports_the_active_runtimes_target_and_source_from_its_record() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        let key = "nightly-wheel-multi-arch-7-14-0a20260601-0123456789abcdef";
+        let registry = dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": "7.14.0a20260601",
+                "install_root": install_root,
+                "channel": "nightly",
+                "index_url": "https://rocm.nightlies.amd.com/whl-multi-arch",
+                "source_layout_generation": "multi-arch-v2",
+                "wheel_composition": {
+                    "source_layout_generation": "multi-arch-v2",
+                    "package_specs": [],
+                    "rocm_sdk_target": "gfx1100"
+                },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let runtime = active_runtime_install_root(dir).expect("one runtime");
+        assert_eq!(runtime.gfx_target.as_deref(), Some("gfx1100"));
+        assert_eq!(
+            runtime.source.as_deref(),
+            Some("https://rocm.nightlies.amd.com/whl-multi-arch (multi-arch-v2)")
+        );
+
+        let legacy_dir = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        write_manifest(
+            legacy_dir.path(),
+            "release-wheel-gfx94x-dcgpu-7-13-0",
+            "7.13.0",
+        );
+        let legacy = active_runtime_install_root(legacy_dir.path()).expect("one runtime");
+        assert_eq!(legacy.gfx_target, None);
+        assert_eq!(legacy.source, None);
     }
 
     /// Several runtimes and no marker: report nothing rather than guess. An
