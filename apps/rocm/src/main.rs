@@ -10,6 +10,7 @@ mod advised_commands;
 #[path = "../../../crates/rocm-core/src/archive_props.rs"]
 mod archive_props;
 mod automations;
+mod background_helper;
 mod bootstrap;
 mod bridge_snapshot;
 mod chat;
@@ -23,6 +24,7 @@ mod comfyui;
 mod config_cmd;
 mod dash;
 mod dash_seam;
+mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod deletion_properties;
@@ -57,6 +59,7 @@ mod runtime_services;
 mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_port;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
@@ -106,12 +109,13 @@ mod update_cmd;
 // reaches them via its own imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
-// `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
+// `crate::<name>`.
 // `therock_install_version_selector` (from `install_cmd.rs`) is re-imported for
-// the same reason: `chat.rs` reaches it as `crate::therock_install_version_selector`.
+// the same reason: `chat/mcp_bridge.rs` reaches it as
+// `crate::therock_install_version_selector`.
 // `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
-// (from `bridge_snapshot.rs`) are re-imported only so `chat.rs` keeps reaching
-// them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
+// (from `bridge_snapshot.rs`) are re-imported only so `chat/mcp_bridge.rs` keeps
+// reaching them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
 // `dispatch()` as well.
 // The clap command tree and its value enums (from `cli.rs`) are re-imported so
 // every module keeps reaching them as `crate::Command`, `crate::Provider` and so
@@ -123,9 +127,9 @@ use crate::bridge_snapshot::{
 };
 use crate::chat_cmd::run_chat_command;
 use crate::cli::{
-    AutomationsCommand, BenchCommand, Cli, ComfyuiCommand, Command, ConfigCommand, DevicePolicyArg,
-    EnginesCommand, InstallFormat, InstallTarget, Provider, RuntimesCommand, SandboxToolArg,
-    ServicesCommand, SetupCommand, StorageCommand,
+    AutomationsCommand, BenchCommand, Cli, Command, ConfigCommand, DevicePolicyArg, EnginesCommand,
+    InstallFormat, InstallTarget, Provider, RuntimesCommand, SandboxToolArg, ServicesCommand,
+    SetupCommand, StorageCommand,
 };
 // Reached only as `super::SUPPORTED_ENGINES` from `advised_commands.rs`'s test,
 // so a non-test build does not carry it.
@@ -169,7 +173,7 @@ use crate::service_control::run_internal_sandbox_tool;
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    render_internal_status_text, render_logs_browser_text, render_logs_text,
+    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
@@ -330,14 +334,15 @@ fn run() -> Result<()> {
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let _log_guard = AppPaths::discover()
-        .ok()
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let _log_guard = logging::is_enabled_for(&raw_args)
+        .then(AppPaths::discover)
+        .and_then(Result::ok)
         .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
     maybe_notice_legacy_uv_cache();
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
     }
@@ -681,9 +686,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             distro,
             model,
+            context_size,
+            kv_cache_type,
             report,
             send,
-        }) => diagnose(symptom, top, json, distro, model, report, send),
+        }) => {
+            let model = model.map(|model_ref| {
+                diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            diagnose(symptom, top, json, distro, model, report, send)
+        }
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -822,6 +834,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -844,6 +857,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -856,13 +870,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             api_key,
             engine_env,
         }),
-        Some(Command::Comfyui { command }) => comfyui(command),
+        Some(Command::Comfyui { command }) => comfyui::run(command),
         Some(Command::Services { command }) => services(command),
         Some(Command::Remote { command }) => remote::run(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
+            follow,
             search,
             query,
         }) => {
@@ -878,7 +893,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
             if let Some(service_id) = service {
-                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                if follow {
+                    follow_service_logs(&paths, &service_id)?;
+                } else {
+                    print!("{}", render_service_logs_text(&paths, &service_id)?);
+                }
             } else {
                 let query = if search.is_empty() {
                     (!query.is_empty()).then(|| query.join(" "))
@@ -1086,169 +1105,6 @@ fn platform_refusal(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Op
         PlatformRuleOut::Allowed
         | PlatformRuleOut::NativeWindowsAim
         | PlatformRuleOut::AimDockerUnavailable => None,
-    }
-}
-
-fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    match command.unwrap_or(ComfyuiCommand::Status) {
-        ComfyuiCommand::Status => {
-            print!("{}", comfyui::render_status(&paths, &config)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_status",
-                "info",
-                "rendered ComfyUI status",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::ModelsPath => {
-            print!("{}", comfyui::render_models_path(&paths)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_models_path",
-                "info",
-                "rendered ComfyUI models path",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::Logs { lines } => {
-            print!("{}", comfyui::render_logs(&paths, lines)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_logs",
-                "info",
-                "rendered ComfyUI logs",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::Install {
-            runtime_id,
-            reinstall,
-            dry_run,
-            yes: _,
-        } => {
-            match comfyui::install(
-                &paths,
-                &config,
-                comfyui::ComfyUiInstallOptions {
-                    runtime_id: runtime_id.clone(),
-                    reinstall,
-                    dry_run,
-                },
-            ) {
-                Ok(text) => {
-                    print!("{text}");
-                    record_cli_audit_event(
-                        &paths,
-                        "app",
-                        if dry_run {
-                            "comfyui_install_dry_run"
-                        } else {
-                            "comfyui_install"
-                        },
-                        "info",
-                        format!(
-                            "ComfyUI install completed runtime={} reinstall={} dry_run={}",
-                            runtime_id.as_deref().unwrap_or("<selected>"),
-                            reinstall,
-                            dry_run
-                        ),
-                        None,
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    record_cli_audit_event(
-                        &paths,
-                        "app",
-                        if dry_run {
-                            "comfyui_install_dry_run"
-                        } else {
-                            "comfyui_install"
-                        },
-                        "error",
-                        format!(
-                            "ComfyUI install failed runtime={} reinstall={} dry_run={}: {error}",
-                            runtime_id.as_deref().unwrap_or("<selected>"),
-                            reinstall,
-                            dry_run
-                        ),
-                        None,
-                    );
-                    Err(error)
-                }
-            }
-        }
-        ComfyuiCommand::Start {
-            host,
-            port,
-            no_open_browser,
-            yes: _,
-        } => match comfyui::start(
-            &paths,
-            comfyui::ComfyUiStartOptions {
-                host,
-                port,
-                no_open_browser,
-            },
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_start",
-                    "info",
-                    "ComfyUI start requested",
-                    None,
-                );
-                Ok(())
-            }
-            Err(error) => {
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_start",
-                    "error",
-                    format!("ComfyUI start failed: {error}"),
-                    None,
-                );
-                Err(error)
-            }
-        },
-        ComfyuiCommand::Stop { yes: _ } => match comfyui::stop(&paths) {
-            Ok(text) => {
-                print!("{text}");
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "info",
-                    "ComfyUI stop requested",
-                    None,
-                );
-                Ok(())
-            }
-            Err(error) => {
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "error",
-                    format!("ComfyUI stop failed: {error}"),
-                    None,
-                );
-                Err(error)
-            }
-        },
     }
 }
 

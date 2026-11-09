@@ -1212,15 +1212,30 @@ jobs:
         }
     }
 
+    /// What the E2E gate step produced: the `run=` value it wrote to
+    /// `$GITHUB_OUTPUT` and everything it printed to stdout (where a
+    /// `::notice::` annotation goes).
+    #[cfg(unix)]
+    struct E2eGateOutcome {
+        run: String,
+        stdout: String,
+    }
+
     /// Run `ci.yml`'s E2E "Decide whether to run" step under bash, as a `run:`
     /// step does, with each `${{ … }}` expression replaced by the value given
-    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT`.
+    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT` together
+    /// with what it printed to stdout (where a `::notice::` annotation goes).
     ///
     /// An expression the table does not name fails the test rather than
     /// expanding to nothing, so the gate cannot start reading a new context
     /// that this test silently feeds as empty.
     #[cfg(unix)]
-    fn run_e2e_gate(event: &str, build_and_test: &str, heavy: &str) -> String {
+    fn run_e2e_gate(
+        event: &str,
+        clippy: &str,
+        build_and_test: &str,
+        heavy: &str,
+    ) -> E2eGateOutcome {
         let ci = read_workflow("ci.yml");
         let step = job_steps(job_block(&ci, "e2e"))
             .expect("ci.yml's `e2e` job has a `steps:` list")
@@ -1228,12 +1243,13 @@ jobs:
             .find_map(|(name, step)| (name == "Decide whether to run").then_some(step))
             .expect("ci.yml's `e2e` job has a \"Decide whether to run\" step");
         let mut script = dedent(&run_block(&step).expect(
-            "the E2E gate step has no `run: |` block; `run_block` reads only that \
-             literal form, not `run: |-`, `run: >` or a one-line `run:`",
+            "the E2E gate step has no block-scalar `run:`; `run_block` reads `run: |`, \
+             `run: |-`, `run: >` and the like, but not a one-line `run:`",
         ))
         .expect("the gate step's script is not empty");
         let values = [
             ("github.event_name", event),
+            ("needs.clippy.result", clippy),
             ("needs.build-and-test.result", build_and_test),
             ("needs.changes.outputs.heavy", heavy),
         ];
@@ -1278,7 +1294,58 @@ jobs:
             1,
             "the E2E gate writes `run=` exactly once; wrote {written:?}"
         );
-        runs[0].to_owned()
+        E2eGateOutcome {
+            run: runs[0].to_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        }
+    }
+
+    /// Assert the gate's two observable effects together: the `run=` it wrote
+    /// and whether it printed a `::notice::`. `notice_for` is `Some(result)`
+    /// when the notice must be printed and must name that clippy result, and
+    /// `None` when no notice may be printed at all.
+    #[cfg(unix)]
+    fn assert_e2e_gate(
+        event: &str,
+        clippy: &str,
+        build_and_test: &str,
+        heavy: &str,
+        expected_run: &str,
+        notice_for: Option<&str>,
+    ) {
+        let E2eGateOutcome { run, stdout } = run_e2e_gate(event, clippy, build_and_test, heavy);
+        let context = format!(
+            "ci.yml E2E gate with event={event}, clippy={clippy}, \
+             build-and-test={build_and_test}, heavy={heavy:?}"
+        );
+        assert_eq!(run, expected_run, "{context}: wrong `run=`");
+        match notice_for {
+            Some(result) => {
+                assert!(
+                    stdout.contains("::notice") && stdout.contains(&format!("result: {result}")),
+                    "{context}: must print a notice naming clippy's result, got {stdout:?}"
+                );
+                // The notice is printed for every non-success result, including
+                // `cancelled`, where nothing is red and nothing is blocked. So it
+                // may tell the reader what to re-run but must not claim the merge
+                // is blocked; `run=false` above is what makes "no scenario ran" true.
+                // Re-running only this job would reuse the clippy result recorded
+                // by the earlier attempt, so the advice is to re-run the workflow,
+                // which runs clippy again and then this job.
+                assert!(
+                    stdout.contains("re-run the workflow")
+                        && !stdout.contains("re-run this job")
+                        && !stdout.contains("blocks the merge"),
+                    "{context}: the notice must say to re-run the workflow, must not say to \
+                     re-run only this job (it would reuse the old clippy result) and must not \
+                     assert a merge block that a `cancelled` clippy does not cause, got {stdout:?}"
+                );
+            }
+            None => assert!(
+                !stdout.contains("::notice"),
+                "{context}: must not print the clippy skip notice, got {stdout:?}"
+            ),
+        }
     }
 
     /// The E2E scenarios run whenever `build-and-test` reached a verdict, not
@@ -1292,7 +1359,9 @@ jobs:
     #[cfg(unix)]
     #[test]
     fn e2e_gate_runs_scenarios_whenever_build_and_test_reached_a_verdict() {
-        // (event, build-and-test result, heavy, expected run=)
+        // (event, build-and-test result, heavy, expected run=); clippy passed
+        // in every case, which `e2e_gate_skips_scenarios_unless_clippy_passed`
+        // varies.
         let cases = [
             ("pull_request", "success", "true", "true"),
             ("pull_request", "failure", "true", "true"),
@@ -1305,11 +1374,44 @@ jobs:
         ];
         for (event, result, heavy, expected) in cases {
             assert_eq!(
-                run_e2e_gate(event, result, heavy),
+                run_e2e_gate(event, "success", result, heavy).run,
                 expected,
                 "ci.yml E2E gate with event={event}, build-and-test={result}, heavy={heavy:?}"
             );
         }
+    }
+
+    /// A lint-red run spends no E2E runner time: the scenarios run only when
+    /// `clippy` succeeded, whatever `build-and-test` did, and the skip says why.
+    ///
+    /// `clippy` is a required check of its own, so a red one blocks the merge
+    /// regardless of E2E. The skipped E2E check then reports green without
+    /// having run a scenario, which is the same shape as a skipped build; the
+    /// `::notice::` the gate prints is what keeps that from being silent. The
+    /// notice's claim that no scenario ran is the `run=false` asserted next to
+    /// it, and `ci_e2e_steps_after_the_gate_follow_its_decision` is what makes
+    /// every later step honour that decision. A `cancelled` clippy reaches the
+    /// same branch with nothing red, so the notice must hold for it too: it says
+    /// to re-run the workflow (not just this job, which would reuse the old
+    /// clippy result), and does not say the merge is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_gate_skips_scenarios_unless_clippy_passed() {
+        for event in ["push", "pull_request", "merge_group"] {
+            for build in ["success", "failure"] {
+                for clippy in ["failure", "cancelled", "skipped"] {
+                    assert_e2e_gate(event, clippy, build, "true", "false", Some(clippy));
+                }
+                assert_e2e_gate(event, "success", build, "true", "true", None);
+            }
+            // A change with no heavy work has no E2E work to skip, so the clippy
+            // notice would be noise: it is for the run that would have run.
+            for clippy in ["success", "failure"] {
+                assert_e2e_gate(event, clippy, "success", "false", "false", None);
+            }
+        }
+        // `clippy` skips itself on a dispatch, which opens the gate regardless.
+        assert_e2e_gate("workflow_dispatch", "skipped", "skipped", "", "true", None);
     }
 
     /// The runner image a hosted Linux job's caches must be keyed by, as it
@@ -1602,9 +1704,9 @@ jobs:
                 assert!(
                     run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
                     "{workflow} job `{job}` names a GPU preflight step but no non-empty \
-                     `run: |` block was found in it, so as far as this check can tell it \
-                     waits for nothing. Only the literal `run: |` form is recognised: a \
-                     `run: |-`, `run: >` or one-line `run:` script reads as missing here"
+                     block-scalar `run:` was found in it, so as far as this check can tell \
+                     it waits for nothing. Only a block-scalar `run:` (`|`, `|-`, `>`, …) \
+                     is read: a one-line `run:` script reads as missing here"
                 );
             }
         }
@@ -2214,20 +2316,22 @@ jobs:
         step
     }
 
-    /// The lines of a step's `run: |` block, still indented.
+    /// The lines of a step's block-scalar `run:` (`run: |`, `|-`, `>`, `>-`,
+    /// …), still indented and, for a folded `>` block, not yet folded: see
+    /// [`run_script`] for the script the shell is handed.
     ///
-    /// Only the literal `run: |` form is recognised. `run: |-`, `run: >` and a
-    /// one-line `run: cmd` all read as no block, so a check that asserts a step
-    /// *has* a script relies on every workflow in this repo using `run: |`, and
-    /// has to say so in its failure message rather than claim the step is empty.
+    /// Every block-scalar header is recognised (see [`run_block_header`]), but a
+    /// one-line `run: cmd` reads as no block, so a check that asserts a step
+    /// *has* a script relies on every such step in this repo using a block
+    /// scalar, and has to say so in its failure message rather than claim the
+    /// step is empty.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
     /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
+        let (run_at, run_indent, _, _) = run_block_header(&lines)?;
         let mut body: Vec<&str> = lines[run_at + 1..]
             .iter()
             .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
@@ -2239,7 +2343,97 @@ jobs:
         Some(body)
     }
 
-    /// The non-comment lines of a step's `run: |` block, joined.
+    /// Where a step's block-scalar `run:` opens: the index of its `run:` line
+    /// in `lines`, the column of the `run` key, whether the block is folded
+    /// (`>`) rather than literal (`|`), and its indentation indicator, if it
+    /// has one. The key may be the step's first (`- run: |`), two columns in
+    /// from the dash.
+    ///
+    /// Any block-scalar header counts — `|` or `>`, with or without a
+    /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
+    /// without a trailing comment — since every one of them hands the step a
+    /// multi-line script.
+    ///
+    /// The first `run:` key at any depth is taken, so a `run:` nested under
+    /// some other key (an action's `with:` input) would be read as the
+    /// step's script. No workflow here has one; a step that does would need
+    /// this to match only at the step's own key column.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool, Option<usize>)> {
+        lines.iter().enumerate().find_map(|(at, line)| {
+            let code = strip_comment(line).trim();
+            let (key, key_column) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), indent_of(line) + 2),
+                None => (code, indent_of(line)),
+            };
+            let indicator = key.strip_prefix("run:")?.trim();
+            let folded = match indicator.chars().next()? {
+                '|' => false,
+                '>' => true,
+                _ => return None,
+            };
+            let modifiers = &indicator[1..];
+            if !modifiers
+                .chars()
+                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+            {
+                return None;
+            }
+            let indent = modifiers
+                .chars()
+                .find_map(|c| c.to_digit(10))
+                .map(|digit| digit as usize);
+            Some((at, key_column, folded, indent))
+        })
+    }
+
+    /// The script a step's block-scalar `run:` hands its shell, one entry per
+    /// line: [`run_block`]'s lines, folded the way YAML folds a `>` block.
+    ///
+    /// In a folded block a line break between two lines at the block's own
+    /// indent becomes a space, so two such lines are ONE line of script; a
+    /// blank line ends the line, and a more-indented line keeps the breaks
+    /// around it. A literal `|` block is the script as written.
+    ///
+    /// The block's indent is the `run` key's column plus its indentation
+    /// indicator (`>2`) when it has one, as YAML reads it; otherwise the
+    /// indent of its first non-blank line.
+    fn run_script(step: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let (_, run_indent, folded, indicator) = run_block_header(&lines)?;
+        let body = run_block(step)?;
+        if !folded {
+            return Some(body.iter().map(|line| (*line).to_owned()).collect());
+        }
+        let indent = indicator.map_or_else(
+            || {
+                body.iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or(0, |line| indent_of(line))
+            },
+            |digit| run_indent + digit,
+        );
+        let mut script: Vec<String> = Vec::new();
+        let mut folds_onto_last = false;
+        for line in body {
+            if line.trim().is_empty() {
+                script.push(String::new());
+                folds_onto_last = false;
+                continue;
+            }
+            let at_block_indent = indent_of(line) == indent;
+            match script.last_mut() {
+                Some(last) if at_block_indent && folds_onto_last => {
+                    last.push(' ');
+                    last.push_str(line.trim_start());
+                }
+                _ => script.push(line.to_owned()),
+            }
+            folds_onto_last = at_block_indent;
+        }
+        Some(script)
+    }
+
+    /// The non-comment lines of a step's block-scalar `run:`, joined.
     ///
     /// A preflight step's body is the only place a lane can still spell its own
     /// floor (the WSL `${…:-8}` default, the PowerShell `else { 8 }`), and a
@@ -2422,7 +2616,8 @@ jobs:
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
     /// to end yields `None`; `preflight_powershell_script` carries those. Like
-    /// every caller of [`run_block`], only the literal `run: |` form is read.
+    /// every caller of [`run_block`], only a block-scalar `run:` is read, and a
+    /// folded `>` one line by line, without folding.
     fn preflight_shell_script(step: &str) -> Option<String> {
         let body = run_block(step)?;
         let body = match body
@@ -2498,6 +2693,82 @@ jobs:
         }
         let body = preflight_body_code(step);
         body.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || body.contains("else { 8 }")
+    }
+
+    /// `CARVEOUT_MAX_MIB` in MiB, read from the harness source as text.
+    ///
+    /// Read as text rather than imported: `xtask` has no edge to `e2e-cucumber`
+    /// and this check is not a reason to add one. Only the two spellings the
+    /// constant can reasonably take are understood, `<n> * 1024` and a bare
+    /// number, and anything else fails loudly instead of guessing.
+    fn carveout_max_mib(source: &str) -> u64 {
+        let line = source
+            .lines()
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("pub const CARVEOUT_MAX_MIB: u64 =")
+            })
+            .expect("device_memory.rs declares `pub const CARVEOUT_MAX_MIB: u64 = ...;`");
+        let expr = line
+            .split_once('=')
+            .and_then(|(_, rhs)| rhs.split_once(';'))
+            .map(|(expr, _)| expr.trim().replace('_', ""))
+            .expect("the constant's value ends in a semicolon");
+        let number = |s: &str| {
+            s.trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("cannot read {s:?} in `{expr}` as a number"))
+        };
+        match expr.split_once('*') {
+            Some((a, b)) => number(a) * number(b),
+            None => number(&expr),
+        }
+    }
+
+    #[test]
+    fn carveout_max_mib_reads_both_spellings() {
+        let spelled = |v: &str| format!("/// doc\npub const CARVEOUT_MAX_MIB: u64 = {v};\n");
+        assert_eq!(carveout_max_mib(&spelled("8 * 1024")), 8192);
+        assert_eq!(carveout_max_mib(&spelled("8192")), 8192);
+        assert_eq!(carveout_max_mib(&spelled("8_192")), 8192);
+    }
+
+    #[test]
+    fn the_serve_drain_carveout_limit_is_the_apu_lanes_preflight_floor() {
+        // The serve drain wait (`tests/e2e-cucumber/src/device_memory.rs`) treats
+        // a VRAM total under `CARVEOUT_MAX_MIB` as an APU's BIOS carveout and
+        // judges GTT instead. Its doc says that limit is the floor the APU lanes
+        // pass as `GPU_PREFLIGHT_MIN_FREE_GIB`, and nothing tied the two together:
+        // moving either one left the other quietly wrong, with every unit test
+        // green. A raised limit would send a small discrete card to GTT; a lowered
+        // floor with the limit left behind would judge a real carveout by VRAM.
+        //
+        // The APU floor is the smallest one any lane sets (the discrete lanes set
+        // a larger one), so this follows the lanes rather than a copy of 8.
+        let mut floors_gib = Vec::new();
+        for (_, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text) {
+                if let Some(floor) = preflight_floor(&step) {
+                    floors_gib.push(floor.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("a preflight floor of {floor:?} is not a whole number of GiB")
+                    }));
+                }
+            }
+        }
+        let apu_floor_gib = *floors_gib
+            .iter()
+            .min()
+            .expect("the self-hosted lanes set a preflight floor");
+        let source =
+            std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/src/device_memory.rs"))
+                .expect("reading tests/e2e-cucumber/src/device_memory.rs");
+        assert_eq!(
+            carveout_max_mib(&source),
+            apu_floor_gib * 1024,
+            "CARVEOUT_MAX_MIB no longer equals the APU lanes' GPU_PREFLIGHT_MIN_FREE_GIB \
+             ({apu_floor_gib} GiB); change them together, or the serve drain wait picks \
+             the wrong memory pool"
+        );
     }
 
     #[test]
@@ -2853,8 +3124,8 @@ jobs:
                 .and_then(|block| dedent(&block))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{workflow}'s clock-settling step has no `run: |` body (only the literal \
-                         `run: |` form is read; `run: |-`, `run: >` and one-line `run:` are not)"
+                        "{workflow}'s clock-settling step has no block-scalar `run:` body \
+                         (`run: |`, `run: >` and the like are read; a one-line `run:` is not)"
                     )
                 });
             bodies.push((workflow, body));
@@ -5921,10 +6192,12 @@ fi
 
     /// The other half of the ordering above: with `clippy` no longer ahead of
     /// `build-and-test`, a clippy-red run reaches the E2E job, so what keeps a
-    /// failed or skipped build from being read as a pass is the E2E job's own
-    /// gate. The job must need `build-and-test`, and every step after the gate step
-    /// must follow the gate's decision. What the gate decides is checked by
-    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict`.
+    /// lint-red, failed or skipped run from being read as a pass is the E2E job's
+    /// own gate. The job must need `clippy` and `build-and-test`, the two results
+    /// the gate reads, and every step after the gate step must follow the gate's
+    /// decision. What the gate decides is checked by
+    /// `ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict` and
+    /// `e2e_gate_skips_scenarios_unless_clippy_passed`.
     #[test]
     fn ci_e2e_steps_after_the_gate_follow_its_decision() {
         let ci = read_workflow("ci.yml");
@@ -5932,8 +6205,10 @@ fi
         let needs = yaml_value_at(&e2e, 4, "needs").expect("e2e declares `needs:`");
         assert_eq!(
             flattened_list_items(&needs),
-            ["changes", "build-and-test"],
-            "the e2e job must need `build-and-test`, which it consumes"
+            ["changes", "clippy", "build-and-test"],
+            "the e2e job must need `clippy` and `build-and-test`, which its gate reads; \
+             without `clippy` in `needs:` the gate's clippy result is empty and a lint-red \
+             run would be skipped, or run, by accident"
         );
         let steps = job_steps(&e2e).expect("e2e has steps");
         let gate_at = steps
@@ -5953,8 +6228,9 @@ fi
         }
     }
 
-    /// Run the e2e gate's own script, the way GitHub runs a step with no `shell:`
-    /// (`bash -e`), over every event and every `build-and-test` result. The gate
+    /// Run the e2e gate's own script through `run_e2e_gate`, the way GitHub runs
+    /// a step with no `shell:` (`bash -e`), over every event and every
+    /// `build-and-test` result. The gate
     /// opens once `build-and-test` ran to a verdict, `success` or `failure`: it is
     /// a matrix over both images and its result is the aggregate, so a failure on
     /// one image must not skip the other's E2E. A `skipped` or `cancelled` build
@@ -5964,66 +6240,27 @@ fi
     #[cfg(unix)]
     #[test]
     fn ci_e2e_gate_opens_only_once_build_and_test_ran_to_a_verdict() {
-        let ci = read_workflow("ci.yml");
-        let steps = job_steps(&ci_job(&ci, "e2e")).expect("e2e has steps");
-        let gate = steps
-            .iter()
-            .find(|(name, _)| name == "Decide whether to run")
-            .expect("e2e has a gate step named `Decide whether to run`");
-        let script = preflight_body_code(&gate.1);
-        let run = |event: &str, build: &str, heavy: &str| -> String {
-            let script = script
-                .replace("${{ github.event_name }}", event)
-                .replace("${{ needs.build-and-test.result }}", build)
-                .replace("${{ needs.changes.outputs.heavy }}", heavy);
-            assert!(
-                !script.contains("${{"),
-                "the gate reads an expression this test does not substitute: {script}"
-            );
-            let dir = tempfile::tempdir().expect("temp dir");
-            let output = dir.path().join("github_output");
-            std::fs::write(&output, "").expect("creating GITHUB_OUTPUT");
-            let out = std::process::Command::new("bash")
-                .args(["-e", "-c", &script])
-                .env("GITHUB_OUTPUT", &output)
-                .output()
-                .expect("running the e2e gate script");
-            assert_eq!(
-                exit_code(out.status, "the e2e gate script"),
-                0,
-                "the gate script must exit 0 for {event}/{build}/{heavy}"
-            );
-            std::fs::read_to_string(&output)
-                .expect("reading GITHUB_OUTPUT")
-                .trim()
-                .to_owned()
-        };
-
+        // The gate is driven through `run_e2e_gate`, which owns the `${{ }}`
+        // substitution, so a context the gate starts reading is added there once.
+        // `clippy` passed throughout, so the clippy notice must never print;
+        // `e2e_gate_skips_scenarios_unless_clippy_passed` varies it.
         for event in ["push", "pull_request", "merge_group"] {
             for ran in ["success", "failure"] {
-                assert_eq!(
-                    run(event, ran, "true"),
-                    "run=true",
-                    "{event}: a {ran} build-and-test ran to a verdict"
-                );
-                assert_eq!(
-                    run(event, ran, "false"),
-                    "run=false",
-                    "{event}: a {ran} build with no heavy change has no E2E work"
-                );
+                // A build that ran to a verdict opens the E2E work.
+                assert_e2e_gate(event, "success", ran, "true", "true", None);
+                // ... but with no heavy change there is no E2E work.
+                assert_e2e_gate(event, "success", ran, "false", "false", None);
             }
+            // A build that never ran to a verdict must not open the E2E work.
             for bad in ["skipped", "cancelled"] {
-                assert_eq!(
-                    run(event, bad, "true"),
-                    "run=false",
-                    "{event}: a {bad} build-and-test never ran to a verdict and must not open the E2E work"
-                );
+                assert_e2e_gate(event, "success", bad, "true", "false", None);
             }
         }
-        // build-and-test is skipped on a dispatch, so the dispatch opens the gate
-        // without it; the job-level platform gate decides whether the job runs.
+        // build-and-test and clippy are both skipped on a dispatch, so the
+        // dispatch opens the gate without them; the job-level platform gate
+        // decides whether the job runs.
         for build in ["success", "skipped", "failure"] {
-            assert_eq!(run("workflow_dispatch", build, ""), "run=true", "{build}");
+            assert_e2e_gate("workflow_dispatch", "skipped", build, "", "true", None);
         }
     }
 
@@ -6638,6 +6875,75 @@ fi
                  `always_run` while assuming the filter still gates correctly:\n{block}"
             );
         }
+    }
+
+    /// `cargo xtask check-architecture-doc` is only a gate if all three places
+    /// that can fail a change actually run it: the pre-commit hook, the pre-push
+    /// hook (which reads the working tree, so it catches a commit made with
+    /// `--no-verify` only when the tree is clean) and a `rust`-gated
+    /// step in the `clippy` CI job. The hook must also see every commit: the
+    /// answer depends on the whole tree, so a `files:` filter would let a
+    /// delete-only or doc-only commit skip it. CI's `rust` path filter must
+    /// include the doc itself, because deleting an entry changes the answer
+    /// though no `*.rs` file moved.
+    #[test]
+    fn architecture_doc_check_runs_in_hooks_and_ci() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "architecture-doc");
+        assert!(
+            hook_block_sets(block, "entry: cargo xtask check-architecture-doc"),
+            "architecture-doc hook must run `cargo xtask check-architecture-doc`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "stages: [pre-commit, pre-push]"),
+            "architecture-doc hook must run at both pre-commit and pre-push:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "always_run: true"),
+            "architecture-doc hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "architecture-doc hook must set `pass_filenames: false`:\n{block}"
+        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "architecture-doc hook must not have a file filter (`{filter_key}`): the check \
+                 reads the whole tree, so narrowing it would let a commit skip it:\n{block}"
+            );
+        }
+
+        let ci = read_workflow("ci.yml");
+        let command = "run: cargo xtask check-architecture-doc";
+        let at = ci
+            .find(command)
+            .unwrap_or_else(|| panic!("ci.yml must run `{command}`"));
+        let gate = ci[..at]
+            .lines()
+            .rev()
+            .take(2)
+            .any(|line| line.trim() == "if: needs.changes.outputs.rust == 'true'");
+        assert!(
+            gate,
+            "the `{command}` step must be gated on `needs.changes.outputs.rust == 'true'`, \
+             like the other xtask checks in the clippy job"
+        );
+
+        let start = ci
+            .find("            rust:\n")
+            .expect("ci.yml defines the `rust` path filter");
+        let end = start
+            + ci[start..]
+                .find("            heavy:\n")
+                .expect("ci.yml defines the `heavy` path filter after `rust`");
+        assert!(
+            ci[start..end].contains("- 'docs/architecture.md'"),
+            "the `rust` path filter must include docs/architecture.md, so a doc-only edit \
+             re-runs `{command}`"
+        );
     }
 
     // Extractor guards: prove the helpers above actually parse the shapes they
@@ -7483,20 +7789,34 @@ permissions:
 
     /// Every `shell: pwsh` step in `text` as `(name, step block)`.
     ///
-    /// The step is found from its `shell: pwsh` line by walking up to the
-    /// nearest `- ` item shallower than it, so the key order inside the step
-    /// does not matter.
+    /// The step is found from its `shell: pwsh` line: that line itself when
+    /// `shell:` is the step's first key (`- shell: pwsh`), and otherwise by
+    /// walking up to the nearest `- ` item shallower than it, so the key order
+    /// inside the step does not matter.
     fn pwsh_steps(text: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = text.lines().collect();
         let mut steps = Vec::new();
         for (at, line) in lines.iter().enumerate() {
-            if strip_comment(line).trim() != "shell: pwsh" {
+            let code = strip_comment(line).trim();
+            let (key, is_item) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (code, false),
+            };
+            if key
+                .strip_prefix("shell:")
+                .is_none_or(|shell| strip_quotes(shell.trim()) != "pwsh")
+            {
                 continue;
             }
             let shell_indent = indent_of(line);
-            let Some(start) = (0..at).rev().find(|&i| {
-                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
-            }) else {
+            let start = if is_item {
+                Some(at)
+            } else {
+                (0..at).rev().find(|&i| {
+                    indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+                })
+            };
+            let Some(start) = start else {
                 continue;
             };
             let step = step_block(&lines, start);
@@ -7506,9 +7826,14 @@ permissions:
     }
 
     /// PowerShell words that open a statement but are not a program to run.
-    const PWSH_KEYWORDS: [&str; 15] = [
+    ///
+    /// Every entry is a keyword to pwsh's own tokenizer
+    /// (`TokenTraits::HasTrait(kind, TokenFlags::Keyword)`), so none can name
+    /// a program at the start of a statement.
+    const PWSH_KEYWORDS: [&str; 22] = [
         "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
-        "catch", "finally", "throw", "exit", "return",
+        "catch", "finally", "throw", "exit", "return", "break", "continue", "begin", "process",
+        "end", "param", "trap",
     ];
 
     /// Whether a trimmed, comment-free pwsh statement runs an external
@@ -7534,7 +7859,7 @@ permissions:
             && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
     }
 
-    /// The statements of a pwsh `run: |` body, in order.
+    /// The statements of a pwsh `run:` script, in order.
     ///
     /// A line is split at its top-level `;`s (see
     /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
@@ -7640,29 +7965,205 @@ permissions:
     }
 
     /// The native-command statements in a pwsh body whose exit status
-    /// nothing reads: not the body's last statement, and not followed by a
-    /// statement that inspects `$LASTEXITCODE`.
+    /// nothing reads (see [`exit_status_is_read`]).
     fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
         let statements = pwsh_statements(body);
         statements
             .iter()
             .enumerate()
             .filter(|(i, line)| {
-                is_native_command_line(line)
-                    && statements
-                        .get(i + 1)
-                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+                is_native_command_line(line) && !exit_status_is_read(&statements[i + 1..])
             })
             .map(|(_, line)| line.clone())
             .collect()
     }
 
-    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
-    /// block, or its one-line `run:` value, which can chain statements with
-    /// `;` just the same.
+    /// Whether a native command's exit status is still in `$LASTEXITCODE`
+    /// when something reads it, given the statements that follow it.
+    ///
+    /// The statements are walked in order:
+    ///
+    /// - one that assigns `$LASTEXITCODE` overwrites the status: unread;
+    /// - one that otherwise mentions `$LASTEXITCODE` reads it: read;
+    /// - one that [leaves it alone](leaves_last_exit_code_alone) is passed
+    ///   over;
+    /// - anything else might run another program, or leave the script, before
+    ///   the status is read: unread.
+    ///
+    /// Running off the end is a read: GitHub's pwsh wrapper appends
+    /// `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+    /// so the step itself exits with the status.
+    fn exit_status_is_read(after: &[String]) -> bool {
+        for statement in after {
+            if assigns_last_exit_code(statement) {
+                return false;
+            }
+            if reads_last_exit_code(statement) {
+                return true;
+            }
+            if !leaves_last_exit_code_alone(statement) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a pwsh statement assigns `$LASTEXITCODE` (`= 0`, `+= 1`, with
+    /// or without a `global:`/`script:`/`local:` scope), so the status it
+    /// held is gone.
+    fn assigns_last_exit_code(statement: &str) -> bool {
+        let lower = statement.trim().to_ascii_lowercase();
+        let Some(variable) = lower.strip_prefix('$') else {
+            return false;
+        };
+        let variable = ["global:", "script:", "local:"]
+            .iter()
+            .find_map(|scope| variable.strip_prefix(scope))
+            .unwrap_or(variable);
+        variable.strip_prefix("lastexitcode").is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
+                .iter()
+                .any(|operator| rest.starts_with(operator))
+        })
+    }
+
+    /// Cmdlets that only write output, a stream or a file: none of them runs
+    /// a program or sets `$LASTEXITCODE`.
+    const PWSH_INERT_CMDLETS: [&str; 11] = [
+        "Write-Output",
+        "Write-Host",
+        "Write-Information",
+        "Write-Verbose",
+        "Write-Debug",
+        "Write-Warning",
+        "Out-File",
+        "Out-Null",
+        "Out-Host",
+        "Add-Content",
+        "Set-Content",
+    ];
+
+    /// Whether a pwsh statement can neither run a program nor touch
+    /// `$LASTEXITCODE`, so a native command's status survives it.
+    ///
+    /// Deliberately narrow, and erring towards "might": every quote in the
+    /// statement closes, and outside single quotes, which are literal, it
+    /// has no `(` (a subexpression
+    /// `$(…)` or a `(…)` argument runs a command, even inside double quotes),
+    /// no `{` (a script block), no `&` (the call operator, `&&`) and no
+    /// expanding `@"` here-string. What is left is a pipeline whose first
+    /// element is a value — a variable, a string or a number — or an
+    /// assignment of one, or one of [`PWSH_INERT_CMDLETS`], and whose every
+    /// later element is one of those cmdlets. Anything else, a keyword
+    /// (`exit`, a loop's closing `}`) or a function call included, is not.
+    fn leaves_last_exit_code_alone(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        if code.contains(['(', '{', '&']) || code.contains("@\"") {
+            return false;
+        }
+        code.split('|').enumerate().all(|(at, element)| {
+            let element = element.trim();
+            let first = element.split_whitespace().next().unwrap_or_default();
+            PWSH_INERT_CMDLETS
+                .iter()
+                .any(|cmdlet| cmdlet.eq_ignore_ascii_case(first))
+                || (at == 0 && is_value_or_assignment(element))
+        })
+    }
+
+    /// Whether a pipeline element is a plain value (`$x`, `"text"`, `'text'`,
+    /// `42`, a literal here-string) or `$name = …` of one, with a target other
+    /// than `$LASTEXITCODE`. A `+=`-style operator counts as `=`.
+    fn is_value_or_assignment(element: &str) -> bool {
+        let value = match element.split_once('=') {
+            Some((target, value)) if element.starts_with('$') => {
+                let target = target
+                    .trim_end()
+                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
+                    .trim_end();
+                let name = target.trim_start_matches('$');
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    || assigns_last_exit_code(element)
+                {
+                    return false;
+                }
+                // `$a = $b = cargo …` chains: the value must pass in turn.
+                return is_value_or_assignment(value.trim());
+            }
+            _ => element,
+        };
+        value.starts_with(['$', '"', '\''])
+            || value.starts_with("@'")
+            || value.starts_with(|c: char| c.is_ascii_digit())
+    }
+
+    /// `statement` with the text inside its single-quoted strings removed:
+    /// that text is literal, so nothing in it can run. Double-quoted strings
+    /// are kept whole, since `$(…)` inside one does run, and a `'` inside one
+    /// is just a character.
+    ///
+    /// `None` when a quote is still open at the end: what it hides cannot be
+    /// told from literal text, so the caller must assume the worst. A stray
+    /// `'@ | git …` would otherwise reduce to a lone `'`, a plain value.
+    fn without_single_quoted_text(statement: &str) -> Option<String> {
+        let mut kept = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = statement.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => {
+                    quote = None;
+                    kept.push(c);
+                }
+                (Some('\''), _) => {}
+                (_, '`') => {
+                    kept.push(c);
+                    if let Some(escaped) = chars.next() {
+                        kept.push(escaped);
+                    }
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    kept.push(c);
+                }
+                _ => kept.push(c),
+            }
+        }
+        quote.is_none().then_some(kept)
+    }
+
+    /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
+    /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
+    /// the same variable and count just the same.
+    ///
+    /// Only a mention outside single quotes counts (`'$LASTEXITCODE'` is
+    /// literal text), and only of the whole name (`$LASTEXITCODEX` is another
+    /// variable). A statement with a quote left open reads nothing.
+    fn reads_last_exit_code(statement: &str) -> bool {
+        let Some(code) = without_single_quoted_text(statement) else {
+            return false;
+        };
+        let code = code.to_ascii_lowercase();
+        code.match_indices("$lastexitcode").any(|(at, name)| {
+            !code[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its
+    /// block-scalar `run:` (`|`, `|-`, `>`, `>-`, …, folded as YAML folds it),
+    /// or its one-line `run:` value, which can chain statements with `;` just
+    /// the same.
     fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
-        match run_block(step) {
-            Some(body) => unchecked_native_commands(&body),
+        match run_script(step) {
+            Some(script) => {
+                unchecked_native_commands(&script.iter().map(String::as_str).collect::<Vec<_>>())
+            }
             None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
         }
     }
@@ -7702,9 +8203,10 @@ permissions:
     /// python b.py --self-test   # exits 0
     /// ```
     ///
-    /// the step is green. Every native command that is not the body's last
-    /// statement must therefore have its `$LASTEXITCODE` read on the next
-    /// line, or be split into its own step (#633), or be allow-listed above
+    /// the step is green. Every native command must therefore have its
+    /// `$LASTEXITCODE` read before anything that could run another program or
+    /// reset it (see [`exit_status_is_read`]; the end of the body counts as a
+    /// read), or be split into its own step (#633), or be allow-listed above
     /// with the reason its failure still surfaces.
     #[test]
     fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
@@ -7750,7 +8252,8 @@ permissions:
             "these `shell: pwsh` steps run a native command whose failure the step \
              would not report, because pwsh carries on and the step takes only the last \
              command's exit code — split each into its own step, or check \
-             `$LASTEXITCODE` right after it:\n  {}",
+             `$LASTEXITCODE` before anything that could run another program or \
+             reset it:\n  {}",
             offenders.join("\n  ")
         );
         // An allow-list entry that no longer matches anything exempts nothing
@@ -8022,5 +8525,257 @@ permissions:
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, ["Package Windows bundle", "Plain"]);
+    }
+
+    /// PowerShell variable names are case-insensitive: a check spelled
+    /// `$LastExitCode` reads the same variable as `$LASTEXITCODE`.
+    #[test]
+    fn unchecked_native_commands_reads_last_exit_code_in_any_case() {
+        for check in [
+            "if ($LastExitCode -ne 0) { exit $LastExitCode }",
+            "if ($lastexitcode -ne 0) { exit 1 }",
+        ] {
+            let body = ["cargo build", check, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{check:?} reads the status: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+    }
+
+    /// A statement that opens with a PowerShell keyword runs no program, so
+    /// it is not a native command left unchecked before `cargo xtask e2e`.
+    #[test]
+    fn a_statement_opening_with_a_pwsh_keyword_is_not_a_native_command() {
+        for statement in [
+            "break",
+            "continue",
+            "begin {",
+            "process {",
+            "end {",
+            "param([string] $Target)",
+            "trap { Write-Output 'trapped' }",
+        ] {
+            assert!(
+                !is_native_command_line(statement),
+                "{statement:?} reads as a native command"
+            );
+            assert!(
+                unchecked_native_commands(&[statement, "cargo xtask e2e"]).is_empty(),
+                "{statement:?}"
+            );
+        }
+    }
+
+    /// Every block-scalar form of `run:` hands a pwsh step a script, so every
+    /// form is checked. Read only as `run: |`, a `run: |-`, `run: >` or
+    /// `run: >-` step fell through to the one-line reading, whose value is the
+    /// bare indicator, and so escaped the contract whatever its script did.
+    #[test]
+    fn unchecked_native_commands_reads_every_block_scalar_run_form() {
+        // Literal forms: each line is a line of script.
+        for header in ["run: |", "run: |-", "run: |+", "run: |2", "run: |-  # note"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+        // Folded forms: a blank line separates two lines of script.
+        for header in ["run: >", "run: >-", "run: >+"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+    }
+
+    /// A folded `run: >` block is read as YAML folds it: lines at the block's
+    /// indent join with a space into one line of script, a blank line starts
+    /// a new one, and a more-indented line keeps its own line. Taken line by
+    /// line instead, the first two lines below would read as two commands and
+    /// the first as unchecked, where pwsh is handed one `cargo` command.
+    #[test]
+    fn a_folded_run_block_is_read_as_yaml_folds_it() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >-\n          \
+                    cargo build\n          --locked\n\n          if ($LASTEXITCODE) {\n            \
+                    exit 1\n          }\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "          cargo build --locked",
+                "",
+                "          if ($LASTEXITCODE) {",
+                "            exit 1",
+                "          }",
+            ]
+        );
+        assert!(unchecked_native_commands_in_step(step).is_empty());
+    }
+
+    /// A folded block with an indentation indicator (`>2`) sets its own
+    /// indent: the run key's column plus the digit, not the indent of its
+    /// first line. Here the first line is more indented than that, so it
+    /// keeps its own line, and the two lines at the block's indent fold into
+    /// one. PyYAML reads both fixtures this way.
+    #[test]
+    fn a_folded_run_block_honours_its_indentation_indicator() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >2\n            \
+                    python a.py --self-test\n          python b.py --self-test\n          \
+                    python c.py\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "            python a.py --self-test",
+                "          python b.py --self-test python c.py",
+            ]
+        );
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["python a.py --self-test"]
+        );
+        // `run:` as the step's first key: the key, not the dash, sets the
+        // column the digit counts from.
+        let step =
+            "      - run: >2\n            a1\n          b\n          c\n        shell: pwsh\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            ["            a1", "          b c"]
+        );
+    }
+
+    /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
+    /// the step is pwsh, and its script checked, just the same. Matched only
+    /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
+    /// `- run: |` read as no script at all.
+    #[test]
+    fn a_pwsh_step_is_checked_whichever_key_comes_first() {
+        let script = "            python a.py --self-test\n            \
+                      python b.py --self-test\n";
+        for step in [
+            format!("      - shell: pwsh\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - shell: 'pwsh'\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - run: |\n{script}        shell: pwsh\n        name: Self-tests\n"),
+        ] {
+            let text = format!("jobs:\n  win:\n    runs-on: windows-latest\n    steps:\n{step}");
+            let found: Vec<(String, Vec<String>)> = pwsh_steps(&text)
+                .into_iter()
+                .map(|(name, step)| (name, unchecked_native_commands_in_step(&step)))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    "Self-tests".to_owned(),
+                    vec!["python a.py --self-test".to_owned()]
+                )],
+                "{step}"
+            );
+        }
+    }
+
+    /// A `$LASTEXITCODE` check need not be the very next statement: what
+    /// sits between may only be statements that can neither run a program
+    /// nor touch `$LASTEXITCODE`. Each case below was run through pwsh after
+    /// a native command exiting 3, under GitHub's wrapper: in every accepted
+    /// case the check still saw 3.
+    #[test]
+    fn a_later_last_exit_code_check_counts_when_nothing_between_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["Write-Output 'built'"][..],
+            &["Write-Host \"built $target\""],
+            &["$artifact = 'dist/rocm.zip'"],
+            &["$env:RESULT = $artifact", "$count += 1"],
+            &["\"k=v\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append"],
+            &[
+                "@'",
+                "## Summary (cargo build; git status)",
+                "'@ | Add-Content $env:GITHUB_STEP_SUMMARY",
+            ],
+            &["Write-Output 'one'", "$x = 'two'", "Write-Host $x"],
+            &["Write-Output 'done (all targets) & {more}'"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{between:?} leaves the status for the check: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+        // The end of the body is a read too: GitHub's wrapper exits with
+        // `$LASTEXITCODE`, which a trailing cmdlet leaves alone.
+        assert!(unchecked_native_commands(&["cargo build", "Write-Output 'done'"]).is_empty());
+    }
+
+    /// The other side of the rule: a statement that can run a program, leave
+    /// the script, or set `$LASTEXITCODE` between a native command and the
+    /// check leaves that command unchecked. Run through pwsh after a native
+    /// command exiting 3 (`.\scripts\collect.ps1` standing for a script
+    /// that ends `exit 0`), each of these lost the 3 before the check —
+    /// another status took its place, or the step left first — except the
+    /// two marked: one this check cannot tell from a statement that does,
+    /// and a loop's closing brace, which is not a statement on its own.
+    #[test]
+    fn a_later_last_exit_code_check_does_not_count_past_a_statement_that_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["git rev-parse HEAD"][..],
+            &["Write-Output (git rev-parse HEAD)"],
+            &["Write-Output \"sha: $(git rev-parse HEAD)\""],
+            &["Write-Output \"it's $(git rev-parse HEAD)\""],
+            &["& .\\scripts\\collect.ps1"],
+            &["$LASTEXITCODE = 0"],
+            &["$global:LastExitCode = 0"],
+            &["$sha = git rev-parse HEAD"],
+            &["$a = $b = git rev-parse HEAD"],
+            &["Write-Output 'x' | git hash-object --stdin"],
+            // Conservative: runs git only if Write-Output fails.
+            &["Write-Output 'x' || git rev-parse HEAD"],
+            &["@\"", "$(git rev-parse HEAD)", "\"@ | Out-File summary.md"],
+            &["Invoke-Expression 'git rev-parse HEAD'"],
+            &["Write-Output 'x' && git rev-parse HEAD"],
+            // A hashtable value is a statement, and runs.
+            &["Write-Output @{ sha = git rev-parse HEAD }"],
+            &["Write-Output @\"", "$(git rev-parse HEAD)", "\"@"],
+            &["exit 0"],
+            // A loop's closing brace: the check reads the last pass only.
+            &["}"],
+            &["Write-Output 'fine'", "git rev-parse HEAD"],
+            // An unclosed `'` hides the rest of the statement, so the
+            // statement is not known to be inert: here a stray closing
+            // marker would leave just `'`, which reads as a plain value.
+            &["'@ | git hash-object --stdin"],
+            &["Write-Output 'open | git hash-object --stdin"],
+            // `$LASTEXITCODE` inside single quotes is literal text, and
+            // `$LASTEXITCODEX` is another variable: neither reads the status.
+            &["git log --grep '$LASTEXITCODE'"],
+            &["Invoke-Thing $LASTEXITCODEX"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).contains(&"cargo build".to_owned()),
+                "{between:?} can reset the status, yet `cargo build` reads as checked"
+            );
+        }
+        assert_eq!(
+            unchecked_native_commands(&["cargo build", "exit 0"]),
+            ["cargo build"]
+        );
     }
 }

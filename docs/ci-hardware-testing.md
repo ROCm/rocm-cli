@@ -165,8 +165,9 @@ command under test exists to reach. That costs no coverage today, because
 way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
-`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
-entry must be present too. `rocm examine` reports the verdict as
+`/dev/dxg` and dxcore alone are not enough, `librocdxg.so` must be present and
+the loader must be able to find it (an `ldconfig` entry, a directory on
+`LD_LIBRARY_PATH`, or the directory of the runtime that opens it) too. `rocm examine` reports the verdict as
 `driver_status: wsl_rocdxg_ready`; anything else (`wsl_rocdxg_missing`,
 `wsl_gpu_plumbing_missing`) means the runtime cannot reach the device even
 though `detected_gfx_target` still names it, because that target is read from
@@ -317,8 +318,12 @@ ordinary PR run is unaffected. Each leg uploads its own artifact (the
 versions share one pre-warmed runtime tree rather than needing separate ones.
 `e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
 pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
-release-branch push runs all six `channel` × `sdk_version` combinations on
-that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+release-branch push runs four of the six `channel` × `sdk_version`
+combinations on that lane: the `nightly` channel is excluded from `n-1`/`n-2`,
+because it only carries the latest (pre-)release builds and cannot resolve the
+pinned released versions (`rocm install sdk` fails with "no mutually compatible
+TheRock ... versions"); those versions are covered by the `release` channel.
+`rad3`/`mi350p` are nightly-only (above) and don't run this matrix
 at all.
 
 `serve` is narrower than `heavy`: it matches only

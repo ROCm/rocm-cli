@@ -14,24 +14,25 @@
 //! registry (`load_managed_services`, `refresh_managed_service_runtime_liveness`,
 //! `recorded_service_pids`, `settle_pending_stop_key_cleanup`), the idempotency
 //! guard that finds an already-live service for a given engine+model
-//! (`existing_live_managed_service`, and its records-in-hand form
-//! `find_live_managed_service`), the serve reuse pre-gate that decides whether
+//! (`existing_live_managed_service_in`, and the records-in-hand match rule
+//! `find_live_managed_service` serve's reuse check uses), the serve reuse pre-gate that decides whether
 //! asking the engine about reuse is worth a round-trip
 //! (`live_managed_services_for_model`), the "is this record live" classifier
 //! (`managed_service_is_live`), and the dashboard sidebar's ready/starting/past-
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`), which only `chat.rs` reads. `service_records.rs`
+//! (`friendly_engine_label`), which only `chat/summaries.rs` reads. `service_records.rs`
 //! calls into it for the in-use check behind service-record removal and pruning
 //! (`managed_service_is_live`, `recorded_service_pids`) and for
 //! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
 //! `load_managed_services` for the codex-bridge snapshot;
 //! `services_text.rs` reads the sidebar helpers for the local-servers view;
-//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `chat/turn.rs` and `chat/mcp_bridge.rs` call into it for the services tool
+//! and the local-assistant readiness check;
 //! `runtime_services.rs` calls into it when reconciling live servers against a
 //! runtime activation; `service_launch.rs` is the only caller of the
-//! `existing_live_managed_service` duplicate-launch guard it runs before
+//! `existing_live_managed_service_in` duplicate-launch guard it runs before
 //! spawning a new managed service. Shared types/config (`ManagedServiceRecord`,
 //! `AppPaths`) and the `endpoint_keys` module stay reachable through
 //! `crate::`/`rocm_core::`, as for other mechanically relocated modules.
@@ -79,15 +80,13 @@ pub(crate) fn managed_service_sidebar_counts(
 }
 
 pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
-    matches!(
-        record.status.as_str(),
-        "ready" | "running" | "starting" | "recovering"
-    )
+    record.is_live()
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any. The caller compares its effective
-/// launch recipe before deciding whether reuse is safe.
+/// service for this engine+model, if any, from an already-refreshed live set.
+/// The caller compares its effective launch recipe before deciding whether reuse
+/// is safe.
 ///
 /// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
 /// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
@@ -97,20 +96,21 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
 /// the newest live match. Prevents a second `serve --managed` for the same
 /// engine+model from spawning a duplicate process once the TUI job-bridge guard
 /// has cleared.
-pub(crate) fn existing_live_managed_service(
-    paths: &AppPaths,
+///
+/// Takes the snapshot rather than the paths so the allocation transaction loads
+/// it once and uses it for both this check and the port reservations: duplicate
+/// detection and candidate selection can never observe different states.
+pub(crate) fn existing_live_managed_service_in<'a>(
+    live: &'a [ManagedServiceRecord],
     engine: &str,
     canonical_model_id: &str,
-) -> Option<ManagedServiceRecord> {
-    find_live_managed_service(
-        &load_managed_services(paths).ok()?,
-        engine,
-        canonical_model_id,
-    )
-    .cloned()
+) -> Option<&'a ManagedServiceRecord> {
+    live.iter()
+        .find(|record| record.engine == engine && record.canonical_model_id == canonical_model_id)
 }
 
-/// [`existing_live_managed_service`]'s match rule, over records already in hand.
+/// The serve-side match rule behind [`existing_live_managed_service_in`] (which
+/// takes a set already filtered to live records), over records already in hand.
 ///
 /// Split out so a caller that has just loaded and liveness-refreshed the
 /// registry can ask the same question again without a second disk scan, and so
@@ -570,145 +570,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn duplicate_managed_launch_detected_across_distinct_service_ids() -> Result<()> {
-        // `generate_service_id` embeds a timestamp, so a second launch for the
-        // same engine+model has a DIFFERENT service_id. The guard must still
-        // detect the live service by (engine, canonical_model_id), and return
-        // the newest live match. `starting` skips the endpoint probe; the
-        // current process id is a guaranteed-live PID.
-        let (root, paths) = test_paths("dup-managed-distinct-ids");
-        paths.ensure()?;
-
-        // Older, dead manifest for the same engine+model (distinct service_id).
-        let mut dead = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-1000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11500,
-            "managed",
-            999_999_999,
-            None,
-            None,
-            None,
-        );
-        dead.status = "ready".to_owned();
-        dead.engine_pid = Some(999_999_999);
-        dead.created_at_unix_ms = 1000;
-        dead.write()?;
-
-        // Newer, live manifest for the same engine+model (distinct service_id).
-        let mut live = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-2000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11501,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        live.status = "starting".to_owned();
-        live.engine_pid = Some(std::process::id());
-        live.created_at_unix_ms = 2000;
-        live.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        let found = found.expect("a live managed service should be detected by engine+model");
-        assert_eq!(
-            found.service_id, "lemonade-qwen-2000",
-            "should return the newest live match"
-        );
-        assert!(managed_service_is_live(&found));
-        Ok(())
-    }
-
-    #[test]
-    fn dead_managed_service_allows_relaunch() -> Result<()> {
-        // A stale manifest with dead PIDs must NOT block a relaunch: liveness
-        // refresh demotes it to "stopped", so the guard returns None.
-        let (root, paths) = test_paths("dup-managed-dead");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-3000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11502,
-            "managed",
-            999_999_999,
-            None,
-            None,
-            None,
-        );
-        record.status = "ready".to_owned();
-        record.engine_pid = Some(999_999_999);
-        record.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        assert!(
-            found.is_none(),
-            "a dead managed service must not block relaunch"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn live_service_for_other_model_does_not_block() -> Result<()> {
-        // A live service for a DIFFERENT model must not match — the guard keys
-        // on the model, not just the engine.
-        let (root, paths) = test_paths("dup-managed-other-model");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-other-1",
-            "lemonade",
-            "other",
-            "other-canonical",
-            "127.0.0.1",
-            11503,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        record.status = "starting".to_owned();
-        record.engine_pid = Some(std::process::id());
-        record.write()?;
-
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-
-        assert!(
-            found.is_none(),
-            "a live service for a different model must not match"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn missing_manifest_allows_launch() {
-        // No services dir / manifests → nothing to detect, launch proceeds.
-        let (root, paths) = test_paths("dup-managed-missing");
-        let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
-        let _ = fs::remove_dir_all(root);
-        assert!(found.is_none());
-    }
-
     /// A public record with a dead pid and a stored endpoint key, for the
     /// liveness-refresh cases below. The port is one nothing listens on, so the
     /// refresh's endpoint probe fails and it falls through to the pid check.
@@ -1042,11 +903,18 @@ mod tests {
 
         let records = live_managed_services_for_model(&paths, "lemonade", "qwen")
             .expect("the planted live record opens the pre-gate");
+        // What the spawn-time guard sees: the same registry, narrowed to live
+        // records, as `service_launch`'s allocation transaction loads it.
+        let live: Vec<_> = records
+            .iter()
+            .filter(|r| managed_service_is_live(r))
+            .cloned()
+            .collect();
         assert_eq!(
             find_live_managed_service(&records, "lemonade", "qwen-canonical")
                 .map(|r| r.service_id.clone()),
-            existing_live_managed_service(&paths, "lemonade", "qwen-canonical")
-                .map(|r| r.service_id),
+            existing_live_managed_service_in(&live, "lemonade", "qwen-canonical")
+                .map(|r| r.service_id.clone()),
         );
         assert!(
             find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),

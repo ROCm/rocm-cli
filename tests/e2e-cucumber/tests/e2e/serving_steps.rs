@@ -11,9 +11,15 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+use e2e_cucumber::device_memory::{
+    DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Pool, Probe, bounded_stdout, describe_verdict,
+    judge, parse_amd_smi_vram, parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
+    sample_is_truncated,
+};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
+    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
+    serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -136,11 +142,15 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 /// rather than three calls at each site: the log must be read and copied out
 /// while the service still owns it, because stopping the service both changes
 /// what the log's last lines say and is the step most likely to fail outright.
+/// For Lemonade the backend inventory is read before the stop too, and the
+/// `llama-server` probes, which execute a backend binary, run only after it so
+/// they cannot contend with the still-running router.
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-fn serve_failure_evidence(
-    world: &E2eWorld,
+async fn serve_failure_evidence(
+    world: &mut E2eWorld,
+    engine: Option<&str>,
     headline: &str,
     device_state: &str,
     stdout: &str,
@@ -155,7 +165,24 @@ fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
-    let stop_status = stop_scenario_services(world);
+    // The stop sits inside this call because its position relative to the
+    // backend probes is the point: see `backend_evidence_around_stop`.
+    let app_paths = world.isolated_root.is_some().then(|| world.app_paths());
+    let isolated_root = world
+        .isolated_root
+        .as_ref()
+        .map(|root| root.path().to_owned());
+    let (stop_status, backend_evidence) =
+        e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
+            move || {
+                app_paths
+                    .map(|paths| paths.engine_install_manifest_path("lemonade"))
+                    .ok_or_else(|| "the scenario has no isolated root".to_owned())
+            },
+            engine,
+            move || stop_services_in(isolated_root.as_deref()),
+        )
+        .await;
     serve_attempt_report(&ServeAttempt {
         headline,
         device_state,
@@ -164,6 +191,7 @@ fn serve_failure_evidence(
         log_tail: &log_tail,
         archived_log: &archived_log,
         stop_status: &stop_status,
+        backend_evidence: backend_evidence.as_deref(),
     })
 }
 
@@ -202,7 +230,15 @@ async fn serve_and_wait(
     };
     panic!(
         "{}",
-        serve_failure_evidence(world, &headline, &device_state, &stdout, &stderr)
+        serve_failure_evidence(
+            world,
+            engine_from_serve_args(args).or_else(|| reported_engine(&stdout)),
+            &headline,
+            &device_state,
+            &stdout,
+            &stderr,
+        )
+        .await
     );
 }
 
@@ -268,124 +304,111 @@ async fn ensure_serve_port_free() -> String {
     wait_for_free_vram().await
 }
 
-/// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
-/// scenario model can allocate its engine's memory share without tripping its
-/// startup check: Qwen3.6-27B plus vLLM's default fraction-of-total KV
-/// reservation needs the MI300X mostly clear. Only a data-center GPU has this
-/// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
-/// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
-/// otherwise the check could never pass. Note the cap no longer sits above what
-/// vLLM asks for: rocm-cli used to pin utilization below it, and now defers to
-/// vLLM's own (higher) default, so the wait has little headroom left and can
-/// time out on a device that is merely holding display memory. The wait is
-/// best-effort and the serve proceeds regardless, so this costs time rather
-/// than correctness; sizing a deliberate margin is follow-up work.
-const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
-
-/// The free-VRAM floor to wait for on this host: the model-sized ceiling, but
-/// never more than 90% of the device's total VRAM. A hardcoded 150 GiB floor is
-/// unreachable on a small card (e.g. Strix Halo's ~48 GiB unified VRAM), so
-/// `wait_for_free_vram` would burn its full deadline on every serve scenario;
-/// scaling to the device keeps the drain-check meaningful everywhere.
-fn required_free_vram_mib(total_mib: u64) -> u64 {
-    MAX_FREE_VRAM_FLOOR_MIB.min(total_mib / 100 * 90)
-}
-
 /// How long to wait for a stopped engine to hand its device memory back.
 const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
-/// Best-effort: wait until the GPU reports enough free VRAM (see
-/// [`required_free_vram_mib`]), so a just-killed serve's memory is actually
-/// reclaimed before the next serve starts. Queries `amd-smi` then `rocm-smi`;
-/// if neither is present (mock/local, no ROCm), returns immediately so non-GPU
-/// runs are unaffected.
+/// Pause between two samples of the device.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Best-effort: wait until the pool the engine allocates from reports enough
+/// free memory (see [`select_drain_target`]: VRAM on a discrete card, GTT on an
+/// APU whose VRAM is only a BIOS carveout), so a just-killed serve's memory is
+/// actually reclaimed before the next serve starts. Queries `amd-smi` then
+/// `rocm-smi`; if neither is present (mock/local, no ROCm), returns immediately
+/// so non-GPU runs are unaffected.
 ///
 /// The wait is bounded and best-effort: on timeout the serve still starts,
 /// because a stale reading must not turn a slow drain into a hard failure. The
-/// returned line records which of the two happened — an undrained device is the
-/// single most likely reason the serve that follows never becomes ready, and
-/// without it the failure looks identical to a genuinely broken serve.
+/// returned line records what happened — an undrained device is the single most
+/// likely reason the serve that follows never becomes ready, and without it the
+/// failure looks identical to a genuinely broken serve. A tool that is installed
+/// but never produces a reading is given up on after a few samples
+/// (`UNREAD_SAMPLES_BEFORE_GIVING_UP`) and reported as unreadable, not as
+/// undrained; the decisions and the wording live in `DrainWait` and
+/// `describe_verdict`, where they are tested.
 async fn wait_for_free_vram() -> String {
-    // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
-    let Some(total) = total_vram_mib() else {
-        return "device state: no GPU tooling (mock/local run)".to_owned();
-    };
-    let floor = required_free_vram_mib(total);
-    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
+    // Started before the first probe so that probe counts against the wait.
+    let started = Instant::now();
+    let deadline = started + VRAM_DRAIN_DEADLINE;
+    let mut wait = DrainWait::default();
     loop {
-        let free = free_vram_mib();
-        if let Some(free) = free
-            && free >= floor
-        {
-            return format!(
-                "device state: drained ({free} MiB free of {total} MiB, floor {floor} MiB)"
-            );
+        // Every probe is held to the time left, so the wait ends at its deadline
+        // rather than a few probe timeouts after it. A sample started with less
+        // than a full probe timeout left is `truncated`: if it gives no reading
+        // that is the deadline's doing, not the tool's, and is not counted.
+        let truncated = sample_is_truncated(Instant::now(), deadline);
+        let sample = judge(probe_device_memory(deadline).await);
+        if let Some(verdict) = wait.observe_truncated(sample, truncated) {
+            return describe_verdict(verdict, started.elapsed().as_secs());
         }
-        if Instant::now() >= deadline {
-            let free = free.map_or_else(|| "unreadable".to_owned(), |mib| format!("{mib} MiB"));
-            return format!(
-                "device state: NOT drained after {}s ({free} free of {total} MiB, floor \
-                 {floor} MiB) — a previous engine is still holding the GPU",
-                VRAM_DRAIN_DEADLINE.as_secs()
-            );
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(left.min(DRAIN_POLL_INTERVAL)).await;
+        if deadline.saturating_duration_since(Instant::now()) < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
+        }
     }
 }
 
-/// Free device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`). `None`
-/// when no such tool exists or its output can't be parsed.
-fn free_vram_mib() -> Option<u64> {
-    vram_mib().map(|(_total, free)| free)
+/// Device memory for GPU 0 off the async worker: VRAM via `amd-smi` (then
+/// `rocm-smi`), plus the GTT pool from `rocm-smi` where the host needs it (see
+/// [`sample_device_memory`] for when GTT is read and what a failed read means).
+/// `amd-smi` is not asked for GTT: its output has no field this harness has been
+/// checked against, whereas the preflight step already reads `rocm-smi`'s GTT
+/// rows on these hosts. It runs subprocesses, each bounded by `probe_budget` (at
+/// most the probe timeout, never past `deadline`), so the blocking thread it
+/// occupies is released.
+async fn probe_device_memory(deadline: Instant) -> Probe<DeviceMemory> {
+    tokio::task::spawn_blocking(move || {
+        sample_device_memory(|| vram_pool(deadline), || gtt_pool(deadline))
+    })
+    .await
+    .unwrap_or(Probe::Unreadable)
 }
 
-/// Total device VRAM in MiB for GPU 0. `None` when no GPU tool is available —
-/// used as the "is there a GPU to wait on at all?" probe in mock/local runs.
-fn total_vram_mib() -> Option<u64> {
-    vram_mib().map(|(total, _free)| total)
+/// GTT for GPU 0, via `rocm-smi`. The command is named in the report when its
+/// output is not understood, so the first run on a host shows the CSV header the
+/// column names were meant to match.
+///
+/// What is and is not checked: `gpu-preflight.sh` matches the labels
+/// `GTT Total Memory` and `GTT Total Used Memory` in `rocm-smi`'s plain-text
+/// `--showmeminfo vram gtt` output, so those labels are known to exist there.
+/// That `--showmeminfo gtt --csv` uses the same words as its column headers is
+/// not checked against real output; it is assumed by analogy with the VRAM CSV.
+/// Warning lines before the header are skipped (see [`parse_rocm_smi_csv_pool`]).
+fn gtt_pool(deadline: Instant) -> Probe<Pool> {
+    use std::process::Command;
+    let mut command = Command::new("rocm-smi");
+    command.args(["--showmeminfo", "gtt", "--csv"]);
+    bounded_stdout(command, probe_budget(Instant::now(), deadline))
+        .parse_text("rocm-smi --showmeminfo gtt --csv", |text| {
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory")
+        })
 }
 
-/// `(total, free)` device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`).
-/// `None` when no such tool exists or its output can't be parsed.
-fn vram_mib() -> Option<(u64, u64)> {
+/// Device VRAM for GPU 0, via `amd-smi` (then `rocm-smi`).
+fn vram_pool(deadline: Instant) -> Probe<Pool> {
     use std::process::Command;
     // amd-smi: lines like "        TOTAL_VRAM: 196592 MB" / "FREE_VRAM: 196309 MB".
-    if let Ok(out) = Command::new("amd-smi").args(["metric", "-m"]).output()
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let field = |name: &str| {
-            text.lines()
-                .find_map(|l| l.trim().strip_prefix(name))
-                .and_then(|v| v.split_whitespace().next())
-                .and_then(|n| n.parse::<u64>().ok())
-        };
-        if let (Some(total), Some(free)) = (field("TOTAL_VRAM:"), field("FREE_VRAM:")) {
-            return Some((total, free));
-        }
-    }
+    let amd_smi = || {
+        let mut command = Command::new("amd-smi");
+        command.args(["metric", "-m"]);
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
+            .parse_text("amd-smi metric -m", parse_amd_smi_vram)
+    };
     // rocm-smi fallback: `--showmeminfo vram --csv` → vram total/used per card.
-    if let Ok(out) = Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram", "--csv"])
-        .output()
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let rocm_smi = || {
+        let mut command = Command::new("rocm-smi");
+        command.args(["--showmeminfo", "vram", "--csv"]);
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
-        // Parse the first data row's total and used to derive free.
-        let mut lines = text.lines();
-        let header = lines.next()?;
-        let cols: Vec<&str> = header.split(',').collect();
-        let total_idx = cols.iter().position(|c| c.contains("Total Memory"))?;
-        let used_idx = cols.iter().position(|c| c.contains("Total Used Memory"))?;
-        let row = lines.next()?;
-        let vals: Vec<&str> = row.split(',').collect();
-        let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
-        let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
-        let mib = 1024 * 1024;
-        return Some((total / mib, total.saturating_sub(used) / mib));
-    }
-    None
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
+            .parse_text("rocm-smi --showmeminfo vram --csv", |text| {
+                parse_rocm_smi_csv_pool(text, "Total Memory", "Total Used Memory")
+            })
+    };
+    amd_smi().or_else(rocm_smi)
 }
 
 /// Kill whatever process is listening on `port`. Best-effort and
@@ -434,6 +457,55 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
     let mock = MockServer::start("TestModel/E2E-1B").await;
     world.endpoint = Some(mock.base_url());
     world.model_name = Some("TestModel/E2E-1B".to_string());
+    world.mock = Some(mock);
+}
+
+#[given("the default serve port is occupied")]
+async fn occupy_default_serve_port(world: &mut E2eWorld) {
+    let _ = ensure_serve_port_free().await;
+    // A stale listener from a prior scenario (not just an unrelated process)
+    // is the realistic way this probe finds the next port taken; clear it the
+    // same way `ensure_serve_port_free` clears the default port instead of
+    // panicking the whole run over leftover state.
+    kill_listeners_on_port(SERVE_PORT + 1);
+    let next = std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT + 1))
+        .expect("the next automatic port must be free before this scenario starts");
+    drop(next);
+    world.automatic_port_guard = Some(
+        std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT))
+            .expect("failed to occupy the default serve port"),
+    );
+}
+
+/// Plant a live managed-service record on the default serve port, backed by a
+/// real mock listener on that exact port.
+///
+/// `ServiceRecordOptions::default()`'s `supervisor_pid: 0` means the CLI's
+/// liveness refresh finds no tracked pid to check; without a real listener
+/// behind the record, the endpoint probe would then come back `Unreachable`
+/// and the record gets demoted to `"stopped"` *before* the explicit-port
+/// collision check ever sees it (`refresh_managed_service_runtime_liveness`
+/// in `apps/rocm/src/managed_service_status.rs`). Backing the record with a `MockServer` on
+/// `SERVE_PORT` makes `/v1/models` list `other-model`, so the probe reports
+/// `Listing`/`Serving` and the record is left `"ready"` instead — the
+/// scenario needs the collision detected, so the port has to be reserved for
+/// real, not just on paper. `supervisor_pid: 0` still keeps this safe for the
+/// World's teardown, which runs `rocm services stop <id> --yes` on every
+/// record left in the isolated tree: a real PID here would point that stop at
+/// the test process itself (see `plant_unauthenticated_lemonade_service`'s
+/// doc comment for the same hazard).
+#[given("another managed service already reserves the default serve port")]
+async fn reserve_default_serve_port(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    let mock = MockServer::start_on_port("other-model", SERVE_PORT).await;
+    write_service_record_with(
+        &services,
+        "other-model",
+        SERVE_PORT,
+        ServiceRecordOptions::default(),
+    );
     world.mock = Some(mock);
 }
 
@@ -494,9 +566,16 @@ fn default_engine_serve_target() -> &'static str {
 /// attempt shares the device with this one, and that must be visible in the
 /// failure rather than inferred from a serve that looks broken.
 fn stop_scenario_services(world: &E2eWorld) -> String {
-    world.isolated_root.as_ref().map_or_else(
+    stop_services_in(world.isolated_root.as_ref().map(tempfile::TempDir::path))
+}
+
+/// [`stop_scenario_services`] on the scenario's isolated root rather than the
+/// world, so a caller that must hand the stop to a `Send` closure (the world holds
+/// PTY handles and is not `Sync`) can capture the path alone.
+fn stop_services_in(isolated_root: Option<&std::path::Path>) -> String {
+    isolated_root.map_or_else(
         || "not attempted: scenario has no isolated root".to_owned(),
-        |root| crate::stop_managed_services(root.path()),
+        crate::stop_managed_services,
     )
 }
 
@@ -609,13 +688,17 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         // outcome is quoted: a stop that found no record (the launch had not yet
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
-        diagnostics.push(serve_failure_evidence(
-            world,
-            &format!("attempt {attempt} of {attempts} (rc={rc})"),
-            &device_state,
-            &stdout,
-            &stderr,
-        ));
+        diagnostics.push(
+            serve_failure_evidence(
+                world,
+                Some(engine),
+                &format!("attempt {attempt} of {attempts} (rc={rc})"),
+                &device_state,
+                &stdout,
+                &stderr,
+            )
+            .await,
+        );
         if attempt == attempts {
             break;
         }
@@ -992,15 +1075,19 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             &ready_substr,
             timeout_secs,
         );
+        let stdout = world.cli_output.clone().unwrap_or_default();
+        let stderr = world.cli_stderr.clone().unwrap_or_default();
         panic!(
             "{}",
             serve_failure_evidence(
                 world,
+                reported_engine(&stdout),
                 &headline,
                 &device_state,
-                world.cli_output.as_deref().unwrap_or_default(),
-                world.cli_stderr.as_deref().unwrap_or_default(),
+                &stdout,
+                &stderr,
             )
+            .await
         );
     }
 }
@@ -1041,6 +1128,17 @@ async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
             "--managed",
         ],
     );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a model with automatic port selection")]
+async fn user_serves_with_automatic_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
+    world.automatic_port_guard.take();
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -1333,8 +1431,78 @@ async fn user_serves_public_bind_no_optin(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// `localhost` is loopback (`is_public_bind_host` returns false, so no
+/// `--allow-public-bind` opt-in is required) but is not the canonical
+/// `127.0.0.1` `validate_port_request` requires for automatic port selection.
+/// This isolates the host-vs-port-explicitness check from the separate
+/// public-bind-opt-in check `networking-03` already covers.
+#[when("the user serves a model bound to a non-canonical host without an explicit port")]
+async fn user_serves_non_canonical_host_no_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", "some-model", "--host", "localhost"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `--port 0` is rejected by `serve_port::parse_serve_port`'s own range check,
+/// which also covers 65536 and non-numeric values via the same message.
+#[when("the user serves a model with an out-of-range port")]
+async fn user_serves_invalid_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "some-model", "--port", "0"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a model explicitly on the reserved port")]
+async fn user_serves_explicit_reserved_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let port = SERVE_PORT.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Same CLI invocation as [`user_serves_explicit_reserved_port`]; the two
+/// scenarios differ only in what is holding the port (a plain listener here,
+/// vs. a live managed-service record there), which `resolve_serve_port`
+/// routes to two different refusal messages.
+#[when("the user serves a model explicitly on the occupied port")]
+async fn user_serves_explicit_occupied_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let port = SERVE_PORT.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// Serve naming both a runtime and an environment. These are mutually exclusive
-/// selectors, rejected during argument parsing before any engine or GPU work — so
+/// selectors, rejected during argument parsing before any engine or GPU work, so
 /// the refusal is observable with no GPU (mock lane).
 #[when("the user serves a model selecting both a runtime and an environment")]
 async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
@@ -1423,6 +1591,45 @@ async fn assert_public_bind_message(world: &mut E2eWorld) {
     assert!(
         output.contains("--allow-public-bind"),
         "expected guidance to pass --allow-public-bind, got:\n{output}"
+    );
+}
+
+#[then("the user is told to pass an explicit port for that host")]
+async fn assert_custom_host_needs_port_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs an explicit `--port"),
+        "expected a message asking for an explicit --port, got:\n{output}"
+    );
+}
+
+#[then("the user is told the port must be between 1 and 65535")]
+async fn assert_invalid_port_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("port must be a number between 1 and 65535"),
+        "expected the port range message, got:\n{output}"
+    );
+}
+
+#[then("the user is told to stop the service holding that port")]
+async fn assert_port_reserved_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("is already reserved by managed service e2e-mock")
+            && output.contains("rocm services stop e2e-mock --yes"),
+        "expected the port-reserved message naming e2e-mock, got:\n{output}"
+    );
+}
+
+#[then("the user is told the port is already in use by another process")]
+async fn assert_port_in_use_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "127.0.0.1:{SERVE_PORT} is already in use by another process"
+        )) && output.contains("Choose a free `--port`"),
+        "expected the port-in-use message, got:\n{output}"
     );
 }
 
@@ -1954,6 +2161,145 @@ async fn assert_lemonade_recovery_guidance(world: &mut E2eWorld) {
     );
 }
 
+/// The Anthropic endpoint `rocm services list` shows for the first service that
+/// has one, waiting for it to appear.
+///
+/// The serving process publishes the endpoint a moment after the engine lists its
+/// model, so a service the CLI already calls ready may not show it on the first
+/// listing.
+async fn listed_anthropic_endpoint(world: &mut E2eWorld) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+        let found = stdout.lines().find_map(|line| {
+            line.trim_start()
+                .strip_prefix("anthropic endpoint: ")
+                .map(str::to_owned)
+        });
+        world.cli_output = Some(stdout);
+        if found.is_some() || Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[then("the service details include an Anthropic-compatible messages endpoint")]
+async fn assert_service_lists_anthropic_endpoint(world: &mut E2eWorld) {
+    let listed = listed_anthropic_endpoint(world).await;
+    let output = world.cli_output.clone().unwrap_or_default();
+    let endpoint = listed
+        .unwrap_or_else(|| panic!("no `anthropic endpoint:` row in `services list`:\n{output}"));
+    assert!(
+        endpoint.starts_with("http://") && !endpoint.contains("/v1"),
+        "the Anthropic endpoint is a base URL clients append `/v1/messages` to, got `{endpoint}`"
+    );
+}
+
+#[then("the service details still include the existing OpenAI-compatible endpoint")]
+async fn assert_service_still_lists_openai_endpoint(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim_start().starts_with("endpoint: http") && line.ends_with("/v1")),
+        "the OpenAI-compatible `endpoint:` row is missing from `services list`:\n{output}"
+    );
+}
+
+#[when("the user sends a request to the Anthropic messages endpoint")]
+async fn user_sends_anthropic_messages_request(world: &mut E2eWorld) {
+    let base = listed_anthropic_endpoint(world)
+        .await
+        .expect("no Anthropic endpoint is listed for the served model");
+    let budget = Duration::from_secs(crate::inference_timeout_for(world));
+    // Sent under a Claude model name on purpose: an Anthropic client names a
+    // Claude model, and the endpoint answers for the model that is served.
+    // The budget leaves room for a reasoning model (Qwen3) to finish thinking
+    // before it answers: at 32 tokens the whole reply was spent on reasoning
+    // and the text block came back empty with `stop_reason: max_tokens`.
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    let reply = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .timeout(budget)
+            .build()
+            .expect("failed to build HTTP client")
+            .post(format!("{base}/v1/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages failed: {error}"))
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|error| panic!("POST {base}/v1/messages returned non-JSON: {error}"))
+    })
+    .await
+    .expect("the Anthropic request task panicked");
+    world.anthropic_response = Some(reply);
+}
+
+#[then("the response is a valid Anthropic Messages API response")]
+async fn assert_valid_anthropic_response(world: &mut E2eWorld) {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    assert_eq!(reply["type"], "message", "not a Message: {reply}");
+    assert_eq!(reply["role"], "assistant", "{reply}");
+    assert!(
+        reply["content"]
+            .as_array()
+            .and_then(|blocks| blocks.first())
+            .is_some_and(|block| block["type"] == "text"
+                && block["text"].as_str().is_some_and(|text| !text.is_empty())),
+        "no text content block in the reply: {reply}"
+    );
+    assert!(reply["stop_reason"].is_string(), "{reply}");
+    assert!(
+        reply["usage"]["input_tokens"].is_u64() && reply["usage"]["output_tokens"].is_u64(),
+        "usage is missing token counts: {reply}"
+    );
+}
+
+#[then("the Anthropic response identifies the correct model")]
+async fn assert_anthropic_response_model_correct(world: &mut E2eWorld) {
+    let reply = world
+        .anthropic_response
+        .as_ref()
+        .expect("no Anthropic response");
+    let model = reply["model"].as_str().unwrap_or("");
+    let expected = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        model_ids_match(model, expected),
+        "the Anthropic response model '{model}' does not identify '{expected}'"
+    );
+}
+
+#[then("both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy")]
+async fn assert_both_endpoints_healthy(world: &mut E2eWorld) {
+    // `services list` probes each endpoint it shows and marks one that does not
+    // answer with `(not responding)`; a healthy service carries neither mark.
+    let listed = listed_anthropic_endpoint(world).await;
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        listed.is_some(),
+        "no `anthropic endpoint:` row in `services list`:\n{output}"
+    );
+    assert!(
+        output.contains("status: ready"),
+        "the OpenAI-compatible endpoint is not reported ready:\n{output}"
+    );
+    assert!(
+        !output.contains("(not responding)"),
+        "the Anthropic-compatible endpoint is reported not responding:\n{output}"
+    );
+}
+
 #[then("an inference request succeeds immediately")]
 async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
     // No extra wait: the CLI already reported ready, so inference must work now.
@@ -2451,13 +2797,39 @@ async fn assert_endpoint_port(world: &mut E2eWorld) {
     );
 }
 
+#[then("the service uses the next automatic port")]
+async fn assert_next_automatic_port(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let rc = world.cli_rc.expect("no serve command was run");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["serve", "<model>", "--engine", "<engine>", "--managed"],
+            rc,
+            stdout,
+            stderr,
+        )
+    );
+    let expected = format!("endpoint: http://127.0.0.1:{}/v1", SERVE_PORT + 1);
+    let disclosure_line = stdout
+        .lines()
+        .position(|line| line.trim() == "Port: automatic; endpoint shown after launch");
+    let endpoint_line = stdout.lines().position(|line| line.trim() == expected);
+    assert!(
+        endpoint_line.is_some(),
+        "expected `{expected}` in real serve output:\n{stdout}"
+    );
+    assert!(
+        disclosure_line.is_some_and(|d| d < endpoint_line.unwrap()),
+        "the automatic-port disclosure must print before the resolved endpoint:\n{stdout}"
+    );
+}
+
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
-    let Some(engine) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("engine:"))
-        .map(str::trim)
-    else {
+    let Some(engine) = reported_engine(output) else {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
@@ -2683,6 +3055,118 @@ async fn user_serves_requiring_api_key(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user serves that same model again on an explicit port other than the running one")]
+async fn user_serves_other_explicit_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            REUSE_REFUSAL_MODEL,
+            "--engine",
+            REUSE_REFUSAL_ENGINE,
+            "--managed",
+            "--port",
+            "11500",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the port the running service uses")]
+async fn assert_refused_naming_running_port(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "an explicit port the running service does not use must be refused:\n{output}"
+    );
+    assert!(
+        output.contains(REUSE_REFUSAL_SERVICE_ID)
+            && output.contains("on port 9,")
+            && output.contains("port 11500 would not be used"),
+        "the refusal must name the running service and both ports:\n{output}"
+    );
+}
+
+#[then("the CLI names the exact command to stop the existing service")]
+async fn assert_names_stop_command(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
+        "the refusal must name the way out, directly runnable with --yes: {output}"
+    );
+}
+
+/// A second record, `e2e-stopped`, on the default serve port: the service the
+/// restart scenario tries to bring back. Cloned from the `e2e-mock` record
+/// `reserve_default_serve_port` planted, so its shape is the one the CLI reads.
+#[given("a stopped managed service is recorded on the default serve port")]
+async fn plant_stopped_service_on_default_port(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(services.join("e2e-mock.json")).expect("read e2e-mock record"),
+    )
+    .expect("parse e2e-mock record");
+    record["service_id"] = "e2e-stopped".into();
+    record["status"] = "stopped".into();
+    record["manifest_path"] = services.join("e2e-stopped.json").to_string_lossy().into();
+    record["log_path"] = services.join("e2e-stopped.log").to_string_lossy().into();
+    record["engine_state_path"] = services
+        .join("e2e-stopped.state.json")
+        .to_string_lossy()
+        .into();
+    std::fs::write(
+        services.join("e2e-stopped.json"),
+        serde_json::to_vec_pretty(&record).expect("serialize record"),
+    )
+    .expect("write stopped record");
+}
+
+#[when("the user restarts the stopped service")]
+async fn user_restarts_stopped_service(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["services", "restart", "e2e-stopped", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the restart is refused naming the service that holds the port")]
+async fn assert_restart_refused_naming_holder(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no restart rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "the restart must be refused, but exited 0:\n{output}"
+    );
+    assert!(
+        output.contains("e2e-mock") && output.contains("recorded on that port"),
+        "the refusal must name the service holding the port:\n{output}"
+    );
+    // Nothing was spawned: the stopped record is still stopped.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("data").join("services").join("e2e-stopped.json"))
+            .expect("read stopped record"),
+    )
+    .expect("parse stopped record");
+    assert_eq!(record["status"], "stopped", "{record}");
+}
+
 #[then("the CLI refuses and names the exact command to stop the existing service")]
 async fn assert_refused_with_stop_hint(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no serve rc recorded");
@@ -2729,6 +3213,29 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         record.get("status").and_then(serde_json::Value::as_str),
         Some("stopped"),
         "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+#[when("the user serves a model with both --wait and --verbose")]
+async fn serve_wait_and_verbose(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen", "--wait", "--verbose"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the conflicting flags")]
+async fn serve_wait_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let text = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected refusal, got rc=0:\n{text}");
+    assert!(
+        text.contains("--wait") && text.contains("--verbose"),
+        "expected both flags named, got:\n{text}"
     );
 }
 

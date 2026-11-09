@@ -284,12 +284,12 @@ form works depends on the engine your GPU selects.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm, PyTorch, and llama.cpp failure modes |
-| `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
+| `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it; for a GGUF, estimate the largest context that fits |
 | `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
-| `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm serve <model>` | Start a local OpenAI-compatible model server (plus a text-only Anthropic `/v1/messages` endpoint) |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
@@ -337,7 +337,7 @@ Windows. The Vulkan driver version is not shown.
 
 ```
 rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
-rocm diagnose --model <model> [--json]
+rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
 
@@ -373,7 +373,9 @@ position.
   those.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing. There is no automatic transport, and there will be
-  none: a report leaves a machine only by its owner's own action.
+  none: a report leaves a machine only by its owner's own action. A `--model`
+  given with it is not assessed (a report carries no model verdict), so a GGUF
+  reference is not looked up on Hugging Face for it.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
@@ -542,6 +544,14 @@ a family of GPUs, or none), or you want to target a different GPU, also pass
 ```
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
 ```
+
+The `--dry-run` preview downloads no `uv` and creates no `tools` folder. For ROCm
+10 and newer, `uv pip compile` is what chooses the `torch` and `torchvision`
+versions, so the preview runs a `uv` that is already installed and gives the
+complete plan. With none installed it can't, and it says so in a
+`resolution_note:` line: the package specs, runtime key, install folder, manifest
+and `command:` (everything made from those versions) read `not resolved by this
+preview`, and a real install fetches `uv` and resolves them.
 
 A family label such as `--family gfx120X-all` is rejected for those versions
 instead of being resolved to a guess, because the ROCm 10 packages publish one
@@ -712,7 +722,9 @@ exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,
-`/opt/rocm`); use `rocm install sdk` instead.
+`/opt/rocm`); use `rocm install sdk` instead. Without `--root`, the environment
+folder is the one that holds the `--python` interpreter's `bin` (or `Scripts`)
+folder; an interpreter anywhere else is refused until you pass `--root`.
 
 ### Disk space
 
@@ -792,14 +804,14 @@ Windows these installs are skipped.
 Ask before downloading anything:
 
 ```
-rocm diagnose --model <model> [--json]
+rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 ```
 
-Answers in seconds, from the curated recipe and this machine's GPU. It
-fetches no weights and makes no network call. The verdict is `ready`,
-`degraded`, `blocked`, or `undetermined`. A `ready` answer also names the
-engine `rocm serve` would use; a `blocked` one names curated models that would
-run here instead.
+Answers from the curated recipe and this machine's GPU, in seconds. It
+downloads no weights. For a curated model it makes no network call. The
+verdict is `ready`, `degraded`, `blocked`, or `undetermined`. A `ready` answer
+also names the engine `rocm serve` would use; a `blocked` one names curated
+models that would run here instead.
 
 `undetermined` is a real answer, not a failure. You get it when any of these is
 true:
@@ -812,7 +824,104 @@ true:
 
 None of these says anything about whether the model fits, so none of them is
 reported as though it did. `rocm serve` still accepts a model outside the
-catalog, but `diagnose` cannot tell you in advance how it will go.
+catalog, but for anything other than a GGUF, `diagnose` cannot tell you in
+advance how it will go.
+
+#### A GGUF model outside the catalog
+
+Pass a local `.gguf` path, or `owner/repo:QUANT` for a file on Hugging Face
+(for example `owner/repo:Q4_K_M`, or an exact file name ending in `.gguf`, with
+its directory when the file is in one and another file shares its name:
+`owner/repo:dir/model-Q4_K_M.gguf`; a bare name means the file at the top of the
+repository when there is one). On Hugging Face, a multimodal projector (an `mmproj`
+file shipped beside a vision model) is never picked as the model, and naming one
+by its file name is answered as such, with the repository's model files named
+instead. A local projector file is not recognised as one; it is read like any
+other GGUF. A file that
+exists on this machine is read as that file even when its name looks like
+`owner/repo:QUANT`. A bare
+`owner/repo`, with no quantization, names a repository rather than a file and
+is answered like any other model outside the catalog: undetermined, with
+nothing read.
+Instead of a recipe's minimum, `diagnose` reads the file's header, which holds
+the layer count, the KV head count and head width, and the tensor shapes. For
+a remote file that is one listing request for the repository (up to 16 MiB, to
+find the file and its size), a `HEAD` request for a file the listing does not
+size, then a few megabytes fetched by HTTP range request (set
+`HF_ENDPOINT` to use a mirror); the weights are never downloaded. A remote read
+has two minutes in all, so on a slow link it can take that long to fail. No
+token is sent, so a gated or private repository cannot be read.
+It then estimates weights, plus the KV cache at `--context-size` (default 4096)
+and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
+reserve, against this GPU's dedicated VRAM:
+
+```
+rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
+```
+
+The answer is labelled `ESTIMATED: fits at N tokens` or `ESTIMATED: does not
+fit at N tokens`, never `ready` or `blocked`: in `--json` the `verdict` stays
+`undetermined` and the figures are under `model.estimate`. It reports the
+largest context that fits with that KV cache type. When the file does not fit
+at the size you asked for, it lists what would make it fit: a smaller context,
+a q8_0 or q4_0 KV cache (llama.cpp needs flash attention for a quantized V
+cache, and the estimate assumes it is on), a smaller quantization, or keeping
+some layers on the CPU. Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
+`--n-gpu-layers`): **`rocm serve` does not take a context size, KV cache type
+or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
+
+The KV cache is exact for a plain full-attention model, and the weights are the
+file's own size from its tensor offsets, less the input embedding, which
+llama.cpp keeps in host memory -- except for a model with tied embeddings (no
+separate output layer), where llama.cpp uses the same tensor for the output
+layer on the GPU, so there it is counted. That case was not measured, and
+counting it can only overstate the figure. Only the compute buffer and the
+runtime reserve are allowances, calibrated against real loads of two dense
+full-attention models on one MI300X with llama.cpp b9752, flash attention on:
+a Llama-3.1-8B-shaped and a Qwen2.5-1.5B-shaped GGUF, each with its own output
+layer.
+No mixture-of-experts, state-space, hybrid or sliding-window model was among
+them. How close the estimate came to those
+loads, and why that describes the fit rather than a bound, is written down once,
+in the
+[`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
+A model with sliding-window, state-space or mixture-of-experts layers was not
+measured. A sliding-window model's KV cache is sized as if every layer attended
+over the whole context, which can only overstate it, so it still gets a verdict.
+A state-space or hybrid model's recurrent state is not counted, and a
+mixture-of-experts model's compute buffer was not measured, so for those the
+figures are shown with this GPU's memory but with no fits / does-not-fit verdict
+(`cannot_estimate`, reason `unmeasured_layout`): a "fits" that is too low would
+be worse than no answer. Many current open models are mixture-of-experts or
+hybrid, so for a large share of them this gives the memory figures and leaves
+the comparison to the reader. A header without the feed-forward or embedding width,
+which size the compute buffer, is treated the same way (reason
+`missing_metadata`, with the figures). Another
+GPU, engine build or batch size can miss by more, so leave headroom. The figures
+are compared with the total dedicated VRAM of the GPU with the most of it that
+ROCm can see, the same figure a curated model's minimum is compared with, not
+with what other processes have left free. When a device-visibility variable
+(`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on
+a host whose GPUs differ in memory, the report says that the mapping between the
+mask and `amd-smi`'s numbering has not been verified on such a host, so the
+figure may be for a different card; that mapping has not been checked on a
+multi-GPU machine. Where memory cannot be read, the memory the model needs is
+shown and nothing is compared. The memory figures are whole MiB, each rounded
+up, and the verdict is decided on their sum, so what is printed always adds up.
+The largest context is also capped at the context length the model was trained
+for. `--context-size` takes 1 to 16777216 tokens. Passing `--context-size` or
+`--kv-cache-type` for a curated model changes nothing, because a recipe's memory
+minimum is fixed; the report says so. Under `--report` the model is not assessed
+at all, so nothing is fetched for it, and `--context-size` and `--kv-cache-type`
+are ignored along with `--model`; a note on stderr names the flags that were
+ignored.
+
+On an integrated GPU (APU), where the CLI can't read the memory
+pool the engine uses, and on a host with no GPU or an unreadable one, the
+answer stays `undetermined` but still shows what the file needs. Layouts the
+formula does not describe (a file that is one shard of a split model, latent
+attention, a model with no attention layers) are reported as such rather than
+estimated.
 
 ### Curated models
 
@@ -842,13 +951,32 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
-                   [--verbose] [--foreground | --managed]
+                   [--verbose] [--foreground | --managed] [--wait]
                    [--no-smoke-test]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
                    [--engine-env KEY=VALUE]...
 ```
+
+Alongside the OpenAI-compatible endpoint, a served model gets an
+Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
+`rocm services list` and in the interactive `rocm serve` summary (a fresh launch
+waits briefly for it; if it is not there yet, check `rocm services list`). It is
+a text-only, non-streaming endpoint. It is a base URL: point an
+Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
+if the service has one, as `x-api-key` (the translation front also accepts a
+bearer token). `rocm` runs a
+translation front on its own port, inside the serving process, so it starts and
+stops with the service; it fronts the engine even when the engine has its own
+`/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
+answers, and the reply names it. The translation covers text turns, system
+prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`;
+streaming, tool use (`tools`, `tool_choice`), extended thinking and image or
+other non-text content blocks are refused with
+an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
+marks the endpoint `(not responding)` when a ready service's endpoint does not
+answer.
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
@@ -862,6 +990,32 @@ after a crash (with the `server-recover` automation enabled) inherits the
 daemon's environment, not yours, so a forwarded secret must also be set
 there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the 5-minute readiness wait
 for a cold-start model download.
+
+`--port` is optional on the default loopback host (`127.0.0.1`): omit it and
+`rocm serve` picks the first free port in `11435`-`11535`, checking both
+rocm-cli's own records and the OS. The non-interactive plan output (piped
+output, or the Dash approval card) shows `Port: automatic; endpoint shown
+after launch` while the launch is in flight and prints the concrete endpoint
+once the port is actually leased; the interactive deployment summary table
+only ever shows the final resolved endpoint. Pass `--port` explicitly to pin
+one; on `127.0.0.1`, an explicit loopback port already reserved by another
+managed service is rejected up front, naming that service and how to free it
+(`rocm services stop <service-id> --yes`). A port held by an untracked process
+is rejected too, but without naming the holder. `--host` to anything other
+than the default
+loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
+requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
+cannot promise a free port anywhere else. An explicit `--port` on such a host
+is refused when a live managed service already holds that port on the same
+address (`localhost` counts as both loopback addresses) or on a wildcard
+listener that covers it (`0.0.0.0` for IPv4 addresses, `::` for any); the OS is not probed on such a
+host, so any other clash is reported by the engine when it starts.
+
+`rocm services restart` and `rocmd`'s automatic recovery are deliberately
+stricter about hosts than that launch check: they refuse to bring a service
+back on a port that any other live managed service has recorded, whatever host
+that service is bound to, because a `0.0.0.0` listener also covers the loopback
+address.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
@@ -891,6 +1045,10 @@ different settings. If you previously started a service with `--temperature`
 flags, or with different ones, stop the existing service first (`rocm
 services stop <service-id> --yes`) or match the original flags.
 
+Likewise, an explicit `--port` that differs from the port the running service
+is already on is refused rather than silently ignored; omit `--port` to reuse
+the running service, or stop it first to serve on the new port.
+
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
@@ -912,6 +1070,17 @@ can:
   directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
+`--wait` keeps `rocm serve` waiting until the server answers requests or its
+engine gives up (vLLM and AIM after 5 minutes by default; raise it with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
+of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`rocm services stop`), it fails with an error that points at the server's logs
+instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
+in the background; a generated API key (public bind) is printed when the wait
+begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
+when the model is already being served and still starting, it waits on that
+server instead (an already-serving one is reported at once). Watch the download with
+`rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
@@ -1082,7 +1251,7 @@ Manage background servers started with `--managed`:
 
 ```
 rocm services list [--all] [--json]
-rocm services logs <service-id>
+rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
@@ -1102,6 +1271,14 @@ second stop can report the server stopped while that process still runs.
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
 nothing, and leaves the stop request recorded.
+
+After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
+and re-checks the port before it respawns: if another live managed service is
+now recorded on that port, or (on the default `127.0.0.1` host only) the port is
+bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
+bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
+`restart` fails saying the server was stopped but not restarted and names
+`rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
@@ -1383,19 +1560,31 @@ provider settings are left untouched.
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
+rocm logs [--service <service-id> [--follow]] [--search TERM ...] [QUERY ...]
+rocm services logs <service-id> [--follow]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
                [--force-dev-binaries]
 ```
 
+`--follow` (`-f`) keeps printing a server's new log output, such as a model
+download's progress, until the server stops (a server that ends `failed` makes the command exit
+non-zero), and prints `Service <id> is ready.` when it finishes starting. Ctrl-C
+ends the follow and leaves the server running. On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>`
+line stays on the row under the newest output. Piped or redirected output keeps
+stdout to the log text alone: the hint (once), `is ready.` and `stopped following.`
+lines go to stderr. A server that is already `failed` when the follow starts exits
+non-zero too, after printing its log.
+
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
 do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
-and `--yes` to skip the confirmation. Outside an interactive terminal, when there
-is something to remove, it refuses with exit code 1 and removes nothing unless
-you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
+and `--yes` to skip the confirmation. It does not create the folders it reports
+on: with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there
+is nothing to remove. Outside an interactive terminal, when there is something
+to remove, it refuses with exit code 1 and removes nothing unless you pass
+`--yes`. Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.

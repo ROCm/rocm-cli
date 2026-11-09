@@ -233,6 +233,104 @@ fn allow_base_overrides(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
 }
 
+/// Only the canonical release index, for a scenario that never pins ROCm 10 and
+/// so never reaches the next layout.
+#[given("a canonical release pip index fixture")]
+async fn canonical_pip_index_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("current"),
+        [
+            ("rocm", CURRENT_ROCM_VERSION),
+            ("torch", CURRENT_TORCH_VERSION),
+            ("torchvision", CURRENT_TORCHVISION_VERSION),
+            ("torchaudio", CURRENT_TORCHAUDIO_VERSION),
+        ],
+    );
+    serve_pip_fixtures(world);
+}
+
+/// File the recording `uv` appends to, one line per invocation.
+const UV_INVOCATION_LOG: &str = "uv-invocations.log";
+
+/// The per-scenario cache folder, under the scenario root.
+const SCRATCH_CACHE_DIR: &str = "scratch-cache";
+
+/// A host where the CLI can find no Python: `PATH` is one empty folder, so the
+/// search comes up empty and no managed Python has been saved. `uv` is a
+/// recording stand-in named through `ROCM_CLI_UV_BINARY`, so a CLI that goes on
+/// to prepare a managed Python reaches it, instead of downloading the real one,
+/// and leaves a line behind.
+///
+/// Relies on the ambient environment not naming a Python: a set
+/// `ROCM_CLI_PYTHON` would answer the search before it looks at `PATH`, and a
+/// set `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP` would turn the case this
+/// scenario is about into an error. Either would make the scenario pass or fail
+/// for a reason it does not name, so they are refused up front.
+#[given("a host with no usable Python and a recording uv")]
+async fn host_with_no_python_and_recording_uv(world: &mut E2eWorld) {
+    let scenario_root = host_without_python(world);
+    let uv = scenario_root
+        .join("recording-uv-bin")
+        .join(e2e_cucumber::fixture_binary::fixture_target_name("uv"));
+    crate::install_fixture_binary("fake-uv", &uv);
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world.command_env.push((
+        "FAKE_UV_LOG",
+        scenario_root.join(UV_INVOCATION_LOG).into_os_string(),
+    ));
+}
+
+/// The same host with no `uv` anywhere: none named by `ROCM_CLI_UV_BINARY` and no
+/// managed copy under the scenario's data folder, so a CLI that needs one would
+/// have to download it. Nothing here can observe a `uv` run, since there is none to
+/// run; what it can observe is the state a download leaves, which is why the
+/// scenario's data and cache folders are the evidence.
+#[given("a host with no uv and no usable Python")]
+async fn host_with_no_uv_and_no_python(world: &mut E2eWorld) {
+    assert!(
+        std::env::var_os(rocm_core::uv::UV_BINARY_ENV).is_none(),
+        "{} is set in the environment running the suite, which would put a uv on this host; \
+         unset it",
+        rocm_core::uv::UV_BINARY_ENV
+    );
+    host_without_python(world);
+}
+
+/// What the hosts these steps build share: `PATH` is one empty folder, so no Python is found
+/// and none has been saved, and the CLI has a cache folder of its own. Returns
+/// the scenario root.
+fn host_without_python(world: &mut E2eWorld) -> std::path::PathBuf {
+    for var in [
+        "ROCM_CLI_PYTHON",
+        "ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP",
+    ] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set in the environment running the suite, which would change what this \
+             scenario exercises; unset it"
+        );
+    }
+    let scenario_root = root(world).to_path_buf();
+    let empty_path = scenario_root.join("no-python-on-path");
+    std::fs::create_dir_all(&empty_path).expect("failed to create the empty PATH folder");
+    world
+        .command_env
+        .push(("PATH", empty_path.into_os_string()));
+    // A cache folder of this scenario's own. The harness otherwise points the
+    // CLI at a cache shared across scenarios and, on CI, across runs, where a
+    // tool archive an earlier run left would trip the backstop check for one in
+    // the cache. Overrides the shared one for this scenario only.
+    let scratch_cache = scenario_root.join(SCRATCH_CACHE_DIR);
+    std::fs::create_dir_all(&scratch_cache).expect("failed to create the scratch cache folder");
+    world
+        .command_env
+        .push(("ROCM_CLI_CACHE_DIR", scratch_cache.into_os_string()));
+    scenario_root
+}
+
 #[given("a canonical release pip index fixture and a ROCm 10 pip index fixture")]
 async fn pip_index_fixtures(world: &mut E2eWorld) {
     let served = root(world).join("therock-pip-fixtures");
@@ -791,6 +889,18 @@ async fn preview_unpinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+/// A `uv` the preview can use without fetching one. The resolution these
+/// scenarios assert on is a real `uv pip compile` against the loopback fixtures,
+/// so the stand-in `uv` of runtime-27 would not do; this installs the managed one
+/// the way a real install would have (from the network, into the scenario's own
+/// data folder, or, when `ROCM_CLI_UV_BINARY` names one, that one).
+#[given("a uv is already installed")]
+async fn a_uv_is_already_installed(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    rocm_core::ensure_uv_binary(&paths)
+        .unwrap_or_else(|error| panic!("failed to install uv for the scenario: {error:#}"));
+}
+
 #[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
     preview_ok(
@@ -1038,6 +1148,299 @@ fn assert_contains(world: &E2eWorld, needle: &str, what: &str) {
         "{what}: expected {needle:?} in the preview:\n{}",
         stdout(world)
     );
+}
+
+/// The managed interpreter the canonical layout needs. Keep in step with
+/// `DEFAULT_MANAGED_PYTHON_VERSION` in `apps/rocm/src/therock/python.rs`.
+const CANONICAL_MANAGED_PYTHON: &str = "3.12";
+
+#[then("the preview says a real install would prepare a managed Python")]
+async fn preview_says_managed_python_would_be_prepared(world: &mut E2eWorld) {
+    assert_contains(world, "python_source: managed", "python source");
+    assert_contains(
+        world,
+        "python_launcher: not prepared by this preview",
+        "python launcher",
+    );
+    assert_contains(
+        world,
+        &format!("would use uv to install managed Python {CANONICAL_MANAGED_PYTHON}"),
+        "python note",
+    );
+}
+
+/// The preview says it prepared no Python, and the state it left agrees. The
+/// claim and the filesystem are checked together: the note alone would pass
+/// with the bug present, and so would the empty folders alone if the preview
+/// had simply stopped before it got to the Python.
+#[then("the preview prepared no Python, as it says")]
+async fn preview_prepared_no_python(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        &format!(
+            "a real install would prepare Python {CANONICAL_MANAGED_PYTHON}. This preview does not."
+        ),
+        "the progress line about what the preview skipped",
+    );
+    assert_no_python_prepared(world);
+}
+
+/// The state half of the claim: the recording `uv` was never run (the evidence
+/// that nothing was prepared), no managed tools folder, no saved configuration,
+/// and, as a backstop only, no tool archive in the scenario's cache. It holds for
+/// both layouts, because a preview never fetches `uv`: the canonical layout needs
+/// none, and the ROCm 10 layout runs one only when it is already present (see
+/// runtime-27 and runtime-28). A scenario that gives the preview a `uv` and expects
+/// it to run must not call this.
+fn assert_no_python_prepared(world: &E2eWorld) {
+    let paths = world.app_paths();
+    let scenario_root = root(world).to_path_buf();
+    let uv_log = scenario_root.join(UV_INVOCATION_LOG);
+    assert!(
+        !uv_log.exists(),
+        "the preview ran uv, which it says it did not:\n{}",
+        std::fs::read_to_string(&uv_log).unwrap_or_default()
+    );
+    let tools = rocm_core::managed_tools_dir(&paths.data_dir);
+    assert!(
+        !tools.exists(),
+        "the preview created the managed tools folder {}, which would hold a managed uv and Python",
+        tools.display()
+    );
+    // A backstop, not the detector. `ROCM_CLI_UV_BINARY` makes `ensure_uv_binary`
+    // return the recording `uv` before any download could begin, so this folder
+    // stays empty even if the preview did go on to prepare a Python; the `uv`
+    // log above is what shows that. It is the scenario's own cache folder (see
+    // the Given), not `paths.cache_dir`, which is the shared one where a run's
+    // leftovers would already be.
+    let cache_tools = scenario_root.join(SCRATCH_CACHE_DIR).join("tools");
+    assert!(
+        !cache_tools.exists(),
+        "the preview downloaded a tool archive into {}",
+        cache_tools.display()
+    );
+    let config = paths.config_path();
+    assert!(
+        !config.exists(),
+        "the preview saved a configuration at {}, which would record a managed Python: {}",
+        config.display(),
+        std::fs::read_to_string(&config).unwrap_or_default()
+    );
+}
+
+/// Plants an interpreter on the empty `PATH` folder that cannot serve the
+/// install: `fake-python` answers the wheel-tag probe with `{}`, which is not
+/// the tag the layout needs, so the search finds a Python and rejects it.
+#[given("the only Python on the host's path is not usable")]
+async fn only_unusable_python_on_path(world: &mut E2eWorld) {
+    let python = root(world).join("no-python-on-path").join("python3");
+    crate::install_fixture_binary("fake-python", &python);
+}
+
+#[given("managed Python bootstrap is disabled")]
+async fn managed_python_bootstrap_disabled(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1".into()));
+}
+
+/// The refusal is the whole story: the output states the finding about the
+/// `PATH` Python and the policy refusal, and no line says what a real install
+/// would go on to do, since it would do nothing.
+#[then("the preview is refused because managed Python is disabled, without a promise")]
+async fn preview_refused_for_disabled_bootstrap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("managed Python bootstrap is disabled"),
+        "expected the policy refusal:\n{stderr}"
+    );
+    let out = stdout(world);
+    assert!(
+        out.contains("Python from PATH is not usable for this ROCm install (cp312 is required).\n"),
+        "expected the finding about the PATH Python:\n{out}"
+    );
+    for promise in [
+        "a real install would",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
+}
+
+#[given("the managed Python version is overridden to 3.13")]
+async fn managed_python_version_overridden(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_MANAGED_PYTHON_VERSION", "3.13".into()));
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 with no version pin")]
+async fn try_preview_unpinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+/// The refusal names the version and the tag rule, as a real install would
+/// meet it, and the state agrees that nothing was prepared on the way to it.
+#[then("the preview is refused because the install would refuse that Python")]
+async fn preview_refused_for_python_version(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    for needle in [
+        "would prepare managed Python 3.13",
+        "Python wheel tag cp313 is not supported",
+        "cp312 is required",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected {needle:?} in the refusal:\n{stderr}"
+        );
+    }
+    // The progress lines must not promise what the refusal then takes back: the
+    // output holds no "would prepare Python 3.13" and no plan.
+    let out = stdout(world);
+    assert!(
+        out.contains("Checking Python for the ROCm install.\n"),
+        "expected the neutral Python check line:\n{out}"
+    );
+    for promise in [
+        "would prepare Python 3.13",
+        "ROCm CLI will prepare",
+        "sdk install",
+    ] {
+        assert!(
+            !out.contains(promise),
+            "the output promised {promise:?} before refusing:\n{out}"
+        );
+    }
+    assert_no_python_prepared(world);
+}
+
+/// The four pins `uv pip compile` would print for the ROCm 10 fixture, one
+/// `name==version` per line, which the CLI reads back as the chosen stack.
+#[given("the recording uv answers uv pip compile with the ROCm 10 fixture's versions")]
+async fn recording_uv_answers_compile(world: &mut E2eWorld) {
+    let pins = [
+        ("rocm", NEXT_ROCM_VERSION),
+        ("torch", NEXT_TORCH_VERSION),
+        ("torchvision", NEXT_TORCHVISION_VERSION),
+        ("torchaudio", NEXT_TORCHAUDIO_VERSION),
+    ]
+    .map(|(name, version)| format!("{name}=={version}"))
+    .join("\n");
+    world.command_env.push(("FAKE_UV_STDOUT", pins.into()));
+    // The CLI pipes the requirements into `uv pip compile -`; see the stand-in.
+    world.command_env.push(("FAKE_UV_DRAIN_STDIN", "1".into()));
+}
+
+/// A `uv` that is present is still used: it ran `uv pip compile`, once and for
+/// nothing else, and the preview did not report the step as skipped. The log is
+/// the evidence, since the plan's versions alone could not tell a compile from a
+/// guess.
+#[then("the preview resolved the versions with the uv that was present")]
+async fn preview_resolved_with_present_uv(world: &mut E2eWorld) {
+    let log_path = root(world).join(UV_INVOCATION_LOG);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!(
+            "the recording uv has no log at {}, so the preview never ran it: {error}",
+            log_path.display()
+        )
+    });
+    let runs: Vec<&str> = log.lines().collect();
+    assert!(
+        matches!(runs.as_slice(), [run] if run.starts_with("pip compile ")),
+        "the preview should run uv once, for `uv pip compile`, and for nothing else:\n{log}"
+    );
+    let out = stdout(world);
+    for unresolved in ["resolution_note:", "not resolved by this preview"] {
+        assert!(
+            !out.contains(unresolved),
+            "the preview ran uv but reported the step as skipped ({unresolved:?}):\n{out}"
+        );
+    }
+}
+
+/// What a preview of the ROCm 10 layout says when no `uv` is there to run, and the
+/// state it left. The claim and the filesystem are checked together: the note alone
+/// would pass with a preview that also downloaded `uv`, and the empty folders alone
+/// would pass if the preview had stopped before it got to the question.
+#[then("the preview says it did not resolve the ROCm 10 package versions, as it says")]
+async fn preview_did_not_resolve_without_uv(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "No uv is installed; a real install would fetch it and resolve the torch and torchvision \
+         versions with `uv pip compile`. This preview does not.",
+        "the progress line about what the preview skipped",
+    );
+    assert_contains(
+        world,
+        "resolution_note: no uv is installed, so a real install would fetch it and run `uv pip \
+         compile` to choose the torch and torchvision versions and to check that the published \
+         packages install together, which this preview did not do",
+        "the note about what the preview skipped",
+    );
+    // Everything made from the versions `uv` would choose is marked, not guessed.
+    for key in [
+        "target",
+        "runtime_key",
+        "package_specs",
+        "command",
+        "manifest",
+    ] {
+        assert_contains(
+            world,
+            &format!("\n  {key}: not resolved by this preview\n"),
+            "a line made from the unchosen versions",
+        );
+    }
+    // What needs no `uv` is still printed, from the same decisions a real install
+    // takes: the exact device payload, the requirements `uv` would be asked about,
+    // and the pinned torchaudio.
+    assert_contains(
+        world,
+        &format!("device_target: {RAW_ARCH}"),
+        "the device target",
+    );
+    assert_version_resolution_extras(world, false);
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {NEXT_ROCM_VERSION}"),
+        "the ROCm version",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio_selection: torchaudio {NEXT_TORCHAUDIO_VERSION}, "),
+        "the torchaudio pin",
+    );
+    for chosen_by_uv in [NEXT_TORCH_VERSION, NEXT_TORCHVISION_VERSION] {
+        assert!(
+            !stdout(world).contains(chosen_by_uv),
+            "the preview named {chosen_by_uv}, which only `uv pip compile` could have chosen:\n{}",
+            stdout(world)
+        );
+    }
+    assert_no_python_prepared(world);
 }
 
 #[then("the preview resolves the canonical release pip index")]

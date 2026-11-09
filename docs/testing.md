@@ -27,6 +27,46 @@ Run clippy with warnings as errors:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Source file size
+
+No source file may exceed 1,500 production lines. Production lines leave out test-gated
+items (inline `#[cfg(test)]` modules and the like) and test-only files, so adding the
+tests a fix needs never counts against a file. Check it with:
+
+```bash
+cargo xtask check-module-size
+```
+
+It exits non-zero and names each offending file with its count. There is one limit for
+every file: no flag, baseline or exemption. For now the check is advisory in the `clippy`
+CI job and in the `cargo-module-size` pre-commit hook, which run
+`cargo xtask check-module-size` and `cargo xtask check-module-size-advisory` and report
+offenders without failing (in CI the step shows red in the job's step list while the job
+stays green); the second is the same check that exits successfully even
+when the check itself cannot run. That holds once xtask has built: a commit that leaves
+xtask or `rocm-core` not compiling still fails the hook.
+The counting rules are unit-tested in `xtask/src/module_size.rs`:
+
+```bash
+cargo test -p xtask module_size
+```
+
+### Module map check
+
+Every production source file must have an entry in [architecture.md](architecture.md). The
+check runs in the `clippy` CI job and in the `architecture-doc` prek hook, and you can run it
+on its own:
+
+```bash
+cargo xtask check-architecture-doc
+```
+
+It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
+does not link, and on a stale entry in the `EXEMPT` list in
+[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
+`lychee` check is complementary, not redundant: it confirms that links already in the doc
+resolve, and says nothing about a file the doc never mentions.
+
 ### Tests that touch the environment
 
 `std::env::set_var` / `remove_var` change state shared by every thread in the
@@ -112,6 +152,44 @@ all of which the scan reports nothing for:
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
+
+### The freeform planner never imports `chat`
+
+`chat.rs` calls the freeform planner, so a planner that imported `chat` back
+would be a module cycle. The cycle is broken by three leaf modules
+([`prompt_text.rs`](../apps/rocm/src/prompt_text.rs),
+[`rocm_argv.rs`](../apps/rocm/src/rocm_argv.rs) and
+[`tool_policy.rs`](../apps/rocm/src/tool_policy.rs)) that the planner and `chat`
+both call into. `cargo xtask check-crate-edges` compares crates and cannot see
+a rule between modules of one crate, so, as with the environment rule above, a
+test enforces it rather than an `xtask` subcommand:
+`the_freeform_planner_and_its_leaf_modules_never_import_chat` in `xtask`
+([`chat_import_contract.rs`](../xtask/src/chat_import_contract.rs)) reads
+[`freeform_planner.rs`](../apps/rocm/src/freeform_planner.rs) and those three
+files and **fails the build** if any of them reaches `chat` in non-test code,
+naming each as `file:line`. Run it on its own with:
+
+```bash
+cargo test -p xtask chat_import_contract
+```
+
+It flags `crate::chat`, `super::chat` and `self::chat` as a path, `chat` as a
+member of a `use crate::{..}` group, and `mod chat`, and a raw identifier
+(`r#chat`) counts as `chat`. The one thing it skips is a
+`#[cfg(test)] mod name { .. }` block, so a `mod tests` may use `chat`; a
+`#[cfg(test)]` on anything else (a `use`, a function, a field, an expression)
+skips nothing, and a test that needs `chat` belongs in the test module. A route
+that never writes the `crate::chat` path is not seen: an alias
+(`use crate as root; root::chat::f()`), a glob (`use crate::*;` then
+`chat::f()`) or a `#[path = ".."] mod` that points at `chat.rs`; and
+`#[cfg(all(test, ..))]` is read as production code, so it can only cause a false
+alarm. It does not flag the
+identifiers and prose that merely contain the word, such as
+`chat_cli_arg_value`. It reads the four listed files only, not the modules they
+import. If one of them moves or is renamed, update `GUARDED` in the test; the
+test fails on a path that no longer exists rather than dropping it from the
+guard. When the planner needs something that lives in `chat.rs`, move it into
+a leaf module and import it from there.
 
 ### Tests that run a fake executable
 
@@ -251,6 +329,63 @@ share of cases and would pass with it present on a short run. The uninstall prop
 knob instead, `ROCM_DELETION_PROP_CASES`, described under Uninstall And
 Download Removal below; it follows the same rule.
 
+When a property fails, proptest saves the shrunk case as a `cc <hash> # shrinks
+to ...` line in a file named after the source file the `proptest!` block is
+written in, and replays it before any new case on every later run: a block in
+`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`, where
+`src/` is the nearest ancestor directory holding a `main.rs` or `lib.rs` (it is
+`src/` for every crate in this tree). Moving
+the test to another file therefore leaves its saved cases behind, and proptest
+does not warn: they just stop being replayed. **Carry the saved cases to the
+test's new file in the same commit**; what that takes depends on how much moved:
+
+- When every property test of the source file moves, and the new file has no
+  regression file yet, `git mv` the regression file to the name the new file
+  needs.
+- When only some of them move (a split), the tests left behind still read the
+  old regression file, and proptest does not record which test a saved case
+  belongs to: all the `proptest!` blocks of a file share one. Keep the old file
+  where it is and copy the `cc` lines to the new file's regression file. If that
+  file already exists, append to it so its own cases stay; do not overwrite it
+  and do not `git mv` onto it. A case copied to a test it did not come from is
+  only one more input for that test to run.
+
+This is enforced in part by a test, not by an `xtask` subcommand:
+`every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
+`xtask` walks the tree and **fails the build** on a file under any
+`proptest-regressions/` directory whose `<crate>/src/<path>.rs` (`src/` being the
+directory with `main.rs` or `lib.rs`) is missing or
+holds no `proptest!` block in code (a mention in a comment or a string literal
+does not count; whitespace or a comment between `proptest` and the `!`, as in
+`proptest ! { .. }`, still does), naming the file and the source file it expected. It cannot see
+the opposite mistake, a split that `git mv`d the regression file away from tests
+that still need it: no file is orphaned then, one is just missing, so read the
+diff of a split for it. Two more things it does not check: a crate with a
+`src/bin/<x>/main.rs` that has a property test would be reported as an orphan by
+mistake, because proptest then keeps its seeds in `src/bin/proptest-regressions/`
+(nothing in this tree has one); and a property test under a crate's `tests/`
+directory is invisible to it, since proptest cannot find a `main.rs` or `lib.rs`
+above such a file and writes the seed next to the test file instead. Run the
+check on its own with:
+
+```bash
+cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
+```
+
+The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
+adds `xtask` when a changed file is under a `proptest-regressions` directory or
+when the diff of a changed Rust file adds or removes a line containing
+`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
+check on the pull request, whether or not its seed moved with it. The other
+source-scan contracts do not have this rule; they still meet a change confined to
+a crate that `xtask` does not depend on in the merge queue, which runs the whole
+workspace. To prove a moved seed is read,
+append a deliberately unparsable line to it, run the test with `--nocapture`
+(`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
+`unparsable line, ignoring` warning naming that path, and remove the line.
+The check does not tell a seed that still reproduces from one that no longer
+does; it only confirms that something reads the file.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
@@ -375,9 +510,117 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). On `main`
-and in the merge queue the full workspace always runs. For local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization.
+`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
+the proptest seed guard and which no other crate depends on: a changed file under
+a `proptest-regressions` directory, and a changed Rust file whose diff adds or
+removes a line containing `proptest!` (found with `git diff -G`). On `main`
+and in the merge queue the full workspace always runs. For a full local verification, keep using
+`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
+narrows the local pre-push hooks (next section).
+
+### Pre-push hook scope
+
+The pre-push hooks `cargo-clippy`, `cargo-clippy-e2e` and `cargo-test` in
+[.pre-commit-config.yaml](../.pre-commit-config.yaml) run through `cargo xtask pre-push-check`
+([prepush.rs](../xtask/src/prepush.rs)), which applies the same selection to the range being
+pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does not have yet;
+`origin/main...HEAD` when run by hand). Each step prints the scope it chose:
+
+- `clippy` runs `cargo clippy -p <crate> … --all-targets -- -D warnings` for the affected crates,
+  or `--workspace` when the selection is the whole workspace.
+- `clippy-e2e` lints the e2e harness target only when `e2e-cucumber` is among the affected crates.
+- `test` runs `cargo test -p <crate> … --all-targets` for the affected crates, never including
+  `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
+  `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
+
+The directory-based selection cannot see a crate's tests reading a file from outside the crate,
+so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
+file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
+test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
+selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+[prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
+`include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
+covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
+whose path is written out (an `include_str!` literal, or a `CARGO_MANIFEST_DIR` chain ending in
+literal `.join("...")` segments) is checked file by file, but a test that derives the repo root in
+one place and joins the rest elsewhere (xtask's `repo_root()` helper) is only recorded as reading
+through the root. For that case the test checks that the crate is a declared reader, not which files
+it reads, so a test that starts reading a new kind of file of another crate needs its
+`CROSS_CRATE_READS` entry added by hand.
+
+A step that has nothing to check says so and exits successfully. A step whose affected crates
+cannot be determined (the pushed range's base is not available locally, the range lists no
+changed files at all, or `cargo metadata` fails) runs over the whole workspace and prints why, so
+narrowing never replaces a check with silence. An empty list counts as undeterminable because the
+hook only fires for a push that contains a Rust file, so an empty list means the range is wrong. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
+filter, as before, including a lockfile-only push.
+
+The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
+job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
+`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
+every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
+`--workspace`.
+
+Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed
+commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
+builds can resolve Cargo features differently from `--workspace` ones.
+
+### Pass stamps
+
+A step that already passed on this exact content is skipped. After a step's cargo command exits 0,
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs) records a stamp, and the next run of the same step
+looks for it first. The stamp stands for:
+
+- the step and its exact cargo arguments, so a pass recorded for `-p xtask` never lets a later run
+  over `--workspace` skip (the selection is part of the key, not a separate check);
+- the git *tree* hash of `HEAD`, not the commit hash, so an amend that only rewords the message, or
+  the same content pushed to a second remote, still hits;
+- the compiler and cargo identity (`rustc -vV`, `cargo -vV`) and a digest of the `CARGO_*` and
+  `RUST*` environment (never the values), minus a short list of per-run variables such as
+  `CARGO_TARGET_DIR` and `CARGO_TERM_COLOR`. The environment is read as raw bytes, so a variable
+  whose value is not valid Unicode never stops the hook: an unrelated one is ignored and a
+  relevant one is hashed as the bytes it is.
+
+The working tree has to be clean for a stamp to be used or written, because cargo checks the working
+tree, not the pushed commit: with uncommitted changes the step runs and says why, and an untracked
+file counts because it can hide a missing `git add`. The tree is probed again after the step, and
+nothing is recorded if cargo changed it (a rewritten `Cargo.lock`, for example). A pass is only
+written after cargo succeeded, per step, so a failed `test` does not erase the `clippy` pass that
+the retry then skips.
+
+Stamps live in `rocm-cli-prepush-passes` under the git common directory, so every worktree of a
+clone shares them, nothing lands in the work tree and `cargo clean` does not erase them. Each write
+drops stamps older than seven days and keeps at most 64. A write goes through a scratch file and a
+rename, and removes the scratch file itself when the rename fails; a process killed mid-write
+leaves its scratch file behind until a later write prunes it, once it is more than an hour old (a
+younger one may belong to a concurrent writer). Any error locating, reading or verifying a
+stamp means the step runs (git is run for an explicit directory with `GIT_DIR` and the other
+repository-selecting variables removed, which git and prek export to a hook run from a linked
+worktree); a stamp that does not match its key exactly, is dated in the future or is
+unreadable is ignored (the step names it); a failed write is reported and never fails the hook.
+
+The skip message says what a stamp does not cover: user-level cargo configuration, installed
+tools, files git ignores (the one thing a clean `git status` cannot see) and flaky tests. Force
+a run with `--rerun` or `ROCM_PRE_PUSH_RERUN=1` (the hook has no flags, so use the variable
+there), or delete the directory the message names. `SKIP=<hook id>` still skips a hook outright,
+and `verify-commits` is a separate hook that checks commit signatures on every push. A skip
+proves that this tree passed these checks earlier, not that they ran during this push; for a
+fresh run before relying on the result, use `--rerun`. A rerun replaces the recorded pass: it
+drops this step's earlier pass before running, so if the rerun fails the next ordinary run runs
+the step instead of skipping on the pass it was meant to double-check, and a successful rerun
+records a fresh one. Other steps' and other selections' passes are left alone, and `--dry-run`
+never touches a stamp.
+
+Preview what a push would check without compiling (a dry run also says when a real run would skip):
+
+```bash
+cargo xtask pre-push-check test --dry-run --base origin/main
+```
+
+`--base` replaces the range's base; `clippy` and `clippy-e2e` take the same flags. The selection
+logic and the stamps are unit-tested in [prepush.rs](../xtask/src/prepush.rs) and
+[prepush_stamp.rs](../xtask/src/prepush_stamp.rs); as dev tooling, with no change to
+what the `rocm` binary does, it has no Gherkin scenario.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
 uses an isolated config/data/cache root, does not install TheRock wheels, does
@@ -510,6 +753,97 @@ rocm install sdk --channel release --format wheel < /dev/null   # expect the ref
 The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
 never prompts and never refuses, whatever the active default is.
+
+The preview also prepares no Python. On a host with no usable Python, a real
+install downloads a managed `uv`, has it install Python, and saves that Python's
+path in the config; `--dry-run` instead prints a `python_note:` line saying so
+and does not prepare Python or save a Python path. Scenario `runtime-23` checks
+the note against the state it left: a recording `uv` standing in for the download
+was never run (that log is the evidence; no network is involved), and there is no
+managed-tools folder and no saved config. It also looks for a tool archive in its
+own cache folder, but only as a backstop: the stand-in `uv` is returned before a
+download could start. The printed `command:` line then shows
+`uv venv --python 3.12 ...` (a version, because no interpreter path exists yet),
+so it is not copy-pasteable verbatim: `uv` resolves `3.12` itself, and on a host
+with a different Python 3.12 it can choose that one rather than the managed one
+a real install prepares. That scenario is a canonical-layout preview.
+
+A preview of a ROCm 10 or newer wheel (a `--version` pin of 10 or later) is held
+to the same rule, and never fetches `uv` either. On that layout `uv pip compile`
+is the one step that chooses the `torch` and `torchvision` versions (the CLI
+picks only the ROCm version and the torchaudio pin), so the preview runs a `uv`
+that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
+previous install left) and, with none, stops before that step. It then prints
+what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
+would be asked about), marks `target`, `runtime_key`, `package_specs`, `command`
+and `manifest` as `not resolved by this preview`, and says why in a
+`resolution_note:` line and a progress line, in the voice of `python_note:`. It
+cannot say whether the published stack installs together either. A real install
+and `rocm update` still fetch `uv` as before, and a preview made after either
+has run is the complete plan. Scenario `runtime-28` checks the note against the
+state it left on a host with no `uv`: no managed-tools folder, no tool archive in
+its own cache folder (here the real detector, since no stand-in `uv` is named),
+no saved config, and no `torch` or `torchvision` version anywhere in the output.
+`runtime-27` is the other polarity: with a `uv` present (the recording stand-in,
+which answers `uv pip compile` with the fixture's four pins, drains its stdin
+under `FAKE_UV_DRAIN_STDIN`, and logs its arguments under `FAKE_UV_LOG`), the
+preview runs it exactly once, for the compile, and prints the resolved plan. The
+`therock-next` scenarios that print resolved package specs start from `And a uv
+is already installed`, which installs the managed `uv` into the scenario's data
+folder the way a real install would have.
+The decision is unit-tested on every platform, Windows included
+(`the_version_step_is_decided_by_layout_access_and_a_present_uv_alone` in
+[uv_access.rs](../apps/rocm/src/therock/resolve/uv_access.rs): the state matrix of
+both layouts, a preview or an install, and a `uv` present or not), as are the
+plan's whole text and its key order against a resolved plan's
+(`the_plan_a_preview_without_uv_prints_is_exactly_this` and
+`a_resolved_and_an_unresolved_plan_print_the_same_keys` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs)). On Unix,
+`a_preview_never_acquires_uv_and_a_real_resolution_still_does` there runs the
+real resolution against a served index and a stand-in `uv`, counting what each
+row looked for, acquired and ran. What no test reaches without the network is the
+real download a real install makes when no `uv` is installed, and that the public
+entry points a real install and `rocm update` call pass `UvAccess::Acquire`: the
+first is a network call, and the second is held only by the types (those entry
+points return a resolved plan and refuse the unresolved one) and by the lanes
+that install a ROCm 10 runtime for real.
+
+The preview does not announce a Python the install would refuse either, and it
+prints nothing that predicts what a real install would do on a path that ends in
+a refusal. With `ROCM_CLI_MANAGED_PYTHON_VERSION` naming a version that reads as
+a wheel tag other than the layout's (`3.13`, `3.13t`, `cpython-3.13` or
+`cpython@3.13` for the canonical cp312 layout), and with managed Python disabled
+by `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`, the preview fails with the
+install's own message after stating only what it found (for example that the
+`PATH` Python is not usable); the single line saying a real install would
+prepare a managed Python appears only for a decision that passed both checks.
+Scenarios `runtime-24` (the `3.13` refusal) and `runtime-25` (policy refusal with
+an unusable `PATH` Python) check this on the whole output. A version whose tag
+cannot be read off its name (`pypy@3.10`, a range) is announced as unchecked: the
+note and the progress line say its tag cannot be checked until it is installed.
+The scenarios run on Linux. The preview's decision (what a host with no usable
+Python is told, which managed version is announced or refused, what the
+bootstrap policy does) is unit-tested on every platform, including the Windows
+CI job, by `a_dry_run_decides_from_an_injected_environment_on_every_platform`:
+it hands `python_for_install` a resolver environment that carries the policy and
+finds nothing, so it needs no interpreter. What stays Unix-only is the search
+order and the interpreter probes, whose stand-ins are shell scripts as in the
+other resolver tests, and no end-to-end run covers the Windows preview, so the
+Windows search order (`python`, `python3`, `py` with `PATHEXT`) is not covered
+by any test.
+`a_dry_runs_whole_python_output_follows_one_decision_in_every_state` in
+[python.rs](../apps/rocm/src/therock/python.rs) is the state matrix: every
+combination of `PATH` Python (usable, unusable, absent), saved Python (usable,
+unusable, absent), bootstrap policy (enabled, disabled) and version override
+(default, accepted, unreadable, refused tag), each asserting the complete
+progress output and that `uv` was not run and no file was written. Beside it are
+`a_dry_run_with_no_usable_python_prepares_nothing`,
+`a_dry_run_refuses_a_managed_python_version_the_install_would_refuse` and
+`a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
+preview does still write its package-index cache under the cache folder.
+The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
+previews in this sense: they resolve with `uv` and can fetch it, and prepare a
+managed Python too.
 
 Then it verifies:
 
@@ -783,6 +1117,34 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
+when none is chosen: it recovers the runtime `rocm setup` created before
+counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
+was lost is found. The real run (`comfyui-16`, against an existing checkout that
+needs no dependencies) writes the entry back; the `--dry-run` preview
+(`comfyui-15`) names the same runtime but writes nothing, because a preview
+promises not to change files. The preview prints the install command with that
+runtime's `--runtime-id`, and `comfyui-17` runs that command as printed from the
+state the preview left: an explicit `--runtime-id`, like an active or default
+runtime, finds the runtime setup created when the registry alone cannot answer,
+so the command works and writes the entry back. `comfyui-18` runs the same
+printed command when the registry cannot take that entry back (a plain file
+stands where its directory should be, which also stops `root`; a read-only
+directory would not): the preview still succeeds, and the real run fails naming
+the runtime whose entry it could not restore, rather than saying "Install ROCm
+first", and leaves the registry as it was. The variant with a read-only registry
+directory that holds other runtimes is a unit test, because a read-only
+directory is writable to `root`. `comfyui-19` covers the other way a setup folder
+can matter: when its runtime is no longer usable (its interpreter is gone) and one
+ready runtime is registered, the preview uses the registered one and does not
+register the unusable one, because an unusable runtime is not a ready runtime and
+cannot change the count; its own error is reported only when no registered
+runtime is ready, which a unit test covers. All five run with no GPU:
+
+```bash
+cargo xtask e2e -- -n "comfyui-1[5-9]"
+```
+
 `comfyui-14` is different: it installs ComfyUI into a real, isolated managed
 runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
 added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
@@ -817,6 +1179,111 @@ every nightly run, and only a manual `include_nightly` dispatch on a host with
 Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
 relying on this coverage.
+
+### Lemonade managed-serve failure evidence
+
+On a failed serve, the shared serve steps preserve the full service log under
+`service-logs/` in the E2E results artifact before stopping the service. The engine
+is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
+neither names one, the report says `engine unknown: backend evidence skipped`. A
+value that starts with `--` (as in `serve m --engine --managed`) is another flag, not
+an engine, and counts as no engine named.
+Lemonade failures also include the installed runtime manifest's version/backend, configured
+`backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
+and `version.txt`,
+and each candidate's `--version` and `--help` output. Candidates are searched
+under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
+`bin/llamacpp`, down to three directory levels below each; the cpu backend is not
+searched. The search is bounded as a whole, not per directory: it reads at most
+128 directories and 2048 directory entries across all four backend directories,
+stops as soon as it finds a ninth candidate (it lists the first eight and says the
+list is cut; exactly eight is not reported as cut), and stops when the
+inventory's time is up, checking the clock at every directory and entry. Siblings are visited in
+sorted order, so a search that finishes inside its limits is deterministic.
+Symlinks are never followed: only real directories are entered and only a regular
+file named `llama-server` counts, so a link cycle ends and a link out of the
+backend directory is not read; the report says how many symlinked entries it
+declined to follow. The same rule covers every file the report reads: the
+manifest, the pins file, `version.txt` and a candidate's fingerprint target are
+refused when the last path component is a symlink, and the report says `symlink
+not followed` in place of the content. On unix the refusal is made by the open
+itself (`O_NOFOLLOW`), so a path swapped for a link after an earlier check is still
+refused; on Windows it is a metadata check followed by an open, so a swap between
+the two is not caught (read-only evidence, and the swap needs write access to the
+backend directory). Only the last component is checked: a link in a parent
+directory is followed. When a limit or the clock ends the search early the report
+says which, and does not claim an empty result. When nothing is found, the report
+lists the searched locations and what `bin/llamacpp` holds (the first 16 names
+out of at most 64 entries read, with a count of those omitted), and does not
+guess at the cause: an interrupted download, a layout outside the search and a
+build that was never installed look the same. The manifest and pin reads, the
+search and each candidate's fingerprint run on blocking threads, never on an
+async worker, and the search carries its own deadline because a timeout around a
+blocking task would only drop its handle.
+At most eight candidates
+are hashed and probed, with two read-only probes per candidate. Each probe retains
+up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
+marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
+output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
+Each probe has a five-second timeout. The inventory has a 20-second budget that
+starts when it is entered and covers the manifest and pin reads, the search and
+the hashing; the probes have their own 20-second budget, which starts
+when the service stop returns; hashing runs off the async executor, rejects files
+over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
+one buffer whatever the size. The cap sits well above a dynamically linked
+`llama-server`: the `rocm-stable` build b12109 on the Strix Halo Ubuntu lanes
+was fingerprinted under the former 32 MiB cap, so current builds fit with room to
+spare. The larger cap is margin for a statically linked multi-target build,
+which is an assumption about future builds, not a measured size, and a larger
+file is a finding in its own right. A candidate over the size cap gets no fingerprint, and
+its entry says so with `sha256 unavailable: executable exceeds 512 MiB hash
+limit`; it is still listed and probed. Filesystem
+operations and process cleanup are not preemptible, so this is not a hard
+wall-clock limit on the entire report.
+A candidate or configured build pin is **not proof** of which binary the router
+launched; a failed probe is retained as evidence, not treated as an identity.
+Probes inherit the harness environment rather than reconstructing the engine's
+managed library paths, so a probe loader error alone does not establish why the
+serve failed. The report reads files first and executes a backend second. The
+manifest, pins, candidate paths, fingerprints and `version.txt` are read once the
+serve has exited non-zero or its readiness wait has timed out and the log has
+been read and archived, but before the service is stopped, so they describe the state being
+diagnosed. The `--version` and `--help` probes run after the stop returns, in the
+report's "probes, run after the service stop was attempted" section: llama.cpp
+builds commonly initialise a GPU backend even for `--version`, and doing that next
+to a still-running router on a shared-memory device could change the state being
+diagnosed. A stop that fails or finds no record can leave the router running; the
+report's `stop` section says so, and the probes still run. No lane has shown
+whether a probe initialises a GPU backend, which is why they are kept off the
+router's side of the stop. The order is fixed in one function,
+`backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
+to show the fingerprint was read before it and the probes came after it. Nothing
+before the stop may keep it from running: a serve with no isolated scenario root
+has no manifest to look for, so the report says `backend evidence unavailable:
+the scenario has no isolated root` (and the stop's own status says it was not
+attempted), and a panic while looking the manifest up is caught and reported the
+same way, so the stop runs exactly once and the failure report is not lost.
+
+The probe's timeout, kill and reap path is tested on every platform, Windows
+included: the unit tests re-run the test binary itself as the child (an ignored
+helper test selected by an environment variable), let the probe time out, and
+require that the child is gone afterwards. The shell-script `llama-server`
+stand-ins used by the other probe tests exist on unix only. Not covered anywhere
+is the `kill/reap failed` branch, which needs an operating system that refuses to
+kill a child it just started.
+
+Use the evidence to distinguish backend startup, download, and router readiness
+failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
+as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+backend's ready line does not establish that the router serves the requested
+model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
+managed-launch contract or imply a backend fix.
+
+Exercise the diagnostics and expectation scoping without a GPU:
+
+```bash
+cargo test -p e2e-cucumber --lib lemonade
+```
 
 ## Runtime Selection And Activation
 
@@ -910,12 +1377,46 @@ rocm runtimes adopt \
   --runtime-key adopted-release-pip-gfx120x-all-7-13-0
 ```
 
+Neither writes into the folder it registers: the registry entry is the only
+file created. The `.rocm-cli-runtime.json` that `rocm install sdk` leaves in an
+install root is ROCm CLI's proof that it owns the folder, so an imported or
+adopted runtime does not get one, and uninstall and prune never delete such a
+folder. A second import or adopt of the same runtime key is refused until
+`--replace` is given. `@id:runtime-lifecycle-import-rejects-duplicate-unless-replacing`
+(`runtime-lifecycle-06`) checks the import half end to end: the registry entry
+exists, the imported folder gains no manifest file, and the duplicate is refused
+until `--replace` (the unit tests also check the refused entry is left as it
+was). Adopting needs a Python environment to probe and the
+recovery of the runtime `rocm setup` created (which restores a missing registry
+entry from the manifest already in the setup folder) needs a setup, so neither
+has a scenario; the unit tests below assert each path's file set instead, and
+`write_runtime_manifest` is the one routine all four paths write through. It writes the registry entry last, after the install-root file, so a write that fails leaves no new entry and an error that says a runtime could not be registered or restored matches the registry; recovery in particular never rewrites the file it restores from, whatever shape that file has.
+A source-reading test, `only_the_shared_routine_writes_a_registry_entry`, fails
+if production code in the `rocm` app, `rocmd`, `rocm-core` or the engines both
+names the registry directory (through the two path helpers, or by spelling the
+`runtimes` and `registry` segments) and writes a file, or if a file not on its
+reviewed list starts calling the path helpers;
+`registry_writer_detector_sees_every_way_of_building_the_path` pins what the
+detector sees. It does not catch a writer that is handed the registry path by a
+function in another file, a write call that is not in its list of write
+primitives, or code outside those source roots.
+
+`--root` may be left out when `--python` sits directly in the environment's `bin`
+(or `Scripts`) folder; an interpreter anywhere else is refused until `--root` is
+given (scenario `runtime-26`).
+
 Focused unit coverage:
 
 ```bash
 cargo test -p rocm --bin rocm runtime_activation
 cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
+cargo test -p rocm --bin rocm runtime_install_writes
+cargo test -p rocm --bin rocm setup_recovery
+cargo test -p rocm --bin rocm write_runtime_manifest
+cargo test -p rocm --bin rocm a_failed_manifest_write
+cargo test -p rocm --bin rocm only_the_shared_routine_writes
+cargo test -p rocm --bin rocm registry_writer_detector
 cargo test -p rocm --bin rocm runtime_key_includes_version_for_side_by_side_installs
 cargo test -p rocm --bin rocm engine_plugin
 cargo test -p rocm --bin rocm model_registry
@@ -956,7 +1457,10 @@ symlinks.
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
-anything is removed:
+anything is removed, and a dry run on a machine ROCm CLI never touched
+(`uninstall-06`) reporting nothing to remove and creating no folder. The
+`uninstall` command does not start the file logger, which would otherwise create
+the data folder's `logs` folder before the plan is built:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"
@@ -1051,10 +1555,28 @@ provider-assisted plan before dispatching it, so it never runs the plan's
 command and shows only the plan text; for that surface the reuse of the
 rendered plan is covered by the unit tests below.
 
+A `serve` the provider proposes must also pass the four serve safety rules the
+chat assistant's `rocm_command` is held to (no CPU device, no public bind, a
+loopback host, managed serving), which one shared check in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) applies to both. Four more
+mock-lane scenarios in the same feature file run `rocm "serve a model"` against
+a provider whose plan breaks one rule each: `chat-13`
+(`chat-planning-assistant-cpu-serve-refused`), `chat-14`
+(`chat-planning-assistant-public-bind-serve-refused`), `chat-15`
+(`chat-planning-assistant-non-local-host-serve-refused`) and `chat-16`
+(`chat-planning-assistant-unmanaged-serve-refused`). Each asks the provider
+exactly once, prints the CLI's own plan rather than the provider's, runs
+nothing, and says why the provider's plan was not used. The two unit suites
+that run one shared table of refused and accepted `serve` argvs are
+`chat_refuses_each_unsafe_serve_and_proposes_nothing` and
+`planner_refuses_each_unsafe_serve_and_plans_nothing`; deleting a rule from the
+shared check fails both.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
+cargo test -p rocm --bin rocm unsafe_serve
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
 cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
 cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
@@ -1067,7 +1589,15 @@ Log browser smoke:
 rocm logs
 rocm logs --search server
 rocm logs --service <service-id>
+rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
+
+While a first-time model download is running, `rocm serve <model> --wait` keeps
+waiting past the usual 45 seconds until the server answers or its engine gives up
+(vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
+and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
+by the argument parser, covered by a unit test. Run the log follow above from a
+second terminal to watch the download.
 
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
@@ -1132,8 +1662,25 @@ cargo test -p rocmd recovery_respawn_fails_closed
 cargo test -p rocmd apply_endpoint_key_env
 ```
 
+Collision-safe port selection, focused tests:
+
+```bash
+cargo test -p rocm --bin rocm -- serve_port::
+cargo test -p rocm --bin rocm automatic_selects_against_real_loopback_listeners
+cargo test -p rocm --bin rocm concurrent_auto_transactions_publish_distinct_ports
+cargo test -p rocm --bin rocm concurrent_equivalent_transactions_converge_on_one_record
+cargo test -p rocmd recovery_waits_for_the_allocation_lock_and_refuses_an_occupied_port
+```
+
+Omitting `--port` on the default loopback host scans `11435..=11535` for a
+candidate neither reserved by a live managed-service record nor occupied on the
+OS ([`serve_port.rs`](../apps/rocm/src/serve_port.rs)), under the same `services/launch.lock` that serializes
+every other managed launch and `rocmd` recovery attempt. An explicit `--port`
+on a non-default `--host` is still required: automatic selection only probes
+`127.0.0.1` and refuses to guess elsewhere.
+
 A loopback bind (`rocm serve <model>`, default `127.0.0.1`) stays
-credential-free. A public bind (`--host 0.0.0.0 --allow-public-bind`) requires an
+credential-free. A public bind (`--host 0.0.0.0 --port <port> --allow-public-bind`) requires an
 API key: pass one with `--api-key` / the `ROCM_SERVE_API_KEY` environment
 variable, or let one be generated. The key is handed to the engine via a 0600
 key file (never argv), persisted as a 0600 per-service file (not the OS keychain,
@@ -1696,7 +2243,8 @@ compaction keeping every pending proposal, the
 newest reviewed ones, and legacy proposal ids. The rotation tests in
 `jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests in `automation::tests` go through the public
+rotation policy and a record type of their own, so the engine's tests do not
+depend on `automation.rs`; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
@@ -1744,9 +2292,32 @@ exit) and `serve-40` in
 (GPU lane: serving with no watcher enabled starts no helper; on a Linux host
 that runs it with lemonade it is an expected failure in
 [expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
+
+Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
+its HTTP front are tested in
+[anthropic_proxy.rs](../apps/rocmd/src/anthropic_proxy.rs) against a stand-in
+OpenAI engine, including an engine that has its own `/v1/messages` route, which is
+still fronted by the proxy so a Claude model name works. The record's adoption of the published endpoint are tested in
+[anthropic_endpoint.rs](../crates/rocm-core/src/anthropic_endpoint.rs) and
+[service_record.rs](../crates/rocm-core/src/service_record.rs).
+
+```bash
+cargo test -p rocmd --lib anthropic_proxy
+cargo test -p rocm-core --lib anthropic_endpoint
+cargo test -p rocm-core --lib engine_refresh_adopts_the_published_anthropic_endpoint
+cargo test -p rocm --bin rocm anthropic_endpoint
+```
+
+The user-visible side is `serve-50` (listed beside the OpenAI endpoint), `serve-51`
+(a real Messages request is answered by the served model) and `serve-52`
+(`services list` reports both endpoints healthy) in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+They run on the GPU lanes (`@requires-gpu`), with whichever engine the host
+serves with. Streaming and tool use are not translated yet, so no scenario
+covers them; a request for either is refused, and the unit tests above pin that.
 
 Natural-language plan handoff tests:
 
@@ -2656,8 +3227,8 @@ rather than the real host. The `a_fallback_read_plans*`/
 `an_unreadable_file*`/`distro_name_names_an_unreadable_file` tests in
 `rocm-core` and `rocm` construct an `OsRelease` directly — bypassing the real
 read entirely, since the production functions that do it
-(`openmpi::real_os_release`, `system_packages::real_os_release`)
-read the real machine
+(`hardware_root::real_os_release`, which every caller goes through)
+reads the real machine
 unconditionally and cannot honour a simulated root — to pin that a
 fallback-sourced read plans and hints identically to a primary-sourced one
 with the same text, and that a file which exists but cannot be read is named
@@ -2678,6 +3249,19 @@ shell probe instead of merely leaving `$ID` unset, which this test does not
 exercise — see its own doc comment for why, and for the known limitation
 this leaves.
 
+The package-manager side reads the real host through one function,
+`hardware_root::real_os_release`. In the `rocm` binary's tests,
+`system_packages::tests::real_os_release_ignores_a_simulated_host_root`
+(`--features e2e-test-hooks`, Linux) plants a root naming another distribution
+and expects the real file back, and
+`system_packages::tests::the_install_hints_read_the_real_host_and_ignore_a_simulated_root`
+holds the three install hints to the same rule. Both live in that process
+rather than in `rocm-core`'s, so the environment variable they set cannot
+overlap a `rocm-core` test that reads host paths.
+`system_packages::tests::no_caller_in_this_binary_reads_the_real_os_release_by_hand`
+fails when a source file of the `rocm` binary reads the file with its own
+resolver instead of calling it.
+
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios
 `examine-20` to `examine-23` and `examine-27` to `examine-28` in
@@ -2696,10 +3280,167 @@ distinctly from both a malformed line and an unknown distribution:
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
 ```
 
+`examine-32` and `examine-33` plant a WSL machine under the same simulated root
+(`/dev/dxg`, DXCore and `librocdxg.so`) with a stand-in `ldconfig` on `PATH`
+whose cache does not list the library, and set `LD_LIBRARY_PATH` explicitly. With
+the library's directory on it, `driver_status` is `wsl_rocdxg_ready`; with the
+variable empty it is `wsl_rocdxg_missing`, which is the control that shows the
+first scenario turns on `LD_LIBRARY_PATH` and not on the planted files alone. Both
+run on every Linux lane, because the planted root, not the runner, decides what
+the probe finds.
+
+`examine-34` plants the same machine with `libhsa-runtime64.so.1` beside the
+library and `LD_LIBRARY_PATH` empty: the runtime opens `librocdxg.so` through its
+own `$ORIGIN` runpath, so `driver_status` is `wsl_rocdxg_ready` with neither the
+cache nor the variable involved, which is the layout of a TheRock tarball
+(ROCM-30386). Its control is `examine-33`, which plants the library alone and
+stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
+is what the verdict turns on.
+
+`serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[123] |serve-42 '
+```
+
 The install plans deliberately read the real file, so no scenario plants one
 for them, including for the fallback; their parsing is covered by the unit
 tests above, and the fallback itself by `hardware_root`'s own unit tests,
 since both now read through the same helper with an identity resolver.
+
+## amd-smi KFD pre-flight
+
+Every synchronous `amd-smi` launch goes through
+[`rocm_core::amd_smi_json`](../crates/rocm-core/src/amd_smi.rs), which first
+tries to open `/dev/kfd` for reading and declines the launch outright when it
+cannot. Against a device in the wrong kernel state `amd-smi` blocks in
+uninterruptible sleep, where no signal and therefore no caller timeout reaches
+it, so declining is the only outcome that bounds `rocmd`'s telemetry poll and
+`serve`'s GPU probes. The open is itself bounded (2s) and the number of probes
+that may be parked at once is capped (8), so the gate's own probe cannot inherit
+the stall it exists to refuse. The dashboard collector
+([amd_smi.rs](../crates/rocm-dash-collectors/src/amd_smi.rs)) gates its own
+launch on the same device through the same shared probe,
+`rocm_core::device_readable_bounded`.
+
+The gate declines on *any* unreachable device, including the fast errno cases
+(absent node, permission denied) that cannot hang anything. That is wider than
+the hazard and deliberate; `kfd_readable`'s doc comment says why, and names what
+`serve` still answers from on such a host.
+
+```bash
+cargo test -p rocm-core --lib amd_smi
+cargo test -p rocm-core --lib --features e2e-test-hooks -- the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it the_public_amd_smi_entry_point_gates_on_the_real_kfd_device
+```
+
+The unit tests cover the gate in isolation: that it stops the *spawn* rather
+than reporting a failure afterwards (a stub `amd-smi` leaves a marker file, and
+its absence is the evidence), that the probe declines rather than hangs against
+a device whose `open` blocks (a FIFO with no writer), that the in-flight budget
+declines rather than parking threads without bound, that the WSL and off-Linux
+wave-throughs hold, and that the public entry point gates on `/dev/kfd` itself
+rather than on some other path.
+
+**The `ROCM_E2E_KFD_DEVICE` seam.** `rocm_core::preflight_kfd_device` reads this
+variable and uses the path it names as the device the pre-flight opens. Only a
+build carrying the `e2e-test-hooks` feature honours it; a released artefact has
+no override compiled in and always gates on `/dev/kfd`. It moves the gate rather
+than removing it, so a scenario pointing it at an unopenable path gets the
+declining branch and one pointing it at an ordinary file gets the allowed
+branch, while with the variable unset the behaviour is production's on every
+build.
+
+`ROCM_CLI_TEST_HOST_ROOT` cannot stand in for it. The gate keeps the real
+`/dev/kfd`'s veto on purpose, so a simulated root can only ever make it decline,
+never allow — which is what stops a test hook starting a real `amd-smi` on a
+machine with no GPU, and also what makes the *allowed* branch unreachable under
+a simulated root on the GPU-less lane that runs per PR.
+
+`examine-31` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) covers the
+declining branch end to end. It plants a stub `amd-smi` that would answer the
+telemetry probe perfectly and records that it ran, points the seam at a path
+inside the scenario's isolated root that is never created, and checks that
+`rocmd`'s bridge snapshot still exits 0, reports `amd_smi_available: false`,
+carries a note saying the launch was *declined*, and names the device **this
+run** pointed the pre-flight at. Both of the last two are what make it
+non-vacuous: without the marker the scenario would pass against a gate that had
+been deleted and merely failed the spawn, and without the named device it would
+pass against a build that ignored the seam, since the GPU-less lane has no
+readable `/dev/kfd` of its own either. Linux-only, like its `examine-24` to
+`examine-26` telemetry siblings: the stub is a shell script, and the gate is a
+wave-through on every other platform.
+
+```bash
+cargo xtask e2e -- -n 'examine-31 '
+```
+
+No scenario drives the `rocm serve` / `rocm model` call sites through the gate.
+Those probes degrade to service-state-only GPU selection rather than failing,
+so there is no user-visible *output* for a scenario to assert on.
+
+Be precise about what does cover them, because the two halves have different
+guards. What the call sites do **with a missing count** is covered by
+`gpu_policy.rs`'s unit tests — `effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows`
+pins the `None` fall-through. That the call sites **route through the
+chokepoint at all** is *not* covered by any unit test: it is guarded by
+`xtask/src/amd_smi_launch_contract.rs`, a static text scan that fails the build
+when a file outside its allowlist calls `resolve_amd_smi_binary`. A rewrite that
+kept the count behaviour but spawned `amd-smi` directly would be caught by that
+scan and by nothing else. The decline
+itself is no longer discarded — `gpu_policy.rs`'s `amd_smi_probe_json` logs it
+at `info` with the full error chain, which is what makes "why did `--gpu auto`
+not rank my GPUs?" answerable without re-running. It is not `warn`, because on
+a GPU-less host it fires on every `serve`, where it is the expected answer and
+not a fault; and not `debug`, because the default filter is `warn,rocm=info`,
+so a `debug` line is invisible unless the user already suspected this — the
+wrong way round for the case that needs it, where the 2s open bound trips on a
+slow but healthy host and the decline is indistinguishable from "no GPU".
+
+### Keeping new launch sites inside the gate
+
+A chokepoint only holds while every launch site uses it, and nothing in a
+behavioural test suite fails when one stops: the regression is the *absence* of
+a call. [amd_smi_launch_contract.rs](../xtask/src/amd_smi_launch_contract.rs) is
+the structural guard for that. It scans every `.rs` file in the tree (comments
+stripped) for calls to `rocm_core::resolve_amd_smi_binary` — the only way to
+find the binary, since the managed SDK ships `amd-smi` inside the runtime
+wheel's bin directory rather than on `PATH` — and fails unless the calling file
+is one of two allowlisted, justified sites. Reverting either `gpu_policy.rs`
+probe to a raw `Command::new(resolve_amd_smi_binary())` now fails this test by
+name. It is bidirectional like the crate-edge allowlist: an entry whose file
+stops calling the resolver is stale and fails too.
+
+```bash
+cargo test -p xtask amd_smi_launch_contract
+```
+
+It is a source-text scan, not a call-graph analysis: a resolver reached through
+a function pointer or a re-export under another name is outside what it can
+see. It closes the cheap, likely regression and claims nothing more.
+
+### What the gate is, and is not
+
+**It is a mitigation heuristic, not a proof.** The gate establishes exactly one
+thing: that `open("/dev/kfd")` returned within 2s. The D-state hang it exists to
+prevent is attributed to `amd-smi`'s *later* `ioctl`s against a wedged device,
+not to the open — so a device whose open succeeds and whose next ioctl wedges is
+not covered, and the 2s bound is a chosen number rather than a measured one. No
+run against a genuinely unhealthy driver was performed for this work: the GPU
+lane has no `amd-smi` at all, and the FIFO fixtures model a blocking `open`,
+which is the closest reachable analogue rather than the real failure. What the
+gate does buy is that the common precondition for the hazard — a device the
+kernel will not hand out — refuses the spawn instead of betting on a timeout
+that cannot reach a process in uninterruptible sleep.
+
+**The decline is broader than the hazard, and broader than the ticket.** Any
+unreachable `/dev/kfd` declines, including the fast errno cases that cannot hang
+anything: an absent node (EAI-8457 states the scenario does not apply with no
+`/dev/kfd`) and `EACCES` for a user outside the `render`/`video` groups.
+`gpu_vram_usage` still falls back to the DRM sysfs counters on such a host, but
+`detect_gpu_count` has **no** sysfs fallback and returns `None`, so `--gpu auto`
+there ranks from the sysfs VRAM rows alone. `kfd_readable`'s doc comment carries
+the same statement next to the code.
 
 ## Windows Runtime Preflight
 
@@ -2798,12 +3539,15 @@ cargo xtask e2e -- -n '(diagnose-48)'
 
 ## Model Fit Preflight
 
-`rocm diagnose --model <ref>` answers whether a curated model will run on this
-host before anything downloads. It reports one of four verdicts: `ready`,
+`rocm diagnose --model <ref>` answers whether a model will run on this host
+before anything downloads: a curated model from its recipe (this section), a
+GGUF outside the catalog from its file header (the next one). For a curated
+model it reports one of four verdicts: `ready`,
 `degraded` (runs, but under the recipe's recommended system RAM),
 `blocked` (will not run here, with alternatives that would), or
 `undetermined` (the CLI could not judge it — an unreachable catalog, an
-unmeasured GPU, or a ref outside the curated set).
+unmeasured GPU, or a ref outside the curated set; for a GGUF reference the
+estimate below is added to that answer).
 
 ```bash
 rocm diagnose --model qwen-smoke --json   # smallest curated recipe
@@ -2822,6 +3566,101 @@ The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
 including the two that need a synthetic signed catalog to trigger
 deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
 produce them on an arbitrary real host.
+
+### GGUF estimate (models outside the catalog)
+
+A GGUF reference outside the catalog (a local `.gguf` path, or
+`owner/repo:QUANT`) is estimated from its header instead:
+`rocm diagnose --model <ref> --context-size N --kv-cache-type f16|q8_0|q4_0`.
+The verdict stays `undetermined` (`model_not_curated`); the answer is
+`model.estimate`, with outcome `fits`, `does_not_fit` or `cannot_estimate`, and
+the text report opens `ESTIMATED:` for the first two. The parts and their tests:
+
+- [gguf.rs](../crates/rocm-core/src/gguf.rs): the header parser, tested against
+  synthetic headers built byte by byte (versions, truncation at every offset,
+  per-layer head arrays, signed 32-bit integers as gguf-py writes them,
+  every fixed-width value type read at its own width as a scalar and as an
+  array element, skipped arrays, alignment, the span of the input embedding) and one test per
+  bound a hostile header would walk past (key length, entry counts, tensor
+  dimensions, array nesting, an overflowing array length, an unknown value type,
+  the layer count, how many shape keys are kept, how large a header may be --
+  including the checks inside a string array and an array of arrays, which are
+  walked over an endless stream and must stop near the bound -- a single length
+  larger than any header, and the length at which an array or string is no
+  longer kept).
+- [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs): the arithmetic (exact KV
+  figures, the boundary between fits and does not, the largest context -- a
+  trained context that is not a whole step included, on both sides -- the
+  suggestions, each layout it refuses to estimate, the state-space, hybrid and
+  mixture-of-experts layouts that get their figures with no verdict, and the
+  measured llama.cpp loads the allowances were calibrated on, which the synthetic Llama- and
+  Qwen-shaped headers must reproduce: buffer sizes, and a total never below the
+  measured use and within a bound of it per model. The module documentation
+  describes the loads and records the actual margins).
+- [gguf_source.rs](../crates/rocm-core/src/gguf_source.rs): reference parsing
+  (an existing file wins over `owner/repo:QUANT`; `owner/repo:dir/file.gguf`
+  names one of two same-named files), file selection (shards of one model versus
+  two models; a full path beats a bare name that matches a nested file; a
+  multimodal projector is never picked, and a name that matches only projectors
+  is refused as naming one), names
+  in a listing that could leave the repository or hide in a terminal (dropped,
+  and never requested), and the range reader, tested against a loopback server that
+  records the ranges it is asked for, so a read of the weights would show, and
+  that also answers with a wrong or missing `Content-Range`, a dropped body, a
+  missing size in the listing and in the `HEAD`, a gated repository and a slow
+  reply. [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs)
+  runs `rocm diagnose --model owner/repo:QUANT` against such a server with every
+  Hugging Face token variable set, and checks that the listing, `HEAD` and
+  range requests carry no `Authorization` or `Cookie` header.
+- [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
+  host-memory states (dedicated, none, unknown, APU), what is attached to a
+  curated or non-GGUF answer (nothing beyond a note on a flag that did not
+  apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
+  reference quoted for a shell), the plan a sized estimate keeps when it
+  could not compare (`amd-smi metric --json` where the memory was unreadable,
+  `rocm diagnose` where no GPU is visible, as for a curated model, and none on
+  an APU; unit-tested only, since no lane has a GPU whose memory cannot be
+  read), and the text and JSON shapes.
+- [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
+  `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
+  device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB, on
+  a discrete card and on an APU alike),
+  and the note for a mask on a host whose GPUs differ in memory. Both are unit
+  tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
+  lane has GPUs of different sizes.
+
+Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
+requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
+none and says on stderr that `--model` was ignored, while the same question
+without `--report` does reach the endpoint and prints no such note. Scenario
+`diagnose-52` has the stand-in answer the repository listing with a model and
+its multimodal projector, and shows that naming the projector exactly is
+answered as a projector, with the model file named instead, after the listing
+request alone.
+
+Scenarios `diagnose-49` and `diagnose-50` write a small GGUF into the scenario's
+isolated directory and assert the shape and the sizes (weights and KV cache are
+exact), and that a host that measured its GPU gets a comparison while one that
+could not is told why. Which branch runs depends on the lane: the GPU-less
+hosted runners take the "could not compare" one (the text report must then read
+UNDETERMINED), and the MI300X self-hosted lane (`E2E tests (MI300X, ...)` in
+`e2e-selfhosted.yml`) takes the compared one, where the text report must read
+ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
+by the unit tests, not by a scenario. Nothing in either runs against a real GPU
+load; see [manual-testing.md](manual-testing.md) for the check that does.
+
+Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independent:
+the context options without `--model` (a usage error naming it), a curated model
+asked about a context size (told the options do not apply, no estimate), a
+`.gguf` path that does not exist (named as not opened, no upstream route, and a
+plan to ask again about that path, the path quoted where the platform's shell
+needs it, so the step accepts it bare or quoted), and a bare `owner/repo` with a context size
+(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
+nothing, and the answer lists the model and the projector, marked as one.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7])'
+```
 
 ## Doctor Report Preflight
 

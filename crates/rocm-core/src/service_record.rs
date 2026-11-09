@@ -11,8 +11,9 @@
 //! on-disk format at runtime, through its own `ServiceRecord` mirror struct
 //! in `registry.rs` rather than this type, and the serde test guards that
 //! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
-//! a doc comment — `rocm-dash-core` and `rocm-dash-collectors` do not depend
-//! on `rocm-core` at all.
+//! a doc comment. `rocm-dash-core` does not depend on `rocm-core` at all;
+//! `rocm-dash-collectors` does since EAI-8457, but only for the shared bounded
+//! `/dev/kfd` probe, and it never reads this on-disk format either.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -20,9 +21,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::AppPaths;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
+use crate::{ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AppPaths};
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
 
 /// Engine state-file key recording when inference was first confirmed.
@@ -126,6 +127,15 @@ pub struct ManagedServiceRecord {
     /// readiness was gated on inference.
     #[serde(default)]
     pub inference_verified_at_unix_ms: Option<u64>,
+    /// Base URL of the Anthropic-compatible `/v1/messages` endpoint, once the
+    /// serving process has published one. Adopted from the engine state file (see
+    /// [`crate::anthropic_endpoint`]); `None` while the service is still coming up
+    /// and on records written before the endpoint existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_url: Option<String>,
+    /// How [`Self::anthropic_endpoint_url`] is provided: `proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_mode: Option<String>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -247,6 +257,8 @@ impl ManagedServiceRecord {
             startup_phase: None,
             inference_verified_at_unix_ms: None,
             inference_probe_attempted_at_unix_ms: None,
+            anthropic_endpoint_url: None,
+            anthropic_endpoint_mode: None,
             manifest_path,
             log_path,
             engine_state_path,
@@ -282,6 +294,10 @@ impl ManagedServiceRecord {
     pub fn reset_for_restart(&mut self) {
         self.inference_verified_at_unix_ms = None;
         self.inference_probe_attempted_at_unix_ms = None;
+        // The respawned process publishes its own endpoint; the old proxy port
+        // died with the previous run.
+        self.anthropic_endpoint_url = None;
+        self.anthropic_endpoint_mode = None;
         self.restart_count = self.restart_count.saturating_add(1);
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
@@ -432,7 +448,66 @@ impl ManagedServiceRecord {
         {
             self.inference_verified_at_unix_ms = Some(verified_at);
         }
+        // The endpoint belongs to the run that published it, so it is replaced
+        // rather than kept: a restarted proxy listens on a different port.
+        let published = |key: &str| {
+            state
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(url) = published(ANTHROPIC_ENDPOINT_URL_STATE_KEY) {
+            self.anthropic_endpoint_url = Some(url);
+            self.anthropic_endpoint_mode = published(ANTHROPIC_ENDPOINT_MODE_STATE_KEY);
+        }
         Ok(self.status != previous)
+    }
+
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
+    /// Mark a launch the CLI has just abandoned — its child terminated, the
+    /// error already reported to the user — as over, while keeping the record
+    /// and log for `rocm services`/`rocm logs` to show.
+    ///
+    /// The status is `stopped`, not `failed`, on purpose: `rocmd`'s recovery
+    /// scan restarts a managed `failed` record that carries no stop marker, so
+    /// a `failed` record here could be respawned after the CLI reported the
+    /// launch as failed. A stop marker would not hold either, because the
+    /// liveness refresh clears it as soon as the recorded PIDs are gone.
+    /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    pub fn mark_launch_abandoned(&mut self) {
+        self.status = "stopped".to_owned();
+    }
+
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
     }
 
     fn with_storage_paths(&self) -> Self {
@@ -561,6 +636,22 @@ mod tests {
         assert!(record.last_restart_unix_ms.is_some());
     }
 
+    #[test]
+    fn blocks_port_needs_a_live_record_on_that_exact_port() {
+        let mut record = probe_test_record(11435);
+        record.status = "running".to_owned();
+        assert!(record.blocks_port(11435));
+        assert!(
+            !record.blocks_port(11436),
+            "a different port is not blocked"
+        );
+        record.status = "stopped".to_owned();
+        assert!(
+            !record.blocks_port(11435),
+            "a stopped record blocks nothing"
+        );
+    }
+
     /// Writes `state` as the record's engine state file and runs the refresh.
     fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
         let dir = std::env::temp_dir().join(format!(
@@ -580,6 +671,33 @@ mod tests {
         record.refresh_from_engine_state().expect("refresh");
         let _ = fs::remove_dir_all(dir);
         record
+    }
+
+    /// The serving process publishes the Anthropic endpoint in the engine state;
+    /// the record adopts it, and a restart drops it so the next run's port wins.
+    #[test]
+    fn engine_refresh_adopts_the_published_anthropic_endpoint() {
+        let record = refresh_from_state(
+            "anthropic",
+            &serde_json::json!({
+                "status": "ready",
+                "anthropic_endpoint_url": "http://127.0.0.1:40123",
+                "anthropic_endpoint_mode": "proxy",
+            }),
+        );
+        assert_eq!(
+            record.anthropic_endpoint_url.as_deref(),
+            Some("http://127.0.0.1:40123")
+        );
+        assert_eq!(record.anthropic_endpoint_mode.as_deref(), Some("proxy"));
+
+        let mut record = record;
+        record.reset_for_restart();
+        assert_eq!(record.anthropic_endpoint_url, None);
+        assert_eq!(record.anthropic_endpoint_mode, None);
+
+        let record = refresh_from_state("no-anthropic", &serde_json::json!({ "status": "ready" }));
+        assert_eq!(record.anthropic_endpoint_url, None);
     }
 
     /// A container engine serves under a different name than the image it pulls;

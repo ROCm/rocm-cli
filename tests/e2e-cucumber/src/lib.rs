@@ -4,11 +4,13 @@
 
 pub mod capability;
 pub mod chat_request;
+pub mod device_memory;
 pub mod expectation;
 pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lemonade_diagnostics;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;

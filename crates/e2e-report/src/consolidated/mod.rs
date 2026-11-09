@@ -24,7 +24,8 @@ mod sidecars;
 #[cfg(test)]
 mod test_support;
 
-use descriptor::{Descriptor, excluded_platform_label, parse_descriptor, with_channel_suffix};
+pub use descriptor::artifact_name_for_platform_slug;
+use descriptor::{Descriptor, full_platform_label, parse_descriptor, with_paren_suffix};
 use sidecars::{
     CommandRecord, ManifestExpectation, PlatformManifest, PlatformVersions, parse_commands,
     parse_platform_manifest,
@@ -179,6 +180,18 @@ const LEGEND_ENTRIES: &[(CellOutcome, &str)] = &[
     (CellOutcome::Missing, "no data."),
 ];
 
+/// The report's PR-gating policy, as the two phrases both renderers must use for
+/// it: the Mock lane **gates the PR**, every other lane is **non-blocking**.
+/// The markdown summary's explanation paragraph and the HTML legend each word the
+/// rest of the sentence for their own medium (the markdown one also spells out
+/// what a red Mock check means for the merge), so only the claim itself is
+/// shared: change who gates the PR here and both renderers change with it, and
+/// a test in `consolidated/mod.rs` fails if either renderer stops using them or
+/// spells either phrase out itself.
+const MOCK_GATES_PR: &str = "gates the PR";
+/// See [`MOCK_GATES_PR`].
+const OTHER_LANES_NON_BLOCKING: &str = "non-blocking";
+
 /// One platform column of the reconciled (scenario-id × platform) grid.
 struct GridColumn {
     /// Platform identity from the manifest (e.g. "mi300x", "strix-halo", "mock").
@@ -214,16 +227,14 @@ struct GridColumn {
 impl GridColumn {
     /// Column heading label: canonical platform + OS, plus channel when known
     /// — the part of column identity that doesn't already show up in
-    /// `versions.summary()`. Full form (platform AND OS), matching
-    /// [`PlatformReport::load`]'s `label` and [`excluded_platform_label`] —
-    /// NOT [`platform_cell`]'s OS-less form, which is only safe there because
-    /// the summary matrix shows OS in its own table column; the grid has no
-    /// such column, so this heading is the only place OS would ever show.
+    /// `versions.summary()`. The full form from [`full_platform_label`], the same
+    /// one [`PlatformReport::load`]'s `label` and the excluded-platform caption
+    /// use (the channel here is the manifest's alone) — NOT [`platform_cell`]'s
+    /// OS-less form, which is only safe there because the summary matrix shows OS
+    /// in its own table column; the grid has no such column, so this heading is
+    /// the only place OS would ever show.
     fn label(&self) -> String {
-        with_channel_suffix(
-            &format!("{} {}", self.platform, self.os),
-            self.versions.channel.as_deref(),
-        )
+        full_platform_label(&self.platform, &self.os, self.versions.channel.as_deref())
     }
 }
 
@@ -255,7 +266,7 @@ struct Grid {
     /// by their `<key>-<NN>` index (i.e. feature-file order).
     groups: Vec<FeatureGroup>,
     columns: Vec<GridColumn>,
-    /// Canonical labels (see [`excluded_platform_label`]) of platforms skipped
+    /// Canonical labels (see [`full_platform_label`]) of platforms skipped
     /// from `columns` because their `PlatformReport::manifest` is `None` — no
     /// `platform.json` file, or one present but not valid JSON for
     /// the expected shape. Distinct from a platform whose `platform.json`
@@ -308,7 +319,13 @@ impl Grid {
 
         for report in reports {
             let Some(manifest) = report.manifest.as_ref() else {
-                excluded.insert(excluded_platform_label(&report.desc));
+                // No manifest, so no `versions.channel` to prefer: the channel
+                // captured from the artifact name is the only one there is.
+                excluded.insert(full_platform_label(
+                    &report.desc.platform,
+                    &report.desc.os,
+                    report.desc.channel_from_name,
+                ));
                 continue;
             };
             // Actual results by id — already computed once by `PlatformReport::load`
@@ -627,8 +644,7 @@ impl PlatformReport {
             .map(|m| m.versions.clone())
             .unwrap_or_default();
         let effective_channel = resolve_channel(&versions, &desc);
-        let label =
-            with_channel_suffix(&format!("{} {}", desc.platform, desc.os), effective_channel);
+        let label = full_platform_label(&desc.platform, &desc.os, effective_channel);
         Self {
             desc,
             label,
@@ -794,7 +810,7 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
 /// summary and `matrix_table` so the two can't drift the way they already
 /// have once (the markdown/HTML drift fixed by #460).
 fn platform_cell(r: &PlatformReport) -> String {
-    with_channel_suffix(&r.desc.platform, r.effective_channel())
+    with_paren_suffix(&r.desc.platform, r.effective_channel())
 }
 
 /// Scenario `@id` → (human name, Gherkin steps); see [`scenario_reference`].
@@ -1656,6 +1672,127 @@ mod tests {
     }
 
     #[test]
+    fn every_platform_label_surface_uses_the_one_full_label() {
+        // `PlatformReport::label` (per-platform detail sections, XPASS notes),
+        // `GridColumn::label` (grid headings, needs-attention list) and the
+        // excluded-platform caption are three consumers of the same platform + OS
+        // (+ channel) label. They differ only in where the channel comes from, so
+        // for one artifact and one manifest they must render the identical
+        // string. A fourth hand-written copy of the rule is what lets one of
+        // them lose the OS or the sdk_version leg again.
+        let manifest = |channel: Option<&str>| {
+            let versions = channel.map_or_else(String::new, |c| {
+                format!(r#""versions": {{"channel": "{c}"}},"#)
+            });
+            format!(
+                r#"{{
+                    "platform_slug": "p",
+                    "capability": {{"effective_serve_engine": "none"}},
+                    {versions}
+                    "expectations": [{{"id":"serve-x","feature":"Serving","expected":"pass"}}]
+                }}"#
+            )
+        };
+        let report_json = feature_json(&[(&["id:serve-x"], &["passed"])]);
+
+        for (artifact, manifest_channel, expected) in [
+            // Manifest channel present: it names the channel in both surfaces.
+            (
+                "e2e-gpu-strix-windows-nightly-report",
+                Some("release"),
+                "Strix Halo Windows (release)",
+            ),
+            (
+                "e2e-gpu-strix-wsl-n-1-report",
+                Some("nightly"),
+                "Strix Halo (n-1) WSL2 (nightly)",
+            ),
+            // No channel anywhere: no suffix, OS still present.
+            ("e2e-report", None, "Mock Linux"),
+            ("e2e-gpu-strix-ubuntu-report", None, "Strix Halo Ubuntu"),
+        ] {
+            let (_d, path) = write_platform(&report_json, &manifest(manifest_channel));
+            let reports = load_reports(&[(artifact.to_string(), path)]);
+            let grid = Grid::build(&reports);
+            assert_eq!(
+                reports[0].label, expected,
+                "{artifact}: PlatformReport::label"
+            );
+            assert_eq!(
+                grid.columns[0].label(),
+                expected,
+                "{artifact}: GridColumn::label"
+            );
+        }
+
+        // No platform.json: the artifact-name channel is the only signal, and the
+        // excluded caption must carry the same label the detail section does.
+        for (artifact, expected) in [
+            (
+                "e2e-gpu-strix-windows-nightly-report",
+                "Strix Halo Windows (nightly)",
+            ),
+            ("e2e-gpu-strix-wsl-n-1-report", "Strix Halo (n-1) WSL2"),
+            ("e2e-report", "Mock Linux"),
+        ] {
+            let bare = write_report(&report_json);
+            let reports = load_reports(&[(artifact.to_string(), bare.path().to_path_buf())]);
+            let grid = Grid::build(&reports);
+            assert_eq!(
+                reports[0].label, expected,
+                "{artifact}: PlatformReport::label"
+            );
+            assert_eq!(
+                grid.excluded,
+                std::collections::BTreeSet::from([expected.to_string()]),
+                "{artifact}: excluded caption"
+            );
+        }
+
+        // Pinned as-is, not endorsed: a manifest with no `versions.channel` under
+        // an artifact whose name carries one labels the detail section with the
+        // name's channel but the grid heading without it, because the heading
+        // reads the manifest only.
+        let (_d, path) = write_platform(&report_json, &manifest(None));
+        let reports = load_reports(&[("e2e-gpu-nightly-report".to_string(), path)]);
+        let grid = Grid::build(&reports);
+        assert_eq!(reports[0].label, "MI300X Linux (nightly)");
+        assert_eq!(grid.columns[0].label(), "MI300X Linux");
+    }
+
+    #[test]
+    fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
+        // What this proves, and what it does not. The rendered text is pinned
+        // verbatim by `summary_explanation_paragraphs_are_unchanged` (markdown)
+        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML), and
+        // each of those also asserts that the rendered output contains
+        // `MOCK_GATES_PR` and `OTHER_LANES_NON_BLOCKING`; together they catch a
+        // renderer that hardcodes the words while a constant's value moves on.
+        // What they cannot catch is a renderer that re-types the CURRENT words
+        // with identical text, which renders the same bytes. This test closes
+        // that gap by reading each renderer's non-test source: it must not
+        // spell either phrase out itself.
+        for (name, source) in [
+            ("markdown.rs", include_str!("markdown.rs")),
+            ("html.rs", include_str!("html.rs")),
+        ] {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split always yields a first part");
+            for (constant, phrase) in [
+                ("MOCK_GATES_PR", MOCK_GATES_PR),
+                ("OTHER_LANES_NON_BLOCKING", OTHER_LANES_NON_BLOCKING),
+            ] {
+                assert!(
+                    !production.contains(phrase),
+                    "{name} re-types {phrase:?} instead of using `{constant}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn expectation_grid_legend_explains_every_glyph() {
         // The legend must explain every glyph `CellOutcome::glyph()` can emit,
         // not just the original pass/xfail/n-a/FAIL/XPASS/no-data set — flaky
@@ -1917,7 +2054,7 @@ mod tests {
                  Mock Linux"
             ),
             "caption must name the excluded platform, with OS (not just the bare platform, which \
-             would collide with a same-named different-OS lane — see excluded_platform_label):\n{md}"
+             would collide with a same-named different-OS lane — see full_platform_label):\n{md}"
         );
         assert!(
             !md.contains("_✅ pass ·"),
@@ -1982,8 +2119,8 @@ mod tests {
             grid.excluded,
             std::collections::BTreeSet::from(["MI300X Linux".to_string()]),
             "the platform.json-less platform must be named as excluded, with OS \
-             (both excluded_platform_label and GridColumn::label use the full \
-             platform+OS form, so an excluded lane can't collide with a same-named \
+             (the excluded caption and GridColumn::label both use the full \
+             platform+OS form from full_platform_label, so an excluded lane can't collide with a same-named \
              different-OS included column)"
         );
 

@@ -17,16 +17,16 @@
 //!
 //! Builds on `family`, `io`, `process`, `python`, `resolve`, `source` and
 //! `version`, and on `runtime_registry` for the manifests; `runtime_key`,
-//! `wheel_runtime_key` and `has_nontrivial_directory_contents`, which name and
-//! inspect the install a plan targets, stay in `therock.rs` with the other keys
-//! and roots helpers.
+//! `wheel_runtime_key`, which name the install a plan targets, stay in
+//! `therock.rs` with the other keys and roots helpers. Whether an install root
+//! holds anything is `rocm_core::install_root_has_payload`, the one rule the
+//! install and activation paths share.
 
 use super::family::family_override_or_recovered_arch;
-use super::io::write_file_atomically;
 use super::process::SuppressProgressOutput;
 use super::python::{
-    PythonLauncher, python_launcher_install_ready, python_requirement, resolve_python_launcher,
-    wheel_compatibility_for_python,
+    PythonLauncher, PythonSource, python_launcher_install_ready, python_requirement,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use super::resolve::{
     AggregateDeviceTarget, resolve_pip_runtime_with_timeout, resolve_tarball_artifact_with_timeout,
@@ -34,12 +34,13 @@ use super::resolve::{
 };
 use super::source::{SourceLayout, TheRockChannel};
 use super::version::{runtime_version_display, version_relation};
-use super::{has_nontrivial_directory_contents, runtime_key, wheel_runtime_key};
+use super::{runtime_key, wheel_runtime_key};
 use crate::runtime_registry::{
     InstalledRuntimeManifest, WheelRuntimeComposition, load_runtime_manifests,
     wheel_composition_device_target,
 };
 use anyhow::{Context, Result, bail};
+use rocm_core::atomic_write::write_file_atomically;
 use rocm_core::{AppPaths, unix_time_millis};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -295,7 +296,7 @@ fn replacement_runtime_is_installed(
             && candidate.format == source.format
             && candidate.family == source.family
             && candidate.wheel_composition.as_ref() == Some(required_composition)
-            && has_nontrivial_directory_contents(&candidate.install_root).unwrap_or(false)
+            && rocm_core::install_root_has_payload(&candidate.install_root).unwrap_or(false)
     })
 }
 
@@ -434,7 +435,7 @@ fn resolve_latest_for_manifest(
                 .filter(|path| python_launcher_install_ready(path, requirement).is_ok())
                 .map(|executable| PythonLauncher {
                     executable,
-                    source: "manifest",
+                    source: PythonSource::Manifest,
                 });
             let python_executable = match manifest_python {
                 Some(python) => python,
@@ -459,17 +460,12 @@ fn resolve_latest_for_manifest(
             // a fresh host probe. Planning must predict the key an apply will
             // produce, and re-probing would disagree with the installed runtime on
             // any host whose GPU is absent, hidden, or simply a second card.
-            let device_target =
-                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
-                    || resolution.device_target.clone(),
-                    |target| {
-                        AggregateDeviceTarget::resolve(
-                            Some(target),
-                            &resolution.family,
-                            &resolution.published_device_targets,
-                        )
-                    },
-                );
+            let device_target = AggregateDeviceTarget::prefer_recorded(
+                &resolution.device_target,
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()),
+                &resolution.family,
+                &resolution.published_device_targets,
+            );
             // No exact target means no reproducible composition, so freshness
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
@@ -775,6 +771,7 @@ mod tests {
         let resolver_env_guard = OverridePythonResolverEnv::new(PythonResolverEnv {
             python_override: None,
             search_dirs: vec![bin_dir],
+            ..PythonResolverEnv::from_process_env()
         });
 
         PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
@@ -1068,6 +1065,55 @@ mod tests {
             ),
             RuntimeFreshness::RepairAvailable
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A replacement counts as installed by `rocm_core::install_root_has_payload`:
+    /// a root holding only the runtime's own dot-marker was prepared but never
+    /// filled, so the repair is still on offer; one entry beside the marker is a
+    /// real install, so it is not. The runtime directory vanishing is covered by
+    /// `an_installed_replacement_sibling_suppresses_repeat_repair`.
+    #[test]
+    fn a_replacement_counts_as_installed_by_the_shared_payload_rule() {
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+        let mut source = test_runtime_manifest(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        source.version = "7.14.0".to_owned();
+        let mut replacement =
+            test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
+        replacement.version = "7.14.0".to_owned();
+        replacement.wheel_composition = Some(required.clone());
+        let (root, _) = test_paths("replacement-shared-payload-rule");
+        replacement.install_root = root.join("replacement");
+        fs::create_dir_all(&replacement.install_root).unwrap();
+        fs::write(
+            replacement.install_root.join(".rocm-cli-runtime.json"),
+            b"{}",
+        )
+        .unwrap();
+        let manifests = vec![source.clone(), replacement.clone()];
+        let freshness = |manifests: &[InstalledRuntimeManifest]| {
+            runtime_freshness_with_manifests(
+                manifests,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            )
+        };
+
+        assert_eq!(
+            freshness(&manifests),
+            RuntimeFreshness::RepairAvailable,
+            "a root with only the dot-marker has no payload, so it is not a replacement"
+        );
+
+        fs::write(replacement.install_root.join("installed.marker"), b"ok").unwrap();
+        assert_eq!(freshness(&manifests), RuntimeFreshness::UpToDate);
         fs::remove_dir_all(root).ok();
     }
 

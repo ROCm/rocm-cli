@@ -446,7 +446,7 @@ fn header_u64(response: &ureq::Response, name: &str) -> Option<u64> {
 }
 
 /// First byte offset from a `Content-Range: bytes <start>-<end>/<total>` header.
-fn content_range_start(response: &ureq::Response) -> Option<u64> {
+pub(crate) fn content_range_start(response: &ureq::Response) -> Option<u64> {
     let value = response.header("Content-Range")?;
     let range = value.trim().strip_prefix("bytes")?.trim_start();
     let start = range.split('-').next()?.trim();

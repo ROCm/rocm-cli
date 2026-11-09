@@ -8,8 +8,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod amd_smi;
+pub mod anthropic_endpoint;
 #[cfg(all(test, unix))]
 mod archive_props;
+pub mod atomic_write;
 pub mod automation;
 pub mod binary_paths;
 pub mod browser;
@@ -27,6 +29,9 @@ pub mod examine;
 pub mod fake_executable;
 pub mod fix;
 mod gfx_target;
+pub mod gguf;
+pub mod gguf_fit;
+pub mod gguf_source;
 pub mod hardware_root;
 pub mod host_gpu;
 mod jsonl_store;
@@ -62,7 +67,11 @@ mod test_support;
 pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
-pub use amd_smi::resolve_amd_smi_binary;
+pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
+pub use anthropic_endpoint::{
+    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
+    anthropic_endpoint_ready, wait_for_published_anthropic_endpoint,
+};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
@@ -124,11 +133,12 @@ pub use gfx_target::{
 };
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, HostGpuSummary, WindowsGpuListing, WslHostDriverProbe,
-    WslSummary, default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
-    detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
+    DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
+    WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
+    detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
+    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
+    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -160,7 +170,7 @@ pub use model_catalog::{
 pub use net::{
     DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
     format_host_for_url, format_host_port, format_http_base_url, http_get_text,
-    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
+    http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -169,7 +179,10 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
+    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{
@@ -193,19 +206,20 @@ use runtime::env_path_override;
 pub use runtime::{
     RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,
     default_cache_dir, default_config_dir, default_data_dir, default_interactive_shell_program,
-    managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir, managed_runtime_data_root,
-    managed_tools_dir, managed_uv_cache_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
-    platform_binary_name, prepend_runtime_path, resolve_path_through_symlinks,
-    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
-    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
-    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
-    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
-    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    install_root_has_payload, managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir,
+    managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
+    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
+    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
+    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
+    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
+    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
-    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_python_env_bin_dir, runtime_python_env_root_for_executable,
+    runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_identity::{ServiceId, generate_service_id};
@@ -217,9 +231,10 @@ pub use service_record::{
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
-    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, find_uv_binary,
+    split_local_version, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
+    uv_pip_check_args, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject,
+    violations_requiring,
 };
 pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
@@ -259,6 +274,27 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
 /// captured output: stderr if non-blank after trimming, else stdout, else a
 /// literal "no output"; the result is trimmed.
 pub fn command_failure_detail(output: &std::process::Output) -> String {
+    command_failure_detail_or_else(output, || "no output".to_owned())
+}
+
+/// The stderr-then-stdout precedence behind [`command_failure_detail`], with the
+/// both-blank fallback left to the caller.
+///
+/// Exists so the precedence rule lives in exactly one place. [`amd_smi_json`]
+/// needs the same ordering but a different last resort — `exit status <code>`
+/// rather than `no output`, because a silent amd-smi's exit code is the only
+/// diagnostic left — and inlining the two `is_empty` checks there to get it put
+/// the same rule in two places. `fallback` is a closure because formatting an
+/// `ExitStatus` is wasted work on the overwhelmingly common non-blank path.
+///
+/// `pub(crate)`, not `pub`: the only caller outside this module is
+/// [`amd_smi_json`], also in this crate. External callers that want the
+/// precedence rule want [`command_failure_detail`], which is the public pair of
+/// this and carries the fallback they would otherwise have to supply.
+pub(crate) fn command_failure_detail_or_else(
+    output: &std::process::Output,
+    fallback: impl FnOnce() -> String,
+) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return stderr;
@@ -267,7 +303,7 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
     if !stdout.is_empty() {
         return stdout;
     }
-    "no output".to_owned()
+    fallback()
 }
 
 /// The `--gpu-memory-utilization` workaround for a shared/busy GPU.

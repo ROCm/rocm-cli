@@ -5,7 +5,6 @@
 //! IO-heavy collector implementations. Used by `rocm-dash-daemon` and, on Windows, `rocm-dash-tui`.
 //!
 //! Every collector implements one of the traits in `rocm_dash_core::traits`.
-//! Stubs return `CollectorError::Unsupported` so the daemon can start with nothing wired.
 
 pub mod amd_smi;
 pub mod bench_load;
@@ -16,8 +15,5 @@ pub mod engine_registry;
 pub mod host;
 pub mod lemonade;
 pub mod parallel;
-pub mod proc_scan;
-pub mod sysfs;
-pub mod vllm_log;
 pub mod vllm_prom;
 pub mod winperf;

@@ -67,11 +67,21 @@ pub struct E2eWorld {
     /// so the port keeps answering, as a started ComfyUI's does, for the rest
     /// of the scenario.
     pub comfyui_port_listener: Option<std::net::TcpListener>,
+    /// Listener that deliberately occupies the default serve port while a real
+    /// `rocm serve` invocation proves automatic allocation advances past it.
+    pub automatic_port_guard: Option<std::net::TcpListener>,
+    /// How many requests a stand-in Hugging Face endpoint has answered, for
+    /// scenarios that must show the CLI did or did not reach out.
+    /// The serving thread stops once the World drops its handle.
+    pub hub_requests: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
     pub chat_response: Option<serde_json::Value>,
+    /// The reply to a request sent to the served model's Anthropic-compatible
+    /// `/v1/messages` endpoint.
+    pub anthropic_response: Option<serde_json::Value>,
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
@@ -323,10 +333,13 @@ impl Default for E2eWorld {
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
+            automatic_port_guard: None,
+            hub_requests: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
             chat_response: None,
+            anthropic_response: None,
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
