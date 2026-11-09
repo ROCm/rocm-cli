@@ -9021,16 +9021,32 @@ permissions:
                 .filter(|c| !(c.is_whitespace() || *c == '"' || *c == '\''))
                 .collect()
         };
-        let text = squeeze(&without_comments(workflow));
-        [
-            "queue-report".to_owned(),
-            "nightly-queue".to_owned(),
-            "queue-run".to_owned(),
-            squeeze(queue_workflow_name),
-        ]
-        .into_iter()
-        .filter(|reference| text.contains(reference.as_str()))
-        .collect()
+        let uncommented = without_comments(workflow);
+        let squeezed = squeeze(&uncommented);
+        // The label and the file stems are whole words, so `queue-runner` is
+        // not a reference to `queue-run`; the workflow's name may be split
+        // across lines and is matched squeezed.
+        let lowered = uncommented.to_lowercase().replace(['"', '\''], "");
+        let word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+        let names_word = |word: &str| {
+            lowered.match_indices(word).any(|(at, _)| {
+                !lowered[..at].chars().next_back().is_some_and(word_char)
+                    && !lowered[at + word.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(word_char)
+            })
+        };
+        let mut found: Vec<String> = ["queue-report", "nightly-queue", "queue-run"]
+            .into_iter()
+            .filter(|word| names_word(word))
+            .map(str::to_owned)
+            .collect();
+        let name = squeeze(queue_workflow_name);
+        if squeezed.contains(name.as_str()) {
+            found.push(name);
+        }
+        found
     }
 
     #[test]
@@ -9061,6 +9077,17 @@ permissions:
                 job("    uses: ./.github/workflows/queue-run.yml"),
                 vec!["queue-run"],
             ),
+            (job("    needs: [queue-run]"), vec!["queue-run"]),
+            (
+                job("    needs:\n      - queue-run\n      - lint"),
+                vec!["queue-run"],
+            ),
+            // Whole words only: these are other names.
+            (
+                job("    uses: ./.github/workflows/queue-runner.yml"),
+                vec![],
+            ),
+            (job("    runs-on: [queue-reporter]"), vec![]),
             (job("    runs-on: ubuntu-latest"), vec![]),
             (job("    runs-on: [self-hosted, linux, mi300x]"), vec![]),
             (
@@ -9495,6 +9522,10 @@ permissions:
                     .to_owned(),
             ];
             for channel in ["release", "nightly"] {
+                // The first channel's preflight is the one before the build.
+                if channel == "nightly" {
+                    steps.push("preflight ran\n".to_owned());
+                }
                 steps.extend([
                     format!(
                         "cargo xtask e2e-prewarm --channel {channel} --prewarm-dir {}/prewarm-{channel}\n",
@@ -9519,6 +9550,8 @@ permissions:
                 from += at + step.len();
             }
             assert_eq!(log.matches("cargo build").count(), 1, "{log}");
+            // One preflight per channel, never two for the same one.
+            assert_eq!(log.matches("preflight ran").count(), 2, "{log}");
             assert!(!log.contains("curl"), "cargo was there already:\n{log}");
         }
     }
