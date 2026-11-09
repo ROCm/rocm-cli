@@ -1134,8 +1134,8 @@ Expected result:
   terminal ends with `Nothing was removed. To remove these items, run it again
   without --dry-run.` Running the same command again without `--dry-run` asks
   `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
-  its output piped to a file or another command it lists the same items and
-  omits that last line (scenario `uninstall-08`).
+  its output piped to a file or another command, or its input redirected, it
+  lists the same items and omits that last line (scenario `uninstall-08`).
 - After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.

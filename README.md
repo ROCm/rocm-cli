@@ -1457,8 +1457,8 @@ do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
 and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
 is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
-`--dry-run`; with nothing to remove, or when its output is not read at a terminal,
-it says nothing about a next step. It does not create the folders it reports on:
+`--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
+(its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
 with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
 nothing to remove. Outside an interactive terminal, when there is something to
 remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.

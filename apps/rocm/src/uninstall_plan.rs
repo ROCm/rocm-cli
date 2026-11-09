@@ -292,8 +292,10 @@ pub(crate) enum PlanAudience {
 }
 
 impl PlanAudience {
-    /// The audience for `rocm uninstall` itself, from whether the process has a
-    /// terminal on both streams.
+    /// The audience for `rocm uninstall` itself, from whether `interactive_terminal`
+    /// holds: stdin and stdout are both terminals. A dry run with either one
+    /// redirected, `--dry-run < /dev/null` at a terminal for one, is `Captured`
+    /// and prints no footer.
     pub(crate) const fn for_command(interactive_terminal: bool) -> Self {
         if interactive_terminal {
             Self::Terminal

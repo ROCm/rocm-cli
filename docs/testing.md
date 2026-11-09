@@ -1217,7 +1217,7 @@ anything is removed, and a dry run on a machine ROCm CLI never touched
 (`uninstall-06`) reporting nothing to remove and creating no folder. At a
 terminal (a pseudo-terminal on the Linux lane), a dry run that lists something
 ends by saying to run it again without `--dry-run`, and `uninstall-07` does that
-and checks the listed folder goes; output that is not read at a terminal, and an
+and checks the listed folder goes; a run whose stdin or stdout is not a terminal, and an
 empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts

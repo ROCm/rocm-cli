@@ -97,7 +97,7 @@ Feature: Uninstall
     Then the uninstall succeeds
     And the config folder is gone
 
-  # Output that is not read at a terminal (a script, the dashboard's
+  # A run whose stdin or stdout is not a terminal (a script, the dashboard's
   # `/uninstall`, the daemon's `rocm_command` tool) has no one to tell to run it
   # again: the real step belongs to whatever drives it. It lists what it would
   # remove, offers no step, and removes nothing.
