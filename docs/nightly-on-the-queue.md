@@ -106,7 +106,10 @@ Every lane runs the same image and command; there is no per-lane variant. The
 channels are the command's, not the queue's: the default command runs the
 `release` channel and then the `nightly` one (`E2E_CHANNELS`, default `release
 nightly`), each with its own runtimes and its own suite run, so a lane takes
-about twice as long as one channel would. Both always run, so a failing
+about twice as long as one channel would. That time has not been measured on a
+queue lane from a cold start, so a lane that cannot finish both channels within
+the run's wait (which also covers waiting for a GPU) is reported as
+**incomplete**; the wait can be raised for a run, up to its limit. Both always run, so a failing
 channel does not hide the other, and the lane fails if either did.
 
 The queue's results are an additional signal, not a replacement: the lanes

@@ -34,6 +34,9 @@ export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
 # The channels are checked before anything is built, so a typo costs nothing.
+# Each at most once: a repeat would rerun into the same pre-warm tree and
+# overwrite that channel's results.
+seen=" "
 for channel in ${channels}; do
   case "${channel}" in
     release | nightly) ;;
@@ -42,6 +45,11 @@ for channel in ${channels}; do
       exit 2
       ;;
   esac
+  if [[ "${seen}" == *" ${channel} "* ]]; then
+    echo "E2E_CHANNELS: channel '${channel}' is named twice" >&2
+    exit 2
+  fi
+  seen+="${channel} "
 done
 # Words, not characters: a tab or a newline alone is no channel either.
 # shellcheck disable=SC2086
@@ -138,7 +146,8 @@ run_channel() {
   local prewarm="${work}/prewarm-${channel}"
   export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
   # The suite writes here, and a channel must not report the last one's files.
-  rm -rf tests/e2e-cucumber/results
+  # Returned, not ignored: the caller's `||` turns `set -e` off in here.
+  rm -rf tests/e2e-cucumber/results || return $?
   HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
     UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
     cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}" ||

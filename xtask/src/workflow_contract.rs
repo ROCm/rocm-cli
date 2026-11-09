@@ -9128,6 +9128,42 @@ permissions:
         );
     }
 
+    /// The job's time limit, the lanes' wait limit and what the doc and the
+    /// workflow comment say of them move together: the limit must leave the
+    /// 30 minutes finishing and publishing a run can take after the longest wait.
+    #[test]
+    fn the_queue_run_timeout_covers_the_wait_limit_the_doc_gives() {
+        let doc = docs_nightly_on_the_queue();
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The limit as the run inputs give it: "at most N seconds".
+        let wait_secs: u64 = flat
+            .split("at most ")
+            .find_map(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect("the doc's run inputs give the wait limit as `at most N seconds`");
+        assert!(
+            flat.contains(&format!("({wait_secs} s")),
+            "the doc's start section must give the same wait limit"
+        );
+        let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
+        assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
+        let text = read_workflow("queue-run.yml");
+        assert!(
+            text.contains(&format!("{wait_secs} s ({wait_text})")),
+            "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
+        );
+        let timeout_minutes: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("    timeout-minutes: "))
+            .expect("queue-run.yml's job has timeout-minutes")
+            .trim()
+            .parse()
+            .expect("timeout-minutes is a number");
+        assert!(
+            timeout_minutes * 60 >= wait_secs + 30 * 60,
+            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait"
+        );
+    }
+
     #[test]
     fn each_queue_workflow_uploads_the_artifact_the_doc_names_for_it() {
         let doc = docs_nightly_on_the_queue();
@@ -9465,7 +9501,16 @@ permissions:
         assert!(!out.join("release").exists(), "{log}");
         assert!(!log.contains("--channel release"), "{log}");
 
-        for channels in ["beta", "release  stable", "  ", "\t", "\n", " \t\n "] {
+        for channels in [
+            "beta",
+            "release  stable",
+            "  ",
+            "\t",
+            "\n",
+            " \t\n ",
+            "release release",
+            "nightly release\tnightly",
+        ] {
             let LaneRun {
                 rc,
                 log,
