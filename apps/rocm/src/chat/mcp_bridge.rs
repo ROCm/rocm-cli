@@ -22,7 +22,6 @@
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
-use crate::engine_runtime_select::app_path_env_vars;
 use crate::freeform_planner::{format_structured_tool_call, plan_freeform_request_with_context};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
@@ -459,7 +458,7 @@ fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    rocm_core::run_rocm_capture_with_env(args, &app_path_env_vars(paths), timeout)
+    rocm_core::run_rocm_capture_with_env(args, &paths.env_vars(), timeout)
 }
 
 fn run_rocm_command_for_paths(

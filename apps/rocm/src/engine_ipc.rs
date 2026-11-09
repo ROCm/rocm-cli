@@ -45,9 +45,8 @@
 //! `ScopedEnvVar` have no callers outside this module and stay private. The
 //! one helper this module calls back into at the crate root, `device_policy_name`,
 //! stays in `main.rs` and is reached via `use crate::device_policy_name;`.
-//! `parse_device_policy` is in `gpu_policy.rs`; `app_path_env_vars` and
-//! `engine_recipe_json_arg` are in `engine_runtime_select.rs`, and
-//! `optional_arg` is in `rocm_engine_protocol`.
+//! `parse_device_policy` is in `gpu_policy.rs`, `engine_recipe_json_arg` is in
+//! `engine_runtime_select.rs`, and `optional_arg` is in `rocm_engine_protocol`.
 
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -65,7 +64,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::device_policy_name;
-use crate::engine_runtime_select::{app_path_env_vars, engine_recipe_json_arg};
+use crate::engine_runtime_select::engine_recipe_json_arg;
 use crate::gpu_policy::parse_device_policy;
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -223,7 +222,7 @@ fn with_scoped_builtin_engine_env<R>(
     let _guard = lock.lock().expect("builtin engine env lock poisoned");
     let mut vars = Vec::new();
     if let Some(paths) = paths {
-        for (key, value) in app_path_env_vars(paths) {
+        for (key, value) in paths.env_vars() {
             vars.push(ScopedEnvVar::set_path(key, value));
         }
     }
