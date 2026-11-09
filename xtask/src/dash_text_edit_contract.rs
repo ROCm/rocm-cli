@@ -17,8 +17,9 @@
 //!
 //! * a no-argument `.pop()` call in a file that names `KeyCode::Backspace` is
 //!   reported, and
-//! * `.push(x)` (or `.push(*x)`, `.push(x.method())`) is reported where `x` is a
-//!   name the same file binds as a key character (`KeyCode::Char(x)`,
+//! * `.push(x)` (or `.push(*x)`, `.push(x.method())`, `.push(x as char)`, and each
+//!   of them with a trailing comma such as `.push(x,)`) is reported where `x` is
+//!   a name the same file binds as a key character (`KeyCode::Char(x)`,
 //!   `KeyCode::Char(mut x)`) or declares as a `char` parameter (`x: char`), in a
 //!   file that names `KeyCode::Char(`.
 //!
@@ -38,9 +39,12 @@
 //!   false alarm; rename it, or add the file to `ALLOWED` with the reason.
 //!   Bindings are per file, not per function, so an unrelated `out.push(c)` is
 //!   also reported when the same file binds `KeyCode::Char(c)` somewhere else.
-//! * Only `.pop()` and `.push(x)` are matched. `push_str`, `truncate`, `clear`,
-//!   `String::pop(&mut b)`, `.insert(..)`, `.remove(..)` and `replace_range(..)`
-//!   are not scanned. A cursor editor such as the serve wizard's Host field
+//! * Only `.pop()` and `.push(x)` are matched, and a push only when its argument
+//!   is the bound name alone, as listed above: `.push((x))`, `.push(char::from(x))`,
+//!   `.push(if shift { x.to_ascii_uppercase() } else { x })` and a call written
+//!   with a gap before the paren (`.push (x)`, which rustfmt never produces) are
+//!   not seen. `push_str`, `truncate`, `clear`, `String::pop(&mut b)`,
+//!   `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned. A cursor editor such as the serve wizard's Host field
 //!   (`InlineEditor` in `ui/serve_wizard.rs`) cannot use the append-only helper,
 //!   so it is a different thing, and a second copy of one goes unseen.
 //! * A file that never names `KeyCode::Char(` is not checked for a `char`
@@ -259,6 +263,33 @@ mod tests {
         names
     }
 
+    /// Whether the text after a `.push(` argument's leading name (ending at `end`)
+    /// closes the call with that name as the whole argument: the bare name
+    /// (`push(c)`), a method on it (`push(c.to_ascii_lowercase())`), a no-op cast
+    /// to `char` (`push(c as char)`), and any of the first and last with a
+    /// trailing comma (`push(c,)`, which rustfmt writes when a call spans lines).
+    /// A second argument (`push(c, 1)`) or a cast to another type
+    /// (`push(c as u8)`, a `Vec<u8>` push) is not a `String` append.
+    fn is_whole_push_argument(chars: &[char], end: usize) -> bool {
+        let mut i = skip_ws(chars, end);
+        if starts_with_at(chars, i, "as") && chars.get(i + 2).is_some_and(|c| c.is_whitespace()) {
+            let ty = skip_ws(chars, i + 2);
+            // Any other cast (`as u8`) leaves `i` on the `as`, which closes nothing.
+            if starts_with_at(chars, ty, "char")
+                && !chars
+                    .get(ty + "char".len())
+                    .is_some_and(|c| is_ident_char(*c))
+            {
+                i = skip_ws(chars, ty + "char".len());
+            }
+        }
+        match chars.get(i) {
+            Some(')' | '.') => true,
+            Some(',') => chars.get(skip_ws(chars, i + 1)) == Some(&')'),
+            _ => false,
+        }
+    }
+
     /// Every hand-rolled append or pop in `source`'s production code.
     ///
     /// Takes the raw file text, so a caller cannot forget to strip comments,
@@ -289,9 +320,7 @@ mod tests {
                 let Some((name, end)) = ident_at(&chars, arg) else {
                     continue;
                 };
-                // The bare name, or a method on it (`c.to_ascii_lowercase()`).
-                let next = chars.get(skip_ws(&chars, end));
-                if matches!(next, Some(')' | '.')) && bound.contains(&name) {
+                if is_whole_push_argument(&chars, end) && bound.contains(&name) {
                     offenses.push(Offense {
                         line: line_of(&chars, at),
                         what: format!("`.push({name})` of a typed-in character"),
@@ -560,6 +589,68 @@ fn a(code: &&KeyCode, q: &mut String) {
 }
 ";
         assert_eq!(lines(&hand_rolled_edits(source)), vec![2]);
+    }
+
+    /// A key arm that appends `shape` to a `String`, wrapped in a function so the
+    /// whole file is a valid fixture for [`hand_rolled_edits`].
+    fn key_arm_pushing(shape: &str) -> String {
+        format!(
+            "fn f(code: KeyCode, q: &mut String) {{\n    if let KeyCode::Char(c) = code {{\n        \
+             {shape};\n    }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn a_push_with_a_trailing_comma_is_reported() {
+        // `q.push(c,)` is a valid call, and the multi-line form below is what
+        // rustfmt writes when a call is too long for one line. Both append a
+        // typed-in character, so both are offenses.
+        let one_line = key_arm_pushing("q.push(c,)");
+        assert_eq!(lines(&hand_rolled_edits(&one_line)), vec![3], "{one_line}");
+        let multi_line = key_arm_pushing("q.push(\n            c,\n        )");
+        assert_eq!(
+            lines(&hand_rolled_edits(&multi_line)),
+            vec![3],
+            "{multi_line}"
+        );
+    }
+
+    #[test]
+    fn the_other_spellings_of_a_pushed_typed_in_char_are_reported() {
+        let mut missed = Vec::new();
+        for (shape, call) in [
+            ("spaces around the comma", "q.push( c , )"),
+            ("a dereference and a comma", "q.push(*c,)"),
+            ("a method and a comma", "q.push(c.to_ascii_lowercase(),)"),
+            ("a comment before the paren", "q.push(c /* typed */)"),
+            ("a cast to char", "q.push(c as char)"),
+            ("a cast to char and a comma", "q.push(c as char,)"),
+            (
+                "the argument on its own line",
+                "q.push(\n            c\n        )",
+            ),
+        ] {
+            let source = key_arm_pushing(call);
+            if hand_rolled_edits(&source).len() != 1 {
+                missed.push(shape);
+            }
+        }
+        assert!(missed.is_empty(), "not reported: {missed:?}");
+    }
+
+    #[test]
+    fn a_push_with_more_than_the_typed_in_char_is_not_reported() {
+        // Not a `String` append of the typed key: two arguments, or a cast to a
+        // type a `String` cannot take.
+        for (shape, call) in [
+            ("two arguments", "q.push(c, 1)"),
+            ("two arguments over lines", "q.push(c,\n            1)"),
+            ("a cast to a byte", "q.push(c as u8,)"),
+            ("a cast to a byte", "q.push(c as u8)"),
+        ] {
+            let source = key_arm_pushing(call);
+            assert!(hand_rolled_edits(&source).is_empty(), "{shape}: {source}");
+        }
     }
 
     #[test]

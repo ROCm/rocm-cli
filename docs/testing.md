@@ -211,8 +211,9 @@ cargo test -p xtask dash_text_edit_contract
 It is per file, not per `match` arm, because the copies the helper replaced were
 not all arms (one had its `push` in a `type_char` method the arm called). In a
 file other than `ui/widgets.rs` it reports a no-argument `.pop()` when the file
-names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)` and
-`.push(x.method())`) when `x` is a name the file binds as a key character
+names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)`,
+`.push(x.method())` and `.push(x as char)`, each with or without a trailing
+comma) when `x` is a name the file binds as a key character
 (`KeyCode::Char(x)`, `KeyCode::Char(mut x)`) or declares as `x: char`, in a file
 that names `KeyCode::Char(`. A `#[cfg(test)] mod name { .. }` block is skipped,
 so a unit test may drive a buffer by hand; a `#[cfg(test)]` on anything else
@@ -222,12 +223,14 @@ file of its own, scanned in full.
 What it does not see: it matches the shape, not the type, so a `let top =
 stack.pop()` in a file that handles `Backspace` is a false alarm, and an
 unrelated `out.push(c)` is reported when the same file binds `KeyCode::Char(c)`
-elsewhere. Only `#[cfg(test)]` exactly is read as a test gate (a
+elsewhere. A push is read only when its argument is that name alone in one of the
+spellings above: `.push((x))`, `.push(char::from(x))`, a `.push(if ..)` of the
+name, and a call with a gap before the paren (`.push (x)`, which rustfmt never
+writes) are not seen. Only `#[cfg(test)]` exactly is read as a test gate (a
 `#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
 `use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
 from one file to a method in another is not followed. Only `.pop()` and
-`.push(x)` are matched: `push_str`, `truncate`,
-`clear`, `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned,
+`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned,
 partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
 [`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
 the append-only helper and is a different thing. A `Backspace` arm that never
