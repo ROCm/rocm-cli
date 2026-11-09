@@ -1456,6 +1456,15 @@ second terminal to watch the download.
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
 
+The log views read the end of a log through one bounded routine,
+`rocm_core::tail_log_decoded`, and decode invalid text lossily. Scenario `logs-08`
+plants an action log with a byte that is not valid text and checks that
+`rocm logs --search` still finds every matching line. Scenarios `logs-09` and
+`logs-10` (`rocm services logs`) and `logs-11` and `logs-12` (`rocm comfyui logs`)
+plant an over-long single line and an empty file and check that only the empty
+file is reported as having no output, with the wording checked against the file
+on disk. The routine itself is covered by `cargo test -p rocm-core --lib log_tail`.
+
 The `service_logs` tool (what the assistant and MCP clients call to read a
 server's log) answers through `rocm_core::service_log_tool_summary`, so an empty
 log (`has no log output yet`) and a log whose newest line is longer than the
