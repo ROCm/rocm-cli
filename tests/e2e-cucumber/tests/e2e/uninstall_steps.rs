@@ -77,6 +77,19 @@ async fn cache_behind_looping_link(world: &mut E2eWorld) {
     E2eWorld::link_directory(&looping, &looping).expect("failed to plant looping link");
 }
 
+/// HOME, the uv cache and the Hugging Face cache inside the scenario's own
+/// folder, so nothing a run resolves can reach the runner's shared caches.
+fn isolated_env(world: &E2eWorld) -> Vec<(&'static str, String)> {
+    let root = root(world);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
+    vec![
+        ("HOME", home.display().to_string()),
+        ("UV_CACHE_DIR", root.join("uv-cache").display().to_string()),
+        ("HF_HOME", root.join("hf-home").display().to_string()),
+    ]
+}
+
 fn run_uninstall(world: &mut E2eWorld, keep: &[&str], settings: &[(&str, &str)]) {
     run_uninstall_with(world, true, keep, settings);
 }
@@ -102,17 +115,11 @@ fn run_uninstall_with(
 /// every other uninstall here.
 fn run_uninstall_args(world: &mut E2eWorld, args: &[&str], settings: &[(&str, &str)]) {
     assert_keeps_binaries(args);
-    let root = root(world).to_path_buf();
-    let home = root.join("home");
-    std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
-    let home = home.display().to_string();
-    let uv = root.join("uv-cache").display().to_string();
-    let hf = root.join("hf-home").display().to_string();
-    let mut envs = vec![
-        ("HOME", home.as_str()),
-        ("UV_CACHE_DIR", &uv),
-        ("HF_HOME", &hf),
-    ];
+    let isolated = isolated_env(world);
+    let mut envs = isolated
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect::<Vec<_>>();
     envs.extend_from_slice(settings);
     let (stdout, stderr, rc) = crate::run_rocm_with_env(world, args, &envs);
     world.cli_output = Some(stdout);
@@ -613,6 +620,88 @@ async fn dry_run_offers_no_step(world: &mut E2eWorld) {
         assert!(
             !stdout.contains(phrase),
             "this dry run must not offer {phrase:?}:\n{stdout}"
+        );
+    }
+}
+
+/// The assistant's uninstall preview, called without a model through the hidden
+/// `rocm mcp-call` entry point the dashboard and chat use for their tools.
+///
+/// The one run here that cannot pass `--keep-binaries`: the preview takes no
+/// flags, plans every folder and the binary under test, and renders the plan. It
+/// removes nothing, and it is made without `--allow-mutation`, so the tool
+/// refuses a call that would remove something instead of running it.
+#[when("the assistant previews an uninstall")]
+async fn assistant_previews_uninstall(world: &mut E2eWorld) {
+    let config = config_dir(world).display().to_string();
+    let isolated = isolated_env(world);
+    let mut envs = isolated
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect::<Vec<_>>();
+    envs.push(("ROCM_CLI_CONFIG_DIR", &config));
+    let arguments = serde_json::json!({ "args": ["uninstall", "--dry-run"] }).to_string();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["mcp-call", "rocm_command", "--arguments-json", &arguments],
+        &envs,
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// What the preview printed: the command's own text inside the tool result.
+fn preview_text(world: &E2eWorld) -> String {
+    let result: serde_json::Value = serde_json::from_str(output(world)).unwrap_or_else(|error| {
+        panic!("the tool result is not JSON ({error}):\n{}", output(world))
+    });
+    result["structuredContent"]["stdout"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the tool result has no command output:\n{}", output(world)))
+        .to_owned()
+}
+
+#[then("the preview succeeds")]
+async fn preview_succeeds(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    assert!(
+        rc == 0,
+        "the preview must exit 0, got {rc}\nstdout:\n{}\nstderr:\n{}",
+        output(world),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    let result: serde_json::Value = serde_json::from_str(output(world)).expect("tool result JSON");
+    assert_eq!(
+        result["isError"],
+        serde_json::Value::Bool(false),
+        "the tool reported an error:\n{}",
+        output(world)
+    );
+}
+
+#[then("the preview lists the config folder")]
+async fn preview_lists_the_config(world: &mut E2eWorld) {
+    let text = preview_text(world);
+    let config = config_dir(world).display().to_string();
+    assert!(
+        text.contains(&format!("config: {config}")),
+        "the preview must list the config folder ({config}):\n{text}"
+    );
+}
+
+#[then("the preview says removal needs approval")]
+async fn preview_says_removal_needs_approval(world: &mut E2eWorld) {
+    let text = preview_text(world);
+    assert!(
+        text.contains("Nothing was removed. Removal needs your approval."),
+        "the preview must say removal needs approval:\n{text}"
+    );
+    // The preview has no flag to offer, so it must not point at one.
+    for phrase in ["run it again", "--dry-run.", "Review uninstall"] {
+        assert!(
+            !text.contains(phrase),
+            "the assistant's preview must not offer {phrase:?}:\n{text}"
         );
     }
 }

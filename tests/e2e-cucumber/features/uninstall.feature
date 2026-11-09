@@ -140,3 +140,19 @@ Feature: Uninstall
   Scenario: uninstall-11 - The uninstall help shows a dry run before the real run
     When the user asks for the uninstall help
     Then the help shows a dry run before the real run
+
+  # The assistant's uninstall preview (the `rocm_command` tool of the chat
+  # assistant and the dashboard, called here without a model through the hidden
+  # `rocm mcp-call`) renders the same plan as a dry run, but it has no flag to
+  # offer, so it says that removal needs approval. It is the one run here that
+  # cannot pass --keep-binaries: the preview takes no flags and removes nothing,
+  # and it is made without --allow-mutation, so a call that would remove
+  # something is refused.
+  @id:uninstall-assistant-preview-says-removal-needs-approval
+  Scenario: uninstall-12 - The assistant's uninstall preview lists what it would remove, says removal needs approval, and removes nothing
+    Given the config folder holds the user's files
+    When the assistant previews an uninstall
+    Then the preview succeeds
+    And the preview lists the config folder
+    And the preview says removal needs approval
+    And the config folder still holds the user's files
