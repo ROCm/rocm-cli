@@ -2577,10 +2577,7 @@ fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
     let log = stand_in_uname_log(world);
     rocm_core::fake_executable::write_fake_executable(
         &bin.join("uname"),
-        format!(
-            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = -v ]; then echo '#1 SMP stand-in'; exit 0; fi\n{release_body}\n",
-            log.display()
-        ),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(release_body, &log),
     )
     .expect("failed to write the stand-in uname");
     let inherited = std::env::var_os("PATH").unwrap_or_default();
