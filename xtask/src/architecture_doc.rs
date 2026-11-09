@@ -33,14 +33,14 @@
 //! `?query` suffix and a root-relative path render as working links but are not
 //! recognised, so the failure message asks for the inline form.
 //!
-//! [`EXEMPT`] is the files that existed, uncited, when the check was added. It
-//! follows the pattern of `ALLOWLIST` in [`crate::crate_edges`] and is checked
-//! in both directions: a source file in neither the doc nor the list fails,
-//! and so does a list entry that is now cited or no longer exists. The list is
-//! meant to shrink as files are documented. Nothing can stop a determined edit
-//! from adding to it, so [`EXEMPT_CEILING`] pins its size in a test: growing
-//! the list means raising that constant too, a second, visible line in the diff
-//! that a reviewer has to accept.
+//! [`EXEMPT`] is the files that may go without an entry. It is empty: every
+//! production file is documented. It follows the pattern of `ALLOWLIST` in
+//! [`crate::crate_edges`] and is checked in both directions: a source file in
+//! neither the doc nor the list fails, and so does a list entry that is now
+//! cited or no longer exists. Nothing can stop a determined edit from adding to
+//! it, so [`EXEMPT_CEILING`] pins its size in a test: growing the list means
+//! raising that constant too, a second, visible line in the diff that a
+//! reviewer has to accept.
 //!
 //! What this does not check: whether an entry's prose still describes the file,
 //! and functions that move between two files that are both already cited.
@@ -62,90 +62,15 @@ const DOC_DIR: &str = "docs";
 /// Source roots whose `<crate>/src` trees are in scope.
 const SOURCE_ROOTS: [&str; 3] = ["apps", "crates", "engines"];
 
-/// Production files that have no entry in `docs/architecture.md` yet: everything
-/// that was uncited when this check was added, mostly the dashboard crates.
-/// Do not add to this list to make the check pass: document the file in the doc
-/// instead. Growing it is a reviewed exception and also needs
-/// [`EXEMPT_CEILING`] raised. Remove an entry when the file gets one. Keep it
-/// sorted.
-const EXEMPT: &[&str] = &[
-    "apps/rocmd/src/main.rs",
-    "crates/rocm-dash-collectors/src/amd_smi.rs",
-    "crates/rocm-dash-collectors/src/bench_load.rs",
-    "crates/rocm-dash-collectors/src/bench_tail.rs",
-    "crates/rocm-dash-collectors/src/cgroup.rs",
-    "crates/rocm-dash-collectors/src/docker.rs",
-    "crates/rocm-dash-collectors/src/engine_registry.rs",
-    "crates/rocm-dash-collectors/src/host.rs",
-    "crates/rocm-dash-collectors/src/lemonade.rs",
-    "crates/rocm-dash-collectors/src/parallel.rs",
-    "crates/rocm-dash-collectors/src/vllm_prom.rs",
-    "crates/rocm-dash-core/src/bench_rollup.rs",
-    "crates/rocm-dash-core/src/bench_schema.rs",
-    "crates/rocm-dash-core/src/config.rs",
-    "crates/rocm-dash-core/src/efficiency.rs",
-    "crates/rocm-dash-core/src/metrics.rs",
-    "crates/rocm-dash-core/src/observation.rs",
-    "crates/rocm-dash-core/src/partition.rs",
-    "crates/rocm-dash-core/src/persist.rs",
-    "crates/rocm-dash-core/src/protocol.rs",
-    "crates/rocm-dash-core/src/state.rs",
-    "crates/rocm-dash-core/src/traits.rs",
-    "crates/rocm-dash-core/src/vram.rs",
-    "crates/rocm-dash-daemon/src/bench_ring.rs",
-    "crates/rocm-dash-daemon/src/demo.rs",
-    "crates/rocm-dash-daemon/src/persist.rs",
-    "crates/rocm-dash-daemon/src/snapshot_ring.rs",
-    "crates/rocm-dash-daemon/src/transport.rs",
-    "crates/rocm-dash-tui/src/client.rs",
-    "crates/rocm-dash-tui/src/jobs.rs",
-    "crates/rocm-dash-tui/src/lib.rs",
-    "crates/rocm-dash-tui/src/llm.rs",
-    "crates/rocm-dash-tui/src/reconnect.rs",
-    "crates/rocm-dash-tui/src/registry_probe.rs",
-    "crates/rocm-dash-tui/src/replay.rs",
-    "crates/rocm-dash-tui/src/tool_exec.rs",
-    "crates/rocm-dash-tui/src/transport.rs",
-    "crates/rocm-dash-tui/src/ui/automations_manager.rs",
-    "crates/rocm-dash-tui/src/ui/bench_run.rs",
-    "crates/rocm-dash-tui/src/ui/command_screen.rs",
-    "crates/rocm-dash-tui/src/ui/config_manager.rs",
-    "crates/rocm-dash-tui/src/ui/core_bars.rs",
-    "crates/rocm-dash-tui/src/ui/dock.rs",
-    "crates/rocm-dash-tui/src/ui/engine_manager.rs",
-    "crates/rocm-dash-tui/src/ui/examine_manager.rs",
-    "crates/rocm-dash-tui/src/ui/folder_browser.rs",
-    "crates/rocm-dash-tui/src/ui/format.rs",
-    "crates/rocm-dash-tui/src/ui/gradient.rs",
-    "crates/rocm-dash-tui/src/ui/install_manager.rs",
-    "crates/rocm-dash-tui/src/ui/launcher.rs",
-    "crates/rocm-dash-tui/src/ui/logs_view.rs",
-    "crates/rocm-dash-tui/src/ui/model_picker.rs",
-    "crates/rocm-dash-tui/src/ui/onboarding.rs",
-    "crates/rocm-dash-tui/src/ui/runtime_manager.rs",
-    "crates/rocm-dash-tui/src/ui/serve_wizard.rs",
-    "crates/rocm-dash-tui/src/ui/services_manager.rs",
-    "crates/rocm-dash-tui/src/ui/sparkline.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/bench.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/chat.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/hardware.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/home.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/mod.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/observe.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/pane.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/rocm.rs",
-    "crates/rocm-dash-tui/src/ui/tabs/serving.rs",
-    "crates/rocm-dash-tui/src/ui/update_manager.rs",
-    "crates/rocm-deps/src/lib.rs",
-    "engines/aim/src/main.rs",
-    "engines/lemonade/src/main.rs",
-    "engines/vllm/src/main.rs",
-];
+/// Production files that deliberately have no entry in `docs/architecture.md`.
+/// Empty: every production file is documented. Do not add to this list to make
+/// the check pass: document the file in the doc instead. Growing it is a
+/// reviewed exception and also needs [`EXEMPT_CEILING`] raised. Keep it sorted.
+const EXEMPT: &[&str] = &[];
 
-/// The most entries [`EXEMPT`] may hold. Lower it when entries are removed; do
-/// not raise it to make the check pass, since a file with no entry in the module
-/// map should get one. Raising it is the visible, reviewed way to grow the list.
-const EXEMPT_CEILING: usize = 71;
+/// The most entries [`EXEMPT`] may hold. Zero: a file with no entry in the module
+/// map should get one. Raising it is the visible, reviewed way to add an exemption.
+const EXEMPT_CEILING: usize = 0;
 
 /// Whether `path` is a tracked-file path this check covers: a `.rs` file under
 /// `<root>/<crate>/src/` for one of the [`SOURCE_ROOTS`].
