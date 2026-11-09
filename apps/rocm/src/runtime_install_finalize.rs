@@ -47,7 +47,7 @@ mod torch_alignment;
 
 use torch_alignment::{
     TorchAlignment, TorchRetention, classify_retained_torch, deliberately_diverged_package,
-    report_torch_alignment, report_torch_retention, retained_diverged_package,
+    diverged_packages, report_torch_alignment, report_torch_retention, retained_diverged_package,
     runtime_library_paths_for_key, runtime_python_for_key, sdk_torch_build_for_key,
 };
 
@@ -164,7 +164,7 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
                 &finalized.runtime_key,
                 // The engine install failed, so no alignment ran and any
                 // divergence found here is a real one.
-                None,
+                &[],
             );
             return Err(error);
         }
@@ -245,9 +245,9 @@ fn report_engine_dependency_check(
     engine: &str,
     python: Option<&Path>,
     runtime_key: &str,
-    realigned_package: Option<&str>,
+    diverged: &[&str],
 ) {
-    let outcome = engine_dependency_check(paths, engine, python, realigned_package);
+    let outcome = engine_dependency_check(paths, engine, python, diverged);
     print!("{}", render_engine_dependency_check(engine, &outcome));
     let (level, message) = match &outcome {
         EngineDependencyCheck::Satisfied => (
@@ -764,7 +764,13 @@ pub(crate) fn settle_engine_install(
             (retained_diverged_package(&retention), probed)
         }
     };
-    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
+    report_engine_dependency_check(
+        paths,
+        engine,
+        Some(python),
+        runtime_key,
+        &diverged_packages(diverged, rocm_core::torch_alignment_disabled()),
+    );
     let devices = report_runtime_device_check(paths, engine, runtime_key, devices);
 
     // Only a runtime that cannot serve raises the question the host answers, so
@@ -792,7 +798,7 @@ fn engine_dependency_check(
     paths: &AppPaths,
     engine: &str,
     python: Option<&Path>,
-    realigned_package: Option<&str>,
+    diverged: &[&str],
 ) -> EngineDependencyCheck {
     let Some(python) = python else {
         return EngineDependencyCheck::NotVerified(
@@ -806,7 +812,7 @@ fn engine_dependency_check(
                 .iter()
                 .map(|violation| violation.detail.clone())
                 .collect();
-            classify_dependency_details(details, realigned_package)
+            classify_dependency_details(details, diverged)
         }
         Err(error) => EngineDependencyCheck::NotVerified(error.to_string()),
     }
@@ -819,25 +825,25 @@ fn engine_dependency_check(
 /// and must not drag it along. Lumping the two together loses the distinction
 /// exactly where it matters most — the remedy for the genuine violation would
 /// reinstall the engine and undo the alignment.
-fn classify_dependency_details(
-    details: Vec<String>,
-    realigned_package: Option<&str>,
-) -> EngineDependencyCheck {
+fn classify_dependency_details(details: Vec<String>, diverged: &[&str]) -> EngineDependencyCheck {
     if details.is_empty() {
         return EngineDependencyCheck::Satisfied;
     }
-    let Some(package) = realigned_package else {
+    if diverged.is_empty() {
         return EngineDependencyCheck::Violated {
             violations: details,
             expected: Vec::new(),
         };
-    };
+    }
     // A line whose subject cannot be parsed is not evidence of a divergence, so it
     // stays a violation: the conservative side keeps saying something is wrong.
     let (expected, violations): (Vec<String>, Vec<String>) =
         details.into_iter().partition(|detail| {
-            rocm_core::violation_subject(detail)
-                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+            rocm_core::violation_subject(detail).is_some_and(|subject| {
+                diverged
+                    .iter()
+                    .any(|package| subject.package.eq_ignore_ascii_case(package))
+            })
         });
     if violations.is_empty() {
         EngineDependencyCheck::ExpectedDivergence(expected)
@@ -1119,7 +1125,7 @@ pub(crate) mod tests {
             vec![
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
             ],
-            Some("torch"),
+            &["torch"],
         );
 
         assert!(matches!(
@@ -1145,7 +1151,7 @@ pub(crate) mod tests {
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
                 "The package `vllm` requires `numpy==1.26.4`, but `2.0.0` is installed".to_owned(),
             ],
-            Some("torch"),
+            &["torch"],
         );
 
         let EngineDependencyCheck::Violated {
@@ -1176,7 +1182,7 @@ pub(crate) mod tests {
         // the divergence was intended, so it must not be quietly excused.
         let outcome = classify_dependency_details(
             vec!["something uv said that this parser does not recognise".to_owned()],
-            Some("torch"),
+            &["torch"],
         );
 
         assert!(matches!(outcome, EngineDependencyCheck::Violated { .. }));
@@ -1547,7 +1553,7 @@ pub(crate) mod tests {
         // than fall through to `satisfied`.
         let (root, paths) = test_paths("engine-dependency-no-python");
 
-        let outcome = engine_dependency_check(&paths, "vllm", None, None);
+        let outcome = engine_dependency_check(&paths, "vllm", None, &[]);
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(

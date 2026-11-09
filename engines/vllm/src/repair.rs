@@ -72,12 +72,14 @@ fn torch_alignment_disabled() -> bool {
 /// next invocation starts over — two full torch-stack flips a run, and a warning
 /// claiming a repair that undid the intended state.
 ///
-/// With the alignment disabled the rule is simply "any torch pin": see below.
+/// With the alignment disabled the rule is simply "any pin on the torch stack" (torch,
+/// torchvision, torchaudio, triton): see below.
 ///
 /// Otherwise three conditions, all required, and they are exactly the rule rocm-cli
 /// applies: take the *release* from the engine's pin and the *build* from the SDK.
 ///
-/// The violation must be about torch — any other unmet requirement is real. The
+/// The violation must be about torch — any other unmet requirement is real. (Opted
+/// out, the packages the SDK installs alongside torch count as torch here.) The
 /// installed release must be the one the engine pins; an SDK torch of a *different*
 /// release is the separate bug where the engine cannot accept what the SDK installed,
 /// and a reinstall is the right answer there. And the installed build must be the one
@@ -92,7 +94,16 @@ fn is_intended_torch_divergence(
     let Some(subject) = violation_subject(detail) else {
         return false;
     };
-    if !subject.package.eq_ignore_ascii_case(TORCH_PACKAGE) {
+    // Opted out, the whole torch stack is spared; aligned, only torch itself is ever
+    // an intended divergence, because rocm-cli realigns torch and nothing else.
+    let package_in_scope = if torch_alignment_disabled {
+        rocm_core::SDK_TORCH_STACK_PACKAGES
+            .iter()
+            .any(|package| subject.package.eq_ignore_ascii_case(package))
+    } else {
+        subject.package.eq_ignore_ascii_case(TORCH_PACKAGE)
+    };
+    if !package_in_scope {
         return false;
     }
     // Opted out, so rocm-cli does not choose this runtime's torch and no build it
@@ -100,8 +111,9 @@ fn is_intended_torch_divergence(
     // The build and release tests below are the aligned-case rule — asking a
     // hand-installed torch to match the SDK's build would fail every time, and the
     // reinstall that followed would install the engine's build over exactly the torch
-    // the opt-out exists to keep. Only torch is spared: the check above already
-    // rejected every other package, so an unrelated vLLM-owned defect still repairs.
+    // the opt-out exists to keep. Only the torch stack is spared: the check above
+    // already rejected every other package, so an unrelated vLLM-owned defect still
+    // repairs.
     if torch_alignment_disabled {
         return true;
     }
@@ -126,9 +138,10 @@ fn is_intended_torch_divergence(
 /// treated as intended and the previous behaviour stands.
 ///
 /// `torch_alignment_disabled` is the user's opt-out. It changes which violations count
-/// as defects, never whether defects are acted on: a torch pin stops being one, and
-/// everything else vLLM requires is assessed exactly as before. Returning early on the
-/// opt-out instead would hide a broken torchvision behind an unrelated preference.
+/// as defects, never whether defects are acted on: a pin on the torch stack stops being
+/// one, and everything else vLLM requires is assessed exactly as before. Returning
+/// early on the opt-out instead would hide a broken unrelated pin behind a preference
+/// about torch.
 fn repair_from_violations(
     violations: &[DependencyViolation],
     sdk_torch_build: Option<&str>,
@@ -195,11 +208,9 @@ fn repair_from_violations(
     // The hint blames `rocm install sdk` for writing the SDK torch stack over vLLM's
     // pins, which stops being a live theory once the manifest names the SDK's build:
     // the alignment then identifies that stack and settles it, so a defect surviving
-    // to here is something else. It stays on under the opt-out, which spares only the
-    // package named `torch` — a `torchvision` or `torchaudio` defect is still the SDK
-    // stack written over vLLM's pins, and the opt-out has turned off the step that
-    // would have corrected it, so the hint is more use there rather than less.
-    if sdk_torch_build.is_none() {
+    // to here is something else. Under the opt-out the torch stack is spared, so a
+    // defect that survives to here is not the SDK stack written over vLLM's pins.
+    if sdk_torch_build.is_none() && !torch_alignment_disabled {
         notes.push(
             "if this recurs after `rocm install sdk`, the SDK torch stack is being written over vLLM's pinned torch".to_owned(),
         );
@@ -510,6 +521,50 @@ mod tests {
         );
     }
     #[test]
+    fn an_opted_out_runtime_keeps_the_whole_sdk_torch_stack() {
+        // What the CI GPU lanes see after `rocm install sdk` on an engine runtime:
+        // the SDK writes torch, torchvision, torchaudio and triton together, and each
+        // one violates vLLM's pin. Sparing only torch left the other three as defects,
+        // and the reinstall they drove installed the engine's exact torch over the
+        // one the opt-out exists to keep.
+        let assessment = repair_from_violations(
+            &[
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `triton==3.6.0`, but `3.8.0+git4cff872c.rocm7.14.1` is installed",
+                ),
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.26.0+rocm7.14.1` is installed",
+                ),
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `torchaudio==2.9.0+eaa9e4e`, but `2.11.0+rocm7.14.1` is installed",
+                ),
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.14.1` is installed",
+                ),
+            ],
+            Some(SDK_BUILD),
+            OPTED_OUT,
+        );
+
+        assert!(
+            !assessment.needed,
+            "the opt-out must spare every package of the torch stack: {:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .all(|note| !note.contains("was reinstalled")),
+            "no note may claim a repair that did not happen: {:?}",
+            assessment.notes
+        );
+    }
+    #[test]
     fn an_opted_out_custom_torch_still_repairs_an_unrelated_defect() {
         // The opt-out is about torch, not about the environment. A vLLM-owned pin that
         // has nothing to do with torch is broken the same way it was before, and
@@ -524,7 +579,7 @@ mod tests {
                 ),
                 violation(
                     "vllm",
-                    "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.20.0+cu128` is installed",
+                    "The package `vllm` requires `numpy==1.26.4`, but `2.1.0` is installed",
                 ),
             ],
             Some(SDK_BUILD),
@@ -548,7 +603,7 @@ mod tests {
             assessment.notes
         );
         assert!(
-            violation_notes[0].contains("torchvision=="),
+            violation_notes[0].contains("numpy=="),
             "the defect named must be the unrelated one: {:?}",
             assessment.notes
         );
