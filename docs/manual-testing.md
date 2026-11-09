@@ -487,6 +487,24 @@ Expected result:
   with `the server exited before it became ready` and a `rocm logs --service`
   pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
+- The log views tell an empty log from one they could not show. Replace a
+  server's log file with one line of more than 4 MiB without a line break (for
+  example `head -c 5000000 /dev/zero | tr '\0' x > <log file>`):
+  `rocm services logs <service-id>` prints `Recent output: none shown; the newest
+  line is longer than the 4 MiB a log view reads`, not `no output yet`, and
+  `rocm logs` lists that log with a `<no output shown from ...>` line instead of
+  `No logs found yet.`; `rocm comfyui logs` says `No output shown: the newest line
+  is longer than the 4 MiB a log view reads.` for a ComfyUI log like that, and
+  `The saved log is empty.` only for an empty one. An empty log file still says
+  `no output yet`. A stray byte that is not valid text shows the readable lines
+  with a replacement character, not a `failed to read` line.
+- The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
+  '{"service_id":"<service-id>","lines":50}'`) answers with one of three
+  summaries: `has no log output yet` for an empty log, `has log output, but none
+  is shown` with the same 4 MiB clause for the over-long line above, or `Read the
+  last N line(s)`. Its structured reply carries `lines` (the number returned,
+  such as 3 for a three-line log), `lines_requested` (the 50 asked for) and
+  `newest_line_exceeds_read_bound`.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
   row's note points at `rocm services prune` to reclaim the space.
