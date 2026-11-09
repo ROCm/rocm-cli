@@ -232,6 +232,16 @@ pub struct ScenarioDecl {
 }
 
 impl ScenarioDecl {
+    /// Whether the scenario needs a usable AMD GPU on this host:
+    /// `@requires-gpu`, or `@requires-real-gpu`, which implies it. `resolve`
+    /// asks this rather than reading `requires_gpu` alone, so a declaration
+    /// built by hand with only `requires_real_gpu` set still skips on a host
+    /// without a GPU instead of running there.
+    #[must_use]
+    pub const fn needs_gpu(&self) -> bool {
+        self.requires_gpu || self.requires_real_gpu
+    }
+
     /// Parse a scenario's declaration from its gherkin tags, accepting the
     /// leading `@` shape cucumber-rs supplies at runtime and bare unit fixtures.
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
@@ -638,7 +648,7 @@ pub fn resolve(
             ),
         };
     }
-    if decl.requires_gpu && !cap.has_amd_gpu {
+    if decl.needs_gpu() && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
         };
@@ -710,7 +720,7 @@ pub fn resolve(
     // A scenario that pins or defaults to a real engine and would actually serve
     // needs that engine to be startable here. We treat any GPU scenario with a
     // resolved engine as engine-gated; non-GPU scenarios never gate on engine.
-    if decl.requires_gpu && !cap.engine_available(engine) {
+    if decl.needs_gpu() && !cap.engine_available(engine) {
         return Expectation::Skip {
             reason: format!(
                 "engine '{engine}' cannot start on this host ({})",
@@ -2636,6 +2646,26 @@ flaky = true
             Expectation::ExpectPass
         );
         // Real mode does not conjure a GPU: the ordinary GPU gate still applies.
+        match resolve(&d, &cap("mock"), &m, real) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("requires an AMD GPU"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    /// The GPU gate holds the implication itself, not only `from_tags`: a
+    /// declaration whose `requires_gpu` was left false still skips on a host
+    /// without a GPU, even with real hardware opted into.
+    #[test]
+    fn requires_real_gpu_alone_still_needs_a_gpu_on_the_host() {
+        let m = Expectations::default();
+        let mut d = decl(&["id:x", "requires-real-gpu"]);
+        d.requires_gpu = false;
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
         match resolve(&d, &cap("mock"), &m, real) {
             Expectation::Skip { reason } => {
                 assert!(reason.contains("requires an AMD GPU"), "{reason}");

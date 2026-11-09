@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 pub const TOOL_OUTPUT_DIR: &str = ".fake-tools";
 
 /// The environment variable that points the CLI at a simulated root.
-/// Must match `rocm_core::hardware_root::TEST_HOST_ROOT_ENV`.
+///
+/// Must match `rocm_core::hardware_root::TEST_HOST_ROOT_ENV`, which
+/// `the_root_variable_is_the_one_the_cli_reads` checks. (`rocm-core` is only a
+/// dev-dependency of this crate, so the library cannot re-export it.)
 pub const TEST_HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
 
 /// Every program the CLI runs to learn about the machine. None of them is
@@ -165,10 +168,13 @@ impl SimulatedGpu {
     }
 
     /// The gfx target the CLI should derive from this GPU, e.g. `gfx942`.
+    ///
+    /// Minor and stepping are single hex digits, as in the product's
+    /// `gfx_target_from_gc_version`: KFD's `90010` is `gfx90a`, not `gfx9010`.
     #[must_use]
     pub fn gfx_target(&self) -> String {
         let v = self.gfx_target_version;
-        format!("gfx{}{}{:x}", v / 10_000, (v / 100) % 100, v % 100)
+        format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100)
     }
 
     /// The PCI address `lspci -D` prints for this GPU, e.g. `0000:11:00.0`.
@@ -194,10 +200,14 @@ pub enum Platform {
 }
 
 /// A machine to simulate.
+///
+/// Built only through the constructors below, so a machine's platform and its
+/// GPUs always agree (a WSL2 machine's Windows-side answers are those of the
+/// Strix Halo it carries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatedHost {
-    pub platform: Platform,
-    pub gpus: Vec<SimulatedGpu>,
+    platform: Platform,
+    gpus: Vec<SimulatedGpu>,
 }
 
 /// A WSL2 kernel string; the CLI recognises WSL by `microsoft-standard-WSL2`.
@@ -240,6 +250,18 @@ impl SimulatedHost {
             platform: Platform::Wsl2,
             gpus: vec![SimulatedGpu::strix_halo()],
         }
+    }
+
+    /// How the GPUs reach the distribution.
+    #[must_use]
+    pub const fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// The GPUs, in KFD node order.
+    #[must_use]
+    pub fn gpus(&self) -> &[SimulatedGpu] {
+        &self.gpus
     }
 
     /// The gfx target of the first GPU, which is what the CLI reports as the
@@ -585,10 +607,17 @@ pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
             .flatten()
             .filter_map(|entry| Some((entry.path(), kfd_properties(&entry.path())?)))
             .filter(|(_, props)| is_nonzero(property(props, "gfx_target_version")))
-            .collect()
+            .collect::<Vec<_>>()
     };
-    let real_gpus = gpu_nodes(real);
-    let simulated_gpus = gpu_nodes(simulated);
+    // `read_dir` order is the filesystem's, so sort before choosing the
+    // simulated node every real one is compared with, as the product does
+    // before it picks the first node.
+    let sorted = |mut nodes: Vec<(PathBuf, Vec<(String, String)>)>| {
+        nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+        nodes
+    };
+    let real_gpus = sorted(gpu_nodes(real));
+    let simulated_gpus = sorted(gpu_nodes(simulated));
     if real_gpus.is_empty() {
         drift.push(format!(
             "no KFD GPU node on this kernel states gfx_target_version in its properties \
@@ -763,6 +792,32 @@ mod tests {
     #[test]
     fn strix_halo_decodes_to_gfx1151() {
         assert_eq!(SimulatedGpu::strix_halo().gfx_target(), "gfx1151");
+    }
+
+    /// Minor and stepping are hex digits, as the product renders them: decimal
+    /// agrees only below ten, so an MI210's `90010` would read `gfx9010`.
+    #[test]
+    fn components_above_nine_decode_as_hex_digits() {
+        let gpu = SimulatedGpu {
+            gfx_target_version: 90_010,
+            ..SimulatedGpu::mi300x(0x11)
+        };
+        assert_eq!(gpu.gfx_target(), "gfx90a");
+        let gpu = SimulatedGpu {
+            gfx_target_version: 101_000,
+            ..SimulatedGpu::mi300x(0x11)
+        };
+        assert_eq!(gpu.gfx_target(), "gfx10a0");
+    }
+
+    /// The CLI reads the simulated root from `rocm_core`'s constant; a second
+    /// literal here would let the two drift apart with nothing to notice.
+    #[test]
+    fn the_root_variable_is_the_one_the_cli_reads() {
+        assert_eq!(
+            TEST_HOST_ROOT_ENV,
+            rocm_core::hardware_root::TEST_HOST_ROOT_ENV
+        );
     }
 
     fn planted(host: &SimulatedHost) -> tempfile::TempDir {
