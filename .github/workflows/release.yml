@@ -10,7 +10,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,18 +46,24 @@ env:
 
 jobs:
   release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build Linux release assets
     runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
           cache-key: ubuntu-24.04
+          cache: false
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -65,7 +71,7 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          VERSION="${{ github.event.inputs.tag }}"
+          VERSION="${GITHUB_EVENT_INPUTS_TAG}"
           if [ -z "${VERSION}" ]; then
             VERSION="${GITHUB_REF_NAME}"
           fi
@@ -83,20 +89,8 @@ jobs:
               ;;
           esac
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Cargo home and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/registry/src
-            ~/.cargo/rustup
-            target
-          key: Linux-manylinux-release-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            Linux-manylinux-release-
+        env:
+          GITHUB_EVENT_INPUTS_TAG: ${{ github.event.inputs.tag }}
 
       - name: Build release binaries
         run: |
@@ -134,7 +128,7 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
-            -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
+            -e ROCM_CLI_RELEASE_REF="${STEPS_VERSION_OUTPUTS_VALUE}" \
             -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
@@ -148,13 +142,16 @@ jobs:
               export PATH="/host-cargo/bin:$PATH"
               cargo build --release -p rocm -p rocmd -p xtask
             '
+        env:
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
 
       - name: Package release bundle
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
+          VERSION="${STEPS_VERSION_OUTPUTS_VALUE}"
           DIST="rocm-cli-${VERSION}-linux-amd64"
 
           chmod +x install.sh
@@ -179,8 +176,9 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          STEPS_VERSION_OUTPUTS_VALUE: ${{ steps.version.outputs.value }}
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
+          VERSION="${STEPS_VERSION_OUTPUTS_VALUE}"
           NOTES="$(cat <<EOF
           Install the latest stable release on Linux x86_64:
 
@@ -221,13 +219,20 @@ jobs:
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
   windows-release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Build and upload Windows release
     runs-on: windows-latest
     needs: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
 
       - name: Verify pinned keys match the signing key
         shell: pwsh
@@ -248,8 +253,9 @@ jobs:
         env:
           ROCM_CLI_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PRIVATE_KEY_PEM }}
           ROCM_CLI_REQUIRE_SIGNATURE: "1"
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          $version = "${{ needs.release.outputs.version }}"
+          $version = "$env:NEEDS_RELEASE_OUTPUTS_VERSION"
           $dist = "rocm-cli-$version-windows-amd64"
           cargo xtask package $dist
           Copy-Item "dist\$dist.zip" "dist\rocm-cli-windows-amd64.zip"
@@ -272,12 +278,16 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          $version = "${{ needs.release.outputs.version }}"
+          $version = "$env:NEEDS_RELEASE_OUTPUTS_VERSION"
           $assets = Get-ChildItem dist -File -Include *.zip,*.sha256,*.sig -Recurse | ForEach-Object { $_.FullName }
           gh release upload $version @assets --clobber
 
   publish-release:
+    # Creates, uploads and deletes releases; the workflow default is read-only.
+    permissions:
+      contents: write
     name: Publish release
     runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
@@ -288,7 +298,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          VERSION="${{ needs.release.outputs.version }}"
+          VERSION="${NEEDS_RELEASE_OUTPUTS_VERSION}"
           RELEASE_ID="$(gh release view "${VERSION}" --json databaseId -q .databaseId)"
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -f draft=false

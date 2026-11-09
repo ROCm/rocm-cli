@@ -110,6 +110,8 @@ jobs:
       sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Filter changed paths (pull requests only)
         id: filter
@@ -175,7 +177,7 @@ jobs:
       - name: Compute sdk_version matrix (ROCMAI-430)
         id: sdk_matrix
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/release/* ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF}" == refs/heads/release/* ]]; then
             echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
@@ -232,6 +234,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -375,17 +379,20 @@ jobs:
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
             cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
-              --release-label "${{ matrix.sdk_version }}"
+              --release-label "${MATRIX_SDK_VERSION}"
 
           # Optional scenario-name filter for a scoped dispatch — lets a manual
           # run select only the large-model scenario instead of the whole suite.
-          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          NAME_FILTER="${GITHUB_EVENT_INPUTS_NAME_FILTER}"
           if [ -n "$NAME_FILTER" ]; then
             echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
           else
             cargo xtask e2e
           fi
+        env:
+          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
       # `xtask::e2e_report`'s static contract test greps `name: e2e-*` lines
@@ -481,6 +488,8 @@ jobs:
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -551,16 +560,19 @@ jobs:
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm" \
-              --release-label "${{ matrix.sdk_version }}"
+              --release-label "${MATRIX_SDK_VERSION}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
-          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          NAME_FILTER="${GITHUB_EVENT_INPUTS_NAME_FILTER}"
           if [ -n "$NAME_FILTER" ]; then
             echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
           else
             cargo xtask e2e
           fi
+        env:
+          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps per the `sdk_version` leg, same as
       # `e2e-gpu` (ROCMAI-430); the `current` leg's name is unchanged from
@@ -634,6 +646,8 @@ jobs:
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # setup-rust-toolchain runs an internal bash script, which this Windows
       # runner lacks (bash: command not found). Bootstrap rustup with the
@@ -887,17 +901,20 @@ jobs:
           # decision lives in `xtask e2e-prewarm` rather than being reimplemented
           # here in PowerShell, so this lane and the Linux lanes cannot drift
           # (EAI-8057; the old existence-only guard never reinstalled).
-          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" --release-label "${{ matrix.sdk_version }}"
+          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" --release-label "$env:MATRIX_SDK_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Optional scenario-name filter for a scoped manual dispatch.
-          $nameFilter = "${{ github.event.inputs.name_filter }}"
+          $nameFilter = "$env:GITHUB_EVENT_INPUTS_NAME_FILTER"
           if ($nameFilter) {
             Write-Host "name filter active: $nameFilter"
             cargo xtask e2e -- --name "$nameFilter"
           } else {
             cargo xtask e2e
           }
+        env:
+          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       - name: Upload E2E report (current)
         if: always() && matrix.sdk_version == 'current'
@@ -989,6 +1006,8 @@ jobs:
       ROCM_CLI_RELEASE_REF: "${{ github.head_ref || github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # `--id Microsoft.WSL --exact`, not the fuzzy `--name` match the
       # `ubuntu/WSL` composite action's own install step uses (with its own
@@ -1456,10 +1475,10 @@ jobs:
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
             cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
-              --release-label "${{ matrix.sdk_version }}"
+              --release-label "$env:MATRIX_SDK_VERSION"
 
           # Optional scenario-name filter for a scoped manual dispatch.
-          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          NAME_FILTER="$env:GITHUB_EVENT_INPUTS_NAME_FILTER"
           if [ -n "$NAME_FILTER" ]; then
             echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
@@ -1468,6 +1487,9 @@ jobs:
           fi
           '@
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        env:
+          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # actions/upload-artifact runs on the Windows host, not inside the WSL
       # guest, so the results need copying out first. Best-effort: `if:
@@ -1573,6 +1595,8 @@ jobs:
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
@@ -1638,17 +1662,20 @@ jobs:
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
             cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
-              --release-label "${{ matrix.sdk_version }}"
+              --release-label "${MATRIX_SDK_VERSION}"
 
           # Optional scenario-name filter for a scoped manual dispatch — a cheap
           # way to exercise this lane against a single scenario without the full suite.
-          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          NAME_FILTER="${GITHUB_EVENT_INPUTS_NAME_FILTER}"
           if [ -n "$NAME_FILTER" ]; then
             echo "name filter active: $NAME_FILTER"
             cargo xtask e2e -- --name "$NAME_FILTER"
           else
             cargo xtask e2e
           fi
+        env:
+          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       - name: Upload E2E report (current)
         if: always() && matrix.sdk_version == 'current'
@@ -1702,12 +1729,15 @@ jobs:
         || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
           cache-key: ubuntu-24.04
+          cache: false
 
       # Pull every self-hosted e2e artifact matching the glob; `xtask e2e-report`
       # turns each into one labeled platform and the `*-report` glob picks up any
