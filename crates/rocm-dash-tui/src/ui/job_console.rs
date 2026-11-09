@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Job console widget (Phase 3 Wave 0).
+//! Job console widget.
 //!
 //! Renders a [`JobState`] from the reducer: a status header, the streamed
 //! output ring, and key hints. This is the shared "running job" surface every

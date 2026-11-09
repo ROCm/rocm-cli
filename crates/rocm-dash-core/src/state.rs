@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 //! Pure reducer. `State::apply(StateEvent) -> Vec<SideEffect>`.
-//! See `../wiki/concepts/tea-reducer-pattern.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

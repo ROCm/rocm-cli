@@ -2,10 +2,9 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Serve wizard overlay (Phase 3 Wave 1).
+//! Serve wizard overlay.
 //!
-//! The headline operational screen rebuilt on the Wave-0 primitives: a compact
-//! **model-first** form that builds a `rocm serve …` invocation and runs it
+//! The headline operational screen: a compact **model-first** form that builds a `rocm serve …` invocation and runs it
 //! **through the approval gate and the job-bridge** — never inline, never with
 //! a legacy `std::thread::spawn` + `try_recv`. A served model launched here
 //! surfaces in the services manager and the dashboard's live `gen_tps`.
@@ -19,7 +18,7 @@
 //! policy, the loopback host, the port, and managed mode.
 //!
 //! The model field can be typed directly (a recipe name, alias, or path) or
-//! filled from the reusable Wave-0 [`FolderBrowser`] for a local model path
+//! filled from the reusable [`FolderBrowser`] for a local model path
 //! (`Tab` on the Model field). The approval *decision* is the user's, captured
 //! by the render+event seam; the CLI owns the actual launch — the read-only
 //! chat invariant is untouched.

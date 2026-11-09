@@ -5,7 +5,7 @@
 //! Pure efficiency derivations (tokens-per-watt). No I/O, no rendering.
 //!
 //! This is the join that turns vLLM throughput + amd-smi power into a
-//! per-instance capacity number. See `../wiki/concepts/metric-registry.md`.
+//! per-instance capacity number.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;

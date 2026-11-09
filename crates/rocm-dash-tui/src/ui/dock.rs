@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Wide-layout triptych rails (Phase 6).
+//! Wide-layout triptych rails.
 //!
 //! When the terminal is wide enough, `ui::draw` splits the body into a left GPU
 //! wall, the existing center tab body, and a persistent right dock. The right
