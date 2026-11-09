@@ -158,6 +158,28 @@ Expected result:
   asking and prints a line crediting that flag by name — not `--yes`.
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
+- On a host with no usable Python (a minimal container; run with `PATH` pointing
+  at an empty folder and no `ROCM_CLI_PYTHON`) and a clean data folder,
+  `rocm install sdk ... --dry-run` still prints a plan. Its `python_launcher:`
+  line says `not prepared by this preview`, `python_source:` says `managed`,
+  and a `python_note:` line says a real install would use `uv` to install the
+  managed Python. Afterwards the data folder has no `tools` folder and the
+  config folder has no `config.json`: the preview downloaded no `uv` or Python
+  and saved no Python path. A real install on the same host does both. The
+  plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
+  interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
+  resolves `3.12` itself and may pick a different Python 3.12 than the managed
+  one a real install prepares. This holds for the canonical layout. A preview
+  pinned to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) still needs
+  `uv` to resolve the package versions, so on a clean host it can download the
+  managed `uv` and create the `tools` folder, although it prepares no Python and
+  saves no Python path.
+- With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
+  `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
+  (such as `3.13` for the canonical layout), on the same host the preview fails
+  with the install's own message. Its output before the failure states only
+  what was found (for example that the `PATH` Python is not usable) and never
+  says a real install would prepare or use a managed Python.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
@@ -373,6 +395,34 @@ unchecked and `rocm serve` prints a `warning:` line on stderr saying the index
 was not checked. The automated scenario for the refusal is `serve-16` on the
 Windows GPU lane.
 
+Omit `--port` on the default loopback host to exercise automatic selection:
+
+```powershell
+rocm serve qwen --engine lemonade --device gpu_required --managed
+```
+
+Expected result:
+
+- The command picks the first free port in `11435`-`11535` instead of failing
+  or always landing on `11435`.
+- `rocm services` shows the launched service bound to the port it picked, and
+  the deployment summary's endpoint matches it.
+
+With that service still running, try to launch a service for a different
+model pinned to the same port. (The same model and engine would be reported as
+already running instead, since an equivalent live service is reused before any
+port check.)
+
+```powershell
+rocm serve <a-different-model> --engine lemonade --device gpu_required --managed --port <the-port-above>
+```
+
+Expected result:
+
+- The command refuses up front, naming the service already holding that port
+  and how to free it (`rocm services stop <service-id> --yes`), without
+  spawning an engine process or writing a new record.
+
 ### Windows display driver check
 
 On a Windows machine with an AMD GPU, check what the CLI says about the display
@@ -417,6 +467,8 @@ After a managed or foreground serve attempt, inspect local server records:
 rocm services
 rocm services list --all
 rocm services logs <service-id>
+rocm services logs <service-id> --follow
+rocm serve <model> --wait   # waits past 45s and returns once the server answers or its engine gives up (also for a matching server still starting; an already-serving one returns at once)
 ```
 
 Expected result:
@@ -434,6 +486,21 @@ Expected result:
   block at all.
 - `rocm services list --all` shows saved history, including the failed or
   stopped attempts the default view hides.
+- `rocm services logs <service-id> --follow` prints the recent output, then new
+  output as it arrives (a download bar redraws on one terminal row), and returns
+  by itself with `Service <id> is <status>; stopped following.` once the server
+  stops (exit non-zero if it ended `failed`), with a `Service <id> is ready.`
+  line when it finishes starting; Ctrl-C ends the follow and the server keeps running.
+  On a terminal, a `Ctrl-C stops following, the server keeps running. Following <id>` line stays on the
+  row directly under the newest output (and under the download bar) as the log
+  grows; piped, stdout carries only the log text and the hint (once), ready and
+  stopped-following lines go to stderr. A server already `failed` when the follow
+  starts also exits non-zero.
+- `rocm serve <model> --wait` keeps waiting past 45 seconds and returns once the
+  server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
+  with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
+  with `the server exited before it became ready` and a `rocm logs --service`
+  pointer, and the record shows `stopped`.
 - The logs command shows the exact service failure or startup output.
 - `rocm storage report` lists these records under `local server records` with
   the folder that holds them; no `rocm storage` command deletes them, and the
@@ -1086,6 +1153,11 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+- On a home folder ROCm CLI never touched, the dry run says
+  `Nothing managed by rocm-cli would be removed.` and leaves the home folder
+  empty (scenario `uninstall-06`): run
+  `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
+  on that folder.
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no
@@ -1193,3 +1265,66 @@ Expected result:
 - Re-enabling a watcher right after disabling the last one (within the few
   seconds before the helper exits) still ends with a helper running: enable
   waits for an exiting helper to finish, then starts a new one.
+
+## 12. Context-Size Estimate for a GGUF Model
+
+Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
+by design) and network access to Hugging Face. The point is to check the
+estimate against what a real load uses: the compute buffer and runtime reserve
+were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
+so a different GPU or build can differ. How close the estimate came on them is
+recorded in the module documentation of
+[gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs), not repeated here.
+
+```bash
+rocm diagnose --model <owner>/<repo>:Q4_K_M --context-size 8192
+```
+
+Expected result:
+
+- The first lines say the header was read and the weights were not downloaded,
+  and the header read finishes in seconds.
+- The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
+  at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
+  and the total, with this GPU's dedicated VRAM and the largest context that
+  fits.
+- Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
+  about 53% and 28% of the `f16` one.
+- Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
+  (with `-fa on` and `--n-gpu-layers 99`, and `--cache-type-k`/`--cache-type-v` if changed) and compare the total in
+  the report with the GPU memory it uses once loaded (`amd-smi metric`). The
+  estimate should be at or a little above the real figure; if it is below it, or
+  far above, report the model and both figures.
+- `llama-server` at the reported largest context should load. The one check of
+  this kind made so far was on a single MI300X, with a second process holding
+  most of the card's memory so that about 15.1-15.5 GiB could still be allocated
+  (the process's `amd-smi` baselines were 181092 and 180738 MiB used of 196592),
+  for a Llama-3.1-8B Q4_K_M with an f16 cache. The card was described to
+  `rocm diagnose` as one with 15854 MiB, for which the estimate was 79872 tokens
+  (77056 tokens for 15500 MiB). `llama-server` loaded at 80896, 83968, 84992 and
+  86016 tokens (used memory grew by 15449, 15837, 15788 and 15767 MiB) and failed
+  to allocate at 87040, 90112 and 93184, so the real limit was between 86016 and
+  87040 tokens and the estimate was about 7-8% under it (79872 is 7.1% under
+  86016 and 8.2% under 87040). The load at 86016 tokens is the calibration load
+  "made with the card almost full" in
+  [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs)'s module documentation,
+  which says how the estimate compared with it. The baseline moved
+  by 354 MiB between runs, so those used-memory figures are good to a few
+  hundred MiB at best. That is one model on one card, not a bound; a different
+  model, GPU or build can land elsewhere. At a size well above what loads, the
+  report should say `does not fit` and list what would make it fit.
+- `rocm serve` is unchanged: it takes no context-size option, and the report
+  names llama.cpp's options only as llama.cpp's.
+
+Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
+`--context-size`, says a quantization is needed; a repository that does not
+exist says it was not found; a `.gguf` path that does not exist says it could
+not be opened and does not point at the upstream tracker; and naming a vision
+model's `mmproj-*.gguf` file on Hugging Face (`owner/repo:mmproj-....gguf`) says
+it is a multimodal projector, not a model, names the model file instead, and
+does not suggest `rocm serve` for the projector. None downloads
+anything.
+
+Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
+8192` prints the report with no model section, and stderr says that `--model,
+--context-size were ignored` and nothing about the model was fetched.
