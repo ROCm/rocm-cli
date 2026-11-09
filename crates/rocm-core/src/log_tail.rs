@@ -30,9 +30,10 @@ pub const LOG_VIEW_MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LogDecode {
     /// Decode the log as UTF-16 little-endian when it carries a byte order
-    /// mark, or (without one) when at least a quarter of the odd-numbered
-    /// bytes in its first 512 bytes are zero (mostly-ASCII UTF-16 text), as a
-    /// Windows shell redirect writes it. Otherwise the log is UTF-8.
+    /// mark, or (without one) when at least half of the odd-numbered bytes in
+    /// its first 512 bytes are zero (mostly-ASCII UTF-16 text, which has a zero
+    /// high byte for each character), as a Windows shell redirect writes it.
+    /// Otherwise the log is UTF-8.
     pub utf16_le: bool,
     /// Remove ANSI CSI escape sequences (colour and cursor codes) from each
     /// returned line.
@@ -408,7 +409,9 @@ fn sniff_utf16_le<R: Read + Seek>(source: &mut R, size: u64, path: &Path) -> Res
     if head.starts_with(&[0xff, 0xfe]) {
         return Ok(Some(true));
     }
-    // Mostly-ASCII UTF-16 has a zero in every other byte.
+    // Mostly-ASCII UTF-16 has a zero in every other byte. At least a quarter
+    // of the sampled bytes being zeros at odd positions is at least half of the
+    // odd positions: the rule the ComfyUI reader this replaced used.
     if size >= 8 {
         let zero_odd_bytes = head
             .iter()
@@ -893,6 +896,34 @@ mod tests {
             ["line-15", "line-16", "line-17", "line-18", "line-19"]
         );
         assert_eq!(tail.skipped_bytes, 120);
+        Ok(())
+    }
+
+    /// `len` bytes of `a` with a zero at the first `zeros` odd positions.
+    fn bytes_with_zero_odd_bytes(len: usize, zeros: usize) -> Vec<u8> {
+        let mut bytes = vec![b'a'; len];
+        for index in (1..len).step_by(2).take(zeros) {
+            bytes[index] = 0;
+        }
+        bytes
+    }
+
+    fn sniff(bytes: Vec<u8>) -> Result<Option<bool>> {
+        let size = bytes.len() as u64;
+        sniff_utf16_le(&mut std::io::Cursor::new(bytes), size, Path::new("sniff"))
+    }
+
+    #[test]
+    fn a_log_without_a_byte_order_mark_is_sixteen_bit_from_half_its_odd_bytes_being_zero()
+    -> Result<()> {
+        // 16 bytes have 8 odd positions: 4 zeros (half) is the threshold.
+        assert_eq!(sniff(bytes_with_zero_odd_bytes(16, 4))?, Some(false));
+        assert_eq!(sniff(bytes_with_zero_odd_bytes(16, 3))?, None);
+        // Only the first 512 bytes count: 256 odd positions, 128 zeros...
+        assert_eq!(sniff(bytes_with_zero_odd_bytes(600, 128))?, Some(false));
+        assert_eq!(sniff(bytes_with_zero_odd_bytes(600, 127))?, None);
+        // ...and a source under 8 bytes is never taken for UTF-16.
+        assert_eq!(sniff(bytes_with_zero_odd_bytes(6, 3))?, None);
         Ok(())
     }
 
