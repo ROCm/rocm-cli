@@ -51,8 +51,8 @@
 //! Replacing a file this way must not quietly change what the user set up:
 //!
 //! - on Unix the new file keeps the old one's permission bits, applied to the
-//!   temp file before any byte is written into it (on Windows, `ReplaceFileW`
-//!   keeps the replaced file's attributes and ACL itself);
+//!   temp file before any byte is written into it (on Windows nothing is
+//!   copied; see the note on attributes above);
 //! - a destination that is a symbolic link — a dotfiles checkout linking
 //!   `config.json`, say — has its *target* replaced through
 //!   [`write_file_atomically`], so the link survives. A link loop is an error.
