@@ -13,7 +13,8 @@ use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
+    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
+    serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -136,11 +137,15 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 /// rather than three calls at each site: the log must be read and copied out
 /// while the service still owns it, because stopping the service both changes
 /// what the log's last lines say and is the step most likely to fail outright.
+/// For Lemonade the backend inventory is read before the stop too, and the
+/// `llama-server` probes, which execute a backend binary, run only after it so
+/// they cannot contend with the still-running router.
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-fn serve_failure_evidence(
-    world: &E2eWorld,
+async fn serve_failure_evidence(
+    world: &mut E2eWorld,
+    engine: Option<&str>,
     headline: &str,
     device_state: &str,
     stdout: &str,
@@ -155,7 +160,24 @@ fn serve_failure_evidence(
         &crate::results_path(),
         world.current_scenario.as_deref().unwrap_or("scenario"),
     );
-    let stop_status = stop_scenario_services(world);
+    // The stop sits inside this call because its position relative to the
+    // backend probes is the point: see `backend_evidence_around_stop`.
+    let app_paths = world.isolated_root.is_some().then(|| world.app_paths());
+    let isolated_root = world
+        .isolated_root
+        .as_ref()
+        .map(|root| root.path().to_owned());
+    let (stop_status, backend_evidence) =
+        e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
+            move || {
+                app_paths
+                    .map(|paths| paths.engine_install_manifest_path("lemonade"))
+                    .ok_or_else(|| "the scenario has no isolated root".to_owned())
+            },
+            engine,
+            move || stop_services_in(isolated_root.as_deref()),
+        )
+        .await;
     serve_attempt_report(&ServeAttempt {
         headline,
         device_state,
@@ -164,6 +186,7 @@ fn serve_failure_evidence(
         log_tail: &log_tail,
         archived_log: &archived_log,
         stop_status: &stop_status,
+        backend_evidence: backend_evidence.as_deref(),
     })
 }
 
@@ -202,7 +225,15 @@ async fn serve_and_wait(
     };
     panic!(
         "{}",
-        serve_failure_evidence(world, &headline, &device_state, &stdout, &stderr)
+        serve_failure_evidence(
+            world,
+            engine_from_serve_args(args).or_else(|| reported_engine(&stdout)),
+            &headline,
+            &device_state,
+            &stdout,
+            &stderr,
+        )
+        .await
     );
 }
 
@@ -543,9 +574,16 @@ fn default_engine_serve_target() -> &'static str {
 /// attempt shares the device with this one, and that must be visible in the
 /// failure rather than inferred from a serve that looks broken.
 fn stop_scenario_services(world: &E2eWorld) -> String {
-    world.isolated_root.as_ref().map_or_else(
+    stop_services_in(world.isolated_root.as_ref().map(tempfile::TempDir::path))
+}
+
+/// [`stop_scenario_services`] on the scenario's isolated root rather than the
+/// world, so a caller that must hand the stop to a `Send` closure (the world holds
+/// PTY handles and is not `Sync`) can capture the path alone.
+fn stop_services_in(isolated_root: Option<&std::path::Path>) -> String {
+    isolated_root.map_or_else(
         || "not attempted: scenario has no isolated root".to_owned(),
-        |root| crate::stop_managed_services(root.path()),
+        crate::stop_managed_services,
     )
 }
 
@@ -658,13 +696,17 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         // outcome is quoted: a stop that found no record (the launch had not yet
         // written one) or failed means the next attempt did NOT get a clean
         // device, and the failure says so instead of looking like a broken serve.
-        diagnostics.push(serve_failure_evidence(
-            world,
-            &format!("attempt {attempt} of {attempts} (rc={rc})"),
-            &device_state,
-            &stdout,
-            &stderr,
-        ));
+        diagnostics.push(
+            serve_failure_evidence(
+                world,
+                Some(engine),
+                &format!("attempt {attempt} of {attempts} (rc={rc})"),
+                &device_state,
+                &stdout,
+                &stderr,
+            )
+            .await,
+        );
         if attempt == attempts {
             break;
         }
@@ -1041,15 +1083,19 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
             &ready_substr,
             timeout_secs,
         );
+        let stdout = world.cli_output.clone().unwrap_or_default();
+        let stderr = world.cli_stderr.clone().unwrap_or_default();
         panic!(
             "{}",
             serve_failure_evidence(
                 world,
+                reported_engine(&stdout),
                 &headline,
                 &device_state,
-                world.cli_output.as_deref().unwrap_or_default(),
-                world.cli_stderr.as_deref().unwrap_or_default(),
+                &stdout,
+                &stderr,
             )
+            .await
         );
     }
 }
@@ -2652,11 +2698,7 @@ async fn assert_next_automatic_port(world: &mut E2eWorld) {
 
 /// Extract the engine name from a serve plan's `engine: <name>` line.
 fn selected_engine(output: &str) -> &str {
-    let Some(engine) = output
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("engine:"))
-        .map(str::trim)
-    else {
+    let Some(engine) = reported_engine(output) else {
         panic!("no 'engine:' line in serve output:\n{output}");
     };
     engine
