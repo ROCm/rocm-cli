@@ -191,6 +191,67 @@ test fails on a path that no longer exists rather than dropping it from the
 guard. When the planner needs something that lives in `chat.rs`, move it into
 a leaf module and import it from there.
 
+### Dash-TUI text fields go through `apply_char_key`
+
+A dash-TUI form edits its `String` through `apply_char_key` /
+`apply_char_key_filtered` in
+[`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs), not through its
+own "`Char` appends, `Backspace` pops one char" code. As with the other module
+rules above, a test enforces it rather than an `xtask` subcommand:
+`the_dash_tui_has_no_hand_rolled_text_edit_outside_the_helper` in `xtask`
+([`dash_text_edit_contract.rs`](../xtask/src/dash_text_edit_contract.rs)) scans
+the non-test code of every file under `crates/rocm-dash-tui/src/` and fails,
+naming each hit as `file:line` with a pointer to the helper. Run it on its own
+with:
+
+```bash
+cargo test -p xtask dash_text_edit_contract
+```
+
+It is per file, not per `match` arm, because the copies the helper replaced were
+not all arms (one had its `push` in a `type_char` method the arm called). In a
+file other than `ui/widgets.rs` it reports a no-argument `.pop()` when the file
+names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)` and
+`.push(x.method())`) when `x` is a name the file binds as a key character
+(`KeyCode::Char(x)`, `KeyCode::Char(mut x)`) or declares as `x: char`, in a file
+that names `KeyCode::Char(`. A `#[cfg(test)] mod name { .. }` block is skipped,
+so a unit test may drive a buffer by hand; a `#[cfg(test)]` on anything else
+skips nothing, and an out-of-line test module (`#[cfg(test)] mod name;`) is a
+file of its own, scanned in full.
+
+What it does not see: it matches the shape, not the type, so a `let top =
+stack.pop()` in a file that handles `Backspace` is a false alarm, and an
+unrelated `out.push(c)` is reported when the same file binds `KeyCode::Char(c)`
+elsewhere. Only `#[cfg(test)]` exactly is read as a test gate (a
+`#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
+`use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
+from one file to a method in another is not followed. Only `.pop()` and
+`.push(x)` are matched: `push_str`, `truncate`,
+`clear`, `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned,
+partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
+[`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
+the append-only helper and is a different thing. A `Backspace` arm that never
+pops, such as the folder browser's "go to the parent directory", is not a text
+edit and is not reported.
+
+The one file with its own `push` and `pop` is the Chat input in
+[`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs), whose keys are
+mapped to a `KeyAction` by a separately tested table. It is listed in `ALLOWED`
+in the test with its reason and the number of offenses it is expected to carry
+(its one push and its one pop). The test fails when the file carries a different
+number, so a further hand-rolled field added there is caught, as is an entry that
+stops being needed, or whose file moves. A new field reuses the helper; a new
+exception is a reviewed entry in that list.
+
+Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
+for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
+every pull request that changes Rust, and the merge queue and post-merge runs
+test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
+selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
+a file it reads, so a pull request that touches nothing but
+`crates/rocm-dash-tui` does not run this test on Linux. The module-import
+contract above has the same property.
+
 ### Tests that run a fake executable
 
 Plant a stand-in `python`, `uv`, `amd-smi`, ... with
