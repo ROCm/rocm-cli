@@ -37,6 +37,8 @@ use host_env::{
     probe_container, probe_cpu_linux, probe_cpu_windows, probe_dmesg_amdgpu, probe_env, probe_os,
     probe_shared_memory,
 };
+#[cfg(test)]
+pub(crate) use host_env::{probe_cpu_linux_from, probe_cpu_windows_with};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};

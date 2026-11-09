@@ -37,9 +37,10 @@ use crate::{
     host_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
 };
 use anyhow::Result;
+pub(crate) use os_facts::detect_cpu_model;
 pub(crate) use os_facts::detect_distro_name;
+use os_facts::detect_kernel_version;
 pub use os_facts::detect_system_ram_gib;
-use os_facts::{detect_cpu_model, detect_kernel_version};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -269,13 +270,24 @@ impl ExamineSummary {
 fn detect_cpu_model_with_windows_inventory(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
-    if runtime_is_windows()
-        && let Some(inventory) = windows_inventory
-    {
-        return inventory.cpu_model.clone();
+    if runtime_is_windows() {
+        return windows_cpu_model(windows_inventory, detect_cpu_model);
     }
 
     detect_cpu_model()
+}
+
+/// The summary's CPU on Windows: the inventory's CPU row whenever there is an
+/// inventory, even one with no such row, and `fallback` (the summary's own CPU
+/// query) only when there is no inventory at all.
+fn windows_cpu_model(
+    windows_inventory: Option<&WindowsExamineInventory>,
+    fallback: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match windows_inventory {
+        Some(inventory) => inventory.cpu_model.clone(),
+        None => fallback(),
+    }
 }
 
 fn detect_system_ram_gib_with_windows_inventory(

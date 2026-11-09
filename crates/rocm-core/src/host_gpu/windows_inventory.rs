@@ -5,10 +5,10 @@
 //! The Windows display-adapter inventory: the PowerShell queries, the parsers for
 //! their output, and the assembly of one inventory from several sources.
 
+#[cfg(any(windows, test))]
+use super::capture::OPTIONAL_COMMAND_TIMEOUT;
 #[cfg(windows)]
-use super::capture::{
-    OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
-};
+use super::capture::{capture_optional_command, capture_optional_command_with_timeout};
 use super::os_facts::{bytes_text_to_gib, normalize_cpu_model};
 use crate::gfx_target::{
     amd_pci_device_id_from_pnp_id, gfx_target_from_amd_marketing_name,
@@ -20,12 +20,17 @@ use std::time::Duration;
 
 pub(super) const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What the system query (CPU model and RAM) is allowed: the 1.5 s of an
+/// optional command, not the 5 s the display queries get.
+#[cfg(any(windows, test))]
+const WINDOWS_SYSTEM_INVENTORY_TIMEOUT: Duration = OPTIONAL_COMMAND_TIMEOUT;
+
 pub(super) const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
 
 #[cfg(windows)]
 pub(super) const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
 
 #[cfg(windows)]
@@ -507,16 +512,32 @@ fn detect_windows_system_inventory_from_cim() -> Option<WindowsExamineInventory>
     if !runtime_is_windows() {
         return None;
     }
-    capture_optional_command_with_timeout(
-        "powershell",
-        &[
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            WINDOWS_SYSTEM_INVENTORY_SCRIPT,
-        ],
-        OPTIONAL_COMMAND_TIMEOUT,
+    windows_system_inventory_with(|script, timeout| {
+        capture_optional_command_with_timeout(
+            "powershell",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            timeout,
+        )
+    })
+}
+
+/// The system inventory (CPU model and installed RAM) from one query, with the
+/// query injected so a test on any host can drive it. `query` is handed the
+/// script and the timeout the inventory allows it, and answers with what the
+/// script printed, or `None` when it could not run, failed or timed out.
+#[cfg(any(windows, test))]
+pub(super) fn windows_system_inventory_with(
+    query: impl FnOnce(&str, Duration) -> Option<String>,
+) -> Option<WindowsExamineInventory> {
+    query(
+        WINDOWS_SYSTEM_INVENTORY_SCRIPT,
+        WINDOWS_SYSTEM_INVENTORY_TIMEOUT,
     )
     .map(|output| parse_windows_examine_inventory(&output))
 }

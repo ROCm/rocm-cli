@@ -115,7 +115,12 @@ pub(super) fn parse_iommu_param(cmdline: &str) -> Option<String> {
 }
 
 pub(super) fn probe_cpu_linux(e: &mut Examination) {
-    let txt = read_host_text("/proc/cpuinfo");
+    probe_cpu_linux_from(e, &read_host_text("/proc/cpuinfo"));
+}
+
+/// [`probe_cpu_linux`] over cpuinfo text already read, so a test can drive it
+/// without a host root.
+pub(crate) fn probe_cpu_linux_from(e: &mut Examination, txt: &str) {
     for line in txt.lines() {
         if (e.cpu_vendor == "unknown")
             && line.starts_with("vendor_id")
@@ -143,15 +148,27 @@ pub(super) fn probe_cpu_linux(e: &mut Examination) {
 }
 
 pub(super) fn probe_cpu_windows(e: &mut Examination) {
-    let (rc, out, _) = run(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
-        ],
-        MEDIUM,
-    );
+    probe_cpu_windows_with(e, |timeout| {
+        run(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
+            ],
+            timeout,
+        )
+    });
+}
+
+/// [`probe_cpu_windows`] with the query injected, so a test on any host can
+/// drive it. `query` is handed the timeout the examination allows it and
+/// answers as [`run`] does: `(rc, stdout, stderr)`.
+pub(crate) fn probe_cpu_windows_with(
+    e: &mut Examination,
+    query: impl FnOnce(std::time::Duration) -> (i32, String, String),
+) {
+    let (rc, out, _) = query(MEDIUM);
     if rc == 0 && !out.trim().is_empty() {
         e.cpu_model = out
             .trim()
@@ -617,5 +634,85 @@ mod tests {
             ("fallback", "1.2")
         );
         assert_eq!(name.as_deref(), Some("Fallback 1.2"));
+    }
+
+    /// Plant `files` (path under the root, body) in a fresh directory and run
+    /// `read` with it as the simulated host root.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    fn with_planted_host_root<T>(files: &[(&str, &str)], read: impl FnOnce() -> T) -> T {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-cpu-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        for (relative, body) in files {
+            let path = root.join(relative.trim_start_matches('/'));
+            std::fs::create_dir_all(path.parent().expect("planted path has a parent"))
+                .expect("create planted directory");
+            std::fs::write(path, body).expect("write planted file");
+        }
+        let result = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            read()
+        };
+        std::fs::remove_dir_all(&root).ok();
+        result
+    }
+
+    /// CPU-model pair of docs/host-probing.md, native Linux. Both reads take
+    /// `/proc/cpuinfo` from the simulated host root, so a planted CPU no runner
+    /// has is what each reports. They differ on the whitespace in it, which the
+    /// summary collapses and the examination keeps.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn cpu_reads_follow_the_simulated_host_root() {
+        let (summary, examined) = with_planted_host_root(
+            &[(
+                "proc/cpuinfo",
+                "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Planted  CPU 9000   Processor\n",
+            )],
+            || {
+                let mut examined = Examination::default();
+                probe_cpu_linux(&mut examined);
+                (crate::host_gpu::detect_cpu_model(), examined)
+            },
+        );
+        assert_eq!(summary.as_deref(), Some("Planted CPU 9000 Processor"));
+        assert_eq!(examined.cpu_model, "Planted  CPU 9000   Processor");
+        assert_eq!(examined.cpu_vendor, "amd");
+    }
+
+    /// CPU-model pair, WSL: the summary reads the CPU and the examination does
+    /// not. `probe_with_interpreter` returns from its WSL branch before
+    /// `probe_cpu_linux`, so on every WSL host `cpu_model` is empty and
+    /// `cpu_vendor` is `unknown` while the summary shows the CPU. Pinned as an
+    /// existing difference of the CPU-model pair, which leaves it as it is.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn on_wsl_the_summary_reads_the_cpu_and_the_examination_does_not() {
+        let (summary, examined) = with_planted_host_root(
+            &[
+                ("dev/dxg", ""),
+                (
+                    "proc/cpuinfo",
+                    "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: Planted WSL CPU\n",
+                ),
+            ],
+            || {
+                (
+                    crate::host_gpu::detect_cpu_model(),
+                    Examination::probe(crate::examine::FrameworkProbe::Skip),
+                )
+            },
+        );
+        assert!(examined.is_wsl, "the planted /dev/dxg reads as WSL");
+        assert_eq!(summary.as_deref(), Some("Planted WSL CPU"));
+        assert_eq!(examined.cpu_model, "");
+        assert_eq!(examined.cpu_vendor, "unknown");
     }
 }
