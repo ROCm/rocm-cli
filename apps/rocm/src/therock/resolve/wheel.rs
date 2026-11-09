@@ -3381,6 +3381,16 @@ sdk install
             "{hint}"
         );
         assert!(!hint.contains("10.1.2"), "{hint}");
+        // A pinned request re-runs its own command with a different
+        // `--version`, so it is told to re-run, not handed a whole install
+        // command. The unpinned `rocm update --apply` case below gets the full
+        // command instead.
+        assert!(
+            hint.contains("Re-run with one of them, for example `--version 10.1.0"),
+            "{hint}"
+        );
+        assert!(!hint.contains("Install one of them"), "{hint}");
+        assert!(!hint.contains("rocm install sdk"), "{hint}");
 
         // An exact pin that is published but failed is not suggested again.
         let hint = next_layout_unsatisfied_hint(
@@ -3434,6 +3444,11 @@ sdk install
             hint.contains("`rocm install sdk --channel release --version 10.0.0 --family gfx1200`"),
             "{hint}"
         );
+        assert!(
+            hint.contains("Install one of them, for example `rocm install sdk"),
+            "{hint}"
+        );
+        assert!(!hint.contains("Re-run with one of them"), "{hint}");
         assert!(!hint.contains("--version 10.1.0"), "{hint}");
         assert!(!hint.contains("nightly"), "{hint}");
 
