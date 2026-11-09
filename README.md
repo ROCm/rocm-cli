@@ -537,16 +537,18 @@ active default runtime, not about what a named prefix loses.
 
 ROCm CLI picks the Python from the ROCm version it installs, not from a
 default you can change. ROCm 7.14 installs use Python 3.12. ROCm 10 and newer
-use Python 3.14, because ROCm CLI's ROCm 10 package stack (including vLLM,
-flash-attn and amd-aiter) is published for that one CPython version. A
-Python that doesn't match is refused rather than used, so
-`ROCM_CLI_PYTHON` (an interpreter of your own) and
-`ROCM_CLI_MANAGED_PYTHON_VERSION` (the version ROCm CLI prepares itself)
-can't make a ROCm 10 install run on Python 3.12.
+use Python 3.14. The ROCm 10 SDK and torch wheels are also published for older
+Pythons, but vLLM, flash-attn and amd-aiter for ROCm 10 are published for
+Python 3.14 only, so ROCm CLI requires 3.14 for every ROCm 10 install. A
+Python that doesn't match is refused rather than used, so `ROCM_CLI_PYTHON`
+(an interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the
+version ROCm CLI prepares itself) can't make a ROCm 10 install run on Python
+3.12.
 
-If you see Python 3.14, the install resolved to ROCm 10 or newer. The install
-prints which Python it chose, and `--dry-run` shows it without changing
-anything.
+If you see Python 3.14, the install resolved to ROCm 10 or newer. That
+happens with `--version 10.x.y`, and also when the channel's newest build is
+ROCm 10, as the nightly channel's is today. The install prints which Python it
+chose, and `--dry-run` shows it without changing anything.
 
 #### ROCm 10 and newer
 
