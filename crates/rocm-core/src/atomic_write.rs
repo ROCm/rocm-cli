@@ -701,6 +701,7 @@ mod tests {
         write_file_atomically(&destination, b"0").unwrap();
 
         let done = Arc::new(AtomicBool::new(false));
+        let (first_read, reader_started) = std::sync::mpsc::channel::<()>();
         let reader = {
             let destination = destination.clone();
             let done = Arc::clone(&done);
@@ -708,7 +709,12 @@ mod tests {
                 let mut reads = 0u32;
                 while !done.load(Ordering::Relaxed) {
                     match fs::read(&destination) {
-                        Ok(_) => reads += 1,
+                        Ok(_) => {
+                            reads += 1;
+                            if reads == 1 {
+                                let _ = first_read.send(());
+                            }
+                        }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
                             return Err(error);
                         }
@@ -718,14 +724,24 @@ mod tests {
                 Ok(reads)
             })
         };
-        for round in 1..=300u32 {
-            write_file_atomically(&destination, round.to_string().as_bytes()).unwrap();
+        // Start writing only once the reader is polling, so a late-scheduled
+        // reader cannot miss every replacement and fail on timing alone. A
+        // reader that exits before its first read (the destination was absent)
+        // disconnects the channel; that is reported from its outcome below.
+        let started = reader_started.recv_timeout(std::time::Duration::from_secs(30));
+        if started.is_ok() {
+            for round in 1..=300u32 {
+                write_file_atomically(&destination, round.to_string().as_bytes()).unwrap();
+            }
         }
         done.store(true, Ordering::Relaxed);
         let outcome = reader.join().unwrap();
         let _ = fs::remove_dir_all(&root);
         let reads = outcome.expect("the destination was absent while it was being replaced");
-        assert!(reads > 0, "the reader never read the destination at all");
+        assert!(
+            started.is_ok() && reads > 0,
+            "the reader never read the destination at all: {started:?}"
+        );
     }
 
     #[test]
