@@ -90,11 +90,11 @@ unverified.
 ### Doing it by hand
 
 The equivalent manual steps, for reference or for a host where the CLI is not
-installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
-the package's maintainer scripts as root, and run it on the root-owned copy
-rather than on a file in `/tmp` that another user could swap after it is
-checked. `rocm install driver` checks the
-download against a digest pinned in the ROCm CLI source
+installed yet. Do not skip the `sha256sum -c` check, because `apt install`
+runs the package's maintainer scripts as root, and run it on the root-owned
+copy rather than on a file in `/tmp` that another user could swap after it is
+checked. The install line runs only if that check passes. `rocm install driver`
+checks the root-owned copy against a digest pinned in the ROCm CLI source
 (`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_plan/rocdxg.rs`), which also
 catches a replaced release asset. A digest read from the release page at
 install time catches only a corrupted download. For a version listed in
@@ -114,10 +114,10 @@ curl -L --fail -o "$d/${ROCDXG_DEB}" \
   "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/${ROCDXG_DEB}"
 sudo install -m 0644 "$d/${ROCDXG_DEB}" "${ROCDXG_STAGED}"
 rm -rf "$d"
-printf '%s  %s\n' "${ROCDXG_SHA256}" "${ROCDXG_STAGED}" | sha256sum -c -
-sudo apt install -y "${ROCDXG_STAGED}"
-sudo rm -f "${ROCDXG_STAGED}"
-sudo ldconfig
+printf '%s  %s\n' "${ROCDXG_SHA256}" "${ROCDXG_STAGED}" | sha256sum -c - &&
+  sudo apt install -y "${ROCDXG_STAGED}" &&
+  sudo rm -f "${ROCDXG_STAGED}" &&
+  sudo ldconfig
 ```
 
 Source-build alternative. Set `win_sdk` to the Windows SDK version installed on

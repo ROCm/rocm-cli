@@ -351,7 +351,9 @@ pub(crate) fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverI
             ),
             // Re-asserted on every run rather than trusted from a previous
             // one: `install -d` also resets the owner and mode of a directory
-            // that already exists.
+            // that already exists. So `/var/cache/rocm-cli` is reserved for
+            // root-owned driver staging: anything else placed there loses its
+            // owner and mode the next time this plan runs.
             driver_command(
                 DriverCommandPhase::Execute,
                 &format!(
@@ -574,6 +576,12 @@ mod tests {
         assert!(check < install, "digest must be checked before install");
     }
 
+    /// System directories whose standard permissions let only root create
+    /// entries in them. Spelled out here rather than derived from
+    /// `ROCDXG_STAGING_PARENT`, so moving the staging directory somewhere
+    /// world-writable fails the tests instead of moving the expectation too.
+    const ROOT_ONLY_STAGING_ROOTS: &[&str] = &["/var/cache/"];
+
     /// The single-quoted path `apt-get install -y` is handed in a ROCDXG plan.
     fn rocdxg_installed_path(commands: &[String]) -> String {
         let install = commands
@@ -608,6 +616,18 @@ mod tests {
             );
 
             let installed = rocdxg_installed_path(&commands);
+            // Ruling out `/tmp` is not enough: `/dev/shm` and `/var/tmp` are
+            // world-writable too, and another user can pre-create a symlink
+            // there. The path must sit under a system directory only root can
+            // write, with no `..` to climb back out of it.
+            assert!(
+                ROOT_ONLY_STAGING_ROOTS
+                    .iter()
+                    .any(|root| installed.starts_with(root))
+                    && !installed.contains("/../"),
+                "{escalation:?}: {installed} is not under a root-only system directory \
+                 ({ROOT_ONLY_STAGING_ROOTS:?})"
+            );
             let staging_dir = Path::new(&installed)
                 .parent()
                 .expect("installed path has a directory")
@@ -655,6 +675,23 @@ mod tests {
             assert!(
                 make_dir < stage && stage < check && check < install,
                 "{escalation:?}: steps out of order:\n{joined}"
+            );
+            // The installed file is root-owned, so removing it needs the same
+            // escalation as the install; without it the `rm` fails as the
+            // invoking user and the plan stops before `ldconfig`.
+            let remove = commands
+                .iter()
+                .position(|c| *c == format!("{sudo}rm -f '{installed}'"))
+                .unwrap_or_else(|| {
+                    panic!("{escalation:?}: no `{sudo}rm -f '{installed}'` step:\n{joined}")
+                });
+            let ldconfig = commands
+                .iter()
+                .position(|c| *c == format!("{sudo}ldconfig"))
+                .expect("plan runs ldconfig");
+            assert!(
+                install < remove && remove < ldconfig,
+                "{escalation:?}: the staged package is not removed between install and ldconfig:\n{joined}"
             );
         }
 

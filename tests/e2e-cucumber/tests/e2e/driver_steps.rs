@@ -219,6 +219,12 @@ async fn assert_driver_plan_stages_privately(world: &mut E2eWorld) {
         .split('\'')
         .nth(1)
         .expect("installed path is single-quoted");
+    // Ruling out `/tmp` is not enough: `/dev/shm` and `/var/tmp` are
+    // world-writable too. Only root can create entries under `/var/cache`.
+    assert!(
+        installed.starts_with("/var/cache/") && !installed.contains("/../"),
+        "the package is not staged under a root-only system directory: {installed}\n{output}"
+    );
     let staging_dir = installed
         .rsplit_once('/')
         .map(|(dir, _)| dir)
