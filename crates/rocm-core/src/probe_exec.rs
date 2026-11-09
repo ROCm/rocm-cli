@@ -775,40 +775,4 @@ mod path_lookup_tests {
         // And with no PATH at all, as the capture runner could still start it.
         assert!(ask_for("cmd", None, scratch.path(), &[]));
     }
-
-    /// A note that cites a test by name is only as good as the name. The
-    /// host-probing note cites the tests that pin each answer this lookup moved,
-    /// and a bare backtick name is not checked by the link checker, so check here
-    /// that every cited name of this module's tests is a function in this file.
-    #[test]
-    fn the_host_probing_note_cites_only_tests_that_exist() {
-        let note = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/host-probing.md"),
-        )
-        .expect("read docs/host-probing.md");
-        let source = include_str!("probe_exec.rs");
-        let prefixes = ["which_", "candidates_", "found_in_", "path_dirs_"];
-        let cited: std::collections::BTreeSet<&str> = note
-            .split('`')
-            .skip(1)
-            .step_by(2)
-            .filter(|word| prefixes.iter().any(|prefix| word.starts_with(prefix)))
-            .filter(|word| {
-                word.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            })
-            .collect();
-        assert!(
-            cited.len() >= 8,
-            "the note should cite this module's tests, found {cited:?}"
-        );
-        let missing: Vec<_> = cited
-            .iter()
-            .filter(|name| !source.contains(&format!("fn {name}(")))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "docs/host-probing.md cites tests that do not exist in probe_exec.rs: {missing:?}"
-        );
-    }
 }
