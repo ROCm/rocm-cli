@@ -156,6 +156,9 @@ jobs:
           rm -rf runtimes/locks
           cp -r "$RUNNER_TEMP/update/locks" runtimes/locks
           cargo xtask deps check
+          # The pull request body must be the table this commit's own code
+          # computes from these files, not whatever `propose` wrote.
+          cargo xtask deps diff --base HEAD | cmp - "$RUNNER_TEMP/update/summary.md"
 
   open-pr:
     name: Open or update the pull request

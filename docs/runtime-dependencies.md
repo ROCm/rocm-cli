@@ -133,7 +133,8 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
   by an edit to any of them is caught offline, even where it still happens to
   satisfy the requirements;
 - that header records the `exclude-newer` cutoff the lock was resolved at,
-  which is what lets a re-lock reproduce it;
+  which is what lets a re-lock reproduce it (AMD-only packages aside, see
+  *Cooldown*);
 - every requirement in its profile is locked at a version that satisfies it;
 - every artifact is an `https` URL with a SHA-256, served by PyPI
   (`files.pythonhosted.org`) or a `vendor-hosts` index, so a download the
@@ -191,8 +192,12 @@ an `--exclude-newer` cutoff and records it in its header
 (`# exclude-newer: <time>`). `update` runs `deps lock --upgrade
 --cooldown-days 7`, which sets a new cutoff 7 days before now; `lock` resolves
 each lock again at the cutoff it records, so it reproduces the lock unless an
-input changed, and a lock that does not exist yet gets a cutoff 7 days before
-now. The previous lock is not handed to uv as version preferences: with these
+input changed or AMD published a new build of an AMD-only package (those are
+exempt from the cutoff, below, and several are pinned as ranges such as
+`torch==2.13.*`), and a lock that does not exist yet gets a cutoff 7 days
+before now. A resolution that differs from the committed lock only in its
+cutoff keeps the committed file unchanged, so a weekly update with nothing
+new proposes nothing. The previous lock is not handed to uv as version preferences: with these
 indexes that does not converge, as successive runs alternate between AMD's
 mirrored version of a package and PyPI's. AMD's indexes publish no
 upload times and uv treats an undated file as too new, so the AMD-only
@@ -211,7 +216,8 @@ or refreshes one pull request on `runtime-deps/update` with a table from
 `deps diff`. Resolving runs upstream code (uv builds the `rocm` sdist for its
 metadata), so that job holds a read-only token. A second read-only job runs
 the base commit's validator and `cargo xtask deps check` against the
-artifact; only then does a third, holding the write token, validate it again
+artifact, and recomputes the pull request's table with `deps diff`, refusing
+an artifact whose summary differs; only then does a third, holding the write token, validate it again
 and commit through `createCommitOnBranch`, which GitHub signs, as the
 `commit-signatures` gate requires. A pull request opened with
 `GITHUB_TOKEN` does not trigger CI: close and reopen it to run the checks.
@@ -238,8 +244,7 @@ Renovate reads `mise.toml` but needs an organisation-level app install.
 
 ## Bootstrapping a profile's first lock
 
-A new profile — and this change's first three — has no committed lock until
-one is generated, and `cargo test -p xtask` (which runs `deps check`) fails
+A new profile has no committed lock until one is generated, and `cargo test -p xtask` (which runs `deps check`) fails
 with "missing or unreadable" until then. Generate it with
 `runtimes/bin/mise run --cd runtimes lock`, or take it from the
 `runtime-locks` artifact the CI job of the same name uploads when it fails,

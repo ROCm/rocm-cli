@@ -123,6 +123,10 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
+              # The Lemonade version and archive digest the build compiles in
+              # (runtimes/mise.lock), so the weekly runtime update's pull
+              # request runs the GPU lanes that exercise it.
+              - 'runtimes/**'
               - 'scripts/**'
               - 'xtask/**'
               - 'engines/**'
@@ -150,6 +154,8 @@ jobs:
             # `rocm` but cannot change serve behaviour.)
             serve:
               - 'engines/**'
+              # Lemonade's pinned version and digest (runtimes/mise.lock).
+              - 'runtimes/**'
               - 'crates/rocm-core/**'
               - 'crates/rocm-engine-protocol/**'
               - 'apps/rocm/**'

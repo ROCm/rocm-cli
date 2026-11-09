@@ -39,7 +39,8 @@ pub(crate) struct LockOptions {
     /// one each lock records, so packages move to newer releases.
     pub(crate) upgrade: bool,
     /// Ignore PyPI releases younger than this many days when a new cutoff is
-    /// set: with `--upgrade`, or for a lock that does not exist yet.
+    /// set: with `--upgrade`, for a lock that does not exist yet, or for one
+    /// whose recorded cutoff is missing or invalid. Without it, 0.
     pub(crate) cooldown_days: Option<u32>,
 }
 
@@ -139,16 +140,22 @@ fn run_with(
         fs::write(&requirements, profile.requirements.join("\n") + "\n")?;
         // What keeps an ordinary re-lock from moving anything is the cutoff
         // the lock records: a fresh resolution against the same cutoff and
-        // the same indexes reproduces it. The old lock is never handed to uv
+        // the same indexes reproduces it. AMD-only packages are the exception:
+        // they are exempt from the cutoff, so a new AMD build inside a range
+        // moves a re-lock. The old lock is never handed to uv
         // as version preferences: with these indexes that does not converge
         // (successive runs alternate between AMD's mirrored versions of a
         // package and PyPI's), so a re-lock would never match.
         let output = work.join(lock_file_name(name, os));
         let _ = fs::remove_file(&output);
         let cutoff = match fs::read_to_string(&committed) {
-            Ok(text) if !options.upgrade => {
-                pylock::recorded_cutoff(&text).unwrap_or_else(|| new_cutoff.clone())
-            }
+            Ok(text) if !options.upgrade => pylock::recorded_cutoff(&text).unwrap_or_else(|| {
+                eprintln!(
+                    "{} records no valid cutoff; resolving at a new one, {new_cutoff}",
+                    super::profiles::slash_path(&Profiles::lock_path(name, os))
+                );
+                new_cutoff.clone()
+            }),
             _ => new_cutoff.clone(),
         };
 
@@ -177,6 +184,13 @@ fn run_with(
             &profiles.inputs_digest(name, os, &uv_config_text),
             &cutoff,
         )?;
+        // A resolution that changes nothing but the cutoff keeps the lock as
+        // it was, so a weekly `--upgrade` with nothing new rewrites no file
+        // and proposes nothing.
+        let locked = match fs::read_to_string(&committed) {
+            Ok(previous) if pylock::same_but_cutoff(&previous, &locked) => previous,
+            _ => locked,
+        };
         resolved.push((committed, locked));
     }
 
@@ -770,10 +784,13 @@ linux = "x86_64-manylinux_2_28"
             uv.calls.borrow().iter().all(|(before, _)| before.is_none()),
             "uv must never be given a previous lock as preferences"
         );
-        // Each lock records the cutoff it was resolved at.
+        // The upgrade resolved at the new cutoff, but resolved the same lock
+        // (the fake uv writes the same body every time), so the lock keeps
+        // its old cutoff: `an_upgrade_that_resolves_nothing_new_rewrites_no_lock`
+        // covers the case where the resolution does change.
         assert_eq!(
             pylock::recorded_cutoff(&fs::read_to_string(&committed).unwrap()).as_deref(),
-            Some("2026-10-30T12:00:00Z")
+            Some("2026-01-01T00:00:00Z")
         );
     }
 
@@ -826,6 +843,63 @@ linux = "x86_64-manylinux_2_28"
                 .join("runtimes/locks/pylock.q-windows.toml")
                 .is_file()
         );
+    }
+
+    /// A committed lock whose cutoff is missing or unreadable is resolved at
+    /// a new cutoff, the cooldown before now, never at an empty one.
+    #[test]
+    fn a_lock_without_a_valid_cutoff_is_resolved_at_a_new_one() {
+        let root = workspace();
+        fs::write(
+            root.path().join("runtimes/locks/pylock.p-linux.toml"),
+            "# exclude-newer: last week\nlock-version = \"1.0\"\n",
+        )
+        .unwrap();
+        let uv = FakeUv::new("0.13.6");
+        let options = LockOptions {
+            profile: Some("p".to_owned()),
+            cooldown_days: Some(7),
+            ..plain()
+        };
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &options,
+            &uv,
+            vec![],
+            now(),
+        )
+        .unwrap();
+        let args = &uv.args.borrow()[0];
+        let cutoff = &args[args.iter().position(|a| a == "--exclude-newer").unwrap() + 1];
+        assert_eq!(cutoff, "2026-10-30T12:00:00Z");
+    }
+
+    /// A stray symlink in the lock directory is removed, never followed: the
+    /// directory it points at, and what is in it, stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_stray_symlink_is_removed_and_not_followed() {
+        let root = workspace();
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "x").unwrap();
+        let link = root.path().join("runtimes/locks/linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &plain(),
+            &FakeUv::new("0.13.6"),
+            vec![],
+            now(),
+        )
+        .unwrap();
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "the symlink is removed"
+        );
+        assert!(outside.join("keep").is_file(), "its target is untouched");
     }
 
     /// CI's first run: the lock directory does not exist yet.
@@ -1109,6 +1183,75 @@ linux = "x86_64-manylinux_2_28"
     /// The two halves of `deps check`'s remediation: re-locking clears a
     /// lock that was stale, and does not clear what the resolver itself
     /// produces from the same inputs, which needs the profile changed.
+    /// The weekly update runs `--upgrade`, which takes a new cutoff every
+    /// time. When nothing new resolves, every lock must stay byte for byte
+    /// as it was, or the update would propose a pull request every week.
+    #[test]
+    fn an_upgrade_that_resolves_nothing_new_rewrites_no_lock() {
+        let root = workspace();
+        let only_p = LockOptions {
+            profile: Some("p".to_owned()),
+            cooldown_days: Some(7),
+            ..plain()
+        };
+        let upgrade = LockOptions {
+            profile: Some("p".to_owned()),
+            upgrade: true,
+            cooldown_days: Some(7),
+        };
+        let first = FakeUv::writing(torch_lock("vendor.example"));
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &only_p,
+            &first,
+            vec![],
+            now(),
+        )
+        .unwrap();
+        let path = root.path().join(Profiles::lock_path("p", "linux"));
+        let before = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            pylock::recorded_cutoff(&before).as_deref(),
+            Some("2026-10-30T12:00:00Z")
+        );
+
+        let later = now() + chrono::Duration::days(7);
+        let same = FakeUv::writing(torch_lock("vendor.example"));
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &upgrade,
+            &same,
+            vec![],
+            later,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "unchanged lock rewritten"
+        );
+
+        // A resolution that does change records the new cutoff.
+        let moved = FakeUv::writing(torch_lock("vendor.example").replace("2.13.0", "2.13.1"));
+        run_with(
+            root.path(),
+            &root.path().join("work"),
+            &upgrade,
+            &moved,
+            vec![],
+            later,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("2.13.1"), "{after}");
+        assert_eq!(
+            pylock::recorded_cutoff(&after).as_deref(),
+            Some("2026-11-06T12:00:00Z")
+        );
+    }
+
     #[test]
     fn relocking_clears_a_stale_lock_but_not_a_policy_problem() {
         assert_eq!(
@@ -1141,15 +1284,10 @@ linux = "x86_64-manylinux_2_28"
         // A non-empty directory where the lock goes makes the rename fail.
         fs::create_dir_all(locks.join("pylock.p-linux.toml")).unwrap();
         fs::write(locks.join("pylock.p-linux.toml/keep"), "").unwrap();
-        // `--upgrade`, so the committed path is not read as preferences first.
-        let upgrade = LockOptions {
-            upgrade: true,
-            ..plain()
-        };
         let err = run_with(
             root.path(),
             &root.path().join("work"),
-            &upgrade,
+            &plain(),
             &FakeUv::new("0.13.6"),
             vec![],
             now(),

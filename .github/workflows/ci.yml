@@ -179,7 +179,7 @@ jobs:
               # so the Linux `test` job (which is `rust`-gated, not
               # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
-              # Read by `the_remediation_command_is_spelled_the_same_everywhere`.
+              # Read by `the_remediation_command_is_spelled_the_same_in_its_checked_files`.
               - 'docs/runtime-dependencies.md'
               # Run by `the_summary_passes_the_update_validator` (on real
               # `deps diff` output) and read by the update-workflow contract
@@ -1834,7 +1834,7 @@ jobs:
         run: |
           git add -N runtimes
           if ! git diff --exit-code --stat -- runtimes; then
-            echo "::error::A runtime lock is missing or stale. Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'."
+            echo "::error::A runtime lock is missing or stale, or AMD published a new build of an AMD-only package (those are not held back by a lock's cutoff). Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'."
             exit 1
           fi
 

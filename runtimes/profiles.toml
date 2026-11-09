@@ -45,12 +45,14 @@ rocm = "10.1.0"
 python = "3.14"
 requirements = [
   # Every arch the 10.1 index publishes a device payload for, so one lock per
-  # OS serves every GPU; an installer takes the core plus its own arch's rows.
+  # OS serves every GPU that OS has a payload for (the Windows lock has no
+  # gfx942, gfx950 or gfx1250 rows); an installer takes the core plus its own
+  # arch's rows.
   "rocm[libraries,device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==10.1.0",
   "torch[device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==2.13.*",
   "torchvision==0.28.*",
   # Exact: 2.11.0 is a CPU-only rebuild; 2.11.0.2 is the HIP build confirmed
-  # against torch 2.13 (see engines/vllm/src/wheel_builds.rs).
+  # against torch 2.13 (see engines/vllm/src/discover_builds.rs).
   "torchaudio==2.11.0.2",
 ]
 

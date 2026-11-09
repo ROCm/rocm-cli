@@ -1010,7 +1010,18 @@ mod tests {
             without_comments(&top_level_block(&workflow, "concurrency")).trim(),
             "group: runtime-deps-update\n  cancel-in-progress: false"
         );
-        pinned_step(&propose, "Free disk space for wheel downloads", "");
+        assert_eq!(
+            run_lines(pinned_step(
+                &propose,
+                "Free disk space for wheel downloads",
+                ""
+            )),
+            [
+                "sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL",
+                "df -h /"
+            ],
+            "the step runs in a job that runs upstream code; its script is pinned whole"
+        );
         // Whether a pull request is opened at all hangs on this step's
         // output, so its id and its script are pinned whole.
         let summarise = pinned_step(&propose, "Summarise what moved", "");
@@ -1122,8 +1133,9 @@ mod tests {
                 "rm -rf runtimes/locks",
                 "cp -r \"$RUNNER_TEMP/update/locks\" runtimes/locks",
                 "cargo xtask deps check",
+                "cargo xtask deps diff --base HEAD | cmp - \"$RUNNER_TEMP/update/summary.md\"",
             ],
-            "the check must validate the artifact, then run deps check on it"
+            "the check must validate the artifact, run deps check on it, and recompute its summary"
         );
 
         // `open-pr` holds the write token: exactly these three steps, none of
@@ -1304,6 +1316,30 @@ mod tests {
         );
     }
 
+    /// Every filter a change under `runtimes/` (a Lemonade pin bump, a
+    /// re-lock) must trip, so the jobs that exercise it run on its pull
+    /// request: the Rust tests that check the locks, the heavy lanes, and the
+    /// self-hosted GPU lanes that run the pinned Lemonade. The update
+    /// validator is read by Linux-only xtask tests, so it sits in `rust` too.
+    #[test]
+    fn a_runtimes_change_trips_every_filter_that_tests_it() {
+        let ci = without_comments(job_block(&read_workflow("ci.yml"), "changes"));
+        let selfhosted =
+            without_comments(job_block(&read_workflow("e2e-selfhosted.yml"), "changes"));
+        for (workflow, job, filter, entry) in [
+            ("ci.yml", &ci, "rust", "runtimes/**"),
+            ("ci.yml", &ci, "heavy", "runtimes/**"),
+            ("ci.yml", &ci, "rust", "scripts/validate_runtime_update.py"),
+            ("e2e-selfhosted.yml", &selfhosted, "heavy", "runtimes/**"),
+            ("e2e-selfhosted.yml", &selfhosted, "serve", "runtimes/**"),
+        ] {
+            assert!(
+                paths_filter_entries(job, filter).iter().any(|e| e == entry),
+                "{workflow} `{filter}` filter must list `{entry}`"
+            );
+        }
+    }
+
     #[test]
     fn runtime_locks_job_is_read_only_and_runs_only_for_runtime_changes() {
         let ci = read_workflow("ci.yml");
@@ -1379,7 +1415,18 @@ mod tests {
             ],
             "runtime-locks' job-level keys (no continue-on-error: the gate must be able to fail)"
         );
-        pinned_step(&steps, "Free disk space for wheel downloads", "");
+        assert_eq!(
+            run_lines(pinned_step(
+                &steps,
+                "Free disk space for wheel downloads",
+                ""
+            )),
+            [
+                "sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL",
+                "df -h /"
+            ],
+            "the step runs in a job that runs upstream code; its script is pinned whole"
+        );
         assert_eq!(
             run_lines(pinned_step(&steps, "Re-lock at the committed pins", "")),
             ["runtimes/bin/mise run --cd runtimes lock"]
@@ -1389,7 +1436,7 @@ mod tests {
             [
                 "git add -N runtimes",
                 "if ! git diff --exit-code --stat -- runtimes; then",
-                "echo \"::error::A runtime lock is missing or stale. Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'.\"",
+                "echo \"::error::A runtime lock is missing or stale, or AMD published a new build of an AMD-only package (those are not held back by a lock's cutoff). Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'.\"",
                 "exit 1",
                 "fi",
             ]

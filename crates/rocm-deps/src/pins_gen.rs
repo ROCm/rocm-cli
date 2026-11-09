@@ -368,7 +368,7 @@ mod tests {
     fn a_sixty_four_character_digest_that_is_not_hex_is_refused() {
         // Upper case too: the Lemonade adapter compares the lower-case hex it
         // computes with this string, so an upper-case digest never matches.
-        for bad in ["z".repeat(64), SUM.to_uppercase()] {
+        for bad in ["z".repeat(64), SUM.to_uppercase(), format!("{SUM}0")] {
             let text = lock("1.0").replacen(SUM, &bad, 1);
             assert!(
                 render(&text)

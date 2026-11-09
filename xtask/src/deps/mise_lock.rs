@@ -598,6 +598,7 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
     #[test]
     fn a_config_without_locking_is_refused() {
         assert!(MiseConfig::parse(&CONFIG.replace("lockfile = true", "lockfile = false")).is_err());
+        assert!(MiseConfig::parse(&CONFIG.replace("lockfile = true\n", "")).is_err());
         assert!(
             MiseConfig::parse(
                 &CONFIG.replace("lockfile_platforms = [\"linux-x64\", \"windows-x64\"]", "")
@@ -794,6 +795,38 @@ lockfile_platforms = ["linux-x64", "windows-x64"]
                 "{what}: {err:#}"
             );
         }
+    }
+
+    /// uv is an `aqua:` tool; its `url_api` is bound to its repository the
+    /// same way a `github:` tool's is.
+    #[test]
+    fn an_aqua_tools_url_api_outside_its_repository_is_reported() {
+        let config = MiseConfig::parse(
+            "[settings]\nlockfile = true\nlockfile_platforms = [\"linux-x64\", \"windows-x64\"]\n\n[tools]\n\"aqua:astral-sh/uv\" = \"0.13.6\"\n",
+        )
+        .unwrap();
+        let committed =
+            std::fs::read_to_string(crate::paths::workspace_root().unwrap().join(MISE_LOCK))
+                .unwrap();
+        let mut uv_only: BTreeMap<_, _> = parse_lock(&committed)
+            .unwrap()
+            .into_iter()
+            .filter(|(name, _)| name == "aqua:astral-sh/uv")
+            .collect();
+        let asset = uv_only
+            .get_mut("aqua:astral-sh/uv")
+            .unwrap()
+            .platforms
+            .get_mut("linux-x64")
+            .unwrap();
+        asset.url_api = Some("https://api.github.com/repos/evil/uv/releases/assets/1".to_owned());
+        assert_eq!(
+            problems(&config, &uv_only),
+            [
+                "aqua:astral-sh/uv: linux-x64 url_api https://api.github.com/repos/evil/uv/releases/assets/1 \
+              is not https://api.github.com/repos/astral-sh/uv/releases/assets/<asset id>"
+            ]
+        );
     }
 
     #[test]

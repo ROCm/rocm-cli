@@ -141,8 +141,9 @@ fn file_now(root: &Path, file: &str) -> Result<Option<String>> {
 fn collect(file: &str, text: &str, into: &mut Versions) -> Result<()> {
     if file == MISE_LOCK {
         // One row per platform, with the digest's first characters after the
-        // version, so a URL or digest swapped at an unchanged version still
-        // shows up in the table the update pull request is opened with.
+        // version, so a digest swapped at an unchanged version still shows up
+        // in the table the update pull request is opened with. A URL changed
+        // at the same digest does not; `deps check` binds the URL instead.
         for (name, tool) in
             mise_lock::parse_lock(text).with_context(|| format!("invalid {file}"))?
         {
@@ -538,6 +539,12 @@ mod tests {
         let old = &before[&(file.to_owned(), "numpy".to_owned())];
         let new = &after[&(file.to_owned(), "numpy".to_owned())];
         assert!(old.starts_with("2.3.0-") && new.starts_with("2.3.0-") && old != new);
+        // A 12-hex-digit digest after the version.
+        let digest = old.strip_prefix("2.3.0-").unwrap();
+        assert!(
+            digest.len() == 12 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{old}"
+        );
         assert!(
             table.contains(&format!(
                 "| `pylock.p-linux.toml` | `numpy` | {old} | {new} |"

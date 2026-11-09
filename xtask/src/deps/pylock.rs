@@ -79,6 +79,17 @@ pub(crate) fn recorded_cutoff(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether two locks differ at most in their `# exclude-newer:` header line.
+pub(crate) fn same_but_cutoff(a: &str, b: &str) -> bool {
+    let without = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.starts_with("# exclude-newer: "))
+            .map(str::to_owned)
+            .collect()
+    };
+    without(a) == without(b)
+}
+
 /// The header line recording what the lock was resolved from (see
 /// `Profiles::inputs_digest`).
 pub(crate) fn inputs_line(digest: &str) -> String {
@@ -205,6 +216,9 @@ wheels = [{ url = "https://files.pythonhosted.org/numpy-2.3.0-cp314-cp314-win_am
 
     #[test]
     fn hosts_are_extracted_from_https_urls_only() {
+        // No host at all is not an https URL.
+        assert_eq!(https_host("https:///x.whl"), None);
+        assert_eq!(https_host("https://u@/x.whl"), None);
         assert_eq!(
             https_host("https://stable.repo.amd.com/rocm/x.whl"),
             Some("stable.repo.amd.com")

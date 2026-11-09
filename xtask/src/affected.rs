@@ -138,7 +138,8 @@ pub fn reverse_closure(
 /// - `docs/ci-hardware-testing.md` and `tests/e2e-cucumber/README.md`: both
 ///   read by `hardware_testing_docs_cover_all_self_hosted_platforms` (xtask).
 /// - `docs/runtime-dependencies.md`: read by
-///   `the_remediation_command_is_spelled_the_same_everywhere` (xtask).
+///   `the_remediation_command_is_spelled_the_same_in_its_checked_files` and
+///   `the_launchers_pin_the_same_mise` (xtask).
 pub(crate) const XTASK_READ_DOCS: &[&str] = &[
     "MANIFEST.md",
     "CONTRIBUTING.md",
@@ -629,7 +630,7 @@ mod tests {
 
     #[test]
     fn select_runtime_docs_read_by_xtask_force_workspace() {
-        // Read by the_remediation_command_is_spelled_the_same_everywhere.
+        // Read by the_remediation_command_is_spelled_the_same_in_its_checked_files.
         let g = graph();
         assert_eq!(
             select(&["docs/runtime-dependencies.md".to_string()], &g),

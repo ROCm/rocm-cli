@@ -16,8 +16,8 @@ pub(crate) const PROFILES_FILE: &str = "runtimes/profiles.toml";
 
 /// Workspace-relative directory every lock is written to. Fixed rather than
 /// configurable: `deps lock` deletes whatever in it no profile produces, and
-/// the CI gate, the update workflow's validator and `.gitattributes` all name
-/// it.
+/// the CI gate, the update workflow's commit step and `.gitattributes` all
+/// name it.
 pub(crate) const LOCK_DIR: &str = "runtimes/locks";
 
 /// A workspace-relative path as it is spelled in messages, docs and git:
@@ -145,9 +145,11 @@ impl Profiles {
         Ok(strays)
     }
 
-    /// Hex SHA-256 of everything the `(name, os)` lock is resolved from: the
-    /// profile's Python version, the platform it is resolved for, its
-    /// requirements (in a fixed order) and the text of `uv.toml`. `deps lock`
+    /// Hex SHA-256 of the per-profile inputs the `(name, os)` lock is resolved
+    /// from: the profile's Python version, the platform it is resolved for,
+    /// its requirements (in a fixed order) and the text of `uv.toml`. Not
+    /// covered: `policy.vendor-packages`, which sets the cutoff exemptions, so
+    /// an edit to it is caught by the `runtime-locks` re-lock, not offline. `deps lock`
     /// records it in the lock's header and `deps check` recomputes it, so an
     /// edited input is caught offline even when the old lock still happens to
     /// satisfy the requirements.
@@ -260,8 +262,16 @@ impl Requirement {
             }
         };
         let version = version.trim();
+        // The line is written into uv's requirements file, so no whitespace
+        // may split it and the name must start and end alphanumeric (PEP 508);
+        // otherwise `-r` or `--pre` could pass as a package name.
         ensure!(
-            !name.is_empty()
+            !text.contains(char::is_whitespace),
+            "requirement {text:?} contains whitespace"
+        );
+        ensure!(
+            name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && name.ends_with(|c: char| c.is_ascii_alphanumeric())
                 && name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
@@ -336,6 +346,14 @@ linux = "x86_64-manylinux_2_28"
 windows = "x86_64-pc-windows-msvc"
 "#;
 
+    /// PEP 503: runs of `-`, `_` and `.` become one `-`, case folded.
+    #[test]
+    fn names_are_normalized_like_pep_503() {
+        assert_eq!(normalize_name("Torch_Audio"), "torch-audio");
+        assert_eq!(normalize_name("a-_.b"), "a-b");
+        assert_eq!(normalize_name("a__b..c"), "a-b-c");
+    }
+
     #[test]
     fn the_committed_profiles_parse() {
         let root = crate::paths::workspace_root().unwrap();
@@ -405,6 +423,11 @@ windows = "x86_64-pc-windows-msvc"
             "torch>=2",
             "torch==2.13\n--pre",
             "torch==2.13\t--index-url\thttp://x",
+            "--pre\n==1",
+            "-r\n==1",
+            "-e\t==1",
+            "-torch==1",
+            "torch-==1",
         ] {
             assert!(Requirement::parse(bad).is_err(), "{bad} should be refused");
         }

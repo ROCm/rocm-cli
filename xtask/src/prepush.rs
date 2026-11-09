@@ -11,7 +11,8 @@
 //! files changed plus every crate that transitively depends on them, with a
 //! fall back to the whole workspace for anything that cannot be attributed to
 //! one crate (the lockfile, the root manifest, the toolchain file, workflow
-//! files, a doc an xtask test reads, an unrecognized path). On top of that the
+//! files, a doc an xtask test reads, a file xtask compiles in by path, an
+//! unrecognized path). On top of that the
 //! hook widens for files that another crate's tests read from outside their own
 //! crate directory ([`CROSS_CRATE_READS`]), which the directory-based selection
 //! cannot see. CI stays the complete gate; this only makes the local early

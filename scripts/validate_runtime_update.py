@@ -111,6 +111,10 @@ def validate(artifact: Path, base_config: Path) -> None:
         if path.is_symlink():
             raise Invalid(f"symlink in artifact: {rel}")
         if path.is_dir():
+            # `locks/` is the only directory an update produces; anything
+            # else, a directory named like a lock included, is refused.
+            if rel != "locks":
+                raise Invalid(f"unexpected artifact entry: {rel}/")
             continue
         if not path.is_file() or not ALLOWED.fullmatch(rel):
             raise Invalid(f"unexpected artifact entry: {rel}")
@@ -121,7 +125,7 @@ def validate(artifact: Path, base_config: Path) -> None:
             raise Invalid(f"artifact is missing {required}")
     # The commit step deletes every committed lock the artifact lacks, so an
     # update that produced none would empty the lock directory.
-    if not any((artifact / "locks").glob("pylock.*.toml")):
+    if not any(path.is_file() for path in (artifact / "locks").glob("pylock.*.toml")):
         raise Invalid("artifact has no locks/pylock.*.toml")
 
     try:
@@ -211,10 +215,13 @@ def self_test() -> None:
                 code = main([str(artifact), str(base)])
         if code != expected:
             raise SystemExit(f"self-test {label!r}: exit {code}, expected {expected}")
-    with contextlib.redirect_stderr(io.StringIO()):
-        usage_code = main([])
-    if usage_code != 2:
-        raise SystemExit("self-test 'main without arguments': expected exit 2")
+    for argv in ([], ["only-one"], ["one", "two", "three"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            usage_code = main(argv)
+        if usage_code != 2:
+            raise SystemExit(
+                f"self-test 'main with {len(argv)} arguments': expected exit 2"
+            )
 
     cases = [
         ("unchanged", BASE, TABLE, None, None),
@@ -345,6 +352,20 @@ def self_test() -> None:
     def missing(artifact: Path) -> None:
         (artifact / "mise.lock").unlink()
 
+    def missing_summary(artifact: Path) -> None:
+        (artifact / "summary.md").unlink()
+
+    def missing_config(artifact: Path) -> None:
+        (artifact / "mise.toml").unlink()
+
+    def lock_named_directory(artifact: Path) -> None:
+        # The only `locks/` entry is a directory named like a lock.
+        (artifact / "locks" / "pylock.p-linux.toml").unlink()
+        (artifact / "locks" / "pylock.z.toml").mkdir()
+
+    def at_size_limit(artifact: Path) -> None:
+        (artifact / "locks" / "pylock.p-linux.toml").write_bytes(b"#" * MAX_BYTES)
+
     cases += [
         (
             "table with a wrong header",
@@ -370,6 +391,13 @@ def self_test() -> None:
             TABLE,
             None,
             "not a concrete version",
+        ),
+        (
+            "version key deleted from a tool table",
+            BASE.replace('version = "1.0", ', ""),
+            TABLE,
+            None,
+            "mise.toml changed",
         ),
         (
             "version that is not a string",
@@ -398,12 +426,27 @@ def self_test() -> None:
         ("oversized lock", oversized, "oversized artifact entry"),
         ("missing mise.lock", missing, "artifact is missing mise.lock"),
         ("no lock at all", no_locks, "has no locks/pylock.*.toml"),
+        ("missing summary.md", missing_summary, "artifact is missing summary.md"),
+        ("missing mise.toml", missing_config, "artifact is missing mise.toml"),
+        (
+            "directory named like a lock",
+            lock_named_directory,
+            "unexpected artifact entry",
+        ),
         ("mise.toml that is not UTF-8", binary_config, "does not parse"),
         ("summary.md that is not UTF-8", binary_summary, "not UTF-8"),
         ("file name ending in a newline", newline_name, "unexpected artifact entry"),
     ]
+    # Exactly at the size limit is still accepted.
+    tampered.append(("lock at the size limit", at_size_limit, None))
     for label, tamper, expected in tampered:
         error = run(BASE, tamper=tamper)
+        if expected is None:
+            if error is not None:
+                raise SystemExit(
+                    f"self-test {label!r}: expected acceptance, got {error!r}"
+                )
+            continue
         if error is None or expected not in error:
             raise SystemExit(
                 f"self-test {label!r}: expected {expected!r}, got {error!r}"

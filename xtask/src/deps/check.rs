@@ -464,6 +464,19 @@ linux = "x86_64-manylinux_2_28"
         );
     }
 
+    /// A host is AMD's only when it is exactly one of `vendor-hosts`: a
+    /// lookalike that merely ends with it is someone else's.
+    #[test]
+    fn a_lookalike_of_an_amd_host_is_not_amd() {
+        let found = problems_of(&lock_text("2.13.0+rocm10.1.0", "evilstable.repo.amd.com"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("AMD-only package taken from evilstable.repo.amd.com")),
+            "{found:?}"
+        );
+    }
+
     #[test]
     fn a_package_served_by_neither_pypi_nor_amd_is_reported() {
         let text = lock_text("2.13.0", "stable.repo.amd.com").replace(
@@ -671,6 +684,11 @@ linux = "x86_64-manylinux_2_28"
             "windows"
         ));
         assert!(!wheel_fits_os("x-1-cp314-cp314-win_arm64.whl", "windows"));
+        // The family is a prefix, not a substring.
+        assert!(!wheel_fits_os(
+            "x-1-cp314-cp314-notlinux_x86_64.whl",
+            "linux"
+        ));
     }
 
     /// `collect` is what `deps check` reports: it must include the binary-lock
