@@ -21,8 +21,6 @@ use rocm_core::{AppPaths, EndpointReadiness, ManagedServiceRecord};
 #[cfg(feature = "e2e-oom-fault-injection")]
 use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
 use std::fmt::Write as _;
-#[cfg(any(target_os = "linux", feature = "e2e-oom-fault-injection", test))]
-use std::fs;
 use std::time::Duration;
 
 /// How long one readiness wait polls before `rocm serve` reports `starting`.
@@ -53,7 +51,7 @@ pub(super) fn service_pid_is_alive(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn process_is_zombie(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
     // `comm` may contain spaces and parentheses; the state follows the last `)`.
@@ -210,7 +208,7 @@ pub(super) fn simulate_oom_managed_launch(
     env_id: Option<&str>,
 ) -> Result<ManagedLaunchReport> {
     paths.ensure()?;
-    fs::create_dir_all(paths.services_dir())?;
+    std::fs::create_dir_all(paths.services_dir())?;
     let mut record = ManagedServiceRecord::new(
         paths,
         service_id,
@@ -240,7 +238,7 @@ pub(super) fn simulate_oom_managed_launch(
     // only the raw OOM line can never see the newest-first scan land on
     // rocm-cli's own sentence instead of the user's error.
     let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-    fs::write(
+    std::fs::write(
         &record.log_path,
         format!(
             "{real_line}\n\
@@ -350,10 +348,7 @@ mod tests {
     use super::*;
     use crate::service_launch::test_support::reusable_record;
     use crate::tests::test_paths;
-    #[cfg(target_os = "linux")]
-    use rocm_core::process_is_running;
-    #[cfg(target_os = "linux")]
-    use std::thread;
+    use std::fs;
 
     #[test]
     fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {
@@ -442,10 +437,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !process_is_zombie(pid) {
             assert!(std::time::Instant::now() < deadline, "child never exited");
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            process_is_running(pid),
+            rocm_core::process_is_running(pid),
             "a zombie still answers kill(pid, 0)"
         );
         assert!(!service_pid_is_alive(pid));
