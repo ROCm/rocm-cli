@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Update overlay (Phase 3 Wave 2).
+//! Update overlay.
 //!
 //! Wraps `rocm update`: a read-only check (and a `--apply --dry-run` preview)
 //! that run straight through the job-bridge, plus the mutating `--apply` /

@@ -3,13 +3,17 @@
 // SPDX-License-Identifier: MIT
 
 //! Render the TUI against a synthetic session NDJSON and dump each view to
-//! a standalone SVG. The screenshots embed cleanly in the marketing page
-//! and demo decks — no live terminal, no manual capture, no drift.
+//! a standalone SVG — no live terminal and no manual capture.
 //!
 //! Usage:
 //!   cargo run --release --example gen_screenshots -p rocm-dash-tui -- \
-//!       --input /tmp/mi355x-demo.ndjson \
-//!       --output-dir marketing/screenshots
+//!       --input session.ndjson \
+//!       --output-dir screenshots
+//!
+//! `--input` is a `PersistedEntry` NDJSON session recording, the format
+//! `rocm dash --replay` reads, such as the `session-*.ndjson` that
+//! `rocm dash --demo` writes under the `demo/` folder of the user data
+//! directory. Whatever the input, the views are marked as simulated data.
 //!
 //! Each output is the actual `ui::draw` framebuffer for a specific
 //! AppState configuration (tab + modal + theme). Cells get run-length
@@ -35,13 +39,12 @@ use rocm_dash_tui::ui;
     about = "Render TUI views to SVG for marketing"
 )]
 struct Args {
-    /// Synthetic session file (produced by `make demo`).
+    /// Session NDJSON recording to render (`PersistedEntry` lines).
     #[arg(long, default_value = "/tmp/mi355x-demo.ndjson")]
     input: PathBuf,
 
-    /// Output directory. Created if absent. SVGs are named per view.
-    /// Default targets the repo-root `marketing/screenshots/` directory
-    /// when run from the `app/` workspace.
+    /// Output directory. Created if absent. SVGs are named per view. The
+    /// default is relative to the working directory.
     #[arg(long, default_value = "../marketing/screenshots")]
     output_dir: PathBuf,
 

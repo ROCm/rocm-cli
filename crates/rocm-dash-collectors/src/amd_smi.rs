@@ -5,7 +5,7 @@
 //! amd-smi subprocess + JSON parse.
 //!
 //! Field paths and the GPU-device pre-flight are vendored from the TypeScript
-//! `AmdSmiProvider` in instinct-dash. See `../wiki/entities/amd-smi.md`.
+//! `AmdSmiProvider` in instinct-dash.
 
 use std::ffi::OsString;
 use std::io;

@@ -2,19 +2,18 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Onboarding wizard (Phase 3 Wave 2, minimal).
+//! Onboarding wizard (minimal).
 //!
-//! The first-run flow, rebuilt on the Wave-0 primitives. This is the **minimal**
-//! version the phase-3 plan calls for: get a clean machine to a working ROCm
-//! runtime two ways —
+//! The first-run flow, kept deliberately **minimal**: get a clean machine to a
+//! working ROCm runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
 //!   step to pick the channel (Release/Nightly), an optional version pin
 //!   (`--build-date` / `--version`), and an optional install folder
-//!   (`--prefix`, via the same Wave-0 [`FolderBrowser`] the Adopt path uses);
+//!   (`--prefix`, via the same [`FolderBrowser`] the Adopt path uses);
 //!   defaults to `--channel release --format wheel` installed into the
 //!   default managed folder.
-//! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
+//! - **Adopt existing folder** — pick an existing ROCm env with the
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),

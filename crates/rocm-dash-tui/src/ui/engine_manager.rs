@@ -2,13 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Engine manager overlay (Phase 3 Wave 1).
+//! Engine manager overlay.
 //!
 //! Lists the serving engines ROCm CLI knows about and runs use/install/reinstall
 //! **through the approval gate and the job-bridge** — never inline. Installs
-//! stream their output into the shared job console (the Wave-0 `running_job`
-//! replacement). This is the third operational screen on the proven primitives;
-//! it feeds the serve wizard (which engine to launch a model with).
+//! stream their output into the shared job console. It feeds the serve wizard
+//! (which engine to launch a model with).
 //!
 //! The approval *decision* is the user's, captured by the render+event seam; the
 //! CLI owns the actual mutation (`rocm config set-default-engine` /

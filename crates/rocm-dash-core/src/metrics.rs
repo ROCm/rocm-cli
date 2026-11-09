@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 //! Live metric types. snake_case + units encoded in field names.
-//! See `../wiki/concepts/metric-registry.md` and `../wiki/data/metric-field-index.md`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Model picker (Phase 3 Wave 1).
+//! Model picker.
 //!
 //! A reusable, filterable list of model recipes — the sub-step the serve wizard
 //! opens from its Model field so the user can pick a built-in recipe instead of
-//! typing a model name. Selecting a recipe fills the model id and (when known)
-//! pre-selects the recipe's preferred engine.
+//! typing a model name. Selecting a recipe returns its summary; the serve
+//! wizard keeps only the id and fills the Model field with it. The recipe's
+//! preferred engine is shown in the list but never applied.
 //!
 //! Recipes are passed in as plain TUI-local [`ModelRecipeSummary`] values — the
 //! bin (`apps/rocm`, which has `rocm-core`) adapts the full `ModelRecipeRecord`
