@@ -479,7 +479,7 @@ async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
     assert_eq!(
         engine_stop["error"],
         "failed to parse engine response envelope \
-         (engine stdio process exited with status exit status: 1); \
+         (engine stdio process exited with code 1); \
          stderr: engine exploded: no container runtime",
         "{report}"
     );

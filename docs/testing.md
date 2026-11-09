@@ -224,7 +224,10 @@ grew its own private copy of the conversation would fail those tests.
 An answer that is not a response envelope is reported as that, and when the
 child also exited with a failing status the error says so, because the status is
 often why the answer was cut short (a clean exit adds nothing). A failing child
-that printed nothing is reported by its status alone. Both carry the child's
+that printed nothing is reported by its status alone. The status is worded from
+the exit code (`exited with code N`) or, for a child ended by a signal on Unix,
+the signal (`was terminated by signal N`), not from `ExitStatus`'s own text, which
+already reads `exit status: N` and would double up (`a_child_ended_by_a_signal_is_reported_by_the_signal`). Both carry the child's
 stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
 the three cases against the fake, and `engine-ipc-02` below shows the same
 message in a `stop_server` report next to what the stop did.

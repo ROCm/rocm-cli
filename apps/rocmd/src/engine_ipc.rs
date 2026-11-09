@@ -613,7 +613,7 @@ mod tests {
             let crash = FakeEngine::new("rocmd-crash", true, "echo boom >&2\nexit 3");
             assert_eq!(
                 request(&crash, &paths).unwrap_err().to_string(),
-                "engine stdio process exited with status exit status: 3: boom"
+                "engine stdio process exited with code 3: boom"
             );
         }
 

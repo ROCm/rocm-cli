@@ -218,9 +218,22 @@ where
     serde_json::from_slice(&stdout).with_context(|| unparseable_answer_message(status, &stderr))
 }
 
-/// How a failing exit is worded wherever the status is reported.
+/// How a failing exit is worded wherever the status is reported. Built from the
+/// exit code (or the signal that ended the process) rather than from the status's
+/// own `Display`, which already says "exit status: N" on Unix and "exit code: N"
+/// on Windows.
 fn exit_note(status: ExitStatus) -> String {
-    format!("engine stdio process exited with status {status}")
+    if let Some(code) = status.code() {
+        return format!("engine stdio process exited with code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return format!("engine stdio process was terminated by signal {signal}");
+        }
+    }
+    "engine stdio process ended without an exit code".to_owned()
 }
 
 /// The error for an answer that is not a response envelope. A child that also
@@ -737,15 +750,12 @@ mod tests {
             let error = run(&engine, &EngineStdioOptions::default()).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "engine stdio process exited with status exit status: 3: boom"
+                "engine stdio process exited with code 3: boom"
             );
 
             let silent = FakeEngine::new("client-silent-crash", true, "exit 4");
             let error = run(&silent, &EngineStdioOptions::default()).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "engine stdio process exited with status exit status: 4"
-            );
+            assert_eq!(error.to_string(), "engine stdio process exited with code 4");
         }
 
         #[test]
@@ -786,6 +796,31 @@ mod tests {
             );
         }
 
+        /// A child ended by a signal has no exit code; it is reported by the signal,
+        /// with or without a half-written answer, and never as a code of its own
+        /// invention.
+        #[test]
+        fn a_child_ended_by_a_signal_is_reported_by_the_signal() {
+            let killed = FakeEngine::new("client-killed", true, "kill -KILL $$");
+            let error = run(&killed, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "engine stdio process was terminated by signal 9"
+            );
+
+            let cut_short = FakeEngine::new(
+                "client-killed-mid-answer",
+                true,
+                "printf '{\"ok\"'\nkill -KILL $$",
+            );
+            let error = run(&cut_short, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope \
+                 (engine stdio process was terminated by signal 9)"
+            );
+        }
+
         /// A child that fails and also leaves something that is not an envelope on
         /// stdout is reported with its exit status (the status says the answer was
         /// cut short, where the parse error alone would not), as a child that
@@ -803,7 +838,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope \
-                 (engine stdio process exited with status exit status: 4); stderr: oops"
+                 (engine stdio process exited with code 4); stderr: oops"
             );
 
             let silent = FakeEngine::new(
@@ -815,7 +850,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope \
-                 (engine stdio process exited with status exit status: 5)"
+                 (engine stdio process exited with code 5)"
             );
 
             let clean = FakeEngine::new("client-garbage-clean", true, "printf 'not json'\nexit 0");
