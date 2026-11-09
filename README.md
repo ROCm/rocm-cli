@@ -1001,6 +1001,14 @@ automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
+An endpoint bound to a public interface (`--allow-public-bind`), or served with
+`--require-api-key`, only answers clients that present its API key as an
+`Authorization: Bearer` header. With the vLLM engine that holds on every route
+the server answers, not just the OpenAI `/v1` API — including vLLM's own
+`/invocations`, `/tokenize` and `/metrics` — with one exception: the `/health`
+liveness check stays open. Because `/metrics` is covered too, `rocm dash`
+cannot show engine metrics for a key-protected vLLM server.
+
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to
 `vllm` and `lemonade`; other engines reject them. For vLLM they are folded

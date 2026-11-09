@@ -810,3 +810,21 @@ Feature: Model serving
     And a stopped managed service is recorded on the default serve port
     When the user restarts the stopped service
     Then the restart is refused naming the service that holds the port
+
+  # An API key on a vLLM endpoint (`--require-api-key`, a public bind, or
+  # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
+  # API: vLLM's own key check guards a fixed set of path prefixes, while the
+  # server also answers inference and tokenizer routes outside them. rocm-cli
+  # starts vLLM with a middleware that demands the key on every route except the
+  # health check. The middleware itself is unit-tested on every PR
+  # (`endpoint_auth` in the vLLM engine crate); this proves it is actually wired
+  # into a real vLLM server. A full extra vLLM serve, so it runs in the merge
+  # queue rather than on every PR.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @merge-queue
+  Scenario: serve-50 - A key-protected vLLM endpoint refuses keyless requests on every route
+    Given a managed runtime is active
+    And a model is being served on GPU behind an API key
+    When a client calls the server's other routes without the key
+    Then every one of those calls is refused as unauthorized
+    And the same calls succeed when the client presents the key
+    And the server's health check still answers without the key

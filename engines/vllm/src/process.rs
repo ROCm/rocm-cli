@@ -235,6 +235,12 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
+    // When `rocm serve` protects an endpoint, the key arrives via the key file
+    // (never argv). It reaches vLLM through the environment, which keeps it out
+    // of the process table, and is enforced on every route by the middleware
+    // `endpoint_auth` installs: vLLM's own `VLLM_API_KEY` check alone leaves
+    // routes such as `/invocations` open.
+    let api_key = rocm_engine_protocol::resolve_endpoint_api_key();
     let mut command = ProcessCommand::new(&runtime.command);
     command
         .args(vllm_serve_args(
@@ -243,16 +249,18 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             request.port,
             vllm_enforce_eager_enabled(),
             request.engine_recipe.as_ref(),
+            api_key.is_some(),
         ))
         .stdin(Stdio::null());
-    // When `rocm serve` protects a public endpoint, the key arrives via the
-    // environment / key file (never argv). Hand it to vLLM as `VLLM_API_KEY` so
-    // its OpenAI server rejects unauthenticated requests; passing it through the
-    // env keeps it out of the process table.
-    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
-        command.env("VLLM_API_KEY", api_key);
-    }
     apply_therock_env(&mut command, runtime)?;
+    // After `apply_therock_env`, which may set its own `PYTHONPATH` entry.
+    if let Some(api_key) = api_key.as_deref() {
+        crate::endpoint_auth::protect_endpoint(
+            &mut command,
+            api_key,
+            &crate::endpoint_auth::module_dir(&AppPaths::discover()?),
+        )?;
+    }
     rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
     if let Some(log_path) = log_path {
         let log = fs::File::create(log_path)
@@ -526,12 +534,16 @@ fn apply_vllm_rocm10_discover_env(
 /// supply a default — vLLM's own default applies unless the user asks for a
 /// specific fraction via `rocm serve --gpu-memory-utilization`, which arrives
 /// here through the engine recipe's `required_flags`.
+///
+/// `require_api_key` adds the `--middleware` that enforces the endpoint key on
+/// every route (see [`crate::endpoint_auth`]).
 fn vllm_serve_args(
     model_ref: &str,
     host: &str,
     port: u16,
     enforce_eager: bool,
     engine_recipe: Option<&EngineRecipeHint>,
+    require_api_key: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "serve".to_owned(),
@@ -549,6 +561,9 @@ fn vllm_serve_args(
         args.push("--enforce-eager".to_owned());
     }
     args.extend(engine_recipe_launch_args(engine_recipe));
+    if require_api_key {
+        args.extend(crate::endpoint_auth::middleware_args());
+    }
     args
 }
 /// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
@@ -583,7 +598,10 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
 }
 
-fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Result<OsString> {
+pub(crate) fn prepend_path_entries(
+    entries: &[PathBuf],
+    current: Option<OsString>,
+) -> Result<OsString> {
     let mut parts = Vec::new();
     for entry in entries {
         if !entry.as_os_str().is_empty() && !parts.iter().any(|part: &PathBuf| part == entry) {
@@ -815,7 +833,7 @@ mod tests {
 
     #[test]
     fn vllm_serve_args_omit_gpu_memory_utilization_without_override() {
-        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None);
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None, false);
 
         assert_eq!(
             args,
@@ -842,7 +860,14 @@ mod tests {
             ..EngineRecipeHint::default()
         };
 
-        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, true, Some(&hint));
+        let args = vllm_serve_args(
+            "facebook/opt-125m",
+            "127.0.0.1",
+            8000,
+            true,
+            Some(&hint),
+            false,
+        );
 
         let position = args
             .iter()
@@ -850,6 +875,32 @@ mod tests {
             .expect("explicit utilization must reach the spawned argv");
         assert_eq!(args.get(position + 1).map(String::as_str), Some("0.35"));
         assert!(args.contains(&"--enforce-eager".to_owned()));
+    }
+    #[test]
+    fn vllm_serve_args_install_the_auth_middleware_when_a_key_is_required() {
+        let args = vllm_serve_args("facebook/opt-125m", "0.0.0.0", 8000, false, None, true);
+
+        let position = args
+            .iter()
+            .position(|arg| arg == "--middleware")
+            .expect("a keyed endpoint must be launched with the auth middleware");
+        assert_eq!(
+            args.get(position + 1).map(String::as_str),
+            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("api-key")),
+            "the key itself must never reach argv: {args:?}"
+        );
+    }
+    #[test]
+    fn vllm_serve_args_omit_the_auth_middleware_without_a_key() {
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None, false);
+        assert!(
+            !args.iter().any(|arg| arg == "--middleware"),
+            "an unkeyed endpoint must not load the middleware, which refuses to construct \
+             without a key: {args:?}"
+        );
     }
     #[test]
     fn resolve_model_echoes_matching_engine_recipe() -> Result<()> {

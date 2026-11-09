@@ -983,7 +983,35 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
-## 7. ComfyUI Verification
+## 7. vLLM Endpoint Key Coverage
+
+Needs a Linux or WSL host where the vLLM engine can start. Check that an
+endpoint key covers every route the vLLM server answers, not only `/v1`:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve Qwen/Qwen3.5-0.8B --engine vllm --require-api-key --managed
+PORT=<the port the deployment summary's endpoint shows>
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/invocations" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"hi"}]}'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/tokenize" \
+  -H 'Content-Type: application/json' -d '{"model":"Qwen/Qwen3.5-0.8B","prompt":"hi"}'
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$PORT/health"
+```
+
+Expected result:
+
+- The `/invocations` and `/tokenize` calls print `401`.
+- Repeating them with `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"` prints
+  `200`.
+- The `/health` call prints `200` without the key.
+
+Stop the service afterwards (`rocm services stop <service-id> --yes`). The
+automated scenario is `serve-vllm-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+
+## 8. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -1062,7 +1090,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 8. Optional Cloud Provider Key
+## 9. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -1087,7 +1115,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 9. Optional Provider-Assisted Planning
+## 10. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
@@ -1115,7 +1143,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 10. Uninstall
+## 11. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):
@@ -1155,7 +1183,7 @@ Expected result:
 
   At a terminal, the same command asks `[y/N]` and treats Enter as no.
 
-## 11. AIM (Docker) Engine Verification
+## 12. AIM (Docker) Engine Verification
 
 Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
 succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
@@ -1220,7 +1248,7 @@ Expected result:
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
 
-## 11. Background Automation Helper
+## 12. Background Automation Helper
 
 The helper (`rocm daemon`) runs only while an automation watcher is enabled.
 Start from a fresh config (all watchers off) and use a scratch
@@ -1251,7 +1279,7 @@ Expected result:
   seconds before the helper exits) still ends with a helper running: enable
   waits for an exiting helper to finish, then starts a new one.
 
-## 12. Context-Size Estimate for a GGUF Model
+## 13. Context-Size Estimate for a GGUF Model
 
 Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
 by design) and network access to Hugging Face. The point is to check the
