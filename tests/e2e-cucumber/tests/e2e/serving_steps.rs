@@ -11,6 +11,11 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+use e2e_cucumber::device_memory::{
+    DeviceMemory, DrainWait, MIN_PROBE_BUDGET, Pool, Probe, bounded_stdout, describe_verdict,
+    judge, parse_amd_smi_vram, parse_rocm_smi_csv_pool, probe_budget, sample_device_memory,
+    sample_is_truncated,
+};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
@@ -299,124 +304,111 @@ async fn ensure_serve_port_free() -> String {
     wait_for_free_vram().await
 }
 
-/// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
-/// scenario model can allocate its engine's memory share without tripping its
-/// startup check: Qwen3.6-27B plus vLLM's default fraction-of-total KV
-/// reservation needs the MI300X mostly clear. Only a data-center GPU has this
-/// much, so on smaller cards (e.g. Strix Halo's smaller unified-memory pool) the
-/// floor is capped to 90% of the device total (see [`required_free_vram_mib`]) —
-/// otherwise the check could never pass. Note the cap no longer sits above what
-/// vLLM asks for: rocm-cli used to pin utilization below it, and now defers to
-/// vLLM's own (higher) default, so the wait has little headroom left and can
-/// time out on a device that is merely holding display memory. The wait is
-/// best-effort and the serve proceeds regardless, so this costs time rather
-/// than correctness; sizing a deliberate margin is follow-up work.
-const MAX_FREE_VRAM_FLOOR_MIB: u64 = 150_000;
-
-/// The free-VRAM floor to wait for on this host: the model-sized ceiling, but
-/// never more than 90% of the device's total VRAM. A hardcoded 150 GiB floor is
-/// unreachable on a small card (e.g. Strix Halo's ~48 GiB unified VRAM), so
-/// `wait_for_free_vram` would burn its full deadline on every serve scenario;
-/// scaling to the device keeps the drain-check meaningful everywhere.
-fn required_free_vram_mib(total_mib: u64) -> u64 {
-    MAX_FREE_VRAM_FLOOR_MIB.min(total_mib / 100 * 90)
-}
-
 /// How long to wait for a stopped engine to hand its device memory back.
 const VRAM_DRAIN_DEADLINE: Duration = Duration::from_mins(2);
 
-/// Best-effort: wait until the GPU reports enough free VRAM (see
-/// [`required_free_vram_mib`]), so a just-killed serve's memory is actually
-/// reclaimed before the next serve starts. Queries `amd-smi` then `rocm-smi`;
-/// if neither is present (mock/local, no ROCm), returns immediately so non-GPU
-/// runs are unaffected.
+/// Pause between two samples of the device.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Best-effort: wait until the pool the engine allocates from reports enough
+/// free memory (see [`select_drain_target`]: VRAM on a discrete card, GTT on an
+/// APU whose VRAM is only a BIOS carveout), so a just-killed serve's memory is
+/// actually reclaimed before the next serve starts. Queries `amd-smi` then
+/// `rocm-smi`; if neither is present (mock/local, no ROCm), returns immediately
+/// so non-GPU runs are unaffected.
 ///
 /// The wait is bounded and best-effort: on timeout the serve still starts,
 /// because a stale reading must not turn a slow drain into a hard failure. The
-/// returned line records which of the two happened — an undrained device is the
-/// single most likely reason the serve that follows never becomes ready, and
-/// without it the failure looks identical to a genuinely broken serve.
+/// returned line records what happened — an undrained device is the single most
+/// likely reason the serve that follows never becomes ready, and without it the
+/// failure looks identical to a genuinely broken serve. A tool that is installed
+/// but never produces a reading is given up on after a few samples
+/// (`UNREAD_SAMPLES_BEFORE_GIVING_UP`) and reported as unreadable, not as
+/// undrained; the decisions and the wording live in `DrainWait` and
+/// `describe_verdict`, where they are tested.
 async fn wait_for_free_vram() -> String {
-    // No GPU tooling → nothing to wait on (mock/local). Probe once up front.
-    let Some(total) = total_vram_mib() else {
-        return "device state: no GPU tooling (mock/local run)".to_owned();
-    };
-    let floor = required_free_vram_mib(total);
-    let deadline = Instant::now() + VRAM_DRAIN_DEADLINE;
+    // Started before the first probe so that probe counts against the wait.
+    let started = Instant::now();
+    let deadline = started + VRAM_DRAIN_DEADLINE;
+    let mut wait = DrainWait::default();
     loop {
-        let free = free_vram_mib();
-        if let Some(free) = free
-            && free >= floor
-        {
-            return format!(
-                "device state: drained ({free} MiB free of {total} MiB, floor {floor} MiB)"
-            );
+        // Every probe is held to the time left, so the wait ends at its deadline
+        // rather than a few probe timeouts after it. A sample started with less
+        // than a full probe timeout left is `truncated`: if it gives no reading
+        // that is the deadline's doing, not the tool's, and is not counted.
+        let truncated = sample_is_truncated(Instant::now(), deadline);
+        let sample = judge(probe_device_memory(deadline).await);
+        if let Some(verdict) = wait.observe_truncated(sample, truncated) {
+            return describe_verdict(verdict, started.elapsed().as_secs());
         }
-        if Instant::now() >= deadline {
-            let free = free.map_or_else(|| "unreadable".to_owned(), |mib| format!("{mib} MiB"));
-            return format!(
-                "device state: NOT drained after {}s ({free} free of {total} MiB, floor \
-                 {floor} MiB) — a previous engine is still holding the GPU",
-                VRAM_DRAIN_DEADLINE.as_secs()
-            );
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(left.min(DRAIN_POLL_INTERVAL)).await;
+        if deadline.saturating_duration_since(Instant::now()) < MIN_PROBE_BUDGET {
+            return describe_verdict(wait.timed_out(), started.elapsed().as_secs());
+        }
     }
 }
 
-/// Free device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`). `None`
-/// when no such tool exists or its output can't be parsed.
-fn free_vram_mib() -> Option<u64> {
-    vram_mib().map(|(_total, free)| free)
+/// Device memory for GPU 0 off the async worker: VRAM via `amd-smi` (then
+/// `rocm-smi`), plus the GTT pool from `rocm-smi` where the host needs it (see
+/// [`sample_device_memory`] for when GTT is read and what a failed read means).
+/// `amd-smi` is not asked for GTT: its output has no field this harness has been
+/// checked against, whereas the preflight step already reads `rocm-smi`'s GTT
+/// rows on these hosts. It runs subprocesses, each bounded by `probe_budget` (at
+/// most the probe timeout, never past `deadline`), so the blocking thread it
+/// occupies is released.
+async fn probe_device_memory(deadline: Instant) -> Probe<DeviceMemory> {
+    tokio::task::spawn_blocking(move || {
+        sample_device_memory(|| vram_pool(deadline), || gtt_pool(deadline))
+    })
+    .await
+    .unwrap_or(Probe::Unreadable)
 }
 
-/// Total device VRAM in MiB for GPU 0. `None` when no GPU tool is available —
-/// used as the "is there a GPU to wait on at all?" probe in mock/local runs.
-fn total_vram_mib() -> Option<u64> {
-    vram_mib().map(|(total, _free)| total)
+/// GTT for GPU 0, via `rocm-smi`. The command is named in the report when its
+/// output is not understood, so the first run on a host shows the CSV header the
+/// column names were meant to match.
+///
+/// What is and is not checked: `gpu-preflight.sh` matches the labels
+/// `GTT Total Memory` and `GTT Total Used Memory` in `rocm-smi`'s plain-text
+/// `--showmeminfo vram gtt` output, so those labels are known to exist there.
+/// That `--showmeminfo gtt --csv` uses the same words as its column headers is
+/// not checked against real output; it is assumed by analogy with the VRAM CSV.
+/// Warning lines before the header are skipped (see [`parse_rocm_smi_csv_pool`]).
+fn gtt_pool(deadline: Instant) -> Probe<Pool> {
+    use std::process::Command;
+    let mut command = Command::new("rocm-smi");
+    command.args(["--showmeminfo", "gtt", "--csv"]);
+    bounded_stdout(command, probe_budget(Instant::now(), deadline))
+        .parse_text("rocm-smi --showmeminfo gtt --csv", |text| {
+            parse_rocm_smi_csv_pool(text, "GTT Total Memory", "GTT Total Used Memory")
+        })
 }
 
-/// `(total, free)` device VRAM in MiB for GPU 0, via `amd-smi` (then `rocm-smi`).
-/// `None` when no such tool exists or its output can't be parsed.
-fn vram_mib() -> Option<(u64, u64)> {
+/// Device VRAM for GPU 0, via `amd-smi` (then `rocm-smi`).
+fn vram_pool(deadline: Instant) -> Probe<Pool> {
     use std::process::Command;
     // amd-smi: lines like "        TOTAL_VRAM: 196592 MB" / "FREE_VRAM: 196309 MB".
-    if let Ok(out) = Command::new("amd-smi").args(["metric", "-m"]).output()
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let field = |name: &str| {
-            text.lines()
-                .find_map(|l| l.trim().strip_prefix(name))
-                .and_then(|v| v.split_whitespace().next())
-                .and_then(|n| n.parse::<u64>().ok())
-        };
-        if let (Some(total), Some(free)) = (field("TOTAL_VRAM:"), field("FREE_VRAM:")) {
-            return Some((total, free));
-        }
-    }
+    let amd_smi = || {
+        let mut command = Command::new("amd-smi");
+        command.args(["metric", "-m"]);
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
+            .parse_text("amd-smi metric -m", parse_amd_smi_vram)
+    };
     // rocm-smi fallback: `--showmeminfo vram --csv` → vram total/used per card.
-    if let Ok(out) = Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram", "--csv"])
-        .output()
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let rocm_smi = || {
+        let mut command = Command::new("rocm-smi");
+        command.args(["--showmeminfo", "vram", "--csv"]);
         // CSV columns include "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)".
-        // Parse the first data row's total and used to derive free.
-        let mut lines = text.lines();
-        let header = lines.next()?;
-        let cols: Vec<&str> = header.split(',').collect();
-        let total_idx = cols.iter().position(|c| c.contains("Total Memory"))?;
-        let used_idx = cols.iter().position(|c| c.contains("Total Used Memory"))?;
-        let row = lines.next()?;
-        let vals: Vec<&str> = row.split(',').collect();
-        let total: u64 = vals.get(total_idx)?.trim().parse().ok()?;
-        let used: u64 = vals.get(used_idx)?.trim().parse().ok()?;
-        let mib = 1024 * 1024;
-        return Some((total / mib, total.saturating_sub(used) / mib));
-    }
-    None
+        bounded_stdout(command, probe_budget(Instant::now(), deadline))
+            .parse_text("rocm-smi --showmeminfo vram --csv", |text| {
+                parse_rocm_smi_csv_pool(text, "Total Memory", "Total Used Memory")
+            })
+    };
+    amd_smi().or_else(rocm_smi)
 }
 
 /// Kill whatever process is listening on `port`. Best-effort and
