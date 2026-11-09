@@ -28,6 +28,7 @@ mod archive_props;
 mod backend_alignment;
 mod device_policy;
 mod direct_llama;
+mod footprint;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -371,14 +372,31 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             bail!("scripted Lemonade backend install failure")
         })?;
     }
-    eprintln!(
-        "Preparing Lemonade embeddable {}...",
-        rocm_deps::LEMONADE_VERSION
-    );
     let env_root = request
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
+    // Announced and space-checked before anything is downloaded: a fresh tree
+    // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
+    if let Some(preflight) = crate::footprint::plan_install_preflight(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::footprint::available_space_for_install,
+    ) {
+        for line in preflight.notice_lines() {
+            eprintln!("{line}");
+        }
+        match preflight.space_verdict() {
+            crate::footprint::SpaceVerdict::Fits => {}
+            crate::footprint::SpaceVerdict::Tight(warning) => eprintln!("{warning}"),
+            crate::footprint::SpaceVerdict::Refuse(message) => bail!(message),
+        }
+    }
+    eprintln!(
+        "Preparing Lemonade embeddable {}...",
+        rocm_deps::LEMONADE_VERSION
+    );
     let mut manifest =
         crate::install::prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
     eprintln!("Detecting best supported Lemonade llama.cpp backend...");
