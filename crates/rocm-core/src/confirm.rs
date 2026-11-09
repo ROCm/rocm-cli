@@ -79,8 +79,10 @@ pub fn print_prompt(out: &mut impl Write, prompt: &str) -> std::io::Result<()> {
 ///
 /// Two things are written to `out` so the caller's own message lands where the
 /// user can read it:
-/// - when the line did not end in a newline (EOF, as from Ctrl-D, so none was
-///   echoed), a newline, ending the prompt line;
+/// - when the line did not end in a newline (EOF, as from Ctrl-D, or piped input
+///   with no final newline such as `printf no |`), a newline, ending the prompt
+///   line: either way nothing echoed a line end, so the cursor is still on the
+///   prompt line and the caller's next line would run into it;
 /// - when the answer is [`Answer::Unrecognized`], a line saying it is being
 ///   treated as no.
 ///
@@ -310,6 +312,16 @@ mod tests {
         let (verdict, written) = answer_and_output(b"yes");
         assert!(verdict, "a yes is a yes with or without the final newline");
         assert_eq!(written, "\n", "the unfinished prompt line is still ended");
+    }
+
+    #[test]
+    fn read_answer_for_a_no_without_a_newline_declines_and_only_ends_the_prompt_line() {
+        // Piped input such as `printf no |` has no final newline either. The
+        // verdict is the decline `no\n` gives and nothing explains it, but the
+        // prompt line is still ended: no newline was echoed after the prompt.
+        let (verdict, written) = answer_and_output(b"no");
+        assert!(!verdict, "a no is a no with or without the final newline");
+        assert_eq!(written, "\n", "only the unfinished prompt line is ended");
     }
 
     #[test]
