@@ -84,6 +84,11 @@ vt100 = "0.16"
 # "inference verified" latch is the field the product reads), never the library
 # itself, and `xtask check-crate-edges` exempts dev edges by design — so keeping
 # it here needs no allowlist entry.
+#
+# For the same reason the library's `device_memory::bounded_stdout` cannot call
+# `rocm_core::process::run_with_timeout`: it repeats that helper's spawn, poll,
+# kill and reap steps on `std` alone, deliberately, and a normal dependency
+# would be a new edge to review. A change to either one should look at the other.
 rocm-core = { path = "../../crates/rocm-core" }
 # `test-util` pauses tokio's clock in the retry loops' unit tests
 # (`#[tokio::test(start_paused = true)]`), so their timing assertions read a

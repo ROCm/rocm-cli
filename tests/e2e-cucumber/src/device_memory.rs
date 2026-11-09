@@ -579,8 +579,13 @@ const SMI_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// `rocm-smi`) do not fork helpers that outlive them, and the drain wait makes
 /// a handful of calls, so this is accepted rather than guarded.
 ///
-/// Written against `std` alone because `rocm_core::process::run_with_timeout`
-/// is reachable here only as a dev-dependency, and this module is library code.
+/// Written against `std` alone, so it repeats the spawn, poll, kill and reap
+/// steps of `rocm_core::process::run_with_timeout` on purpose: `rocm-core` is
+/// only a dev-dependency of this crate (see its entry in `Cargo.toml`) and this
+/// module is library code, and a normal dependency would be a new first-party
+/// edge that `cargo xtask check-crate-edges` makes a reviewed addition. The two
+/// can drift, so a change to either one's kill or drain behaviour should look at
+/// the other.
 pub fn bounded_stdout(mut command: Command, timeout: Duration) -> Probe<String> {
     let mut child = match command
         .stdin(Stdio::null())
