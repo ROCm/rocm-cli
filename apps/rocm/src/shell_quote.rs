@@ -33,7 +33,9 @@
 //! That implementation is [`rocm_core::posix_shell_quote`], the quoter
 //! `rocm-core` keeps for command lines with execution stakes, with its own
 //! real-`sh` read-back test. This module is the CLI's name for it, plus the
-//! control-character predicate the chat guards share.
+//! two predicates the chat guards share: the control-character one, and the
+//! characters a model-chosen value may not carry onto a line meant to be
+//! pasted.
 //!
 //! `rocm-dash-tui` renders its approval previews with a copy,
 //! `ui::exec::quote_display_arg`, because it may not depend on `rocm-core`
@@ -54,9 +56,13 @@
 //! double-quoted form happened to paste cleanly into `cmd.exe`; `'…'` does not.
 //! It is correct in any POSIX shell (bash, sh, WSL). PowerShell also reads
 //! `'…'` literally, but escapes an embedded `'` as `''` rather than `'\''`, so a
-//! value containing a single quote is the one case that does not paste cleanly
-//! there. On Windows it is still unambiguous to a *reader* — which is what an
-//! approval gate needs — where the old form was ambiguous everywhere.
+//! value containing a single quote does not paste cleanly there — and not
+//! merely untidily: PowerShell reads `'\''` as the end of the string followed
+//! by live syntax. `cmd.exe` gives single quotes no meaning, so its own
+//! metacharacters stay live inside them. For a value the *model* chose, both
+//! are closed by refusal rather than quoting ([`paste_unsafe_character`]); a
+//! value the user typed is rendered as typed and reads correctly in a POSIX
+//! shell.
 
 /// Quote `value` so a POSIX shell reads it back as exactly one word equal to
 /// `value`.
@@ -80,22 +86,59 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// whoever supplied the argument. A value in this shape is refused upstream
 /// rather than rendered.
 ///
-/// The predicate is [`rocm_core::terminal::is_control_or_format`] — C0, DEL
-/// and C1 (so ESC and the 8-bit CSI alike), plus the Unicode format characters:
-/// a bidi override such as U+202E reorders how the rest of the line is drawn,
-/// and a zero-width character hides a difference between what is shown and
-/// what runs. U+2028/U+2029 are added, through
-/// [`rocm_core::terminal::is_control_or_line_separator`], because a terminal
-/// may start a new row at either, which would let a value forge a line of its
-/// own. That is the predicate the terminal classifier and the vLLM symptom
-/// guard share for the same reason, so the set of line-breaking characters is
-/// decided in one place.
+/// The predicate is [`rocm_core::terminal::is_display_altering`]: C0, DEL and
+/// C1 (so ESC and the 8-bit CSI alike); the Unicode format characters, where a
+/// bidi override such as U+202E reorders how the rest of the line is drawn and
+/// a zero-width character hides a difference between what is shown and what
+/// runs; U+2028/U+2029, at which a terminal may start a new row, letting a
+/// value forge a line of its own; and the rest of Unicode's default-ignorable
+/// set, such as the tag characters, which can carry a whole string with no
+/// glyph. It is the set `rocm chat` removes from the prose it prints
+/// ([`rocm_core::terminal::sanitize_terminal_text`]), so nothing in a refused
+/// value would have survived there either.
 pub(crate) fn has_terminal_control_character(value: &str) -> bool {
-    value.chars().any(|character| {
-        rocm_core::terminal::is_control_or_format(character)
-            || rocm_core::terminal::is_control_or_line_separator(character)
+    value.chars().any(rocm_core::terminal::is_display_altering)
+}
+
+/// The characters that make a value unsafe on a command line meant to be
+/// pasted, when the value is one the model chose: `'` and the typographic
+/// single quotes (U+2018 to U+201B), and `& | < > ^ % " !`.
+///
+/// Every value is POSIX-quoted ([`shell_quote`]), which is enough for `sh`,
+/// bash and WSL. Windows shells read the same line differently:
+///
+/// * PowerShell reads `'…'` literally too, but escapes an embedded single
+///   quote as `''`, and takes the typographic single quotes as quotes as well.
+///   POSIX's `'\''` therefore reads there as the end of the string followed by
+///   live syntax, so the rest of the value would run.
+/// * `cmd.exe` gives single quotes no meaning at all, so `& | < > ^ % "` keep
+///   theirs inside them: `&` and `|` start another command, `<` and `>`
+///   redirect, `^` escapes, `%` expands a variable and `"` toggles quoting, and
+///   with delayed expansion `!` expands a variable too.
+///
+/// Quoting cannot cover all three readings at once, so a value the model chose
+/// is refused if it holds one of these, and the user supplies it themselves.
+/// Values the user typed are never held to this; they are rendered as typed.
+/// Everything else a POSIX shell treats specially (`$`, `` ` ``, `;`, `(`,
+/// spaces…) is inert inside single quotes in POSIX shells and PowerShell, and
+/// stays accepted and quoted. `cmd.exe` still splits an unquoted space, so a
+/// value with a space does not paste there as one argument, but nothing in it
+/// can run as a command of its own.
+pub(crate) fn paste_unsafe_character(value: &str) -> Option<char> {
+    value.chars().find(|&character| {
+        matches!(
+            character,
+            '\'' | '&' | '|' | '<' | '>' | '^' | '%' | '"' | '!'
+        ) || TYPOGRAPHIC_SINGLE_QUOTES.contains(&u32::from(character))
     })
 }
+
+/// U+2018 to U+201B, the typographic single quotes PowerShell also takes as
+/// quote characters. Held as code points rather than `char` literals: they
+/// are only compared against, never printed, and the ASCII-output contract
+/// (`xtask/src/ascii_output_contract.rs`) reads a non-ASCII `char` literal as
+/// text that may reach a console.
+const TYPOGRAPHIC_SINGLE_QUOTES: std::ops::RangeInclusive<u32> = 0x2018..=0x201b;
 
 /// The argument generator the CLI's preview property tests share.
 ///
@@ -320,6 +363,55 @@ mod tests {
         }
         for value in ["/mnt/my folder", "qwen2.5-7b", "x'; rm -rf ~; echo '", "é"] {
             assert!(!has_terminal_control_character(value), "{value:?}");
+        }
+    }
+
+    /// Default-ignorable characters outside the `Cf` category: invisible,
+    /// and each one lets two values that look identical differ.
+    #[test]
+    fn invisible_non_format_characters_are_refused_too() {
+        for value in [
+            "qwen\u{3164}",  // Hangul filler, renders as blank space
+            "qwen\u{e0041}", // tag character, spells ASCII with no glyph
+            "qwen\u{fe0f}",  // variation selector
+            "qwen\u{034f}x", // combining grapheme joiner
+        ] {
+            assert!(has_terminal_control_character(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn paste_unsafe_characters_are_the_quotes_and_the_cmd_metacharacters() {
+        for (value, found) in [
+            ("it's", '\''),
+            ("a\u{2018}b", '\u{2018}'),
+            ("a\u{2019}b", '\u{2019}'),
+            ("a\u{201a}b", '\u{201a}'),
+            ("a\u{201b}b", '\u{201b}'),
+            ("C:\\R&D", '&'),
+            ("a|b", '|'),
+            ("a<b", '<'),
+            ("a>b", '>'),
+            ("a^b", '^'),
+            ("%USERPROFILE%\\rocm", '%'),
+            ("a\"b", '"'),
+            ("a!b", '!'),
+        ] {
+            assert_eq!(paste_unsafe_character(value), Some(found), "{value:?}");
+        }
+        // Inert inside single quotes in POSIX shells and PowerShell, and with no
+        // command meaning in cmd.exe: still accepted, and quoted.
+        for value in [
+            "/mnt/my folder",
+            "$(id)",
+            "`id`",
+            "a;b",
+            "C:\\Program Files\\ROCm",
+            "qwen2.5:7b",
+            "repo@main",
+            "a\u{201c}b\u{201d}",
+        ] {
+            assert_eq!(paste_unsafe_character(value), None, "{value:?}");
         }
     }
 }

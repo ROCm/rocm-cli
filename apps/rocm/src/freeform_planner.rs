@@ -1022,6 +1022,10 @@ pub(crate) fn validate_provider_planner_tool_call(
             format_structured_tool_call("rocm", &call.args)
         ),
     }
+    // The planner is a model, and its argv becomes the plan's `tool_call:` and
+    // `next_tool_call:` lines, which are offered to be run. Checked last, so
+    // the rules above keep their own refusals.
+    tool_policy::validate_model_chosen_argv(&call.args, "provider planner")?;
     Ok(call.args.clone())
 }
 
@@ -1883,6 +1887,40 @@ mod tests {
 
             assert!(error.contains("--managed"), "unexpected error: {error}");
         }
+    }
+
+    /// The planner's argv becomes the plan's `tool_call:` line, which is offered
+    /// to be run, so a value a Windows shell reads as syntax is refused there
+    /// as it is from the chat assistant, and a serve reference is held to the
+    /// same character set.
+    #[test]
+    fn provider_planner_refuses_values_unsafe_to_paste() {
+        for args in [
+            vec!["install", "sdk", "--prefix", "/mnt/R&D"],
+            vec!["install", "sdk", "--prefix", "/mnt/o'brien"],
+            vec!["serve", "qwen%PATH%", "--managed"],
+            vec!["serve", "qwen;id", "--managed"],
+        ] {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            };
+            let error = validate_provider_planner_tool_call(&call)
+                .expect_err(&format!("{args:?}"))
+                .to_string();
+            assert!(
+                error.starts_with("provider planner ")
+                    && (error.contains("supply it yourself") || error.contains("only letters")),
+                "{args:?}: {error}"
+            );
+        }
+        let ordinary = ProviderPlannerToolCall {
+            tool: "rocm".to_owned(),
+            args: ["install", "sdk", "--prefix", "/mnt/my rocm"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        validate_provider_planner_tool_call(&ordinary).expect("a space is quoted, not refused");
     }
 
     #[test]

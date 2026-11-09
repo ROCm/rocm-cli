@@ -307,7 +307,10 @@ pub(crate) enum Command {
     /// In a terminal with no --prompt, opens the interactive chat (switch
     /// providers there with /provider; --provider, --model, and --tools don't
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
-    /// prompt and prints the reply. Use `rocm config enable-provider` and
+    /// prompt and prints the reply, with terminal escape sequences removed. With
+    /// --tools, a value the assistant chose that a Windows shell would read as
+    /// syntax (a single quote, or & | < > ^ % " !) is refused rather than shown
+    /// in a command to paste. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
     /// `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \

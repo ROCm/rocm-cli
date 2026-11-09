@@ -1396,6 +1396,16 @@ standard input, it sends one prompt and prints the reply.
   forwarded to the request. Each is independent, so omit any of them to use the
   provider's default.
 
+The reply, tool output and error messages are printed with terminal escape
+sequences and invisible characters removed, so a reply cannot hide part of a
+line, retitle the window or write the clipboard; text it tried to hide is
+shown. A change the assistant asks for with `--tools` is not made from
+`--prompt`: it is shown as an `advanced manual command:` line, quoted for a
+POSIX shell. A value the assistant chose is refused if it holds a character
+that PowerShell or `cmd.exe` would read as syntax inside those quotes (a single
+quote, or any of `& | < > ^ % " !`); the message tells you to run the command
+yourself with that value. Values you typed are shown as typed.
+
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
 That backend logs a warning and ignores all three sampling flags. This is an

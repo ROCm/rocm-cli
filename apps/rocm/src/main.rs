@@ -320,11 +320,20 @@ fn exit_code_for(result: Result<()>) -> ExitCode {
                 // ignore a failed write here rather than `eprintln!`, which panics.
                 // A caller with a closed stderr pipe must still see exit code 1, not
                 // a panic that replaces it.
-                let _ = writeln!(io::stderr(), "Error: {e:?}");
+                let _ = writeln!(io::stderr(), "{}", render_error_for_terminal(&e));
                 ExitCode::FAILURE
             }
         }
     }
+}
+
+/// The `Error: …` report `exit_code_for` prints, in the standard `{:?}` form,
+/// with terminal escape sequences and other display-altering characters
+/// removed: an error can quote text this process did not write — a model's
+/// tool name or argument, a provider's error body — and stderr is a terminal
+/// too.
+fn render_error_for_terminal(error: &anyhow::Error) -> String {
+    rocm_core::terminal::sanitize_terminal_text(&format!("Error: {error:?}"))
 }
 
 fn run() -> Result<()> {
@@ -1296,6 +1305,19 @@ pub(crate) mod tests {
     fn exit_code_for_generic_error_is_failure() {
         let err = anyhow::anyhow!("boom");
         assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// An error can quote a model's or a provider's text, and it is printed to
+    /// a terminal: the escape sequences go, the text around them stays, and
+    /// the `Caused by:` layout of the standard report survives.
+    #[test]
+    fn an_error_quoting_untrusted_text_is_printed_without_its_escapes() {
+        let error = anyhow::anyhow!("provider said `x\u{1b}[2K\u{1b}]0;title\u{7}y\u{9b}1A`")
+            .context("chat request failed");
+        assert_eq!(
+            super::render_error_for_terminal(&error),
+            "Error: chat request failed\n\nCaused by:\n    provider said `xy`"
+        );
     }
 
     /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`

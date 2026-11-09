@@ -242,7 +242,7 @@ async fn run_rocm_read_tool(
     let Some(exec) = exec.cloned() else {
         return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
     };
-    match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
+    match tokio::task::spawn_blocking(move || exec.execute_model_call(name, &args)).await {
         Ok(RocmToolOutcome::Result(v)) => v,
         Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
         Ok(RocmToolOutcome::ApprovalRequired(_)) => {
@@ -497,7 +497,7 @@ macro_rules! rocm_mutating_tool {
                 record(&self.fired, $name);
                 match self.executor.as_ref() {
                     None => Ok(json!({ "error": "ROCm tools unavailable in this mode." })),
-                    Some(e) => match e.execute($name, &args) {
+                    Some(e) => match e.execute_model_call($name, &args) {
                         RocmToolOutcome::ApprovalRequired(intent) => {
                             if let Some(tx) = self.approval_tx.as_ref() {
                                 let _ = tx.send(ClientMsg::ChatApprovalRequired { intent });
@@ -1098,6 +1098,50 @@ mod tests {
         fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
             self.execute(name, args)
         }
+    }
+
+    /// Executor that answers differently through its two entry points, so a
+    /// test can tell which one a tool used.
+    #[derive(Debug)]
+    struct EntryPointExec;
+    impl crate::tool_exec::RocmToolExecutor for EntryPointExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(json!({ "via": "execute" }))
+        }
+        fn execute_model_call(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(json!({ "via": "execute_model_call" }))
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    /// The agent's tools are the model's calls, so they go through
+    /// `execute_model_call`, where the bin applies the rules only a
+    /// model-chosen value is held to; `execute` is for the operator's own
+    /// slash commands.
+    #[tokio::test]
+    async fn the_agents_tools_reach_the_executor_as_model_calls() {
+        let read = ExamineRocmTool {
+            executor: Some(Arc::new(EntryPointExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(
+            read.call(json!({})).await.expect("tool call ok"),
+            json!({ "via": "execute_model_call" })
+        );
+        let mutating = InstallSdkRocmTool {
+            executor: Some(Arc::new(EntryPointExec)),
+            approval_tx: None,
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(
+            mutating
+                .call(json!({ "prefix": "/tmp/x" }))
+                .await
+                .expect("tool call ok"),
+            json!({ "via": "execute_model_call" })
+        );
     }
 
     /// In-memory `tracing` writer, so a test can read back what was logged.

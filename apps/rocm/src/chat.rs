@@ -58,6 +58,7 @@ pub(crate) use crate::tool_policy::{
 };
 pub(crate) use crate::tool_policy::{
     chat_tool_approval_request, chat_tool_call_is_read_only, validate_chat_tool_call,
+    validate_model_chosen_tool_call,
 };
 use crate::{ChatInferenceParams, providers};
 use anyhow::{Context, Result};
@@ -166,7 +167,9 @@ pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<Strin
         "Choose Chat source to switch between local and remote assistants."
     );
     let _ = writeln!(output, "Choose Settings to manage saved keys and defaults.");
-    Ok(output)
+    // The model names come from a provider or a local server's listing, which
+    // this process did not write.
+    Ok(rocm_core::terminal::sanitize_terminal_text(&output))
 }
 
 fn plain_provider_auth_status(status: &str) -> String {
