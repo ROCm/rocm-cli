@@ -237,7 +237,11 @@ writes are covered that way: the request to the child's stdin, and the forwardin
 of the child's stderr to this process's stderr (a line of progress, and the note
 recorded when reading it fails). The forwarding test writes into a real pipe whose
 reader is closed, because a mock sink that returns `BrokenPipe` itself never
-raises the signal. `FakeEngine` quotes the response and its scratch directory
+raises the signal. Each forwarding write is guarded on its own, never the loop
+around it, because the reads between lines block for as long as the engine is
+quiet and the disposition is process-wide; a third re-executed test,
+`forwarding_guards_each_write_and_never_the_reads_between_them`, records the
+disposition inside every read and every write and after the loop. `FakeEngine` quotes the response and its scratch directory
 for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
 apostrophe, reaches the client intact.
 

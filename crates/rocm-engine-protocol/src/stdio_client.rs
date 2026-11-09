@@ -975,6 +975,102 @@ mod tests {
             }
         }
 
+        /// Whether SIGPIPE is ignored right now, read by installing the same
+        /// disposition back.
+        #[allow(unsafe_code)] // libc::signal
+        fn sigpipe_is_ignored() -> bool {
+            // SAFETY: reading/installing a signal disposition is always safe.
+            let current = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            // SAFETY: putting back what was just read.
+            unsafe {
+                libc::signal(libc::SIGPIPE, current);
+            }
+            current == libc::SIG_IGN
+        }
+
+        /// Forwarding guards each write on its own and never holds SIGPIPE ignored
+        /// across the reads between them. The reads block for as long as the engine
+        /// is quiet (an install runs for minutes), and the disposition is
+        /// process-wide, so a guard around the whole loop would leave every other
+        /// thread's write to a closed stdout returning an error for that whole time
+        /// instead of ending `rocm` quietly. Each line costs one pair of
+        /// `signal` calls, which is nothing next to the write itself. A fresh
+        /// process with `SIG_DFL` records the disposition seen inside every read
+        /// and every write, and after the loop.
+        #[test]
+        #[allow(unsafe_code)] // libc::signal, to install the default action in the child
+        fn forwarding_guards_each_write_and_never_the_reads_between_them() {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            type Seen = Rc<RefCell<Vec<(&'static str, bool)>>>;
+
+            struct Source {
+                lines: Vec<&'static [u8]>,
+                seen: Seen,
+            }
+            impl Read for Source {
+                fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                    self.seen.borrow_mut().push(("read", sigpipe_is_ignored()));
+                    if self.lines.is_empty() {
+                        return Ok(0);
+                    }
+                    let line = self.lines.remove(0);
+                    buffer[..line.len()].copy_from_slice(line);
+                    Ok(line.len())
+                }
+            }
+            struct Sink(Seen);
+            impl Write for Sink {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.0.borrow_mut().push(("write", sigpipe_is_ignored()));
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            if std::env::var_os("ROCM_TEST_CLIENT_GUARD_SCOPE_ARM").is_some() {
+                // SAFETY: installing a signal disposition is always safe.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                }
+                let seen: Seen = Rc::default();
+                let source = Source {
+                    lines: vec![b"one\n", b"two\n", b"three\n"],
+                    seen: Rc::clone(&seen),
+                };
+                collect_stderr(source, Some(Sink(Rc::clone(&seen))));
+                let seen = seen.borrow();
+                let writes = seen.iter().filter(|(what, _)| *what == "write").count();
+                assert_eq!(writes, 3, "{seen:?}");
+                for (what, ignored) in seen.iter() {
+                    assert_eq!(
+                        *ignored,
+                        *what == "write",
+                        "SIGPIPE must be ignored inside each write and only there: {seen:?}"
+                    );
+                }
+                assert!(
+                    !sigpipe_is_ignored(),
+                    "the default action is back after the loop"
+                );
+                return;
+            }
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "stdio_client::tests::child::forwarding_guards_each_write_and_never_the_reads_between_them",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("ROCM_TEST_CLIENT_GUARD_SCOPE_ARM", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{status:?}");
+        }
+
         /// A request written to an engine that has already exited comes back as an
         /// ordinary error, also where SIGPIPE is at its default action. Re-executes
         /// this test in a fresh process that installs `SIG_DFL` first, because the
