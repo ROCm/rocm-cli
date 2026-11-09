@@ -11,7 +11,7 @@ use super::capture::{
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
 
-pub(super) fn detect_kernel_version() -> Option<String> {
+pub(crate) fn detect_kernel_version() -> Option<String> {
     if runtime_is_windows() {
         capture_optional_command("cmd", &["/C", "ver"])
             .map(|value| value.trim().to_owned())

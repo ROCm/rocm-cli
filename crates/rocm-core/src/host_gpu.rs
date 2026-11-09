@@ -37,9 +37,10 @@ use crate::{
     host_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
 };
 use anyhow::Result;
+use os_facts::detect_cpu_model;
 pub(crate) use os_facts::detect_distro_name;
+pub(crate) use os_facts::detect_kernel_version;
 pub use os_facts::detect_system_ram_gib;
-use os_facts::{detect_cpu_model, detect_kernel_version};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
