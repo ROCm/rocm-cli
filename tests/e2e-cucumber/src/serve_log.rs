@@ -55,6 +55,44 @@ fn parse_log_path(serve_stdout: &str) -> Option<&str> {
         .filter(|path| !path.is_empty())
 }
 
+/// The selected engine, if the serve reached the point of printing its plan.
+#[must_use]
+pub fn reported_engine(serve_stdout: &str) -> Option<&str> {
+    serve_stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("engine:"))
+        .map(str::trim)
+        .filter(|engine| !engine.is_empty())
+}
+
+/// The engine named on a `rocm serve` command line.
+///
+/// Accepts `--engine X` and `--engine=X`. `None` when no engine was requested:
+/// the CLI then picks a default, which only the printed plan reveals (see
+/// [`reported_engine`]). A value that starts with `--` is another flag, not an
+/// engine (`serve m --engine --managed`), so it counts as absent too: reporting
+/// `--managed` as the engine would skip the backend inventory without the
+/// [`ENGINE_UNKNOWN_EVIDENCE`] line that makes the skip visible.
+#[must_use]
+pub fn engine_from_serve_args<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let value = if let Some(inline) = arg.strip_prefix("--engine=") {
+            Some(inline)
+        } else if arg == "--engine" {
+            args.next()
+        } else {
+            continue;
+        };
+        return value.filter(|engine| !engine.is_empty() && !engine.starts_with("--"));
+    }
+    None
+}
+
+/// What a failed serve's report says when no engine could be determined, so a
+/// skipped backend inventory is visible rather than silently absent.
+pub const ENGINE_UNKNOWN_EVIDENCE: &str = "engine unknown: backend evidence skipped";
+
 /// The last `max` lines of `text`.
 fn tail_lines(text: &str, max: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -119,16 +157,55 @@ fn slugify(name: &str) -> String {
 /// this is collecting. Seeking keeps the cost fixed however big the log grows.
 ///
 /// The log may still be being written, so `len` is a snapshot: the head and tail
-/// are always real, and only the elided count can be slightly stale.
-fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+/// are always real, and only the elided count can be slightly stale. A log that
+/// grows past the cap after the size was taken is clamped the same way and the
+/// note says it grew (see [`read_clamped_file`]); no caller gets a silent
+/// truncation. Callers: `archive_service_log` (the note lands on the archived-path
+/// line) and the Lemonade report's pins and `version.txt` reads (the note follows
+/// the quoted text); its manifest read discards the note, but a truncated JSON
+/// manifest fails to parse and the report says so.
+pub(crate) fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    read_clamped_file(file, len, max)
+}
+
+/// [`read_clamped`] on an open file whose size was read as `len`. Split out so a
+/// test can hand it a `len` that has gone stale, which is what a log that grows
+/// between the size check and the read looks like.
+///
+/// A file that fits is read in full, but one byte past `max` is asked for: if it
+/// is there, the log grew after `len` was taken. That is not allowed to pass as
+/// "fits" with the surplus dropped without a word, so the read falls back to the
+/// head and tail of the file as it is now and the note says it grew. A file that
+/// shrank instead is returned as read, with a note that it changed.
+pub(crate) fn read_clamped_file(
+    mut file: std::fs::File,
+    len: u64,
+    max: u64,
+) -> std::io::Result<(Vec<u8>, String)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
+    let mut len = len;
+    let mut grown = false;
     if len <= max {
         let mut body = Vec::new();
-        file.read_to_end(&mut body)?;
-        return Ok((body, String::new()));
+        file.by_ref()
+            .take(max.saturating_add(1))
+            .read_to_end(&mut body)?;
+        if body.len() as u64 <= max {
+            return Ok((body, String::new()));
+        }
+        len = file.metadata()?.len();
+        if len <= max {
+            body.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+            return Ok((
+                body,
+                format!(" (truncated at {max} bytes: the file changed while it was read)"),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        grown = true;
     }
     // `len > max >= 2 * half`, so the two halves can never overlap.
     let half = max / 2;
@@ -143,7 +220,15 @@ fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
     let mut body = head;
     body.extend_from_slice(marker.as_bytes());
     body.extend_from_slice(&tail);
-    Ok((body, format!(" ({elided} bytes elided from the middle)")))
+    let grown_note = if grown {
+        "; the file grew while it was read"
+    } else {
+        ""
+    };
+    Ok((
+        body,
+        format!(" ({elided} bytes elided from the middle{grown_note})"),
+    ))
 }
 
 /// Copy the log written by the managed service `serve_stdout` launched into
@@ -230,6 +315,8 @@ pub struct ServeAttempt<'a> {
     /// failed, means the engine may still hold the port and the device — which
     /// changes how every later failure in the run should be read.
     pub stop_status: &'a str,
+    /// Only Lemonade attempts carry the optional backend inventory.
+    pub backend_evidence: Option<&'a str>,
 }
 
 /// Render one serve attempt's evidence as a failure message.
@@ -241,7 +328,7 @@ pub struct ServeAttempt<'a> {
 #[must_use]
 pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
     use crate::section;
-    format!(
+    let mut report = format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         attempt.headline,
         section("device state", attempt.device_state),
@@ -250,14 +337,20 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
         section("service log (tail)", attempt.log_tail),
         section("service log (full)", attempt.archived_log),
         section("stop", attempt.stop_status),
-    )
+    );
+    if let Some(evidence) = attempt.backend_evidence {
+        report.push_str("\n--- Lemonade backend evidence ---\n");
+        report.push_str(evidence);
+    }
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, parse_log_path, read_clamped,
-        serve_attempt_report, service_log_tail, slugify, tail_lines,
+        MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, engine_from_serve_args,
+        parse_log_path, read_clamped, read_clamped_file, reported_engine, serve_attempt_report,
+        service_log_tail, slugify, tail_lines,
     };
 
     const SERVE_PLAN: &str = "\
@@ -269,6 +362,38 @@ managed service launched
   log_path: /tmp/rocm-e2e-abc123/data/services/vllm-qwen.log
   readiness: starting
 ";
+
+    #[test]
+    fn engine_lookup_is_safe_for_missing_or_incomplete_serve_plans() {
+        assert_eq!(reported_engine(SERVE_PLAN), Some("vllm"));
+        assert_eq!(reported_engine("  engine: lemonade\n"), Some("lemonade"));
+        for output in ["", "serve failed", "  engine:   \n"] {
+            assert_eq!(reported_engine(output), None);
+        }
+    }
+
+    #[test]
+    fn engine_is_read_from_both_flag_forms_and_absent_otherwise() {
+        assert_eq!(
+            engine_from_serve_args(&["serve", "m", "--engine", "lemonade", "--managed"]),
+            Some("lemonade")
+        );
+        assert_eq!(
+            engine_from_serve_args(&["serve", "m", "--engine=lemonade", "--managed"]),
+            Some("lemonade")
+        );
+        for args in [
+            &["serve", "m", "--managed"][..],
+            &["serve", "m", "--engine"],
+            &["serve", "m", "--engine="],
+            &["serve", "m", "--engine", ""],
+            &["serve", "m", "--engine", "--managed"],
+            &["serve", "m", "--engine=--managed"],
+            &["serve", "--engine-version=1"],
+        ] {
+            assert_eq!(engine_from_serve_args(args), None, "{args:?}");
+        }
+    }
 
     #[test]
     fn log_path_is_read_from_the_indented_plan_line() {
@@ -395,6 +520,34 @@ managed service launched
         read_clamped(&path, max).expect("read log")
     }
 
+    /// A log that grows after its size was read must not be cut at the cap without
+    /// saying so. `len` is handed in stale (10 bytes under a 20-byte cap) for a file
+    /// that now holds 60: the read keeps the head and tail of what is there and the
+    /// note says it grew. Cutting at the cap silently turns this red, and a file
+    /// that really fits (stale or not) stays verbatim with no note.
+    #[test]
+    fn a_log_that_grew_after_its_size_was_read_is_clamped_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("service.log");
+        let body: Vec<u8> = (0..60u8).map(|i| b'a' + i % 26).collect();
+        std::fs::write(&path, &body).expect("write log");
+
+        let (clamped, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 10, 20).expect("read");
+        assert!(note.contains("the file grew while it was read"), "{note}");
+        assert!(note.contains("40 bytes elided from the middle"), "{note}");
+        let text = String::from_utf8_lossy(&clamped);
+        assert!(text.starts_with(&String::from_utf8_lossy(&body[..10]).to_string()));
+        assert!(text.ends_with(&String::from_utf8_lossy(&body[50..]).to_string()));
+
+        let (whole, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 60, 100).expect("read");
+        assert_eq!((whole, note), (body.clone(), String::new()));
+        let (exact, note) =
+            read_clamped_file(std::fs::File::open(&path).expect("open"), 60, 60).expect("read");
+        assert_eq!((exact, note), (body, String::new()));
+    }
+
     /// A runaway log is bounded, but never at the cost of the startup banner:
     /// both ends survive and the gap says so.
     #[test]
@@ -502,7 +655,7 @@ managed service launched
     /// full log went — none of which the plain readiness timeout reported.
     #[test]
     fn a_stalled_serve_report_carries_every_piece_of_evidence() {
-        let report = serve_attempt_report(&ServeAttempt {
+        let mut attempt = ServeAttempt {
             headline: "`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --engine lemonade --managed` \
                        exited 0, but the endpoint never served `Qwen3-0.6B` within 600s",
             device_state: "device state: drained (48000 MiB free of 49000 MiB, floor 44100 MiB)",
@@ -511,7 +664,15 @@ managed service launched
             log_tail: "load: failed to load model",
             archived_log: "archived to service-logs/scenario--svc.log",
             stop_status: "lemonade-qwen: stopped",
-        });
+            backend_evidence: None,
+        };
+        let report = serve_attempt_report(&attempt);
+        assert!(!report.contains("Lemonade backend evidence"), "{report}");
+        attempt.backend_evidence = Some("fixture backend identity");
+        assert_eq!(
+            serve_attempt_report(&attempt),
+            format!("{report}\n--- Lemonade backend evidence ---\nfixture backend identity")
+        );
 
         for expected in [
             "exited 0",

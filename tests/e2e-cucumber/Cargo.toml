@@ -61,8 +61,9 @@ rand.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile = "3"
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
 toml = "1.1"
 # `ServeDir` backs the install scenario's loopback download server (see
 # `src/loopback_http.rs`), so the E2E suite does not hand-roll HTTP framing,

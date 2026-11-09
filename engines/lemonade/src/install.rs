@@ -196,7 +196,7 @@ where
 }
 
 fn manifest_path(paths: &AppPaths) -> PathBuf {
-    paths.engine_manifests_dir(ENGINE_NAME).join("runtime.json")
+    paths.engine_install_manifest_path(ENGINE_NAME)
 }
 
 fn lemonade_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
@@ -572,6 +572,43 @@ mod tests {
     use std::io::Write;
     #[cfg(windows)]
     use std::process::{Command as ProcessCommand, Stdio};
+
+    /// The e2e harness reads this manifest back to describe a failed serve
+    /// (`tests/e2e-cucumber/src/lemonade_diagnostics.rs`), by the same path
+    /// helper and the field names asserted here. A rename on either side would
+    /// otherwise show up only as `unavailable:` in a report from the real lane.
+    #[test]
+    fn written_manifest_is_where_and_how_the_e2e_failure_report_reads_it() {
+        let dir = scratch_dir("manifest-path-and-fields");
+        let paths = AppPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            cache_dir: dir.join("cache"),
+        };
+        let manifest = LemonadeInstallManifest {
+            env_id: "lemonade-embeddable-fixture".to_owned(),
+            version: "fixture".to_owned(),
+            runtime_dir: dir.join("runtime"),
+            lemond: dir.join("runtime/lemond"),
+            lemonade: dir.join("runtime/lemonade"),
+            backend_recipe: LLAMACPP_RECIPE.to_owned(),
+            backend_name: ROCM_BACKEND_NAME.to_owned(),
+            installed_at_unix_ms: 1,
+        };
+        write_manifest(&paths, &manifest).unwrap();
+
+        let path = paths.engine_install_manifest_path("lemonade");
+        assert_eq!(manifest_path(&paths), path);
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], "fixture");
+        assert_eq!(written["backend_recipe"], LLAMACPP_RECIPE);
+        assert_eq!(written["backend_name"], ROCM_BACKEND_NAME);
+        assert_eq!(
+            written["runtime_dir"],
+            serde_json::json!(manifest.runtime_dir)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn embeddable_package_matches_runtime_os() {
