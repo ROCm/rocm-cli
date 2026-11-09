@@ -40,6 +40,7 @@ use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
     load_managed_services, managed_service_is_live, recorded_pids_may_be_running,
+    recorded_service_pids,
 };
 use crate::services_text::{load_managed_service, validate_service_id};
 use crate::{cli_progress, cli_report, endpoint_keys, service_hints};
@@ -182,6 +183,57 @@ fn managed_service_record_is_in_use_with(
     managed_service_is_live(record) || recorded_pids_may_be_running(record, probe)
 }
 
+/// The recorded processes `--force` may remove a record over: `Some` only when
+/// none of them is confirmed running, at least one could not be queried (so
+/// `rocm` cannot tell whether it is still running), and a stop was requested on
+/// the record, so the user has already tried to stop it. A process confirmed
+/// running is never forced past.
+fn forceable_unqueryable_pids(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> Option<Vec<u32>> {
+    let probed: Vec<(u32, ProcessProbe)> = recorded_service_pids(record)
+        .into_iter()
+        .map(|pid| (pid, probe(pid)))
+        .collect();
+    if probed
+        .iter()
+        .any(|(_, probed)| *probed == ProcessProbe::Running)
+    {
+        return None;
+    }
+    let unqueryable: Vec<u32> = probed
+        .into_iter()
+        .filter(|(_, probed)| *probed == ProcessProbe::Unqueryable)
+        .map(|(pid, _)| pid)
+        .collect();
+    (!unqueryable.is_empty() && record.stop_requested_unix_ms.is_some()).then_some(unqueryable)
+}
+
+/// The recorded PIDs as the message names them: `process 4242`, or
+/// `processes 4242 and 4243`.
+fn named_processes(pids: &[u32]) -> String {
+    match pids {
+        [one] => format!("process {one}"),
+        many => format!(
+            "processes {}",
+            many.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+    }
+}
+
+/// What [`remove_managed_service_record`] did.
+pub(crate) struct RemovedRecord {
+    /// The text to print.
+    pub(crate) text: String,
+    /// The removal went ahead over a recorded process that could not be queried
+    /// (`--force`), rather than for a record that is not running.
+    pub(crate) forced: bool,
+}
+
 /// Remove one non-running local server record and everything it owns.
 ///
 /// Refuses a live record rather than stopping it: a removal that silently killed
@@ -190,22 +242,59 @@ fn managed_service_record_is_in_use_with(
 /// which has already been refreshed against the engine state file and the real
 /// processes — a manifest still saying `ready` for a dead PID has demoted to
 /// `stopped` by then, and must stay removable.
+///
+/// A recorded process that could not be queried (on Windows, a live one this
+/// process may not open) makes the record count as running, and nothing else
+/// `rocm` has can tell a dead server whose PID was reused from a live one. For
+/// that case only, `--force` removes the record anyway: when no recorded process
+/// is confirmed running, at least one could not be queried, and a stop was
+/// requested. The removal then says exactly that, since the process may still
+/// be serving and its endpoint key is deleted with the record.
+#[cfg(test)]
 pub(crate) fn remove_managed_service_record(
     paths: &AppPaths,
     service_id: &str,
     yes: bool,
 ) -> Result<String> {
+    remove_managed_service_record_with(paths, service_id, yes, false, rocm_core::probe_process)
+        .map(|removed| removed.text)
+}
+
+/// [`remove_managed_service_record`] with `--force` and the read of each
+/// recorded PID supplied by the caller.
+pub(crate) fn remove_managed_service_record_with(
+    paths: &AppPaths,
+    service_id: &str,
+    yes: bool,
+    force: bool,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> Result<RemovedRecord> {
     validate_service_id(service_id)?;
     let record = load_managed_service(paths, service_id)?;
+    let mut forced_over = None;
     // Checked before `--yes` on purpose: for a running server "stop it first" is
     // the actionable error, and repeating the command with --yes must not be the
     // advice a user takes away from it.
-    if managed_service_record_is_in_use(&record) {
-        bail!(
-            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
-            record.status,
-            service_hints::service_stop_hint(service_id)
-        );
+    if managed_service_record_is_in_use_with(&record, &probe) {
+        let forceable = forceable_unqueryable_pids(&record, &probe);
+        match (force, forceable) {
+            (true, Some(pids)) => forced_over = Some(pids),
+            (false, Some(pids)) => bail!(
+                "local server `{service_id}` cannot be removed: {} it recorded could not be queried, so `rocm` cannot tell whether it is still running.\n\nTry: {}",
+                named_processes(&pids),
+                service_hints::service_forced_remove_hint(service_id)
+            ),
+            (true, None) => bail!(
+                "--force removes a record only when none of its recorded processes is confirmed running, at least one could not be queried, and a stop was requested. Local server `{service_id}` is {} and does not meet that.\n\nTry: {}",
+                record.status,
+                service_hints::service_stop_hint(service_id)
+            ),
+            (false, None) => bail!(
+                "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
+                record.status,
+                service_hints::service_stop_hint(service_id)
+            ),
+        }
     }
     if !yes {
         bail!(
@@ -223,6 +312,15 @@ pub(crate) fn remove_managed_service_record(
         "Removing local server record `{service_id}` (status: {}).",
         record.status
     );
+    if let Some(pids) = &forced_over {
+        // Said before the delete and in full: what is being risked is the user's
+        // to know, and after this there is no record left to ask about.
+        let _ = writeln!(
+            output,
+            "--force: {} could not be queried, so `rocm` cannot tell whether it is still running. If it is, it keeps running; this removes the record and the endpoint key it may still be serving with.",
+            named_processes(pids)
+        );
+    }
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
@@ -241,7 +339,10 @@ pub(crate) fn remove_managed_service_record(
         report = report.detail("removed", path.display());
     }
     let _ = write!(output, "{}", report.render());
-    Ok(output)
+    Ok(RemovedRecord {
+        text: output,
+        forced: forced_over.is_some(),
+    })
 }
 
 /// One record `rocm services prune` would delete.
@@ -1829,8 +1930,8 @@ mod tests {
         Ok(())
     }
 
-    /// The way out `docs/manual-testing.md` gives for a record whose process
-    /// `rocm` cannot query: the record is refused while that process may be
+    /// The by-hand way out, which still works alongside `--force`, for a record
+    /// whose process `rocm` cannot query: the record is refused while that process may be
     /// running, and deleting its `<service-id>.json` by hand and running
     /// `prune --any-age` leaves nothing behind (log, key and engine state all
     /// swept), with the endpoint key among the files removed.
@@ -1864,6 +1965,178 @@ mod tests {
         );
         assert_eq!(leftovers, 0, "prune swept every leftover file");
         assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    /// A record the user already tried to stop, held by the test's own live PID,
+    /// so the real liveness read that loads it leaves it alone and only the
+    /// injected probe says the process cannot be queried.
+    fn held_record(paths: &AppPaths, service_id: &str, stop_requested: bool) -> Result<()> {
+        let mut record = plant_service_record(paths, service_id, "ready", std::process::id())?;
+        if stop_requested {
+            record.stop_requested_unix_ms = Some(1);
+            record.write()?;
+        }
+        Ok(())
+    }
+
+    fn files_left(paths: &AppPaths, service_id: &str) -> usize {
+        let manifest = paths.service_manifest_path(service_id).exists();
+        let log = paths.service_log_path(service_id).exists();
+        let key = endpoint_keys::endpoint_key_file_path(paths, service_id).exists();
+        usize::from(manifest) + usize::from(log) + usize::from(key)
+    }
+
+    /// Without `--force` the refusal names the forced removal, and everything the
+    /// record owns is still there: the advice and the state, together.
+    #[test]
+    fn a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal() -> Result<()>
+    {
+        let (root, paths) = test_paths("services-remove-unqueryable-refused");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+
+        let error = remove_managed_service_record_with(&paths, "svc-held", true, false, |_| {
+            ProcessProbe::Unqueryable
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record held by an unqueryable process is refused");
+        let message = format!("{error:#}");
+        let left = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(message.contains("could not be queried"), "{message}");
+        assert!(
+            message.contains("rocm services remove svc-held --force --yes"),
+            "{message}"
+        );
+        assert_eq!(left, 3, "nothing was removed");
+        // The command the refusal names parses as printed.
+        let words: Vec<String> = service_hints::service_forced_remove_hint("svc-held")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            crate::advised_commands::rocm_verdict(&words[1..]),
+            crate::advised_commands::Verdict::Parses,
+            "{words:?}"
+        );
+        Ok(())
+    }
+
+    /// `--force` removes it and says what it risked; the audit-relevant flag is set.
+    #[test]
+    fn force_removes_a_record_held_by_an_unqueryable_process_and_says_so() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-unqueryable-forced");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let pid = std::process::id();
+
+        let removed = remove_managed_service_record_with(&paths, "svc-held", true, true, |_| {
+            ProcessProbe::Unqueryable
+        })?;
+        let left = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(removed.forced);
+        assert!(
+            removed.text.contains(&format!(
+                "--force: process {pid} could not be queried, so `rocm` cannot tell whether it is still running"
+            )),
+            "{}",
+            removed.text
+        );
+        assert!(removed.text.contains("endpoint key"), "{}", removed.text);
+        assert_eq!(left, 0, "every file the record owned is gone");
+        Ok(())
+    }
+
+    /// `--force` never goes past a process that is confirmed running, and it
+    /// needs a stop to have been requested: the refusal says which, and names the
+    /// stop that is the way forward.
+    #[test]
+    fn force_is_refused_for_a_running_process_and_without_a_requested_stop() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-refused");
+        paths.ensure()?;
+        held_record(&paths, "svc-running", true)?;
+        held_record(&paths, "svc-no-stop", false)?;
+
+        let running = remove_managed_service_record_with(&paths, "svc-running", true, true, |_| {
+            ProcessProbe::Running
+        })
+        .map(|removed| removed.text)
+        .expect_err("a confirmed running process is never forced past");
+        let no_stop = remove_managed_service_record_with(&paths, "svc-no-stop", true, true, |_| {
+            ProcessProbe::Unqueryable
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record nobody tried to stop is not forced");
+        let left = files_left(&paths, "svc-running") + files_left(&paths, "svc-no-stop");
+        let _ = fs::remove_dir_all(root);
+
+        for error in [format!("{running:#}"), format!("{no_stop:#}")] {
+            assert!(
+                error.contains("--force removes a record only when"),
+                "{error}"
+            );
+        }
+        assert!(
+            format!("{running:#}").contains("rocm services stop svc-running --yes"),
+            "{running:#}"
+        );
+        assert_eq!(left, 6, "nothing was removed");
+        Ok(())
+    }
+
+    /// `--force` on a record that is simply not running changes nothing: it is
+    /// removed as usual and not reported as forced.
+    #[test]
+    fn force_on_a_record_that_is_not_running_is_an_ordinary_removal() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-unneeded");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-stopped", "stopped", 999_999_999)?;
+
+        let removed =
+            remove_managed_service_record_with(&paths, "svc-stopped", true, true, |_| {
+                ProcessProbe::Gone
+            })?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(!removed.forced);
+        assert!(!removed.text.contains("--force"), "{}", removed.text);
+        Ok(())
+    }
+
+    /// One recorded process that cannot be queried does not make a record
+    /// forceable while another is confirmed running: the running one is never
+    /// forced past, whichever role it has.
+    #[test]
+    fn force_is_refused_when_one_process_is_unqueryable_and_another_is_running() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-mixed");
+        paths.ensure()?;
+        let own = std::process::id();
+        let mut record = plant_service_record(&paths, "svc-mixed", "ready", own)?;
+        record.engine_pid = Some(999_999_997);
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+
+        let error = remove_managed_service_record_with(&paths, "svc-mixed", true, true, |pid| {
+            if pid == own {
+                ProcessProbe::Unqueryable
+            } else {
+                ProcessProbe::Running
+            }
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record with a process confirmed running is never forced");
+        let left = files_left(&paths, "svc-mixed");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            format!("{error:#}").contains("--force removes a record only when"),
+            "{error:#}"
+        );
+        assert_eq!(left, 3, "nothing was removed");
         Ok(())
     }
 }

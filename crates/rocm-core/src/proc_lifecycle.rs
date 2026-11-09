@@ -215,6 +215,15 @@ pub enum TerminationOutcome {
     /// be running and holding the device. Deliberately not
     /// [`TimedOut`](Self::TimedOut): the root did not outlive any deadline.
     DescendantsUnconfirmed,
+    /// The recorded process was gone by the time the separate kill of the
+    /// processes under it ran (on Windows, `taskkill` found no such process and
+    /// the root's re-read agrees): it exited by itself after the identity check.
+    /// `taskkill /T` reaches children only through a live parent, and nothing
+    /// recorded what was under the root, so this stop cannot say whether a
+    /// process it left running is still there. Not a stop on its own; the
+    /// aggregate over the record's processes confirms it when another recorded
+    /// process is confirmed gone ([`terminate_recorded_service_pids`]).
+    ExitedBeforeTreeKill,
 }
 
 impl TerminationOutcome {
@@ -223,12 +232,17 @@ impl TerminationOutcome {
     /// `false` for [`TimedOut`](Self::TimedOut) (still alive),
     /// [`Unverified`](Self::Unverified) (could not be confirmed either way) and
     /// [`DescendantsUnconfirmed`](Self::DescendantsUnconfirmed) (the root is gone
-    /// but a process under it may not be).
+    /// but a process under it may not be) and
+    /// [`ExitedBeforeTreeKill`](Self::ExitedBeforeTreeKill) (the root is gone and
+    /// nothing says what was under it).
     #[must_use]
     pub const fn stopped(self) -> bool {
         !matches!(
             self,
-            Self::TimedOut | Self::Unverified | Self::DescendantsUnconfirmed
+            Self::TimedOut
+                | Self::Unverified
+                | Self::DescendantsUnconfirmed
+                | Self::ExitedBeforeTreeKill
         )
     }
 
@@ -253,6 +267,7 @@ impl TerminationOutcome {
             Self::Forced => "forced",
             Self::TimedOut => "timed_out",
             Self::DescendantsUnconfirmed => "descendants_unconfirmed",
+            Self::ExitedBeforeTreeKill => "exited_before_tree_kill",
         }
     }
 }
@@ -468,6 +483,28 @@ impl RecordedPidStop {
 /// `terminate` is injectable so a caller's test can supply the verdicts it
 /// cannot construct on demand (a process that survives `SIGKILL`, one whose
 /// identity cannot be read).
+///
+/// One verdict is settled across the record rather than per PID. A root that
+/// exited by itself before its processes could be taken down
+/// ([`TerminationOutcome::ExitedBeforeTreeKill`]) cannot say what it left
+/// running. It becomes [`TerminationOutcome::AlreadyGone`] only when another
+/// process the record names is confirmed gone (a stop, or itself such a root):
+/// the record's other process is the one thing that was under the root and is
+/// independently verified. A root that is the only process the record names, or
+/// whose sibling is still running or unconfirmed, stays unconfirmed. Processes
+/// the record does not name that were under a root can be neither found nor
+/// verified, which is the same limit as for a root that was already gone when a
+/// stop began.
+///
+/// This relies on the engine being visited as its own role, which it is: the
+/// engine PID is an entry of its own, with its own token and its own verdict, so
+/// a worker the root left running is reached by the engine's own termination
+/// when the record names it. Both callers fold every row (`rocm services stop`
+/// in `stop_internal_managed_service_confirmed_with`, `rocmd` in
+/// `stop_managed_service_with`): the stop is confirmed, and the recorded PIDs and
+/// the endpoint key cleared, only when every recorded role is individually
+/// stopped. A root that exited alone therefore never confirms a stop on its own
+/// row, and the record is kept when the engine role is not confirmed.
 pub fn terminate_recorded_service_pids(
     record: &crate::ManagedServiceRecord,
     terminate: impl Fn(&ProcessIdentity) -> TerminationOutcome,
@@ -496,7 +533,7 @@ pub fn terminate_recorded_service_pids(
         }
     }
 
-    entries
+    let mut stops: Vec<RecordedPidStop> = entries
         .into_iter()
         .map(|(pid, role, ticks)| {
             let outcome = if pid == std::process::id() {
@@ -506,7 +543,47 @@ pub fn terminate_recorded_service_pids(
             };
             RecordedPidStop { pid, role, outcome }
         })
-        .collect()
+        .collect();
+    settle_roots_that_exited_alone(&mut stops);
+    stops
+}
+
+/// Whether `stop` is a recorded process that is confirmed gone: stopped, or a
+/// root that exited by itself ([`TerminationOutcome::ExitedBeforeTreeKill`]).
+/// The stopping process's own PID is not a service process and never counts.
+const fn recorded_process_is_gone(stop: RecordedPidStop) -> bool {
+    match stop.outcome {
+        RecordedPidOutcome::OwnProcess => false,
+        RecordedPidOutcome::Terminated(outcome) => {
+            outcome.stopped() || matches!(outcome, TerminationOutcome::ExitedBeforeTreeKill)
+        }
+    }
+}
+
+/// Turn each [`TerminationOutcome::ExitedBeforeTreeKill`] into
+/// [`TerminationOutcome::AlreadyGone`] when some other recorded process is
+/// confirmed gone, and leave it unconfirmed otherwise. Judged on the verdicts as
+/// they came in, so two roots that both exited by themselves corroborate each
+/// other.
+fn settle_roots_that_exited_alone(stops: &mut [RecordedPidStop]) {
+    let corroborated: Vec<bool> = (0..stops.len())
+        .map(|index| {
+            stops
+                .iter()
+                .enumerate()
+                .any(|(other, stop)| other != index && recorded_process_is_gone(*stop))
+        })
+        .collect();
+    for (stop, corroborated) in stops.iter_mut().zip(corroborated) {
+        if corroborated
+            && matches!(
+                stop.outcome,
+                RecordedPidOutcome::Terminated(TerminationOutcome::ExitedBeforeTreeKill)
+            )
+        {
+            stop.outcome = RecordedPidOutcome::Terminated(TerminationOutcome::AlreadyGone);
+        }
+    }
 }
 
 /// Terminate one recorded process, and its descendants, after verifying its
@@ -591,16 +668,22 @@ enum TreeKill {
 /// deadline; [`Unverified`](TerminationOutcome::Unverified)) stay as they are.
 ///
 /// A kill that found no such process ([`TreeKill::NotFound`]) is judged by the
-/// root's own re-read, which `outcome` carries: when the root is gone
+/// root's own re-read, which `outcome` carries. When the root is gone
 /// ([`TerminationOutcome::AlreadyGone`]) it exited on its own between the
-/// identity check and the kill, and that is what the stop reports, as for any
-/// recorded process that is already gone. When the root is still there, "no such
+/// identity check and the kill: that is [`TerminationOutcome::ExitedBeforeTreeKill`],
+/// not a stop. `taskkill /T` reaches children only through a live parent, so a
+/// child the root left running is out of its reach, and the stop kept no list of
+/// what was under the root to check afterwards. The aggregate over the record's
+/// processes decides whether another recorded process corroborates the exit
+/// ([`terminate_recorded_service_pids`]). When the root is still there, "no such
 /// process" contradicts what the termination found, so the kill is treated as
 /// failed.
 const fn after_tree_kill(tree: TreeKill, outcome: TerminationOutcome) -> TerminationOutcome {
     match (tree, outcome) {
         (TreeKill::Completed, outcome) => outcome,
-        (TreeKill::NotFound, TerminationOutcome::AlreadyGone) => TerminationOutcome::AlreadyGone,
+        (TreeKill::NotFound, TerminationOutcome::AlreadyGone) => {
+            TerminationOutcome::ExitedBeforeTreeKill
+        }
         (
             TreeKill::NotFound | TreeKill::Failed,
             TerminationOutcome::Graceful
@@ -667,10 +750,13 @@ fn hold_pid(identity: &ProcessIdentity) -> PidHold {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    // SAFETY: a plain Win32 call; a non-null handle is owned by nothing else and
-    // is closed when the `OwnedHandle` drops.
+    // SAFETY: `OpenProcess` takes only plain values and returns a handle or null;
+    // there is no pointer to keep valid.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
     PidHold {
+        // SAFETY: this closure runs only for a non-null handle, which
+        // `OpenProcess` just returned and which nothing else owns or closes, so
+        // the `OwnedHandle` may take ownership and close it exactly once on drop.
         _handle: (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) }),
     }
 }
@@ -1004,6 +1090,13 @@ mod tests {
         assert_ne!(
             TerminationOutcome::DescendantsUnconfirmed.as_str(),
             TerminationOutcome::TimedOut.as_str()
+        );
+        // A root that exited by itself before its tree kill: not a stop alone.
+        assert!(!TerminationOutcome::ExitedBeforeTreeKill.stopped());
+        assert!(!TerminationOutcome::ExitedBeforeTreeKill.graceful());
+        assert_eq!(
+            TerminationOutcome::ExitedBeforeTreeKill.as_str(),
+            "exited_before_tree_kill"
         );
 
         // Unverified: neither stopped nor graceful — we could not act.
@@ -1362,8 +1455,8 @@ mod tests {
     #[test]
     fn managed_stop_classifies_each_outcome_as_signaled_forced_and_stopped() {
         use TerminationOutcome::{
-            AlreadyGone, DescendantsUnconfirmed, Forced, Graceful, IdentityMismatch, TimedOut,
-            Unverified,
+            AlreadyGone, DescendantsUnconfirmed, ExitedBeforeTreeKill, Forced, Graceful,
+            IdentityMismatch, TimedOut, Unverified,
         };
         let record = record_naming(SUPERVISOR_PID, None, None, None);
 
@@ -1377,6 +1470,8 @@ mod tests {
             (TimedOut, true, true, false),
             // Signalled and forced by the tree kill, but not confirmed gone.
             (DescendantsUnconfirmed, true, true, false),
+            // Nothing signalled: the root was gone before the tree kill ran.
+            (ExitedBeforeTreeKill, false, false, false),
         ];
         for (outcome, signaled, forced, stopped) in expected {
             let (_, stops) = stop_with(&record, outcome);
@@ -1728,11 +1823,12 @@ mod tests {
 
     /// `taskkill` answering "no such process" is judged by the root's own
     /// re-read. The root that went away by itself between the identity check and
-    /// the kill is a stop that happened: nothing is left to wait for, and
-    /// reporting it unconfirmed would keep a record, a stop request and a key for
-    /// a service that is gone.
+    /// the kill is not reported as a kill this stop performed, and not as a stop
+    /// either on its own: `taskkill /T` reaches children only through a live
+    /// parent, so a child the root left running was out of its reach, and nothing
+    /// recorded what was under it. The record-level settling decides.
     #[test]
-    fn a_tree_kill_that_found_no_process_is_a_stop_when_the_root_is_gone() {
+    fn a_tree_kill_that_found_no_process_with_the_root_gone_is_not_a_stop_by_itself() {
         let (verdict, steps) = tree_kill_run_with(
             true,
             TreeKill::NotFound,
@@ -1742,14 +1838,142 @@ mod tests {
 
         assert_eq!(
             verdict,
-            TerminationOutcome::AlreadyGone,
-            "the root exited on its own: the truth, not a kill this stop performed"
+            TerminationOutcome::ExitedBeforeTreeKill,
+            "the root exited on its own and nothing says what it left running"
         );
-        assert!(verdict.stopped());
+        assert!(!verdict.stopped());
         assert!(
             steps.contains(&Step::Terminate(SUPERVISOR_PID)),
             "the root is re-read by the termination: {steps:?}"
         );
+    }
+
+    /// What the record's processes say together about a root that exited by
+    /// itself. `exits` maps each recorded PID to the verdict `terminate` gives.
+    fn settled(
+        record: &crate::ManagedServiceRecord,
+        exits: &[(u32, TerminationOutcome)],
+    ) -> Vec<TerminationOutcome> {
+        terminate_recorded_service_pids(record, |identity| {
+            exits
+                .iter()
+                .find(|(pid, _)| *pid == identity.pid)
+                .map(|(_, outcome)| *outcome)
+                .expect("a verdict for every recorded pid")
+        })
+        .into_iter()
+        .map(|stop| match stop.outcome {
+            RecordedPidOutcome::Terminated(outcome) => outcome,
+            RecordedPidOutcome::OwnProcess => panic!("not the stopping process"),
+        })
+        .collect()
+    }
+
+    /// A parent that exits by itself while its child keeps running is not a
+    /// stop: with only the parent recorded, nothing independently verifies the
+    /// child, so the stop stays unconfirmed (and the record, the stop request
+    /// and the key are kept by the callers). This is the case a root's exit
+    /// cannot settle.
+    #[test]
+    fn a_parent_that_exits_alone_with_nothing_else_recorded_is_not_a_confirmed_stop() {
+        use TerminationOutcome::ExitedBeforeTreeKill;
+        let record = record_naming(SUPERVISOR_PID, None, None, None);
+
+        let verdicts = settled(&record, &[(SUPERVISOR_PID, ExitedBeforeTreeKill)]);
+
+        assert_eq!(verdicts, vec![ExitedBeforeTreeKill]);
+        assert!(!verdicts[0].stopped());
+    }
+
+    /// The same parent with its engine recorded: the engine is the process under
+    /// it that is independently verified, by its own entry. Confirmed gone, the
+    /// stop is confirmed, which keeps the concern that a root exiting on its own
+    /// must not leave a stop unconfirmed for nothing.
+    #[test]
+    fn a_parent_that_exits_alone_is_confirmed_when_the_recorded_engine_is_confirmed_gone() {
+        use TerminationOutcome::{AlreadyGone, ExitedBeforeTreeKill, Forced, Graceful};
+        let record = record_naming(SUPERVISOR_PID, None, Some(ENGINE_PID), None);
+
+        for engine in [Forced, Graceful, AlreadyGone] {
+            let verdicts = settled(
+                &record,
+                &[(SUPERVISOR_PID, ExitedBeforeTreeKill), (ENGINE_PID, engine)],
+            );
+
+            assert_eq!(verdicts, vec![AlreadyGone, engine], "engine {engine:?}");
+            assert!(verdicts.iter().all(|verdict| verdict.stopped()));
+        }
+        // And the other way round: the engine is the root that exited alone.
+        let verdicts = settled(
+            &record,
+            &[
+                (SUPERVISOR_PID, Graceful),
+                (ENGINE_PID, ExitedBeforeTreeKill),
+            ],
+        );
+        assert_eq!(verdicts, vec![Graceful, AlreadyGone]);
+    }
+
+    /// A parent that exits while the recorded engine is still running, or not
+    /// confirmed, stays unconfirmed: the engine is the child that survived.
+    #[test]
+    fn a_parent_that_exits_alone_stays_unconfirmed_while_the_recorded_engine_is_not_gone() {
+        use TerminationOutcome::{
+            DescendantsUnconfirmed, ExitedBeforeTreeKill, TimedOut, Unverified,
+        };
+        let record = record_naming(SUPERVISOR_PID, None, Some(ENGINE_PID), None);
+
+        for engine in [TimedOut, Unverified, DescendantsUnconfirmed] {
+            let verdicts = settled(
+                &record,
+                &[(SUPERVISOR_PID, ExitedBeforeTreeKill), (ENGINE_PID, engine)],
+            );
+
+            assert_eq!(
+                verdicts,
+                vec![ExitedBeforeTreeKill, engine],
+                "engine {engine:?}"
+            );
+            assert!(
+                !verdicts[0].stopped(),
+                "the parent is not settled by {engine:?}"
+            );
+        }
+    }
+
+    /// Two roots that both exited by themselves corroborate each other: every
+    /// process the record names is gone.
+    #[test]
+    fn two_roots_that_both_exited_alone_are_a_confirmed_stop() {
+        use TerminationOutcome::{AlreadyGone, ExitedBeforeTreeKill};
+        let record = record_naming(SUPERVISOR_PID, None, Some(ENGINE_PID), None);
+
+        let verdicts = settled(
+            &record,
+            &[
+                (SUPERVISOR_PID, ExitedBeforeTreeKill),
+                (ENGINE_PID, ExitedBeforeTreeKill),
+            ],
+        );
+
+        assert_eq!(verdicts, vec![AlreadyGone, AlreadyGone]);
+    }
+
+    /// The stopping process's own PID is not a service process: it never
+    /// corroborates a root that exited alone.
+    #[test]
+    fn the_stopping_process_does_not_corroborate_a_root_that_exited_alone() {
+        use TerminationOutcome::ExitedBeforeTreeKill;
+        let record = record_naming(SUPERVISOR_PID, None, Some(std::process::id()), None);
+
+        let stops = terminate_recorded_service_pids(&record, |_| ExitedBeforeTreeKill);
+
+        assert_eq!(
+            stops[0].outcome,
+            RecordedPidOutcome::Terminated(ExitedBeforeTreeKill)
+        );
+        assert_eq!(stops[1].outcome, RecordedPidOutcome::OwnProcess);
+        assert!(!stops[0].stopped());
     }
 
     /// "No such process" while the root is still there is a contradiction, so it

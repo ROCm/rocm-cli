@@ -1254,7 +1254,7 @@ rocm services list [--all] [--json]
 rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
-rocm services remove <service-id> --yes
+rocm services remove <service-id> --yes [--force]
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
@@ -1263,13 +1263,15 @@ gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
 processes, and any endpoint key, which the server may still be enforcing. It
 names each process that, or a process under it, did not exit after it was
-signaled (on Windows also a process that did exit while taking the processes
-under it down did not complete, so one of them may still be running); for a
-process it could not verify as the server's (its recorded
+signaled. On Windows it also names a process that did exit (or was already gone)
+when taking the processes under it down did not complete, or found nothing and
+no other recorded process is confirmed gone, because one of them may still be
+running. For a process it could not verify as the server's (its recorded
 start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
-all), it signals nothing and names an operating-system command to check on it. It does not suggest
-running the stop again: when only a process under the recorded one survived, a
-second stop can report the server stopped while that process still runs.
+all), it signals nothing and names an operating-system command to check on it.
+It does not suggest running the stop again: when only a process under the
+recorded one survived, a second stop can report the server stopped while that
+process still runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
@@ -1278,8 +1280,9 @@ nothing, and leaves the stop request recorded.
 After the stop confirms, `restart` takes the same launch lock `rocm serve` uses
 and re-checks the port before it respawns: if another live managed service is
 now recorded on that port, or (on the default `127.0.0.1` host only) the port is
-bound by another process, it refuses and the service stays stopped (`rocm services list` shows it). The lock wait is
-bounded (5 seconds), unlike `rocm serve`'s: if a launch still holds the lock,
+bound by another process, it refuses and the service stays stopped
+(`rocm services list` shows it). The lock wait is bounded (5 seconds), unlike
+`rocm serve`'s: if a launch still holds the lock,
 `restart` fails saying the server was stopped but not restarted and names
 `rocm services restart <id> --yes` to run once that launch finishes.
 
@@ -1290,7 +1293,11 @@ alone, and additionally clears leftover files whose record is already gone. A
 server counts as running while any process it recorded may be running, which on
 Windows includes one `rocm` cannot query (a live process the account may not
 open): `remove` and `prune` refuse such a record until that process is gone.
-`docs/manual-testing.md` describes clearing one by hand.
+`remove <service-id> --force --yes` is the way out for exactly that case: it
+removes the record when a stop was requested, no recorded process is confirmed
+running, and at least one could not be queried, says which one, and never
+removes a record whose process `rocm` can see running. `prune` has no
+`--force`. `docs/manual-testing.md` walks through it.
 
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is

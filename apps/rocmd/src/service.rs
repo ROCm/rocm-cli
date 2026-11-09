@@ -1093,4 +1093,94 @@ mod tests {
             );
         }
     }
+
+    /// A root that exited by itself before its tree could be taken down confirms
+    /// the stop only through the record's other roles, as this caller folds
+    /// them: the supervisor's own row is not enough, and the record, its PIDs,
+    /// its stop marker and its key are kept unless the engine role is
+    /// confirmed gone too.
+    #[test]
+    fn a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does() -> Result<()> {
+        use rocm_core::TerminationOutcome::{ExitedBeforeTreeKill, Forced, TimedOut};
+
+        for (engine, confirmed) in [(Forced, true), (TimedOut, false)] {
+            let (root, paths, service_id) = plant_record_naming(
+                "stop-root-exited-alone",
+                SUPERVISOR_PID,
+                None,
+                Some(ENGINE_PID),
+                None,
+            )?;
+            let key = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+            fs::create_dir_all(paths.services_dir())?;
+            fs::write(&key, "secret-key")?;
+
+            let report = stop_managed_service_with(&paths, service_id, |identity| {
+                if identity.pid == SUPERVISOR_PID {
+                    ExitedBeforeTreeKill
+                } else {
+                    engine
+                }
+            })?;
+            let record = find_managed_service(&paths, service_id)?;
+            let key_kept = key.exists();
+            fs::remove_dir_all(root).ok();
+
+            assert_eq!(
+                stop_report_confirmed(&report),
+                confirmed,
+                "{engine:?}: {report}"
+            );
+            assert_eq!(
+                report["pid_outcomes"][0]["outcome"],
+                if confirmed {
+                    "already_gone"
+                } else {
+                    "exited_before_tree_kill"
+                },
+                "{engine:?}: {report}"
+            );
+            if confirmed {
+                assert_eq!(record.status, "stopped");
+                assert_eq!(
+                    record.supervisor_pid, 0,
+                    "the confirmed stop clears the PIDs"
+                );
+                assert!(!key_kept, "and the key");
+            } else {
+                assert_eq!(record.status, "ready", "{engine:?}");
+                assert_eq!(record.supervisor_pid, SUPERVISOR_PID, "the PIDs are kept");
+                assert!(
+                    record.stop_requested_unix_ms.is_some(),
+                    "the marker is kept"
+                );
+                assert!(key_kept, "the key is kept");
+            }
+        }
+        Ok(())
+    }
+
+    /// A root that exited by itself with no other role recorded cannot be
+    /// vouched for, so this caller does not clear the record on its say-so.
+    #[test]
+    fn a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed() -> Result<()> {
+        let (root, paths, service_id) = plant_record_naming(
+            "stop-lone-root-exited-alone",
+            SUPERVISOR_PID,
+            None,
+            None,
+            None,
+        )?;
+
+        let report = stop_managed_service_with(&paths, service_id, |_| {
+            rocm_core::TerminationOutcome::ExitedBeforeTreeKill
+        })?;
+        let record = find_managed_service(&paths, service_id)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(!stop_report_confirmed(&report), "{report}");
+        assert_eq!(record.supervisor_pid, SUPERVISOR_PID);
+        assert!(record.stop_requested_unix_ms.is_some());
+        Ok(())
+    }
 }

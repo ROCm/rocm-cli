@@ -50,6 +50,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
     ("service_record_cleanup.feature", "service-cleanup"),
+    ("service_record_unqueryable.feature", "service-unqueryable"),
     ("service_stop.feature", "service-stop"),
     ("service_unknown_id.feature", "service-unknown"),
     ("storage.feature", "storage"),

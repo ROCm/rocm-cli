@@ -1131,12 +1131,12 @@ pub(crate) enum ServicesCommand {
     /// confirmed and exits with an error, keeping the record, which still names
     /// the processes, and any endpoint key, which the server may still be
     /// enforcing. It names each process that did not exit (on Windows also one
-    /// that exited while taking the processes under it down did not complete),
-    /// and for one it could
-    /// not verify (its recorded start-time can no longer be read back, or, on
-    /// Windows, it cannot be queried at all) it signals nothing and names an
-    /// operating-system command to check on it. It does not suggest running the
-    /// stop again.
+    /// that exited, or was already gone, when taking the processes under it
+    /// down did not complete or found nothing and no other recorded process is
+    /// confirmed gone), and for one it could not verify (its recorded
+    /// start-time can no longer be read back, or, on Windows, it cannot be
+    /// queried at all) it signals nothing and names an operating-system
+    /// command to check on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
@@ -1170,6 +1170,17 @@ pub(crate) enum ServicesCommand {
         /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
+        /// Remove a record whose recorded process `rocm` cannot query.
+        ///
+        /// For the one case with no other way out: a stop was requested, no
+        /// recorded process is confirmed running, and at least one could not be
+        /// queried (on Windows, a live process the account may not open, which
+        /// can be a dead server's PID taken by another program). The record, its
+        /// log, engine state and endpoint key are deleted, the command says
+        /// which process could not be queried, and a process that is still
+        /// running keeps running. Refused for any process confirmed running.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete local server records that are no longer running.
     ///

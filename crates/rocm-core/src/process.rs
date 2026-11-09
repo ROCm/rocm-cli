@@ -387,8 +387,10 @@ pub enum ProcessProbe {
     /// may be serving), and there is no better evidence to be had: the creation
     /// time that would tell the two processes apart is read with the same access
     /// right, so a process that cannot be opened has no readable token to
-    /// compare. The record can be cleared by hand; see `docs/manual-testing.md`,
-    /// "A record that stays unverified".
+    /// compare. `rocm services remove <id> --force --yes` clears such a record
+    /// (see `docs/manual-testing.md`, "A record that stays unverified"); it
+    /// applies only when no recorded process is confirmed running, one could not
+    /// be queried, and a stop was requested.
     Unqueryable,
 }
 
@@ -440,6 +442,23 @@ fn system_tool_path(system_root: Option<std::ffi::OsString>, name: &str) -> Path
     }
 }
 
+/// E2E hook: `ROCM_E2E_UNQUERYABLE_PIDS`, a comma-separated list of PIDs, makes
+/// [`probe_process`] answer [`ProcessProbe::Unqueryable`] for each of them.
+///
+/// A live process this account may not open cannot be staged from outside the
+/// binary, and without it the stop, the liveness refresh and `services remove`
+/// have no live coverage for that case off Windows. Compiled only into the
+/// `e2e-test-hooks` build; production builds never read the variable.
+#[cfg(feature = "e2e-test-hooks")]
+fn scripted_probe(pid: u32) -> Option<ProcessProbe> {
+    let listed = std::env::var("ROCM_E2E_UNQUERYABLE_PIDS").ok()?;
+    listed
+        .split(',')
+        .filter_map(|entry| entry.trim().parse::<u32>().ok())
+        .any(|listed| listed == pid)
+        .then_some(ProcessProbe::Unqueryable)
+}
+
 /// Look at `pid`, keeping a process that cannot be queried apart from one that
 /// is gone. See [`ProcessProbe`].
 #[cfg(windows)]
@@ -448,15 +467,24 @@ fn system_tool_path(system_root: Option<std::ffi::OsString>, name: &str) -> Path
 pub fn probe_process(pid: u32) -> ProcessProbe {
     use windows_sys::Win32::Foundation::CloseHandle;
 
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(scripted) = scripted_probe(pid) {
+        return scripted;
+    }
     if pid == 0 {
         return ProcessProbe::Gone;
     }
+    // SAFETY: `OpenProcess` takes only plain values and returns a handle or null.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return classify_open_failure(std::io::Error::last_os_error().raw_os_error());
     }
     let mut exit_code = 0;
+    // SAFETY: `handle` is the non-null handle opened above, still open, and
+    // `exit_code` is a live local that is valid for this one call to write to.
     let queried = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
+    // SAFETY: `handle` is the handle opened above, closed here exactly once and
+    // not used afterwards.
     unsafe {
         CloseHandle(handle);
     }
@@ -474,6 +502,10 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
 #[cfg(not(windows))]
 #[must_use]
 pub fn probe_process(pid: u32) -> ProcessProbe {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(scripted) = scripted_probe(pid) {
+        return scripted;
+    }
     if process_is_running(pid) {
         ProcessProbe::Running
     } else {
@@ -488,23 +520,8 @@ pub fn probe_process(pid: u32) -> ProcessProbe {
 /// stopped, deleting it) asks [`probe_process`] instead and keeps
 /// [`ProcessProbe::Unqueryable`] apart.
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
 pub fn process_is_running(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-
-    if pid == 0 {
-        return false;
-    }
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-    let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
-    unsafe {
-        CloseHandle(handle);
-    }
-    ok && exit_code == 259
+    probe_process(pid) == ProcessProbe::Running
 }
 
 #[cfg(not(windows))]

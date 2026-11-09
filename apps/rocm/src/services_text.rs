@@ -1054,6 +1054,10 @@ pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value
 ///   not completed (`descendants_unconfirmed`, Windows): this stop saw the
 ///   recorded process exit, so it does not say anything outlived a deadline, but
 ///   one of the processes under it may still be running;
+/// - a recorded process that exited by itself before the processes under it
+///   could be taken down (`exited_before_tree_kill`, Windows), with no other
+///   recorded process confirmed gone to vouch for what was under it: nothing
+///   was signalled, and one of them may still be running;
 /// - a process that was not signalled because its identity could not be
 ///   verified (`unverified`), with how to look at it. There are two routes to
 ///   it: a recorded start-time that can no longer be read back from a running
@@ -1096,6 +1100,8 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
     let timed_out = with_outcome(rocm_core::TerminationOutcome::TimedOut.as_str());
     let descendants_unconfirmed =
         with_outcome(rocm_core::TerminationOutcome::DescendantsUnconfirmed.as_str());
+    let exited_before_tree_kill =
+        with_outcome(rocm_core::TerminationOutcome::ExitedBeforeTreeKill.as_str());
     let unverified = with_outcome(rocm_core::TerminationOutcome::Unverified.as_str());
 
     let mut text = String::new();
@@ -1123,6 +1129,12 @@ fn render_unconfirmed_service_stop(output: &serde_json::Value) -> String {
         let _ = writeln!(
             text,
             "  not confirmed: process {pid} ({role}) exited, but a process under it may still be running, because taking the processes under it down did not complete"
+        );
+    }
+    for (pid, role) in &exited_before_tree_kill {
+        let _ = writeln!(
+            text,
+            "  not confirmed: process {pid} ({role}) was already gone when the processes under it were to be taken down, and nothing else the server recorded vouches for them, so one of them may still be running"
         );
     }
     for (pid, role) in &unverified {

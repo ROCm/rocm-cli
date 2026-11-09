@@ -2865,4 +2865,87 @@ mod tests {
         assert!(on_disk.stop_requested_unix_ms.is_some());
         assert_eq!(key.as_deref(), Some("key-123"));
     }
+
+    /// A root that exited by itself before its tree could be taken down confirms
+    /// the stop only through the record's other roles, through the real routine
+    /// and this caller's own folding: the root's row alone is not enough, and the
+    /// record, its PIDs, its stop request and its key are kept unless the engine
+    /// role is confirmed gone too.
+    #[test]
+    fn a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does() {
+        use rocm_core::TerminationOutcome::{ExitedBeforeTreeKill, Forced, TimedOut};
+
+        for (engine, confirmed) in [(Forced, true), (TimedOut, false)] {
+            let (root, paths) = test_paths("services-stop-root-exited-alone");
+            paths.ensure().unwrap();
+            let service_id = "svc-root-exited-alone";
+            let mut record = stop_test_record(&paths, service_id);
+            record.supervisor_pid = 999_999_998;
+            record.engine_pid = Some(999_999_997);
+            record.write().unwrap();
+            endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+            let report = stop_internal_managed_service_with(&paths, service_id, |record| {
+                rocm_core::terminate_recorded_service_pids(record, |identity| {
+                    if identity.pid == 999_999_998 {
+                        ExitedBeforeTreeKill
+                    } else {
+                        engine
+                    }
+                })
+            })
+            .unwrap();
+            let on_disk = raw_manifest(&paths, service_id);
+            let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+            let _ = fs::remove_dir_all(root);
+
+            assert_eq!(report["stopped"], confirmed, "{engine:?}: {report}");
+            if confirmed {
+                assert_eq!(on_disk.status, "stopped");
+                assert_eq!(
+                    on_disk.supervisor_pid, 0,
+                    "the confirmed stop clears the PIDs"
+                );
+                assert_eq!(key, None, "and the key");
+            } else {
+                assert_eq!(on_disk.supervisor_pid, 999_999_998, "the PIDs are kept");
+                assert!(on_disk.stop_requested_unix_ms.is_some());
+                assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+            }
+        }
+    }
+
+    /// A lone root that exited by itself is not vouched for by anything else the
+    /// record names, so this caller does not clear the record on its say-so.
+    #[test]
+    fn a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed() {
+        let (root, paths) = test_paths("services-stop-lone-root-exited-alone");
+        paths.ensure().unwrap();
+        let service_id = "svc-lone-root-exited-alone";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |record| {
+            rocm_core::terminate_recorded_service_pids(record, |_| {
+                rocm_core::TerminationOutcome::ExitedBeforeTreeKill
+            })
+        })
+        .unwrap();
+        let answer = internal_stop_server_value(report);
+        let outcome = finish_service_action(&paths, "stop_server", service_id, &answer);
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let rendered = format!("{:#}", outcome.expect_err("not a confirmed stop"));
+        assert!(
+            rendered.contains("was already gone when the processes under it were to be taken down"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Local server stopped"), "{rendered}");
+        assert_no_retry_line(&rendered);
+        assert_eq!(on_disk.supervisor_pid, 999_999_999);
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+        assert_eq!(key.as_deref(), Some("key-123"));
+    }
 }

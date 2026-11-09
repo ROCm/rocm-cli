@@ -2005,12 +2005,25 @@ request and key that are kept
 (`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
 `only_a_clean_taskkill_exit_is_a_completed_tree_kill_and_128_is_not_found`). A
 `taskkill` that exits 128 (process not found) is judged by the root's own re-read:
-with the root gone it exited by itself and the stop is reported as for any
-recorded process already gone, so the record is not kept for nothing; with the
-root still there the kill counts as failed
-(`a_tree_kill_that_found_no_process_is_a_stop_when_the_root_is_gone`,
-`a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill`,
-`a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed`). That `taskkill` runs under
+with the root still there the kill counts as failed
+(`a_tree_kill_that_found_no_process_while_the_root_runs_is_a_failed_kill`); with
+the root gone it exited by itself, and the outcome is `exited_before_tree_kill`,
+not a stop on its own, because `taskkill /T` reaches children only through a live
+parent and nothing recorded what was under the root
+(`a_tree_kill_that_found_no_process_with_the_root_gone_is_not_a_stop_by_itself`).
+Across the record, such a root becomes `already_gone`, and the stop confirmed,
+only when another recorded process is confirmed gone (`a_parent_that_exits_alone_is_confirmed_when_the_recorded_engine_is_confirmed_gone`,
+`two_roots_that_both_exited_alone_are_a_confirmed_stop`); with nothing else
+recorded, or the engine still running or unconfirmed, it stays unconfirmed
+(`a_parent_that_exits_alone_with_nothing_else_recorded_is_not_a_confirmed_stop`,
+`a_parent_that_exits_alone_stays_unconfirmed_while_the_recorded_engine_is_not_gone`,
+`the_stopping_process_does_not_corroborate_a_root_that_exited_alone`). Both
+callers fold every row, so the record, PIDs and key are kept unless every
+recorded role is confirmed
+(`a_root_that_exited_alone_confirms_the_stop_only_when_the_engine_role_does` in
+`rocm` and in `rocmd`, `a_lone_root_that_exited_alone_leaves_the_stop_unconfirmed`
+in both). A failed tree kill with the root gone stays unconfirmed
+(`a_failed_tree_kill_with_the_root_gone_is_still_unconfirmed`). That `taskkill` runs under
 a deadline of `MANAGED_STOP_GRACE`: one that stalls is killed and reaped and
 counts as a failed tree kill, so it cannot hang `rocm services stop`, `restart`
 or the attached Ctrl-C stop
@@ -2028,8 +2041,17 @@ recorded token that differs outranks a failed query
 (`a_readable_token_mismatch_outranks_a_failed_query`), but the creation time and
 the query are read with the same access right, so on Windows this only reaches a
 process that opens and then fails the exit-code query; a process that cannot be
-opened has no readable token, stays unverifiable, and is cleared by hand (see
-"A record that stays unverified" in [manual-testing.md](manual-testing.md)). What no
+opened has no readable token, stays unverifiable, and is cleared with
+`rocm services remove <id> --force --yes` (see "A record that stays unverified"
+in [manual-testing.md](manual-testing.md); the unit tests
+`force_removes_a_record_held_by_an_unqueryable_process_and_says_so`,
+`a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal`,
+`force_is_refused_for_a_running_process_and_without_a_requested_stop` and
+`force_on_a_record_that_is_not_running_is_an_ordinary_removal` cover it with the
+probe injected, and `service-unqueryable-01` and `-02` drive the stop, the
+refusal naming `--force`, and the forced removal through the real binary, with
+the `e2e-test-hooks` variable `ROCM_E2E_UNQUERYABLE_PIDS` making the listed PIDs
+read as unqueryable; `-02` is Linux-only because it starts a real process). What no
 test here reaches is the Windows API itself: the handle hold, the open-failure
 codes and a real `taskkill` failing run only on the Windows lane.
 
@@ -2058,7 +2080,7 @@ that will read it exists. `a_stop_reports_its_own_pid_as_self` and
 Third, the `check:` line an unverified stop prints is a diagnostic, not a
 remediation: it shows whether the process is still running, and what clears the
 condition is that process ending (or, for a record held by a process `rocm`
-cannot open, the hand-clearing in `manual-testing.md`), after which a stop or a
+cannot open, `rocm services remove <id> --force --yes`), after which a stop or a
 service listing confirms and drops the key. The command is a stock one the host
 has, pinned by `the_process_check_command_is_the_one_the_host_has`, and
 `service-stop-07` uses the same `tasklist /FI "PID eq <pid>"` filter (in CSV

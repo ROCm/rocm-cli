@@ -505,12 +505,14 @@ rocm services restart <service-id> --yes
 `stop` prints `Local server stopped` only once every recorded process is
 confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
 keeps the record and any endpoint key, and exits non-zero. It names each
-process that, or a process under it, did not exit (on Windows also one that did
-exit while taking the processes under it down did not complete, so one of them
-may still be running: `not confirmed: process <pid> (<role>) exited, but a
-process under it may still be running`), and for one it could not
-verify, an operating-system command to check on it. It never prints a `retry:`
-line.
+process that, or a process under it, did not exit. On Windows it also names one
+that did exit while taking the processes under it down did not complete
+(`not confirmed: process <pid> (<role>) exited, but a process under it may still
+be running`), and one that was already gone when that step ran with no other
+recorded process confirmed gone (`not confirmed: process <pid> (<role>) was
+already gone when the processes under it were to be taken down`). For one it
+could not verify, it names an operating-system command to check on it. It never
+prints a `retry:` line.
 
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
@@ -541,12 +543,15 @@ possibly running, which is the safe direction: the record never reconciles to
 1. Run the check command the stop printed. If the process is this server's, end it
    yourself (from an elevated prompt if the account may not), then run
    `rocm services`; the record reconciles and its endpoint key is dropped.
-2. If it is an unrelated process, `rocm` has no command that clears the record.
-   Delete the record's `<service-id>.json` by hand from the folder that
-   `rocm storage report` lists under `local server records`, then run
-   `rocm services prune --any-age --yes`, which sweeps the log, the endpoint key
-   and the engine state file that are left with no record. The server can no
-   longer be restarted afterwards.
+2. If it is an unrelated process, run `rocm services remove <service-id> --force
+   --yes`. The refusal of a plain `remove` names exactly this command. `--force`
+   applies only when a stop was requested (the stop that reported `unverified`
+   did that), no recorded process is confirmed running, and at least one could
+   not be queried; a process `rocm` can see running is never forced past. The
+   command says which process could not be queried and that, if it is still
+   running, it keeps running, and it deletes the record, its log, its engine
+   state and its endpoint key. The server can no longer be restarted afterwards.
+   `rocm services prune` has no `--force`: it leaves such a record alone.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
