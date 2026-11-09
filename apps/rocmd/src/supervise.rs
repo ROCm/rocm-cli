@@ -2453,12 +2453,12 @@ mod tests {
     /// spawned yet: the rollback at that first write must undo the in-memory
     /// transition and leave the on-disk record exactly as it was, not a
     /// half-applied `recovering` row. The manifest write goes through
-    /// [`crate::write_atomic`][rocm_core_write_atomic]-style write-then-rename,
+    /// [`write_file_atomically`][rocm_core_atomic_write]-style write-then-rename,
     /// so a read-only *file* no longer blocks it (rename ignores the
     /// destination's own permission bits) — a read-only *directory* still does,
     /// since it can't hold the new temp file the rename needs.
     ///
-    /// [rocm_core_write_atomic]: rocm_core
+    /// [rocm_core_atomic_write]: rocm_core::atomic_write::write_file_atomically
     ///
     /// Unix only and skipped as root, where a read-only mode is not enforced
     /// and the write would simply succeed.

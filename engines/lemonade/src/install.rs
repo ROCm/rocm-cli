@@ -364,12 +364,34 @@ fn restore_packaged_backend_versions_with(
         // Missing (or not JSON): there is nothing of the user's to keep.
         None => packaged,
     };
-    rocm_core::write_atomic(&target, &restored, "pins")
+    write_pin_file(&target, &restored)
         .with_context(|| format!("failed to restore {}", target.display()))?;
     Ok(Some(PinFileBackup {
         target,
         previous: current,
     }))
+}
+
+/// Replaces the pin file at `target` through
+/// `rocm_core::atomic_write::write_file_atomically`, but only inside a
+/// directory that is still there.
+///
+/// The shared writer creates a missing parent directory. For this file that
+/// would rebuild `resources/` in a runtime tree that has been removed, leaving
+/// a directory holding nothing but a pin file that looks like the start of an
+/// install. The restore and the put-back both run after a failed install, when
+/// the tree may be gone, so a missing parent stays a failure, as it was before
+/// the shared writer took over.
+fn write_pin_file(target: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent()
+        && !parent.is_dir()
+    {
+        bail!(
+            "{} does not exist; not recreating it to hold the pin file",
+            parent.display()
+        );
+    }
+    rocm_core::atomic_write::write_file_atomically(target, bytes)
 }
 
 /// The two entries of `resources/backend_versions.json` that backend alignment
@@ -416,7 +438,7 @@ fn set_or_remove_pin(
 
 /// What `resources/backend_versions.json` held before
 /// [`restore_packaged_backend_versions`] rewrote it. Written back through
-/// `rocm_core::write_atomic`, like the restore itself.
+/// `rocm_core::atomic_write::write_file_atomically`, like the restore itself.
 ///
 /// A restore is attempted after any failed install, including a transient
 /// network or disk error, so a restore whose retry fails too must not leave a
@@ -439,7 +461,7 @@ impl PinFileBackup {
     /// Writes the previous bytes back, or removes the file if there were none.
     pub(crate) fn put_back(self) -> Result<()> {
         match self.previous {
-            Some(bytes) => rocm_core::write_atomic(&self.target, &bytes, "pins")
+            Some(bytes) => write_pin_file(&self.target, &bytes)
                 .with_context(|| format!("failed to put back {}", self.target.display())),
             None => match fs::remove_file(&self.target) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -567,7 +589,8 @@ fn collect_embeddable_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scratch_dir;
+    use crate::test_support::{retired_pin_temp_path, scratch_dir};
+    use rocm_core::foreign_temp_probe::assert_write_spares_foreign_temp_files;
     use sha2::{Digest, Sha256};
     use std::io::Write;
     #[cfg(windows)]
@@ -1097,40 +1120,64 @@ mod tests {
         )
     }
 
+    /// A runtime tree holding a pin file, with a verified embeddable archive
+    /// cached that ships its own packaged pin file, ready to be restored over.
+    struct RestoreFixture {
+        dir: PathBuf,
+        pins: PathBuf,
+        manifest: LemonadeInstallManifest,
+        sha256: String,
+    }
+
+    impl RestoreFixture {
+        fn new(tag: &str, packaged: &str, current: &str) -> Self {
+            let dir = scratch_dir(tag);
+            let root = dir.join("lemonade");
+            let runtime_dir = runtime_dir_in(&root);
+            fs::create_dir_all(runtime_dir.join("resources")).unwrap();
+            let pins = runtime_dir.join("resources/backend_versions.json");
+            fs::write(&pins, current).unwrap();
+            let source = dir.join("source-archive");
+            write_embeddable_with_pins(&source, packaged);
+            let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+            let manifest = LemonadeInstallManifest {
+                env_id: "test".to_owned(),
+                version: "11.5.1".to_owned(),
+                runtime_dir: runtime_dir.clone(),
+                lemond: lemond_path_in(&runtime_dir),
+                lemonade: lemonade_path_in(&runtime_dir),
+                backend_recipe: LLAMACPP_RECIPE.to_owned(),
+                backend_name: ROCM_BACKEND_NAME.to_owned(),
+                installed_at_unix_ms: 0,
+            };
+            cache_archive(&root, &source);
+            Self {
+                dir,
+                pins,
+                manifest,
+                sha256,
+            }
+        }
+
+        fn restore(&self) -> Result<Option<PinFileBackup>> {
+            restore_packaged_backend_versions_with(
+                &self.manifest,
+                "resources/backend_versions.json",
+                &self.sha256,
+                || {},
+            )
+        }
+    }
+
     /// [`restore_over`] with the pin file the archive ships given too.
     fn restore_over_packaged(
         tag: &str,
         packaged: &str,
         current: &str,
     ) -> (Option<PinFileBackup>, String) {
-        let dir = scratch_dir(tag);
-        let root = dir.join("lemonade");
-        let runtime_dir = runtime_dir_in(&root);
-        fs::create_dir_all(runtime_dir.join("resources")).unwrap();
-        let pins = runtime_dir.join("resources/backend_versions.json");
-        fs::write(&pins, current).unwrap();
-        let source = dir.join("source-archive");
-        write_embeddable_with_pins(&source, packaged);
-        let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
-        let manifest = LemonadeInstallManifest {
-            env_id: "test".to_owned(),
-            version: "11.5.1".to_owned(),
-            runtime_dir: runtime_dir.clone(),
-            lemond: lemond_path_in(&runtime_dir),
-            lemonade: lemonade_path_in(&runtime_dir),
-            backend_recipe: LLAMACPP_RECIPE.to_owned(),
-            backend_name: ROCM_BACKEND_NAME.to_owned(),
-            installed_at_unix_ms: 0,
-        };
-        cache_archive(&root, &source);
-        let backup = restore_packaged_backend_versions_with(
-            &manifest,
-            "resources/backend_versions.json",
-            &sha256,
-            || {},
-        )
-        .unwrap();
-        let after = fs::read_to_string(&pins).unwrap();
+        let fixture = RestoreFixture::new(tag, packaged, current);
+        let backup = fixture.restore().unwrap();
+        let after = fs::read_to_string(&fixture.pins).unwrap();
         // The backup, if any, still has to be able to put the file back.
         if let Some(backup) = &backup {
             assert!(backup.previous.is_some());
@@ -1371,6 +1418,124 @@ mod tests {
         // Already gone is not an error.
         PinFileBackup::new(pins, None).put_back().unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Restoring the packaged pins never writes through a file another writer
+    /// already staged next to `backend_versions.json`. The occupied names are
+    /// the ones the retired clock-and-pid temp naming would have picked
+    /// (`backend_versions.pins.tmp-<millis>-<pid>`), so a restore that still
+    /// used one would truncate a foreign file and rename it into place.
+    /// The restore tests above would pass for either writer; the foreign files
+    /// are what tell them apart.
+    #[test]
+    fn restoring_the_packaged_pins_never_reuses_another_writers_temp_file() {
+        let drifted = r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#;
+        let fixture = RestoreFixture::new(
+            "restore-foreign-temp",
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            drifted,
+        );
+
+        // Each attempt starts from the drifted file again, since a restore of
+        // an already restored file writes nothing.
+        let mut restored = None;
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_pin_temp_path(&fixture.pins, millis),
+            || {
+                fs::write(&fixture.pins, drifted)?;
+                restored = fixture.restore()?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(&fixture.pins).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["therock"]["version"], "7.13.0", "{after}");
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752", "{after}");
+        assert!(restored.is_some(), "a drifted pin file must be restored");
+        assert_no_pin_temp_files(fixture.pins.parent().unwrap());
+        fs::remove_dir_all(&fixture.dir).ok();
+    }
+
+    /// Putting a backup back spares foreign staged files for the same reason.
+    #[test]
+    fn putting_a_pin_file_backup_back_never_reuses_another_writers_temp_file() {
+        let dir = scratch_dir("pin-backup-foreign-temp");
+        let pins = dir.join("backend_versions.json");
+        let previous = br#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#;
+        fs::write(&pins, br#"{"therock":{"version":"7.13.0"}}"#).unwrap();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_pin_temp_path(&pins, millis),
+            || PinFileBackup::new(pins.clone(), Some(previous.to_vec())).put_back(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&pins).unwrap(), previous);
+        assert_no_pin_temp_files(&dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A put-back onto a runtime tree that has been removed fails, as it did
+    /// before the shared atomic writer, and recreates nothing: the shared
+    /// writer would build `resources/` just to hold the pin file. The failure
+    /// message and the absent directory are asserted together, since the
+    /// warning the caller prints says the previous file could not be put back.
+    #[test]
+    fn putting_a_pin_file_backup_back_into_a_removed_tree_fails_and_recreates_nothing() {
+        let dir = scratch_dir("pin-backup-removed-tree");
+        let resources = dir.join("runtime").join("resources");
+        let pins = resources.join("backend_versions.json");
+
+        let error = PinFileBackup::new(pins, Some(b"{}".to_vec()))
+            .put_back()
+            .expect_err("the tree is gone, so the previous pins cannot be put back into it");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("failed to put back") && text.contains("not recreating"),
+            "{text}"
+        );
+        assert!(
+            !resources.exists(),
+            "put_back recreated {}",
+            resources.display()
+        );
+        assert!(!dir.join("runtime").exists(), "put_back recreated the tree");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The restore has the same rule: a runtime tree removed while the archive
+    /// was being read is not rebuilt around a freshly written pin file.
+    #[test]
+    fn restoring_the_packaged_pins_into_a_removed_tree_fails_and_recreates_nothing() {
+        let fixture = RestoreFixture::new(
+            "restore-removed-tree",
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#,
+        );
+        let runtime_dir = fixture.manifest.runtime_dir.clone();
+
+        let error = restore_packaged_backend_versions_with(
+            &fixture.manifest,
+            "resources/backend_versions.json",
+            &fixture.sha256,
+            || fs::remove_dir_all(&runtime_dir).unwrap(),
+        )
+        .expect_err("the tree is gone, so the packaged pins cannot be written into it");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("failed to restore") && text.contains("not recreating"),
+            "{text}"
+        );
+        assert!(
+            !runtime_dir.exists(),
+            "the restore recreated {}",
+            runtime_dir.display()
+        );
+        fs::remove_dir_all(&fixture.dir).ok();
     }
 
     #[test]
