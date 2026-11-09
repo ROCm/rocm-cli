@@ -1105,7 +1105,7 @@ async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
     // below would only hide a planting or probe-root regression: hold the
     // topology read here to the planted GPU count and never decline to check.
     if let Some(simulated) = world.simulated_host.as_ref() {
-        let planted = simulated.host.gpus.len();
+        let planted = simulated.host.gpus().len();
         let read = topology.as_ref().map(Vec::len);
         assert!(
             planted > 0 && read == Some(planted),
