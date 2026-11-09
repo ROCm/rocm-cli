@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 mod discover_builds;
+mod endpoint_auth;
 mod install;
 mod process;
 mod repair;

@@ -88,9 +88,25 @@ pub(crate) async fn model_is_ready(
     expect_model: Option<&str>,
     timeout_secs: u64,
 ) -> bool {
+    model_is_ready_with_key(models_url, expect_model, timeout_secs, None).await
+}
+
+/// [`model_is_ready`] against an endpoint protected by `api_key`, which a
+/// keyless listing would only ever see refused.
+async fn model_is_ready_with_key(
+    models_url: &str,
+    expect_model: Option<&str>,
+    timeout_secs: u64,
+    api_key: Option<&str>,
+) -> bool {
+    let client = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        if let Ok(resp) = reqwest::get(models_url).await
+        let mut request = client.get(models_url);
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        if let Ok(resp) = request.send().await
             && resp.status().is_success()
         {
             match expect_model {
@@ -588,6 +604,121 @@ async fn setup_gpu_model(world: &mut E2eWorld) {
     serve_gpu_model(world).await;
 }
 
+/// The key the keyed-serve scenario protects its endpoint with. A fixed value:
+/// what that scenario checks is whether the key is enforced, not how it is minted.
+const PROTECTED_ENDPOINT_KEY: &str = "e2e-protected-endpoint-key-7f3a91c2";
+
+#[given("a model is being served on GPU behind an API key")]
+async fn setup_gpu_model_behind_key(world: &mut E2eWorld) {
+    serve_gpu_model_with_key(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+}
+
+/// Server routes outside the OpenAI `/v1` API that can run the model, read its
+/// tokenizer or report on it. Each must demand the key like `/v1` does; the
+/// bodies are valid requests, so a refusal can only come from authentication.
+fn routes_outside_the_openai_api(
+    model: &str,
+) -> Vec<(reqwest::Method, &'static str, serde_json::Value)> {
+    vec![
+        (
+            reqwest::Method::POST,
+            "/invocations",
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 8,
+            }),
+        ),
+        (
+            reqwest::Method::POST,
+            "/tokenize",
+            serde_json::json!({"model": model, "prompt": "Hello"}),
+        ),
+        (
+            reqwest::Method::POST,
+            "/detokenize",
+            serde_json::json!({"model": model, "tokens": [9707]}),
+        ),
+        (reqwest::Method::GET, "/metrics", serde_json::Value::Null),
+    ]
+}
+
+/// Call every route in [`routes_outside_the_openai_api`], with or without the
+/// key, recording each status in `world.route_statuses`.
+async fn call_routes_outside_the_openai_api(world: &mut E2eWorld, api_key: Option<&str>) {
+    let model = world.model_name.clone().expect("no model served");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_mins(2))
+        .build()
+        .expect("http client");
+    let base = format!("http://127.0.0.1:{SERVE_PORT}");
+    world.route_statuses.clear();
+    for (method, path, body) in routes_outside_the_openai_api(&model) {
+        let mut request = client.request(method.clone(), format!("{base}{path}"));
+        if !body.is_null() {
+            request = request.json(&body);
+        }
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        let status = request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{method} {base}{path} failed: {e}"))
+            .status()
+            .as_u16();
+        world
+            .route_statuses
+            .push((format!("{method} {path}"), status));
+    }
+}
+
+#[when("a client calls the server's other routes without the key")]
+async fn client_calls_other_routes_without_key(world: &mut E2eWorld) {
+    call_routes_outside_the_openai_api(world, None).await;
+}
+
+#[then("every one of those calls is refused as unauthorized")]
+async fn assert_other_routes_refused(world: &mut E2eWorld) {
+    assert!(!world.route_statuses.is_empty(), "no routes were called");
+    let unrefused: Vec<_> = world
+        .route_statuses
+        .iter()
+        .filter(|(_, status)| *status != 401)
+        .collect();
+    assert!(
+        unrefused.is_empty(),
+        "routes answered a client without the key instead of 401: {unrefused:?}"
+    );
+}
+
+#[then("the same calls succeed when the client presents the key")]
+async fn assert_other_routes_open_with_key(world: &mut E2eWorld) {
+    call_routes_outside_the_openai_api(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+    let failed: Vec<_> = world
+        .route_statuses
+        .iter()
+        .filter(|(_, status)| !(200..300).contains(status))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "routes refused a client presenting the key: {failed:?}"
+    );
+}
+
+#[then("the server's health check still answers without the key")]
+async fn assert_health_open_without_key(_world: &mut E2eWorld) {
+    let url = format!("http://127.0.0.1:{SERVE_PORT}/health");
+    let status = reqwest::get(&url)
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))
+        .status();
+    assert!(
+        status.is_success(),
+        "GET {url} without the key answered {status}; the liveness probe must stay open"
+    );
+}
+
 #[when("the user serves a model on GPU from the installed runtime")]
 async fn user_serves_gpu_model_from_installed_runtime(world: &mut E2eWorld) {
     // Unlike `setup_active_runtime`, this scenario intentionally keeps the
@@ -598,6 +729,12 @@ async fn user_serves_gpu_model_from_installed_runtime(world: &mut E2eWorld) {
 }
 
 async fn serve_gpu_model(world: &mut E2eWorld) {
+    serve_gpu_model_with_key(world, None).await;
+}
+
+/// Serve the host's GPU model, protecting the endpoint with `api_key` when one
+/// is given (`--require-api-key`, so even this loopback bind demands it).
+async fn serve_gpu_model_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
     // explicit engine matching this host. This step is a *precondition* for
     // scenarios that test inference/chat behavior, so it must not fail for
@@ -636,9 +773,19 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
     for attempt in 1..=attempts {
         made = attempt;
         let device_state = ensure_serve_port_free().await;
-        let (stdout, stderr, rc) =
-            crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
-        if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
+        let mut args = vec!["serve", model, "--engine", engine, "--managed"];
+        // The key goes through `ROCM_SERVE_API_KEY`, as `rocm serve --help`
+        // advises, not `--api-key`: argv is recorded verbatim in the uploaded
+        // `results/commands.jsonl`.
+        let mut envs = Vec::new();
+        if let Some(key) = api_key {
+            args.push("--require-api-key");
+            envs.push(("ROCM_SERVE_API_KEY", key));
+        }
+        let (stdout, stderr, rc) = crate::run_rocm_with_env(world, &args, &envs);
+        if rc == 0
+            && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+        {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
             return;

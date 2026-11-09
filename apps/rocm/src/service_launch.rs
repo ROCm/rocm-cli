@@ -154,7 +154,8 @@ pub(crate) fn drop_orphaned_endpoint_key_on_already_running(
 /// The one such case today: Windows managed Lemonade. Its server reads the
 /// value-typed `LEMONADE_API_KEY` env var, but the Windows detached-spawn
 /// primitive only carries path-valued env overrides, so the key never reaches it.
-/// vLLM enforces auth on every platform (`VLLM_API_KEY`), and loopback binds
+/// vLLM enforces auth wherever it runs (`VLLM_API_KEY` plus the every-route
+/// middleware in `engines/vllm/src/endpoint_auth.rs`), and loopback binds
 /// (`public_bind == false`) need no key — both pass. `is_windows` is a parameter
 /// so both branches are unit-testable off-Windows.
 pub(crate) fn ensure_public_bind_engine_supported(

@@ -147,6 +147,9 @@ pub struct E2eWorld {
     /// records a behavioral precondition here; the When step remains a plain user
     /// action and consumes the fixture without exposing its mechanism in Gherkin.
     pub command_env: Vec<(&'static str, std::ffi::OsString)>,
+    /// `(request, HTTP status)` for each server route a step called directly,
+    /// in call order, for a later Then step to judge.
+    pub route_statuses: Vec<(String, u16)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -352,6 +355,7 @@ impl Default for E2eWorld {
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),
+            route_statuses: Vec::new(),
             tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
