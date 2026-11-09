@@ -463,6 +463,16 @@ jobs:
         # `channel` dimension above, not replacing it — this lane is the only
         # per-PR job with two independent matrix axes.
         sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        # The nightly channel only carries the latest (pre-)release builds, so
+        # it cannot resolve the n-1/n-2 released versions the matrix pins
+        # (`rocm install sdk` fails with "no mutually compatible TheRock ...
+        # versions"). Those legs are covered by the `release` channel; a no-op
+        # when the matrix is the single-element `current`.
+        exclude:
+          - channel: nightly
+            sdk_version: n-1
+          - channel: nightly
+            sdk_version: n-2
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A pool host can be busy with other CI work between GPU preflight and
