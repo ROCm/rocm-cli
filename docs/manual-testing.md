@@ -1257,3 +1257,66 @@ Expected result:
 - Re-enabling a watcher right after disabling the last one (within the few
   seconds before the helper exits) still ends with a helper running: enable
   waits for an exiting helper to finish, then starts a new one.
+
+## 12. Context-Size Estimate for a GGUF Model
+
+Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
+by design) and network access to Hugging Face. The point is to check the
+estimate against what a real load uses: the compute buffer and runtime reserve
+were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
+so a different GPU or build can differ. How close the estimate came on them is
+recorded in the module documentation of
+[gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs), not repeated here.
+
+```bash
+rocm diagnose --model <owner>/<repo>:Q4_K_M --context-size 8192
+```
+
+Expected result:
+
+- The first lines say the header was read and the weights were not downloaded,
+  and the header read finishes in seconds.
+- The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
+  at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
+  and the total, with this GPU's dedicated VRAM and the largest context that
+  fits.
+- Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
+  about 53% and 28% of the `f16` one.
+- Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
+  (with `-fa on` and `--n-gpu-layers 99`, and `--cache-type-k`/`--cache-type-v` if changed) and compare the total in
+  the report with the GPU memory it uses once loaded (`amd-smi metric`). The
+  estimate should be at or a little above the real figure; if it is below it, or
+  far above, report the model and both figures.
+- `llama-server` at the reported largest context should load. The one check of
+  this kind made so far was on a single MI300X, with a second process holding
+  most of the card's memory so that about 15.1-15.5 GiB could still be allocated
+  (the process's `amd-smi` baselines were 181092 and 180738 MiB used of 196592),
+  for a Llama-3.1-8B Q4_K_M with an f16 cache. The card was described to
+  `rocm diagnose` as one with 15854 MiB, for which the estimate was 79872 tokens
+  (77056 tokens for 15500 MiB). `llama-server` loaded at 80896, 83968, 84992 and
+  86016 tokens (used memory grew by 15449, 15837, 15788 and 15767 MiB) and failed
+  to allocate at 87040, 90112 and 93184, so the real limit was between 86016 and
+  87040 tokens and the estimate was about 7-8% under it (79872 is 7.1% under
+  86016 and 8.2% under 87040). The load at 86016 tokens is the calibration load
+  "made with the card almost full" in
+  [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs)'s module documentation,
+  which says how the estimate compared with it. The baseline moved
+  by 354 MiB between runs, so those used-memory figures are good to a few
+  hundred MiB at best. That is one model on one card, not a bound; a different
+  model, GPU or build can land elsewhere. At a size well above what loads, the
+  report should say `does not fit` and list what would make it fit.
+- `rocm serve` is unchanged: it takes no context-size option, and the report
+  names llama.cpp's options only as llama.cpp's.
+
+Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
+`--context-size`, says a quantization is needed; a repository that does not
+exist says it was not found; a `.gguf` path that does not exist says it could
+not be opened and does not point at the upstream tracker; and naming a vision
+model's `mmproj-*.gguf` file on Hugging Face (`owner/repo:mmproj-....gguf`) says
+it is a multimodal projector, not a model, names the model file instead, and
+does not suggest `rocm serve` for the projector. None downloads
+anything.
+
+Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size
+8192` prints the report with no model section, and stderr says that `--model,
+--context-size were ignored` and nothing about the model was fetched.

@@ -153,6 +153,44 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### The freeform planner never imports `chat`
+
+`chat.rs` calls the freeform planner, so a planner that imported `chat` back
+would be a module cycle. The cycle is broken by three leaf modules
+([`prompt_text.rs`](../apps/rocm/src/prompt_text.rs),
+[`rocm_argv.rs`](../apps/rocm/src/rocm_argv.rs) and
+[`tool_policy.rs`](../apps/rocm/src/tool_policy.rs)) that the planner and `chat`
+both call into. `cargo xtask check-crate-edges` compares crates and cannot see
+a rule between modules of one crate, so, as with the environment rule above, a
+test enforces it rather than an `xtask` subcommand:
+`the_freeform_planner_and_its_leaf_modules_never_import_chat` in `xtask`
+([`chat_import_contract.rs`](../xtask/src/chat_import_contract.rs)) reads
+[`freeform_planner.rs`](../apps/rocm/src/freeform_planner.rs) and those three
+files and **fails the build** if any of them reaches `chat` in non-test code,
+naming each as `file:line`. Run it on its own with:
+
+```bash
+cargo test -p xtask chat_import_contract
+```
+
+It flags `crate::chat`, `super::chat` and `self::chat` as a path, `chat` as a
+member of a `use crate::{..}` group, and `mod chat`, and a raw identifier
+(`r#chat`) counts as `chat`. The one thing it skips is a
+`#[cfg(test)] mod name { .. }` block, so a `mod tests` may use `chat`; a
+`#[cfg(test)]` on anything else (a `use`, a function, a field, an expression)
+skips nothing, and a test that needs `chat` belongs in the test module. A route
+that never writes the `crate::chat` path is not seen: an alias
+(`use crate as root; root::chat::f()`), a glob (`use crate::*;` then
+`chat::f()`) or a `#[path = ".."] mod` that points at `chat.rs`; and
+`#[cfg(all(test, ..))]` is read as production code, so it can only cause a false
+alarm. It does not flag the
+identifiers and prose that merely contain the word, such as
+`chat_cli_arg_value`. It reads the four listed files only, not the modules they
+import. If one of them moves or is renamed, update `GUARDED` in the test; the
+test fails on a path that no longer exists rather than dropping it from the
+guard. When the planner needs something that lives in `chat.rs`, move it into
+a leaf module and import it from there.
+
 ### Tests that run a fake executable
 
 Plant a stand-in `python`, `uv`, `amd-smi`, ... with
@@ -288,6 +326,63 @@ share of cases and would pass with it present on a short run. The uninstall prop
 knob instead, `ROCM_DELETION_PROP_CASES`, described under Uninstall And
 Download Removal below; it follows the same rule.
 
+When a property fails, proptest saves the shrunk case as a `cc <hash> # shrinks
+to ...` line in a file named after the source file the `proptest!` block is
+written in, and replays it before any new case on every later run: a block in
+`<crate>/src/<path>.rs` uses `<crate>/proptest-regressions/<path>.txt`, where
+`src/` is the nearest ancestor directory holding a `main.rs` or `lib.rs` (it is
+`src/` for every crate in this tree). Moving
+the test to another file therefore leaves its saved cases behind, and proptest
+does not warn: they just stop being replayed. **Carry the saved cases to the
+test's new file in the same commit**; what that takes depends on how much moved:
+
+- When every property test of the source file moves, and the new file has no
+  regression file yet, `git mv` the regression file to the name the new file
+  needs.
+- When only some of them move (a split), the tests left behind still read the
+  old regression file, and proptest does not record which test a saved case
+  belongs to: all the `proptest!` blocks of a file share one. Keep the old file
+  where it is and copy the `cc` lines to the new file's regression file. If that
+  file already exists, append to it so its own cases stay; do not overwrite it
+  and do not `git mv` onto it. A case copied to a test it did not come from is
+  only one more input for that test to run.
+
+This is enforced in part by a test, not by an `xtask` subcommand:
+`every_proptest_regression_file_belongs_to_a_property_test_that_reads_it` in
+`xtask` walks the tree and **fails the build** on a file under any
+`proptest-regressions/` directory whose `<crate>/src/<path>.rs` (`src/` being the
+directory with `main.rs` or `lib.rs`) is missing or
+holds no `proptest!` block in code (a mention in a comment or a string literal
+does not count; whitespace or a comment between `proptest` and the `!`, as in
+`proptest ! { .. }`, still does), naming the file and the source file it expected. It cannot see
+the opposite mistake, a split that `git mv`d the regression file away from tests
+that still need it: no file is orphaned then, one is just missing, so read the
+diff of a split for it. Two more things it does not check: a crate with a
+`src/bin/<x>/main.rs` that has a property test would be reported as an orphan by
+mistake, because proptest then keeps its seeds in `src/bin/proptest-regressions/`
+(nothing in this tree has one); and a property test under a crate's `tests/`
+directory is invisible to it, since proptest cannot find a `main.rs` or `lib.rs`
+above such a file and writes the seed next to the test file instead. Run the
+check on its own with:
+
+```bash
+cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_that_reads_it
+```
+
+The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
+adds `xtask` when a changed file is under a `proptest-regressions` directory or
+when the diff of a changed Rust file adds or removes a line containing
+`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
+check on the pull request, whether or not its seed moved with it. The other
+source-scan contracts do not have this rule; they still meet a change confined to
+a crate that `xtask` does not depend on in the merge queue, which runs the whole
+workspace. To prove a moved seed is read,
+append a deliberately unparsable line to it, run the test with `--nocapture`
+(`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
+`unparsable line, ignoring` warning naming that path, and remove the line.
+The check does not tell a seed that still reproduces from one that no longer
+does; it only confirms that something reads the file.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
@@ -412,7 +507,10 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). On `main`
+`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
+the proptest seed guard and which no other crate depends on: a changed file under
+a `proptest-regressions` directory, and a changed Rust file whose diff adds or
+removes a line containing `proptest!` (found with `git diff -G`). On `main`
 and in the merge queue the full workspace always runs. For a full local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
 narrows the local pre-push hooks (next section).
@@ -1040,6 +1138,111 @@ every nightly run, and only a manual `include_nightly` dispatch on a host with
 Docker exercises AIM serve. The `e2e-gpu-nightly-strix` job logs whether Docker
 is reachable ("Report whether Docker is reachable"); check that line before
 relying on this coverage.
+
+### Lemonade managed-serve failure evidence
+
+On a failed serve, the shared serve steps preserve the full service log under
+`service-logs/` in the E2E results artifact before stopping the service. The engine
+is taken from `--engine X` or `--engine=X`, or else from the printed serve plan; if
+neither names one, the report says `engine unknown: backend evidence skipped`. A
+value that starts with `--` (as in `serve m --engine --managed`) is another flag, not
+an engine, and counts as no engine named.
+Lemonade failures also include the installed runtime manifest's version/backend, configured
+`backend_versions.json`, candidate GPU `llama-server` paths, SHA-256 fingerprints
+and `version.txt`,
+and each candidate's `--version` and `--help` output. Candidates are searched
+under the `rocm-stable`, `rocm-nightly`, `rocm` and `vulkan` directories of
+`bin/llamacpp`, down to three directory levels below each; the cpu backend is not
+searched. The search is bounded as a whole, not per directory: it reads at most
+128 directories and 2048 directory entries across all four backend directories,
+stops as soon as it finds a ninth candidate (it lists the first eight and says the
+list is cut; exactly eight is not reported as cut), and stops when the
+inventory's time is up, checking the clock at every directory and entry. Siblings are visited in
+sorted order, so a search that finishes inside its limits is deterministic.
+Symlinks are never followed: only real directories are entered and only a regular
+file named `llama-server` counts, so a link cycle ends and a link out of the
+backend directory is not read; the report says how many symlinked entries it
+declined to follow. The same rule covers every file the report reads: the
+manifest, the pins file, `version.txt` and a candidate's fingerprint target are
+refused when the last path component is a symlink, and the report says `symlink
+not followed` in place of the content. On unix the refusal is made by the open
+itself (`O_NOFOLLOW`), so a path swapped for a link after an earlier check is still
+refused; on Windows it is a metadata check followed by an open, so a swap between
+the two is not caught (read-only evidence, and the swap needs write access to the
+backend directory). Only the last component is checked: a link in a parent
+directory is followed. When a limit or the clock ends the search early the report
+says which, and does not claim an empty result. When nothing is found, the report
+lists the searched locations and what `bin/llamacpp` holds (the first 16 names
+out of at most 64 entries read, with a count of those omitted), and does not
+guess at the cause: an interrupted download, a layout outside the search and a
+build that was never installed look the same. The manifest and pin reads, the
+search and each candidate's fingerprint run on blocking threads, never on an
+async worker, and the search carries its own deadline because a timeout around a
+blocking task would only drop its handle.
+At most eight candidates
+are hashed and probed, with two read-only probes per candidate. Each probe retains
+up to 32 KiB of stdout and 32 KiB of stderr; only streams that discard bytes are
+marked as truncated. Across sixteen probes this is up to 1 MiB of retained raw
+output, plus metadata and formatting (invalid UTF-8 bytes may expand when rendered).
+Each probe has a five-second timeout. The inventory has a 20-second budget that
+starts when it is entered and covers the manifest and pin reads, the search and
+the hashing; the probes have their own 20-second budget, which starts
+when the service stop returns; hashing runs off the async executor, rejects files
+over 512 MiB, and checks its deadline between 64 KiB reads, so memory stays at
+one buffer whatever the size. The cap sits well above a dynamically linked
+`llama-server`: the `rocm-stable` build b12109 on the Strix Halo Ubuntu lanes
+was fingerprinted under the former 32 MiB cap, so current builds fit with room to
+spare. The larger cap is margin for a statically linked multi-target build,
+which is an assumption about future builds, not a measured size, and a larger
+file is a finding in its own right. A candidate over the size cap gets no fingerprint, and
+its entry says so with `sha256 unavailable: executable exceeds 512 MiB hash
+limit`; it is still listed and probed. Filesystem
+operations and process cleanup are not preemptible, so this is not a hard
+wall-clock limit on the entire report.
+A candidate or configured build pin is **not proof** of which binary the router
+launched; a failed probe is retained as evidence, not treated as an identity.
+Probes inherit the harness environment rather than reconstructing the engine's
+managed library paths, so a probe loader error alone does not establish why the
+serve failed. The report reads files first and executes a backend second. The
+manifest, pins, candidate paths, fingerprints and `version.txt` are read once the
+serve has exited non-zero or its readiness wait has timed out and the log has
+been read and archived, but before the service is stopped, so they describe the state being
+diagnosed. The `--version` and `--help` probes run after the stop returns, in the
+report's "probes, run after the service stop was attempted" section: llama.cpp
+builds commonly initialise a GPU backend even for `--version`, and doing that next
+to a still-running router on a shared-memory device could change the state being
+diagnosed. A stop that fails or finds no record can leave the router running; the
+report's `stop` section says so, and the probes still run. No lane has shown
+whether a probe initialises a GPU backend, which is why they are kept off the
+router's side of the stop. The order is fixed in one function,
+`backend_evidence_around_stop`, whose unit tests make the stop delete the candidate
+to show the fingerprint was read before it and the probes came after it. Nothing
+before the stop may keep it from running: a serve with no isolated scenario root
+has no manifest to look for, so the report says `backend evidence unavailable:
+the scenario has no isolated root` (and the stop's own status says it was not
+attempted), and a panic while looking the manifest up is caught and reported the
+same way, so the stop runs exactly once and the failure report is not lost.
+
+The probe's timeout, kill and reap path is tested on every platform, Windows
+included: the unit tests re-run the test binary itself as the child (an ignored
+helper test selected by an environment variable), let the probe time out, and
+require that the child is gone afterwards. The shell-script `llama-server`
+stand-ins used by the other probe tests exist on unix only. Not covered anywhere
+is the `kill/reap failed` branch, which needs an operating system that refuses to
+kill a child it just started.
+
+Use the evidence to distinguish backend startup, download, and router readiness
+failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
+as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+backend's ready line does not establish that the router serves the requested
+model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
+managed-launch contract or imply a backend fix.
+
+Exercise the diagnostics and expectation scoping without a GPU:
+
+```bash
+cargo test -p e2e-cucumber --lib lemonade
+```
 
 ## Runtime Selection And Activation
 
@@ -1999,7 +2202,8 @@ compaction keeping every pending proposal, the
 newest reviewed ones, and legacy proposal ids. The rotation tests in
 `jsonl_store::tests` drive
 `append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
-rotation policy; two further tests in `automation::tests` go through the public
+rotation policy and a record type of their own, so the engine's tests do not
+depend on `automation.rs`; two further tests in `automation::tests` go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
@@ -2047,7 +2251,7 @@ exit) and `serve-40` in
 (GPU lane: serving with no watcher enabled starts no helper; on a Linux host
 that runs it with lemonade it is an expected failure in
 [expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (#897), so the helper check is
+serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
 not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
 the row also matches other Linux lemonade hosts, where a pass is tolerated).
 
@@ -3274,12 +3478,15 @@ cargo xtask e2e -- -n '(diagnose-48)'
 
 ## Model Fit Preflight
 
-`rocm diagnose --model <ref>` answers whether a curated model will run on this
-host before anything downloads. It reports one of four verdicts: `ready`,
+`rocm diagnose --model <ref>` answers whether a model will run on this host
+before anything downloads: a curated model from its recipe (this section), a
+GGUF outside the catalog from its file header (the next one). For a curated
+model it reports one of four verdicts: `ready`,
 `degraded` (runs, but under the recipe's recommended system RAM),
 `blocked` (will not run here, with alternatives that would), or
 `undetermined` (the CLI could not judge it — an unreachable catalog, an
-unmeasured GPU, or a ref outside the curated set).
+unmeasured GPU, or a ref outside the curated set; for a GGUF reference the
+estimate below is added to that answer).
 
 ```bash
 rocm diagnose --model qwen-smoke --json   # smallest curated recipe
@@ -3298,6 +3505,101 @@ The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
 including the two that need a synthetic signed catalog to trigger
 deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
 produce them on an arbitrary real host.
+
+### GGUF estimate (models outside the catalog)
+
+A GGUF reference outside the catalog (a local `.gguf` path, or
+`owner/repo:QUANT`) is estimated from its header instead:
+`rocm diagnose --model <ref> --context-size N --kv-cache-type f16|q8_0|q4_0`.
+The verdict stays `undetermined` (`model_not_curated`); the answer is
+`model.estimate`, with outcome `fits`, `does_not_fit` or `cannot_estimate`, and
+the text report opens `ESTIMATED:` for the first two. The parts and their tests:
+
+- [gguf.rs](../crates/rocm-core/src/gguf.rs): the header parser, tested against
+  synthetic headers built byte by byte (versions, truncation at every offset,
+  per-layer head arrays, signed 32-bit integers as gguf-py writes them,
+  every fixed-width value type read at its own width as a scalar and as an
+  array element, skipped arrays, alignment, the span of the input embedding) and one test per
+  bound a hostile header would walk past (key length, entry counts, tensor
+  dimensions, array nesting, an overflowing array length, an unknown value type,
+  the layer count, how many shape keys are kept, how large a header may be --
+  including the checks inside a string array and an array of arrays, which are
+  walked over an endless stream and must stop near the bound -- a single length
+  larger than any header, and the length at which an array or string is no
+  longer kept).
+- [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs): the arithmetic (exact KV
+  figures, the boundary between fits and does not, the largest context -- a
+  trained context that is not a whole step included, on both sides -- the
+  suggestions, each layout it refuses to estimate, the state-space, hybrid and
+  mixture-of-experts layouts that get their figures with no verdict, and the
+  measured llama.cpp loads the allowances were calibrated on, which the synthetic Llama- and
+  Qwen-shaped headers must reproduce: buffer sizes, and a total never below the
+  measured use and within a bound of it per model. The module documentation
+  describes the loads and records the actual margins).
+- [gguf_source.rs](../crates/rocm-core/src/gguf_source.rs): reference parsing
+  (an existing file wins over `owner/repo:QUANT`; `owner/repo:dir/file.gguf`
+  names one of two same-named files), file selection (shards of one model versus
+  two models; a full path beats a bare name that matches a nested file; a
+  multimodal projector is never picked, and a name that matches only projectors
+  is refused as naming one), names
+  in a listing that could leave the repository or hide in a terminal (dropped,
+  and never requested), and the range reader, tested against a loopback server that
+  records the ranges it is asked for, so a read of the weights would show, and
+  that also answers with a wrong or missing `Content-Range`, a dropped body, a
+  missing size in the listing and in the `HEAD`, a gated repository and a slow
+  reply. [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs)
+  runs `rocm diagnose --model owner/repo:QUANT` against such a server with every
+  Hugging Face token variable set, and checks that the listing, `HEAD` and
+  range requests carry no `Authorization` or `Cookie` header.
+- [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
+  host-memory states (dedicated, none, unknown, APU), what is attached to a
+  curated or non-GGUF answer (nothing beyond a note on a flag that did not
+  apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
+  reference quoted for a shell), the plan a sized estimate keeps when it
+  could not compare (`amd-smi metric --json` where the memory was unreadable,
+  `rocm diagnose` where no GPU is visible, as for a curated model, and none on
+  an APU; unit-tested only, since no lane has a GPU whose memory cannot be
+  read), and the text and JSON shapes.
+- [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
+  `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
+  device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB, on
+  a discrete card and on an APU alike),
+  and the note for a mask on a host whose GPUs differ in memory. Both are unit
+  tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
+  lane has GPUs of different sizes.
+
+Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
+requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
+none and says on stderr that `--model` was ignored, while the same question
+without `--report` does reach the endpoint and prints no such note. Scenario
+`diagnose-52` has the stand-in answer the repository listing with a model and
+its multimodal projector, and shows that naming the projector exactly is
+answered as a projector, with the model file named instead, after the listing
+request alone.
+
+Scenarios `diagnose-49` and `diagnose-50` write a small GGUF into the scenario's
+isolated directory and assert the shape and the sizes (weights and KV cache are
+exact), and that a host that measured its GPU gets a comparison while one that
+could not is told why. Which branch runs depends on the lane: the GPU-less
+hosted runners take the "could not compare" one (the text report must then read
+UNDETERMINED), and the MI300X self-hosted lane (`E2E tests (MI300X, ...)` in
+`e2e-selfhosted.yml`) takes the compared one, where the text report must read
+ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
+by the unit tests, not by a scenario. Nothing in either runs against a real GPU
+load; see [manual-testing.md](manual-testing.md) for the check that does.
+
+Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independent:
+the context options without `--model` (a usage error naming it), a curated model
+asked about a context size (told the options do not apply, no estimate), a
+`.gguf` path that does not exist (named as not opened, no upstream route, and a
+plan to ask again about that path, the path quoted where the platform's shell
+needs it, so the step accepts it bare or quoted), and a bare `owner/repo` with a context size
+(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
+nothing, and the answer lists the model and the projector, marked as one.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7])'
+```
 
 ## Doctor Report Preflight
 
