@@ -584,6 +584,68 @@ mod tests {
         );
     }
 
+    /// A status that is neither an exit nor a signal (a stopped process, on
+    /// Unix) has neither a code nor a signal to name, and is reported as that.
+    #[cfg(unix)]
+    #[test]
+    fn a_status_with_no_code_and_no_signal_gets_the_neutral_wording() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Stopped by SIGSTOP: WIFSTOPPED, which is neither WIFEXITED nor WIFSIGNALED.
+        let stopped = ExitStatus::from_raw(0x137f);
+        assert_eq!(stopped.code(), None);
+        assert_eq!(stopped.signal(), None);
+        assert_eq!(
+            exit_note(stopped),
+            "engine stdio process ended without an exit code"
+        );
+    }
+
+    /// A source that does not answer until released, then never stops answering,
+    /// and says when it is dropped.
+    struct Gated {
+        release: mpsc::Receiver<()>,
+        dropped: mpsc::Sender<()>,
+        released: bool,
+    }
+    impl Read for Gated {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.released {
+                self.release.recv().unwrap();
+                self.released = true;
+            }
+            buffer[..4].copy_from_slice(b"late");
+            Ok(4)
+        }
+    }
+    impl Drop for Gated {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// Once the bounded read has given up, the reading thread that is still
+    /// blocked is not left spinning: when its source finally answers it finds
+    /// nobody listening and ends (it drops the source, which the test sees). The
+    /// source never reaches its end, so a thread that kept reading after the
+    /// failed send would never end.
+    #[test]
+    fn the_reader_left_behind_by_a_bounded_read_ends_when_nobody_is_listening() {
+        let (release, released) = mpsc::channel();
+        let (dropped, dropped_signal) = mpsc::channel();
+        let source = Gated {
+            release: released,
+            dropped,
+            released: false,
+        };
+        let collected = read_available(source, Duration::from_millis(50));
+        assert!(collected.is_empty());
+
+        release.send(()).unwrap();
+        dropped_signal
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the abandoned reader thread did not end");
+    }
+
     /// A stderr whose reads fail.
     struct Fails;
     impl Read for Fails {
@@ -592,15 +654,23 @@ mod tests {
         }
     }
 
-    /// A sink that refuses every write, like a closed terminal.
-    struct Closed;
-    impl Write for Closed {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+    /// A sink that hands every write to a closure: one that refuses them is a
+    /// closed terminal, one that records them shows what was forwarded.
+    struct FnSink<F>(F);
+    impl<F: FnMut(&[u8]) -> io::Result<usize>> Write for FnSink<F> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            (self.0)(bytes)
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_closure_sink_writes_through_and_flushes_nothing() {
+        let mut sink = FnSink(|bytes: &[u8]| Ok(bytes.len()));
+        assert_eq!(sink.write(b"abc").unwrap(), 3);
+        sink.flush().unwrap();
     }
 
     #[test]
@@ -626,11 +696,8 @@ mod tests {
         }
         let started = Instant::now();
         let collected = collect_until(&receiver, Instant::now());
-        assert!(
-            collected.is_empty(),
-            "collected {} bytes after the deadline",
-            collected.len()
-        );
+        let after_deadline = collected.len();
+        assert_eq!(after_deadline, 0, "collected bytes after the deadline");
         assert!(started.elapsed() < Duration::from_secs(1));
 
         // Before the deadline, queued output is collected, and a closed channel
@@ -675,7 +742,12 @@ mod tests {
         assert_eq!(collected, b"step 1\nstep 2\n");
 
         // A sink that refuses writes (a closed terminal) costs nothing.
-        let collected = collect_stderr(&b"still kept\n"[..], Some(Closed));
+        let collected = collect_stderr(
+            &b"still kept\n"[..],
+            Some(FnSink(|_: &[u8]| {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            })),
+        );
         assert_eq!(collected, b"still kept\n");
     }
 
@@ -971,9 +1043,7 @@ mod tests {
                 .unwrap();
             // The engine has said its piece and exited before the failure is
             // handled, as it has in the case this bounds.
-            while child.try_wait().unwrap().is_none() {
-                thread::sleep(Duration::from_millis(5));
-            }
+            child.wait().unwrap();
             let started = Instant::now();
 
             let error = finishes_within(Duration::from_secs(4), move || {
@@ -984,10 +1054,10 @@ mod tests {
                 )
             });
 
+            let waited = started.elapsed();
             assert!(
-                started.elapsed() < Duration::from_secs(4),
-                "waited for the grandchild: {:?}",
-                started.elapsed()
+                waited < Duration::from_secs(4),
+                "waited for the grandchild: {waited:?}"
             );
             assert!(error.to_string().ends_with("; stderr: said"), "{error}");
         }
@@ -1064,19 +1134,6 @@ mod tests {
             );
         }
 
-        /// A writer that keeps what it is given where the test can read it.
-        #[derive(Clone, Default)]
-        struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for SharedSink {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         /// What the running child writes to its stderr reaches the forwarding
         /// sink as it arrives. (That nothing is forwarded without the option is
         /// the `off` arm of the test below.)
@@ -1086,17 +1143,24 @@ mod tests {
             let body = format!("printf '%s' '{progress}' >&2\nprintf '%s' '{STOPPED}'");
             let engine = FakeEngine::new("client-forward-sink", true, &body);
 
-            let sink = SharedSink::default();
+            let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = {
+                let forwarded = std::sync::Arc::clone(&forwarded);
+                FnSink(move |bytes: &[u8]| {
+                    forwarded.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                })
+            };
             let answer = run_engine_stdio_forwarding(
                 engine.path(),
                 ["stdio"],
                 &EngineStdioOptions::default(),
                 &stop_request(),
-                Some(sink.clone()),
+                Some(sink),
             )
             .unwrap();
             assert!(answer.ok);
-            assert_eq!(sink.0.lock().unwrap().as_slice(), progress.as_bytes());
+            assert_eq!(forwarded.lock().unwrap().as_slice(), progress.as_bytes());
         }
 
         /// The public entry point sends the child's stderr to THIS process's
@@ -1136,12 +1200,7 @@ mod tests {
                 assert_eq!(
                     stderr.contains(LINE),
                     expected,
-                    "forward_stderr {arm}: the child's stderr {} this process's stderr:\n{stderr}",
-                    if expected {
-                        "must reach"
-                    } else {
-                        "must not reach"
-                    }
+                    "forward_stderr {arm}: the child's stderr on this process's stderr:\n{stderr}"
                 );
             }
         }
@@ -1239,16 +1298,6 @@ mod tests {
                     Ok(line.len())
                 }
             }
-            struct Sink(Seen);
-            impl Write for Sink {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    self.0.borrow_mut().push(("write", sigpipe_is_ignored()));
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
 
             if std::env::var_os("ROCM_TEST_CLIENT_GUARD_SCOPE_ARM").is_some() {
                 // SAFETY: installing a signal disposition is always safe.
@@ -1260,7 +1309,12 @@ mod tests {
                     lines: vec![b"one\n", b"two\n", b"three\n"],
                     seen: Rc::clone(&seen),
                 };
-                collect_stderr(source, Some(Sink(Rc::clone(&seen))));
+                let sink_seen = Rc::clone(&seen);
+                let sink = FnSink(move |bytes: &[u8]| {
+                    sink_seen.borrow_mut().push(("write", sigpipe_is_ignored()));
+                    Ok(bytes.len())
+                });
+                collect_stderr(source, Some(sink));
                 let seen = seen.borrow();
                 let writes = seen.iter().filter(|(what, _)| *what == "write").count();
                 assert_eq!(writes, 3, "{seen:?}");
