@@ -50,12 +50,12 @@ const DEFAULT_BG: (u8, u8, u8) = (13, 15, 18);
 )]
 struct Args {
     /// Session NDJSON recording to render (`PersistedEntry` lines).
-    #[arg(long, default_value = "/tmp/mi355x-demo.ndjson")]
+    #[arg(long)]
     input: PathBuf,
 
     /// Output cast file. Parent dir created if absent. The default is relative
     /// to the working directory.
-    #[arg(long, default_value = "../marketing/asciinema/rocm-dash.cast")]
+    #[arg(long, default_value = "rocm-dash.cast")]
     output: PathBuf,
 
     /// Terminal grid (cols × rows) the cast is rendered at.
@@ -369,6 +369,17 @@ const fn resolve_color(c: Option<Color>, default: (u8, u8, u8)) -> (u8, u8, u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_required_and_output_defaults_to_the_working_directory() {
+        let err = Args::try_parse_from(["gen_cast"])
+            .err()
+            .expect("no recording is produced at a fixed path, so --input has no default");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let args = Args::try_parse_from(["gen_cast", "--input", "session.ndjson"])
+            .expect("--input alone is enough");
+        assert_eq!(args.output, PathBuf::from("rocm-dash.cast"));
+    }
 
     #[test]
     fn generated_cast_is_marked_simulated() {

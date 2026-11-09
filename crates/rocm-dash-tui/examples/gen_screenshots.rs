@@ -40,12 +40,12 @@ use rocm_dash_tui::ui;
 )]
 struct Args {
     /// Session NDJSON recording to render (`PersistedEntry` lines).
-    #[arg(long, default_value = "/tmp/mi355x-demo.ndjson")]
+    #[arg(long)]
     input: PathBuf,
 
     /// Output directory. Created if absent. SVGs are named per view. The
     /// default is relative to the working directory.
-    #[arg(long, default_value = "../marketing/screenshots")]
+    #[arg(long, default_value = "screenshots")]
     output_dir: PathBuf,
 
     /// How many snapshots to replay before capturing. Higher = fuller
@@ -449,6 +449,17 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_required_and_output_dir_defaults_to_the_working_directory() {
+        let err = Args::try_parse_from(["gen_screenshots"])
+            .err()
+            .expect("no recording is produced at a fixed path, so --input has no default");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let args = Args::try_parse_from(["gen_screenshots", "--input", "session.ndjson"])
+            .expect("--input alone is enough");
+        assert_eq!(args.output_dir, PathBuf::from("screenshots"));
+    }
 
     #[test]
     fn generated_screenshot_is_marked_simulated() {
