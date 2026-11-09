@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+pub mod binary_path;
 pub mod capability;
 pub mod chat_request;
 pub mod expectation;

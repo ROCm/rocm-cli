@@ -1024,10 +1024,12 @@ pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (Strin
     let binary = rocm_binary();
     // A binary given as a relative path was meant relative to this process's
     // directory, not to the scenario's, so it is made absolute before the child
-    // moves. A bare name (`rocm`, found on `PATH`) cannot be canonicalised and
-    // stays as it is.
+    // moves. A bare name (`rocm`, found on `PATH`) stays as it is, even if the
+    // harness's directory happens to hold a file of that name.
     let program = if world.command_dir.is_some() {
-        std::fs::canonicalize(&binary).unwrap_or_else(|_| PathBuf::from(&binary))
+        e2e_cucumber::binary_path::program_for_moved_child(&binary, |path| {
+            std::fs::canonicalize(path)
+        })
     } else {
         PathBuf::from(&binary)
     };
