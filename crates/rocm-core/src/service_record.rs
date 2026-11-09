@@ -21,9 +21,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::AppPaths;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
+use crate::{ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AppPaths};
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
 
 /// Engine state-file key recording when inference was first confirmed.
@@ -127,6 +127,15 @@ pub struct ManagedServiceRecord {
     /// readiness was gated on inference.
     #[serde(default)]
     pub inference_verified_at_unix_ms: Option<u64>,
+    /// Base URL of the Anthropic-compatible `/v1/messages` endpoint, once the
+    /// serving process has published one. Adopted from the engine state file (see
+    /// [`crate::anthropic_endpoint`]); `None` while the service is still coming up
+    /// and on records written before the endpoint existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_url: Option<String>,
+    /// How [`Self::anthropic_endpoint_url`] is provided: `proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_endpoint_mode: Option<String>,
     pub manifest_path: PathBuf,
     pub log_path: PathBuf,
     pub engine_state_path: PathBuf,
@@ -248,6 +257,8 @@ impl ManagedServiceRecord {
             startup_phase: None,
             inference_verified_at_unix_ms: None,
             inference_probe_attempted_at_unix_ms: None,
+            anthropic_endpoint_url: None,
+            anthropic_endpoint_mode: None,
             manifest_path,
             log_path,
             engine_state_path,
@@ -283,6 +294,10 @@ impl ManagedServiceRecord {
     pub fn reset_for_restart(&mut self) {
         self.inference_verified_at_unix_ms = None;
         self.inference_probe_attempted_at_unix_ms = None;
+        // The respawned process publishes its own endpoint; the old proxy port
+        // died with the previous run.
+        self.anthropic_endpoint_url = None;
+        self.anthropic_endpoint_mode = None;
         self.restart_count = self.restart_count.saturating_add(1);
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
@@ -451,6 +466,19 @@ impl ManagedServiceRecord {
                 .and_then(serde_json::Value::as_u64)
         {
             self.inference_verified_at_unix_ms = Some(verified_at);
+        }
+        // The endpoint belongs to the run that published it, so it is replaced
+        // rather than kept: a restarted proxy listens on a different port.
+        let published = |key: &str| {
+            state
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(url) = published(ANTHROPIC_ENDPOINT_URL_STATE_KEY) {
+            self.anthropic_endpoint_url = Some(url);
+            self.anthropic_endpoint_mode = published(ANTHROPIC_ENDPOINT_MODE_STATE_KEY);
         }
         Ok(self.status != previous)
     }
@@ -662,6 +690,33 @@ mod tests {
         record.refresh_from_engine_state().expect("refresh");
         let _ = fs::remove_dir_all(dir);
         record
+    }
+
+    /// The serving process publishes the Anthropic endpoint in the engine state;
+    /// the record adopts it, and a restart drops it so the next run's port wins.
+    #[test]
+    fn engine_refresh_adopts_the_published_anthropic_endpoint() {
+        let record = refresh_from_state(
+            "anthropic",
+            &serde_json::json!({
+                "status": "ready",
+                "anthropic_endpoint_url": "http://127.0.0.1:40123",
+                "anthropic_endpoint_mode": "proxy",
+            }),
+        );
+        assert_eq!(
+            record.anthropic_endpoint_url.as_deref(),
+            Some("http://127.0.0.1:40123")
+        );
+        assert_eq!(record.anthropic_endpoint_mode.as_deref(), Some("proxy"));
+
+        let mut record = record;
+        record.reset_for_restart();
+        assert_eq!(record.anthropic_endpoint_url, None);
+        assert_eq!(record.anthropic_endpoint_mode, None);
+
+        let record = refresh_from_state("no-anthropic", &serde_json::json!({ "status": "ready" }));
+        assert_eq!(record.anthropic_endpoint_url, None);
     }
 
     /// A container engine serves under a different name than the image it pulls;

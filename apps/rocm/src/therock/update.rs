@@ -23,7 +23,6 @@
 //! install and activation paths share.
 
 use super::family::family_override_or_recovered_arch;
-use super::io::write_file_atomically;
 use super::process::SuppressProgressOutput;
 use super::python::{
     PythonLauncher, PythonSource, python_launcher_install_ready, python_requirement,
@@ -41,6 +40,7 @@ use crate::runtime_registry::{
     wheel_composition_device_target,
 };
 use anyhow::{Context, Result, bail};
+use rocm_core::atomic_write::write_file_atomically;
 use rocm_core::{AppPaths, unix_time_millis};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -460,17 +460,12 @@ fn resolve_latest_for_manifest(
             // a fresh host probe. Planning must predict the key an apply will
             // produce, and re-probing would disagree with the installed runtime on
             // any host whose GPU is absent, hidden, or simply a second card.
-            let device_target =
-                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
-                    || resolution.device_target.clone(),
-                    |target| {
-                        AggregateDeviceTarget::resolve(
-                            Some(target),
-                            &resolution.family,
-                            &resolution.published_device_targets,
-                        )
-                    },
-                );
+            let device_target = AggregateDeviceTarget::prefer_recorded(
+                &resolution.device_target,
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()),
+                &resolution.family,
+                &resolution.published_device_targets,
+            );
             // No exact target means no reproducible composition, so freshness
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.

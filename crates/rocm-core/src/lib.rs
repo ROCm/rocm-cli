@@ -8,8 +8,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod amd_smi;
+pub mod anthropic_endpoint;
 #[cfg(all(test, unix))]
 mod archive_props;
+pub mod atomic_write;
 pub mod automation;
 pub mod binary_paths;
 pub mod browser;
@@ -66,6 +68,10 @@ pub mod uv;
 pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
+pub use anthropic_endpoint::{
+    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
+    anthropic_endpoint_ready, wait_for_published_anthropic_endpoint,
+};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, EVENT_LOG_ROTATE_BYTES, EVENT_LOG_ROTATED_GENERATIONS,
@@ -75,7 +81,9 @@ pub use automation::{
     load_recent_automation_events, load_recent_automation_proposals,
     update_automation_proposal_status,
 };
-pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
+pub use binary_paths::{
+    daemon_binary_path, engine_binary_path, sibling_binary_path, sibling_binary_path_from,
+};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
@@ -164,7 +172,7 @@ pub use model_catalog::{
 pub use net::{
     DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
     format_host_for_url, format_host_port, format_http_base_url, http_get_text,
-    http_get_text_with_auth, http_post_json_with_auth, parse_http_endpoint,
+    http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -226,9 +234,10 @@ pub use service_record::{
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
-    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, find_uv_binary,
+    split_local_version, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
+    uv_pip_check_args, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject,
+    violations_requiring,
 };
 pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
