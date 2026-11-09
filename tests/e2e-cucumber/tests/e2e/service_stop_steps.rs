@@ -468,16 +468,19 @@ async fn engine_answer_survives_a_failing_exit(world: &mut E2eWorld) {
     assert_eq!(report["result"]["stopped"], true, "{report}");
 }
 
-/// An answer that cannot be read is reported as that, with what the engine said
-/// on stderr, rather than as an exit status.
-#[then("the tool reports the stop request failed, with the engine's stderr")]
+/// An answer that cannot be read is reported as that, together with the status
+/// the engine exited with and what it said on stderr: the status says the answer
+/// was cut short, the stderr why.
+#[then("the tool reports the stop request failed, with the engine's exit status and stderr")]
 async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
     let report = tool_report(world);
     let engine_stop = &report["result"]["engine_stop"];
     assert_eq!(engine_stop["attempted"], true, "{report}");
     assert_eq!(
         engine_stop["error"],
-        "failed to parse engine response envelope; stderr: engine exploded: no container runtime",
+        "failed to parse engine response envelope \
+         (engine stdio process exited with status exit status: 1); \
+         stderr: engine exploded: no container runtime",
         "{report}"
     );
     assert!(engine_stop.get("stopped").is_none(), "{report}");

@@ -221,6 +221,14 @@ choose: the program and verb, the app paths, and whether stderr is forwarded (se
 `apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). A caller that
 grew its own private copy of the conversation would fail those tests.
 
+An answer that is not a response envelope is reported as that, and when the
+child also exited with a failing status the error says so, because the status is
+often why the answer was cut short (a clean exit adds nothing). A failing child
+that printed nothing is reported by its status alone. Both carry the child's
+stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
+the three cases against the fake, and `engine-ipc-02` below shows the same
+message in a `stop_server` report next to what the stop did.
+
 The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
 its default action, which is how `rocm` runs, because the test harness leaves it
 ignored and changing it process-wide would race sibling tests. A write that is
@@ -1858,8 +1866,8 @@ records its argv and the request it was sent, and prints what the scenario
 says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
 report carries the engine's answer (not an error built from the exit status).
 `engine-ipc-02` has it print something that is not an answer, write to stderr
-and exit non-zero: the report's engine error is the parse failure with that
-stderr. Both check the report together with the server's process, record and
+and exit non-zero: the report's engine error is the parse failure, naming the
+exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
 endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
 one `stop` request line. The server is a `vllm` one, for which the engine's
 `Stop` is advisory, so in `-02` the stop still completes; an engine whose stop

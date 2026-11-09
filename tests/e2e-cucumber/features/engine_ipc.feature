@@ -40,7 +40,7 @@ Feature: How the daemon reads an engine's answer
     And the engine prints something that is not an answer, complains on stderr and exits with a failing status
     When the standalone daemon's stop_server tool stops that server
     Then the engine received one stop request for that server over stdio
-    And the tool reports the stop request failed, with the engine's stderr
+    And the tool reports the stop request failed, with the engine's exit status and stderr
     And the tool still reports the server stopped
     And the recorded process is no longer running
     And the server's record reads stopped and names no process

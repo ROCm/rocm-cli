@@ -22,7 +22,7 @@
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -166,21 +166,34 @@ where
         .map(|reader| reader.join().unwrap_or_default())
         .unwrap_or_default();
 
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
     if !status.success() && stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let exited = exit_note(status);
         if stderr.is_empty() {
-            bail!("engine stdio process exited with status {status}");
+            bail!("{exited}");
         }
-        bail!("engine stdio process exited with status {status}: {stderr}");
+        bail!("{exited}: {stderr}");
     }
-    serde_json::from_slice(&stdout).with_context(|| {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-        if stderr.is_empty() {
-            "failed to parse engine response envelope".to_owned()
-        } else {
-            format!("failed to parse engine response envelope; stderr: {stderr}")
-        }
-    })
+    serde_json::from_slice(&stdout).with_context(|| unparseable_answer_message(status, &stderr))
+}
+
+/// How a failing exit is worded wherever the status is reported.
+fn exit_note(status: ExitStatus) -> String {
+    format!("engine stdio process exited with status {status}")
+}
+
+/// The error for an answer that is not a response envelope. A child that also
+/// exited with a failing status says so, because that is often why the answer is
+/// cut short; the stderr it wrote follows when there is any.
+fn unparseable_answer_message(status: ExitStatus, stderr: &str) -> String {
+    let mut message = "failed to parse engine response envelope".to_owned();
+    if !status.success() {
+        message.push_str(&format!(" ({})", exit_note(status)));
+    }
+    if !stderr.is_empty() {
+        message.push_str(&format!("; stderr: {stderr}"));
+    }
+    message
 }
 
 /// Read the child's whole answer from `stdout`.
@@ -600,6 +613,46 @@ mod tests {
 
             let silent = FakeEngine::new("client-garbage-quiet", true, "printf 'not json'");
             let error = run(&silent, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope"
+            );
+        }
+
+        /// A child that fails and also leaves something that is not an envelope on
+        /// stdout is reported with its exit status (the status says the answer was
+        /// cut short, where the parse error alone would not), as a child that
+        /// printed nothing is. The same unreadable answer from a child that exited
+        /// cleanly carries no status, so the note is the condition's own and not
+        /// added to every parse failure.
+        #[test]
+        fn an_unparseable_answer_from_a_failing_child_names_the_exit_status() {
+            let crashed = FakeEngine::new(
+                "client-garbage-crash",
+                true,
+                "printf 'not json'\necho oops >&2\nexit 4",
+            );
+            let error = run(&crashed, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope \
+                 (engine stdio process exited with status exit status: 4); stderr: oops"
+            );
+
+            let silent = FakeEngine::new(
+                "client-garbage-crash-quiet",
+                true,
+                "printf 'not json'\nexit 5",
+            );
+            let error = run(&silent, &EngineStdioOptions::default()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to parse engine response envelope \
+                 (engine stdio process exited with status exit status: 5)"
+            );
+
+            let clean = FakeEngine::new("client-garbage-clean", true, "printf 'not json'\nexit 0");
+            let error = run(&clean, &EngineStdioOptions::default()).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "failed to parse engine response envelope"
