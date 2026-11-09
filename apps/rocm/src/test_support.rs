@@ -389,7 +389,7 @@ pub(crate) fn owned_argv(args: &[&str]) -> Vec<String> {
 
 /// Build an `AutomationRuntimeState` for the background-helper tests (the
 /// no-double-spawn guard in `background_helper.rs` and the autostart tests in
-/// `service_launch.rs`).
+/// `service_launch/helper_autostart.rs`).
 pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
     AutomationRuntimeState {
         running,

@@ -22,7 +22,7 @@ e2e-test-hooks = [
 # hook that simulates a managed vLLM launch which OOM'd and never became ready,
 # so the positive OOM-guidance summary can be verified on a GPU-less CI host.
 # See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in
-# `service_launch.rs`.
+# `service_launch/readiness.rs`.
 e2e-oom-fault-injection = []
 
 [dependencies]

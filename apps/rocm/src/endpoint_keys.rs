@@ -5,7 +5,7 @@
 //! Secure storage for per-service inference-endpoint API keys.
 //!
 //! When `rocm serve` binds a public (non-loopback) interface it protects the
-//! endpoint with an API key (see `resolve_endpoint_auth` in `service_launch.rs`).
+//! endpoint with an API key (see `resolve_endpoint_auth` in `service_launch/endpoint_auth.rs`).
 //! The key is stored in a 0600 file under the services directory, keyed by
 //! service id.
 //!

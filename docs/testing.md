@@ -2960,7 +2960,7 @@ the per-PR mock lane. The host predicate itself is the shared
 than restated in either, so the test cannot drift from the production rule.
 
 The bypass decision's other arguments are in the same position — the unit tests
-in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
+in [`launch_transaction.rs`](../apps/rocm/src/service_launch/launch_transaction.rs) pin `managed_service_reuse_refusal` itself,
 not which values `serve()` hands it — so each one has a scenario instead:
 serve-30 for `require_api_key`, serve-32 for the requested recipe. The device
 policy needs neither: the predicate takes it by value rather than as an
