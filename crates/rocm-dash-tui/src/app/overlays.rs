@@ -219,7 +219,8 @@ impl AppState {
     /// (and is ignored while a job runs) before it can eject the manager.
     pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
-            w.browser.is_none()
+            w.editor.is_none()
+                && w.browser.is_none()
                 && w.picker.is_none()
                 && w.approval.is_none()
                 && w.active_job.is_none()
@@ -324,6 +325,56 @@ mod tests {
     use super::*;
     use crate::app::ChatConsent;
     use crate::app::test_support::st;
+
+    #[test]
+    fn serve_wizard_editor_handles_escape_before_overlay_back_out() {
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Serving;
+        let mut wizard = crate::ui::serve_wizard::ServeWizardState {
+            model: "typed-model".into(),
+            ..Default::default()
+        };
+        wizard.editor = Some(crate::ui::serve_wizard::InlineEditor {
+            field: crate::ui::serve_wizard::Field::Host,
+            value: "localhost".into(),
+            cursor: 9,
+            selected: false,
+        });
+        state.serve_wizard = Some(wizard);
+
+        assert!(
+            !state.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must reach the inline editor instead of closing the wizard"
+        );
+
+        // Drive Esc through the real dispatch (mirrors event_loop.rs's
+        // `state.serve_wizard.is_some()` arm) instead of only checking the
+        // routing predicate above, so a removed `editor_key` Esc arm turns
+        // this test red.
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut state.serve_wizard,
+            &mut state.jobs,
+            &state.model_recipes,
+            key,
+        );
+
+        let wizard = state
+            .serve_wizard
+            .as_ref()
+            .expect("Esc must not close the wizard");
+        assert!(
+            wizard.editor.is_none(),
+            "Esc must discard the inline editor"
+        );
+        assert_eq!(
+            wizard.model, "typed-model",
+            "the in-progress form remains available to the editor handler"
+        );
+    }
 
     #[test]
     fn global_hotkeys_are_unreachable_while_a_modal_overlay_or_prompt_owns_the_keyboard() {
@@ -496,10 +547,12 @@ mod tests {
             field: _,
             model: _,
             engine_idx: _,
-            device_idx: _,
             host: _,
+            port_mode: _,
             port: _,
             managed: _,
+            advanced_expanded: _,
+            editor: _,
             browser,
             picker,
             approval,

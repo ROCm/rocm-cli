@@ -337,6 +337,48 @@ mod tests {
             .expect("a fallback Esc chip stepping the pane back out must always be present");
     }
 
+    /// The rendered row of the footer for `state`, as one string.
+    fn footer_row(state: &AppState) -> String {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_footer(f, f.area(), state, &theme);
+        })
+        .unwrap();
+        (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect()
+    }
+
+    /// The e2e dashboard steps wait for the literal `Esc  menu` (two spaces) to
+    /// know the frame is drawn through the footer with no overlay open, and rely
+    /// on the chip reading `close` instead when the main menu is open. This pins
+    /// that rendering, so a change to the chip's spacing or wording fails here
+    /// and not as a 30 s timeout in the `dash-` scenarios
+    /// (`services_manager_closed` in `tests/e2e-cucumber/tests/e2e/dash_steps.rs`).
+    #[test]
+    fn footer_esc_chip_renders_the_text_the_e2e_dashboard_steps_wait_for() {
+        let state = AppState::new("t".into(), "default-dark".into());
+        let idle = footer_row(&state);
+        assert!(
+            idle.contains("Esc  menu"),
+            "an idle dashboard's footer must read `Esc  menu`: {idle:?}"
+        );
+
+        let mut menu_open = AppState::new("t".into(), "default-dark".into());
+        menu_open.modal = Modal::Menu;
+        let open = footer_row(&menu_open);
+        assert!(
+            open.contains("Esc  close") && !open.contains("Esc  menu"),
+            "with the main menu open the Esc chip must read `close`, not `menu`: {open:?}"
+        );
+    }
+
     #[test]
     fn footer_esc_chip_dispatches_pane_escape_when_detail_focused() {
         // Regression: on Rocm/Serving with `pane_focus == Detail`, the real

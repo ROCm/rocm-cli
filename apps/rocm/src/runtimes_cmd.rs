@@ -14,10 +14,10 @@
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`runtimes(command)`,
 //! re-imported via `use crate::runtimes_cmd::{runtimes, ...};`).
-//! `RuntimesCommand` remains in the crate root (part of the `Command`/`Cli`
-//! clap definition) and is reached via `use crate::RuntimesCommand`, the same
-//! way `EnginesCommand` stayed behind when `engines()` moved to
-//! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` stays
+//! `RuntimesCommand` lives in `cli.rs` (part of the `Command`/`Cli` clap
+//! definition) and is reached via `use crate::RuntimesCommand`, a re-import in
+//! `main.rs`, the same way `engines_cmd.rs` reaches `EnginesCommand`.
+//! `RuntimeActivationResult` stays
 //! `pub(crate)`: it is read by `append_update_activate_summary` in
 //! `update_cmd.rs`'s `apply_runtime_update` flow. The uninstall plan and apply
 //! code lives in `runtime_uninstall.rs`, and the active-runtime marker model in
@@ -39,8 +39,8 @@
 use std::fmt::Write as _;
 use std::fs;
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal};
+use anyhow::{Context, Result};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
 
 use crate::runtime_adopt::{
     AdoptRuntimeOptions, adopt_runtime_from_python_options, import_runtime_manifest,
@@ -213,12 +213,9 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
-            let plan = if yes {
+            let plan = if require_yes_or_interactive(yes, "runtimes uninstall")? {
                 plan
             } else {
-                if !interactive_terminal() {
-                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
-                }
                 match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
                     RuntimeUninstallConfirmation::Cancelled => {
                         println!("runtime uninstall cancelled");
@@ -476,13 +473,9 @@ impl ActivationSnapshot {
             // failed, so it is the write least able to afford leaving a
             // truncated marker behind — which runtime resolution and the
             // storage retention holds would both read as "nothing is active".
+            // The helper creates the `runtimes` folder when it is missing.
             MarkerSnapshot::Contents(bytes) => {
-                let parent = path
-                    .parent()
-                    .context("active runtime marker path has no parent directory")?;
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-                therock::write_file_atomically(&path, &bytes)
+                rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
             // Only a regular file is removed: whatever else may sit at that
@@ -530,16 +523,48 @@ fn restore_after_failed_activation(
     error: anyhow::Error,
 ) -> anyhow::Error {
     match snapshot.restore(paths, config) {
-        Ok(()) => error.context(
+        Ok(()) => discard_failed_marker_replacement(error).context(
             "failed to record the active ROCm runtime; the previously active runtime is still \
              the active one",
         ),
-        Err(restore_error) => error.context(format!(
+        Err(restore_error) => discard_failed_marker_replacement(error).context(format!(
             "failed to record the active ROCm runtime, and restoring the previous state failed \
              too ({restore_error:#}); the ROCm CLI config and the active runtime marker may now \
              disagree. Run `rocm runtimes list` to see both, then re-run `rocm runtimes activate \
              <runtime_key>` for the runtime you want to write them again"
         )),
+    }
+}
+
+/// Drop the marker a failed activation left behind, and the advice to use it.
+///
+/// On Windows a marker publish can fail after taking the old marker away, and
+/// the shared writer then keeps the new marker in its temp file and advises
+/// renaming it into place (`rocm_core::atomic_write::KeptReplacement`). The
+/// activation is being rolled back, so that file holds the marker of an
+/// activation that failed, and renaming it would install that marker over
+/// whatever the rollback restored. So the file is removed, and the error is
+/// rebuilt without the advice. If the file cannot be removed, the error names
+/// it and says to delete it instead.
+fn discard_failed_marker_replacement(error: anyhow::Error) -> anyhow::Error {
+    let Some(kept) = error.downcast_ref::<rocm_core::atomic_write::KeptReplacement>() else {
+        return error;
+    };
+    let failure = format!(
+        "failed to write active runtime marker {}: {}",
+        kept.destination().display(),
+        kept.cause()
+    );
+    match fs::remove_file(kept.kept()) {
+        Ok(()) => anyhow::anyhow!(failure),
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!(failure)
+        }
+        Err(remove_error) => anyhow::anyhow!(
+            "{failure}; {} holds the marker of the activation that failed and could not be \
+             removed ({remove_error}): delete it, do not rename it into place",
+            kept.kept().display()
+        ),
     }
 }
 
@@ -846,12 +871,20 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
     }
 }
 
+/// Replace the active-runtime marker in one step.
+///
+/// Two `rocm` processes can activate a runtime against the same data
+/// directory at once (two terminals, a script), so the write goes through the
+/// shared atomic writer: each writer stages into its own exclusively created
+/// temp file, and the marker is replaced rather than removed first. On Unix,
+/// and on Windows whenever `ReplaceFileW` succeeds, a reader therefore always
+/// finds a complete marker. A `ReplaceFileW` that fails part-way is the
+/// exception: it can leave the marker missing, which the writer repairs with a
+/// plain rename when that rename succeeds (see `rocm_core::atomic_write`); two
+/// replacements in flight at once on Windows are not tested. It does not order
+/// the two activations: the last one to publish wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
-    fs::create_dir_all(
-        path.parent()
-            .context("active runtime marker path has no parent directory")?,
-    )?;
     // The shared helper rather than a local temp-file-and-rename: it is the same
     // write the failed-activation restore uses, and it is strictly stronger than
     // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
@@ -861,18 +894,21 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
-    // the folder `rocm runtimes` reads.
-    therock::write_file_atomically(
-        &path,
-        &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    // the folder `rocm runtimes` reads. The one exception is a Windows publish
+    // that took the old marker away and could not put the new one in place:
+    // the temp file is then the only copy, so it is kept and the error names
+    // it; a failed activation removes it again once the restore has put the
+    // previous marker back (`discard_failed_marker_replacement`). It also
+    // creates the `runtimes` folder when it is missing.
+    let bytes =
+        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write active runtime marker {}", path.display()))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::append_examine_runtime_state;
@@ -881,6 +917,7 @@ pub(crate) mod tests {
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
+    use crate::runtime_registry::{ManifestOverwrite, write_runtime_manifest};
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
@@ -1196,6 +1233,146 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn test_active_runtime_marker(paths: &AppPaths, runtime_key: &str) -> ActiveRuntimeMarker {
+        ActiveRuntimeMarker {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: runtime_key.to_owned(),
+            manifest_path: runtime_manifest_path(paths, runtime_key),
+            install_root: paths.data_dir.join("runtimes").join(runtime_key),
+            previous_runtime_id: None,
+            previous_runtime_key: None,
+            activated_at_unix_ms: rocm_core::unix_time_millis(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn leftover_marker_temp_files(paths: &AppPaths) -> Result<Vec<String>> {
+        let dir = active_runtime_marker_path(paths)
+            .parent()
+            .context("marker has a parent")?
+            .to_path_buf();
+        let mut leftovers = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with("active.json.tmp-") {
+                leftovers.push(name);
+            }
+        }
+        Ok(leftovers)
+    }
+
+    /// Two activations writing the marker at once must both succeed, and a
+    /// reader must find a complete marker throughout. #605 reported a writer
+    /// that removed `active.json` before renaming the replacement in, and two
+    /// writers in the same millisecond sharing one temp file, so one failed
+    /// with "failed to move active runtime marker" and the other could publish
+    /// the shorter payload followed by the longer one's tail. #424 fixed that;
+    /// this change routes the marker through `rocm_core::atomic_write`, the
+    /// writer `rocm` and `rocmd` now share, and this test pins that the marker
+    /// keeps the property through it.
+    ///
+    /// The bug is a race, so against the old code this fails with high
+    /// probability per round rather than deterministically; against the
+    /// current writer nothing in it is timing-dependent. Unix only: the
+    /// property under test is that `rename` replaces in one step. The Windows
+    /// publish path goes through `ReplaceFileW` instead, whose behaviour with
+    /// two replacements of one file in flight this test has not been run
+    /// against.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_active_runtime_marker_writes_keep_a_complete_marker_published() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 200;
+        let (root, paths) = test_paths("marker-concurrent");
+        write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "initial"))?;
+        let marker_path = active_runtime_marker_path(&paths);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let done = Arc::clone(&done);
+            let marker_path = marker_path.clone();
+            std::thread::spawn(move || {
+                let mut problems = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    match fs::read(&marker_path) {
+                        Ok(bytes) => {
+                            if let Err(error) =
+                                serde_json::from_slice::<ActiveRuntimeMarker>(&bytes)
+                            {
+                                problems.push(format!("unparsable marker: {error}"));
+                            }
+                        }
+                        Err(error) => problems.push(format!("marker unreadable: {error}")),
+                    }
+                }
+                problems
+            })
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = [
+            "short",
+            "a-runtime-key-long-enough-to-leave-a-tail-behind-a-shorter-payload",
+        ]
+        .into_iter()
+        .map(|runtime_key| {
+            let barrier = Arc::clone(&barrier);
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let mut errors = Vec::new();
+                for _ in 0..ROUNDS {
+                    barrier.wait();
+                    if let Err(error) = write_active_runtime_marker(
+                        &paths,
+                        test_active_runtime_marker(&paths, runtime_key),
+                    ) {
+                        errors.push(format!("{error:#}"));
+                    }
+                }
+                errors
+            })
+        })
+        .collect();
+
+        let mut writer_errors = Vec::new();
+        for writer in writers {
+            writer_errors.extend(writer.join().expect("writer thread panicked"));
+        }
+        done.store(true, Ordering::Release);
+        let reader_problems = reader.join().expect("reader thread panicked");
+
+        let published: ActiveRuntimeMarker = serde_json::from_slice(&fs::read(&marker_path)?)?;
+        let leftovers = leftover_marker_temp_files(&paths)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            writer_errors.is_empty(),
+            "{} of {} marker writes failed; first: {:?}",
+            writer_errors.len(),
+            2 * ROUNDS,
+            writer_errors.first()
+        );
+        assert!(
+            reader_problems.is_empty(),
+            "a reader found no complete marker {} times; first: {:?}",
+            reader_problems.len(),
+            reader_problems.first()
+        );
+        assert!(
+            [
+                "short",
+                "a-runtime-key-long-enough-to-leave-a-tail-behind-a-shorter-payload"
+            ]
+            .contains(&published.runtime_key.as_str()),
+            "unexpected marker: {published:?}"
+        );
+        assert_eq!(leftovers, Vec::<String>::new());
+        Ok(())
+    }
+
     #[test]
     fn runtime_activation_records_exact_key_and_rollback() -> Result<()> {
         let (root, paths) = test_paths("runtime-activation");
@@ -1301,10 +1478,10 @@ pub(crate) mod tests {
     }
 
     /// Replace the active-runtime marker with a NON-EMPTY directory, so the
-    /// next `write_active_runtime_marker` fails at a predictable point: its
-    /// `create_dir_all` of the parent succeeds, and the final `fs::rename` of
-    /// the temp file onto a non-empty directory fails on both supported
-    /// platforms without needing privileges or a real full disk.
+    /// next `write_active_runtime_marker` fails at a predictable point: the
+    /// temp file is staged beside it, and publishing that file onto a
+    /// non-empty directory fails on both supported platforms without needing
+    /// privileges or a real full disk.
     fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
         let marker = active_runtime_marker_path(paths);
         let _ = fs::remove_file(&marker);
@@ -1996,6 +2173,198 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The Windows partial-replace failure during activation: the marker publish
+    /// took the old marker away and kept the new one in its temp file. Once the
+    /// restore has put the previous marker back, the kept file holds the failed
+    /// activation's marker, so it is removed, and the error no longer tells the
+    /// user to rename it into place. Driven through the shared writer's publish
+    /// seam, so it runs on every platform.
+    #[test]
+    fn a_restored_activation_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+
+        let marker_path = active_runtime_marker_path(&paths);
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(
+            !marker_temp_file_names(&paths)?.is_empty(),
+            "the shared writer keeps the new marker when the old one is gone"
+        );
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(&marker_path)?;
+        let leftovers = marker_temp_file_names(&paths)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(restored_marker, previous_marker);
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        assert!(
+            leftovers.is_empty(),
+            "the failed activation's marker was left beside the restored one: {leftovers:?}"
+        );
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// Produce the error the shared writer returns when a marker publish took
+    /// the old marker away and kept the new one, through its publish seam.
+    /// `prepare_kept` runs on the kept temp file before the error is returned.
+    fn partial_replace_marker_error(
+        paths: &AppPaths,
+        prepare_kept: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> anyhow::Error {
+        let marker_path = active_runtime_marker_path(paths);
+        rocm_core::atomic_write::write_file_atomically_with_publish(
+            &marker_path,
+            b"{\"runtime_key\":\"new\"}",
+            |attempt| std::ffi::OsString::from(format!("partial-{attempt}")),
+            || {},
+            |tmp, path| {
+                fs::remove_file(path)?;
+                prepare_kept(tmp)?;
+                Err(rocm_core::atomic_write::destination_removed_error(
+                    std::io::Error::from_raw_os_error(1176),
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                ))
+            },
+        )
+        .expect_err("the simulated partial replace fails the write")
+        .context(format!(
+            "failed to write active runtime marker {}",
+            marker_path.display()
+        ))
+    }
+
+    /// When the kept marker cannot be removed, the error names it and says to
+    /// delete it, and nothing in it still says to rename it into place. The
+    /// kept path is made a non-empty directory, which `remove_file` refuses on
+    /// every platform.
+    #[test]
+    fn a_kept_marker_that_cannot_be_removed_is_named_with_delete_advice_only() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-stuck");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        let previous_marker = fs::read(active_runtime_marker_path(&paths))?;
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        let write_error = partial_replace_marker_error(&paths, |tmp| {
+            fs::remove_file(tmp)?;
+            fs::create_dir(tmp)?;
+            fs::write(tmp.join("occupied.txt"), "stuck")
+        });
+        let kept = marker_temp_file_names(&paths)?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let restored_marker = fs::read(active_runtime_marker_path(&paths))?;
+        let still_there = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(still_there, kept, "the stuck file is left where it was");
+        assert_eq!(restored_marker, previous_marker);
+        assert!(
+            rendered.contains(&kept[0]),
+            "the stuck file is named:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("delete it, do not rename it"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rename that file"),
+            "renaming would install the failed activation's marker:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A kept marker that is already gone by the time the rollback looks for it
+    /// is as good as removed: the error neither names it nor tells the user to
+    /// delete or rename it.
+    #[test]
+    fn a_kept_marker_already_gone_is_treated_as_removed() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-gone");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        let kept = marker_temp_file_names(&paths)?;
+        let runtimes_dir = active_runtime_marker_path(&paths)
+            .parent()
+            .context("active runtime marker path has no parent directory")?
+            .to_path_buf();
+        for name in &kept {
+            fs::remove_file(runtimes_dir.join(name))?;
+        }
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            rendered.contains("the previously active runtime is still the active one"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&kept[0]), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(!rendered.contains("delete it"), "{rendered}");
+        Ok(())
+    }
+
+    /// When the rollback itself fails as well, the kept marker is still the
+    /// failed activation's, so it goes too, and the error keeps the rollback's
+    /// own recovery advice without the advice to rename it. The config path is
+    /// made a non-empty directory so the restore's config save fails.
+    #[test]
+    fn a_failed_rollback_still_drops_the_marker_a_partial_replace_kept() -> Result<()> {
+        let (root, paths) = test_paths("activation-partial-replace-double-fault");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        let write_error = partial_replace_marker_error(&paths, |_| Ok(()));
+        assert!(!marker_temp_file_names(&paths)?.is_empty());
+        let config_path = paths.config_path();
+        let _ = fs::remove_file(&config_path);
+        fs::create_dir_all(&config_path)?;
+        fs::write(config_path.join("occupied.txt"), "not a config")?;
+
+        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let rendered = format!("{error:#}");
+        let leftovers = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("restoring the previous state failed too"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rocm runtimes list"), "{rendered}");
+        assert!(!rendered.contains("rename that file"), "{rendered}");
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        Ok(())
+    }
+
     // A restore that fails too must say so and name the way out, rather than
     // claim the previous runtime is still the active one. The marker's parent is
     // made a regular file, so writing the captured bytes back fails at
@@ -2314,9 +2683,14 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
-        let (root, paths) = test_paths("runtime-adopt");
+    /// A Python environment outside ROCm CLI's folders that `rocm runtimes adopt`
+    /// accepts: an interpreter, the SDK libraries the probe names, and the probe
+    /// that reports them. Returns the environment folder, the request that adopts
+    /// it, and the probe.
+    fn adoptable_environment(
+        root: &Path,
+        replace: bool,
+    ) -> Result<(PathBuf, AdoptRuntimeRequest, therock::RocmSdkPythonProbe)> {
         let external_root = root.join("external-therock-venv");
         let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
         let python_executable = scripts_dir.join(if cfg!(windows) {
@@ -2345,37 +2719,43 @@ pub(crate) mod tests {
         fs::write(&amdhip, "amdhip")?;
         fs::write(&hipblas, "hipblas")?;
 
-        let adopted = adopt_runtime_from_probe(
-            &paths,
-            AdoptRuntimeRequest {
-                python_executable,
-                install_root: external_root.clone(),
-                runtime_id: "therock-release:gfx120X-all".to_owned(),
-                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
-                replace: false,
-            },
-            therock::RocmSdkPythonProbe {
-                import_ok: true,
-                rocm_sdk_version: Some("7.13.0".to_owned()),
-                root_path: Some(sdk_root.clone()),
-                bin_path: Some(sdk_bin.clone()),
-                runtime_roots: vec![sdk_root],
-                bin_paths: vec![sdk_bin.clone()],
-                library_paths: vec![sdk_bin],
-                resolved_libraries: vec![
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "amdhip64".to_owned(),
-                        paths: vec![amdhip],
-                    },
-                    therock::RocmSdkLibraryProbe {
-                        shortname: "hipblas".to_owned(),
-                        paths: vec![hipblas],
-                    },
-                ],
-                resolved_target_family: Some("gfx120X-all".to_owned()),
-                ..therock::RocmSdkPythonProbe::default()
-            },
-        )?;
+        let request = AdoptRuntimeRequest {
+            python_executable,
+            install_root: external_root.clone(),
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+            replace,
+        };
+        let probe = therock::RocmSdkPythonProbe {
+            import_ok: true,
+            rocm_sdk_version: Some("7.13.0".to_owned()),
+            root_path: Some(sdk_root.clone()),
+            bin_path: Some(sdk_bin.clone()),
+            runtime_roots: vec![sdk_root],
+            bin_paths: vec![sdk_bin.clone()],
+            library_paths: vec![sdk_bin],
+            resolved_libraries: vec![
+                therock::RocmSdkLibraryProbe {
+                    shortname: "amdhip64".to_owned(),
+                    paths: vec![amdhip],
+                },
+                therock::RocmSdkLibraryProbe {
+                    shortname: "hipblas".to_owned(),
+                    paths: vec![hipblas],
+                },
+            ],
+            resolved_target_family: Some("gfx120X-all".to_owned()),
+            ..therock::RocmSdkPythonProbe::default()
+        };
+        Ok((external_root, request, probe))
+    }
+
+    #[test]
+    fn runtime_adopt_records_read_only_manifest_from_probe() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+
+        let adopted = adopt_runtime_from_probe(&paths, request, probe)?;
 
         assert!(adopted.read_only);
         assert_eq!(adopted.channel, "release");
@@ -2405,6 +2785,310 @@ pub(crate) mod tests {
         let rendered = render_runtimes_text(&paths, &config)?;
         assert!(rendered.contains("* adopted-release-pip-gfx120x-all-7-13-0"));
         assert!(rendered.contains("mode=read-only"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Which of the two files a registered runtime can have exist: its registry
+    /// entry, and the `.rocm-cli-runtime.json` ROCm CLI keeps in the install
+    /// root as proof that it owns the folder.
+    fn registered_files(paths: &AppPaths, install_root: &Path, runtime_key: &str) -> (bool, bool) {
+        (
+            runtime_manifest_path(paths, runtime_key).is_file(),
+            install_root.join(".rocm-cli-runtime.json").is_file(),
+        )
+    }
+
+    /// A runtime ROCm CLI installed itself, with both of its manifest files
+    /// deleted so a test sees only what the write under test creates.
+    fn installed_runtime_without_manifest_files(
+        paths: &AppPaths,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let manifest = write_test_pip_runtime(
+            paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        fs::remove_file(runtime_manifest_path(paths, &manifest.runtime_key))?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        assert_eq!(
+            registered_files(paths, &manifest.install_root, &manifest.runtime_key),
+            (false, false)
+        );
+        Ok(manifest)
+    }
+
+    /// Registering a runtime whose registry entry exists is refused until the
+    /// caller asks to replace it. `register(replace)` makes the attempt; the
+    /// message and the entry on disk are asserted together, and the same call
+    /// with `replace` set is what clears the refusal.
+    fn assert_duplicate_registration_needs_replace(
+        paths: &AppPaths,
+        runtime_key: &str,
+        register: impl Fn(bool) -> Result<()>,
+    ) -> Result<()> {
+        let entry = runtime_manifest_path(paths, runtime_key);
+        fs::write(&entry, "stale entry")?;
+
+        let error = register(false).unwrap_err().to_string();
+
+        assert!(
+            error.contains("already exists") && error.contains("--replace"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "stale entry",
+            "a refused registration must leave the existing entry alone"
+        );
+        register(true)?;
+        let replaced: therock::InstalledRuntimeManifest =
+            serde_json::from_slice(&fs::read(&entry)?)?;
+        assert_eq!(replaced.runtime_key, runtime_key);
+        Ok(())
+    }
+
+    /// Installing writes both files, and a second install of the same key
+    /// overwrites both without being asked: it is the same runtime again.
+    #[test]
+    fn runtime_install_writes_the_registry_entry_and_the_install_root_manifest() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-install");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+
+        write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        let reinstalled = therock::InstalledRuntimeManifest {
+            version: "7.14.0".to_owned(),
+            ..manifest.clone()
+        };
+        write_runtime_manifest(&paths, &reinstalled, ManifestOverwrite::Replace)?;
+        for path in [
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+        ] {
+            let written: therock::InstalledRuntimeManifest =
+                serde_json::from_slice(&fs::read(&path)?)?;
+            assert_eq!(written.version, "7.14.0", "{}", path.display());
+        }
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Importing registers a folder somebody else owns, so it writes the
+    /// registry entry and nothing into that folder, and refuses to replace an
+    /// existing entry unless asked.
+    #[test]
+    fn runtime_import_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-import");
+        let manifest = installed_runtime_without_manifest_files(&paths)?;
+        let exported_manifest = root.join("external-runtime.json");
+        fs::write(&exported_manifest, serde_json::to_vec_pretty(&manifest)?)?;
+
+        import_runtime_manifest(&paths, &exported_manifest, false)?;
+
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false)
+        );
+        assert_duplicate_registration_needs_replace(&paths, &manifest.runtime_key, |replace| {
+            import_runtime_manifest(&paths, &exported_manifest, replace).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, false),
+            "replacing an import must not start writing into the folder either"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Adopting has the same contract as importing: registry entry only, and a
+    /// duplicate needs `--replace`.
+    #[test]
+    fn runtime_adopt_writes_the_registry_entry_only_and_refuses_a_duplicate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-adopt");
+        let (external_root, request, probe) = adoptable_environment(&root, false)?;
+        let runtime_key = request.runtime_key.clone();
+
+        adopt_runtime_from_probe(&paths, request.clone(), probe.clone())?;
+
+        assert_eq!(
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false)
+        );
+        assert_duplicate_registration_needs_replace(&paths, &runtime_key, |replace| {
+            let request = AdoptRuntimeRequest {
+                replace,
+                ..request.clone()
+            };
+            adopt_runtime_from_probe(&paths, request, probe.clone()).map(drop)
+        })?;
+        assert_eq!(
+            registered_files(&paths, &external_root, &runtime_key),
+            (true, false),
+            "replacing an adoption must not start writing into the environment either"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Recovering the runtime `rocm setup` created restores its registry entry
+    /// from the manifest in its folder, leaves that manifest in place, and does
+    /// not replace an entry that is already there.
+    #[test]
+    fn setup_recovery_restores_the_registry_entry_and_keeps_the_install_root_manifest() -> Result<()>
+    {
+        let (root, paths) = test_paths("runtime-files-recovery");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        fs::remove_file(&entry)?;
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (false, true)
+        );
+
+        let recovered = recover_setup_runtime_registration(&paths, &config)?;
+
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert_eq!(
+            registered_files(&paths, &manifest.install_root, &manifest.runtime_key),
+            (true, true)
+        );
+        fs::write(&entry, "entry written since")?;
+        recover_setup_runtime_registration(&paths, &config)?;
+        assert_eq!(
+            fs::read_to_string(&entry)?,
+            "entry written since",
+            "recovery only fills a missing entry"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Rewrite a manifest file as an older rocm-cli wrote it: without the keys
+    /// that hold no value, which a newer binary reads back as their defaults and
+    /// writes out as explicit `null`s. Returns the bytes now on disk.
+    fn rewrite_as_legacy_shaped(path: &Path) -> Result<Vec<u8>> {
+        let mut document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let object = document
+            .as_object_mut()
+            .context("a manifest is a JSON object")?;
+        let empty: Vec<String> = object
+            .iter()
+            .filter(|(_, value)| value.is_null())
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert!(
+            !empty.is_empty(),
+            "the fixture must hold a null-valued key for this to mean anything"
+        );
+        for key in empty {
+            object.remove(&key);
+        }
+        let legacy = serde_json::to_vec_pretty(&document)?;
+        fs::write(path, &legacy)?;
+        Ok(legacy)
+    }
+
+    /// Recovering the setup runtime from a manifest an older binary wrote, in a
+    /// folder the user cannot write to: the file decodes to the very manifest the
+    /// recovery would write, so it is already current and is left alone. Judging
+    /// it by bytes would read the missing keys as a change, write the registry
+    /// entry, and then fail on the read-only file. The registry entry and the
+    /// file's bytes are asserted together. (Where the file stays writable
+    /// regardless, as for an administrator, the unchanged bytes still prove the
+    /// file was not rewritten.)
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn setup_recovery_leaves_a_read_only_legacy_shaped_install_root_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-recovery-legacy");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        let entry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let local = manifest.install_root.join(".rocm-cli-runtime.json");
+        fs::remove_file(&entry)?;
+        let legacy = rewrite_as_legacy_shaped(&local)?;
+        let mut permissions = fs::metadata(&local)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&local, permissions.clone())?;
+
+        let recovered = recover_setup_runtime_registration(&paths, &config);
+
+        permissions.set_readonly(false);
+        fs::set_permissions(&local, permissions)?;
+        let recovered = recovered
+            .context("a usable manifest in a folder that cannot be written is recovered")?;
+        assert_eq!(recovered.as_deref(), Some(manifest.runtime_key.as_str()));
+        assert!(entry.is_file(), "the registry entry is restored");
+        assert_eq!(
+            fs::read(&local)?,
+            legacy,
+            "the install root manifest is already current and must not be rewritten"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The writer gives a runtime a manifest in its folder exactly when
+    /// uninstall, which prune asks the same question of, may delete that folder.
+    /// The two are written in different modules; this is what ties them.
+    #[test]
+    fn a_runtime_gets_an_install_root_manifest_exactly_when_uninstall_may_remove_its_folder()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-files-ownership");
+        for (label, read_only, imported) in [
+            ("owned", false, false),
+            ("read-only", true, false),
+            ("imported", false, true),
+        ] {
+            let mut manifest = write_test_pip_runtime(
+                &paths,
+                &format!("release-pip-{label}"),
+                "therock-release:gfx120X-all",
+                "7.13.0",
+                20,
+            )?;
+            manifest.read_only = read_only;
+            manifest.imported_from = imported.then(|| PathBuf::from("elsewhere/manifest.json"));
+            fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+
+            write_runtime_manifest(&paths, &manifest, ManifestOverwrite::Replace)?;
+
+            let has_manifest = manifest
+                .install_root
+                .join(".rocm-cli-runtime.json")
+                .is_file();
+            let may_remove =
+                should_remove_runtime_install_root(&manifest)? == InstallRootDecision::Remove;
+            assert_eq!(has_manifest, may_remove, "{label}");
+            assert_eq!(has_manifest, manifest.owns_install_root(), "{label}");
+        }
 
         let _ = fs::remove_dir_all(root);
         Ok(())

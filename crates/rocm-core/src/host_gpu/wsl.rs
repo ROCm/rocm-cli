@@ -14,28 +14,15 @@ use super::windows_inventory::{
     parse_windows_examine_inventory,
 };
 use super::{DriverSummary, WslSummary};
-use crate::gfx_target::{parse_windows_display_gfx_target, parse_windows_display_name};
+use crate::gfx_target::parse_windows_display_gfx_target;
 use crate::{discover_rocm_installs, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
-
-pub(super) fn detect_wsl_windows_display_gfx_target(wsl: Option<&WslSummary>) -> Option<String> {
-    if !runtime_is_linux() || wsl.is_none() {
-        return None;
-    }
-
-    detect_wsl_windows_display_gfx_target_fast()
-}
+use std::path::{Path, PathBuf};
 
 pub(super) fn detect_wsl_windows_display_gfx_target_fast() -> Option<String> {
     detect_wsl_windows_display_probe_text()
         .as_deref()
         .and_then(parse_windows_display_gfx_target)
-}
-
-pub(super) fn detect_wsl_windows_display_name_fast() -> Option<String> {
-    detect_wsl_windows_display_probe_text()
-        .as_deref()
-        .and_then(parse_windows_display_name)
 }
 
 /// What the guest was able to learn about the Windows host's AMD display driver.
@@ -221,22 +208,87 @@ pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
     ldconfig_cache().map(|text| text.contains("librocdxg.so"))
 }
 
-/// Whether `relative` exists under any ROCm install on this host.
+/// The ROCm install roots on this host: the conventional `/opt/rocm` first, then
+/// every install discovery reports.
 ///
 /// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
 /// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
 /// package that was in fact installed. Ask the same resolver the rest of the CLI
 /// uses, and keep the conventional root as a fallback for the case where
 /// discovery finds nothing.
-fn rocm_relative_file_exists(relative: &str) -> bool {
-    if host_path("/opt/rocm").join(relative).exists() {
-        return true;
-    }
+fn rocm_roots() -> Vec<PathBuf> {
     // Discovery reports real install paths; reading them through `host_path`
     // keeps a simulated host's answer from being decided by the real machine.
-    discover_rocm_installs()
-        .iter()
-        .any(|install| host_path(&install.path).join(relative).exists())
+    std::iter::once(host_path("/opt/rocm"))
+        .chain(
+            discover_rocm_installs()
+                .iter()
+                .map(|install| host_path(&install.path)),
+        )
+        .collect()
+}
+
+/// Whether `relative` exists under any of `roots`.
+fn rocm_relative_file_exists(roots: &[PathBuf], relative: &str) -> bool {
+    roots.iter().any(|root| root.join(relative).exists())
+}
+
+/// Whether `librocdxg.so` sits in a directory on `ld_library_path`.
+///
+/// The dynamic loader searches `LD_LIBRARY_PATH` before it consults the linker
+/// cache, so a library there is loadable whether or not `ldconfig` ever heard of
+/// it. A TheRock tarball under `/opt/rocm-<version>` is the case that matters:
+/// nothing registers it with the cache, so a shell that has put the install on
+/// `LD_LIBRARY_PATH` (see `docs/wsl.md`) reaches ROCm only through this
+/// variable. The value read is the invoking process's own, not the managed
+/// environment the CLI applies to the commands it launches.
+///
+/// Takes the variable's value and an existence check rather than reading the
+/// machine, so the path-splitting rules can be tested without one. Empty entries
+/// are skipped: the loader reads an empty entry as the current directory, which
+/// says nothing about where ROCm lives.
+fn librocdxg_on_loader_path(ld_library_path: Option<&str>, exists: impl Fn(&Path) -> bool) -> bool {
+    ld_library_path.is_some_and(|value| {
+        std::env::split_paths(value)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .any(|dir| exists(&dir.join("librocdxg.so")))
+    })
+}
+
+/// Whether some ROCm install holds `librocdxg.so` in the same `lib` directory as
+/// a `libhsa-runtime64`.
+///
+/// The runtime opens `librocdxg.so` by name, and TheRock builds it with
+/// `RUNPATH $ORIGIN`, so the loader looks in the runtime's own directory before it
+/// asks the linker cache or `LD_LIBRARY_PATH`. A tarball under
+/// `/opt/rocm-<version>` keeps the two side by side and registers neither, which
+/// is why a working install read as missing while those were the only sources
+/// asked (ROCM-30386). The library alone in a `lib` directory does not count: with
+/// no runtime beside it, only the cache or `LD_LIBRARY_PATH` can reach it.
+///
+/// Takes the install roots and an existence check rather than reading the
+/// machine, so the layouts can be tested without one.
+fn librocdxg_beside_runtime(roots: &[PathBuf], exists: impl Fn(&Path) -> bool) -> bool {
+    roots.iter().any(|root| {
+        let lib = root.join("lib");
+        exists(&lib.join("librocdxg.so"))
+            && ["libhsa-runtime64.so.1", "libhsa-runtime64.so"]
+                .iter()
+                .any(|runtime| exists(&lib.join(runtime)))
+    })
+}
+
+/// Whether the loader can resolve `librocdxg.so`: registered in the linker cache,
+/// on `LD_LIBRARY_PATH`, or beside the runtime that opens it.
+///
+/// The one place the sources are combined, so `rocdxg_ready`, the `missing`
+/// detail and the diagnose guards cannot disagree about it.
+const fn librocdxg_loadable(
+    in_linker_cache: bool,
+    on_ld_library_path: bool,
+    beside_runtime: bool,
+) -> bool {
+    in_linker_cache || on_ld_library_path || beside_runtime
 }
 
 /// The predicate itself, separated from reading the machine so the union can be
@@ -261,6 +313,40 @@ fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
     proc_version.contains("microsoft") || proc_version.contains("wsl")
 }
 
+/// The entries of the `missing ...` detail, separated from reading the machine so
+/// the list can be tested against each combination of sources.
+///
+/// `librocdxg_found` is the file existing under a ROCm install or in a directory
+/// on `LD_LIBRARY_PATH`; `loadable` is [`librocdxg_loadable`]. The cache entry is
+/// named only when no source resolves the library: one on `LD_LIBRARY_PATH` or
+/// beside the runtime that opens it loads without a cache entry, so naming the
+/// cache would send the user after a registration the workload does not need.
+#[allow(clippy::fn_params_excessive_bools)] // four independent probe answers, named at the one call site
+fn missing_plumbing(
+    dxg_device: bool,
+    dxcore: bool,
+    librocdxg_found: bool,
+    loadable: bool,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !dxg_device {
+        missing.push("/dev/dxg");
+    }
+    if !dxcore {
+        missing.push("/usr/lib/wsl/lib/libdxcore.so");
+    }
+    if !librocdxg_found {
+        // Named without a directory: the file is looked up across every ROCm
+        // install and `LD_LIBRARY_PATH`, so quoting one root would misreport where
+        // it was not found.
+        missing.push("librocdxg.so");
+    }
+    if !loadable {
+        missing.push("ldconfig:librocdxg.so");
+    }
+    missing
+}
+
 pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     if !runtime_is_linux() || !is_wsl_host() {
         return None;
@@ -270,29 +356,34 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
     let is_wsl = true;
 
     let dxcore = host_path("/usr/lib/wsl/lib/libdxcore.so").exists();
-    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
-    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let roots = rocm_roots();
+    let librocdxg = rocm_relative_file_exists(&roots, "lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists(&roots, "share/rocdxg/dids.conf");
     let ldconfig_text = ldconfig_cache();
     let ldconfig_librocdxg = ldconfig_text
         .as_deref()
         .is_some_and(|text| text.contains("librocdxg.so"));
+    // Read through `host_path`, like every other file this probe looks for, so a
+    // simulated host decides the answer rather than the real machine.
+    let librocdxg_on_ld_library_path =
+        librocdxg_on_loader_path(std::env::var("LD_LIBRARY_PATH").ok().as_deref(), |file| {
+            host_path(file).exists()
+        });
+    // The roots are already re-rooted through `host_path`, so this existence check
+    // takes the path as given.
+    let librocdxg_beside_runtime = librocdxg_beside_runtime(&roots, Path::exists);
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
-    let mut missing = Vec::new();
-    if !dxg_device {
-        missing.push("/dev/dxg");
-    }
-    if !dxcore {
-        missing.push("/usr/lib/wsl/lib/libdxcore.so");
-    }
-    if !librocdxg {
-        // Named without a directory: the file is looked up across every ROCm
-        // install, so quoting one root would misreport where it was not found.
-        missing.push("librocdxg.so");
-    }
-    if !ldconfig_librocdxg {
-        missing.push("ldconfig:librocdxg.so");
-    }
+    let missing = missing_plumbing(
+        dxg_device,
+        dxcore,
+        librocdxg || librocdxg_on_ld_library_path,
+        librocdxg_loadable(
+            ldconfig_librocdxg,
+            librocdxg_on_ld_library_path,
+            librocdxg_beside_runtime,
+        ),
+    );
     let detail = if missing.is_empty() {
         Some("WSL DXCore and ROCDXG plumbing detected".to_owned())
     } else {
@@ -306,6 +397,8 @@ pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
         librocdxg,
         rocdxg_dids,
         ldconfig_librocdxg,
+        librocdxg_on_ld_library_path,
+        librocdxg_beside_runtime,
         rocminfo,
         cargo,
         detail,
@@ -321,14 +414,28 @@ impl WslSummary {
     /// same machine for want of a GPU.
     #[must_use]
     pub const fn rocdxg_ready(&self) -> bool {
-        self.dxg_device && self.dxcore && self.librocdxg && self.ldconfig_librocdxg
+        self.dxg_device
+            && self.dxcore
+            && self.librocdxg_present()
+            && librocdxg_loadable(
+                self.ldconfig_librocdxg,
+                self.librocdxg_on_ld_library_path,
+                self.librocdxg_beside_runtime,
+            )
     }
 }
+
+/// The `driver_status` `rocm examine` reports when the WSL GPU path is usable.
+///
+/// One constant for the producer ([`wsl_driver_summary`]) and for the advice that
+/// tells a refused `rocm serve` user which status to look for, so the two cannot
+/// drift apart.
+pub const WSL_ROCDXG_READY: &str = "wsl_rocdxg_ready";
 
 pub(super) fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
     let ready = wsl.rocdxg_ready();
     let status = if ready {
-        "wsl_rocdxg_ready"
+        WSL_ROCDXG_READY
     } else if wsl.dxg_device && wsl.dxcore {
         "wsl_rocdxg_missing"
     } else {
@@ -400,6 +507,8 @@ mod tests {
             librocdxg: false,
             rocdxg_dids: false,
             ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: false,
             rocminfo: false,
             cargo: true,
             detail: Some("missing /opt/rocm/lib/librocdxg.so".to_owned()),
@@ -480,6 +589,235 @@ mod tests {
     }
 
     #[test]
+    fn the_loader_path_finds_the_library_in_any_listed_directory() {
+        // The helper is not Linux-gated, so this runs on the Windows job too. The
+        // variable is built with the platform's own separator, and the library is
+        // matched by its parent directory rather than by a `/`-joined string.
+        let on_disk = |file: &Path| {
+            file.file_name() == Some(std::ffi::OsStr::new("librocdxg.so"))
+                && file.parent() == Some(Path::new("/opt/rocm-10.1.0/lib"))
+        };
+        let joined = |dirs: &[&str]| {
+            std::env::join_paths(dirs)
+                .expect("directories hold no separator")
+                .into_string()
+                .expect("directories are UTF-8")
+        };
+        // Not the first entry: the search is over every directory, in the order
+        // the loader reads them.
+        assert!(librocdxg_on_loader_path(
+            Some(&joined(&[
+                "/usr/lib/wsl/lib",
+                "/opt/rocm-10.1.0/lib",
+                "/other"
+            ])),
+            on_disk
+        ));
+        assert!(!librocdxg_on_loader_path(
+            Some(&joined(&["/usr/lib/wsl/lib", "/opt/rocm-9.0.0/lib"])),
+            on_disk
+        ));
+    }
+
+    #[test]
+    fn an_unset_or_empty_loader_path_finds_nothing() {
+        let everywhere = |_: &Path| true;
+        assert!(!librocdxg_on_loader_path(None, everywhere));
+        assert!(!librocdxg_on_loader_path(Some(""), everywhere));
+        // An empty entry is the current directory to the loader, which says
+        // nothing about where ROCm lives, so a variable of nothing but empty
+        // entries must not count as a hit even when a file of that name would
+        // exist relative to it. Built with the platform's separator.
+        for entries in [&["", ""][..], &["", "", ""][..]] {
+            let value = std::env::join_paths(entries)
+                .expect("empty entries hold no separator")
+                .into_string()
+                .expect("empty entries are UTF-8");
+            assert!(
+                !librocdxg_on_loader_path(Some(&value), everywhere),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// An existence check over a fixed set of files, compared component-wise so a
+    /// path built with the platform separator matches one written with `/`.
+    fn exists_among(files: &[&str]) -> impl Fn(&Path) -> bool {
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        move |path| {
+            files
+                .iter()
+                .any(|file| file.components().eq(path.components()))
+        }
+    }
+
+    #[test]
+    fn the_library_beside_the_runtime_that_opens_it_counts() {
+        // The ROCM-30386 layout: a TheRock tarball under a versioned root, the two
+        // libraries side by side, neither registered anywhere.
+        let roots = [PathBuf::from("/opt/rocm-10.1.0")];
+        for runtime in ["libhsa-runtime64.so.1", "libhsa-runtime64.so"] {
+            let runtime = format!("/opt/rocm-10.1.0/lib/{runtime}");
+            assert!(
+                librocdxg_beside_runtime(
+                    &roots,
+                    exists_among(&["/opt/rocm-10.1.0/lib/librocdxg.so", &runtime])
+                ),
+                "{runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_library_alone_or_the_runtime_alone_does_not_count() {
+        let roots = [PathBuf::from("/opt/rocm")];
+        // The package layout: librocdxg in a `lib` directory with no runtime
+        // beside it, reached only through the cache or LD_LIBRARY_PATH.
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&["/opt/rocm/lib/librocdxg.so"])
+        ));
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&["/opt/rocm/lib/libhsa-runtime64.so.1"])
+        ));
+        assert!(!librocdxg_beside_runtime(&[], exists_among(&[])));
+    }
+
+    #[test]
+    fn beside_means_the_same_directory_not_the_same_machine() {
+        // The runtime in one install and the library in another: the runtime's
+        // `$ORIGIN` is its own install, so the other one's library is not found.
+        let roots = [
+            PathBuf::from("/opt/rocm"),
+            PathBuf::from("/opt/rocm-10.1.0"),
+        ];
+        assert!(!librocdxg_beside_runtime(
+            &roots,
+            exists_among(&[
+                "/opt/rocm/lib/librocdxg.so",
+                "/opt/rocm-10.1.0/lib/libhsa-runtime64.so.1",
+            ])
+        ));
+        // A runtime elsewhere under the same root is not beside it either.
+        assert!(!librocdxg_beside_runtime(
+            &roots[..1],
+            exists_among(&[
+                "/opt/rocm/lib/librocdxg.so",
+                "/opt/rocm/lib/llvm/lib/libhsa-runtime64.so.1",
+            ])
+        ));
+    }
+
+    #[test]
+    fn the_library_is_loadable_from_any_one_source() {
+        assert!(librocdxg_loadable(true, false, false));
+        assert!(librocdxg_loadable(false, true, false));
+        assert!(librocdxg_loadable(false, false, true));
+        assert!(librocdxg_loadable(true, true, true));
+        assert!(!librocdxg_loadable(false, false, false));
+    }
+
+    #[test]
+    fn rocdxg_is_ready_for_an_unregistered_library_beside_the_runtime() {
+        // The ROCM-30386 layout with no environment help at all: the tarball's
+        // runtime opens librocdxg from its own directory.
+        let mut summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: true,
+            rocminfo: true,
+            cargo: false,
+            detail: None,
+        };
+        assert!(summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_ready");
+        // Without the sibling runtime nothing reaches the library.
+        summary.librocdxg_beside_runtime = false;
+        assert!(!summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_missing");
+    }
+
+    #[test]
+    fn a_rocdxg_only_on_the_loader_path_is_ready() {
+        // A source build in a non-ROCm directory: no ROCm root holds it, so
+        // `librocdxg` is false, and the cache does not list it. The variable alone
+        // reaches it, which is what docs/wsl.md tells the user to arrange.
+        let mut summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: false,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: true,
+            librocdxg_beside_runtime: false,
+            rocminfo: true,
+            cargo: false,
+            detail: None,
+        };
+        assert!(summary.librocdxg_present());
+        assert!(summary.rocdxg_ready());
+        let driver = wsl_driver_summary(&summary);
+        assert_eq!(driver.status, "wsl_rocdxg_ready");
+        // Not ready without the variable: the library is then nowhere.
+        summary.librocdxg_on_ld_library_path = false;
+        assert!(!summary.librocdxg_present());
+        assert!(!summary.rocdxg_ready());
+    }
+
+    #[test]
+    fn a_rocdxg_on_the_loader_path_is_not_listed_as_missing() {
+        // found via LD_LIBRARY_PATH only: loadable, so neither entry appears.
+        assert!(missing_plumbing(true, true, true, true).is_empty());
+        // Nowhere: both the file and the way to load it are named.
+        assert_eq!(
+            missing_plumbing(true, true, false, false),
+            ["librocdxg.so", "ldconfig:librocdxg.so"]
+        );
+        // On disk under a root but reached by nothing: only the loader entry.
+        assert_eq!(
+            missing_plumbing(true, true, true, false),
+            ["ldconfig:librocdxg.so"]
+        );
+        assert_eq!(
+            missing_plumbing(false, false, true, true),
+            ["/dev/dxg", "/usr/lib/wsl/lib/libdxcore.so"]
+        );
+    }
+
+    #[test]
+    fn rocdxg_is_ready_for_an_unregistered_library_on_the_loader_path() {
+        // The ROCM-30386 layout: a versioned tarball install the linker cache has
+        // never heard of, reachable through LD_LIBRARY_PATH.
+        let mut summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: true,
+            ldconfig_librocdxg: false,
+            librocdxg_on_ld_library_path: true,
+            librocdxg_beside_runtime: false,
+            rocminfo: true,
+            cargo: false,
+            detail: None,
+        };
+        assert!(summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_ready");
+        // The same machine without the variable is still not ready: the loader
+        // has no way to find the library.
+        summary.librocdxg_on_ld_library_path = false;
+        assert!(!summary.rocdxg_ready());
+        assert_eq!(wsl_driver_summary(&summary).status, "wsl_rocdxg_missing");
+    }
+
+    #[test]
     fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
         assert!(wsl_signals_indicate_wsl(false, "MICROSOFT-STANDARD-WSL2"));
     }
@@ -526,6 +864,8 @@ mod tests {
             librocdxg: true,
             rocdxg_dids: false,
             ldconfig_librocdxg: true,
+            librocdxg_on_ld_library_path: false,
+            librocdxg_beside_runtime: false,
             rocminfo: false,
             cargo: false,
             detail: None,

@@ -26,7 +26,7 @@ const ENDPOINT_API_KEY_LEN: usize = 48;
 /// deliberately *not* derived from `generate_service_id` (a timestamp-based,
 /// guessable identifier — unsuitable as a secret).
 pub fn generate_endpoint_api_key() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::distr::Alphanumeric;
 
     rand::rng()

@@ -184,8 +184,8 @@ fn anthropic_api_key_for_dash() -> Option<String> {
 }
 
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
-/// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so the
-/// dash crates stay free of it).
+/// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so
+/// `rocm-dash-tui`, which `crate_edges.rs` still forbids one, stays free of it).
 fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
     builtin_model_recipes()
         .into_iter()

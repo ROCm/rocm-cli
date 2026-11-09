@@ -33,7 +33,7 @@
 //! `render_uninstall_plan`; `storage.rs` calls into it for
 //! `UninstallPlan`/`UninstallPlanEntry`/`confirm_uninstall`; `runtimes_cmd.rs`
 //! calls into it for `confirm_uninstall` (the same `[y/N]` prompt, reused for
-//! `rocm runtimes uninstall`); `chat.rs` calls into it for
+//! `rocm runtimes uninstall`); `chat/mcp_bridge.rs` calls into it for
 //! `render_uninstall_dry_run` (the deterministic uninstall-preview tool
 //! result); `deletion_properties.rs`'s recursive-deletion property tests call
 //! into it for `UninstallOptions`/`build_uninstall_plan`/`remove_path`/
@@ -137,7 +137,7 @@ pub(crate) fn build_uninstall_plan(
     // Only a helper that is running can be left behind. "Uninstall does not stop
     // it" is said only where that is the whole story: with a watcher enabled the
     // helper stays up; an idle one is already on its way out.
-    if let Some(note) = crate::service_launch::background_helper_note(paths)
+    if let Some(note) = crate::background_helper::background_helper_note(paths)
         && note.running
     {
         plan.warnings.push(if note.outlives {

@@ -575,8 +575,37 @@ impl ScrollTarget {
     ];
 }
 
-/// Esc-menu rows: Options / Help / Quit.
-pub const MENU_ITEMS: usize = 3;
+/// One selectable row of the Esc main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Options,
+    Help,
+    Quit,
+}
+
+impl MenuItem {
+    /// The text the menu draws for this row.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Options => "Options",
+            Self::Help => "Help",
+            Self::Quit => "Quit",
+        }
+    }
+}
+
+/// Esc-menu rows, top to bottom.
+///
+/// The one list the menu is built from: the wrap bound of
+/// `KeyAction::MenuMove` and the row an activation runs (`app/actions.rs`),
+/// and the rows, labels and reserved height `draw_menu` paints
+/// (`ui/menu.rs`), all read it. A new row is added here and gets an
+/// arm in the `KeyAction::MenuActivate` match, which the compiler requires
+/// for every `MenuItem`. A `MenuItem` left out of this list is not caught by
+/// the compiler (stable Rust cannot check that without a derive macro this
+/// crate doesn't depend on), the same limit as `ScrollTarget::ALL` above.
+pub const MENU_ITEMS: &[MenuItem] = &[MenuItem::Options, MenuItem::Help, MenuItem::Quit];
 
 /// Command-palette destinations (label, tab).
 pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[

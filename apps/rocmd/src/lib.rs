@@ -10,6 +10,7 @@ mod daemon;
 mod engine_ipc;
 mod host_snapshot;
 mod mcp;
+mod mcp_argv;
 mod persistence;
 mod sandbox;
 mod sandbox_tool;

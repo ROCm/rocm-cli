@@ -87,7 +87,7 @@ pub fn generate_rsa_signing_keypair() -> Result<(String, String)> {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
     // `rsa` 0.9 is built against `rand_core` 0.6, while the workspace `rand` is
-    // 0.9 (`rand_core` 0.9) — the two trait sets are not interchangeable, so an
+    // on a newer `rand_core` — the two trait sets are not interchangeable, so an
     // rng from `rand::rng()` does not satisfy `RsaPrivateKey::new`. Use the
     // `rand_core` that `rsa` itself re-exports, which keeps the versions matched
     // no matter which one `rand` moves to. `OsRng` draws straight from the

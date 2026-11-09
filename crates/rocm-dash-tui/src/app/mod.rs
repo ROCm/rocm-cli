@@ -74,9 +74,9 @@ pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 #[cfg(test)]
 pub(crate) use terminal::restore_after_session;
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, Modal,
-    OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs, ScrollTarget,
-    UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, MenuItem,
+    Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs,
+    ScrollTarget, UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 

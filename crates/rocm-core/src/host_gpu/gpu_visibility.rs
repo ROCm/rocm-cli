@@ -47,15 +47,27 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     // `examine` cannot contradict each other in either direction: ready means a
     // device, not-ready means none, and both match what the report prints.
     if is_wsl_host() {
-        let ready = detect_wsl_summary().is_some_and(|wsl| wsl.rocdxg_ready());
-        // One device: WSL2 exposes no per-device topology to enumerate, and the
-        // visibility mask still applies on top so an explicit
-        // HIP_VISIBLE_DEVICES="" is honoured.
-        return usable_amd_gpu_indices_from(usize::from(ready), visibility_mask_from_env());
+        return wsl_usable_indices(detect_wsl_summary().as_ref(), visibility_mask_from_env());
     }
     let present =
         combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())?;
     usable_amd_gpu_indices_from(present, visibility_mask_from_env())
+}
+
+/// The usable ordinals on a WSL host, from the plumbing `examine` reports on.
+///
+/// One device: WSL2 exposes no per-device topology to enumerate, and the
+/// visibility mask still applies on top so an explicit `HIP_VISIBLE_DEVICES=""`
+/// is honoured. Takes the summary rather than reading the machine so the
+/// decision -- ready means a device, anything else means none -- is testable
+/// without a WSL host.
+#[cfg(any(target_os = "linux", test))]
+fn wsl_usable_indices(
+    wsl: Option<&super::WslSummary>,
+    mask: Option<GpuVisibilityMask>,
+) -> Option<Vec<u32>> {
+    let ready = wsl.is_some_and(super::WslSummary::rocdxg_ready);
+    usable_amd_gpu_indices_from(usize::from(ready), mask)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -312,6 +324,55 @@ pub(super) fn visibility_mask_in_effect() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wsl_summary(librocdxg_in_cache: bool, on_ld_library_path: bool) -> super::super::WslSummary {
+        super::super::WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: true,
+            ldconfig_librocdxg: librocdxg_in_cache,
+            librocdxg_on_ld_library_path: on_ld_library_path,
+            librocdxg_beside_runtime: false,
+            rocminfo: false,
+            cargo: false,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_wsl_host_whose_loader_reaches_rocdxg_has_one_usable_gpu() {
+        // The `rocm serve --gpu auto` side of an unregistered library reached
+        // through LD_LIBRARY_PATH: the same readiness `examine` reports must
+        // yield a device, or serve refuses a GPU examine says is there.
+        for (in_cache, on_path) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                wsl_usable_indices(Some(&wsl_summary(in_cache, on_path)), None),
+                Some(vec![0]),
+                "cache {in_cache}, LD_LIBRARY_PATH {on_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wsl_host_with_rocdxg_beside_the_runtime_has_one_usable_gpu() {
+        // The tarball layout: no cache entry and no LD_LIBRARY_PATH, but the
+        // runtime opens the library from its own directory.
+        let mut summary = wsl_summary(false, false);
+        summary.librocdxg_beside_runtime = true;
+        assert_eq!(wsl_usable_indices(Some(&summary), None), Some(vec![0]));
+    }
+
+    #[test]
+    fn a_wsl_host_the_loader_cannot_reach_rocdxg_on_has_no_usable_gpu() {
+        assert_eq!(
+            wsl_usable_indices(Some(&wsl_summary(false, false)), None),
+            Some(vec![])
+        );
+        // No summary at all is not a GPU either.
+        assert_eq!(wsl_usable_indices(None, None), Some(vec![]));
+    }
 
     #[test]
     fn a_ready_wsl_host_offers_a_device_and_an_unready_one_does_not() {

@@ -769,9 +769,9 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // <id> --dry-run`. Assert the shape (present once per cause, ending in
     // the always-on auto/manual marker) rather than a specific fix-id's exact
     // flags: the top match is environment-dependent, and a shared vocabulary
-    // doesn't guarantee diagnose and the fix.rs catalog agree on the
-    // underlying values for a given fix-id -- unit tests in diagnose.rs call
-    // fix.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
+    // doesn't guarantee diagnose and the fix/catalog.rs catalog agree on the
+    // underlying values for a given fix-id -- unit tests in diagnose/linux.rs call
+    // fix/catalog.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
     let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
@@ -3329,5 +3329,684 @@ async fn assert_hip_sdk_advice_follows_the_inspection(world: &mut E2eWorld) {
         text("framework_rocm_version"),
         text("hip_sdk_path"),
         field("hipinfo_present"),
+    );
+}
+
+const TINY_GGUF_LAYERS: u64 = 2;
+const TINY_GGUF_KV_HEADS: u64 = 1;
+const TINY_GGUF_HEAD_WIDTH: u64 = 64;
+const TINY_GGUF_WEIGHT_BYTES: u64 = 1024 * 1024;
+const TINY_GGUF_REQUESTED_CONTEXT: u64 = 2048;
+
+/// A minimal, valid GGUF v3 file: the metadata an estimate reads, one tensor
+/// record, and a zeroed weight region of [`TINY_GGUF_WEIGHT_BYTES`].
+fn tiny_gguf_bytes() -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    fn entry_u32(out: &mut Vec<u8>, key: &str, value: u32) {
+        string(out, key);
+        out.extend_from_slice(&4_u32.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut metadata = Vec::new();
+    string(&mut metadata, "general.architecture");
+    metadata.extend_from_slice(&8_u32.to_le_bytes());
+    string(&mut metadata, "e2e");
+    entry_u32(&mut metadata, "e2e.block_count", TINY_GGUF_LAYERS as u32);
+    entry_u32(&mut metadata, "e2e.embedding_length", 128);
+    entry_u32(&mut metadata, "e2e.feed_forward_length", 256);
+    entry_u32(&mut metadata, "e2e.attention.head_count", 2);
+    entry_u32(
+        &mut metadata,
+        "e2e.attention.head_count_kv",
+        TINY_GGUF_KV_HEADS as u32,
+    );
+    entry_u32(&mut metadata, "e2e.context_length", 8192);
+
+    let mut tensor = Vec::new();
+    string(&mut tensor, "w");
+    tensor.extend_from_slice(&1_u32.to_le_bytes());
+    tensor.extend_from_slice(&1024_u64.to_le_bytes());
+    tensor.extend_from_slice(&0_u32.to_le_bytes());
+    tensor.extend_from_slice(&0_u64.to_le_bytes());
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"GGUF");
+    file.extend_from_slice(&3_u32.to_le_bytes());
+    file.extend_from_slice(&1_u64.to_le_bytes());
+    file.extend_from_slice(&7_u64.to_le_bytes());
+    file.extend_from_slice(&metadata);
+    file.extend_from_slice(&tensor);
+    // Tensor data starts at the next multiple of the default 32-byte alignment.
+    file.resize(file.len().div_ceil(32) * 32, 0);
+    file.resize(file.len() + TINY_GGUF_WEIGHT_BYTES as usize, 0);
+    file
+}
+
+#[given("a user asking about a small GGUF file on this machine")]
+async fn user_asks_about_a_small_gguf(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let path = root.join("tiny-e2e-model.gguf");
+    std::fs::write(&path, tiny_gguf_bytes()).expect("write the GGUF fixture");
+    world.model_name = Some(path.to_string_lossy().into_owned());
+}
+
+#[when(
+    "the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form"
+)]
+async fn user_asks_whether_a_gguf_would_run_json(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            &model,
+            "--context-size",
+            "2048",
+            "--kv-cache-type",
+            "q8_0",
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when(
+    "the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form"
+)]
+async fn user_asks_whether_a_gguf_would_run_text(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            &model,
+            "--context-size",
+            "2048",
+            "--kv-cache-type",
+            "q8_0",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn estimate_section(model: &serde_json::Value) -> &serde_json::Value {
+    model
+        .get("estimate")
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| panic!("the model section carries no estimate: {model:#}"))
+}
+
+#[then("the answer is an estimate under its own outcome, and the verdict stays undetermined")]
+async fn assert_gguf_answer_is_an_estimate(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "an estimate from a header is not a recipe's verdict: {model:#}"
+    );
+    assert_eq!(
+        model_field(&model, "undetermined_reason").as_str(),
+        Some("model_not_curated"),
+        "{model:#}"
+    );
+    let estimate = estimate_section(&model);
+    assert_eq!(estimate["context_size"], TINY_GGUF_REQUESTED_CONTEXT);
+    assert_eq!(estimate["context_size_defaulted"], false);
+    assert_eq!(estimate["kv_cache_type"], "q8_0");
+    assert_eq!(estimate["architecture"], "e2e");
+    assert_eq!(estimate["layers"], TINY_GGUF_LAYERS);
+}
+
+#[then("the estimate sizes the file's weights and its KV cache at that context")]
+async fn assert_gguf_estimate_sizes_weights_and_cache(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    let gib = f64::from(1024 * 1024 * 1024_u32);
+    let weights = estimate["weights_gib"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no weights figure: {estimate:#}"));
+    assert!(
+        (weights - TINY_GGUF_WEIGHT_BYTES as f64 / gib).abs() < 1e-9,
+        "the weights are the file's size after its header: {estimate:#}"
+    );
+    // layers x kv heads x (key + value width) x tokens x 34/32 bytes (q8_0).
+    let kv_bytes = (TINY_GGUF_LAYERS * TINY_GGUF_KV_HEADS * 2 * TINY_GGUF_HEAD_WIDTH) as f64
+        * TINY_GGUF_REQUESTED_CONTEXT as f64
+        * 34.0
+        / 32.0;
+    let kv = estimate["kv_cache_gib"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no KV cache figure: {estimate:#}"));
+    assert!(
+        (kv - kv_bytes / gib).abs() < 1e-9,
+        "expected {} GiB of KV cache: {estimate:#}",
+        kv_bytes / gib
+    );
+}
+
+#[then(
+    "a machine that measured its GPU is told whether the estimate fits, and one that could not is told why"
+)]
+async fn assert_gguf_estimate_compares_only_a_measured_gpu(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    let outcome = estimate["outcome"].as_str().unwrap_or_default();
+    if estimate["available_gib"].is_number() {
+        // The outcome the reported figures imply: the verdict is decided on the
+        // parts as shown (each rounded up to a whole MiB) against the card's
+        // memory, so the same arithmetic over the JSON says which answer is
+        // owed on this lane, and a predicate turned the wrong way fails here.
+        const MIB: f64 = 1024.0 * 1024.0;
+        let shown_mib: f64 = [
+            "weights_bytes",
+            "kv_cache_bytes",
+            "compute_buffer_bytes",
+            "runtime_reserve_bytes",
+        ]
+        .iter()
+        .map(|field| {
+            let bytes = estimate[field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no {field}: {estimate:#}"));
+            (bytes as f64 / MIB).ceil()
+        })
+        .sum();
+        let available_mib = estimate["available_gib"].as_f64().unwrap_or_default() * 1024.0;
+        let expected = if shown_mib <= available_mib {
+            "fits"
+        } else {
+            "does_not_fit"
+        };
+        assert_eq!(
+            outcome, expected,
+            "{shown_mib} MiB needed against {available_mib} MiB: {estimate:#}"
+        );
+        if outcome == "fits" {
+            assert!(
+                estimate["max_context"].as_u64().unwrap_or(0) >= TINY_GGUF_REQUESTED_CONTEXT,
+                "fits at 2048 tokens but reports a smaller ceiling: {estimate:#}"
+            );
+        }
+    } else {
+        assert_eq!(outcome, "cannot_estimate", "{estimate:#}");
+        let reason = estimate["cannot_estimate_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            matches!(
+                reason,
+                "no_gpu" | "accelerator_memory_unknown" | "unified_memory_unreadable"
+            ),
+            "no memory was measured, so the reason must say so: {estimate:#}"
+        );
+        assert!(
+            estimate["total_gib"].is_number(),
+            "what the file needs is still worth reporting: {estimate:#}"
+        );
+    }
+}
+
+#[then(
+    "the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked"
+)]
+async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let output = world.cli_output.clone().expect("no diagnose output");
+    let model = world.model_name.clone().expect("no model named");
+    let header = output
+        .lines()
+        .find(|line| line.starts_with(&format!("rocm diagnose --model {model}: ")))
+        .unwrap_or_else(|| panic!("no model header in:\n{output}"));
+    for verdict in ["READY", "BLOCKED", "DEGRADED"] {
+        assert!(
+            !header.ends_with(verdict) && !header.contains(&format!(": {verdict}")),
+            "an estimate was reported with the verdict word {verdict}: {header}"
+        );
+    }
+    // Which label is owed depends on whether this host's memory was compared,
+    // and the report says which: a compared estimate names the card it was
+    // compared with. A compared estimate must be labelled ESTIMATED with the
+    // outcome its own figures imply, and one that was not, UNDETERMINED -- so
+    // the label is checked on whichever lane runs this, not only accepted.
+    // A GPU-less hosted runner takes the second branch; a lane that measures
+    // dedicated VRAM (the MI300X self-hosted lane) takes the first.
+    let compared = output.contains("the GPU with the most dedicated VRAM that ROCm can see has");
+    if compared {
+        // The label owed follows from the two figures the report prints: the
+        // total it needs ("= about N MiB") and the card's ("has M MiB").
+        let number_after = |marker: &str| -> u64 {
+            let at = output
+                .find(marker)
+                .unwrap_or_else(|| panic!("no `{marker}` in:\n{output}"))
+                + marker.len();
+            output[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| panic!("no figure after `{marker}` in:\n{output}"))
+        };
+        let needed = number_after("= about ");
+        let offered = number_after("can see has ");
+        let label = if needed <= offered {
+            ": ESTIMATED: fits at 2048 tokens"
+        } else {
+            ": ESTIMATED: does not fit at 2048 tokens"
+        };
+        assert!(
+            header.contains(label),
+            "{needed} MiB needed against {offered} MiB, so `{label}` is owed: {header}"
+        );
+    } else {
+        assert!(
+            header.ends_with(": UNDETERMINED"),
+            "nothing was compared, so the answer is undetermined: {header}"
+        );
+    }
+    assert!(
+        output.contains("KV cache (q8_0)"),
+        "the figures the estimate rests on were not shown:\n{output}"
+    );
+}
+
+/// Start a stand-in Hugging Face endpoint on a loopback port and point the CLI at
+/// it. It counts every connection. A repository listing request
+/// (`/api/models/...`) is answered with `listing` when one is given; every other
+/// request, and a listing when none is given, gets an empty 404. It stops when
+/// the World lets go of its handle, so a scenario leaves no thread behind.
+fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in hub");
+    listener
+        .set_nonblocking(true)
+        .expect("make the stand-in hub non-blocking");
+    let port = listener.local_addr().expect("hub address").port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        while Arc::strong_count(&seen) > 1 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    // The request line is all that is needed, and it arrives first.
+                    let mut buf = [0_u8; 2048];
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let is_listing = request
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|path| path.starts_with("/api/models/"));
+                    let response = match listing {
+                        Some(body) if is_listing => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned(),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    });
+    world.hub_requests = Some(requests);
+    world
+        .command_env
+        .push(("HF_ENDPOINT", format!("http://127.0.0.1:{port}").into()));
+}
+
+#[given("a Hugging Face endpoint that records every request made to it")]
+async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
+    start_stand_in_hub(world, None);
+}
+
+/// A repository holding one model and its multimodal projector, as llama.cpp
+/// vision models ship. Sizes are given so no `HEAD` request is needed.
+const MODEL_AND_PROJECTOR_LISTING: &str = r#"{"siblings":[{"rfilename":"e2e-model-Q4_K_M.gguf","size":1048576},{"rfilename":"mmproj-e2e-model-f16.gguf","size":1048576}]}"#;
+
+#[given("a Hugging Face repository that holds a model and its multimodal projector")]
+async fn a_hub_repository_with_a_model_and_a_projector(world: &mut E2eWorld) {
+    start_stand_in_hub(world, Some(MODEL_AND_PROJECTOR_LISTING));
+}
+
+#[when("the user asks the CLI whether the projector file would run, naming it exactly")]
+async fn user_asks_about_the_projector_file(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            "e2e-owner/e2e-repo:mmproj-e2e-model-f16.gguf",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI says the file is a multimodal projector and names the model file instead")]
+async fn assert_the_cli_named_the_projector_and_the_model(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains(
+            "`mmproj-e2e-model-f16.gguf` is a multimodal projector (mmproj), not a language model"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("e2e-model-Q4_K_M.gguf"), "{output}");
+    assert!(!output.contains("no GGUF file matching"), "{output}");
+    // Nothing points the user back at the file it refused.
+    assert!(
+        !output.contains("rocm serve e2e-owner/e2e-repo:mmproj"),
+        "the refused projector was offered as a serve command:\n{output}"
+    );
+    // The one model in the repository is offered by its exact name.
+    assert!(
+        output.contains(
+            "verify after fix: rocm diagnose --model e2e-owner/e2e-repo:e2e-model-Q4_K_M.gguf"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("header could not be read"), "{output}");
+}
+
+#[then("the endpoint was asked only for the repository's file list")]
+async fn assert_only_the_listing_was_requested(world: &mut E2eWorld) {
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    // One listing request; the projector was refused before any header read.
+    assert_eq!(seen, 1, "the hub was asked {seen} time(s)");
+}
+
+const HUB_MODEL_REF: &str = "e2e-owner/e2e-repo:Q4_K_M";
+
+async fn run_hub_model_question(world: &mut E2eWorld, report: bool) {
+    // The environment the Given recorded is consumed by one run; keep it for the next.
+    let env = world.command_env.clone();
+    let mut args = vec!["diagnose", "--model", HUB_MODEL_REF, "--json"];
+    if report {
+        args.insert(1, "--report");
+    }
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    world.command_env = env;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to prepare a problem report that names a model on that endpoint")]
+async fn user_prepares_a_report_naming_a_hub_model(world: &mut E2eWorld) {
+    run_hub_model_question(world, true).await;
+}
+
+#[when("the user asks the CLI the same model question without preparing a report")]
+async fn user_asks_the_hub_model_question_without_a_report(world: &mut E2eWorld) {
+    run_hub_model_question(world, false).await;
+}
+
+#[then("no request reached the endpoint")]
+async fn assert_no_request_reached_the_hub(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    // A moment for a request that was sent to be counted before the check.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(seen, 0, "a prepared report reached the hub {seen} time(s)");
+}
+
+#[then("the CLI says the model was ignored rather than assessed")]
+async fn assert_the_report_said_it_ignored_the_model(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        stderr.contains("--model was ignored") && stderr.contains("nothing about the model"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[then("the CLI does not say the model was ignored")]
+async fn assert_the_cli_did_not_say_it_ignored_the_model(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(!stderr.contains("was ignored"), "stderr was: {stderr}");
+}
+
+#[then("the endpoint was asked about the model")]
+async fn assert_the_hub_was_asked_about_the_model(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        seen > 0,
+        "the same question without --report never reached the endpoint, so the check above \
+         proved nothing"
+    );
+}
+
+fn run_model_question(world: &mut E2eWorld, args: &[&str]) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn evidence_text(model: &serde_json::Value) -> String {
+    model_field(model, "evidence")
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[when("the user asks the CLI for a context size or a KV cache type without naming a model")]
+async fn user_asks_for_context_options_without_a_model(world: &mut E2eWorld) {
+    let mut outcomes = Vec::new();
+    for option in [["--context-size", "8192"], ["--kv-cache-type", "q8_0"]] {
+        let (_, stderr, rc) =
+            crate::run_rocm_with_scenario_env(world, &["diagnose", option[0], option[1]]);
+        outcomes.push(format!("{}\t{rc}\t{stderr}", option[0]));
+    }
+    world.cli_output = Some(outcomes.join("\n\u{0}\n"));
+}
+
+#[then("the CLI refuses each as a usage error that names --model")]
+async fn assert_context_options_refused_without_a_model(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let outcomes: Vec<&str> = output.split("\n\u{0}\n").collect();
+    assert_eq!(outcomes.len(), 2, "{output}");
+    for outcome in outcomes {
+        let mut parts = outcome.splitn(3, '\t');
+        let (option, rc, stderr) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        // clap's usage-error exit code.
+        assert_eq!(
+            rc, "2",
+            "{option} was not refused as a usage error: {stderr}"
+        );
+        assert!(
+            stderr.contains("--model"),
+            "{option}: the refusal does not name what is missing: {stderr}"
+        );
+    }
+}
+
+#[when(
+    "the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_curated_model_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            SMALLEST_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then(
+    "the answer says the context options do not apply to a curated recipe, and carries no estimate"
+)]
+async fn assert_curated_model_says_context_options_do_not_apply(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains("do not apply to a curated recipe"),
+        "the option was accepted and nothing said it was not applied: {model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a curated model was estimated from a header it has none of: {model:#}"
+    );
+}
+
+fn missing_gguf_path(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-model.gguf")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when(
+    "the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form"
+)]
+async fn user_asks_about_a_missing_gguf(world: &mut E2eWorld) {
+    let path = missing_gguf_path(world);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "{path} must not exist"
+    );
+    run_model_question(world, &["diagnose", "--model", &path, "--json"]);
+}
+
+#[then("the answer says the file could not be opened and offers no upstream route")]
+async fn assert_missing_gguf_could_not_be_opened(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!("could not open {path}")),
+        "the answer does not say which file could not be opened: {model:#}"
+    );
+    assert_eq!(
+        estimate_section(&model)["cannot_estimate_reason"],
+        "header_unreadable",
+        "{model:#}"
+    );
+    assert!(
+        model.get("route").is_none_or(serde_json::Value::is_null),
+        "a path that does not exist was routed to the upstream tracker: {model:#}"
+    );
+}
+
+#[then("the plan is to ask again about that path")]
+async fn assert_missing_gguf_plan_is_to_check_the_path(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let fix = model_field(&model, "fix");
+    // The command names the path as given, quoted when the platform's shell
+    // would split or expand it (the scenario's temp directory decides which).
+    let verify = fix["verify"].as_str().unwrap_or("");
+    let bare = format!("rocm diagnose --model {path}");
+    let quoted = format!("rocm diagnose --model '{path}'");
+    // Either form asks again with `rocm diagnose`; serving a file that is not
+    // there would only repeat the error.
+    assert!(verify == bare || verify == quoted, "{model:#}");
+}
+
+#[when(
+    "the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_bare_repository_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            UNCURATED_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then("the answer says the reference names a repository and asks for a quantization")]
+async fn assert_bare_repository_asks_for_a_quantization(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!(
+            "`{UNCURATED_MODEL_REF}` names a repository, not a model file: add `:QUANT`"
+        )),
+        "{model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a repository was estimated as if it were one file: {model:#}"
+    );
+}
+
+#[when("the user asks the CLI about a quantization the repository does not hold")]
+async fn user_asks_about_a_missing_quantization(world: &mut E2eWorld) {
+    run_model_question(world, &["diagnose", "--model", "e2e-owner/e2e-repo:Q8_0"]);
+}
+
+#[then("the CLI says nothing matches and lists the model and the projector, marked as a projector")]
+async fn assert_missing_quantization_lists_every_gguf(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains(
+            "no GGUF file matching `Q8_0` in the repository (it has: e2e-model-Q4_K_M.gguf, \
+             mmproj-e2e-model-f16.gguf (multimodal projector))"
+        ),
+        "{output}"
     );
 }

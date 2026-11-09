@@ -27,6 +27,7 @@ use super::{
 };
 use crate::cli_progress::AnimatedSpinner;
 use crate::freeform_planner::format_structured_tool_call;
+use crate::runtime_adopt::SetupRecovery;
 use crate::therock;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -48,7 +49,14 @@ pub(crate) fn install(
     options: ComfyUiInstallOptions,
 ) -> Result<String> {
     paths.ensure()?;
-    let runtime = select_runtime(paths, config, options.runtime_id.as_deref())?;
+    // A preview names the runtime the real run will use but does not write the
+    // registry entry that run would restore.
+    let runtime = select_runtime(
+        paths,
+        config,
+        options.runtime_id.as_deref(),
+        SetupRecovery::for_dry_run(options.dry_run),
+    )?;
     let app_root = runtime_app_root(&runtime.manifest);
     let source_path = source_path_from_app_root(&app_root);
     let log_path = install_log_path_from_app_root(&app_root);
@@ -1905,6 +1913,170 @@ mod tests {
         );
         assert!(!with_record.contains("  replaces:"), "{with_record}");
         assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// `--dry-run` promises not to change files. With nothing chosen, the install
+    /// finds the runtime `rocm setup` created even though its registry entry was
+    /// lost, but a preview must not write that entry back: it names the same
+    /// runtime the real run will use and leaves the registry as it found it.
+    #[test]
+    fn dry_run_previews_the_setup_runtime_without_restoring_its_registry_entry() -> Result<()> {
+        let paths = test_paths("comfyui-dry-run-setup-runtime");
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new()
+        );
+
+        let rendered = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: None,
+                reinstall: false,
+                dry_run: true,
+            },
+        )?;
+
+        assert!(rendered.contains("  mode: dry-run\n"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "  ROCm runtime: {}\n",
+                therock::runtime_version_display(&manifest.version)
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("install command:")
+                    && line.contains(&format!("--runtime-id {}", manifest.runtime_key))),
+            "{rendered}"
+        );
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            Vec::<String>::new(),
+            "a preview must not restore the registry entry"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A runtime that setup created and the registry forgot, with a cached
+    /// ComfyUI archive and a fake interpreter, so a real install into it needs
+    /// no network and no GPU.
+    #[cfg(unix)]
+    fn setup_runtime_the_registry_forgot(
+        name: &str,
+    ) -> Result<(AppPaths, RocmCliConfig, therock::InstalledRuntimeManifest)> {
+        let paths = test_paths(name);
+        let manifest = crate::test_support::write_test_setup_runtime_missing_from_registry(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+        )?;
+        let config = RocmCliConfig::load(&paths)?;
+        let app_root = runtime_app_root(&manifest);
+        plant_cached_source_archive(
+            &app_root,
+            &[("main.py", "new main"), ("requirements.txt", "torch\n")],
+        )?;
+        let python = PathBuf::from(
+            manifest
+                .python_executable
+                .as_deref()
+                .context("runtime has no Python")?,
+        );
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
+        )?;
+        Ok((paths, config, manifest))
+    }
+
+    /// The preview prints the install command it would run, and that command
+    /// has to work from the state the preview left: the registry still without
+    /// the entry. Its `--runtime-id` is an explicit choice, which used to look
+    /// only in the registry and fail with "Install ROCm first". Following the
+    /// printed command previews again without a write, and runs for real with
+    /// the one write the real run makes.
+    #[cfg(unix)]
+    #[test]
+    fn the_printed_install_command_works_from_the_state_the_preview_left() -> Result<()> {
+        let (paths, config, manifest) =
+            setup_runtime_the_registry_forgot("comfyui-printed-command-setup-runtime")?;
+        let options = |runtime_id: Option<String>, dry_run| ComfyUiInstallOptions {
+            runtime_id,
+            reinstall: false,
+            dry_run,
+        };
+        let printed_runtime_id = |rendered: &str| -> Result<String> {
+            let line = rendered
+                .lines()
+                .find(|line| line.contains("install command:"))
+                .with_context(|| format!("the preview prints its command:\n{rendered}"))?;
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let at = words
+                .iter()
+                .position(|word| *word == "--runtime-id")
+                .context("the printed command names the runtime")?;
+            Ok(words[at + 1].to_owned())
+        };
+
+        let preview = install(&paths, &config, options(None, true))?;
+        let printed = printed_runtime_id(&preview)?;
+        assert_eq!(printed, manifest.runtime_key, "{preview}");
+        assert!(
+            crate::test_support::runtime_registry_entry_names(&paths).is_empty(),
+            "the premise: the preview leaves the registry without the entry"
+        );
+
+        let again = install(&paths, &config, options(Some(printed.clone()), true))
+            .context("the printed command, previewed again")?;
+        assert_eq!(printed_runtime_id(&again)?, printed, "{again}");
+        assert!(
+            crate::test_support::runtime_registry_entry_names(&paths).is_empty(),
+            "previewing the printed command must not write the entry either"
+        );
+
+        install(&paths, &config, options(Some(printed), false))
+            .context("the printed command, run for real")?;
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)],
+            "the real run restores the entry the printed command's runtime needs"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// The other half: the real run does restore the entry, so the runtime the
+    /// preview named is one `rocm runtimes list` shows once the install has run.
+    #[cfg(unix)]
+    #[test]
+    fn install_restores_the_setup_runtime_registry_entry_the_preview_left_alone() -> Result<()> {
+        let (paths, config, manifest) =
+            setup_runtime_the_registry_forgot("comfyui-install-setup-runtime")?;
+
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: None,
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        assert_eq!(
+            crate::test_support::runtime_registry_entry_names(&paths),
+            vec![format!("{}.json", manifest.runtime_key)]
+        );
         remove_test_root(&paths);
         Ok(())
     }

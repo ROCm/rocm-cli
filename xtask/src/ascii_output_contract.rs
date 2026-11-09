@@ -53,11 +53,11 @@
 //!
 //! * **Clap `--help` text** comes from `///` doc comments, which are comments
 //!   and so are skipped here. `every_help_text_in_the_command_tree_is_ascii`
-//!   (`apps/rocm/src/main.rs`) walks the whole clap command tree and asserts
+//!   (`apps/rocm/src/cli.rs`) walks the whole clap command tree and asserts
 //!   the *rendered* help is ASCII, which also covers `#[arg(help = ...)]`.
 //! * **Text assembled at runtime** from non-literal sources.
 //!   `every_message_the_diagnose_catalog_can_emit_is_ascii`
-//!   (`crates/rocm-core/src/diagnose.rs`) walks the `CHECKERS` catalog and
+//!   (`crates/rocm-core/src/diagnose/catalog.rs`) walks the `CHECKERS` catalog and
 //!   asserts the rendered report and the `--json` payload are ASCII.
 //!
 //! Source scan and rendered-output walk catch different mistakes; keep both.

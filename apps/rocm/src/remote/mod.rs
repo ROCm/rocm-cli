@@ -224,7 +224,7 @@ fn remote_doctor(
     // Deliberately not `ensure_ready`: that provisions a missing CLI, and a
     // health check has no business installing software on a machine it was only
     // asked to look at. The daemon's read-only allowlist
-    // (`ensure_rocm_command_is_read_only` in `apps/rocmd/src/lib.rs`) admits
+    // (`ensure_rocm_command_is_read_only` in `apps/rocmd/src/mcp_argv.rs`) admits
     // `remote doctor` without the approval flow, which is only true while this
     // stays a pure read.
     let remote_cli = bootstrap::locate_cli(&transport, target)?;

@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+mod discover_builds;
 mod install;
 mod process;
 mod repair;

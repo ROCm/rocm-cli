@@ -57,8 +57,8 @@ pub use tools::{
     ExamineRocmTool, GpuSnapshotRocmTool, GpuStatusArgs, GpuStatusTool, InstallEngineRocmTool,
     InstallSdkDryRunRocmTool, InstallSdkRocmTool, LaunchServerRocmTool, ListInstancesTool,
     NaturalLanguagePlanRocmTool, NoArgs, PathExistsRocmTool, PortStatusRocmTool,
-    ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, RocmCommandRocmTool, SKILL_NAMES,
-    ServiceLogsRocmTool, ServicesRocmTool, StopServerRocmTool, TokensPerWattTool, ToolError,
+    ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, RocmCommandRocmTool, ServiceLogsRocmTool,
+    ServicesRocmTool, StopServerRocmTool, TELEMETRY_TOOL_NAMES, TokensPerWattTool, ToolError,
     UpdateCheckRocmTool, WatcherDisableRocmTool, WatcherEnableRocmTool,
 };
 

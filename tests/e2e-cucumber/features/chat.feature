@@ -150,3 +150,38 @@ Feature: Chat and endpoint detection
     Then the planning assistant was asked exactly once
     And the plan text returned is the one the planning assistant gave
     And the action returned is the one the planning assistant gave
+
+  # A `serve` the planning assistant proposes is held to the same four rules as
+  # one the chat assistant proposes: no CPU device, no public bind, loopback host
+  # only, and managed serving. The CLI does not show an unsafe plan from the
+  # assistant, it falls back to its own plan and says why, and nothing is run.
+  # The message is asserted with the plan shown, which is the behavior it
+  # describes: the assistant's serve names a model the CLI's own plan never
+  # would, so that model must not appear anywhere in the output.
+  @id:chat-planning-assistant-cpu-serve-refused
+  Scenario: chat-13 - A plan that serves on the CPU is refused, not shown
+    Given a local planning assistant that suggests serving a model with "--device cpu --managed"
+    When the user asks the CLI to plan a vague request
+    Then the planning assistant was asked exactly once
+    And the CLI plans the request itself and says the planning assistant's plan "cannot request CPU execution; ROCm GPU execution is required"
+
+  @id:chat-planning-assistant-public-bind-serve-refused
+  Scenario: chat-14 - A plan that binds the server publicly is refused, not shown
+    Given a local planning assistant that suggests serving a model with "--allow-public-bind --managed"
+    When the user asks the CLI to plan a vague request
+    Then the planning assistant was asked exactly once
+    And the CLI plans the request itself and says the planning assistant's plan "cannot request public network binding"
+
+  @id:chat-planning-assistant-non-local-host-serve-refused
+  Scenario: chat-15 - A plan that binds a non-local host is refused, not shown
+    Given a local planning assistant that suggests serving a model with "--host 0.0.0.0 --managed"
+    When the user asks the CLI to plan a vague request
+    Then the planning assistant was asked exactly once
+    And the CLI plans the request itself and says the planning assistant's plan "cannot request non-local host `0.0.0.0`"
+
+  @id:chat-planning-assistant-unmanaged-serve-refused
+  Scenario: chat-16 - A plan that serves in the foreground is refused, not shown
+    Given a local planning assistant that suggests serving a model with "--foreground"
+    When the user asks the CLI to plan a vague request
+    Then the planning assistant was asked exactly once
+    And the CLI plans the request itself and says the planning assistant's plan "must request managed serving with --managed"

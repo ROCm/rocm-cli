@@ -541,8 +541,9 @@ struct ExamineFacts {
 
 /// `driver_status` value meaning ROCm's WSL passthrough path is complete.
 ///
-/// The CLI sets this only when `/dev/dxg`, dxcore, `librocdxg.so` and its
-/// ldconfig entry are all present; the other WSL states (`wsl_rocdxg_missing`,
+/// The CLI sets this only when `/dev/dxg`, dxcore and `librocdxg.so` are
+/// present and the loader can find the library (an ldconfig entry, or a
+/// directory on `LD_LIBRARY_PATH`); the other WSL states (`wsl_rocdxg_missing`,
 /// `wsl_gpu_plumbing_missing`) mean the runtime cannot reach the GPU.
 const WSL_DRIVER_READY: &str = "wsl_rocdxg_ready";
 

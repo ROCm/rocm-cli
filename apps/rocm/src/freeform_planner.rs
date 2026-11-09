@@ -43,9 +43,12 @@ use rocm_core::{
 use serde::Deserialize;
 use std::fmt::Write as _;
 
-use crate::service_launch::is_loopback_host;
-use crate::shell_quote::{has_terminal_control_character, shell_quote};
-use crate::{Cli, chat, providers};
+// `format_structured_tool_call` lives in `rocm_argv.rs` and stays reachable here
+// as `freeform_planner::format_structured_tool_call` (read by `comfyui.rs`,
+// `freeform_execution.rs` and `providers.rs`'s tests).
+pub(crate) use crate::rocm_argv::format_structured_tool_call;
+use crate::shell_quote::has_terminal_control_character;
+use crate::{Cli, prompt_text, providers, rocm_argv, tool_policy};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
 /// below; production code calls [`plan_freeform_request_with_context`]
@@ -83,7 +86,7 @@ pub(crate) fn freeform_plan_next_action(
 /// Builds the freeform plan exactly once, returning both the rendered plan
 /// text and the next action derived from that same plan.
 ///
-/// Used by `chat.rs`'s `natural_language_plan` MCP tool, which used to call
+/// Used by `chat/mcp_bridge.rs`'s `natural_language_plan` MCP tool, which used to call
 /// `render_freeform_plan` and (the now-removed)
 /// `freeform_plan_next_action_with_context` independently — each building its
 /// own `StructuredRequestPlan`. When the request is ambiguous and a cloud
@@ -368,7 +371,7 @@ fn build_freeform_plan_on(
             .map(|recipe| recipe.canonical_model_id.as_str())
             .or(requested_model)
             .unwrap_or("<model>");
-        let engine = infer_engine_from_request(&lower)
+        let engine = prompt_text::infer_engine_from_request(&lower)
             .or_else(|| resolved_recipe.as_ref().and_then(planner_recipe_engine))
             .unwrap_or(default_engine);
         let device_policy = infer_device_policy_from_request(&lower).or_else(|| {
@@ -376,7 +379,7 @@ fn build_freeform_plan_on(
                 .as_ref()
                 .map(|recipe| recipe.device_policy.as_str())
         });
-        if device_policy.is_some_and(device_policy_is_cpu_mode) {
+        if device_policy.is_some_and(rocm_argv::device_policy_is_cpu_mode) {
             let (parsed, confidence) = serve_plan_parsed_fields_and_confidence(
                 model,
                 engine,
@@ -456,7 +459,7 @@ fn build_freeform_plan_on(
     }
 
     if planner_mentions_comfyui(&lower) {
-        if chat::any_substring(&lower, &["log", "logs"]) {
+        if prompt_text::any_substring(&lower, &["log", "logs"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Inspect,
@@ -471,7 +474,7 @@ fn build_freeform_plan_on(
                 Vec::new(),
             );
         }
-        if chat::any_substring(&lower, &["start", "run", "launch", "open"]) {
+        if prompt_text::any_substring(&lower, &["start", "run", "launch", "open"]) {
             return StructuredRequestPlan::deterministic(
                 trimmed,
                 PlannerIntent::Serve,
@@ -522,8 +525,8 @@ fn build_freeform_plan_on(
         } else {
             "release"
         };
-        let build_date = chat::requested_therock_build_date_from_prompt(&lower);
-        let Some(prefix) = chat::requested_install_prefix_from_prompt(trimmed) else {
+        let build_date = prompt_text::requested_therock_build_date_from_prompt(&lower);
+        let Some(prefix) = prompt_text::requested_install_prefix_from_prompt(trimmed) else {
             let mut parsed = vec![
                 ("channel".to_owned(), channel.to_owned()),
                 ("format".to_owned(), "wheel".to_owned()),
@@ -717,31 +720,6 @@ fn planned_device_policy_without_fallback(policy: &str) -> &str {
         "gpu_preferred" => "gpu_required",
         other => other,
     }
-}
-
-fn device_policy_is_cpu_mode(policy: &str) -> bool {
-    matches!(
-        policy.trim().to_ascii_lowercase().as_str(),
-        "cpu" | "cpu_only"
-    )
-}
-
-pub(crate) fn serve_args_request_cpu_device(args: &[String]) -> bool {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--device=")
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-        if arg == "--device"
-            && let Some(value) = iter.peek()
-            && device_policy_is_cpu_mode(value)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn planner_resolve_model_recipe(
@@ -1031,29 +1009,12 @@ pub(crate) fn validate_provider_planner_tool_call(
         [command] if command == "examine" => {}
         [command, subcommand] if command == "engines" && subcommand == "list" => {}
         [command, subcommand, ..] if command == "install" && subcommand == "sdk" => {
-            chat::validate_chat_rocm_command_safety(&call.args)?;
+            tool_policy::validate_chat_rocm_command_safety(&call.args)?;
         }
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
         [command, ..] if command == "serve" => {
-            if chat::chat_cli_has_flag(&call.args, "--allow-public-bind") {
-                bail!("provider planner cannot request public network binding");
-            }
-            if serve_args_request_cpu_device(&call.args) {
-                bail!(
-                    "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution"
-                );
-            }
-            if let Some(host) = chat::chat_cli_arg_value(&call.args, "--host")
-                && !is_loopback_host(host)
-            {
-                bail!("provider planner cannot request non-local host `{host}`");
-            }
-            if chat::chat_cli_has_flag(&call.args, "--foreground")
-                || !chat::chat_cli_has_flag(&call.args, "--managed")
-            {
-                bail!("provider planner must request managed serving with --managed");
-            }
+            tool_policy::validate_serve_command_safety(&call.args, "provider planner")?;
         }
         [command, ..] if command == "uninstall" => {}
         _ => bail!(
@@ -1235,11 +1196,11 @@ fn planner_is_inspect_request(lower: &str) -> bool {
 }
 
 fn planner_mentions_comfyui(lower: &str) -> bool {
-    chat::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
+    prompt_text::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
 }
 
 fn planner_requests_comfyui_install(lower: &str) -> bool {
-    chat::any_substring(
+    prompt_text::any_substring(
         lower,
         &[
             "can you setup",
@@ -1257,19 +1218,6 @@ fn planner_requests_comfyui_install(lower: &str) -> bool {
 fn contains_planner_word(text: &str, expected: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
         .any(|word| word == expected)
-}
-
-pub(crate) fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
-    // Word-boundary match, not substring: "aim" as a bare `.contains` also
-    // matches "aiming"/"claim"/"maintain", silently steering an unrelated
-    // chat request onto the Docker-backed AIM engine.
-    let words: std::collections::HashSet<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
-    ["lemonade", "vllm", "aim"]
-        .into_iter()
-        .find(|engine| words.contains(engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -1321,48 +1269,8 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
-/// Render an argv as the command line a human is shown for it.
-///
-/// This is the only thing an operator sees before approving a mutating tool
-/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
-/// line) is offered to be copied and run. So it has to denote the argv it was
-/// built from: quoted with [`shell_quote`], every argument splits back to
-/// itself under a shell's own word-splitting, and nothing inside a value can
-/// read as a second command.
-///
-/// Values carrying terminal control characters never get here — they are
-/// refused at validation ([`has_terminal_control_character`]), because no
-/// amount of quoting stops a `\r` from rewriting the line the operator is
-/// reading.
-pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| shell_quote(arg)));
-    parts.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::infer_engine_from_request;
-
-    /// "aim" must match as its own word, not as a substring of an unrelated
-    /// word like "aiming"/"claim"/"maintain" in a free-text chat request.
-    #[test]
-    fn infer_engine_from_request_does_not_match_aim_as_a_substring() {
-        assert_eq!(
-            infer_engine_from_request("serve a small model, aiming for low latency"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("please explain how to maintain a claim"),
-            None
-        );
-        assert_eq!(
-            infer_engine_from_request("serve qwen3.5-9b with aim"),
-            Some("aim")
-        );
-    }
-
     use super::*;
     use crate::tests::test_paths;
 
@@ -2092,5 +2000,210 @@ mod tests {
             plan.notes
         );
         Ok(())
+    }
+
+    /// The planner's response for a `serve` call, as the provider would send it.
+    fn serve_planner_response(args: &[&str]) -> String {
+        serde_json::json!({
+            "intent": "serve",
+            "tool_call": {"tool": "rocm", "args": args},
+        })
+        .to_string()
+    }
+
+    /// The serve safety rules as the provider-assisted planner meets them: every
+    /// refusal in the shared table, at the validator and at the response parser
+    /// that builds the plan. A refused response yields no `StructuredRequestPlan`,
+    /// so there is no planned action for anything to run, and the operator sees
+    /// the refusal as the planner's failure note.
+    ///
+    /// The chat suite (`tool_policy`) runs the same table.
+    #[test]
+    fn planner_refuses_each_unsafe_serve_and_plans_nothing() {
+        use crate::test_support::{SERVE_SAFETY_REFUSALS, owned_argv};
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let context = format!("{}: {:?}", case.rule, case.args);
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: owned_argv(case.args),
+            };
+            let error = validate_provider_planner_tool_call(&call).expect_err(&context);
+            assert_eq!(error.to_string(), case.planner_error, "{context}");
+
+            let error = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(case.args),
+            )
+            .expect_err(&context);
+            assert_eq!(error.to_string(), case.planner_error, "{context}");
+            assert_eq!(
+                planner_failure_note("local", &error),
+                format!(
+                    "Provider-assisted planner `local` could not resolve this request: {}",
+                    case.planner_error
+                ),
+                "{context}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_plans_a_safe_serve_for_approval_with_its_argv_unchanged() -> Result<()> {
+        use crate::test_support::{SERVE_SAFETY_ACCEPTED, owned_argv};
+
+        for args in SERVE_SAFETY_ACCEPTED {
+            let plan = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(args),
+            )?;
+            assert_eq!(plan.intent, PlannerIntent::Serve, "{args:?}");
+            // A serve starts a server, so the plan always asks for approval.
+            assert_eq!(plan.approval, "required before execution", "{args:?}");
+            assert_eq!(plan.actions.len(), 1, "{args:?}");
+            assert_eq!(plan.actions[0].args, owned_argv(args), "{args:?}");
+        }
+        Ok(())
+    }
+
+    /// The planner has no port rule: a loopback host other than `127.0.0.1`
+    /// without `--port` is planned, where the chat policy refuses it
+    /// (`chat_requires_a_port_on_a_loopback_host_other_than_the_default`).
+    #[test]
+    fn planner_accepts_a_loopback_host_without_a_port() -> Result<()> {
+        use crate::test_support::{SERVE_PORT_RULE_CHAT_ONLY, owned_argv};
+
+        for (args, _) in SERVE_PORT_RULE_CHAT_ONLY {
+            let plan = provider_planner_response_to_plan(
+                "serve a model",
+                "local",
+                &serve_planner_response(args),
+            )?;
+            assert_eq!(plan.actions[0].args, owned_argv(args), "{args:?}");
+        }
+        Ok(())
+    }
+
+    /// The rules fire in a fixed order, so an argv that breaks several reports
+    /// the first one: public bind, then CPU, then host, then managed.
+    #[test]
+    fn planner_reports_the_first_broken_serve_rule() {
+        use crate::test_support::owned_argv;
+
+        for (args, expected) in [
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--allow-public-bind",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "provider planner cannot request public network binding",
+            ),
+            (
+                &[
+                    "serve",
+                    "qwen",
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "0.0.0.0",
+                    "--foreground",
+                ][..],
+                "provider planner cannot request CPU execution; ROCm GPU execution is required",
+            ),
+            (
+                &["serve", "qwen", "--host", "0.0.0.0", "--foreground"][..],
+                "provider planner cannot request non-local host `0.0.0.0`",
+            ),
+            (
+                &["serve", "qwen", "--foreground"][..],
+                "provider planner must request managed serving with --managed",
+            ),
+        ] {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: owned_argv(args),
+            };
+            let error = validate_provider_planner_tool_call(&call)
+                .expect_err("unsafe")
+                .to_string();
+            assert_eq!(error, expected, "{args:?}");
+        }
+    }
+
+    /// The planner and the chat tool policy enforce one set of serve rules, so
+    /// they refuse an argv with the same words and differ only in who is named
+    /// at the front of the message.
+    #[test]
+    fn planner_and_chat_serve_refusals_differ_in_the_actor_only() {
+        use crate::test_support::SERVE_SAFETY_REFUSALS;
+
+        for case in SERVE_SAFETY_REFUSALS {
+            let chat = case
+                .chat_error
+                .strip_prefix("local assistant ")
+                .unwrap_or_else(|| panic!("chat refusal names the assistant: {}", case.chat_error));
+            let planner = case
+                .planner_error
+                .strip_prefix("provider planner ")
+                .unwrap_or_else(|| {
+                    panic!("planner refusal names the planner: {}", case.planner_error)
+                });
+            assert_eq!(chat, planner, "{}: {:?}", case.rule, case.args);
+        }
+    }
+
+    /// `--foreground` next to `--managed` is refused by clap before the planner's
+    /// safety check runs, where the chat check refuses it for the managed rule.
+    #[test]
+    fn planner_refuses_foreground_with_managed_as_an_invalid_command() {
+        use crate::test_support::{SERVE_FOREGROUND_AND_MANAGED, owned_argv};
+
+        let call = ProviderPlannerToolCall {
+            tool: "rocm".to_owned(),
+            args: owned_argv(SERVE_FOREGROUND_AND_MANAGED),
+        };
+        let error = validate_provider_planner_tool_call(&call)
+            .expect_err("clap refuses the conflicting flags")
+            .to_string();
+        assert_eq!(
+            error,
+            "provider planner returned a rocm command that is not valid"
+        );
+    }
+
+    /// The planner matches the `serve` word exactly, where the chat check
+    /// ignores case, so `Serve` and `SERVE` never reach the planner's safety
+    /// check: the clap parse that precedes it refuses them. Either way an
+    /// uppercase `serve` is refused; only the reason differs.
+    #[test]
+    fn planner_refuses_an_uppercase_serve_word_before_the_safety_check() {
+        use crate::test_support::owned_argv;
+
+        for word in ["Serve", "SERVE"] {
+            for args in [
+                &[word, "qwen", "--device", "cpu", "--managed"][..],
+                &[word, "qwen", "--managed"][..],
+            ] {
+                let call = ProviderPlannerToolCall {
+                    tool: "rocm".to_owned(),
+                    args: owned_argv(args),
+                };
+                let error = validate_provider_planner_tool_call(&call)
+                    .expect_err("an uppercase serve word is not a rocm command")
+                    .to_string();
+                assert_eq!(
+                    error, "provider planner returned a rocm command that is not valid",
+                    "{args:?}"
+                );
+            }
+        }
     }
 }

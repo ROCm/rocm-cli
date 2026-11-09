@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The platform atoms `rocm fix` prints, which it builds by joining a recipe's
-/// `applies_on` with `/` (see `FixRecipe` in `crates/rocm-core/src/fix.rs`).
+/// `applies_on` with `/` (see `FixRecipe` in `crates/rocm-core/src/fix/catalog.rs`).
 /// A catalog cell is any non-empty `/`-joined subset of these.
 const PLATFORM_ATOMS: &[&str] = &["linux", "windows", "wsl"];
 
@@ -209,7 +209,7 @@ fn catalog_os_scopes_use_the_cli_spellings() {
         "skills/rocm-doctor/reference.md scopes these fixes with words `rocm fix` never prints: \
          {bad:?}.\n\
          An OS-scope cell must be a `/`-joined list of {PLATFORM_ATOMS:?}, matching the recipe's \
-         `applies_on` in crates/rocm-core/src/fix.rs. Spell the platforms out instead of \
+         `applies_on` in crates/rocm-core/src/fix/catalog.rs. Spell the platforms out instead of \
          introducing a shorthand: the skill contract compares these cells literally, and a \
          shorthand would have to be translated -- which is how a dropped platform hides."
     );
@@ -259,7 +259,7 @@ fn catalog_markers_use_the_cli_vocabulary() {
         "skills/rocm-doctor/reference.md marks these fixes with words `rocm fix` never prints: \
          {bad:?}.\n\
          A marker cell must be one of {MARKER_WORDS:?}, matching `FixClass::marker` in \
-         crates/rocm-core/src/fix.rs (lower-cased). {} of those are `yes`/`no`, the vocabulary \
+         crates/rocm-core/src/fix/options.rs (lower-cased). {} of those are `yes`/`no`, the vocabulary \
          the class rewrite retired -- replace with the CLI's own marker word.",
         bad.iter()
             .filter(|(_, word)| retired.contains(word.as_str()))
