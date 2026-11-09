@@ -162,8 +162,7 @@ pub(crate) enum Command {
     /// the limit is enforced.
     CheckModuleSizeAdvisory,
     /// Fail if a production source file (a `.rs` file under `apps/*/src`,
-    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`,
-    /// or the exemption list in `xtask/src/architecture_doc.rs` has gone stale.
+    /// `crates/*/src` or `engines/*/src`) has no entry in `docs/architecture.md`.
     CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {

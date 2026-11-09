@@ -18,8 +18,9 @@
 //! inside an HTML comment, a code block or a code span does not count, and
 //! neither does a link missing its `[` or `)`, one with an escaped bracket, an
 //! image, or the outer brackets of a link that contains another link),
-//! or be a test-only helper (see [`is_test_helper`]). Out of scope: `build.rs` files at a crate's root and the
-//! `tests/` and `examples/` trees, which sit outside `<crate>/src`.
+//! or be a test-only helper (see [`is_test_helper`]). Out of scope: `build.rs`
+//! files at a crate's root and the `tests/` and `examples/` trees, which sit
+//! outside `<crate>/src`.
 //!
 //! It reads the git index and the working tree, never a git diff, so the answer
 //! does not depend on a base ref. That is the same answer in CI and in the
