@@ -11,6 +11,7 @@
 
 pub mod bench_rollup;
 pub mod bench_schema;
+pub mod chat_template;
 pub mod config;
 pub mod efficiency;
 pub mod metrics;
