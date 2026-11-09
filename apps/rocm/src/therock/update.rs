@@ -23,7 +23,6 @@
 //! install and activation paths share.
 
 use super::family::family_override_or_recovered_arch;
-use super::io::write_file_atomically;
 use super::process::SuppressProgressOutput;
 use super::python::{
     PythonLauncher, PythonSource, python_launcher_install_ready, python_requirement,
@@ -41,6 +40,7 @@ use crate::runtime_registry::{
     wheel_composition_device_target,
 };
 use anyhow::{Context, Result, bail};
+use rocm_core::atomic_write::write_file_atomically;
 use rocm_core::{AppPaths, unix_time_millis};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
