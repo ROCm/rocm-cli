@@ -508,7 +508,7 @@ fn resolve_latest_for_manifest(
                     (wheel_compatibility_for_python(&python.executable)?, None)
                 }
                 (None, PythonAccess::SearchOnly) => {
-                    let planned = plan_python_launcher(paths, requirement)?;
+                    let planned = plan_python_launcher(paths, requirement, None)?;
                     (planned.wheel_compatibility()?, planned.update_note())
                 }
             };

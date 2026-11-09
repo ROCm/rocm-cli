@@ -641,7 +641,8 @@ Feature: Runtime configuration
   # home folder whose `~/bin/python` fails `--version`. The install now refuses
   # a folder ROCm CLI cannot show it created, and the second half takes the
   # refusal's own advice to prove it is a way forward, not a dead end. The
-  # `--dry-run` preview comes first: it has to predict that refusal and print
+  # `--dry-run` preview comes first: it has to predict that refusal from the
+  # folder's files, without running the folder's Python, and print
   # `command: none`, since the install will run no command.
   #
   # No GPU or network: the index is a loopback fixture, and the install pins
@@ -665,7 +666,8 @@ Feature: Runtime configuration
   # keeps the user's models, workflows and outputs under `apps/comfyui`. A
   # rebuild replaces the environment's own files and nothing else, and the line
   # it prints names what it kept — asserted together with the disk. The preview
-  # shows the `uv venv --allow-existing` a rebuild runs. Same hermetic setup and
+  # runs nothing from the folder, so it cannot tell reuse from a rebuild; it
+  # says so and shows the `uv venv --allow-existing` a rebuild runs. Same hermetic setup and
   # Linux-only reason as runtime-29; the fake uv refuses a non-empty folder
   # without `--allow-existing` and wipes it on `--clear`, as uv 0.10 does.
   @id:runtime-install-sdk-rebuild-keeps-comfyui-data @requires-os:linux
@@ -676,3 +678,23 @@ Feature: Runtime configuration
     Then the preview shows a rebuild in place that keeps the folder
     When the user installs the SDK into the folder ROCm CLI installed into
     Then the install rebuilds only the environment's own files and reports keeping the ComfyUI data
+
+  # A preview runs nothing from the install folder. `install_sdk_dry_run` is a
+  # tool the local assistant may call without approval and with a `--prefix` of
+  # its choosing, so a folder holding someone else's `bin/python` (a downloaded
+  # or cloned tree) must not be run by a preview. Whether a folder with a
+  # Python and `pyvenv.cfg` would be reused is something only running that
+  # Python can tell, so the preview says it cannot tell and prints the refusal
+  # the install gives if it is not reused. The planted Python records every
+  # run, and the Then checks the record together with the line.
+  #
+  # Same hermetic setup and Linux-only reason as runtime-29. The interpreter
+  # search a preview runs is held to the same rule by the unit test
+  # `a_dry_run_runs_no_python_from_the_install_folder_while_searching` in
+  # `apps/rocm/src/therock/python.rs`.
+  @id:runtime-install-preview-runs-nothing-from-prefix @requires-os:linux
+  Scenario: runtime-31 - Previewing an SDK install into a folder holding another Python environment runs nothing from it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's folder holds a Python environment ROCm CLI did not make
+    When the user previews installing the SDK into that folder
+    Then the preview says it cannot tell whether that environment is reused, runs nothing from the folder, and changes nothing

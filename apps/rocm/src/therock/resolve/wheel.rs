@@ -2963,6 +2963,7 @@ sdk install
   package_specs: not resolved by this preview
   package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction
   mode: dry-run
+  python_env: not resolved by this preview
   command: not resolved by this preview
   activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process
   manifest: not resolved by this preview
@@ -3047,7 +3048,9 @@ sdk install
         };
         let mut resolved = String::new();
         write_wheel_plan(&mut resolved, &plan);
-        write_dry_run_tail(&mut resolved, &plan);
+        let (paths_root, paths) = super::super::super::test_support::test_paths("plan-keys");
+        write_dry_run_tail(&mut resolved, &plan, Some(&paths));
+        std::fs::remove_dir_all(paths_root).ok();
 
         let mut expected = plan_keys(&resolved);
         let at = expected

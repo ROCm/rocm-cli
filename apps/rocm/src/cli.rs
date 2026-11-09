@@ -828,6 +828,11 @@ rocm install sdk --devel")]
         /// host with no uv installed, the plan marks the package versions it
         /// would need uv to choose, and everything made from them, as not
         /// resolved.
+        ///
+        /// Runs nothing from the install folder: what happens to a Python
+        /// environment already there is read from its files, and where only
+        /// running its Python could tell whether it is reused, the plan says
+        /// so and shows both outcomes.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and

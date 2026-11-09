@@ -2166,6 +2166,8 @@ const EMPTY_INSTALL_FOLDER: &str = "empty-install-folder";
 /// A runtime folder an earlier `install sdk --prefix` created, now holding
 /// ComfyUI's models as well as the venv.
 const ROCM_CLI_MADE_FOLDER: &str = "rocm-cli-made-prefix";
+/// A folder holding someone else's venv, such as a downloaded or cloned tree.
+const CLONED_VENV_FOLDER: &str = "cloned-venv";
 
 fn install_folder(world: &E2eWorld, name: &str) -> std::path::PathBuf {
     let folder = root(world).join(name);
@@ -2187,8 +2189,37 @@ fn write_executable(path: &Path, body: &str) {
     }
 }
 
-fn plant_python_that_no_longer_runs(folder: &Path) {
-    write_executable(&folder.join("bin").join("python"), "#!/bin/sh\nexit 1\n");
+/// A Python that fails, and first appends a line to [`prefix_python_log`] so a
+/// step can tell whether anything ran it.
+fn plant_python_that_no_longer_runs(world: &E2eWorld, folder: &Path) {
+    write_executable(
+        &folder.join("bin").join("python"),
+        &python_that_no_longer_runs(world),
+    );
+}
+
+/// The script [`plant_python_that_no_longer_runs`] plants.
+fn python_that_no_longer_runs(world: &E2eWorld) -> String {
+    format!(
+        "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
+        prefix_python_log(world).display()
+    )
+}
+
+/// Where every Python planted in an install folder records that it was run.
+/// Outside the folders, so recording changes none of them.
+fn prefix_python_log(world: &E2eWorld) -> std::path::PathBuf {
+    root(world).join("prefix-python-ran.log")
+}
+
+/// Fails the step if anything ran a Python planted in an install folder.
+fn assert_no_prefix_python_ran(world: &E2eWorld, reported: &str) {
+    let log = prefix_python_log(world);
+    assert!(
+        !log.exists(),
+        "the preview ran a Python from the install folder:\n{}\n{reported}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
 }
 
 /// Run a real (not `--dry-run`) wheel install into `folder`.
@@ -2305,14 +2336,14 @@ fn reported(world: &E2eWorld) -> String {
 #[given("the user's home folder holds their files and a Python that no longer runs")]
 async fn home_folder_with_failing_python(world: &mut E2eWorld) {
     let home = install_folder(world, USER_HOME_FOLDER);
-    plant_python_that_no_longer_runs(&home);
+    plant_python_that_no_longer_runs(world, &home);
     write_fixture(&home.join("Documents").join("thesis.txt"), "years of work");
 }
 
 #[given("a folder ROCm CLI installed into holds ComfyUI models and a Python that no longer runs")]
 async fn rocm_cli_folder_with_comfyui_models(world: &mut E2eWorld) {
     let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
-    plant_python_that_no_longer_runs(&folder);
+    plant_python_that_no_longer_runs(world, &folder);
     write_fixture(&folder.join("pyvenv.cfg"), "home = /usr/bin\n");
     write_fixture(
         &folder
@@ -2372,11 +2403,15 @@ async fn preview_predicts_home_refusal(world: &mut E2eWorld) {
     let reported = reported(world);
     assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
     assert!(
+        reported.contains("python_env: the install will refuse this folder\n"),
+        "the preview did not predict the refusal:\n{reported}"
+    );
+    assert!(
         reported.contains(&format!(
-            "python_env: the install will refuse this folder: refusing to create the Python environment at {}",
+            "refusal: refusing to create the Python environment at {}",
             home.display()
         )),
-        "the preview did not predict the refusal:\n{reported}"
+        "the preview did not give the install's refusal:\n{reported}"
     );
     // No command for an install that will not run one.
     assert!(
@@ -2393,6 +2428,7 @@ async fn preview_predicts_home_refusal(world: &mut E2eWorld) {
         "a preview changed the home folder"
     );
     assert!(home.join("bin").join("python").is_file());
+    assert_no_prefix_python_ran(world, &reported);
 }
 
 #[then("the preview shows a rebuild in place that keeps the folder")]
@@ -2400,18 +2436,71 @@ async fn preview_shows_rebuild_in_place(world: &mut E2eWorld) {
     let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
     let reported = reported(world);
     assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    // The folder's Python and `pyvenv.cfg` are both there, so only running
+    // that Python could tell reuse from a rebuild. The preview does not run
+    // it: it says so and gives the rebuild as the other outcome.
     assert!(
-        reported.contains("python_env: rebuild only the venv files ROCm CLI created here"),
+        reported.contains(
+            "this preview runs nothing from the folder, so it cannot tell whether it does; if not, rebuild only the venv files ROCm CLI created here"
+        ),
         "the preview did not describe the in-place rebuild:\n{reported}"
     );
     assert!(
-        reported.contains(&format!("{} --allow-existing &&", folder.display())),
+        reported.contains(&format!(
+            "command_if_rebuilt: UV_VENV_CLEAR=0 uv venv --python {}",
+            root(world).join("fake-python").join("python3.14").display()
+        )) && reported.contains(&format!("{} --allow-existing &&", folder.display())),
         "the previewed uv venv command is not the one a rebuild runs:\n{reported}"
     );
     assert!(
         folder.join("lib").is_dir() && folder.join("pyvenv.cfg").is_file(),
         "a preview changed the folder"
     );
+    assert_no_prefix_python_ran(world, &reported);
+}
+
+#[given("the user's folder holds a Python environment ROCm CLI did not make")]
+async fn folder_with_someone_elses_venv(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    plant_python_that_no_longer_runs(world, &folder);
+    write_fixture(&folder.join("pyvenv.cfg"), "home = /usr/bin\n");
+    write_fixture(&folder.join("README.md"), "a project the user downloaded");
+}
+
+#[when("the user previews installing the SDK into that folder")]
+async fn preview_sdk_install_into_cloned_venv(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    run_sdk_install_into(world, &folder, true);
+}
+
+#[then(
+    "the preview says it cannot tell whether that environment is reused, runs nothing from the folder, and changes nothing"
+)]
+async fn preview_runs_nothing_from_cloned_venv(world: &mut E2eWorld) {
+    let folder = install_folder(world, CLONED_VENV_FOLDER);
+    let reported = reported(world);
+    assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    assert!(
+        reported.contains(
+            "python_env: reuse the Python environment here if its Python runs, reports wheel tag cp314 and has this folder as its sys.prefix; this preview runs nothing from the folder, so it cannot tell whether it does; if not, the install will refuse this folder"
+        ),
+        "the preview did not say what it could not tell:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!(
+            "refusal_if_not_reused: refusing to create the Python environment at {}: the folder is not empty and ROCm CLI cannot show it holds a ROCm CLI install (found a Python at {} that this preview did not run;",
+            folder.display(),
+            folder.join("bin").join("python").display()
+        )),
+        "the preview did not give the refusal for the other outcome:\n{reported}"
+    );
+    assert_no_prefix_python_ran(world, &reported);
+    assert_eq!(
+        std::fs::read_to_string(folder.join("README.md")).ok(),
+        Some("a project the user downloaded".to_owned()),
+        "a preview changed the folder"
+    );
+    assert!(folder.join("bin").join("python").is_file() && folder.join("pyvenv.cfg").is_file());
 }
 
 #[when("the user installs the SDK into the folder ROCm CLI installed into")]
@@ -2444,7 +2533,7 @@ async fn install_refuses_home_folder(world: &mut E2eWorld) {
     );
     assert_eq!(
         std::fs::read_to_string(home.join("bin").join("python")).ok(),
-        Some("#!/bin/sh\nexit 1\n".to_owned()),
+        Some(python_that_no_longer_runs(world)),
         "the user's bin/python is gone or changed"
     );
     assert!(
@@ -2479,8 +2568,9 @@ async fn install_rebuilds_and_keeps_comfyui(world: &mut E2eWorld) {
     let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
     let reported = reported(world);
     let line = format!(
-        "Existing Python environment at {} no longer runs or does not match the required interpreter; rebuilding only its venv files (kept: .rocm-cli-runtime.json, apps).",
-        folder.display()
+        "Existing Python environment at {} cannot be used as it is (found a Python at {} that does not run); rebuilding only its venv files (kept: .rocm-cli-runtime.json, apps).",
+        folder.display(),
+        folder.join("bin").join("python").display()
     );
     assert!(
         reported.contains(&line),
