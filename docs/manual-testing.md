@@ -574,15 +574,22 @@ as stopped).
 
 #### Windows host check
 
-The Windows-only parts of the stop (the `OpenProcess` failure codes, the
-creation-time token, the PID hold, `taskkill /T /F` and its exit codes, and the
-`System32` resolution) are executed by no CI job, and were not run on a Windows
-host when they were written. On a Windows host with a `--features
-rocm/e2e-test-hooks` debug build, run
-`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[1-8]"` and
-`-n "service-unqueryable-0"` with `ROCM_CLI_BINARY` set (`service-stop-07` and
-the Windows half of `service-stop-08` run only there; `service-unqueryable-02`
-is Linux-only), and record the result.
+The Windows build-and-test job runs the workspace unit tests, which include two
+`#[cfg(windows)]` tests in `proc_lifecycle.rs` that stop a real `ping` process
+through the PID hold, the creation-time read and the System32 `taskkill`. It does
+not run any scenario, and nothing there stages the unrun parts: the end-to-end
+tree kill of a parent with a child (`service-stop-07`), a real unopenable
+process (the `OpenProcess` failure codes), and `taskkill` exiting 128 or failing
+or stalling. None of these has been run on a Windows host, and no Windows result
+is claimed. On a Windows host with a `--features rocm/e2e-test-hooks` debug
+build and `ROCM_CLI_BINARY` set, run the scenarios that apply to Windows:
+`cargo test -p e2e-cucumber --test e2e -- -n "service-stop-0[178]"` (`-01`
+plants PID 0, `-07` is Windows-only, `-08` runs on every OS) and
+`cargo test -p e2e-cucumber --test e2e -- -n "service-unqueryable-01"`, and
+record the result. Do not select `service-stop-02` to `-06` or
+`service-unqueryable-02`: they are Linux-only (they need `sleep` or `/proc`),
+and `-n` bypasses the harness's OS filter, so they would fail for want of the
+platform rather than for any defect.
 
 #### A record that stays unverified
 

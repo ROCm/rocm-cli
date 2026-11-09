@@ -162,8 +162,9 @@ pub(super) fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedSe
         // is a forced tree kill of a pid that may by now belong to another
         // process, which cannot be undone. The spawn primitive returns only the
         // pid and closes its handle, so a handle-based identity would mean
-        // changing it; that is not done here, and this path is not executed on
-        // Windows by any CI job.
+        // changing it; that is not done here. Only the pure refusal decision
+        // (`launch_cleanup_refusal`) is under a test that runs on Windows; the
+        // cleanup of a real Windows child is run by no test.
         let outcome = if let Some(refusal) =
             launch_cleanup_refusal(record.engine_start_ticks, host_records_start_tokens())
         {

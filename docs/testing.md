@@ -2093,16 +2093,29 @@ repeats it against a bystander on Windows only and then stops that bystander
 with its true token. `service-stop-08` is the live version on every OS: it
 records a running process under a token no live process has, stops the server,
 and asserts that the process is still running and the record names no process.
-None of the Windows-only paths has been executed on a Windows host for this
-change, and no CI job executes them: the Windows build-and-test job runs clippy,
-the build, the unit tests and the harness self-tests, not the `service-stop-*`
-or `service-unqueryable-*` scenarios. `service-stop-07` (`@requires-os:windows`)
-and the Windows half of `service-stop-08` can run only through the harness on a
-Windows host, which is a manual step (see "Windows host check" in
-[manual-testing.md](manual-testing.md)); on the Linux e2e jobs `-07` is skipped
-and `-08` runs its Linux half. The Windows unit tests (`#[cfg(windows)]`) run on
-the Windows unit-test job; they were written without a Windows host to run them
-on. A stop that cannot
+None of the Windows-only paths has been run on a Windows host for this change,
+and I am not claiming a Windows result for this head. What the CI configuration
+does and does not run there, read from `.github/workflows/ci.yml`: the
+`windows-debug` job (`Windows build and test (debug)`), when Rust files change,
+runs clippy, the build, `cargo test --workspace --all-targets` and the harness
+self-tests. That test run includes unit tests in `proc_lifecycle.rs` that stop a
+real process on Windows: `terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
+and `terminate_recorded_pid_stops_a_process_recorded_without_a_token` are
+`#[cfg(windows)]` and start a real `ping` child and stop it through
+`terminate_recorded_pid`, which takes the PID hold, reads the creation time,
+applies the identity gate (a wrong token leaves the process running; a matching
+or absent token stops it) and runs the System32 `taskkill /T /F`. The e2e target
+is excluded from `cargo test`, so no scenario runs there: the `service-stop-*`
+and `service-unqueryable-*` scenarios do not run on that job.
+`service-stop-07` (`@requires-os:windows`) and the Windows half of
+`service-stop-08` can run only through the harness on a Windows host, which is a
+manual step (see "Windows host check" in [manual-testing.md](manual-testing.md));
+on the Linux e2e jobs `-07` is skipped and `-08` runs its Linux half. Not covered
+by any CI job: the end-to-end tree kill of a parent with a child (`-07`), the
+failure cases that cannot be staged (an `OpenProcess` access-denied process, a
+failing or stalled `taskkill`, `taskkill` exiting 128), and the launch-cleanup
+branch; the unit tests above stop a `ping` that has no child of its own, so they
+do not show a descendant being taken down. A stop that cannot
 verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
 eq <pid>"` on Windows (`process_check_command`).
 Three further Windows paths of that stop are tested through injected functions
@@ -2176,11 +2189,15 @@ lists the record with the command, and running that command clears it) cover it 
 probe injected, and `service-unqueryable-01` and `-02` drive the stop, the
 refusal naming `--force`, and the forced removal through the real binary, with
 the `e2e-test-hooks` variable `ROCM_E2E_UNQUERYABLE_PIDS` making the listed PIDs
-read as unqueryable; `-02` is Linux-only because it starts a real process). What no
-test here reaches is the Windows API itself: the handle hold, the `OpenProcess`
-failure codes, `GetProcessTimes` and a real `taskkill` (its exit 128 included)
-are executed by no CI job and were not run on a Windows host. What was moved
-out of the FFI so that it is unit-tested on Linux and on the Windows unit-test
+read as unqueryable; `-02` is Linux-only because it starts a real process). On
+Windows the happy paths of the PID hold, the creation-time read and the System32
+`taskkill` are exercised by the two `#[cfg(windows)]` unit tests named above when
+`windows-debug` runs the workspace tests (no result for this head is claimed
+here). What no test reaches there is the failure side of the Windows API: the
+`OpenProcess` failure codes against a real unopenable process, `taskkill`
+exiting 128 or failing or stalling, and a descendant actually being taken down;
+none of those has been run on a Windows host. What was moved out of the FFI so
+that it is unit-tested on Linux and, as plain `cargo test`, on the Windows unit
 job: the open-failure code mapping (`classify_open_failure`), the exit-code query
 mapping (`classify_exit_query`), the `taskkill` result and arguments
 (`classify_taskkill`, `taskkill_args`), the `System32` path building, the
@@ -2203,7 +2220,7 @@ Three gaps in the scenario coverage are deliberate. `service-stop-07` records no
 token, so the path a record written by this version takes on Windows (a token
 recorded, matching, with the tree kill then running) has no scenario; it rests on
 `what_a_stop_does_for_each_recorded_and_live_token` and the other injected tests,
-and on the Windows unit tests that stop a real process with its true token. And
+and on the `#[cfg(windows)]` unit tests that stop a real process with its true token. And
 the `self` row that `rocm` now puts in `pid_outcomes` has no scenario: it appears
 only in the JSON answer of the hidden `sandbox-run stop_server` and the sandbox
 tool, never in the text of `rocm services stop`, and it names the stopping
