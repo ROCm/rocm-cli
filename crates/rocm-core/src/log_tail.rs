@@ -165,19 +165,63 @@ pub fn tail_log_decoded(
     tail_lines_from(file, metadata.len(), path, limit, max_tail_read, decode)
 }
 
+/// How many times a read measures the source again after finding it shorter
+/// than the size it was given, before it gives up on a log that will not hold
+/// still.
+const SHRINK_RETRIES: usize = 3;
+
+/// What one pass of the tail read found.
+enum Pass {
+    /// The lines of the log.
+    Read(LogTail),
+    /// The source ended before the `size` it was given: the log was truncated
+    /// or recreated after the size was taken, as a restart does.
+    Shrunk,
+}
+
 /// The tail read over any seekable source of `size` bytes; `path` only names
 /// the source in error messages. Split out so a test can count the bytes the
-/// read touches.
+/// read touches, or hand it a source that shrinks.
+///
+/// A log can be recreated between the size being taken and the read (a service
+/// restart creates its log afresh), so a read that runs into the end of the
+/// source early is not an error: the source is measured again and the read
+/// starts over from that size, which also covers a log that is now small enough
+/// to be read from its start. A log that keeps shrinking through
+/// [`SHRINK_RETRIES`] passes has nothing stable to show and reads as empty.
 fn tail_lines_from<R: Read + Seek>(
     mut source: R,
-    size: u64,
+    mut size: u64,
     path: &Path,
     limit: usize,
     max_tail_read: u64,
     decode: LogDecode,
 ) -> Result<LogTail> {
+    for _ in 0..SHRINK_RETRIES {
+        match tail_pass(&mut source, size, path, limit, max_tail_read, decode)? {
+            Pass::Read(tail) => return Ok(tail),
+            Pass::Shrunk => {
+                size = source
+                    .seek(SeekFrom::End(0))
+                    .with_context(|| format!("failed to measure {}", path.display()))?;
+            }
+        }
+    }
+    Ok(LogTail::default())
+}
+
+/// One pass of [`tail_lines_from`] against a source believed to hold `size`
+/// bytes.
+fn tail_pass<R: Read + Seek>(
+    source: &mut R,
+    size: u64,
+    path: &Path,
+    limit: usize,
+    max_tail_read: u64,
+    decode: LogDecode,
+) -> Result<Pass> {
     let utf16_bom = if decode.utf16_le {
-        sniff_utf16_le(&mut source, size, path)?
+        sniff_utf16_le(source, size, path)?
     } else {
         None
     };
@@ -193,10 +237,10 @@ fn tail_lines_from<R: Read + Seek>(
             seek_pos += 1;
         }
         if seek_pos >= size {
-            return Ok(LogTail {
+            return Ok(Pass::Read(LogTail {
                 lines: Vec::new(),
                 skipped_bytes: size,
-            });
+            }));
         }
         // Probe the unit preceding `seek_pos` to classify the first line, then
         // leave the cursor at `seek_pos` for the read below.
@@ -205,9 +249,18 @@ fn tail_lines_from<R: Read + Seek>(
             .with_context(|| format!("failed to seek in {}", path.display()))?;
         let mut probe = [0u8; 2];
         let probe = &mut probe[..unit as usize];
-        source
-            .read_exact(probe)
-            .with_context(|| format!("failed to read from {}", path.display()))?;
+        match source.read_exact(probe) {
+            Ok(()) => {}
+            // `seek_pos` is inside the size the source was measured at, so
+            // running out here means the source got shorter since.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(Pass::Shrunk);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read from {}", path.display()));
+            }
+        }
         // The unit before the first line of a file with a byte order mark is
         // the mark itself, not the end of a previous line.
         first_line_is_partial = seek_pos != bom_len && probe != [b'\n'] && probe != [b'\n', 0];
@@ -245,10 +298,13 @@ fn tail_lines_from<R: Read + Seek>(
         // The window is at most `max_tail_read` bytes (or the whole, smaller,
         // file), so it is read in one go and split on the newline unit.
         let mut window = Vec::new();
-        (&mut source)
+        source
             .take(size - window_start)
             .read_to_end(&mut window)
             .with_context(|| format!("failed to read lines from {}", path.display()))?;
+        if (window.len() as u64) < size - window_start {
+            return Ok(Pass::Shrunk);
+        }
         let units: Vec<u16> = window
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -279,6 +335,7 @@ fn tail_lines_from<R: Read + Seek>(
         // whose writer is still appending must not pull the read past the
         // budget by however much it grew since `size` was taken.
         let mut reader = BufReader::new(source.take(size - window_start));
+        let mut window_len = 0u64;
         // Read raw bytes rather than `BufRead::lines()`: when the seek above
         // lands inside a multi-byte UTF-8 character, the leading fragment is
         // invalid UTF-8 on its own. `lines()` would surface that as an `Err`
@@ -294,6 +351,7 @@ fn tail_lines_from<R: Read + Seek>(
             if bytes_read == 0 {
                 break;
             }
+            window_len += bytes_read as u64;
             let terminated = raw_line.last() == Some(&b'\n');
             if terminated {
                 raw_line.pop();
@@ -307,6 +365,9 @@ fn tail_lines_from<R: Read + Seek>(
             }
             keep(String::from_utf8_lossy(&raw_line).into_owned(), terminated);
         }
+        if window_len < size - window_start {
+            return Ok(Pass::Shrunk);
+        }
     }
 
     let lines = lines
@@ -319,7 +380,7 @@ fn tail_lines_from<R: Read + Seek>(
             }
         })
         .collect();
-    Ok(LogTail {
+    Ok(Pass::Read(LogTail {
         lines,
         // Not `window_start`: a byte order mark skipped at the start of a
         // whole-file read is not something the budget left unread.
@@ -328,7 +389,7 @@ fn tail_lines_from<R: Read + Seek>(
         } else {
             0
         },
-    })
+    }))
 }
 
 /// `Some(has_byte_order_mark)` when the start of the source reads as UTF-16
@@ -650,6 +711,185 @@ mod tests {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         bytes
+    }
+
+    // --- a log that shrinks between the size and the read ----------------
+
+    /// How a [`ShrinkingSource`] loses bytes.
+    #[derive(Clone, Copy)]
+    enum Shrink {
+        /// Cut the content to this many bytes once.
+        Once(usize),
+        /// Lose one byte on every read, so the source never settles.
+        EveryRead,
+    }
+
+    /// A source that gets shorter when a read starts at or after `trigger_pos`,
+    /// the way a log recreated by a restart does between the `stat` and the
+    /// read. The size handed to the routine is the one taken before the shrink.
+    struct ShrinkingSource {
+        inner: std::io::Cursor<Vec<u8>>,
+        trigger_pos: u64,
+        shrink: Shrink,
+        done: bool,
+    }
+
+    impl ShrinkingSource {
+        fn new(content: Vec<u8>, trigger_pos: u64, shrink: Shrink) -> Self {
+            Self {
+                inner: std::io::Cursor::new(content),
+                trigger_pos,
+                shrink,
+                done: false,
+            }
+        }
+    }
+
+    impl Read for ShrinkingSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() >= self.trigger_pos {
+                match self.shrink {
+                    Shrink::Once(len) if !self.done => {
+                        self.inner.get_mut().truncate(len);
+                        self.done = true;
+                    }
+                    Shrink::Once(_) => {}
+                    Shrink::EveryRead => {
+                        let content = self.inner.get_mut();
+                        content.truncate(content.len().saturating_sub(1));
+                    }
+                }
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for ShrinkingSource {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    /// Twenty eight-byte lines, `line-00` to `line-19`.
+    fn twenty_lines() -> String {
+        (0..20).map(|index| format!("line-{index:02}\n")).collect()
+    }
+
+    fn tail_of_shrinking(
+        content: Vec<u8>,
+        trigger_pos: u64,
+        shrink: Shrink,
+        max_tail_read: u64,
+        decode: LogDecode,
+    ) -> Result<LogTail> {
+        let size = content.len() as u64;
+        tail_lines_from(
+            ShrinkingSource::new(content, trigger_pos, shrink),
+            size,
+            Path::new("shrinking-source"),
+            10,
+            max_tail_read,
+            decode,
+        )
+    }
+
+    #[test]
+    fn a_log_that_shrank_before_the_probe_is_measured_again_instead_of_failing() -> Result<()> {
+        // 160 bytes under a 40 byte budget: the probe reads byte 119. By then
+        // the log is three lines (24 bytes), so that byte is gone.
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, 119, Shrink::Once(24), 40, LogDecode::PLAIN)?;
+
+        assert_eq!(tail.lines, ["line-00", "line-01", "line-02"]);
+        assert_eq!(
+            tail.skipped_bytes, 0,
+            "the whole shrunk log fits the budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_that_shrank_before_the_window_read_is_measured_again() -> Result<()> {
+        // The probe succeeds; the log is cut to three lines before the window
+        // starts reading at byte 120, which would otherwise show as no lines.
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, 120, Shrink::Once(24), 40, LogDecode::PLAIN)?;
+
+        assert_eq!(tail.lines, ["line-00", "line-01", "line-02"]);
+        assert_eq!(tail.skipped_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_that_shrank_but_is_still_larger_than_the_budget_is_read_from_its_new_end() -> Result<()>
+    {
+        // Cut from 160 to 80 bytes (ten lines) under a 40 byte budget: the
+        // tail is the last five lines of what is left, not of what was.
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, 119, Shrink::Once(80), 40, LogDecode::PLAIN)?;
+
+        assert_eq!(
+            tail.lines,
+            ["line-05", "line-06", "line-07", "line-08", "line-09"]
+        );
+        assert_eq!(tail.skipped_bytes, 40);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sixteen_bit_log_that_shrank_is_measured_again_at_the_probe_and_the_window() -> Result<()> {
+        let content = utf16_le_bytes(&twenty_lines(), true);
+        // 322 bytes under a 64 byte budget: the probe unit is at byte 256 and
+        // the window starts at 258. Cut to the mark plus three lines (50).
+        for trigger_pos in [256, 258] {
+            let tail = tail_of_shrinking(
+                content.clone(),
+                trigger_pos,
+                Shrink::Once(50),
+                64,
+                LogDecode::CONSOLE,
+            )?;
+
+            assert_eq!(
+                tail.lines,
+                ["line-00", "line-01", "line-02"],
+                "shrunk at byte {trigger_pos}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_file_read_of_a_log_that_shrank_is_measured_again() -> Result<()> {
+        // Under the budget there is no probe; the window read itself runs short.
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, 0, Shrink::Once(24), 4096, LogDecode::PLAIN)?;
+
+        assert_eq!(tail.lines, ["line-00", "line-01", "line-02"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_that_keeps_shrinking_ends_in_an_empty_tail_not_an_error() -> Result<()> {
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, 0, Shrink::EveryRead, 4096, LogDecode::PLAIN)?;
+
+        assert_eq!(tail, LogTail::default());
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_that_did_not_shrink_reads_exactly_as_before() -> Result<()> {
+        // The trigger is past the end, so the source never shrinks.
+        let content = twenty_lines().into_bytes();
+        let tail = tail_of_shrinking(content, u64::MAX, Shrink::Once(0), 40, LogDecode::PLAIN)?;
+
+        assert_eq!(
+            tail.lines,
+            ["line-15", "line-16", "line-17", "line-18", "line-19"]
+        );
+        assert_eq!(tail.skipped_bytes, 120);
+        Ok(())
     }
 
     #[test]
