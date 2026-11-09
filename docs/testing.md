@@ -839,8 +839,8 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
 The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
-previews in this sense: they resolve with `uv` and can fetch it, and prepare a
-managed Python too.
+previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
+can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
 
 Then it verifies:
 
@@ -2380,9 +2380,10 @@ JSON, the startup check, the check plan and `apply_runtime_update` with
 that show the stand-in `uv` is reachable. Which of the two plans a `--dry-run` and
 an apply take is also pinned on every platform, Windows included, by
 `a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in
-[update_cmd.rs](../apps/rocm/src/update_cmd.rs). As for the install preview, resolving a
-ROCm 10 or newer runtime uses `uv pip compile` and can fetch the managed `uv`,
-though never a Python.
+[update_cmd.rs](../apps/rocm/src/update_cmd.rs). Unlike the install preview, which fetches no
+`uv`, the check on a ROCm 10 or newer runtime still resolves the package versions
+with `uv pip compile` and can fetch the managed `uv`, though never a Python; the
+scenarios above use the canonical layout, which needs no `uv`.
 
 Runtime version-ordering tests:
 
