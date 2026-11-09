@@ -419,6 +419,11 @@ pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &
 /// stop cleared it (`stop_internal_managed_service_confirmed_with`): anything
 /// still set has been written since this restart began, so it belongs to a
 /// *new* stop racing the restart rather than to the one the restart performed.
+/// `cfg(not(windows))` to match its only caller: the restart's early-exit
+/// branch is Unix-only, because the Windows restart has no `try_wait()` of its
+/// own to land in — it sleeps the same 200ms and goes straight to recording the
+/// child.
+#[cfg(not(windows))]
 pub(crate) fn managed_service_stop_marker_present(paths: &AppPaths, service_id: &str) -> bool {
     crate::services_text::read_managed_service_manifest(paths, service_id)
         .is_ok_and(|(record, _)| record.stop_requested_unix_ms.is_some())
