@@ -18,12 +18,14 @@
 //! route of its own (vLLM, Lemonade): that route only accepts the served model's
 //! name, and an Anthropic client sends a Claude one.
 //!
-//! The translation is the text subset of the Messages API: system prompts and
-//! text turns, sampling parameters, stop sequences, usage and stop reasons.
-//! Streaming, tool use (`tools`, `tool_choice`), extended thinking and non-text
-//! content blocks are refused with an Anthropic `invalid_request_error` that says
-//! so, rather than being dropped silently. Fields that only annotate a request
-//! (`metadata`) are ignored.
+//! The translation covers system prompts and text turns, sampling parameters,
+//! stop sequences, usage and stop reasons, and tool use in both directions:
+//! `tools` and `tool_choice` on the request, `tool_use` and `tool_result` blocks
+//! in the conversation, and `tool_use` blocks with the `tool_use` stop reason in
+//! the reply. Streaming, extended thinking, server tools and other non-text
+//! content blocks (images) are refused with an Anthropic `invalid_request_error`
+//! that says so, rather than being dropped silently. Fields that only annotate a
+//! request (`metadata`) are ignored.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -417,6 +419,230 @@ fn text_of(content: &Value, field: &str) -> Result<String, ProxyError> {
     }
 }
 
+/// The text of a `tool_result` block's `content`: a string, or `text` blocks.
+fn tool_result_text(block: &Value) -> Result<String, ProxyError> {
+    let text = match block.get("content") {
+        None | Some(Value::Null) => String::new(),
+        Some(content) => text_of(content, "a `tool_result` content block")?,
+    };
+    Ok(
+        if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+            // OpenAI's tool message has no error flag; say it in the text instead.
+            format!("Error: {text}")
+        } else {
+            text
+        },
+    )
+}
+
+/// Append one Anthropic turn to `messages` as OpenAI chat messages.
+///
+/// A string, or an array of `text` blocks, is one message. An assistant
+/// `tool_use` block becomes a `tool_calls` entry on that message. A user
+/// `tool_result` block becomes a `tool` message of its own, placed before the
+/// turn's text: OpenAI wants tool results to follow the assistant's calls
+/// directly, and Anthropic requires them first in the user turn.
+fn push_turn(messages: &mut Vec<Value>, role: &str, content: &Value) -> Result<(), ProxyError> {
+    let Value::Array(blocks) = content else {
+        messages.push(json!({ "role": role, "content": text_of(content, "messages")? }));
+        return Ok(());
+    };
+    let mut text = Vec::new();
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str);
+        match (kind, role) {
+            (Some("text"), _) => text.push(block.clone()),
+            (Some("tool_use"), "assistant") => {
+                let field = |name: &str| {
+                    block
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ProxyError::invalid(format!(
+                                "a `tool_use` content block needs a string `{name}`"
+                            ))
+                        })
+                };
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                calls.push(json!({
+                    "id": field("id")?,
+                    "type": "function",
+                    "function": { "name": field("name")?, "arguments": input.to_string() },
+                }));
+            }
+            (Some("tool_result"), "user") => {
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ProxyError::invalid("a `tool_result` content block needs a `tool_use_id`")
+                    })?;
+                results.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": tool_result_text(block)?,
+                }));
+            }
+            (Some(kind @ ("tool_use" | "tool_result")), _) => {
+                let allowed = if kind == "tool_use" {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                return Err(ProxyError::invalid(format!(
+                    "messages: a `{kind}` content block belongs in a {allowed} message, not {role}"
+                )));
+            }
+            (Some(other), _) => {
+                return Err(ProxyError::unsupported(&format!(
+                    "a `{other}` content block in `messages`"
+                )));
+            }
+            (None, _) => {
+                return Err(ProxyError::invalid(
+                    "a content block in `messages` has no `type`",
+                ));
+            }
+        }
+    }
+    messages.extend(results);
+    let text = text_of(&Value::Array(text), "messages")?;
+    if calls.is_empty() {
+        if !text.is_empty() || blocks.is_empty() {
+            messages.push(json!({ "role": role, "content": text }));
+        }
+    } else {
+        let content = if text.is_empty() {
+            Value::Null
+        } else {
+            json!(text)
+        };
+        messages.push(json!({ "role": role, "content": content, "tool_calls": calls }));
+    }
+    Ok(())
+}
+
+/// Anthropic `tools` as OpenAI function tools; `None` when none are given.
+///
+/// Server tools (web search, code execution, ...) run on Anthropic's side and
+/// have no engine counterpart, so a tool with a `type` other than `custom` is
+/// refused.
+fn translate_tools(tools: Option<&Value>) -> Result<Option<Value>, ProxyError> {
+    let Some(tools) = tools.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| ProxyError::invalid("tools: must be an array"))?;
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if let Some(kind) = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| *kind != "custom")
+        {
+            return Err(ProxyError::unsupported(&format!(
+                "the `{kind}` server tool"
+            )));
+        }
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ProxyError::invalid("tools: each tool needs a `name`"))?;
+        let mut function = json!({
+            "name": name,
+            "parameters": tool
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+        });
+        if let Some(description) = tool.get("description").filter(|value| value.is_string()) {
+            function["description"] = description.clone();
+        }
+        out.push(json!({ "type": "function", "function": function }));
+    }
+    Ok(Some(Value::Array(out)))
+}
+
+/// Anthropic `tool_choice` as OpenAI's, plus whether parallel calls stay allowed.
+fn translate_tool_choice(choice: &Value) -> Result<(Value, bool), ProxyError> {
+    let parallel = choice
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        != Some(true);
+    let translated = match choice.get("type").and_then(Value::as_str) {
+        Some("auto") => json!("auto"),
+        Some("any") => json!("required"),
+        Some("none") => json!("none"),
+        Some("tool") => {
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| ProxyError::invalid("tool_choice: `tool` needs a `name`"))?;
+            json!({ "type": "function", "function": { "name": name } })
+        }
+        _ => {
+            return Err(ProxyError::invalid(
+                "tool_choice: `type` must be auto, any, tool or none",
+            ));
+        }
+    };
+    Ok((translated, parallel))
+}
+
+/// The engine's `tool_calls` as Anthropic `tool_use` blocks.
+fn tool_use_blocks(calls: &[Value]) -> Result<Vec<Value>, ProxyError> {
+    let bad_gateway = |message: String| ProxyError {
+        status: 502,
+        kind: "api_error",
+        message,
+    };
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| bad_gateway("the engine's tool call had no name".to_owned()))?;
+            let input = match call.pointer("/function/arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(Value::String(raw)) if raw.trim().is_empty() => json!({}),
+                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_object)
+                    .ok_or_else(|| {
+                        bad_gateway(format!(
+                            "the model's arguments for tool `{name}` were not a JSON object: {raw}"
+                        ))
+                    })?,
+                Some(object @ Value::Object(_)) => object.clone(),
+                Some(_) => {
+                    return Err(bad_gateway(format!(
+                        "the engine's arguments for tool `{name}` were not a JSON object"
+                    )));
+                }
+            };
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map_or_else(|| format!("toolu_rocm_{index}"), str::to_owned);
+            Ok(json!({ "type": "tool_use", "id": id, "name": name, "input": input }))
+        })
+        .collect()
+}
+
 /// Translate an Anthropic Messages request into an OpenAI chat-completions one.
 fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, ProxyError> {
     let object = request
@@ -424,19 +650,6 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
         .ok_or_else(|| ProxyError::invalid("the request body must be a JSON object"))?;
     if object.get("stream").and_then(Value::as_bool) == Some(true) {
         return Err(ProxyError::unsupported("streaming (`stream: true`)"));
-    }
-    if object
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return Err(ProxyError::unsupported("tool use (`tools`)"));
-    }
-    if object
-        .get("tool_choice")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(ProxyError::unsupported("`tool_choice`"));
     }
     if object
         .get("thinking")
@@ -475,9 +688,10 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
         let content = turn
             .get("content")
             .ok_or_else(|| ProxyError::invalid("messages: each message needs `content`"))?;
-        messages.push(json!({ "role": role, "content": text_of(content, "messages")? }));
+        push_turn(&mut messages, role, content)?;
     }
 
+    let tools = translate_tools(object.get("tools"))?;
     let mut out = json!({
         "model": served_model,
         "messages": messages,
@@ -488,6 +702,23 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
         if let Some(value) = object.get(key).filter(|value| value.is_number()) {
             out[key] = value.clone();
         }
+    }
+    if let Some(tools) = tools {
+        out["tools"] = tools;
+        if let Some(choice) = object.get("tool_choice").filter(|value| !value.is_null()) {
+            let (choice, parallel) = translate_tool_choice(choice)?;
+            out["tool_choice"] = choice;
+            if !parallel {
+                out["parallel_tool_calls"] = json!(false);
+            }
+        }
+    } else if object
+        .get("tool_choice")
+        .is_some_and(|choice| !choice.is_null())
+    {
+        return Err(ProxyError::invalid(
+            "tool_choice: `tools` must list at least one tool to choose from",
+        ));
     }
     if let Some(stops) = object.get("stop_sequences").and_then(Value::as_array)
         && !stops.is_empty()
@@ -512,10 +743,22 @@ fn openai_to_anthropic(reply: &Value, served_model: &str) -> Result<Value, Proxy
         .pointer("/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let calls = choice
+        .pointer("/message/tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Some engines report `stop` beside tool calls, so the calls decide.
     let stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
+        _ if !calls.is_empty() => "tool_use",
         Some("length") => "max_tokens",
         _ => "end_turn",
     };
+    let mut content = Vec::new();
+    if !text.is_empty() || calls.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    content.extend(tool_use_blocks(calls)?);
     let id = reply
         .get("id")
         .and_then(Value::as_str)
@@ -539,7 +782,7 @@ fn openai_to_anthropic(reply: &Value, served_model: &str) -> Result<Value, Proxy
             .and_then(Value::as_str)
             .filter(|model| !model.is_empty())
             .unwrap_or(served_model),
-        "content": [{ "type": "text", "text": text }],
+        "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
@@ -627,14 +870,14 @@ mod tests {
         let base = || json!({"max_tokens": 8, "messages": [{"role": "user", "content": "x"}]});
         let mut streaming = base();
         streaming["stream"] = json!(true);
-        let mut tools = base();
-        tools["tools"] = json!([{"name": "get_weather", "input_schema": {"type": "object"}}]);
+        let mut server_tool = base();
+        server_tool["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
         let image = json!({"max_tokens": 8, "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}}
         ]}]});
         for (request, needle) in [
             (streaming, "streaming"),
-            (tools, "tool use"),
+            (server_tool, "`web_search_20250305` server tool"),
             (image, "`image` content block"),
         ] {
             let error = translate(&request).unwrap_err();
@@ -759,18 +1002,9 @@ mod tests {
     #[test]
     fn requests_that_would_silently_lose_meaning_are_refused() {
         let base = json!({"max_tokens": 4, "messages": [{"role": "user", "content": "x"}]});
-        for (field, value) in [
-            ("tool_choice", json!({"type": "auto"})),
-            (
-                "thinking",
-                json!({"type": "enabled", "budget_tokens": 1024}),
-            ),
-        ] {
-            let mut request = base.clone();
-            request[field] = value;
-            let error = translate(&request).unwrap_err();
-            assert_eq!(error.status, 400, "{field}");
-        }
+        let mut request = base.clone();
+        request["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
+        assert_eq!(translate(&request).unwrap_err().status, 400);
         let mut disabled = base;
         disabled["thinking"] = json!({"type": "disabled"});
         assert!(translate(&disabled).is_ok());
@@ -781,6 +1015,237 @@ mod tests {
         let error = translate(&missing_text).unwrap_err();
         assert_eq!(error.status, 400);
         assert!(error.message.contains("string `text`"), "{}", error.message);
+    }
+
+    fn weather_tool() -> Value {
+        json!({
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        })
+    }
+
+    #[test]
+    fn tools_and_tool_choice_become_function_tools() {
+        let mut request = json!({
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [weather_tool()],
+        });
+        let out = translate(&request).unwrap();
+        assert_eq!(
+            out["tools"],
+            json!([{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": weather_tool()["input_schema"],
+            }}])
+        );
+        assert!(out.get("tool_choice").is_none());
+        for (choice, expected) in [
+            (json!({"type": "auto"}), json!("auto")),
+            (json!({"type": "any"}), json!("required")),
+            (json!({"type": "none"}), json!("none")),
+            (
+                json!({"type": "tool", "name": "get_weather"}),
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+            ),
+        ] {
+            request["tool_choice"] = choice;
+            let out = translate(&request).unwrap();
+            assert_eq!(out["tool_choice"], expected);
+            assert!(out.get("parallel_tool_calls").is_none());
+        }
+        request["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": true});
+        assert_eq!(translate(&request).unwrap()["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn malformed_tool_definitions_and_choices_are_invalid_requests() {
+        let base = json!({"max_tokens": 8, "messages": [{"role": "user", "content": "x"}]});
+        for (tools, choice) in [
+            (json!([{"input_schema": {}}]), json!(null)),
+            (json!("get_weather"), json!(null)),
+            (json!([weather_tool()]), json!({"type": "sometimes"})),
+            (json!([weather_tool()]), json!({"type": "tool"})),
+            // A choice with nothing to choose from.
+            (json!([]), json!({"type": "any"})),
+        ] {
+            let mut request = base.clone();
+            request["tools"] = tools;
+            request["tool_choice"] = choice;
+            assert_eq!(
+                translate(&request).unwrap_err().kind,
+                "invalid_request_error"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_use_and_tool_result_blocks_become_tool_calls_and_tool_messages() {
+        let out = translate(&json!({
+            "max_tokens": 8,
+            "tools": [weather_tool()],
+            "messages": [
+                {"role": "user", "content": "weather in Oslo?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Oslo"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "thanks"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "3C"}]},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "get_weather", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "no data", "is_error": true},
+                ]},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            out["messages"],
+            json!([
+                {"role": "user", "content": "weather in Oslo?"},
+                {"role": "assistant", "content": "Checking.", "tool_calls": [{
+                    "id": "toolu_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"},
+                }]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "3C"},
+                {"role": "user", "content": "thanks"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "toolu_2", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "toolu_2", "content": "Error: no data"},
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_blocks_in_the_wrong_role_or_missing_fields_are_invalid_requests() {
+        for (role, block) in [
+            (
+                "user",
+                json!({"type": "tool_use", "id": "a", "name": "n", "input": {}}),
+            ),
+            (
+                "assistant",
+                json!({"type": "tool_result", "tool_use_id": "a", "content": "x"}),
+            ),
+            (
+                "assistant",
+                json!({"type": "tool_use", "name": "n", "input": {}}),
+            ),
+            (
+                "assistant",
+                json!({"type": "tool_use", "id": "a", "input": {}}),
+            ),
+            ("user", json!({"type": "tool_result", "content": "x"})),
+        ] {
+            let error = translate(&json!({
+                "max_tokens": 8,
+                "messages": [{"role": role, "content": [block.clone()]}],
+            }))
+            .unwrap_err();
+            assert_eq!(error.kind, "invalid_request_error", "{block}");
+        }
+    }
+
+    #[test]
+    fn tool_calls_in_the_reply_become_tool_use_blocks_with_the_tool_use_stop() {
+        let message = openai_to_anthropic(
+            &json!({
+                "id": "chatcmpl-t1",
+                "choices": [{
+                    "message": {"content": "Let me check.", "tool_calls": [
+                        {"id": "call_1", "type": "function",
+                         "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}},
+                        {"type": "function", "function": {"name": "get_time", "arguments": ""}},
+                    ]},
+                    // Engines that report `stop` beside tool calls are still tool use.
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7},
+            }),
+            MODEL,
+        )
+        .unwrap();
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(
+            message["content"],
+            json!([
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Oslo"}},
+                {"type": "tool_use", "id": "toolu_rocm_1", "name": "get_time", "input": {}},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_reply_of_only_tool_calls_has_no_empty_text_block() {
+        let message = openai_to_anthropic(
+            &json!({"choices": [{
+                "message": {"content": null, "tool_calls": [
+                    {"id": "c", "function": {"name": "n", "arguments": "{}"}},
+                ]},
+                "finish_reason": "tool_calls",
+            }]}),
+            MODEL,
+        )
+        .unwrap();
+        assert_eq!(message["content"].as_array().unwrap().len(), 1);
+        assert_eq!(message["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn unusable_tool_calls_from_the_engine_are_a_bad_gateway() {
+        for call in [
+            json!({"id": "c", "function": {"name": "n", "arguments": "{not json"}}),
+            json!({"id": "c", "function": {"name": "n", "arguments": "[1]"}}),
+            json!({"id": "c", "function": {"arguments": "{}"}}),
+        ] {
+            let error = openai_to_anthropic(
+                &json!({"choices": [{"message": {"tool_calls": [call]}, "finish_reason": "tool_calls"}]}),
+                MODEL,
+            )
+            .unwrap_err();
+            assert_eq!(error.status, 502);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_use_round_trips_through_the_engine() {
+        let engine = fake_engine();
+        let base = proxy_over(&engine).await;
+        let (status, message) = tokio::task::spawn_blocking(move || {
+            post(
+                &base,
+                "/v1/messages",
+                None,
+                &json!({
+                    "model": "claude-sonnet-4",
+                    "max_tokens": 64,
+                    "tools": [weather_tool()],
+                    "tool_choice": {"type": "tool", "name": "get_weather"},
+                    "messages": [{"role": "user", "content": "weather in Oslo?"}],
+                }),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(
+            message["content"],
+            json!([{"type": "tool_use", "id": "call_9", "name": "get_weather", "input": {"city": "Oslo"}}])
+        );
+        let seen = engine.seen.lock().unwrap();
+        let forwarded: Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(forwarded["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(forwarded["tool_choice"]["function"]["name"], "get_weather");
     }
 
     #[test]
@@ -864,6 +1329,24 @@ mod tests {
                     ("401 Unauthorized", json!({"error": {"message": "bad key"}}))
                 } else if request_line.contains("/v1/models") {
                     ("200 OK", json!({"data": [{"id": MODEL}]}))
+                } else if body.contains("\"tools\"") {
+                    log.lock().unwrap().push((auth, body.to_owned()));
+                    (
+                        "200 OK",
+                        json!({
+                            "id": "chatcmpl-2",
+                            "model": MODEL,
+                            "choices": [{
+                                "message": {"content": null, "tool_calls": [{
+                                    "id": "call_9",
+                                    "type": "function",
+                                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"},
+                                }]},
+                                "finish_reason": "tool_calls",
+                            }],
+                            "usage": {"prompt_tokens": 20, "completion_tokens": 9},
+                        }),
+                    )
                 } else {
                     log.lock().unwrap().push((auth, body.to_owned()));
                     (

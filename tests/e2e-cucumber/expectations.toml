@@ -116,6 +116,13 @@ reason = "Lemonade managed serve never exposes the model, so the Anthropic reque
 serve_timeout_secs = 90
 flaky = true
 
+[["serve-anthropic-messages-tool-use"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "Lemonade managed serve never exposes the model, so the tool-use request never gets an answer."
+serve_timeout_secs = 90
+flaky = true
+
 [["serve-anthropic-endpoint-readiness"]]
 when = { effective_engine = "lemonade", os = "linux" }
 bug = "ROCMAI-898"
