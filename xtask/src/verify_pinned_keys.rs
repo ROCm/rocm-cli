@@ -64,10 +64,18 @@
 //!   rather than guessed at.
 //! - **Read-only at runtime.** `install.sh` must mark each slot `readonly` after
 //!   assigning it, so a later write fails instead of silently replacing the trust
-//!   root. The `readonly` command must name the slot itself, with no flags
-//!   (`-f` names a function, `-p` only prints) and not in a trailing comment. `install.ps1` does not: `irm … | iex` runs it in the caller's session,
-//!   where a read-only variable would outlive the run and make the next install in
-//!   that session fail (`-Force` would avoid that, but also defeats the point).
+//!   root. The `readonly` command, or the `readonly NAME="…"` declaration, must
+//!   start its line (an indented one sits in a block or function that may never
+//!   run), and a separate command must name the slot itself, with no flags
+//!   (`-f` names a function, `-p` only prints) and not in a trailing comment.
+//!   A textual check cannot tell whether an unindented `readonly` line runs, so
+//!   one inside an `if false` block or an uncalled function whose body is not
+//!   indented still counts; review is the control there, as above.
+//!
+//!   `install.ps1` does not mark its slots read-only: `irm … | iex` runs it in
+//!   the caller's session, where a read-only variable would outlive the run and
+//!   make the next install in that session fail (`-Force` would avoid that, but
+//!   also defeats the point).
 //! - **CI cross-check.** When a CI signing public key is configured — the file
 //!   named by `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else the inline
 //!   `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` release/nightly CI wires from the secret —
@@ -242,9 +250,12 @@ const fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The part of a shell line before a trailing ` #` comment.
+/// The part of a shell line before a trailing comment: a `#` that starts a word,
+/// so after any whitespace (a space or a tab), not one inside a word like `a#b`.
 fn shell_code(line: &str) -> &str {
-    line.split(" #").next().unwrap_or(line)
+    line.char_indices()
+        .find(|&(index, c)| c == '#' && line[..index].ends_with(char::is_whitespace))
+        .map_or(line, |(index, _)| &line[..index])
 }
 
 /// Whether `line` is `readonly`/`export` followed only by names and flags, which
@@ -371,12 +382,17 @@ fn classify(line: &str, start: usize, name: &str, embedding: Embedding) -> Optio
 }
 
 /// Whether the occurrence of a name at `start` in `line` is named by a `readonly`
-/// command that makes it read-only: no flags (`-f` names a function, `-p` only
-/// prints), and the name in the command itself rather than its trailing comment.
+/// command that makes it read-only: at the start of the line (an indented one
+/// sits in a block or function that may never run), no flags (`-f` names a
+/// function, `-p` only prints), and the name in the command itself rather than
+/// its trailing comment.
 fn marks_readonly(line: &str, start: usize) -> bool {
     let code = shell_code(line);
     let mut words = code.split_whitespace();
-    is_attribute_command(line)
+    // `starts_with` is the start-of-line test; the word check below alone would
+    // also accept an indented command.
+    code.starts_with("readonly")
+        && is_attribute_command(line)
         && words.next() == Some("readonly")
         && words.all(|word| !word.starts_with('-'))
         && start < code.len()
@@ -550,7 +566,9 @@ fn extract_constant<'a>(
     Ok(Constant {
         value,
         line: assignment.line,
-        readonly: source[line_start..].trim_start().starts_with("readonly")
+        // Same start-of-line rule as a separate `readonly` command: an indented
+        // `readonly NAME="…"` may sit in a block that never runs.
+        readonly: source[line_start..].starts_with("readonly")
             || readonly_lines.iter().any(|&line| line > assignment.line),
     })
 }
@@ -591,15 +609,18 @@ fn pinned_pem_body(
             .to_owned()
     };
     // install.ps1 trims each line before decoding, so indentation is harmless
-    // there. The shell writes the value out verbatim and `openssl` cannot read an
-    // indented PEM, so outside PowerShell a line may not start with whitespace.
+    // there. install.sh and the Rust source hand the value on verbatim, so outside
+    // PowerShell a line may not start with whitespace: one rule for both, kept
+    // stricter than any one PEM reader rather than tracking what each tolerates.
     if !matches!(embedding, Embedding::PowerShell)
         && text
             .lines()
             .any(|line| line.starts_with(char::is_whitespace))
     {
         return Err(
-            "has a key line that starts with whitespace, which `openssl` cannot read".to_owned(),
+            "has a key line that starts with whitespace; only install.ps1, which trims \
+             each line, may indent a pinned key"
+                .to_owned(),
         );
     }
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
@@ -661,7 +682,9 @@ fn check_pinned_keys(root: &Path, ci_public_key: Option<&str>) -> Result<Vec<Str
             if matches!(source.embedding, Embedding::Shell) && !constant.readonly {
                 bail!(
                     "{}: {} does not mark {} readonly after assigning it on line {}; add \
-                     `readonly {}` so no later line can replace the trust root",
+                     a line `readonly {}` after the assignment so no later line can \
+                     replace the trust root (it must start the line, with no flags, and \
+                     name the slot outside any comment)",
                     entry.name,
                     source.path,
                     source.token,
@@ -1586,8 +1609,10 @@ mod tests {
             &good_rs(),
             &["install.sh does not embed the canonical key"],
         );
-        // An indented key: openssl cannot read it from the file install.sh writes,
-        // while install.ps1 trims each line before decoding.
+        // An indented key: install.sh and the Rust source pass the value on
+        // verbatim, while install.ps1 trims each line before decoding. The message
+        // names that rule rather than one PEM reader's limits, since the Rust
+        // source never goes through `openssl`.
         for indent in ["  ", "\t"] {
             let indented = SAMPLE.replace('\n', &format!("\n{indent}"));
             let indented = indented.trim_end();
@@ -1597,6 +1622,7 @@ mod tests {
                 &good_rs(),
                 &[
                     "install.sh PINNED_RELEASE_PUBLIC_KEY_CURRENT on line 1 has a key line that starts with whitespace",
+                    "only install.ps1, which trims each line, may indent a pinned key",
                 ],
             );
             rejected(
@@ -1606,10 +1632,13 @@ mod tests {
                     "const {RS_META}: &str = \"{}\";\n",
                     META.replace('\n', &format!("\n{indent}")).trim_end()
                 ),
-                &[&format!(
-                    "{} {RS_META} on line 1 has a key line that starts with whitespace",
-                    rs_file()
-                )],
+                &[
+                    &format!(
+                        "{} {RS_META} on line 1 has a key line that starts with whitespace",
+                        rs_file()
+                    ),
+                    "only install.ps1, which trims each line, may indent a pinned key",
+                ],
             );
             accepted(
                 &good_sh(),
@@ -1888,17 +1917,28 @@ mod tests {
                 sh_current()
             )
         };
+        // An indented `readonly` sits in a block or function that may never run
+        // (`if false; then … fi`), so it does not count either. Each of these
+        // is told what a qualifying line looks like, since the slot's name is
+        // already on the line it rejected.
         for line in [
             "readonly COPY=\"${PINNED_RELEASE_PUBLIC_KEY_CURRENT}\"",
             "readonly OTHER # PINNED_RELEASE_PUBLIC_KEY_CURRENT",
+            "readonly OTHER\t# PINNED_RELEASE_PUBLIC_KEY_CURRENT",
             "readonly -f PINNED_RELEASE_PUBLIC_KEY_CURRENT",
             "readonly -p PINNED_RELEASE_PUBLIC_KEY_CURRENT",
+            "if false; then\n  readonly PINNED_RELEASE_PUBLIC_KEY_CURRENT\nfi",
+            "f() {\n\treadonly PINNED_RELEASE_PUBLIC_KEY_CURRENT\n}",
         ] {
             rejected(
                 &with_line(line),
                 &good_ps1(),
                 &good_rs(),
-                &["install.sh does not mark PINNED_RELEASE_PUBLIC_KEY_CURRENT readonly"],
+                &[
+                    "install.sh does not mark PINNED_RELEASE_PUBLIC_KEY_CURRENT readonly",
+                    "add a line `readonly PINNED_RELEASE_PUBLIC_KEY_CURRENT` after the assignment",
+                    "it must start the line, with no flags, and name the slot outside any comment",
+                ],
             );
         }
         // A trailing comment after an assignment is not an attribute command at
@@ -1921,6 +1961,41 @@ mod tests {
             ),
             &good_ps1(),
             &good_rs(),
+        );
+        // The declaration form follows the same start-of-line rule: indented, it
+        // may sit in a block that never runs, so it does not mark the slot.
+        rejected(
+            &format!(
+                "if true; then\n  readonly {SH_CURRENT}=\"{SAMPLE}\"\nfi\n\
+                 PINNED_RELEASE_PUBLIC_KEY_NEXT=\"{NEXT_KEY}\"\n\
+                 readonly PINNED_RELEASE_PUBLIC_KEY_NEXT\n"
+            ),
+            &good_ps1(),
+            &good_rs(),
+            &[
+                "install.sh does not mark PINNED_RELEASE_PUBLIC_KEY_CURRENT readonly after assigning it on line 2",
+                "it must start the line",
+            ],
+        );
+        // A comment after a tab is a comment too, so the command still only
+        // names variables: it marks both slots rather than counting as a second
+        // write of them.
+        accepted(
+            &format!(
+                "{}PINNED_RELEASE_PUBLIC_KEY_NEXT=\"{NEXT_KEY}\"\n\
+                 readonly PINNED_RELEASE_PUBLIC_KEY_CURRENT PINNED_RELEASE_PUBLIC_KEY_NEXT\t# note\n",
+                sh_current()
+            ),
+            &good_ps1(),
+            &good_rs(),
+        );
+        // `#` inside a word does not start a comment, so the command is not one
+        // that only names variables, and the mention counts as a write.
+        rejected(
+            &with_line("readonly OTHER a#b PINNED_RELEASE_PUBLIC_KEY_CURRENT"),
+            &good_ps1(),
+            &good_rs(),
+            &["install.sh assigns PINNED_RELEASE_PUBLIC_KEY_CURRENT 2 times"],
         );
     }
 
