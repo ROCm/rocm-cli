@@ -5,8 +5,6 @@
 //! The Windows display-adapter inventory: the PowerShell queries, the parsers for
 //! their output, and the assembly of one inventory from several sources.
 
-#[cfg(any(windows, test))]
-use super::capture::OPTIONAL_COMMAND_TIMEOUT;
 #[cfg(windows)]
 use super::capture::{capture_optional_command, capture_optional_command_with_timeout};
 use super::os_facts::{bytes_text_to_gib, normalize_cpu_model};
@@ -20,17 +18,20 @@ use std::time::Duration;
 
 pub(super) const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What the system query (CPU model and RAM) is allowed: the 1.5 s of an
-/// optional command, not the 5 s the display queries get.
-#[cfg(any(windows, test))]
-const WINDOWS_SYSTEM_INVENTORY_TIMEOUT: Duration = OPTIONAL_COMMAND_TIMEOUT;
+/// What the system query (CPU model and RAM) is allowed: the same 5 s every
+/// other inventory query gets, for the summary's inventory and the
+/// examination's CPU read alike. It was the 1.5 s of an optional command in
+/// the summary and 8 s in the examination's own CPU query. One limit sits
+/// between the two: a CIM query on a PowerShell that has not started yet can
+/// outlast 1.5 s, so the summary's read waits longer than it did, and the
+/// examination's gives up 3 s sooner.
+const WINDOWS_SYSTEM_INVENTORY_TIMEOUT: Duration = WINDOWS_INVENTORY_QUERY_TIMEOUT;
 
 pub(super) const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
 
 #[cfg(windows)]
 pub(super) const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
 
-#[cfg(any(windows, test))]
 const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
 
 #[cfg(windows)]
@@ -512,26 +513,37 @@ fn detect_windows_system_inventory_from_cim() -> Option<WindowsExamineInventory>
     if !runtime_is_windows() {
         return None;
     }
-    windows_system_inventory_with(|script, timeout| {
-        capture_optional_command_with_timeout(
-            "powershell",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ],
-            timeout,
-        )
-    })
+    windows_system_inventory_with(run_windows_system_query)
+}
+
+/// Run the system query's `script` under PowerShell for at most `timeout`, and
+/// answer with its stdout, or `None` when it could not run, failed or timed out.
+#[cfg(windows)]
+pub(super) fn run_windows_system_query(script: &str, timeout: Duration) -> Option<String> {
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        timeout,
+    )
+}
+
+/// Off Windows there is no PowerShell to run the system query.
+#[cfg(not(windows))]
+pub(super) const fn run_windows_system_query(_script: &str, _timeout: Duration) -> Option<String> {
+    None
 }
 
 /// The system inventory (CPU model and installed RAM) from one query, with the
 /// query injected so a test on any host can drive it. `query` is handed the
-/// script and the timeout the inventory allows it, and answers with what the
-/// script printed, or `None` when it could not run, failed or timed out.
-#[cfg(any(windows, test))]
+/// script and the time [`WINDOWS_SYSTEM_INVENTORY_TIMEOUT`] allows it, and
+/// answers with what the script printed, or `None` when it could not run,
+/// failed or timed out.
 pub(super) fn windows_system_inventory_with(
     query: impl FnOnce(&str, Duration) -> Option<String>,
 ) -> Option<WindowsExamineInventory> {

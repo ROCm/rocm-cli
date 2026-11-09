@@ -7,6 +7,7 @@
 
 use super::Examination;
 use super::library_copies::libraries_on_ld_path;
+use crate::host_gpu::{CpuFacts, read_linux_cpu_facts, read_windows_cpu_facts};
 use crate::probe_exec::{MEDIUM, SHORT, read_host_text, run, truncate_to_chars};
 use crate::{runtime_is_linux, runtime_is_windows};
 
@@ -114,81 +115,36 @@ pub(super) fn parse_iommu_param(cmdline: &str) -> Option<String> {
     })
 }
 
+/// Fill the CPU fields from the shared reader's answer. A CPU that could not be
+/// read leaves the model empty and the vendor `unknown`, which is how the JSON
+/// has always said "not collected".
+pub(crate) fn record_cpu(e: &mut Examination, facts: CpuFacts) {
+    e.cpu_model = facts.model.unwrap_or_default();
+    e.cpu_vendor = facts.vendor;
+}
+
+/// The CPU on Linux, from `/proc/cpuinfo` through the reader the host summary
+/// uses. A cpuinfo with no CPU in it is not a probe failure.
 pub(super) fn probe_cpu_linux(e: &mut Examination) {
-    probe_cpu_linux_from(e, &read_host_text("/proc/cpuinfo"));
+    record_cpu(e, read_linux_cpu_facts());
 }
 
-/// [`probe_cpu_linux`] over cpuinfo text already read, so a test can drive it
-/// without a host root.
-pub(crate) fn probe_cpu_linux_from(e: &mut Examination, txt: &str) {
-    for line in txt.lines() {
-        if (e.cpu_vendor == "unknown")
-            && line.starts_with("vendor_id")
-            && let Some((_, value)) = line.split_once(':')
-        {
-            let value = value.trim();
-            e.cpu_vendor = if value.contains("AMD") {
-                "amd".to_owned()
-            } else if value.contains("Intel") {
-                "intel".to_owned()
-            } else {
-                value.to_lowercase()
-            };
-        }
-        if e.cpu_model.is_empty()
-            && line.starts_with("model name")
-            && let Some((_, value)) = line.split_once(':')
-        {
-            e.cpu_model = value.trim().to_owned();
-        }
-        if e.cpu_vendor != "unknown" && !e.cpu_model.is_empty() {
-            break;
-        }
-    }
-}
-
+/// The CPU on Windows, from the CPU row of the system inventory through the
+/// reader the host summary uses.
 pub(super) fn probe_cpu_windows(e: &mut Examination) {
-    probe_cpu_windows_with(e, |timeout| {
-        run(
-            "powershell",
-            &[
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
-            ],
-            timeout,
-        )
-    });
+    record_cpu_windows(e, read_windows_cpu_facts());
 }
 
-/// [`probe_cpu_windows`] with the query injected, so a test on any host can
-/// drive it. `query` is handed the timeout the examination allows it and
-/// answers as [`run`] does: `(rc, stdout, stderr)`.
-pub(crate) fn probe_cpu_windows_with(
-    e: &mut Examination,
-    query: impl FnOnce(std::time::Duration) -> (i32, String, String),
-) {
-    let (rc, out, _) = query(MEDIUM);
-    if rc == 0 && !out.trim().is_empty() {
-        e.cpu_model = out
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let lname = e.cpu_model.to_lowercase();
-        e.cpu_vendor = if lname.contains("amd") {
-            "amd".to_owned()
-        } else if lname.contains("intel") {
-            "intel".to_owned()
-        } else {
-            "unknown".to_owned()
-        };
-    } else {
+/// [`record_cpu`], and a failure entry when no CPU could be read: on Windows the
+/// CPU comes from a query that can fail or time out, and an empty model alone
+/// would not say so. Crate-visible so a test on any host can feed it the answer
+/// of an injected query.
+pub(crate) fn record_cpu_windows(e: &mut Examination, facts: CpuFacts) {
+    if facts.model.is_none() {
         e.probe_failures
             .push("Get-CimInstance Win32_Processor failed; cannot identify CPU.".to_owned());
     }
+    record_cpu(e, facts);
 }
 
 pub(super) fn probe_env(e: &mut Examination) {
@@ -666,8 +622,8 @@ mod tests {
 
     /// CPU-model pair of docs/host-probing.md, native Linux. Both reads take
     /// `/proc/cpuinfo` from the simulated host root, so a planted CPU no runner
-    /// has is what each reports. They differ on the whitespace in it, which the
-    /// summary collapses and the examination keeps.
+    /// has is what each reports, and both report the model with its whitespace
+    /// collapsed (the examination used to keep the runs of spaces).
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn cpu_reads_follow_the_simulated_host_root() {
@@ -683,7 +639,7 @@ mod tests {
             },
         );
         assert_eq!(summary.as_deref(), Some("Planted CPU 9000 Processor"));
-        assert_eq!(examined.cpu_model, "Planted  CPU 9000   Processor");
+        assert_eq!(examined.cpu_model, "Planted CPU 9000 Processor");
         assert_eq!(examined.cpu_vendor, "amd");
     }
 

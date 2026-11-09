@@ -8,6 +8,9 @@
 use super::capture::{
     OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
 };
+use super::windows_inventory::{
+    WindowsExamineInventory, run_windows_system_query, windows_system_inventory_with,
+};
 use crate::{hardware_root, host_path, runtime_is_linux, runtime_is_windows};
 use std::fs;
 
@@ -64,54 +67,140 @@ fn distro_name_from_os_release(read: &hardware_root::OsRelease) -> String {
     }
 }
 
+/// The CPU's model and vendor, read together by the one reader both stacks use:
+/// the summary's `cpu` through [`detect_cpu_model`] and the Windows inventory,
+/// the examination's `cpu_model` and `cpu_vendor` through `probe_cpu_linux` and
+/// `probe_cpu_windows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CpuFacts {
+    /// The model with every run of whitespace collapsed to one space, or `None`
+    /// when no model could be read. `None` covers every way of not knowing (no
+    /// file, no line, a blank value, a query that failed or timed out), so a
+    /// caller cannot tell a failed query from an absent line; the Windows
+    /// examination records a failure for any `None`, and Linux for none.
+    pub(crate) model: Option<String>,
+    /// `amd` or `intel`, any other vendor lower-cased as the file spells it, or
+    /// [`UNKNOWN_CPU_VENDOR`] when none could be read.
+    pub(crate) vendor: String,
+}
+
+/// The vendor of a CPU no source named.
+pub(crate) const UNKNOWN_CPU_VENDOR: &str = "unknown";
+
+impl CpuFacts {
+    fn unknown() -> Self {
+        Self {
+            model: None,
+            vendor: UNKNOWN_CPU_VENDOR.to_owned(),
+        }
+    }
+}
+
+/// The CPU summary line: the model of [`read_cpu_facts`].
 pub(crate) fn detect_cpu_model() -> Option<String> {
+    read_cpu_facts().model
+}
+
+/// The CPU facts of the host this process runs on.
+pub(crate) fn read_cpu_facts() -> CpuFacts {
     if runtime_is_windows() {
-        return detect_cpu_model_windows(|timeout| {
-            let script =
-                "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
-            capture_optional_command_with_timeout(
-                "powershell",
-                &["-NoProfile", "-Command", script],
-                timeout,
-            )
-        });
+        read_windows_cpu_facts()
+    } else if runtime_is_linux() {
+        read_linux_cpu_facts()
+    } else {
+        CpuFacts::unknown()
     }
-
-    if runtime_is_linux()
-        && let Some(model) = fs::read_to_string(host_path("/proc/cpuinfo"))
-            .ok()
-            .and_then(|text| cpu_model_from_cpuinfo(&text))
-    {
-        return Some(model);
-    }
-
-    None
 }
 
-/// The summary's own Windows CPU query, with the query injected so a test on any
-/// host can drive it. `query` is handed the timeout the summary allows it.
-pub(super) fn detect_cpu_model_windows(
-    query: impl FnOnce(std::time::Duration) -> Option<String>,
-) -> Option<String> {
-    query(OPTIONAL_COMMAND_TIMEOUT)
-        .map(|value| normalize_cpu_model(&value))
-        .filter(|value| !value.is_empty())
+/// The CPU facts from `/proc/cpuinfo`, read through [`host_path`].
+pub(crate) fn read_linux_cpu_facts() -> CpuFacts {
+    cpu_facts_from_cpuinfo(&fs::read_to_string(host_path("/proc/cpuinfo")).unwrap_or_default())
 }
 
-/// The first `model name` or `Hardware` line of `/proc/cpuinfo` text that has a
-/// value, whitespace collapsed.
-pub(super) fn cpu_model_from_cpuinfo(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let value = line
-            .strip_prefix("model name")
-            .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-            .or_else(|| {
-                line.strip_prefix("Hardware")
-                    .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-            })?;
-        let value = normalize_cpu_model(value);
-        (!value.is_empty()).then_some(value)
-    })
+/// The CPU facts from `/proc/cpuinfo` text.
+///
+/// The model is the first `model name` or `Hardware` line that has a value,
+/// whichever comes first: an Arm board that prints no `model name` is still
+/// named. The vendor is the first `vendor_id` line that has a value, `amd` or
+/// `intel` by substring (`AuthenticAMD`, `GenuineIntel`) and any other
+/// lower-cased. A file with no `vendor_id` (Arm kernels print none) has an
+/// unknown vendor beside a known model.
+pub(super) fn cpu_facts_from_cpuinfo(text: &str) -> CpuFacts {
+    let mut facts = CpuFacts::unknown();
+    for line in text.lines() {
+        if facts.model.is_none()
+            && let Some(value) = line
+                .strip_prefix("model name")
+                .or_else(|| line.strip_prefix("Hardware"))
+                .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
+        {
+            let value = normalize_cpu_model(value);
+            if !value.is_empty() {
+                facts.model = Some(value);
+            }
+        }
+        if facts.vendor == UNKNOWN_CPU_VENDOR
+            && let Some(value) = line
+                .strip_prefix("vendor_id")
+                .and_then(|rest| rest.split_once(':').map(|(_, value)| value.trim()))
+                .filter(|value| !value.is_empty())
+        {
+            facts.vendor = if value.contains("AMD") {
+                "amd".to_owned()
+            } else if value.contains("Intel") {
+                "intel".to_owned()
+            } else {
+                value.to_lowercase()
+            };
+        }
+        if facts.model.is_some() && facts.vendor != UNKNOWN_CPU_VENDOR {
+            break;
+        }
+    }
+    facts
+}
+
+/// The CPU facts from the Windows system inventory's `CPU` row: the one query
+/// the summary's inventory runs for its CPU and RAM.
+pub(crate) fn read_windows_cpu_facts() -> CpuFacts {
+    windows_cpu_facts_with(run_windows_system_query)
+}
+
+/// [`read_windows_cpu_facts`] with the query injected, so a test on any host can
+/// drive it. `query` is handed the script and the time the inventory allows it,
+/// and answers with what the script printed, or `None` when it could not run,
+/// failed or timed out.
+pub(super) fn windows_cpu_facts_with(
+    query: impl FnOnce(&str, std::time::Duration) -> Option<String>,
+) -> CpuFacts {
+    cpu_facts_from_windows_inventory(windows_system_inventory_with(query).as_ref())
+}
+
+/// The CPU facts of a Windows inventory: its CPU row, or unknown when there is
+/// no inventory or the row is absent or blank. The summary reads the inventory
+/// it already holds through this, so it starts no second query for the CPU and
+/// reads the same row the examination's reader does.
+///
+/// Windows reports no vendor field here, so it is derived from the model string
+/// (`amd` or `intel`, else unknown).
+pub(super) fn cpu_facts_from_windows_inventory(
+    inventory: Option<&WindowsExamineInventory>,
+) -> CpuFacts {
+    let Some(model) = inventory.and_then(|inventory| inventory.cpu_model.clone()) else {
+        return CpuFacts::unknown();
+    };
+    let lowered = model.to_lowercase();
+    let vendor = if lowered.contains("amd") {
+        "amd"
+    } else if lowered.contains("intel") {
+        "intel"
+    } else {
+        UNKNOWN_CPU_VENDOR
+    };
+    CpuFacts {
+        model: Some(model),
+        vendor: vendor.to_owned(),
+    }
 }
 
 pub fn detect_system_ram_gib() -> Option<f64> {
@@ -238,91 +327,85 @@ mod tests {
 
     // ── CPU model: the summary's read and the examination's read ──────────
     //
-    // Characterisation tests for the CPU-model pair of docs/host-probing.md.
-    // `rocm examine --json` reads the CPU twice: the summary (`summary.cpu`, the
-    // `cpu:` line of the text) through `detect_cpu_model` and the Windows
-    // inventory's CPU row, and the examination (`cpu_model` and `cpu_vendor`)
-    // through `probe_cpu_linux` and `probe_cpu_windows`. Each case below gives
-    // both reads the same input and pins what each returns, so the change that
-    // merges them moves exactly the assertions it means to. Where the two
-    // agree, one value is asserted for both. Where they differ, each read's own
-    // answer is asserted, under a comment that says so.
+    // Tests of the CPU-model pair of docs/host-probing.md. `rocm examine --json`
+    // reads the CPU in two places: the summary (`summary.cpu`, the `cpu:` line of
+    // the text) and the examination (`cpu_model` and `cpu_vendor`). Both go
+    // through one reader now, so each case below hands both the same input and
+    // asserts one answer. The cases that used to differ say so in their
+    // comment, with what each read answered before.
 
-    use crate::examine::{Examination, probe_cpu_linux_from, probe_cpu_windows_with};
+    use crate::examine::{Examination, record_cpu, record_cpu_windows};
     use crate::host_gpu::windows_inventory::{
         InventoryScope, WindowsExamineInventory, WindowsInventorySources,
         assemble_windows_inventory, windows_system_inventory_with,
     };
     use std::time::Duration;
 
-    /// One `/proc/cpuinfo` and what each read makes of it.
+    /// One `/proc/cpuinfo` and the CPU both reads make of it.
     struct CpuinfoCase {
         name: &'static str,
         text: &'static str,
-        /// `detect_cpu_model`'s answer.
-        summary: Option<&'static str>,
-        /// `Examination::cpu_model` and `Examination::cpu_vendor`.
-        examination: (&'static str, &'static str),
+        /// The model: `summary.cpu`, and `cpu_model` where `Some`, empty where `None`.
+        model: Option<&'static str>,
+        /// `cpu_vendor`.
+        vendor: &'static str,
     }
 
-    const INTEL_CPUINFO: &str = "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel name\t: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz\nprocessor\t: 1\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz\n";
-
     #[test]
-    fn linux_cpuinfo_the_two_reads_agree_on_an_ordinary_cpu() {
+    fn linux_cpuinfo_both_reads_report_one_cpu() {
         let cases = [
             CpuinfoCase {
                 name: "Intel, model name and vendor_id",
-                text: INTEL_CPUINFO,
-                summary: Some("Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz"),
-                examination: ("Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz", "intel"),
+                text: "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel name\t: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz\nprocessor\t: 1\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz\n",
+                model: Some("Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz"),
+                vendor: "intel",
             },
             CpuinfoCase {
                 name: "AMD, model name and vendor_id",
                 text: "vendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 9 9950X 16-Core Processor\n",
-                summary: Some("AMD Ryzen 9 9950X 16-Core Processor"),
-                examination: ("AMD Ryzen 9 9950X 16-Core Processor", "amd"),
+                model: Some("AMD Ryzen 9 9950X 16-Core Processor"),
+                vendor: "amd",
             },
             CpuinfoCase {
                 // No `vendor_id` (Arm kernels print none): the model is read, the
-                // vendor stays "unknown" in the examination.
+                // vendor stays "unknown".
                 name: "model name and no vendor_id",
                 text: "processor\t: 0\nmodel name\t: ARMv8 Processor rev 1 (v8l)\n",
-                summary: Some("ARMv8 Processor rev 1 (v8l)"),
-                examination: ("ARMv8 Processor rev 1 (v8l)", "unknown"),
+                model: Some("ARMv8 Processor rev 1 (v8l)"),
+                vendor: "unknown",
             },
             CpuinfoCase {
                 name: "a blank model name line, then a real one",
                 text: "vendor_id\t: GenuineIntel\nmodel name\t:   \nmodel name\t: Intel(R) Xeon(R) Gold 6248\n",
-                summary: Some("Intel(R) Xeon(R) Gold 6248"),
-                examination: ("Intel(R) Xeon(R) Gold 6248", "intel"),
+                model: Some("Intel(R) Xeon(R) Gold 6248"),
+                vendor: "intel",
             },
             CpuinfoCase {
                 // `Hardware` after the per-core blocks is what an Arm board
                 // prints, and it follows `model name`, so both read the latter.
                 name: "model name first, Hardware last",
                 text: "processor\t: 0\nmodel name\t: ARMv7 Processor rev 4 (v7l)\nHardware\t: BCM2835\n",
-                summary: Some("ARMv7 Processor rev 4 (v7l)"),
-                examination: ("ARMv7 Processor rev 4 (v7l)", "unknown"),
+                model: Some("ARMv7 Processor rev 4 (v7l)"),
+                vendor: "unknown",
             },
             CpuinfoCase {
                 name: "nothing to read",
                 text: "processor\t: 0\nCPU implementer\t: 0x41\n",
-                summary: None,
-                examination: ("", "unknown"),
+                model: None,
+                vendor: "unknown",
             },
             CpuinfoCase {
                 name: "an empty file",
                 text: "",
-                summary: None,
-                examination: ("", "unknown"),
+                model: None,
+                vendor: "unknown",
             },
             CpuinfoCase {
-                // The examination lower-cases a vendor it does not know, the
-                // summary records no vendor at all.
+                // A vendor other than AMD and Intel is kept, lower-cased.
                 name: "a vendor_id that is neither AMD nor Intel",
                 text: "vendor_id\t: HygonGenuine\nmodel name\t: Hygon C86 7185 32-core Processor\n",
-                summary: Some("Hygon C86 7185 32-core Processor"),
-                examination: ("Hygon C86 7185 32-core Processor", "hygongenuine"),
+                model: Some("Hygon C86 7185 32-core Processor"),
+                vendor: "hygongenuine",
             },
         ];
         for case in cases {
@@ -330,42 +413,53 @@ mod tests {
         }
     }
 
-    /// The inputs on which the two reads give different answers today; each
-    /// read's own answer is pinned.
+    /// The inputs on which the two reads used to give different answers. Each
+    /// comment says what the summary and the examination answered before the
+    /// reads were merged; the answer asserted is the one both give now.
     #[test]
-    fn linux_cpuinfo_the_two_reads_differ_on_four_inputs() {
+    fn linux_cpuinfo_the_inputs_the_two_reads_used_to_disagree_on() {
         let cases = [
             CpuinfoCase {
-                // The summary collapses whitespace runs, the examination trims
-                // only: one model string, two spellings in one `--json`.
+                // Before: summary collapsed whitespace runs, examination trimmed
+                // only (`Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz`).
                 name: "repeated spaces inside the model name",
                 text: "vendor_id\t: GenuineIntel\nmodel name\t:  Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz  \n",
-                summary: Some("Intel(R) Pentium(R) CPU N3700 @ 1.60GHz"),
-                examination: ("Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz", "intel"),
+                model: Some("Intel(R) Pentium(R) CPU N3700 @ 1.60GHz"),
+                vendor: "intel",
             },
             CpuinfoCase {
-                // The summary falls back to `Hardware`; the examination reads
-                // `model name` only, so it reports no CPU at all.
+                // Before: summary read `Hardware`, examination read `model name`
+                // only and reported no CPU (empty model, vendor unknown).
                 name: "Hardware and no model name",
                 text: "processor\t: 0\nBogoMIPS\t: 38.40\nHardware\t: BCM2835\nRevision\t: a02082\n",
-                summary: Some("BCM2835"),
-                examination: ("", "unknown"),
+                model: Some("BCM2835"),
+                vendor: "unknown",
             },
             CpuinfoCase {
-                // The summary takes whichever of the two comes first, the
-                // examination only ever the `model name`.
+                // Before: summary took whichever of the two came first
+                // (`BCM2835`), examination only the `model name`.
                 name: "Hardware before model name",
                 text: "Hardware\t: BCM2835\nmodel name\t: ARMv7 Processor rev 4 (v7l)\n",
-                summary: Some("BCM2835"),
-                examination: ("ARMv7 Processor rev 4 (v7l)", "unknown"),
+                model: Some("BCM2835"),
+                vendor: "unknown",
             },
             CpuinfoCase {
-                // An empty `vendor_id` value is taken as the vendor by the
-                // examination, which then stops looking for another.
+                // Before: examination took an empty `vendor_id` as the vendor
+                // (`""`) and stopped looking. An empty value names no vendor, so
+                // the next `vendor_id` line is read.
                 name: "an empty vendor_id value",
                 text: "vendor_id\t:\nmodel name\t: Some CPU\nvendor_id\t: GenuineIntel\n",
-                summary: Some("Some CPU"),
-                examination: ("Some CPU", ""),
+                model: Some("Some CPU"),
+                vendor: "intel",
+            },
+            CpuinfoCase {
+                // The same input where no later line names a vendor. Before:
+                // examination `""`; now `unknown`, which is what the JSON says
+                // for a vendor that was not read.
+                name: "an empty vendor_id value and no other",
+                text: "vendor_id\t:\nmodel name\t: Some CPU\n",
+                model: Some("Some CPU"),
+                vendor: "unknown",
             },
         ];
         for case in cases {
@@ -374,17 +468,19 @@ mod tests {
     }
 
     fn assert_cpuinfo_case(case: &CpuinfoCase) {
+        // The summary's `cpu`: what `detect_cpu_model` makes of the file.
         assert_eq!(
-            cpu_model_from_cpuinfo(case.text).as_deref(),
-            case.summary,
+            cpu_facts_from_cpuinfo(case.text).model.as_deref(),
+            case.model,
             "summary, {}",
             case.name
         );
+        // The examination's fields.
         let mut examined = Examination::default();
-        probe_cpu_linux_from(&mut examined, case.text);
+        record_cpu(&mut examined, cpu_facts_from_cpuinfo(case.text));
         assert_eq!(
             (examined.cpu_model.as_str(), examined.cpu_vendor.as_str()),
-            case.examination,
+            (case.model.unwrap_or(""), case.vendor),
             "examination, {}",
             case.name
         );
@@ -396,22 +492,25 @@ mod tests {
         );
     }
 
-    /// What the examination makes of one answer from its Windows query.
-    fn examination_on_windows(rc: i32, stdout: &str) -> (Examination, Duration) {
+    /// What the examination makes of one answer from the system query.
+    fn examination_on_windows(output: Option<&str>) -> (Examination, Duration) {
         let mut examined = Examination::default();
         let mut asked = None;
-        probe_cpu_windows_with(&mut examined, |timeout| {
-            asked = Some(timeout);
-            (rc, stdout.to_owned(), String::new())
-        });
+        record_cpu_windows(
+            &mut examined,
+            windows_cpu_facts_with(|_, timeout| {
+                asked = Some(timeout);
+                output.map(str::to_owned)
+            }),
+        );
         (examined, asked.expect("the examination ran its query"))
     }
 
     /// The summary's system inventory with only `system` wired, so a test sees
-    /// the query the CPU row comes from.
+    /// the query the CPU row comes from and counts how many run.
     struct SystemQuery<'a> {
         output: Option<&'a str>,
-        asked: Option<(String, Duration)>,
+        asked: Vec<(String, Duration)>,
     }
 
     impl WindowsInventorySources for SystemQuery<'_> {
@@ -426,89 +525,60 @@ mod tests {
         }
         fn system(&mut self) -> Option<WindowsExamineInventory> {
             windows_system_inventory_with(|script, timeout| {
-                self.asked = Some((script.to_owned(), timeout));
+                self.asked.push((script.to_owned(), timeout));
                 self.output.map(str::to_owned)
             })
         }
     }
 
     /// What the summary reports for the CPU on Windows when the system query
-    /// prints `system_output` (`None`: it could not run) and its own fallback
-    /// query prints `fallback_output`.
-    struct SummaryOnWindows {
-        cpu: Option<String>,
-        system_query: Option<(String, Duration)>,
-        fallback_timeout: Option<Duration>,
-    }
-
-    fn summary_on_windows(
-        system_output: Option<&str>,
-        fallback_output: Option<&str>,
-    ) -> SummaryOnWindows {
+    /// prints `output` (`None`: it could not run), and every query that ran.
+    fn summary_on_windows(output: Option<&str>) -> (Option<String>, Vec<(String, Duration)>) {
         let mut sources = SystemQuery {
-            output: system_output,
-            asked: None,
+            output,
+            asked: Vec::new(),
         };
         let inventory = assemble_windows_inventory(&mut sources, InventoryScope::SUMMARY);
-        let mut fallback_timeout = None;
-        let cpu = crate::host_gpu::windows_cpu_model(inventory.as_ref(), || {
-            detect_cpu_model_windows(|timeout| {
-                fallback_timeout = Some(timeout);
-                fallback_output.map(str::to_owned)
-            })
-        });
-        SummaryOnWindows {
-            cpu,
-            system_query: sources.asked,
-            fallback_timeout,
-        }
+        (
+            cpu_facts_from_windows_inventory(inventory.as_ref()).model,
+            sources.asked,
+        )
     }
 
     const WINDOWS_CPU_NAME: &str = "AMD Ryzen 9 9950X 16-Core Processor";
 
     #[test]
-    fn windows_the_two_reads_agree_on_a_name_the_query_returns() {
-        let summary = summary_on_windows(
-            Some(&format!("CPU\t{WINDOWS_CPU_NAME}\nRAM\t68719476736\n")),
-            None,
-        );
-        assert_eq!(summary.cpu.as_deref(), Some(WINDOWS_CPU_NAME));
-        assert_eq!(
-            summary.fallback_timeout, None,
-            "an inventory was read, so the summary's own query does not run"
-        );
-        let (examined, _) = examination_on_windows(0, &format!("{WINDOWS_CPU_NAME}\r\n"));
+    fn windows_both_reads_report_the_name_the_query_returns() {
+        let output = format!("CPU\t{WINDOWS_CPU_NAME}\r\nRAM\t68719476736\r\n");
+        let (summary, _) = summary_on_windows(Some(&output));
+        assert_eq!(summary.as_deref(), Some(WINDOWS_CPU_NAME));
+        let (examined, _) = examination_on_windows(Some(&output));
         assert_eq!(examined.cpu_model, WINDOWS_CPU_NAME);
         assert_eq!(examined.cpu_vendor, "amd");
         assert!(examined.probe_failures.is_empty());
     }
 
-    /// The summary collapses whitespace runs, the examination trims and keeps
-    /// the first line only. Windows pads the name of some CPUs.
+    /// Before: the summary collapsed whitespace runs and the examination
+    /// trimmed and kept the first line only. Windows pads the name of some CPUs.
+    /// Both collapse now.
     #[test]
-    fn windows_the_two_reads_differ_on_whitespace_inside_the_name() {
-        let summary = summary_on_windows(
-            Some("CPU\t  Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz   \n"),
-            None,
-        );
+    fn windows_both_reads_collapse_whitespace_inside_the_name() {
+        let output = "CPU\t  Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz   \r\n";
+        let (summary, _) = summary_on_windows(Some(output));
         assert_eq!(
-            summary.cpu.as_deref(),
+            summary.as_deref(),
             Some("Intel(R) Pentium(R) CPU N3700 @ 1.60GHz")
         );
-        let (examined, _) =
-            examination_on_windows(0, "  Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz   \r\n");
+        let (examined, _) = examination_on_windows(Some(output));
         assert_eq!(
             examined.cpu_model,
-            "Intel(R) Pentium(R) CPU  N3700  @ 1.60GHz"
+            "Intel(R) Pentium(R) CPU N3700 @ 1.60GHz"
         );
         assert_eq!(examined.cpu_vendor, "intel");
-        // Only the examination reads a first line out of several.
-        let (several, _) = examination_on_windows(0, "AMD EPYC 7763\r\nAMD EPYC 7763\r\n");
-        assert_eq!(several.cpu_model, "AMD EPYC 7763");
     }
 
     #[test]
-    fn windows_the_examination_derives_the_vendor_from_the_model_string() {
+    fn windows_the_vendor_is_derived_from_the_model_string() {
         for (name, vendor) in [
             ("AMD Ryzen 7 5800X 8-Core Processor", "amd"),
             ("amd epyc 7763", "amd"),
@@ -516,114 +586,73 @@ mod tests {
             ("Genuine Intel(R) CPU 0000", "intel"),
             ("Qualcomm(R) Snapdragon(R) X Elite", "unknown"),
         ] {
-            let (examined, _) = examination_on_windows(0, name);
+            let (examined, _) = examination_on_windows(Some(&format!("CPU\t{name}\n")));
             assert_eq!(examined.cpu_vendor, vendor, "{name}");
             assert_eq!(examined.cpu_model, name);
         }
     }
 
-    /// The system query printed no CPU row (here only the RAM row), or nothing.
-    /// The summary has an inventory, so it reports no CPU and does not ask
-    /// again; the examination reads blank output as a failed query.
+    /// The query printed no CPU row (only the RAM row, or a blank one), or
+    /// nothing, or could not run: both reads report no CPU. The examination
+    /// records a failure and leaves the vendor `unknown`; the summary starts no
+    /// second query. Before: an empty answer or a query that could not run
+    /// sent the summary to a second, separate PowerShell query for the CPU.
     #[test]
-    fn windows_an_answer_with_no_cpu_in_it() {
-        for (system_output, output) in [
-            (Some("RAM\t17179869184\n"), "\r\n"),
-            (Some("CPU\t   \nRAM\t17179869184\n"), "   "),
+    fn windows_an_answer_with_no_cpu_is_no_cpu_in_both_reads() {
+        for output in [
+            Some("RAM\t17179869184\n"),
+            Some("CPU\t   \nRAM\t17179869184\n"),
+            Some(""),
+            None,
         ] {
-            let summary = summary_on_windows(system_output, Some("must not be read"));
-            assert_eq!(summary.cpu, None);
-            assert_eq!(summary.fallback_timeout, None);
-            let (examined, _) = examination_on_windows(0, output);
-            assert_eq!(examined.cpu_model, "");
-            assert_eq!(examined.cpu_vendor, "unknown");
+            let (summary, queries) = summary_on_windows(output);
+            assert_eq!(summary, None, "{output:?}");
+            assert_eq!(
+                queries.len(),
+                1,
+                "one system query, no second one: {output:?}"
+            );
+            let (examined, _) = examination_on_windows(output);
+            assert_eq!(examined.cpu_model, "", "{output:?}");
+            assert_eq!(examined.cpu_vendor, "unknown", "{output:?}");
             assert_eq!(
                 examined.probe_failures,
-                ["Get-CimInstance Win32_Processor failed; cannot identify CPU."]
+                ["Get-CimInstance Win32_Processor failed; cannot identify CPU."],
+                "{output:?}"
             );
         }
     }
 
-    /// The system query printed nothing at all, so there is no inventory. The
-    /// summary asks the CPU question a second time, itself, and keeps that
-    /// answer; the examination reports a failure.
+    /// One limit for both reads: 5 s, the limit of every inventory query. Before:
+    /// 8 s for the examination, 1.5 s for the summary's system query and for its
+    /// own CPU query.
     #[test]
-    fn windows_an_empty_answer_sends_the_summary_to_its_own_query() {
-        let summary = summary_on_windows(Some(""), Some("Intel(R) Core(TM) i5-12400\r\n"));
-        assert_eq!(summary.cpu.as_deref(), Some("Intel(R) Core(TM) i5-12400"));
-        assert!(summary.fallback_timeout.is_some());
-        let (examined, _) = examination_on_windows(0, "");
-        assert_eq!(examined.cpu_model, "");
-        assert_eq!(examined.probe_failures.len(), 1);
-    }
-
-    /// The query could not run, failed or timed out. Both stacks read that as
-    /// no CPU; the summary tries its own query once more first, the examination
-    /// records a failure and leaves the vendor unknown.
-    #[test]
-    fn windows_a_query_that_fails_or_times_out() {
-        // `run` answers 127 for a program it could not start and 124 for one
-        // it killed at the deadline.
-        for rc in [1, 124, 127] {
-            let (examined, _) = examination_on_windows(rc, "");
-            assert_eq!(examined.cpu_model, "", "rc {rc}");
-            assert_eq!(examined.cpu_vendor, "unknown", "rc {rc}");
-            assert_eq!(examined.probe_failures.len(), 1, "rc {rc}");
-        }
-        // A non-zero exit with a name on stdout is not trusted either.
-        let (failed_with_output, _) = examination_on_windows(1, WINDOWS_CPU_NAME);
-        assert_eq!(failed_with_output.cpu_model, "");
-        assert_eq!(failed_with_output.probe_failures.len(), 1);
-
-        let both_fail = summary_on_windows(None, None);
-        assert_eq!(both_fail.cpu, None);
-        assert!(both_fail.fallback_timeout.is_some());
-        let second_try = summary_on_windows(None, Some(WINDOWS_CPU_NAME));
-        assert_eq!(second_try.cpu.as_deref(), Some(WINDOWS_CPU_NAME));
-    }
-
-    /// The limits: the examination allows its query 8 s, the summary allows the
-    /// system query behind the inventory's CPU row 1.5 s, and its own fallback
-    /// query 1.5 s too. A host that answers in between is read by one and not
-    /// the other.
-    #[test]
-    fn windows_the_two_reads_are_given_different_time() {
-        let (_, examination_limit) = examination_on_windows(0, WINDOWS_CPU_NAME);
-        assert_eq!(examination_limit, Duration::from_secs(8));
-        let summary = summary_on_windows(None, None);
-        let (script, system_limit) = summary.system_query.expect("the system query ran");
-        assert_eq!(system_limit, Duration::from_millis(1_500));
+    fn windows_both_reads_are_given_the_same_time() {
+        let (_, examination_limit) = examination_on_windows(Some("CPU\tAMD EPYC 7763\n"));
+        assert_eq!(examination_limit, Duration::from_secs(5));
+        let (_, queries) = summary_on_windows(Some("CPU\tAMD EPYC 7763\n"));
+        let (script, summary_limit) = &queries[0];
+        assert_eq!(*summary_limit, Duration::from_secs(5));
         assert!(
             script.contains("Win32_Processor") && script.contains("Win32_ComputerSystem"),
             "the CPU row comes from the system query, which also asks for RAM: {script}"
         );
-        assert_eq!(summary.fallback_timeout, Some(Duration::from_millis(1_500)));
     }
 
-    /// With an inventory the summary never starts its own CPU query, even when
-    /// the inventory has no CPU row: that is `windows_cpu_model`'s rule, and the
-    /// fallback is for the case with no inventory at all.
+    /// With no inventory at all the summary has no CPU, and reads the CPU row of
+    /// an inventory it holds without asking again.
     #[test]
-    fn windows_the_summary_asks_its_own_query_only_without_an_inventory() {
-        let with_cpu = crate::host_gpu::windows_inventory::parse_windows_examine_inventory(
+    fn windows_the_inventory_is_the_summarys_only_source() {
+        assert_eq!(cpu_facts_from_windows_inventory(None), CpuFacts::unknown());
+        let inventory = crate::host_gpu::windows_inventory::parse_windows_examine_inventory(
             "CPU\tAMD EPYC 7763\n",
         );
-        let without_cpu = crate::host_gpu::windows_inventory::parse_windows_examine_inventory(
-            "RAM\t17179869184\n",
-        );
-        let never = || -> Option<String> { panic!("an inventory was given") };
         assert_eq!(
-            crate::host_gpu::windows_cpu_model(Some(&with_cpu), never).as_deref(),
-            Some("AMD EPYC 7763")
-        );
-        assert_eq!(
-            crate::host_gpu::windows_cpu_model(Some(&without_cpu), never),
-            None
-        );
-        assert_eq!(
-            crate::host_gpu::windows_cpu_model(None, || Some("from the fallback".to_owned()))
-                .as_deref(),
-            Some("from the fallback")
+            cpu_facts_from_windows_inventory(Some(&inventory)),
+            CpuFacts {
+                model: Some("AMD EPYC 7763".to_owned()),
+                vendor: "amd".to_owned()
+            }
         );
     }
 }

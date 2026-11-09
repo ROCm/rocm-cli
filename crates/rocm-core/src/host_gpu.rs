@@ -37,10 +37,11 @@ use crate::{
     host_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
 };
 use anyhow::Result;
-pub(crate) use os_facts::detect_cpu_model;
-pub(crate) use os_facts::detect_distro_name;
 use os_facts::detect_kernel_version;
 pub use os_facts::detect_system_ram_gib;
+pub(crate) use os_facts::{
+    CpuFacts, detect_cpu_model, detect_distro_name, read_linux_cpu_facts, read_windows_cpu_facts,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -270,23 +271,22 @@ impl ExamineSummary {
 fn detect_cpu_model_with_windows_inventory(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
-    if runtime_is_windows() {
-        return windows_cpu_model(windows_inventory, detect_cpu_model);
-    }
-
-    detect_cpu_model()
+    summary_cpu(runtime_is_windows(), windows_inventory, detect_cpu_model)
 }
 
-/// The summary's CPU on Windows: the inventory's CPU row whenever there is an
-/// inventory, even one with no such row, and `fallback` (the summary's own CPU
-/// query) only when there is no inventory at all.
-fn windows_cpu_model(
+/// The summary's CPU. On Windows it is the inventory's CPU row, which is the one
+/// query the examination's reader runs too; with no inventory there is no CPU,
+/// because the inventory run already asked for it and asking again is the same
+/// query. Elsewhere it is `read`, the Linux reader.
+fn summary_cpu(
+    windows: bool,
     windows_inventory: Option<&WindowsExamineInventory>,
-    fallback: impl FnOnce() -> Option<String>,
+    read: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    match windows_inventory {
-        Some(inventory) => inventory.cpu_model.clone(),
-        None => fallback(),
+    if windows {
+        os_facts::cpu_facts_from_windows_inventory(windows_inventory).model
+    } else {
+        read()
     }
 }
 
@@ -501,6 +501,28 @@ mod tests {
     use crate::test_support::temp_app_paths;
     use std::path::PathBuf;
     use windows_inventory::WindowsInventorySources;
+
+    /// The summary's CPU on Windows is the inventory's CPU row and nothing else:
+    /// with an inventory that has no such row, or with no inventory at all, it
+    /// is no CPU, and the Linux reader is never asked. Before, an absent
+    /// inventory sent the summary to a CPU query of its own. Off Windows the
+    /// Linux reader answers and the inventory is not looked at.
+    #[test]
+    fn the_summary_cpu_comes_from_the_windows_inventory_or_not_at_all() {
+        let never = || -> Option<String> { panic!("the Linux reader runs only off Windows") };
+        let with_cpu = parse_windows_examine_inventory("CPU\tAMD EPYC 7763\nRAM\t17179869184\n");
+        let without_cpu = parse_windows_examine_inventory("RAM\t17179869184\n");
+        assert_eq!(
+            summary_cpu(true, Some(&with_cpu), never).as_deref(),
+            Some("AMD EPYC 7763")
+        );
+        assert_eq!(summary_cpu(true, Some(&without_cpu), never), None);
+        assert_eq!(summary_cpu(true, None, never), None);
+        assert_eq!(
+            summary_cpu(false, Some(&with_cpu), || Some("from cpuinfo".to_owned())).as_deref(),
+            Some("from cpuinfo")
+        );
+    }
 
     #[test]
     fn windows_examine_gfx_detection_uses_the_display_inventory() {
