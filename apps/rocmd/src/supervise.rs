@@ -2211,7 +2211,7 @@ mod tests {
     }
 
     /// Mirrors `launch_releases_the_leased_port_before_spawning_the_child` in
-    /// `apps/rocm/src/service_launch.rs`: the probe lease on the recorded port
+    /// `apps/rocm/src/service_launch/spawn.rs`: the probe lease on the recorded port
     /// must already be released by the time the recovery supervisor is
     /// spawned, or the supervisor's own bind of that port would fail.
     #[test]
