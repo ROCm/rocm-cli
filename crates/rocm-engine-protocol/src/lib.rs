@@ -645,6 +645,46 @@ impl HealthcheckResponse {
     }
 }
 
+/// The OpenAI-compatible routes every chat server answers.
+///
+/// Each engine reports them, after its own health route, in
+/// [`EndpointResponse::supported_routes`] (built by
+/// [`engine_supported_routes`]), and the API docs describe the same list.
+pub const OPENAI_CHAT_ROUTES: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/completions"];
+
+/// Each engine's health route, keyed by engine id.
+///
+/// It is the one route an engine's chat server answers besides
+/// [`OPENAI_CHAT_ROUTES`]. The engines' own `supported_routes` and the API
+/// docs both read it here, so neither can describe an engine's server as
+/// another engine's. A new engine adds a row.
+pub const ENGINE_HEALTH_ROUTES: [(&str, &str); 3] = [
+    ("lemonade", "/v1/health"),
+    ("vllm", "/health"),
+    ("aim", "/health"),
+];
+
+/// The health route of `engine`'s server, or `None` for an engine this table
+/// does not know.
+#[must_use]
+pub fn engine_health_route(engine: &str) -> Option<&'static str> {
+    ENGINE_HEALTH_ROUTES
+        .iter()
+        .find(|(id, _)| *id == engine)
+        .map(|(_, route)| *route)
+}
+
+/// `supported_routes` for `engine`'s chat server: its health route, when
+/// [`ENGINE_HEALTH_ROUTES`] knows it, then [`OPENAI_CHAT_ROUTES`].
+#[must_use]
+pub fn engine_supported_routes(engine: &str) -> Vec<String> {
+    engine_health_route(engine)
+        .into_iter()
+        .chain(OPENAI_CHAT_ROUTES)
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResponse {
     pub endpoint_url: String,
@@ -690,6 +730,33 @@ mod tests {
         assert_eq!(resolve_response(Some("qwen")).served_model_name(), "qwen");
         assert_eq!(resolve_response(Some(" ")).served_model_name(), "image:tag");
         assert_eq!(resolve_response(None).served_model_name(), "image:tag");
+    }
+
+    #[test]
+    fn each_engine_reports_its_own_health_route_before_the_chat_routes() {
+        for (engine, health) in [
+            ("lemonade", "/v1/health"),
+            ("vllm", "/health"),
+            ("aim", "/health"),
+        ] {
+            assert_eq!(engine_health_route(engine), Some(health), "{engine}");
+            assert_eq!(
+                engine_supported_routes(engine),
+                [
+                    health,
+                    "/v1/models",
+                    "/v1/chat/completions",
+                    "/v1/completions"
+                ],
+                "{engine}"
+            );
+        }
+        assert_eq!(engine_health_route("unknown"), None);
+        assert_eq!(
+            engine_supported_routes("unknown"),
+            OPENAI_CHAT_ROUTES,
+            "an engine the table does not know gets no guessed health route"
+        );
     }
 
     use super::*;

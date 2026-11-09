@@ -41,6 +41,7 @@ mod e2e {
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
+    pub mod service_docs_steps;
     pub mod service_stop_steps;
     pub mod service_unknown_id_steps;
     pub mod serving_steps;
@@ -240,6 +241,19 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
+    /// A `rocm services docs` a scenario started; it serves until killed,
+    /// which `Drop` does before the isolated tree it reads is removed.
+    pub docs_command: Option<e2e::service_docs_steps::DocsCommand>,
+    /// The API docs link a `service-docs` scenario read from the CLI.
+    pub docs_link: Option<String>,
+    /// A listener holding a port a `service-docs` scenario must find taken:
+    /// the one a refused `rocm services docs` is given, or the default docs
+    /// port. `None` for the default port when another program already holds
+    /// it. Released when the scenario ends.
+    pub held_docs_port: Option<(u16, Option<std::net::TcpListener>)>,
+    /// What a successful real `rocm serve` printed, for steps that check the
+    /// launch output after the server came up.
+    pub serve_stdout: Option<String>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -409,6 +423,10 @@ impl Default for E2eWorld {
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
+            docs_command: None,
+            docs_link: None,
+            held_docs_port: None,
+            serve_stdout: None,
         }
     }
 }
@@ -770,6 +788,8 @@ impl Drop for E2eWorld {
                 let _ = rocm_core::terminate_recorded_pid(&descendant);
             }
         }
+        // Killed and reaped by its own `Drop`.
+        self.docs_command.take();
         // A scenario that enabled a watcher started a real detached `rocm daemon`,
         // which only exits once the watcher is disabled. If a step failed first,
         // nothing else would stop it, and it would keep polling a config dir

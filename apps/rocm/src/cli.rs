@@ -460,7 +460,8 @@ rocm model --verbose"
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// (status, endpoint, the `rocm services docs` command for its API docs, model, and
+    /// smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
@@ -1177,6 +1178,10 @@ pub(crate) enum ComfyuiCommand {
 pub(crate) enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
+    ///
+    /// Each running server gets a `docs:` line naming the command that serves
+    /// its API docs (`rocm services docs <id>`); a vLLM server also gets an
+    /// `engine docs:` line, the docs vLLM serves itself.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
@@ -1188,6 +1193,23 @@ pub(crate) enum ServicesCommand {
         /// started, rather than scraping the human table.
         #[arg(long)]
         json: bool,
+    },
+    /// Serve browsable API docs for running local model servers until Ctrl+C.
+    ///
+    /// Serves a loopback-only page (Swagger UI) per running server listing the
+    /// routes it answers, with a working "Try it out" that sends requests
+    /// through the page to the server. Prints the page links, then serves them
+    /// until Ctrl+C; nothing keeps running afterwards and the model servers
+    /// are not touched. Refuses when the named server is not running, or when
+    /// no server is.
+    Docs {
+        /// Service id from `rocm services list`; without it, every running
+        /// server's docs are linked.
+        service_id: Option<String>,
+        /// Port to serve the docs on (127.0.0.1 only). Without it, 11430 is
+        /// used, or a free port when 11430 is taken.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Show logs for a local model server.
     Logs {
@@ -1434,6 +1456,25 @@ mod tests {
         }
         if reference == "unknown" {
             assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    /// The API docs and each engine's `supported_routes` take an engine's
+    /// health route from one table; an engine `rocm serve` accepts but the
+    /// table lacks would get docs without a health route.
+    #[test]
+    fn every_supported_engine_has_a_health_route_and_no_other_engine_does() {
+        for engine in SUPPORTED_ENGINES {
+            assert!(
+                rocm_engine_protocol::engine_health_route(engine).is_some(),
+                "{engine} is missing from ENGINE_HEALTH_ROUTES"
+            );
+        }
+        for (engine, _) in rocm_engine_protocol::ENGINE_HEALTH_ROUTES {
+            assert!(
+                SUPPORTED_ENGINES.contains(&engine),
+                "ENGINE_HEALTH_ROUTES names {engine}, which `rocm serve` does not accept"
+            );
         }
     }
 

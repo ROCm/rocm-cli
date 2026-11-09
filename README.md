@@ -1251,8 +1251,9 @@ the running service, or stop it first to serve on the new port.
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
+with the status, the engine, the API-qualified model name, the full inference
+endpoint, the command that serves the server's API docs (see API docs below),
+and a quick smoke test (time to first token and approximate tokens per second). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
@@ -1477,6 +1478,7 @@ Manage background servers started with `--managed`:
 
 ```
 rocm services list [--all] [--json]
+rocm services docs [<service-id>] [--port <port>]
 rocm services logs <service-id> [--follow]
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
@@ -1548,6 +1550,46 @@ started while a `prune` is scanning waits for the prune.
 
 `--json` prints the service records verbatim, for scripting and for the remote
 orchestration below.
+
+#### API docs
+
+`rocm services docs` serves interactive API docs for the running model servers,
+in the foreground, until you press Ctrl+C. `rocm serve` names the command next
+to the endpoint, and `rocm services list` repeats it for each running server
+(`--json` prints the records alone, without it):
+
+```
+  endpoint  http://127.0.0.1:11435/v1/chat/completions
+  docs      rocm services docs <service-id>
+```
+
+Run it to get the links:
+
+```
+$ rocm services docs <service-id>
+API docs for running model servers: http://127.0.0.1:11430/
+  <service-id> (<model>): http://127.0.0.1:11430/services/<service-id>/docs/
+Press Ctrl+C to stop serving the docs; the model servers keep running.
+```
+
+Without a service id it links every running server. It refuses, and serves
+nothing, when the named server is not running or when no server is.
+
+The page lists the routes the server answers (the model list, chat and text
+completions, and the engine's health check), with request examples already
+filled in with the served model. "Try it out" sends the request through the
+docs page to the server, so it works for every engine without enabling
+cross-origin access on the server; for a server started with an endpoint key,
+enter the key under "Authorize" (it is kept only until the page is closed).
+The root page lists every running server, judged as `rocm services list` judges
+it; a server that stops or exits drops off about a second later. vLLM also documents its full API at
+its own `/docs` page: `rocm serve` and `rocm services list` print it as
+`engine docs`, and the docs page links to it.
+
+The docs listen on 127.0.0.1 only, answer browser requests only from their own
+pages, cannot be framed by other sites, and work offline. They use port 11430, or a free port when 11430 is
+taken; `--port <port>` picks one and fails if it is taken. Nothing keeps
+running after Ctrl+C, and the model servers are never touched.
 
 ### Remote machines (preview)
 

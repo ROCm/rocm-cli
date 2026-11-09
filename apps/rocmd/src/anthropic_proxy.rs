@@ -82,12 +82,7 @@ impl AnthropicProxyConfig {
     /// Where to reach the engine from this machine, even when it listens on a
     /// wildcard address.
     fn upstream_url(&self) -> String {
-        let host = match self.host.as_str() {
-            "0.0.0.0" => "127.0.0.1",
-            "::" => "::1",
-            other => other,
-        };
-        format_http_base_url(host, self.engine_port)
+        format_http_base_url(rocm_core::reachable_host(&self.host), self.engine_port)
     }
 }
 
@@ -1656,6 +1651,10 @@ mod tests {
         };
         assert_eq!(config("0.0.0.0").upstream_url(), "http://127.0.0.1:8000");
         assert_eq!(config("::").upstream_url(), "http://[::1]:8000");
+        assert_eq!(
+            config("0:0:0:0:0:0:0:0").upstream_url(),
+            "http://[::1]:8000"
+        );
         assert_eq!(config("127.0.0.1").upstream_url(), "http://127.0.0.1:8000");
     }
 

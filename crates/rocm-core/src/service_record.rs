@@ -206,6 +206,21 @@ impl std::fmt::Display for ManagedServiceNotFound {
 impl std::error::Error for ManagedServiceNotFound {}
 
 impl ManagedServiceRecord {
+    /// The server's base URL as reached from this machine: a server bound to
+    /// every interface is reached on loopback, per [`crate::reachable_host`].
+    #[must_use]
+    pub fn local_base_url(&self) -> String {
+        crate::format_http_base_url(crate::reachable_host(&self.host), self.port)
+    }
+
+    /// The docs page the engine itself serves, for the engines that serve
+    /// one: vLLM documents every route it answers at `/docs`. Lemonade (and
+    /// the llama.cpp server behind it) and AIM serve none rocm-cli relies on.
+    #[must_use]
+    pub fn engine_docs_url(&self) -> Option<String> {
+        (self.engine == "vllm").then(|| format!("{}/docs", self.local_base_url()))
+    }
+
     /// Read and parse the record for `service_id` exactly as it is on disk.
     ///
     /// The single loader behind every command that takes a service id, in both
@@ -732,6 +747,59 @@ mod tests {
                 .is_some(),
             "{error:?}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn url_test_record(paths: &AppPaths, engine: &str, host: &str) -> ManagedServiceRecord {
+        ManagedServiceRecord::new(
+            paths,
+            "svc-1",
+            engine,
+            "qwen",
+            "Qwen/Qwen3.5",
+            host,
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_server_bound_to_every_interface_is_reached_on_loopback() {
+        let (root, paths) = temp_app_paths("record-local-base-url");
+        for (host, expected) in [
+            ("127.0.0.1", "http://127.0.0.1:8000"),
+            ("0.0.0.0", "http://127.0.0.1:8000"),
+            ("::", "http://[::1]:8000"),
+            ("::1", "http://[::1]:8000"),
+            ("192.168.1.5", "http://192.168.1.5:8000"),
+        ] {
+            assert_eq!(
+                url_test_record(&paths, "vllm", host).local_base_url(),
+                expected,
+                "{host}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_vllm_names_docs_of_its_own() {
+        let (root, paths) = temp_app_paths("record-engine-docs-url");
+        assert_eq!(
+            url_test_record(&paths, "vllm", "0.0.0.0").engine_docs_url(),
+            Some("http://127.0.0.1:8000/docs".to_owned())
+        );
+        for engine in ["lemonade", "aim", "unknown"] {
+            assert_eq!(
+                url_test_record(&paths, engine, "127.0.0.1").engine_docs_url(),
+                None,
+                "{engine}"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 

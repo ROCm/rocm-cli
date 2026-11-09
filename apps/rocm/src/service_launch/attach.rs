@@ -104,6 +104,10 @@ pub(crate) fn run_attached_service(
             println!("model already being served");
             println!("  service_id: {}", report.service_id);
             println!("  endpoint: {}", report.endpoint_url);
+            for (label, value) in crate::services_docs::launch_docs_rows(paths, &report.service_id)
+            {
+                println!("  {label}: {value}");
+            }
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
             println!(
@@ -138,8 +142,12 @@ pub(crate) fn run_attached_service(
     // printed as the "serve plan" block in `serve()`; extend it with the launch
     // coordinates and the streaming hint rather than repeating it.
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
+    let docs_rows = crate::services_docs::launch_docs_rows(paths, &service_id);
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
+    for (label, value) in &docs_rows {
+        println!("  {label}: {value}");
+    }
     if let Some(key) = endpoint_api_key {
         // Same intentional one-time key display as `print_managed_launch_plain`
         // in `service_launch/start.rs`; see its rationale for why the tag below is
@@ -168,6 +176,9 @@ pub(crate) fn run_attached_service(
             println!("detached - server still running");
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
+            for (label, value) in &docs_rows {
+                println!("  {label}: {value}");
+            }
             println!("  list: rocm services");
             println!("  logs: rocm logs {service_id}");
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));

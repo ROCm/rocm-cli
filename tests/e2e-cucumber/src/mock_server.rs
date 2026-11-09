@@ -583,7 +583,8 @@ impl MockServer {
             .route("/v1/models", get(handle_models))
             .route("/models", get(handle_models))
             .route("/v1/chat/completions", post(handle_chat))
-            .route("/chat/completions", post(handle_chat));
+            .route("/chat/completions", post(handle_chat))
+            .route("/docs", get(handle_engine_docs));
         if with_metrics {
             app = app.route("/metrics", get(handle_metrics));
         }
@@ -911,6 +912,16 @@ pub fn write_service_record_with(
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
+}
+
+/// The title of the page [`MockServer::start`]'s server answers `/docs` with,
+/// standing in for the API docs vLLM serves there itself.
+pub const MOCK_ENGINE_DOCS_TITLE: &str = "Mock engine API docs";
+
+async fn handle_engine_docs() -> axum::response::Html<String> {
+    axum::response::Html(format!(
+        "<!doctype html><html><head><title>{MOCK_ENGINE_DOCS_TITLE}</title></head></html>"
+    ))
 }
 
 async fn handle_models(State(state): State<ServerState>) -> Json<Value> {

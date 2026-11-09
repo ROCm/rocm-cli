@@ -188,6 +188,13 @@ pub fn run_cli() -> Result<()> {
     }
 }
 
+/// The routes this engine's server answers, as its `Endpoint` answer reports
+/// them in `supported_routes`.
+#[must_use]
+pub(crate) fn supported_routes() -> Vec<String> {
+    rocm_engine_protocol::engine_supported_routes(ENGINE_NAME)
+}
+
 pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     handle_envelope(envelope)
 }

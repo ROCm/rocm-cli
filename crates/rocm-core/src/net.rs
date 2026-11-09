@@ -36,6 +36,23 @@ pub fn format_http_base_url(host: &str, port: u16) -> String {
     format!("http://{}", format_host_port(host, port))
 }
 
+/// The address a server bound to `bind_host` is reached on from this machine.
+///
+/// A server bound to every interface is reached on the loopback address of the
+/// same family, `0.0.0.0` on `127.0.0.1` and `::` on `::1`. `::1` reaches a
+/// `::` socket whether or not it also accepts IPv4, which `127.0.0.1` does not
+/// (Docker's `[::]` publish, `bindv6only=1`). Any other host is returned as
+/// given. The service records' `local_base_url` and the Anthropic proxy both
+/// reach their engine through this, so the two cannot map a bind differently.
+#[must_use]
+pub fn reachable_host(bind_host: &str) -> &str {
+    match bind_host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) if ip.is_unspecified() => DEFAULT_LOCAL_HOST,
+        Ok(std::net::IpAddr::V6(ip)) if ip.is_unspecified() => "::1",
+        _ => bind_host,
+    }
+}
+
 pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
     let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
     let authority = without_scheme.split('/').next()?.trim();
@@ -292,6 +309,21 @@ fn http_response_is_complete(response: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wildcard_bind_is_reached_on_the_loopback_of_its_family() {
+        for (bind, reached) in [
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "::1"),
+            ("0:0:0:0:0:0:0:0", "::1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "::1"),
+            ("192.0.2.7", "192.0.2.7"),
+            ("localhost", "localhost"),
+        ] {
+            assert_eq!(reachable_host(bind), reached, "{bind}");
+        }
+    }
 
     #[test]
     fn connect_tcp_stream_reaches_ipv4_listener_via_localhost() {

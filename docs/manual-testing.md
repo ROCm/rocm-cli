@@ -1260,6 +1260,42 @@ Expected result:
   disabling the wait. Clear the override with
   `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
 
+### 4e. API docs
+
+With a model served by `rocm serve <model>` (any engine):
+
+Expected result:
+
+- The deployment summary has a `docs` row under `endpoint` naming
+  `rocm services docs <service-id>`, plus an `engine docs` row ending in
+  `/docs` when the engine is vLLM. `rocm services list` shows the same lines
+  for that server.
+- `rocm serve <model> --verbose` of a model that is not yet running prints the
+  `docs:` line after `endpoint:`, and again in the "detached - server still
+  running" block after Ctrl-D. (Serving a model that is already running, piped
+  or with `--verbose`, is scenarios `service-docs-10` and `11`.)
+- `rocm services docs <service-id>` for a stopped server is refused, naming
+  `rocm services restart <service-id> --yes`; running that brings the server
+  back, and the docs command then serves its docs.
+- `rocm services docs <service-id>` prints a link and keeps running. Opening the
+  link in a browser shows the server's routes. Under
+  `POST /v1/chat/completions`, "Try it out" then "Execute" returns a chat
+  completion from the served model; the example body already names that model.
+- The page loads with the network disconnected (the docs need no CDN).
+- For a server started with `--require-api-key` (an endpoint key), "Execute"
+  is refused until the key is entered under "Authorize".
+- With a second `rocm services docs` already holding port 11430, a new one
+  says it serves on a free port and prints that port's link; with `--port 11430`
+  it fails instead.
+- With `HTTP_PROXY` set to an address nothing listens on before
+  `rocm services docs` starts, "Try it out" still reaches the server.
+- Killing the model server's process (not with `rocm services stop`) while the
+  docs are open: about a second later the root page no longer lists it and its page
+  says it is not running, as `rocm services list` no longer lists it as
+  running.
+- After Ctrl+C the command prints `API docs stopped.`, the link no longer
+  opens, and the model server still answers on its endpoint.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are

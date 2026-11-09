@@ -27,7 +27,7 @@ use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 ///
 /// Distinct from every other e2e serve model so its service records can never
 /// collide with another scenario's.
-const LIVE_REUSE_MODEL: &str = "e2e/reuse-model";
+pub(crate) const LIVE_REUSE_MODEL: &str = "e2e/reuse-model";
 
 /// How long to wait for an interactive (PTY) serve summary to render and exit.
 ///
@@ -229,6 +229,7 @@ async fn serve_and_wait(
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
+        world.serve_stdout = Some(stdout.clone());
         return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
@@ -683,6 +684,7 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
+            world.serve_stdout = Some(stdout);
             return;
         }
         // `serve_failure_evidence` reads and copies out the log BEFORE it stops

@@ -1316,6 +1316,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 metrics,
                 api_key: launched_key,
                 notes,
+                docs_rows: crate::services_docs::launch_docs_rows(&paths, &report.service_id),
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
             // in service_launch/start.rs; see its rationale for why the tag below is
@@ -1324,7 +1325,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             print!("{}", serve_summary::render_summary(&summary));
         } else {
             spinner.clear();
-            print_managed_launch_plain(&report, launched_key.as_deref());
+            print_managed_launch_plain(
+                &report,
+                launched_key.as_deref(),
+                &crate::services_docs::launch_docs_rows(&paths, &report.service_id),
+            );
         }
         return Ok(());
     }

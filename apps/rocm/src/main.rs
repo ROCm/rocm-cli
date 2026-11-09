@@ -68,6 +68,7 @@ mod service_hints;
 mod service_launch;
 mod service_records;
 mod services_cmd;
+mod services_docs;
 mod services_text;
 mod setup_cmd;
 mod shell_quote;

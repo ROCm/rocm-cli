@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT
 
 //! `rocm services`: the command handler (`services`), which dispatches the
-//! `list`, `logs`, `stop`, `restart`, `remove` and `prune` subcommands, and
+//! `list`, `docs` (to `services_docs.rs`), `logs`, `stop`, `restart`,
+//! `remove` and `prune` subcommands, and
 //! `run_approved_service_action`, the approval-gated stop/restart path, with
 //! `finish_service_action`, which renders its result and fails a stop that
 //! could not confirm the server gone.
@@ -59,6 +60,9 @@ pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
                 print!("{}", render_services_text(&paths, all)?);
             }
             Ok(())
+        }
+        ServicesCommand::Docs { service_id, port } => {
+            crate::services_docs::run(&paths, service_id.as_deref(), port)
         }
         ServicesCommand::Logs { service_id, follow } => {
             if follow {

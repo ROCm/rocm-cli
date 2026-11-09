@@ -53,6 +53,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
+    ("service_docs.feature", "service-docs"),
     ("service_record_cleanup.feature", "service-cleanup"),
     ("service_record_unqueryable.feature", "service-unqueryable"),
     ("service_stop.feature", "service-stop"),

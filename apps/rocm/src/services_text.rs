@@ -463,15 +463,22 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
                 anthropic_endpoint_line(paths, &record, anthropic)
             );
         }
+        if record.is_live() {
+            let _ = writeln!(
+                output,
+                "  docs: {}",
+                crate::services_docs::docs_hint(&record.service_id)
+            );
+            if let Some(engine_docs) = record.engine_docs_url() {
+                let _ = writeln!(output, "  engine docs: {engine_docs}");
+            }
+        }
         let _ = writeln!(
             output,
             "  logs: rocm services logs {}",
             shell_quote(&record.service_id)
         );
-        if matches!(
-            record.status.as_str(),
-            "ready" | "running" | "starting" | "recovering"
-        ) {
+        if record.is_live() {
             let _ = writeln!(
                 output,
                 "  stop: {}",
@@ -1820,6 +1827,60 @@ pub(crate) mod tests {
         }
         assert!(!paths.service_manifest_path("nope").exists());
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The `docs:` line names `rocm services docs` for a running server only,
+    /// and the `engine docs:` line appears only for vLLM, the one engine that
+    /// serves docs of its own. That the named command serves the docs is
+    /// scenario service-docs-01, which runs the printed line.
+    #[test]
+    fn services_list_names_the_docs_command_only_for_running_servers() -> Result<()> {
+        let mut rendered = Vec::new();
+        for (name, engine, status) in [
+            ("services-docs-vllm", "vllm", "starting"),
+            ("services-docs-lemonade", "lemonade", "starting"),
+            ("services-docs-stopped", "vllm", "stopped"),
+        ] {
+            let (root, paths) = test_paths(name);
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                "svc-x",
+                engine,
+                "qwen",
+                "Qwen/Qwen3.5",
+                "0.0.0.0",
+                11436,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            );
+            record.status = status.to_owned();
+            record.write()?;
+            rendered.push(render_services_text(&paths, true)?);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let [vllm, lemonade, stopped] = &rendered[..] else {
+            unreachable!()
+        };
+        assert!(
+            vllm.contains("\n  docs: rocm services docs svc-x\n"),
+            "{vllm}"
+        );
+        assert!(
+            vllm.contains("\n  engine docs: http://127.0.0.1:11436/docs\n"),
+            "{vllm}"
+        );
+        assert!(
+            lemonade.contains("\n  docs: rocm services docs svc-x\n"),
+            "{lemonade}"
+        );
+        assert!(!lemonade.contains("engine docs:"), "{lemonade}");
+        assert!(stopped.contains("status: stopped"), "{stopped}");
+        assert!(!stopped.contains("docs:"), "{stopped}");
         Ok(())
     }
 
