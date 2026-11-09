@@ -149,7 +149,11 @@ use host_gpu::{
     detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
-pub use log_tail::tail_lines;
+pub use log_tail::{
+    LOG_VIEW_MAX_TAIL_READ, LogDecode, LogTail, newest_line_exceeds_bound_notice,
+    service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
+    tail_log_decoded,
+};
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
