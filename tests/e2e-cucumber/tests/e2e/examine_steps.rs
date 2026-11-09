@@ -2549,9 +2549,21 @@ async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
 /// The release the stand-in `uname` reports, chosen so no real host has it.
 const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
 
+/// Where the stand-in `uname` logs the arguments of every call, one line each,
+/// so a scenario can count the reads. Inside the isolated root.
+fn stand_in_uname_log(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-calls.log")
+}
+
 /// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
 /// `release_body` (a shell fragment); `-v` answers a fixed string, so the
-/// examination's other `uname` read has nothing to wait for. Nothing else on the
+/// examination's other `uname` read has nothing to wait for. Every call appends
+/// its arguments to [`stand_in_uname_log`]. Nothing else on the
 /// machine is planted: the stand-in is what `rocm examine` reads on any Linux
 /// host, native or WSL, because both stacks run `uname -r` there.
 fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
@@ -2562,10 +2574,12 @@ fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
         .path()
         .join("uname-bin");
     std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    let log = stand_in_uname_log(world);
     rocm_core::fake_executable::write_fake_executable(
         &bin.join("uname"),
         format!(
-            "#!/bin/sh\nif [ \"$1\" = -v ]; then echo '#1 SMP stand-in'; exit 0; fi\n{release_body}\n"
+            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = -v ]; then echo '#1 SMP stand-in'; exit 0; fi\n{release_body}\n",
+            log.display()
         ),
     )
     .expect("failed to write the stand-in uname");
@@ -2612,6 +2626,18 @@ async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
         STAND_IN_KERNEL_RELEASE,
         "{json:#}"
     );
+}
+
+/// One `rocm examine --json` run asks `uname` for the release once, for the
+/// examination and the summary together: the stand-in logged a single `-r`. A
+/// second read would show as a second line, and it is what lets a transient
+/// failure make the two fields disagree.
+#[then("that run asked uname for the kernel release once")]
+async fn assert_uname_was_asked_for_the_release_once(world: &mut E2eWorld) {
+    let log = std::fs::read_to_string(stand_in_uname_log(world))
+        .expect("the stand-in uname was never called");
+    let release_reads = log.lines().filter(|line| line.trim() == "-r").count();
+    assert_eq!(release_reads, 1, "calls of the stand-in uname:\n{log}");
 }
 
 #[then(

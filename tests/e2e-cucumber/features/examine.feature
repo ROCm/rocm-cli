@@ -605,7 +605,10 @@ Feature: GPU detection and system inspection
   # diagnoses read). They used to run `uname -r` separately, with different limits
   # and different rules for a failed or malformed answer, and could disagree. They
   # share one read now, so one `--json` run holds the two level on a specific
-  # value, not only on both being filled.
+  # value, not only on both being filled, and the stand-in counts its calls to show
+  # that the run asked for the release once: the summary takes the examination's
+  # read, so a transient failure cannot make the two fields disagree and a hung
+  # `uname` costs one timeout.
   #
   # The stand-in `uname` is planted first on PATH, so the scenario describes a
   # kernel no runner has. It runs on every Linux lane, native or WSL, because both
@@ -616,6 +619,7 @@ Feature: GPU detection and system inspection
     Given a machine whose uname reports a kernel release
     When the user inspects that machine in machine-readable form
     Then the summary and the examination report that kernel release
+    And that run asked uname for the kernel release once
 
   # A `uname` that fails is not trusted for what it printed first: the examination
   # used to keep that release while the summary dropped it. Neither reports a

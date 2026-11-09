@@ -88,7 +88,8 @@ pub(crate) fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Resul
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
         // in a loop.
-        let host = ExamineSummary::gather()?;
+        // `gather_after`, so the kernel release is read once for both documents.
+        let host = ExamineSummary::gather_after(&examination)?;
         // The human report's "AMD GPU detected" line reads this same
         // `detected_gfx_target`; WSL skips the probes that would set
         // `has_amd_gpu`, so take it from here rather than leave the two forms
