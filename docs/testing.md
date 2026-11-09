@@ -1066,7 +1066,12 @@ backend directory is not read; the report says how many symlinked entries it
 declined to follow. The same rule covers every file the report reads: the
 manifest, the pins file, `version.txt` and a candidate's fingerprint target are
 refused when the last path component is a symlink, and the report says `symlink
-not followed` in place of the content. When a limit or the clock ends the search early the report
+not followed` in place of the content. On unix the refusal is made by the open
+itself (`O_NOFOLLOW`), so a path swapped for a link after an earlier check is still
+refused; on Windows it is a metadata check followed by an open, so a swap between
+the two is not caught (read-only evidence, and the swap needs write access to the
+backend directory). Only the last component is checked: a link in a parent
+directory is followed. When a limit or the clock ends the search early the report
 says which, and does not claim an empty result. When nothing is found, the report
 lists the searched locations and what `bin/llamacpp` holds (the first 16 names
 out of at most 64 entries read, with a count of those omitted), and does not

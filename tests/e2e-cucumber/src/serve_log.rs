@@ -179,7 +179,7 @@ pub(crate) fn read_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, S
 /// "fits" with the surplus dropped without a word, so the read falls back to the
 /// head and tail of the file as it is now and the note says it grew. A file that
 /// shrank instead is returned as read, with a note that it changed.
-fn read_clamped_file(
+pub(crate) fn read_clamped_file(
     mut file: std::fs::File,
     len: u64,
     max: u64,

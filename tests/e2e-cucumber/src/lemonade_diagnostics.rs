@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::serve_log::{ENGINE_UNKNOWN_EVIDENCE, read_clamped};
+use crate::serve_log::{ENGINE_UNKNOWN_EVIDENCE, read_clamped_file};
 
 const MAX_EVIDENCE_BYTES: u64 = 64 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,19 +175,61 @@ impl Inventory {
 /// What the report says about a file it did not read because it is a symlink.
 const SYMLINK_NOT_FOLLOWED: &str = "symlink not followed";
 
-/// Whether the last component of `path` is itself a symlink (not followed).
+/// Whether the last component of `path` is itself a symlink (not followed). Only
+/// the non-unix [`open_no_follow`] needs it; unix refuses in the open itself.
+#[cfg(not(unix))]
 fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
-/// [`read_clamped`], except that a path which is a symlink is refused rather than
-/// followed, the same rule the directory walk applies: a link inside the backend
-/// tree that points outside it must not put the outside file into the report.
-fn read_regular_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
-    if is_symlink(path) {
-        return Err(std::io::Error::other(SYMLINK_NOT_FOLLOWED));
+/// Whether `error` is the refusal [`open_no_follow`] makes for a symlink.
+fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Other && error.to_string() == SYMLINK_NOT_FOLLOWED
+}
+
+/// Open `path` for reading, refusing it when its last component is a symlink.
+///
+/// On unix the refusal is made by the open itself (`O_NOFOLLOW`), so there is no
+/// window between a check and the open in which the path could be swapped for a
+/// link: a link is refused whenever it is there at the moment of the open. On
+/// Windows the check is a metadata read followed by an open, so a path swapped for
+/// a link between the two is not caught; the evidence is read-only and the swap
+/// needs write access to the backend directory, so that is accepted rather than
+/// reached for with platform calls this harness does not otherwise make. Only
+/// the last component is checked on either platform: a link in a parent directory
+/// is followed.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    std::io::Error::other(SYMLINK_NOT_FOLLOWED)
+                } else {
+                    error
+                }
+            })
     }
-    read_clamped(path, max)
+    #[cfg(not(unix))]
+    {
+        if is_symlink(path) {
+            return Err(std::io::Error::other(SYMLINK_NOT_FOLLOWED));
+        }
+        std::fs::File::open(path)
+    }
+}
+
+/// [`read_clamped`] on a file opened with [`open_no_follow`]: a link inside the
+/// backend tree that points outside it must not put the outside file into the
+/// report, the same rule the directory walk applies.
+fn read_regular_clamped(path: &Path, max: u64) -> std::io::Result<(Vec<u8>, String)> {
+    let file = open_no_follow(path)?;
+    let len = file.metadata()?.len();
+    read_clamped_file(file, len, max)
 }
 
 /// Answers "has the inventory's time run out?". Injected so a test can drive the
@@ -296,15 +338,19 @@ fn inspect_candidate(server: &Path, deadline: Instant) -> String {
     }
     if let Some(parent) = server.parent() {
         let version = parent.join("version.txt");
-        if is_symlink(&version) {
-            let _ = writeln!(report, "{}: {SYMLINK_NOT_FOLLOWED}", version.display());
-        } else if let Ok((bytes, note)) = read_clamped(&version, MAX_EVIDENCE_BYTES) {
-            let _ = writeln!(
-                report,
-                "{}: {}{note}",
-                version.display(),
-                String::from_utf8_lossy(&bytes)
-            );
+        match read_regular_clamped(&version, MAX_EVIDENCE_BYTES) {
+            Ok((bytes, note)) => {
+                let _ = writeln!(
+                    report,
+                    "{}: {}{note}",
+                    version.display(),
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            Err(error) if is_symlink_refusal(&error) => {
+                let _ = writeln!(report, "{}: {SYMLINK_NOT_FOLLOWED}", version.display());
+            }
+            Err(_) => {}
         }
     }
     report
@@ -630,10 +676,7 @@ fn fingerprint_with_limit(server: &Path, deadline: Instant, limit: u64) -> std::
             describe_hash_limit(limit)
         ))
     };
-    if is_symlink(server) {
-        return Err(std::io::Error::other(SYMLINK_NOT_FOLLOWED));
-    }
-    let mut file = std::fs::File::open(server)?;
+    let mut file = open_no_follow(server)?;
     // Do not hash an arbitrarily large corrupt cache entry while reporting a
     // failure. Never label a partial hash as SHA256.
     if file.metadata()?.len() > limit {
@@ -1183,6 +1226,38 @@ mod tests {
         assert_eq!(found.stop, None, "{found:?}");
         assert_eq!(found.symlinks_skipped, 5, "{found:?}");
         assert_eq!(found.dirs_visited, 2, "{found:?}");
+    }
+
+    /// The refusal is made by the open itself, not by a check before it, so a path
+    /// that becomes a link after any check is still refused. The helper is called
+    /// directly on a link, which is what a swap after the metadata check looks like
+    /// to it; removing `O_NOFOLLOW` makes the open succeed and turns this red. A
+    /// regular file still opens, and a missing one reports its own error, not a
+    /// refusal. (Unix only: on Windows the check and the open are separate steps.)
+    #[cfg(unix)]
+    #[test]
+    fn the_open_itself_refuses_a_symlink() {
+        use std::io::Read as _;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, "OUTSIDE").unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        let error = open_no_follow(&link).unwrap_err();
+        assert!(is_symlink_refusal(&error), "{error}");
+        assert_eq!(error.to_string(), SYMLINK_NOT_FOLLOWED);
+
+        let mut text = String::new();
+        open_no_follow(&real)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "OUTSIDE");
+        let missing = open_no_follow(&dir.path().join("missing")).unwrap_err();
+        assert!(!is_symlink_refusal(&missing), "{missing}");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Every file the report reads from the backend tree is refused when it is a
