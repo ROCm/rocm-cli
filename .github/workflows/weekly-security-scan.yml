@@ -22,6 +22,7 @@ jobs:
     name: Security scan
     # Only the job that uploads SARIF gets write access to code scanning.
     permissions:
+      actions: read
       contents: read
       security-events: write
     uses: ROCm/rocm-security-gh/.github/workflows/security-baseline.yml@35d3060c4b2ed48f950f85bd414a1302a431fc0b # v1.0.8

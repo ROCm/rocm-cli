@@ -15,8 +15,9 @@ name: Security scan (PR)
 
 on:
   pull_request:
-    # Spelled out the default to avoid confusion.
-    types: [opened, synchronize, reopened]
+    # The default types plus ready_for_review, so a draft marked ready without
+    # a new push still gets scanned.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
