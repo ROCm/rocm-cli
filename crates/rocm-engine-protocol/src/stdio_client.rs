@@ -1083,7 +1083,7 @@ mod tests {
         #[test]
         fn a_childs_stderr_reaches_the_forwarding_sink_when_there_is_one() {
             let progress = "downloading 1/2\ndownloading 2/2\n";
-            let body = format!("printf '%s' '{}' >&2\nprintf '%s' '{STOPPED}'", progress);
+            let body = format!("printf '%s' '{progress}' >&2\nprintf '%s' '{STOPPED}'");
             let engine = FakeEngine::new("client-forward-sink", true, &body);
 
             let sink = SharedSink::default();
