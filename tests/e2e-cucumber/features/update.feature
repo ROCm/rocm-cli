@@ -92,3 +92,49 @@ Feature: Update report
     When the user checks for updates against that catalog
     Then the report calls the runtime the catalog spells differently up to date
     And the report offers no update for the four-component runtime that is ahead of the catalog
+
+  # `rocm update` is a check: it reads the installed runtimes and the index and
+  # changes nothing. To tell which wheels fit a wheel runtime it needs the
+  # interpreter's tag, and on a host with no usable Python it used to go and get
+  # one: it downloaded a managed `uv`, had `uv` install Python and saved that
+  # Python's path in the configuration, all before printing the report. The same
+  # resolution runs for `rocm update --json` (the dashboard's check) and for the
+  # startup check that runs ahead of other commands, so a read-only look at the
+  # runtimes could prepare a Python. Now the check works the tag out from the
+  # interpreter the install would prepare, says it would prepare one, and
+  # prepares nothing.
+  #
+  # The report's note says the check prepared nothing, so the Then checks that
+  # note and the state together, as runtime-23 does for the install preview: the
+  # recording `uv` is reached only by going on to prepare a Python, so its log not
+  # existing means no preparation was attempted, and the managed tools folder and
+  # the configuration must be absent too. The first Then shows the check still got
+  # as far as a verdict, so the absences are not just a command that stopped
+  # early. `--json` and the startup check are pinned by the unit tests in
+  # `apps/rocm/src/therock/update.rs`.
+  #
+  # Linux only, for the same empty-`PATH` host as runtime-23. The canonical
+  # release index is served from a loopback fixture, so no network is needed.
+  @id:update-check-prepares-no-python @requires-os:linux
+  Scenario: update-09 - Checking for updates on a host with no usable Python prepares no Python
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And a registered wheel runtime older than the index with no recorded Python
+    When the user checks for updates against the pip index
+    Then the report offers the newer runtime and says it would prepare a managed Python
+    And the update check prepared no Python, as it says
+
+  # The sibling for `--dry-run`, which promises to show what `--apply` would do
+  # and change nothing. Its plan step resolved the same way and prepared the
+  # Python before the preview was printed; the apply itself still prepares what it
+  # needs, which the unit tests keep apart from the check.
+  #
+  # Linux only, for the same empty-`PATH` host as update-09.
+  @id:update-dry-run-prepares-no-python @requires-os:linux
+  Scenario: update-10 - Previewing an update on a host with no usable Python prepares no Python
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And a registered wheel runtime older than the index with no recorded Python
+    When the user previews applying the update to that wheel runtime
+    Then the preview says a real install would prepare a managed Python
+    And the preview prepared no Python, as it says

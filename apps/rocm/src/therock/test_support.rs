@@ -11,7 +11,45 @@ use crate::runtime_registry::{InstalledRuntimeManifest, runtime_manifest_path};
 use anyhow::Result;
 use rocm_core::AppPaths;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Process environment variables set for one test and restored on drop. Every
+/// caller holds `PROCESS_ENV_TEST_LOCK` for as long as it holds this.
+pub(super) struct RestoredEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl RestoredEnv {
+    /// Sets (`Some`) or removes (`None`) each variable, remembering what it was.
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    pub(super) fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for RestoredEnv {
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 pub(super) fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
     FamilyResolution {
