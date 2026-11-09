@@ -1831,10 +1831,10 @@ runs the real stop against this test's own PID with a wrong token on Linux and
 Windows (a stop that went ahead would end the test process), and
 `terminate_recorded_pid_leaves_a_recycled_pid_alone_and_stops_the_verified_one`
 repeats it against a bystander on Windows only and then stops that bystander
-with its true token. `service-stop-09` is the live version on every OS: it
+with its true token. `service-stop-08` is the live version on every OS: it
 records a running process under a token no live process has, stops the server,
 and asserts that the process is still running and the record names no process.
-Neither Windows-only test nor the Windows half of `service-stop-09` ran where
+Neither Windows-only test nor the Windows half of `service-stop-08` ran where
 this was written; the Windows CI jobs are what exercise them. A stop that cannot
 verify a process names `ps -p <pid> -o pid,args` on Linux and `tasklist /FI "PID
 eq <pid>"` on Windows (`process_check_command`).
@@ -1882,7 +1882,7 @@ checks that the line omits it and no key file exists. Because the seam
 replaces `terminate_verified`, they say nothing about what is signalled. They need
 a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 --features rocm/e2e-test-hooks`, then the command above with `-n
-"service-stop-0[1-69]"`. Not `-n "service-stop"`: a name filter bypasses the
+"service-stop-0[1-68]"`. Not `-n "service-stop"`: a name filter bypasses the
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 

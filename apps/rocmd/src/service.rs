@@ -331,7 +331,7 @@ mod tests {
     /// read from `/proc`. The same refusal on Windows, where the token is the
     /// process creation time, is asserted in `rocm-core`'s `proc_lifecycle`
     /// tests (`terminate_recorded_pid_refuses_a_pid_whose_recorded_identity_no_longer_matches`
-    /// and its Windows-only neighbour) and by scenario `service-stop-09`.
+    /// and its Windows-only neighbour) and by scenario `service-stop-08`.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_managed_service_refuses_a_pid_whose_recorded_identity_no_longer_matches() -> Result<()>

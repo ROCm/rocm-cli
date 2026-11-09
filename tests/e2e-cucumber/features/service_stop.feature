@@ -157,7 +157,7 @@ Feature: Stopping a managed service
   # running, and the scenario fails on it. No GPU, no engine, no network. The
   # record carries no start-time token, like a Windows record written before the
   # token was recorded: the case where the PID cannot be refuted, which the tree
-  # kill and the cleared record exist for. service-stop-09 below is the same stop
+  # kill and the cleared record exist for. service-stop-08 below is the same stop
   # with a token that does not match.
 
   @id:service-stop-takes-down-the-whole-process-tree-on-windows
@@ -182,7 +182,7 @@ Feature: Stopping a managed service
   # checked on the process itself. Runs on every OS: the planted token is one
   # no live process has.
   @id:service-stop-leaves-a-process-that-reused-the-recorded-pid-alone
-  Scenario: service-stop-09 - Stopping a managed server whose recorded PID now belongs to another process leaves that process running
+  Scenario: service-stop-08 - Stopping a managed server whose recorded PID now belongs to another process leaves that process running
     Given a managed server whose recorded process id now belongs to a different process
     When the user stops it with --yes
     Then the CLI reports the service as stopped
