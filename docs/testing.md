@@ -245,6 +245,15 @@ disposition inside every read and every write and after the loop. `FakeEngine` q
 for the shell, so a response such as `can't stop`, or a `TMPDIR` containing an
 apostrophe, reaches the client intact.
 
+The `forward_stderr` option, which is what shows a user an engine install's
+progress, is tested at both ends: the client runs against a private entry point
+that takes the sink (`a_childs_stderr_reaches_the_forwarding_sink_when_there_is_one`,
+a `Vec`-backed writer), and the public entry point is run in a re-executed test
+binary whose own stderr the parent reads
+(`forward_stderr_sends_the_childs_stderr_to_this_processs_stderr`: the child's
+line is there with the option and absent without it). Replacing the one
+`forward_stderr.then(io::stderr)` with `None` turns the second red.
+
 A child whose answer cannot be read is killed and reaped before the error is
 returned, as it is when the request cannot be written, so the long-lived daemon
 does not collect a running engine or a zombie per failure.

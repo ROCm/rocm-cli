@@ -141,6 +141,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_engine_stdio_forwarding(
+        program,
+        args,
+        options,
+        envelope,
+        options.forward_stderr.then(io::stderr),
+    )
+}
+
+/// [`run_engine_stdio`] with the sink the child's stderr is forwarded to chosen
+/// by the caller (`None` forwards nothing), so a test can see what is forwarded
+/// without capturing this process's own stderr. [`run_engine_stdio`] is the one
+/// place the `forward_stderr` option becomes a sink.
+fn run_engine_stdio_forwarding<I, S>(
+    program: &Path,
+    args: I,
+    options: &EngineStdioOptions<'_>,
+    envelope: &EngineRequestEnvelope,
+    forward: Option<impl Write + Send + 'static>,
+) -> Result<EngineResponseEnvelope>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut child = engine_stdio_command(program, args, options)
         .spawn()
         .with_context(|| format!("failed to spawn engine stdio process {}", program.display()))?;
@@ -167,10 +191,10 @@ where
     // End of the request: the engine reads to EOF before it answers.
     drop(stdin);
 
-    let forward_stderr = options.forward_stderr;
-    let stderr_reader = child.stderr.take().map(|stderr| {
-        thread::spawn(move || collect_stderr(stderr, forward_stderr.then(io::stderr)))
-    });
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || collect_stderr(stderr, forward)));
     let stdout_pipe = child
         .stdout
         .take()
@@ -988,6 +1012,88 @@ mod tests {
                 error.to_string(),
                 "failed to spawn engine stdio process /no/such/engine"
             );
+        }
+
+        /// A writer that keeps what it is given where the test can read it.
+        #[derive(Clone, Default)]
+        struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for SharedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// What the running child writes to its stderr reaches the forwarding
+        /// sink as it arrives. (That nothing is forwarded without the option is
+        /// the `off` arm of the test below.)
+        #[test]
+        fn a_childs_stderr_reaches_the_forwarding_sink_when_there_is_one() {
+            let progress = "downloading 1/2\ndownloading 2/2\n";
+            let body = format!("printf '%s' '{}' >&2\nprintf '%s' '{STOPPED}'", progress);
+            let engine = FakeEngine::new("client-forward-sink", true, &body);
+
+            let sink = SharedSink::default();
+            let answer = run_engine_stdio_forwarding(
+                engine.path(),
+                ["stdio"],
+                &EngineStdioOptions::default(),
+                &stop_request(),
+                Some(sink.clone()),
+            )
+            .unwrap();
+            assert!(answer.ok);
+            assert_eq!(sink.0.lock().unwrap().as_slice(), progress.as_bytes());
+        }
+
+        /// The public entry point sends the child's stderr to THIS process's
+        /// stderr when `forward_stderr` is set, and does not when it is not. That
+        /// is the one place the option takes effect, and it is what shows a user
+        /// an engine install's progress. The test binary re-executes itself so the
+        /// parent can read the stderr the arm writes.
+        #[test]
+        fn forward_stderr_sends_the_childs_stderr_to_this_processs_stderr() {
+            const LINE: &str = "engine progress line for the terminal";
+            if let Some(arm) = std::env::var_os("ROCM_TEST_CLIENT_FORWARD_OPTION_ARM") {
+                let engine = FakeEngine::new(
+                    "client-forward-option",
+                    true,
+                    &format!("echo '{LINE}' >&2\nprintf '%s' '{STOPPED}'"),
+                );
+                let options = EngineStdioOptions {
+                    forward_stderr: arm == "on",
+                    ..EngineStdioOptions::default()
+                };
+                run_engine_stdio(engine.path(), ["stdio"], &options, &stop_request()).unwrap();
+                return;
+            }
+
+            for (arm, expected) in [("on", true), ("off", false)] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "stdio_client::tests::child::forward_stderr_sends_the_childs_stderr_to_this_processs_stderr",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("ROCM_TEST_CLIENT_FORWARD_OPTION_ARM", arm)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{arm}: {:?}", output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    stderr.contains(LINE),
+                    expected,
+                    "forward_stderr {arm}: the child's stderr {} this process's stderr:\n{stderr}",
+                    if expected {
+                        "must reach"
+                    } else {
+                        "must not reach"
+                    }
+                );
+            }
         }
 
         /// Progress forwarded to a stderr whose reader has gone away is dropped, not
