@@ -364,12 +364,34 @@ fn restore_packaged_backend_versions_with(
         // Missing (or not JSON): there is nothing of the user's to keep.
         None => packaged,
     };
-    rocm_core::atomic_write::write_file_atomically(&target, &restored)
+    write_pin_file(&target, &restored)
         .with_context(|| format!("failed to restore {}", target.display()))?;
     Ok(Some(PinFileBackup {
         target,
         previous: current,
     }))
+}
+
+/// Replaces the pin file at `target` through
+/// `rocm_core::atomic_write::write_file_atomically`, but only inside a
+/// directory that is still there.
+///
+/// The shared writer creates a missing parent directory. For this file that
+/// would rebuild `resources/` in a runtime tree that has been removed, leaving
+/// a directory holding nothing but a pin file that looks like the start of an
+/// install. The restore and the put-back both run after a failed install, when
+/// the tree may be gone, so a missing parent stays a failure, as it was before
+/// the shared writer took over.
+fn write_pin_file(target: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent()
+        && !parent.is_dir()
+    {
+        bail!(
+            "{} does not exist; not recreating it to hold the pin file",
+            parent.display()
+        );
+    }
+    rocm_core::atomic_write::write_file_atomically(target, bytes)
 }
 
 /// The two entries of `resources/backend_versions.json` that backend alignment
@@ -439,7 +461,7 @@ impl PinFileBackup {
     /// Writes the previous bytes back, or removes the file if there were none.
     pub(crate) fn put_back(self) -> Result<()> {
         match self.previous {
-            Some(bytes) => rocm_core::atomic_write::write_file_atomically(&self.target, &bytes)
+            Some(bytes) => write_pin_file(&self.target, &bytes)
                 .with_context(|| format!("failed to put back {}", self.target.display())),
             None => match fs::remove_file(&self.target) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -1453,6 +1475,67 @@ mod tests {
         assert_eq!(fs::read(&pins).unwrap(), previous);
         assert_no_pin_temp_files(&dir);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A put-back onto a runtime tree that has been removed fails, as it did
+    /// before the shared atomic writer, and recreates nothing: the shared
+    /// writer would build `resources/` just to hold the pin file. The failure
+    /// message and the absent directory are asserted together, since the
+    /// warning the caller prints says the previous file could not be put back.
+    #[test]
+    fn putting_a_pin_file_backup_back_into_a_removed_tree_fails_and_recreates_nothing() {
+        let dir = scratch_dir("pin-backup-removed-tree");
+        let resources = dir.join("runtime").join("resources");
+        let pins = resources.join("backend_versions.json");
+
+        let error = PinFileBackup::new(pins, Some(b"{}".to_vec()))
+            .put_back()
+            .expect_err("the tree is gone, so the previous pins cannot be put back into it");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("failed to put back") && text.contains("not recreating"),
+            "{text}"
+        );
+        assert!(
+            !resources.exists(),
+            "put_back recreated {}",
+            resources.display()
+        );
+        assert!(!dir.join("runtime").exists(), "put_back recreated the tree");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The restore has the same rule: a runtime tree removed while the archive
+    /// was being read is not rebuilt around a freshly written pin file.
+    #[test]
+    fn restoring_the_packaged_pins_into_a_removed_tree_fails_and_recreates_nothing() {
+        let fixture = RestoreFixture::new(
+            "restore-removed-tree",
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#,
+        );
+        let runtime_dir = fixture.manifest.runtime_dir.clone();
+
+        let error = restore_packaged_backend_versions_with(
+            &fixture.manifest,
+            "resources/backend_versions.json",
+            &fixture.sha256,
+            || fs::remove_dir_all(&runtime_dir).unwrap(),
+        )
+        .expect_err("the tree is gone, so the packaged pins cannot be written into it");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("failed to restore") && text.contains("not recreating"),
+            "{text}"
+        );
+        assert!(
+            !runtime_dir.exists(),
+            "the restore recreated {}",
+            runtime_dir.display()
+        );
+        fs::remove_dir_all(&fixture.dir).ok();
     }
 
     #[test]
