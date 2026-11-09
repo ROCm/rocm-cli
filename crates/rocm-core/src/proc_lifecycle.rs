@@ -502,6 +502,10 @@ pub fn terminate_recorded_service_pids(
 /// hold, the process could exit and an unrelated one take its PID between the
 /// check and the kill.
 ///
+/// The descendant kill is bounded: a `taskkill` that has not finished within
+/// [`MANAGED_STOP_GRACE`] is killed and reaped and counts as a tree kill that did
+/// not complete, so a stalled helper cannot hang the stop.
+///
 /// A tree kill that did not complete leaves the stop unconfirmed, whatever the
 /// root's own termination says: [`terminate_verified`] can only watch the root
 /// on Windows, so a descendant that `taskkill` did not take down is one this stop
@@ -631,9 +635,11 @@ fn platform_tree_kill() -> Option<&'static dyn Fn(u32) -> TreeKill> {
 
 /// The verdict on one `taskkill` run, from whether it started and the exit code
 /// it ended with. Only a clean exit (0) is a completed tree kill: a failed
-/// launch, a nonzero code (a process it could not terminate, or none found) and a
-/// run that ended without a code are all [`TreeKill::Failed`]. Split out of the
-/// process spawn so a test runs it on every host.
+/// launch, a run that did not finish within its deadline
+/// ([`std::io::ErrorKind::TimedOut`], see [`run_to_exit_code`]), a nonzero code
+/// (a process it could not terminate, or none found) and a run that ended
+/// without a code are all [`TreeKill::Failed`]. Split out of the process spawn
+/// so a test runs it on every host.
 #[cfg(any(windows, test))]
 fn classify_taskkill(run: std::io::Result<Option<i32>>) -> TreeKill {
     match run {
@@ -642,18 +648,69 @@ fn classify_taskkill(run: std::io::Result<Option<i32>>) -> TreeKill {
     }
 }
 
+/// How long the descendant kill may run. It happens before
+/// [`terminate_verified`]'s bounded waits, so without its own deadline a stalled
+/// helper would hang the stop; the same bound as every other wait of a managed
+/// stop.
+#[cfg(windows)]
+const TREE_KILL_DEADLINE: Duration = MANAGED_STOP_GRACE;
+
+/// Start `command` and wait for it to exit, for at most `deadline`. Returns its
+/// exit code (`None` when it ended without one). A child still running at the
+/// deadline is killed and reaped, so none is left behind, and the call fails
+/// with [`std::io::ErrorKind::TimedOut`].
+#[cfg(any(windows, test))]
+fn run_to_exit_code(
+    command: &mut std::process::Command,
+    deadline: Duration,
+) -> std::io::Result<Option<i32>> {
+    let mut child = command.spawn()?;
+    wait_for_exit_code(&mut child, deadline)
+}
+
+/// The wait of [`run_to_exit_code`], on a child already started. Kills and reaps
+/// `child` when the deadline passes, or when it cannot be polled, rather than
+/// leaving it running.
+#[cfg(any(windows, test))]
+fn wait_for_exit_code(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> std::io::Result<Option<i32>> {
+    let end = Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        let now = Instant::now();
+        if now >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the process did not exit before its deadline",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL.min(end.saturating_duration_since(now)));
+    }
+}
+
 #[cfg(windows)]
 fn taskkill_tree(pid: u32) -> TreeKill {
     use std::process::{Command, Stdio};
-    classify_taskkill(
+    classify_taskkill(run_to_exit_code(
         Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.code()),
-    )
+            .stderr(Stdio::null()),
+        TREE_KILL_DEADLINE,
+    ))
 }
 
 /// Poll until every process in `members` has exited, or `grace` elapses.
@@ -1589,6 +1646,100 @@ mod tests {
         }
     }
 
+    /// A command that exits at once with `code`, and one that runs far longer
+    /// than any test waits, on whichever platform the tests run.
+    fn exits_with(code: i32) -> std::process::Command {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", &format!("exit {code}")]);
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    fn runs_for_thirty_seconds() -> std::process::Command {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[test]
+    fn a_helper_that_exits_in_time_gives_its_exit_code() {
+        let deadline = Duration::from_secs(20);
+
+        assert_eq!(
+            run_to_exit_code(&mut exits_with(0), deadline).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            run_to_exit_code(&mut exits_with(3), deadline).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_started_is_an_error() {
+        let mut command = std::process::Command::new("rocm-core-test-no-such-program");
+
+        assert!(run_to_exit_code(&mut command, Duration::from_secs(1)).is_err());
+    }
+
+    /// A helper that stalls must not hold the stop: it is killed and reaped at
+    /// its deadline, the call ends close to it, and the verdict is a failed tree
+    /// kill, which leaves the stop unconfirmed.
+    #[test]
+    fn a_helper_that_stalls_is_killed_and_reaped_at_its_deadline() {
+        let mut command = runs_for_thirty_seconds();
+        let mut child = command.spawn().expect("spawn the stalled helper");
+        let pid = child.id();
+        let started = Instant::now();
+
+        let run = wait_for_exit_code(&mut child, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        let error = run.expect_err("a stalled helper does not finish");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(10),
+            "returned after {elapsed:?}, far from the deadline"
+        );
+        // Reaped: its status is already collected, and the process is gone.
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the killed helper was waited for"
+        );
+        assert!(
+            !crate::process_is_running(pid),
+            "the helper was killed, not left running"
+        );
+        assert_eq!(classify_taskkill(Err(error)), TreeKill::Failed);
+    }
+
     #[test]
     fn only_a_clean_taskkill_exit_is_a_completed_tree_kill() {
         use std::io::{Error, ErrorKind};
@@ -1598,9 +1749,13 @@ mod tests {
         assert_eq!(classify_taskkill(Ok(Some(128))), TreeKill::Failed);
         // Ended without an exit code.
         assert_eq!(classify_taskkill(Ok(None)), TreeKill::Failed);
-        // Could not be started.
+        // Could not be started, or did not finish before its deadline.
         assert_eq!(
             classify_taskkill(Err(Error::from(ErrorKind::NotFound))),
+            TreeKill::Failed
+        );
+        assert_eq!(
+            classify_taskkill(Err(Error::from(ErrorKind::TimedOut))),
             TreeKill::Failed
         );
     }

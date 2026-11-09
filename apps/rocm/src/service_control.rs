@@ -2772,4 +2772,50 @@ mod tests {
             );
         }
     }
+
+    /// The stop and the liveness read after it, end to end: a stop that cannot
+    /// verify a recorded process leaves the key and the stop request, and a later
+    /// refresh that still cannot query the process must not take them away or
+    /// reconcile the record to `stopped`. The refresh reads the record the stop
+    /// wrote, as a service listing does.
+    #[test]
+    fn an_unverified_stop_keeps_its_key_and_marker_through_a_later_liveness_refresh() {
+        let (root, paths) = test_paths("stop-unverified-then-refresh");
+        paths.ensure().unwrap();
+        let service_id = "svc-unverified-then-refresh";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            vec![stop_of(
+                999_999_999,
+                rocm_core::TerminationOutcome::Unverified,
+            )]
+        })
+        .unwrap();
+        assert_eq!(report["stopped"], false, "{report}");
+        let (mut record, _) = read_managed_service_manifest(&paths, service_id).unwrap();
+        assert!(
+            record.stop_requested_unix_ms.is_some(),
+            "the stop is pending"
+        );
+
+        let changed = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+            &paths,
+            &mut record,
+            |_| rocm_core::ProcessProbe::Unqueryable,
+        );
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+        assert!(
+            record.stop_requested_unix_ms.is_some(),
+            "the stop request is kept"
+        );
+        assert!(
+            !changed,
+            "nothing about the record may change while the process is unqueryable"
+        );
+    }
 }

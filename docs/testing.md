@@ -1852,11 +1852,30 @@ time that was compared is that of the process the kill then reaches
 reported as `timed_out`, whatever the root's own termination says, because only
 the root's exit is watched on Windows
 (`a_tree_kill_that_did_not_complete_leaves_the_stop_unconfirmed`,
-`only_a_clean_taskkill_exit_is_a_completed_tree_kill`); the report and the record
+`only_a_clean_taskkill_exit_is_a_completed_tree_kill`). That `taskkill` runs under
+a deadline of `MANAGED_STOP_GRACE`: one that stalls is killed and reaped and
+counts as a failed tree kill, so it cannot hang `rocm services stop`, `restart`
+or the attached Ctrl-C stop
+(`a_helper_that_stalls_is_killed_and_reaped_at_its_deadline` runs a long-sleeping
+child under a 200 ms deadline on every host and asserts the error, the bounded
+elapsed time, the reaped child and the failed verdict; `a_helper_that_exits_in_time_gives_its_exit_code`
+and `a_helper_that_cannot_be_started_is_an_error` are its neighbours). The report and the record
 a `timed_out` stop leaves are covered by
 `an_unconfirmed_stop_keeps_the_recorded_processes_for_the_next_stop`. What no
 test here reaches is the Windows API itself: the handle hold, the open-failure
 codes and a real `taskkill` failing run only on the Windows lane.
+
+The same unqueryable-process rule holds wherever a service's liveness decides
+something destructive. The deferred key cleanup and the reconciliation to
+`stopped` in the liveness refresh (`refresh_managed_service_runtime_liveness`) and
+the in-use check behind `rocm services remove` and `prune` read each recorded PID
+through `probe_process` and treat anything but a confirmed exit as possibly
+running. `a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried`
+drives the refresh with an unqueryable PID and then a confirmed-gone one,
+`an_unverified_stop_keeps_its_key_and_marker_through_a_later_liveness_refresh` runs
+an unverified stop and then the refresh over the record it wrote, and
+`a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone` covers the
+removal guard; each takes the probe as an argument, so they run on every host.
 `service-stop-06` (Linux) is the same stop of a real recorded process through
 `rocm services stop`, checking the persisted state: the process exited and the
 record names none. Run the Windows scenario on a Windows host with

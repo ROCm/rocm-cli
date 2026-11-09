@@ -369,11 +369,8 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
 /// but cannot be queried reads the same as one that is gone. A stop that is about
 /// to report a process as exited must not make that mistake, so this keeps the
 /// third answer apart.
-// Only the Windows probe can fail to query a live process, so nothing builds
-// `Unqueryable` elsewhere; the decision on it is shared by every platform.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcessProbe {
+pub enum ProcessProbe {
     /// The PID names a process that has not exited.
     Running,
     /// The PID names no process, or one that has exited.
@@ -382,6 +379,17 @@ pub(crate) enum ProcessProbe {
     /// confirmed gone. On Windows that includes a live process the caller may not
     /// open (`ERROR_ACCESS_DENIED`).
     Unqueryable,
+}
+
+impl ProcessProbe {
+    /// Whether the process may still be running: everything but a confirmed
+    /// exit. The answer for a decision that must not treat a process it could
+    /// not look at as gone, such as dropping a service's endpoint key, marking
+    /// its record stopped or deleting it.
+    #[must_use]
+    pub const fn may_be_running(self) -> bool {
+        !matches!(self, Self::Gone)
+    }
 }
 
 /// Windows `ERROR_INVALID_PARAMETER`: what `OpenProcess` sets for a PID that
@@ -406,8 +414,9 @@ pub(crate) const fn classify_open_failure(code: Option<i32>) -> ProcessProbe {
 /// Look at `pid`, keeping a process that cannot be queried apart from one that
 /// is gone. See [`ProcessProbe`].
 #[cfg(windows)]
+#[must_use]
 #[allow(unsafe_code)] // Win32 FFI
-pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
+pub fn probe_process(pid: u32) -> ProcessProbe {
     use windows_sys::Win32::Foundation::CloseHandle;
 
     if pid == 0 {
@@ -434,7 +443,8 @@ pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
 /// not signal (`EPERM`, which counts as running) from one that is gone, so there
 /// is no third answer to keep apart here.
 #[cfg(not(windows))]
-pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
+#[must_use]
+pub fn probe_process(pid: u32) -> ProcessProbe {
     if process_is_running(pid) {
         ProcessProbe::Running
     } else {
@@ -442,6 +452,12 @@ pub(crate) fn probe_process(pid: u32) -> ProcessProbe {
     }
 }
 
+/// Whether `pid` names a running process.
+///
+/// On Windows a live process this one may not open reads as not running here; a
+/// decision that must not take it for gone (dropping a key, marking a record
+/// stopped, deleting it) asks [`probe_process`] instead and keeps
+/// [`ProcessProbe::Unqueryable`] apart.
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub fn process_is_running(pid: u32) -> bool {

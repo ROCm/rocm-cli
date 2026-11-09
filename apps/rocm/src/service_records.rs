@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, ManagedServiceRecord, process_is_running};
+use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
     load_managed_services, managed_service_is_live, recorded_service_pids,
@@ -165,11 +165,24 @@ fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result
 /// server whose engine reported failure while its process is still up reads as
 /// removable, and deleting it takes the log and the 0600 endpoint key out from
 /// under a process that may still be serving.
+///
+/// A recorded process that could not be queried (on Windows, a live one this
+/// process may not open) counts as running: deleting the record and its key on
+/// the strength of a failed look is the mistake this guard exists to prevent.
 fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+    managed_service_record_is_in_use_with(record, rocm_core::probe_process)
+}
+
+/// [`managed_service_record_is_in_use`] with the read of each recorded PID
+/// supplied by the caller.
+fn managed_service_record_is_in_use_with(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
     managed_service_is_live(record)
         || recorded_service_pids(record)
             .iter()
-            .any(|pid| process_is_running(*pid))
+            .any(|pid| probe(*pid).may_be_running())
 }
 
 /// Remove one non-running local server record and everything it owns.
@@ -1793,6 +1806,29 @@ mod tests {
             "the error must name the preview command: {message}"
         );
         assert!(manifest_exists, "a refused prune must delete nothing");
+        Ok(())
+    }
+
+    /// A record whose status is not live is still in use while a process it
+    /// recorded may be running, and a process that could not be queried (on
+    /// Windows, a live one this process may not open) may be. Only a confirmed
+    /// exit makes it removable.
+    #[test]
+    fn a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone() -> Result<()> {
+        let (root, paths) = test_paths("services-in-use-probe");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-in-use", "failed", 999_999_999)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Unqueryable
+        }));
+        assert!(managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Running
+        }));
+        assert!(!managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Gone
+        }));
         Ok(())
     }
 }

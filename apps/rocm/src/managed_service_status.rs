@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rocm_core::{
-    AppPaths, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
-    managed_service_endpoint_readiness, process_is_running,
+    AppPaths, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord, ProcessProbe,
+    managed_service_endpoint_readiness,
 };
 
 use crate::endpoint_keys;
@@ -206,13 +206,22 @@ pub(crate) fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
 /// [`refresh_managed_service_runtime_liveness`], so a record that reached
 /// "stopped" by another route still gets its deferred cleanup rather than
 /// stranding the key.
-fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedServiceRecord) -> bool {
+///
+/// "Observed gone" means every recorded process is *confirmed* gone: a process
+/// that could not be queried (on Windows, a live one this process may not open)
+/// is not gone, and the stop that reported it unverified must keep its key and
+/// its marker until it is.
+fn settle_pending_stop_key_cleanup(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
     if record.stop_requested_unix_ms.is_none() {
         return false;
     }
     if recorded_service_pids(record)
         .iter()
-        .any(|pid| process_is_running(*pid))
+        .any(|pid| probe(*pid).may_be_running())
     {
         return false;
     }
@@ -225,7 +234,20 @@ pub(crate) fn refresh_managed_service_runtime_liveness(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> bool {
-    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record);
+    refresh_managed_service_runtime_liveness_with(paths, record, rocm_core::probe_process)
+}
+
+/// [`refresh_managed_service_runtime_liveness`] with the read of each recorded
+/// PID supplied by the caller, so a test drives the answer a host can give for a
+/// process it cannot query. Every decision here that a process is gone (the
+/// deferred key cleanup, the status reconciled to `stopped`) takes a confirmed
+/// exit; a process that could not be queried counts as possibly running.
+pub(crate) fn refresh_managed_service_runtime_liveness_with(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
+    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record, &probe);
     if !managed_service_is_live(record) {
         return settled_pending_stop;
     }
@@ -271,7 +293,7 @@ pub(crate) fn refresh_managed_service_runtime_liveness(
 
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
+    let has_live_pid = tracked_pids.iter().any(|pid| probe(*pid).may_be_running());
     if has_tracked_pid && !has_live_pid {
         // Reconcile the status only. The endpoint key is *not* dropped here:
         // dead pids alone do not distinguish a stopped service from a crashed
@@ -920,6 +942,95 @@ mod tests {
             find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),
             "the canonical-id term must still discriminate"
         );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A record whose stop was requested but not confirmed, with its endpoint
+    /// key on disk: the state a stop leaves when a recorded process cannot be
+    /// verified.
+    fn pending_stop_record(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "key-123")?;
+        Ok(record)
+    }
+
+    /// A process that cannot be queried (on Windows, a live one this process may
+    /// not open) is not one that is gone. Whatever is reading liveness must keep
+    /// the key and the stop marker the unverified stop left, and must not
+    /// reconcile the record to `stopped`; only a confirmed exit may.
+    #[test]
+    fn a_pending_stop_keeps_its_key_and_marker_while_a_process_cannot_be_queried() -> Result<()> {
+        let (root, paths) = test_paths("liveness-unqueryable-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-unqueryable";
+        let mut record = pending_stop_record(&paths, service_id)?;
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Unqueryable
+        });
+
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some(),
+            "the key of a service that may still be running is kept"
+        );
+        assert_eq!(
+            record.stop_requested_unix_ms,
+            Some(1),
+            "so is the stop marker that hands the cleanup to a later confirmed exit"
+        );
+        assert_ne!(
+            record.status, "stopped",
+            "a process that could not be looked at does not make the service stopped"
+        );
+
+        // The same record once the process is confirmed gone: now the deferred
+        // cleanup and the reconciliation both happen.
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+        assert!(
+            endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_none(),
+            "a confirmed exit drops the key"
+        );
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert_eq!(record.status, "stopped");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_stop_keeps_its_key_and_marker_while_a_process_runs() -> Result<()> {
+        let (root, paths) = test_paths("liveness-running-pending-stop");
+        paths.ensure()?;
+        let service_id = "svc-running";
+        let mut record = pending_stop_record(&paths, service_id)?;
+
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Running
+        });
+
+        assert!(endpoint_keys::endpoint_key_file_if_present(&paths, service_id).is_some());
+        assert_eq!(record.stop_requested_unix_ms, Some(1));
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
