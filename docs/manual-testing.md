@@ -747,8 +747,15 @@ Expected result:
   held legend first, then `T/S`. Enlarging it brings them back.
 - With a model served whose figures are a scrape window old, the `*` held
   marker and the `* = held (prior scrape window)` legend explaining it appear
-  and disappear together as the terminal is resized. A `*` on a reading with
-  no legend anywhere on screen is a bug; so is the legend with nothing marked.
+  and disappear **together** as the terminal is resized. A `*` on a reading
+  with no legend anywhere on screen is a bug; so is the legend with nothing
+  marked.
+
+  Check this one by **starting tall and shrinking**, not at the 22-to-24 rows
+  above. The legend is the first row the hero drops, and the marker is gated on
+  the legend fitting — so at 22 to 24 rows neither is on screen and there is
+  nothing to compare. Start around 30 rows, confirm both are present, then
+  shrink past the drop and confirm both go at once.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

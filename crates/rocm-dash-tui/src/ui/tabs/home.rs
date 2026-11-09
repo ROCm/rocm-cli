@@ -392,10 +392,15 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[4],
     );
     // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
-    // held AND rendered with a marker — `tpw.is_some()` mirrors the gate on
-    // `tpw_label` above so an unmeasured aggregate (which prints
-    // "tokens / watt —" with no marker) never shows an unexplained legend.
-    if tpw.is_some() && any_tpw_held {
+    // held, so an unmeasured aggregate (which prints "tokens / watt —" with no
+    // marker) never shows an unexplained legend.
+    //
+    // `any_tpw_held` already implies `tpw.is_some()`: it requires some instance
+    // with a finite `tokens_per_watt`, and `instance_aggregate` folds exactly
+    // those into `Some` over the same `state.instances` set. The extra
+    // `tpw.is_some() &&` term was unreachable-false, so it is gone rather than
+    // left to read as a real second condition.
+    if any_tpw_held {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format::HELD_LEGEND,
