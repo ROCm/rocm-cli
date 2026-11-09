@@ -218,8 +218,16 @@ builds, `decode_engine_response`, stderr collection) run on every platform, and
 the ones that start the fake are `#[cfg(unix)]`. The `rocm` and `rocmd` callers
 each run their own entry point against the same fake and pin only what they
 choose: the program and verb, the app paths, and whether stderr is forwarded (see
-`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). A caller that
-grew its own private copy of the conversation would fail those tests.
+`apps/rocm/src/engine_ipc.rs` and `apps/rocmd/src/engine_ipc.rs`). These tests
+catch behavioural drift: a caller whose own copy of the conversation behaved
+differently from the shared client in what they pin (the framing, the
+environment, the exit and answer handling, the guards) would fail them, but a
+copy that behaves the same passes them, so nothing here rules out a second
+copy existing. A structural check would have to read the callers' files from
+outside this crate, a cross-crate read that `cargo xtask prepush` only accepts
+with an entry in its widening rule
+(`every_cross_crate_read_is_covered_by_the_widening_rule`), which is not worth
+adding for this, so the guarantee is for behaviour only.
 
 An answer that is not a response envelope is reported as that, and when the
 child also exited with a failing status the error says so, because the status is

@@ -34,6 +34,17 @@
 //! this change leaves it to be decided on its own. The one wait this client adds
 //! itself, for the stderr of a child whose request could not be written, is
 //! bounded by `EXITED_STDERR_GRACE`.
+//!
+//! Forwarding the child's stderr guards each write against SIGPIPE on its own
+//! (see `forward_best_effort`), and the guard is held for as long as that write
+//! blocks. If the sink is stalled rather than closed (a terminal that has stopped
+//! reading), SIGPIPE therefore stays ignored process-wide for that time, and a
+//! concurrent `print!` to a closed pipe on another thread fails with an error
+//! (which `print!` turns into a panic) instead of ending the process quietly. The
+//! guard is not held across the reads between lines, so this needs a stalled
+//! sink, not just a quiet engine. It is accepted: a guard that could be taken
+//! back mid-write does not exist, and without one a closed sink would end
+//! `rocm` before the request could report why.
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};
@@ -630,7 +641,11 @@ mod tests {
     }
 
     /// A producer that keeps writing (a descendant holding the pipe) cannot hold
-    /// the collection past its deadline.
+    /// the collection past its deadline. A secondary guard: it is timing-based
+    /// and also passes with the loop that let queued output bypass the deadline,
+    /// because that producer sleeps between messages. The fix is covered by
+    /// `collecting_stops_at_the_deadline_even_with_output_queued` above, which is
+    /// deterministic.
     #[test]
     fn collecting_returns_at_the_deadline_while_output_keeps_arriving() {
         let (sender, receiver) = mpsc::channel::<Vec<u8>>();
