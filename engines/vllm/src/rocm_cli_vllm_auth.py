@@ -17,8 +17,8 @@ key: the first is the liveness probe rocm-cli advertises, the second carries
 no credentials by design and is answered by vLLM's CORS middleware before
 any route runs.
 
-The key is read from ``VLLM_API_KEY`` — the same variable vLLM's own check
-reads, set by rocm-cli on the server process — so both checks always agree.
+The key is read from ``VLLM_API_KEY`` -- the same variable vLLM's own check
+reads, set by rocm-cli on the server process -- so both checks always agree.
 Construction fails when the variable is empty, so a launch that asked for
 protection cannot come up unprotected.
 

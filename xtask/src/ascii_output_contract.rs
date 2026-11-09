@@ -162,6 +162,12 @@ mod tests {
             "The `©` is in a `#` shell comment of the installer `rocm remote \
              provision` uploads. The shell never echoes a comment.",
         ),
+        (
+            "engines/vllm/src/rocm_cli_vllm_auth.py",
+            "The `©` is in the `#` copyright comment of the auth middleware \
+             module `rocm serve` writes for vLLM to import. Python never prints \
+             a comment.",
+        ),
     ];
 
     /// Individual literals that are out of scope, as
