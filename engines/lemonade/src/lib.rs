@@ -28,6 +28,7 @@ mod archive_props;
 mod backend_alignment;
 mod device_policy;
 mod direct_llama;
+mod footprint;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -41,6 +42,12 @@ mod test_support;
 // the crate root before the split, and `apps/rocm` depends on this crate's
 // lib target.
 pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+// The read-only view of Lemonade's install trees and record that `apps/rocm`
+// needs for `rocm storage` and `rocm runtimes uninstall`; see `footprint`.
+pub use footprint::{
+    InstallRecord, RecordCleanup, forget_install_record_inside, install_record, install_tree_dirs,
+    install_tree_root, recorded_runtime_dir,
+};
 
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
@@ -358,6 +365,35 @@ fn detect_response() -> DetectResponse {
     }
 }
 
+/// The install proper: extract the embeddable, pick and align the llama.cpp
+/// backend, then write the install record, replacing whatever was there.
+///
+/// The record is written, never read, on this path: a corrupt record is
+/// overwritten by the next plain install and the current tree is kept, which is
+/// why that is what the CLI advises when it cannot read the record. The two
+/// steps are parameters so a test can run this real sequence without
+/// downloading anything or running `lemonade`.
+fn install_and_record(
+    paths: &AppPaths,
+    env_root: Option<&std::path::Path>,
+    reinstall: bool,
+    prepare_embeddable: impl FnOnce(
+        &AppPaths,
+        Option<&std::path::Path>,
+        bool,
+    ) -> Result<crate::install::LemonadeInstallManifest>,
+    prepare_backend: impl FnOnce(
+        &AppPaths,
+        &mut crate::install::LemonadeInstallManifest,
+    ) -> Result<Option<String>>,
+) -> Result<(crate::install::LemonadeInstallManifest, Option<String>)> {
+    let mut manifest = prepare_embeddable(paths, env_root, reinstall)?;
+    eprintln!("Detecting best supported Lemonade llama.cpp backend...");
+    let aligned_version = prepare_backend(paths, &mut manifest)?;
+    crate::install::write_manifest(paths, &manifest)?;
+    Ok((manifest, aligned_version))
+}
+
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
@@ -371,20 +407,38 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             bail!("scripted Lemonade backend install failure")
         })?;
     }
-    eprintln!(
-        "Preparing Lemonade embeddable {}...",
-        rocm_deps::LEMONADE_VERSION
-    );
     let env_root = request
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
-    let mut manifest =
-        crate::install::prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
-    eprintln!("Detecting best supported Lemonade llama.cpp backend...");
-    let aligned_version =
-        crate::backend_alignment::prepare_llamacpp_backend_for_active_rocm(&paths, &mut manifest)?;
-    crate::install::write_manifest(&paths, &manifest)?;
+    // Announced and space-checked before anything is downloaded: a fresh tree
+    // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
+    if let Some(preflight) = crate::footprint::plan_install_preflight(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::footprint::available_space_for_install,
+    ) {
+        for line in preflight.notice_lines() {
+            eprintln!("{line}");
+        }
+        match preflight.space_verdict() {
+            crate::footprint::SpaceVerdict::Fits => {}
+            crate::footprint::SpaceVerdict::Tight(warning) => eprintln!("{warning}"),
+            crate::footprint::SpaceVerdict::Refuse(message) => bail!(message),
+        }
+    }
+    eprintln!(
+        "Preparing Lemonade embeddable {}...",
+        rocm_deps::LEMONADE_VERSION
+    );
+    let (manifest, aligned_version) = install_and_record(
+        &paths,
+        env_root.as_deref(),
+        request.reinstall,
+        crate::install::prepare_embeddable,
+        crate::backend_alignment::prepare_llamacpp_backend_for_active_rocm,
+    )?;
     let mut warnings = vec![
         "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
         format!(

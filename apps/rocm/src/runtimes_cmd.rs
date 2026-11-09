@@ -55,7 +55,8 @@ pub(crate) use crate::runtime_registry::{
     validate_runtime_manifest_for_activation,
 };
 pub(crate) use crate::runtime_uninstall::{
-    InstallRootDecision, should_remove_runtime_install_root, uninstall_runtime,
+    InstallRootDecision, lemonade_record_report_line, should_remove_runtime_install_root,
+    uninstall_runtime,
 };
 use crate::runtime_uninstall::{
     RuntimeUninstallConfirmation, apply_runtime_uninstall,
@@ -256,6 +257,9 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None => {
                     report = report.detail("folder_removed", "no");
                 }
+            }
+            if let Some(line) = lemonade_record_report_line(&result.lemonade_record) {
+                report = report.detail("lemonade", line);
             }
             if result.default_runtime_cleared {
                 report = report

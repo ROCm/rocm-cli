@@ -1433,6 +1433,40 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Lemonade Installs On Disk
+
+`features/lemonade_installs.feature` covers what a user is told about the
+Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
+
+- `lemonade-installs-01` and `-02` reach the engine's pre-install free-space
+  refusal from `rocm engines install lemonade` and from `rocm serve`, with 1 MiB
+  reported free (below what any Lemonade install needs). Room for Lemonade but
+  not for the multi-gigabyte ROCm backend only warns, which the unit tests cover
+  because a scenario would have to start the download. They use
+  `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
+  `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
+  disk that nothing was downloaded. That variable also waives serve's no-GPU
+  refusal, as serve-18's failure hook does.
+- `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
+  and checks `rocm storage report` lists both and flags the unused one.
+- `lemonade-installs-04` uninstalls that runtime and checks the install record
+  is cleared.
+- `lemonade-installs-05` and `-06` cover the two cases the report must not
+  overstate: a record naming a folder with no install (the surviving copy is
+  not offered for deletion) and a read-only runtime (its copy is not said to be
+  removed with it, and uninstall then leaves it). A copy inside a registered
+  runtime is never marked reclaimable, because it is reused when that runtime
+  becomes active; two registered runtimes are covered by a unit test.
+
+Run them alone with `cargo xtask e2e -- -n "lemonade-installs-"`.
+
+The Windows console fix for the backend download's progress is unit-tested
+through the real command builder (`backend_install_command` in
+[process.rs](../engines/lemonade/src/process.rs)), which receives the console
+state and the hide step, so a dropped or unconditional hide turns the test red.
+Whether the output actually reaches a real console is a manual check in
+[manual-testing.md](manual-testing.md).
+
 ## Uninstall And Download Removal
 
 `rocm uninstall` and `rocm storage remove-downloads` both end in the same

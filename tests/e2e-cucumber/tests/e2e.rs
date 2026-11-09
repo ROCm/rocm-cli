@@ -32,6 +32,7 @@ mod e2e {
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod host_guard;
+    pub mod lemonade_install_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
     pub mod model_catalog_steps;
