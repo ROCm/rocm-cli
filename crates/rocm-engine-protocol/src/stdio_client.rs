@@ -35,6 +35,17 @@
 //! itself, for the stderr of a child whose request could not be written, is
 //! bounded by `EXITED_STDERR_GRACE`.
 //!
+//! A request that cannot be written is the other place the answer-wins rule does
+//! not apply: if the engine answered and exited without draining a request larger
+//! than a pipe buffer, the write fails, the child is killed and its stdout is
+//! never read, so the error carries its stderr and not its answer. Every engine
+//! here (`lemonade`, `vllm`, `aim`, and the `rocm __engine-stdio` verb that serves
+//! the built-in ones) reads stdin to the end before it answers, so reaching this
+//! needs an engine that breaks the protocol. Decoding such an answer would mean
+//! waiting, up to a deadline, for the child to finish printing it and to exit
+//! before deciding it is complete, and an engine that has stopped reading is no
+//! engine to wait for, so it is left as a documented limit.
+//!
 //! Forwarding the child's stderr guards each write against SIGPIPE on its own
 //! (see `forward_best_effort`), and the guard is held for as long as that write
 //! blocks. If the sink is stalled rather than closed (a terminal that has stopped

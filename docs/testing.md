@@ -285,7 +285,7 @@ runs the whole client against a fake that exits without reading;
 `the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
 grandchild keeps the pipe open. The last two run the step on a real child with an
 injected write error, because whether a real write fails before the child has
-closed its stdin is a race. The bound compares the deadline with the clock
+closed its stdin is a race. The answer of an engine that exits without draining a request larger than a pipe buffer is not read on this path (every engine here reads stdin to the end before answering, so that needs one that breaks the protocol); the module comment in `stdio_client.rs` states the limit. The bound compares the deadline with the clock
 before every receive and receives nothing once it has passed, because a receive
 with an expired timeout still returns output that is already queued, which would
 let a backlog or a descendant that keeps writing hold the error path past it;
