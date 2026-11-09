@@ -84,7 +84,9 @@ pub fn print_prompt(out: &mut impl Write, prompt: &str) -> std::io::Result<()> {
 ///   line: either way nothing echoed a line end, so the cursor is still on the
 ///   prompt line and the caller's next line would run into it;
 /// - when the answer is [`Answer::Unrecognized`], a line saying it is being
-///   treated as no.
+///   treated as no, with the answer shown back quoted and escaped and cut to
+///   [`MAX_ECHOED_ANSWER_CHARS`] characters, so a long pasted line does not fill
+///   the screen.
 ///
 /// Both writes are best effort: a failure to explain a decline must not turn
 /// into an error that replaces the decline, which `fix`'s `confirm()` relies on.
@@ -98,11 +100,24 @@ pub fn read_answer(input: &mut impl BufRead, out: &mut impl Write) -> std::io::R
     if answer == Answer::Unrecognized {
         let _ = writeln!(
             out,
-            "{:?} is not yes or no; treating it as no.",
-            line.trim()
+            "{} is not yes or no; treating it as no.",
+            echoed_answer(line.trim())
         );
     }
     Ok(answer == Answer::Yes)
+}
+
+/// The most characters of a typed answer that the "not understood" line shows.
+const MAX_ECHOED_ANSWER_CHARS: usize = 40;
+
+/// `answer` as shown back to the user: quoted with control characters escaped, and
+/// cut to [`MAX_ECHOED_ANSWER_CHARS`] characters (never in the middle of one), with
+/// `...` after the closing quote when there was more.
+fn echoed_answer(answer: &str) -> String {
+    let mut chars = answer.chars();
+    let shown: String = chars.by_ref().take(MAX_ECHOED_ANSWER_CHARS).collect();
+    let more = if chars.next().is_some() { "..." } else { "" };
+    format!("{shown:?}{more}")
 }
 
 /// Whether this process can hold an interactive exchange with a user.
@@ -312,6 +327,74 @@ mod tests {
         let (verdict, written) = answer_and_output(b"yes");
         assert!(verdict, "a yes is a yes with or without the final newline");
         assert_eq!(written, "\n", "the unfinished prompt line is still ended");
+    }
+
+    #[test]
+    fn read_answer_cuts_a_long_answer_short_and_marks_the_cut() {
+        let typed = format!("{}\n", "a".repeat(100));
+        let (verdict, written) = answer_and_output(typed.as_bytes());
+        assert!(!verdict);
+        assert_eq!(
+            written,
+            format!(
+                "\"{}\"... is not yes or no; treating it as no.\n",
+                "a".repeat(MAX_ECHOED_ANSWER_CHARS)
+            )
+        );
+    }
+
+    #[test]
+    fn read_answer_shows_an_answer_of_exactly_the_limit_whole() {
+        let answer = "b".repeat(MAX_ECHOED_ANSWER_CHARS);
+        let (_, written) = answer_and_output(format!("{answer}\n").as_bytes());
+        assert_eq!(
+            written,
+            format!("\"{answer}\" is not yes or no; treating it as no.\n"),
+            "an answer that fits is not marked as cut"
+        );
+        let (_, written) = answer_and_output(format!("{answer}c\n").as_bytes());
+        assert_eq!(
+            written,
+            format!("\"{answer}\"... is not yes or no; treating it as no.\n"),
+            "one character over the limit is cut"
+        );
+    }
+
+    #[test]
+    fn read_answer_cuts_between_characters_not_inside_one() {
+        // 2-byte and 4-byte characters: a cut by bytes would split one and panic
+        // or write invalid UTF-8; the limit counts characters.
+        for ch in ['é', '🦀'] {
+            let typed = format!("{}\n", ch.to_string().repeat(MAX_ECHOED_ANSWER_CHARS + 5));
+            let (_, written) = answer_and_output(typed.as_bytes());
+            assert_eq!(
+                written,
+                format!(
+                    "\"{}\"... is not yes or no; treating it as no.\n",
+                    ch.to_string().repeat(MAX_ECHOED_ANSWER_CHARS)
+                ),
+                "answer of {ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_answer_bounds_the_line_even_when_every_character_is_escaped() {
+        // An escaped control character is longer than itself, so the limit is on
+        // the typed characters and the line stays bounded by it.
+        let typed = format!("{}\n", "\x1b".repeat(100));
+        let (_, written) = answer_and_output(typed.as_bytes());
+        assert_eq!(
+            written,
+            format!(
+                "\"{}\"... is not yes or no; treating it as no.\n",
+                "\\u{1b}".repeat(MAX_ECHOED_ANSWER_CHARS)
+            )
+        );
+        assert!(
+            !written.contains('\x1b'),
+            "no raw escape reaches the terminal"
+        );
     }
 
     #[test]
