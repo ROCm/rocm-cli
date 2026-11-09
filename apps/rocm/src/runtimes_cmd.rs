@@ -880,20 +880,22 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
 /// Two `rocm` processes can activate a runtime against the same data
 /// directory at once (two terminals, a script), so the write goes through the
 /// shared atomic writer: each writer stages into its own exclusively created
-/// temp file, and the marker is replaced rather than removed first. On Unix,
-/// and on Windows whenever `ReplaceFileW` succeeds, a reader therefore always
-/// finds a complete marker. A `ReplaceFileW` that fails part-way is the
-/// exception: it can leave the marker missing, which the writer repairs with a
-/// plain rename when that rename succeeds (see `rocm_core::atomic_write`); two
-/// replacements in flight at once on Windows are not tested. It does not order
-/// the two activations: the last one to publish wins, as before.
+/// temp file, and the marker is replaced rather than removed first, so a
+/// reader always finds a complete marker: on Windows the publish renames first,
+/// which replaces in one step. Only when that rename fails, because another
+/// process holds the marker open without delete sharing, does it fall back to
+/// `ReplaceFileW`, and a `ReplaceFileW` that fails part-way can leave the marker
+/// missing, which the writer repairs with a plain rename when that succeeds
+/// (see `rocm_core::atomic_write`); two replacements in flight at once through
+/// the fallback are not tested. It does not order the two activations: the last
+/// one to publish wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
     // The shared helper rather than a local temp-file-and-rename: it is the same
     // write the failed-activation restore uses, and it is strictly stronger than
     // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
     // sharing violation when another process holds the marker open. The helper
-    // uses `ReplaceFileW` there whenever the destination exists. The
+    // renames first there and falls back to `ReplaceFileW` when that fails. The
     // destination is never removed first, on any platform — that would leave a
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
@@ -1280,9 +1282,8 @@ pub(crate) mod tests {
     /// probability per round rather than deterministically; against the
     /// current writer nothing in it is timing-dependent. Unix only: the
     /// property under test is that `rename` replaces in one step. The Windows
-    /// publish path goes through `ReplaceFileW` instead, whose behaviour with
-    /// two replacements of one file in flight this test has not been run
-    /// against.
+    /// publish tries `rename` first too, but this test has not been run
+    /// against it there, nor against the `ReplaceFileW` fallback.
     #[cfg(unix)]
     #[test]
     fn concurrent_active_runtime_marker_writes_keep_a_complete_marker_published() -> Result<()> {

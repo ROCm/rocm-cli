@@ -62,8 +62,8 @@ cargo xtask check-architecture-doc
 ```
 
 It fails on a `.rs` file under `apps/*/src`, `crates/*/src` or `engines/*/src` that the doc
-does not link, and on a stale entry in the `EXEMPT` list in
-[architecture_doc.rs](../xtask/src/architecture_doc.rs), which is empty. Test-only helpers need no entry. The
+does not link, and there is no exemption list; see
+[architecture_doc.rs](../xtask/src/architecture_doc.rs). Test-only helpers need no entry. The
 `lychee` check is complementary, not redundant: it confirms that links already in the doc
 resolve, and says nothing about a file the doc never mentions.
 
@@ -190,6 +190,70 @@ import. If one of them moves or is renamed, update `GUARDED` in the test; the
 test fails on a path that no longer exists rather than dropping it from the
 guard. When the planner needs something that lives in `chat.rs`, move it into
 a leaf module and import it from there.
+
+### Dash-TUI text fields go through `apply_char_key`
+
+A dash-TUI form edits its `String` through `apply_char_key` /
+`apply_char_key_filtered` in
+[`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs), not through its
+own "`Char` appends, `Backspace` pops one char" code. As with the other module
+rules above, a test enforces it rather than an `xtask` subcommand:
+`the_dash_tui_has_no_hand_rolled_text_edit_outside_the_helper` in `xtask`
+([`dash_text_edit_contract.rs`](../xtask/src/dash_text_edit_contract.rs)) scans
+the non-test code of every file under `crates/rocm-dash-tui/src/` and fails,
+naming each hit as `file:line` with a pointer to the helper. Run it on its own
+with:
+
+```bash
+cargo test -p xtask dash_text_edit_contract
+```
+
+It is per file, not per `match` arm, because the copies the helper replaced were
+not all arms (one had its `push` in a `type_char` method the arm called). In a
+file other than `ui/widgets.rs` it reports a no-argument `.pop()` when the file
+names `KeyCode::Backspace`, and `.push(x)` (also `.push(*x)`,
+`.push(x.method())` and `.push(x as char)`, each with or without a trailing
+comma) when `x` is a name the file binds as a key character
+(`KeyCode::Char(x)`, `KeyCode::Char(mut x)`) or declares as `x: char`, in a file
+that names `KeyCode::Char(`. A `#[cfg(test)] mod name { .. }` block is skipped,
+so a unit test may drive a buffer by hand; a `#[cfg(test)]` on anything else
+skips nothing, and an out-of-line test module (`#[cfg(test)] mod name;`) is a
+file of its own, scanned in full.
+
+What it does not see: it matches the shape, not the type, so a `let top =
+stack.pop()` in a file that handles `Backspace` is a false alarm, and an
+unrelated `out.push(c)` is reported when the same file binds `KeyCode::Char(c)`
+elsewhere. A push is read only when its argument is that name alone in one of the
+spellings above: `.push((x))`, `.push(char::from(x))`, a `.push(if ..)` of the
+name, and a call with a gap before the paren (`.push (x)`, which rustfmt never
+writes) are not seen. Only `#[cfg(test)]` exactly is read as a test gate (a
+`#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
+`use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
+from one file to a method in another is not followed. Only `.pop()` and
+`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`,
+`.remove(..)` and `replace_range(..)` are not scanned, partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
+[`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
+the append-only helper and is a different thing. A `Backspace` arm that never
+pops, such as the folder browser's "go to the parent directory", is not a text
+edit and is not reported.
+
+The one file with its own `push` and `pop` is the Chat input in
+[`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs), whose keys are
+mapped to a `KeyAction` by a separately tested table. It is listed in `ALLOWED`
+in the test with its reason and the number of offenses it is expected to carry
+(its one push and its one pop). The test fails when the file carries a different
+number, so a further hand-rolled field added there is caught, as is an entry that
+stops being needed, or whose file moves. A new field reuses the helper; a new
+exception is a reviewed entry in that list.
+
+Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
+for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
+every pull request that changes Rust, and the merge queue and post-merge runs
+test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
+selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
+a file it reads, so a pull request that touches nothing but
+`crates/rocm-dash-tui` does not run this test on Linux. The module-import
+contract above has the same property.
 
 ### Tests that run a fake executable
 
@@ -958,8 +1022,8 @@ progress output and that `uv` was not run and no file was written. Beside it are
 `a_dry_run_reads_every_spelling_of_a_managed_python_version_the_same_way`. The
 preview does still write its package-index cache under the cache folder.
 The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
-previews in this sense: they resolve with `uv` and can fetch it, and prepare a
-managed Python too.
+previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
+can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
 
 Then it verifies:
 
@@ -2561,11 +2625,46 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
 
+A check changes nothing, and that includes Python. Reading the index for a wheel
+runtime needs the interpreter's wheel tag. A runtime that records a usable Python
+supplies it. For one that does not, on a host with no usable Python, the check
+used to download a managed `uv`, have it install Python and save that Python's
+path in the config, only to ask it for the tag. The text report, `--json`, the
+startup check that runs ahead of other commands, and the plan behind
+`rocm update --apply --dry-run` now take the tag from the interpreter the layout
+requires instead and prepare nothing; the text report adds a `python_note:` line
+saying an update would use `uv` to install the managed Python, which the check did
+not do. `--json` carries no such line, since its shape is the dashboard's
+contract. `rocm update --apply` still prepares the Python, because the install
+that follows needs it. Scenarios `update-09` (the report) and `update-10`
+(`--dry-run`) check the note against the state it left, as `runtime-23` does for
+the install preview: the recording `uv` was never run, and there is no
+managed-tools folder and no saved config. They run on Linux; the entry points the
+scenarios do not drive are covered by
+`the_update_checks_prepare_no_python_and_the_apply_plan_does` in
+[update.rs](../apps/rocm/src/therock/update.rs), which drives the report, the
+JSON, the startup check, the check plan and `apply_runtime_update` with
+`--dry-run`, with the plan an apply works from, and a real apply, as the controls
+that show the stand-in `uv` is reachable. Which of the two plans a `--dry-run` and
+an apply take is also pinned on every platform, Windows included, by
+`a_dry_run_takes_the_check_and_an_apply_takes_the_plan` in
+[update_cmd.rs](../apps/rocm/src/update_cmd.rs). Unlike the install preview, which fetches no
+`uv`, the check on a ROCm 10 or newer runtime still resolves the package versions
+with `uv pip compile` and can fetch the managed `uv`, though never a Python; the
+scenarios above use the canonical layout, which needs no `uv`.
+
 Runtime version-ordering tests:
 
 ```bash
 cargo test -p rocm --bin rocm version_proptests
 cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Update checks that must not prepare Python:
+
+```bash
+cargo test -p rocm --bin rocm the_update_checks_prepare_no_python
+cargo xtask e2e -- -n 'update-(09|10)'
 ```
 
 Where `rocm install sdk` and `rocm update` compare runtime versions, they
@@ -3469,6 +3568,12 @@ cache nor the variable involved, which is the layout of a TheRock tarball
 (ROCM-30386). Its control is `examine-33`, which plants the library alone and
 stays `wsl_rocdxg_missing`, so the sibling runtime, and not the planted library,
 is what the verdict turns on.
+
+`examine-35`, `examine-36`, `examine-37` and `examine-38` hold the two answers `rocm examine --json` gives to "is `rocminfo` installed" level on that same planted WSL machine: `summary.wsl.rocminfo` from the host summary and `wsl.rocminfo` from the examination, which share one `PATH` lookup. They plant a stand-in `rocminfo` that prints nothing, and build the `PATH` from the machine's stand-in directory followed by the runner's own entries that hold no `rocminfo`, so a runner with ROCm installed cannot be why the tool reads as found. `examine-35` is the control: the tool in a `PATH` directory is found by both. `examine-36` puts it only in the directory the command runs from, with an empty entry first on `PATH`: neither report finds it, because an empty entry is skipped and not read as the current directory (the harness's `command_dir` sets that directory). `examine-38` is its control: the same machine with `.` as the first entry instead, which both reports find, so it fails if `rocm` does not really run from that directory and `examine-36`'s answer cannot come from a harness that ignored `command_dir`. `examine-37` puts it in a `PATH` directory whose name is not valid Unicode: both find it, because a `PATH` that is not Unicode is still searched. The Windows spellings of the lookup (`PATHEXT`, a quoted entry holding a `;`, the System32 locations) cannot run on the Linux lane and are covered by the unit tests in `probe_exec.rs`, which the Windows job runs.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-3[5-8] '
+```
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 
