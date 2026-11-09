@@ -67,6 +67,24 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let response = http_get_with_auth(endpoint_url, path, endpoint_api_key, timeout)?;
+    if response.status != 200 {
+        bail!("HTTP endpoint returned status {}", response.status);
+    }
+    Ok(response.body)
+}
+
+/// GET `path` and return the status and body, whatever the status.
+///
+/// The GET sibling of [`http_post_json_with_auth`]: a caller that relays the
+/// endpoint's answer (a proxy) must tell "answered with a refusal" apart from
+/// "never answered", which [`http_get_text_with_auth`] folds into one error.
+pub fn http_get_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
     let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
@@ -87,10 +105,12 @@ pub fn http_get_text_with_auth(
         .split_once("\r\n\r\n")
         .context("HTTP response was missing a body")?;
     let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("HTTP endpoint returned {status_line}");
-    }
-    Ok(body.to_owned())
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
 }
 
 /// POST a JSON body and return the response status line plus body.

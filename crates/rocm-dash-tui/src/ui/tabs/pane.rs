@@ -6,9 +6,10 @@
 //!
 //! Each domain tab is a left **Actions** bento (its locked verb list) plus a
 //! right **`Details: <verb>`** bento that previews the selected operation. The
-//! verb rows open EXISTING managers through the EXISTING execution seam
-//! (`KeyAction::Open*` → `apply_action` → `RocmToolExecutor` / `ui/approval.rs`)
-//! — no second approval path, no reimplementation of the managers.
+//! verb rows open EXISTING managers: a verb produces a `KeyAction::Open*`, and
+//! `apply_action` (in `app/actions.rs`) opens the matching overlay. Nothing
+//! here executes anything — no second approval path, no reimplementation of
+//! the managers.
 //!
 //! `rocm.rs` and `serving.rs` only declare their verb tables; all rendering,
 //! hit-testing, and the list|detail geometry live here so the two tabs cannot

@@ -12,13 +12,13 @@
 //! [`crate::confirm`] and is re-exported here too, so the
 //! `crate::host_gpu::interactive_terminal` path keeps resolving.
 //!
-//! The probes live in child modules: `capture` (optional-command capture and the
-//! tool-on-`PATH` lookup), `os_facts` (kernel, distro, CPU and RAM), `linux`
-//! (sysfs, KFD and DRM), `gpu_visibility` (which GPUs this process may use),
-//! `windows_inventory` (the Windows display-adapter inventory), `wsl` (WSL
-//! detection and the Windows host driver as seen from the guest), `render` (the
-//! `rocm examine` text of an `ExamineSummary`), `diagnostics` (the GPU
-//! detection diagnostics text) and `engine_default` (the default serve engine).
+//! The probes live in child modules: `capture` (optional-command capture),
+//! `os_facts` (kernel, distro, CPU and RAM), `linux` (sysfs, KFD and DRM),
+//! `gpu_visibility` (which GPUs this process may use), `windows_inventory` (the
+//! Windows display-adapter inventory), `wsl` (WSL detection and the Windows host
+//! driver as seen from the guest), `render` (the `rocm examine` text of an
+//! `ExamineSummary`), `diagnostics` (the GPU detection diagnostics text) and
+//! `engine_default` (the default serve engine).
 //!
 //! The `examine` child modules and `fix.rs` still reach several items here
 //! through `lib.rs`'s flat `crate::` re-export paths rather than

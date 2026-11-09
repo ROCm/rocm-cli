@@ -169,11 +169,25 @@ Expected result:
   plan's `command:` line shows `uv venv --python 3.12 ...` (a version, as no
   interpreter path exists yet), so it is not copy-pasteable verbatim: `uv`
   resolves `3.12` itself and may pick a different Python 3.12 than the managed
-  one a real install prepares. This holds for the canonical layout. A preview
-  pinned to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) still needs
-  `uv` to resolve the package versions, so on a clean host it can download the
-  managed `uv` and create the `tools` folder, although it prepares no Python and
-  saves no Python path.
+  one a real install prepares. This holds for every layout. A preview pinned
+  to ROCm 10 or newer (`--version 10.0.0 --family gfx1200`) needs `uv` to choose
+  the `torch` and `torchvision` versions, so on a host with no `uv` installed it
+  stops before that step: the data folder still has no `tools` folder, a
+  `resolution_note:` line says why, and `target:`, `runtime_key:`,
+  `package_specs:`, `command:` and `manifest:` read `not resolved by this
+  preview`. Run the real install (or any command that fetches `uv`), then the
+  preview again, and it prints the complete plan; so does a preview with
+  `ROCM_CLI_UV_BINARY` naming a `uv`.
+- On the same host, with a wheel runtime registered whose manifest records no
+  usable Python, `rocm update` (also `--json`, `--dry-run`, and the check the
+  CLI runs at startup) still reports. The text report gives the runtime's
+  verdict and a `python_note:` line saying an update would use `uv` to install
+  the managed Python, which the check did not do. Afterwards the data folder has
+  no `tools` folder and the config folder has no `config.json`. That holds for a
+  canonical-layout runtime; for a ROCm 10 or newer runtime the check still
+  resolves the package versions with `uv` and can fetch the managed `uv` into the
+  data folder, though never a Python. `rocm update --apply` on the same host does
+  prepare the Python, since the install needs it.
 - With `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP=1`, or a
   `ROCM_CLI_MANAGED_PYTHON_VERSION` whose Python the layout does not accept
   (such as `3.13` for the canonical layout), on the same host the preview fails
@@ -309,6 +323,7 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
+- `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. A request with `"stream":true` or `tools` is refused with an `invalid_request_error`.
 
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
@@ -332,6 +347,36 @@ ROCm backend directory under `bin/llamacpp/`, and run
   packaged backend.
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
+
+To check what a Lemonade install says about its size (no download needed for
+the refusal): with a debug build, set
+`ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
+folder run `rocm engines install lemonade --yes`. Expected result:
+
+- Before anything else it prints `Installing Lemonade <version> into <folder>`
+  and a line giving the ROCm backend's download (up to about 4.4 GiB), disk use
+  (up to about 25 GiB) and the free space on that drive.
+- It then fails with `not enough free disk space to install Lemonade: ...
+  Nothing was downloaded.`, and `<folder>` has no `downloads` or `runtime`
+  subfolder.
+- With `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=2147483648` (2 GiB) instead, it
+  warns that only 2.0 GiB is free for a backend of up to about 4.4 GiB and
+  carries on: Lemonade picks the backend after this point and a smaller one may
+  fit. (Stop it before the download if you do not want one.)
+
+With room to spare, on Windows from an interactive console: install Lemonade
+with no runtime active, then `rocm install sdk`, then `rocm serve <gguf-model>`.
+Expected result:
+
+- The serve prints the install notice for the runtime's own
+  `engines\lemonade` folder, and says the data folder's copy is not reused.
+- Lemonade's own backend download progress (`[1/2] ...`, `Total: ...`) appears
+  in the console instead of a silent wait.
+- `rocm storage report` lists both copies under `Engine installs`, with the data
+  folder's one `not used right now` (and reclaimable) and the runtime's one `in use`.
+- `rocm runtimes uninstall <runtime-key>` says Lemonade's install was inside the
+  runtime and removed with it, and a following `rocm storage report` shows the
+  remaining copy as `not recorded as installed`.
 
 While the log stream is attached, verify detach and stop behave differently:
 
@@ -1164,7 +1209,12 @@ Expected result:
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
   as the command exits) and, under
   `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  terminal ends with `Nothing was removed. To remove these items, run it again
+  without --dry-run.` Running the same command again without `--dry-run` asks
+  `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With
+  its output piped to a file or another command, or its input redirected, it
+  lists the same items and omits that last line (scenario `uninstall-08`).
 - After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
@@ -1176,7 +1226,14 @@ Expected result:
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
-  on that folder.
+  on that folder. It adds no line about how to remove anything (scenario
+  `uninstall-09`).
+- Passing `--force` to `rocm uninstall` is refused with a message that says it
+  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  unknown-argument error (exit 2). Neither
+  suggests `--force-dev-binaries` (scenario `uninstall-10`).
+  `rocm uninstall --help` ends with examples that start with a dry run
+  (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no
@@ -1187,7 +1244,13 @@ Expected result:
   HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
   ```
 
-  At a terminal, the same command asks `[y/N]` and treats Enter as no.
+  At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
+  `maybe` and it cancels after printing `"maybe" is not yes or no; treating it
+  as no.`; an answer longer than 40 characters is shown cut to its first 40,
+  with `...` after the closing quote. Press Ctrl-D and `uninstall cancelled`
+  appears on a line of its own, not after the prompt. Nothing is removed in
+  either case. The same prompt is shared by `rocm fix` and the SDK-overwrite
+  prompt, so the same answers behave the same way there.
 
 ## 11. AIM (Docker) Engine Verification
 

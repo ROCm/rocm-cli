@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Reusable folder browser (Phase 3 Wave 0).
+//! Reusable folder browser.
 //!
 //! A shared input primitive: pick (or create-under) a directory. Dependency of
 //! serve / install / runtime / onboarding. Models the frozen rocm-cli
