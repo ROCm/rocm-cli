@@ -1233,6 +1233,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn test_active_runtime_marker(paths: &AppPaths, runtime_key: &str) -> ActiveRuntimeMarker {
         ActiveRuntimeMarker {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
@@ -1245,6 +1246,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn leftover_marker_temp_files(paths: &AppPaths) -> Result<Vec<String>> {
         let dir = active_runtime_marker_path(paths)
             .parent()
