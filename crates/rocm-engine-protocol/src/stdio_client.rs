@@ -56,12 +56,25 @@
 //! sink, not just a quiet engine. It is accepted: a guard that could be taken
 //! back mid-write does not exist, and without one a closed sink would end
 //! `rocm` before the request could report why.
+//!
+//! These three are deliberate tradeoffs, not oversights: the wait on pipes held
+//! by a grandchild is unbounded, an answer from an engine that exits without
+//! draining a large request is not decoded, and SIGPIPE stays ignored
+//! process-wide while a stalled stderr forward blocks. Only the first is
+//! partly cheap to bound: the stderr side would be one deadline on
+//! `StderrCollector::finish`, but stdout is read to its end on the calling thread,
+//! so a bound there needs a second reader thread and a decision on what to report
+//! when it fires, and bounding one pipe and not the other would be a half
+//! measure. The stderr is read from the moment the child starts, on its own
+//! thread, so an engine that fills it before draining a large request cannot
+//! deadlock the write.
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -199,6 +212,14 @@ where
         .stdin
         .take()
         .context("engine stdio child did not expose stdin")?;
+    // Read the child's stderr from the start, on its own thread: an engine that
+    // fills the stderr pipe before it has drained a request larger than a pipe
+    // buffer would otherwise block on that write while this process blocks on
+    // its own, with nobody reading either side.
+    let stderr_collector = child
+        .stderr
+        .take()
+        .map(|stderr| StderrCollector::start(stderr, forward));
     // Ignore SIGPIPE for the duration of the write. Under the default action, an
     // engine that exits before reading its stdin would kill this process with
     // SIGPIPE (`rocm` runs that way, and so does the daemon hosted in it);
@@ -210,6 +231,7 @@ where
     if let Err(error) = written {
         return Err(abandon_unwritten_request(
             child,
+            stderr_collector,
             &error,
             EXITED_STDERR_GRACE,
         ));
@@ -217,10 +239,6 @@ where
     // End of the request: the engine reads to EOF before it answers.
     drop(stdin);
 
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|stderr| thread::spawn(move || collect_stderr(stderr, forward)));
     let stdout_pipe = child
         .stdout
         .take()
@@ -229,8 +247,8 @@ where
     let status = child
         .wait()
         .context("failed waiting for engine stdio response")?;
-    let stderr = stderr_reader
-        .map(|reader| reader.join().unwrap_or_default())
+    let stderr = stderr_collector
+        .map(|collector| collector.finish(None))
         .unwrap_or_default();
 
     let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
@@ -294,15 +312,15 @@ const EXITED_STDERR_GRACE: Duration = Duration::from_secs(1);
 /// and this error path must not block on it.
 fn abandon_unwritten_request(
     mut child: Child,
+    stderr: Option<StderrCollector>,
     write_error: &io::Error,
     grace: Duration,
 ) -> anyhow::Error {
     let _ = child.kill();
     let _ = child.wait();
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| read_available(stderr, grace))
+    let deadline = Instant::now() + grace;
+    let stderr = stderr
+        .map(|collector| collector.finish(Some(deadline)))
         .unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
     let mut message = format!("failed to write engine request: {write_error}");
@@ -312,46 +330,55 @@ fn abandon_unwritten_request(
     anyhow::anyhow!(message)
 }
 
-/// Read `source` to its end, or for at most `grace` if it does not end, and
-/// return what arrived. The reading thread is left to finish by itself when the
-/// pipe closes.
-fn read_available(mut source: impl Read + Send + 'static, grace: Duration) -> Vec<u8> {
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match source.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if sender.send(buffer[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    collect_until(&receiver, Instant::now() + grace)
+/// A child's stderr being collected on a thread of its own, from the moment it
+/// is started, whatever the main thread is doing meanwhile.
+struct StderrCollector {
+    /// Everything read so far, appended line by line as it arrives.
+    collected: Arc<Mutex<Vec<u8>>>,
+    /// Receives one message when the stderr has been read to its end.
+    finished: mpsc::Receiver<()>,
 }
 
-/// Gather what arrives on `receiver` until it closes or `deadline` passes.
-///
-/// The deadline is compared with the clock before every receive, and nothing is
-/// received once it has passed: `recv_timeout` with an expired timeout still
-/// hands back a message that is already queued, so a backlog, or a descendant
-/// that keeps writing, would otherwise keep this collecting past the bound.
-fn collect_until(receiver: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
-    let mut collected = Vec::new();
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        match receiver.recv_timeout(deadline - now) {
-            Ok(chunk) => collected.extend(chunk),
-            Err(_) => break,
+impl StderrCollector {
+    /// Start reading `stderr`, forwarding each line to `forward` when there is
+    /// one (see [`collect_stderr_into`]).
+    fn start(
+        stderr: impl Read + Send + 'static,
+        forward: Option<impl Write + Send + 'static>,
+    ) -> Self {
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
+        let sink = Arc::clone(&collected);
+        thread::spawn(move || {
+            collect_stderr_into(stderr, forward, &sink);
+            let _ = done.send(());
+        });
+        Self {
+            collected,
+            finished,
         }
     }
-    collected
+
+    /// What was collected, once the stderr has ended, or what has arrived by
+    /// `deadline` when there is one and the stderr has not ended by then (a
+    /// grandchild holding the pipe open). With no deadline this waits for the
+    /// end, which is the unbounded wait the module comment states.
+    fn finish(&self, deadline: Option<Instant>) -> Vec<u8> {
+        match deadline {
+            None => {
+                let _ = self.finished.recv();
+            }
+            Some(deadline) => {
+                let _ = self
+                    .finished
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            }
+        }
+        self.collected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Read the child's whole answer from `stdout`.
@@ -380,9 +407,23 @@ fn read_response(child: &mut Child, mut stdout: impl Read) -> Result<Vec<u8>> {
 /// pipe ends the whole process before `write_all` can return, so each forward
 /// runs inside [`with_sigpipe_ignored`] (see [`forward_best_effort`]). A read error ends the
 /// collection and is itself recorded as the last line.
-fn collect_stderr(stderr: impl Read, mut forward: Option<impl Write>) -> Vec<u8> {
+#[cfg(test)]
+fn collect_stderr(stderr: impl Read, forward: Option<impl Write>) -> Vec<u8> {
+    let collected = Mutex::new(Vec::new());
+    collect_stderr_into(stderr, forward, &collected);
+    collected
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// [`collect_stderr`], appending to `collected` as each line arrives so a caller
+/// that stops waiting still has what was read.
+fn collect_stderr_into(
+    stderr: impl Read,
+    mut forward: Option<impl Write>,
+    collected: &Mutex<Vec<u8>>,
+) {
     let mut reader = io::BufReader::new(stderr);
-    let mut collected = Vec::new();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -392,19 +433,25 @@ fn collect_stderr(stderr: impl Read, mut forward: Option<impl Write>) -> Vec<u8>
                 if let Some(sink) = forward.as_mut() {
                     forward_best_effort(sink, &line);
                 }
-                collected.extend_from_slice(&line);
+                append(collected, &line);
             }
             Err(error) => {
                 let message = format!("failed to read engine progress: {error}\n");
                 if let Some(sink) = forward.as_mut() {
                     forward_best_effort(sink, message.as_bytes());
                 }
-                collected.extend_from_slice(message.as_bytes());
+                append(collected, message.as_bytes());
                 break;
             }
         }
     }
+}
+
+fn append(collected: &Mutex<Vec<u8>>, bytes: &[u8]) {
     collected
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend_from_slice(bytes);
 }
 
 /// Write `bytes` to the forwarding sink and drop the result: a sink that has
@@ -615,50 +662,61 @@ mod tests {
         );
     }
 
-    /// A source that does not answer until released, then never stops answering,
-    /// and says when it is dropped.
+    /// A source that does not answer until released, then answers once and ends.
     struct Gated {
         release: mpsc::Receiver<()>,
-        dropped: mpsc::Sender<()>,
         released: bool,
     }
     impl Read for Gated {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            if !self.released {
-                self.release.recv().unwrap();
-                self.released = true;
+            if self.released {
+                return Ok(0);
             }
-            buffer[..4].copy_from_slice(b"late");
-            Ok(4)
-        }
-    }
-    impl Drop for Gated {
-        fn drop(&mut self) {
-            let _ = self.dropped.send(());
+            self.release.recv().unwrap();
+            self.released = true;
+            buffer[..5].copy_from_slice(b"late\n");
+            Ok(5)
         }
     }
 
-    /// Once the bounded read has given up, the reading thread that is still
-    /// blocked is not left spinning: when its source finally answers it finds
-    /// nobody listening and ends (it drops the source, which the test sees). The
-    /// source never reaches its end, so a thread that kept reading after the
-    /// failed send would never end.
+    /// A collector whose stderr is still open at the deadline reports what had
+    /// arrived and is not waited for; the reading thread is left alone and the
+    /// rest is there once the stderr does end.
     #[test]
-    fn the_reader_left_behind_by_a_bounded_read_ends_when_nobody_is_listening() {
+    fn a_collector_stops_waiting_at_its_deadline_and_keeps_collecting() {
         let (release, released) = mpsc::channel();
-        let (dropped, dropped_signal) = mpsc::channel();
-        let source = Gated {
-            release: released,
-            dropped,
-            released: false,
-        };
-        let collected = read_available(source, Duration::from_millis(50));
-        assert!(collected.is_empty());
+        let collector = StderrCollector::start(
+            Gated {
+                release: released,
+                released: false,
+            },
+            None::<io::Sink>,
+        );
+        let started = Instant::now();
+        let early = collector.finish(Some(Instant::now() + Duration::from_millis(50)));
+        assert!(early.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
 
         release.send(()).unwrap();
-        dropped_signal
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the abandoned reader thread did not end");
+        assert_eq!(collector.finish(None), b"late\n");
+    }
+
+    /// An expired deadline returns at once with what is there, however much is
+    /// queued behind it.
+    #[test]
+    fn an_expired_deadline_returns_what_is_collected_without_waiting() {
+        let (release, released) = mpsc::channel();
+        let collector = StderrCollector::start(
+            Gated {
+                release: released,
+                released: false,
+            },
+            None::<io::Sink>,
+        );
+        let started = Instant::now();
+        assert!(collector.finish(Some(Instant::now())).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(release);
     }
 
     /// A stderr whose reads fail.
@@ -698,55 +756,6 @@ mod tests {
             collected,
             "failed to read engine progress: pipe went away\n"
         );
-    }
-
-    /// Output already queued when the deadline has passed is not collected:
-    /// `recv_timeout(Duration::ZERO)` would still return it, one message after
-    /// another, for as long as the queue stays non-empty.
-    #[test]
-    fn collecting_stops_at_the_deadline_even_with_output_queued() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-        for _ in 0..100_000 {
-            sender.send(vec![b'x'; 16]).unwrap();
-        }
-        let started = Instant::now();
-        let collected = collect_until(&receiver, Instant::now());
-        let after_deadline = collected.len();
-        assert_eq!(after_deadline, 0, "collected bytes after the deadline");
-        assert!(started.elapsed() < Duration::from_secs(1));
-
-        // Before the deadline, queued output is collected, and a closed channel
-        // ends the collection early.
-        drop(sender);
-        let collected = collect_until(&receiver, Instant::now() + Duration::from_secs(30));
-        assert_eq!(collected.len(), 100_000 * 16);
-    }
-
-    /// A producer that keeps writing (a descendant holding the pipe) cannot hold
-    /// the collection past its deadline. A secondary guard: it is timing-based
-    /// and also passes with the loop that let queued output bypass the deadline,
-    /// because that producer sleeps between messages. The fix is covered by
-    /// `collecting_stops_at_the_deadline_even_with_output_queued` above, which is
-    /// deterministic.
-    #[test]
-    fn collecting_returns_at_the_deadline_while_output_keeps_arriving() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-        let producer = thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < until {
-                if sender.send(vec![b'y'; 1024]).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
-        let started = Instant::now();
-        let collected = collect_until(&receiver, Instant::now() + Duration::from_millis(100));
-        let elapsed = started.elapsed();
-        drop(receiver);
-        producer.join().unwrap();
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
-        assert!(!collected.is_empty(), "what arrived in time is kept");
     }
 
     #[test]
@@ -979,6 +988,37 @@ mod tests {
                 .unwrap_or_else(|_| panic!("did not finish within {limit:?}"))
         }
 
+        /// An engine that fills its stderr before it has drained a request larger
+        /// than a pipe buffer does not deadlock the client: the stderr is read from
+        /// the start, so the engine's write completes while the request is still
+        /// being written. (With the collector started after the write, the engine
+        /// blocks on a full stderr pipe and the client on a full stdin pipe.)
+        #[test]
+        fn an_engine_that_writes_a_lot_of_stderr_before_reading_its_request_does_not_deadlock() {
+            let engine = FakeEngine::new(
+                "client-stderr-first",
+                false,
+                &format!(
+                    "head -c 300000 /dev/zero | tr '\\0' x >&2\ncat > /dev/null\nprintf '%s' '{STOPPED}'"
+                ),
+            );
+            let envelope =
+                engine_request_envelope(EngineMethod::Stop, &json!({"blob": "y".repeat(1 << 20)}))
+                    .unwrap();
+            let program = engine.path().to_path_buf();
+            let answer = finishes_within(Duration::from_secs(20), move || {
+                run_engine_stdio(
+                    &program,
+                    ["stdio"],
+                    &EngineStdioOptions::default(),
+                    &envelope,
+                )
+            })
+            .expect("the engine answered");
+            assert!(answer.ok);
+            drop(engine);
+        }
+
         /// A request that cannot be written because the engine is gone reports
         /// what the engine said on stderr, not only that the write failed: the
         /// engine's own words are the explanation. The request is larger than a
@@ -1021,8 +1061,14 @@ mod tests {
             assert!(Path::new(&proc_entry).exists(), "the child is running");
 
             let error = finishes_within(Duration::from_secs(10), move || {
+                let mut child = child;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|pipe| StderrCollector::start(pipe, None::<io::Sink>));
                 abandon_unwritten_request(
                     child,
+                    stderr,
                     &io::Error::from(io::ErrorKind::BrokenPipe),
                     Duration::from_secs(1),
                 )
@@ -1061,9 +1107,14 @@ mod tests {
             child.wait().unwrap();
             let started = Instant::now();
 
+            let stderr = child
+                .stderr
+                .take()
+                .map(|pipe| StderrCollector::start(pipe, None::<io::Sink>));
             let error = finishes_within(Duration::from_secs(4), move || {
                 abandon_unwritten_request(
                     child,
+                    stderr,
                     &io::Error::from(io::ErrorKind::BrokenPipe),
                     Duration::from_millis(300),
                 )

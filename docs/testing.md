@@ -301,13 +301,20 @@ runs the whole client against a fake that exits without reading;
 `the_stderr_of_a_failed_write_is_not_waited_for_past_the_grace` one whose
 grandchild keeps the pipe open. The last two run the step on a real child with an
 injected write error, because whether a real write fails before the child has
-closed its stdin is a race. The answer of an engine that exits without draining a request larger than a pipe buffer is not read on this path (every engine here reads stdin to the end before answering, so that needs one that breaks the protocol); the module comment in `stdio_client.rs` states the limit. The bound compares the deadline with the clock
-before every receive and receives nothing once it has passed, because a receive
-with an expired timeout still returns output that is already queued, which would
-let a backlog or a descendant that keeps writing hold the error path past it;
-`collecting_stops_at_the_deadline_even_with_output_queued` and
-`collecting_returns_at_the_deadline_while_output_keeps_arriving` run that
-collection directly, on every platform.
+closed its stdin is a race. The answer of an engine that exits without draining a request larger than a pipe buffer is not read on this path (every engine here reads stdin to the end before answering, so that needs one that breaks the protocol); the module comment in `stdio_client.rs` states the limit. The stderr of a failed
+write is collected by a thread that starts before the request is written and is
+waited for with one deadline (`StderrCollector::finish`), returning what had
+arrived when it passes; `a_collector_stops_waiting_at_its_deadline_and_keeps_collecting`
+and `an_expired_deadline_returns_what_is_collected_without_waiting` run that on
+every platform.
+
+Starting the collector before the write also means an engine that fills its
+stderr pipe before it has drained a request larger than a pipe buffer cannot
+deadlock the client (the engine blocked on a full stderr, the client on a full
+stdin, nobody reading either).
+`an_engine_that_writes_a_lot_of_stderr_before_reading_its_request_does_not_deadlock`
+runs that against a fake that writes 300 kB to stderr first and is red when the
+collector is started after the write.
 
 One wait is deliberately not bounded and has no test: after the child exits, the
 answer is read to the end of its stdout and its stderr collector is joined, so an
