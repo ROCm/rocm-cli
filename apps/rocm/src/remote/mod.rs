@@ -1317,6 +1317,58 @@ mod tests {
         }
     }
 
+    /// A session record is plain JSON in the user's data dir, and its
+    /// `remote_cli` is the one field placed into the remote command line
+    /// unquoted — it has to be, so the remote shell expands the `$HOME` in
+    /// `$HOME/.local/bin/rocm`. Any other value would be parsed by the remote
+    /// shell as part of the command line the next time `rocm remote status`
+    /// polled, so a record naming one is refused before it is used.
+    ///
+    /// Driven through `load_all`, the path every consumer actually uses, rather
+    /// than through the validator directly: that is what proves the check is
+    /// wired in rather than merely present.
+    #[test]
+    fn a_tampered_remote_cli_never_reaches_the_remote_shell() {
+        let (root, paths) = temp_paths("remote-cli");
+        std::fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+        std::fs::write(
+            paths
+                .remote_sessions_dir()
+                .join("remote-gpu-box-11434.json"),
+            r#"{"session_id":"remote-gpu-box-11434","target":"gpu-box",
+                "peer_host":"gpu-box.example-tailnet.ts.net","ssh_port":null,
+                "model":"qwen","remote_service_id":"svc-1",
+                "remote_cli":"rocm; touch /tmp/unexpected #","remote_port":11434,
+                "tailnet_port":8000,"base_url":"http://x/v1","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let records = session::load_all(&paths).expect("one bad record must not fail the read");
+        assert!(
+            records.is_empty(),
+            "a record naming an unexpected remote CLI must be refused, not acted on: {records:?}"
+        );
+
+        // And the legitimate forms still load, so the guard is a filter on
+        // tampering rather than on remote sessions in general.
+        for cli in ["rocm", bootstrap::REMOTE_CLI_PATH] {
+            let mut record = sample_record();
+            record.remote_cli = cli.to_owned();
+            record.write(&paths).unwrap();
+            assert_eq!(
+                session::load_all(&paths)
+                    .unwrap()
+                    .iter()
+                    .filter(|loaded| loaded.remote_cli == cli)
+                    .count(),
+                1,
+                "`{cli}` is a form this tool writes and must keep loading"
+            );
+            std::fs::remove_file(record.path(&paths)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn the_remote_server_binds_loopback_but_demands_a_key() {
         // The bind stays loopback — the publish is what widens reach — so the

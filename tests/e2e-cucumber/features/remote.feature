@@ -80,6 +80,7 @@ Feature: Working with GPU machines over a private network
     Then the user is given an endpoint and a credential
     And the user is told the endpoint is reachable by the whole network
     And the machine is publishing that endpoint
+    And the session is recorded where only the user can reach it
 
   @id:remote-status-reports-both-halves @requires-docker
   Scenario: remote-11 - Status reports the model and the endpoint separately
@@ -131,3 +132,14 @@ Feature: Working with GPU machines over a private network
     When the user serves a model on that machine
     Then the user is told it is already serving and given the exact command to stop it
     And running that command on the machine stops it
+
+  # A session record names the command this tool runs on the machine. One that
+  # has been edited to name something else must be refused before it reaches
+  # the machine, not merely reported oddly after it ran there.
+  @id:remote-status-refuses-altered-record @requires-docker
+  Scenario: remote-16 - A session record altered to run something else is refused, not run
+    Given a model serving on a reachable GPU machine
+    When the session record is altered to run an extra command on that machine
+    And the user asks about their remote sessions
+    Then the user is told the session record was refused
+    And the extra command never ran on the machine
