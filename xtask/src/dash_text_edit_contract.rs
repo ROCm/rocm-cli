@@ -44,9 +44,10 @@
 //!   `.push(if shift { x.to_ascii_uppercase() } else { x })` and a call written
 //!   with a gap before the paren (`.push (x)`, which rustfmt never produces) are
 //!   not seen. `push_str`, `truncate`, `clear`, `String::pop(&mut b)`,
-//!   `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned. A cursor editor such as the serve wizard's Host field
-//!   (`InlineEditor` in `ui/serve_wizard.rs`) cannot use the append-only helper,
-//!   so it is a different thing, and a second copy of one goes unseen.
+//!   `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned. A
+//!   cursor editor such as the serve wizard's Host field (`InlineEditor` in
+//!   `ui/serve_wizard.rs`) cannot use the append-only helper, so it is a
+//!   different thing, and a second copy of one goes unseen.
 //! * A file that never names `KeyCode::Char(` is not checked for a `char`
 //!   push. A typed key can reach such a file through a call from another one (the
 //!   `install_manager` `type_char` shape, with the arm in a different file), and
@@ -471,9 +472,23 @@ fn pop(c: KeyCode, q: &mut String) { if c == KeyCode::Backspace { q.pop(); } }
             );
         }
         // The helper itself is the shape being banned elsewhere, so it must
-        // read as an offender here: that is what the exemption is for.
+        // read as an offender here: that is what the exemption is for. Its count
+        // is not pinned (`check` skips the helper file, so nothing else depends on
+        // it, and an unrelated edit to `widgets.rs` must not fail this test): it
+        // must show a push and a pop, the two halves of the edit it implements.
         let helper = &files.iter().find(|(p, _)| p == HELPER_FILE).unwrap().1;
-        assert_eq!(hand_rolled_edits(helper).len(), 2, "push and pop");
+        let seen: Vec<String> = hand_rolled_edits(helper)
+            .into_iter()
+            .map(|offense| offense.what)
+            .collect();
+        assert!(
+            seen.iter().any(|what| what.contains(".push(")),
+            "the scan no longer sees the helper's push: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|what| what.contains(".pop()")),
+            "the scan no longer sees the helper's pop: {seen:?}"
+        );
     }
 
     #[test]

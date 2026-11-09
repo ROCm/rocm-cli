@@ -230,8 +230,8 @@ writes) are not seen. Only `#[cfg(test)]` exactly is read as a test gate (a
 `#[cfg(all(test, ..))]` is scanned, which can only cause a false alarm), and
 `use KeyCode::*` or an alias of `KeyCode` defeats the scan. A typed key passed
 from one file to a method in another is not followed. Only `.pop()` and
-`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`, `.remove(..)` and `replace_range(..)` are not scanned,
-partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
+`.push(x)` are matched: `push_str`, `truncate`, `clear`, `.insert(..)`,
+`.remove(..)` and `replace_range(..)` are not scanned, partly because a cursor editor (the serve wizard's Host field, `InlineEditor` in
 [`serve_wizard.rs`](../crates/rocm-dash-tui/src/ui/serve_wizard.rs)) cannot use
 the append-only helper and is a different thing. A `Backspace` arm that never
 pops, such as the folder browser's "go to the parent directory", is not a text
