@@ -17,8 +17,6 @@ mod loopback;
 #[path = "common/proptest_cases.rs"]
 mod proptest_cases;
 
-use std::path::PathBuf;
-use std::thread;
 use std::time::Duration;
 
 use loopback::LoopbackServer;
@@ -27,15 +25,13 @@ use proptest_cases::proptest_cases;
 use rocm_core::{DOWNLOAD_CHUNK_BYTES, DownloadRequest, download_file_streaming};
 use sha2::{Digest, Sha256};
 
-fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rocm-core-digest-gate-{tag}-{}-{:?}",
-        std::process::id(),
-        thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// A fresh scratch directory, removed when the returned guard drops — including
+/// when an assertion fails, so a failing run leaves nothing in the temp dir.
+fn scratch_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("rocm-core-digest-gate-{tag}-"))
+        .tempdir()
+        .expect("scratch dir")
 }
 
 /// Run one download against a loopback server, returning whether the gate
@@ -55,7 +51,8 @@ fn download_outcome(
     expected_sha256: Option<&str>,
     tag: &str,
 ) -> (Result<(), String>, Vec<String>) {
-    let dir = scratch_dir(tag);
+    let scratch = scratch_dir(tag);
+    let dir = scratch.path();
     let destination = dir.join("artifact.bin");
     let server = LoopbackServer::start(None, body.to_vec());
     let url = format!("{}/artifact.bin", server.url());
@@ -71,7 +68,7 @@ fn download_outcome(
         "the download never reached the test server: {result:?}"
     );
     drop(server);
-    let mut left_behind: Vec<String> = std::fs::read_dir(&dir)
+    let mut left_behind: Vec<String> = std::fs::read_dir(dir)
         .expect("read scratch dir")
         .map(|entry| {
             entry
@@ -82,7 +79,6 @@ fn download_outcome(
         })
         .collect();
     left_behind.sort();
-    let _ = std::fs::remove_dir_all(&dir);
     (result, left_behind)
 }
 
