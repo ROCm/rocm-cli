@@ -83,16 +83,32 @@ impl ExamineSummary {
             // do is let an engine decide and then read back what it chose -
             // which is the `device:` row this same ticket added, and the only
             // thing on this host that can actually settle the question.
-            GpuSupportLevel::Unknown => format!(
-                "  rocm_support: unknown - {}, so this build can confirm neither \
-                 ROCm support nor its absence; serve a model with `rocm serve \
-                 <model> --engine lemonade` and read the backend it picked from \
-                 the `device:` row of `rocm services list`\n",
-                match detected {
-                    Some(gfx) => format!("GPU target {gfx} is not in this build's catalog"),
-                    None => "no AMD GPU was detected".to_owned(),
-                }
-            ),
+            // Two different hosts reach `Unknown`, and they need different
+            // advice because only one of them can serve anything.
+            //
+            // A detected-but-unrecognised target means a GPU *is* present, so
+            // `rocm serve` runs and the engine's own `device:` row settles what
+            // this catalog could not. With nothing detected, that same command
+            // is refused outright by the no-usable-GPU pre-flight under the
+            // default `gpu_required` policy — naming it would be advice that
+            // cannot clear the condition it is printed for (AGENTS.md section 3).
+            // `rocm diagnose` is the command that can: its `fix-3-rocm-kernel`,
+            // `fix-4-render-group` and `fix-5-amdgpu-load` entries are exactly
+            // the reasons a present GPU goes undetected.
+            GpuSupportLevel::Unknown => match detected {
+                Some(gfx) => format!(
+                    "  rocm_support: unknown - GPU target {gfx} is not in this \
+                     build's catalog, so this build can confirm neither ROCm \
+                     support nor its absence; serve a model with `rocm serve \
+                     <model> --engine lemonade` and read the backend it picked \
+                     from the `device:` row of `rocm services list`\n"
+                ),
+                None => "  rocm_support: unknown - no AMD GPU was detected, so \
+                         this build can confirm neither ROCm support nor its \
+                         absence; run `rocm diagnose` to find out why no GPU is \
+                         visible\n"
+                    .to_owned(),
+            },
         }
     }
 
@@ -502,7 +518,18 @@ mod tests {
 
     #[test]
     fn examine_answers_the_support_question_the_unknown_engine_note_sends_users_here_for() {
-        for detected in [None, Some("gfx803")] {
+        // Both `Unknown` sub-cases must answer, and both must leave somewhere
+        // to go — but not the same somewhere. A detected-but-unrecognised
+        // target has a GPU, so `rocm serve` runs and its `device:` row settles
+        // the backend. With nothing detected that command is refused by the
+        // no-usable-GPU pre-flight, so the only honest next step is finding out
+        // why the GPU is invisible. See
+        // `no_gpu_advice_names_a_command_that_host_can_run`, which pins that
+        // distinction against the behaviour rather than the wording.
+        for (detected, expected_command) in [
+            (None, "rocm diagnose"),
+            (Some("gfx803"), "rocm serve <model> --engine lemonade"),
+        ] {
             let rendered = examine_summary_with_gpu(detected, None).render_text();
             let line = rendered
                 .lines()
@@ -516,14 +543,71 @@ mod tests {
             // Says which level it is, and leaves a command that can settle it.
             assert!(line.contains("unknown"), "{line}");
             assert!(
-                line.contains("rocm serve <model> --engine lemonade"),
-                "an `unknown` answer still has to leave somewhere to go: {line}"
-            );
-            assert!(
-                line.contains("device:"),
-                "and name where the real backend shows up: {line}"
+                line.contains(expected_command),
+                "an `unknown` answer still has to leave somewhere to go, and it \
+                 has to be somewhere this host can actually go: {line}"
             );
         }
+
+        // The detected sub-case also names where the backend shows up; the
+        // undetected one has no server to read it from.
+        let unrecognised = examine_summary_with_gpu(Some("gfx803"), None).render_text();
+        assert!(
+            unrecognised.contains("device:"),
+            "a host that can serve must be told where the real backend shows up: \
+             {unrecognised}"
+        );
+    }
+
+    /// The advice a host is given must name a command that host can actually
+    /// run — asserted against the serve pre-flight's own predicate, not against
+    /// the wording.
+    ///
+    /// `rocm serve` refuses on a host with no usable AMD GPU under the default
+    /// `gpu_required` policy, so telling an undetected host to serve a model is
+    /// advice that cannot clear the condition it is printed for. Both `Unknown`
+    /// sub-cases are driven here because they differ precisely on this: a
+    /// detected-but-unrecognised target has a GPU and may serve, nothing
+    /// detected may not.
+    ///
+    /// Written against `gpu_support_level` + the rendered line rather than a
+    /// string match on the sentence: a reworded message that still sent a
+    /// GPU-less host to `rocm serve` would pass a wording assertion and fail
+    /// this one.
+    #[test]
+    fn no_gpu_advice_names_a_command_that_host_can_run() {
+        let undetected = examine_summary_with_gpu(None, None).render_text();
+        let line = undetected
+            .lines()
+            .find(|l| l.trim_start().starts_with("rocm_support:"))
+            .expect("every host gets a support line");
+        assert_eq!(
+            gpu_support_level(None, None),
+            GpuSupportLevel::Unknown,
+            "precondition: nothing detected is the Unknown tier"
+        );
+        assert!(
+            !line.contains("rocm serve"),
+            "`rocm serve` is refused on a host with no usable AMD GPU, so it \
+             cannot be the next step offered to one: {line}"
+        );
+        assert!(
+            line.contains("rocm diagnose"),
+            "dropping the unusable command must still leave a usable one: {line}"
+        );
+
+        // The sibling sub-case keeps the serve advice, because that host has a
+        // GPU and the engine's own device row is what settles the question.
+        let unrecognised = examine_summary_with_gpu(Some("gfx-not-in-catalog"), None).render_text();
+        let line = unrecognised
+            .lines()
+            .find(|l| l.trim_start().starts_with("rocm_support:"))
+            .expect("every host gets a support line");
+        assert!(
+            line.contains("rocm serve"),
+            "a detected GPU can serve, so the advice that settles its backend \
+             must not be withheld: {line}"
+        );
     }
 
     #[test]
