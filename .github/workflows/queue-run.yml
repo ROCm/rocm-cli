@@ -6,7 +6,7 @@
 # lane matrix, uploads the lanes' files, and passes or fails with the run's
 # verdict. It needs no credential and no permission: the runner asks from where
 # it stands, and runs only this workflow and nightly-queue.yml as they are on
-# main. What that does and does not protect is in docs/nightly-on-the-queue.md.
+# main. What that protects is in docs/nightly-on-the-queue.md.
 name: E2E on the queue
 
 on:

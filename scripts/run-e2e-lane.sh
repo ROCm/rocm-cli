@@ -4,16 +4,22 @@
 # SPDX-License-Identifier: MIT
 
 # One lane of the nightly on the shared GPU queue: the full E2E suite, nightly
-# scenarios included, on the one GPU the lane was given.
+# scenarios included, on the one GPU the lane was given, once for each ROCm
+# channel.
 #
-# It mirrors the self-hosted nightly job (`e2e-gpu-nightly` in nightly.yml) from a
-# cold start: the lane is a fresh container holding a checkout of the commit
-# under test, with no toolchain, build or runtime cached from an earlier run. The
-# queue side runs this from the checkout's root. What a lane must and must not
-# write is in docs/nightly-on-the-queue.md.
+# It mirrors the self-hosted nightly jobs (`e2e-gpu-nightly` in nightly.yml, a
+# matrix over the release and nightly channels) from a cold start: the lane is a
+# fresh container holding a checkout of the commit under test, with no
+# toolchain, build or runtime cached from an earlier run. The build is shared;
+# each channel gets its own runtimes, its own suite run, and its own directory
+# under the lane's out, `<channel>/results`. Both channels always run, so one
+# failing does not hide the other; the lane fails if either did. The queue side
+# runs this from the checkout's root. What a lane must and must not write is in
+# docs/nightly-on-the-queue.md.
 #
 # Inputs, all optional:
-#   E2E_CHANNEL    the ROCm channel to pre-warm, release (default) or nightly
+#   E2E_CHANNELS   the ROCm channels to run, in order: release, nightly, or
+#                  both (default "release nightly")
 #   E2E_LANE_WORK  where the build and runtimes go (default /var/tmp/e2e-lane)
 #   LANE_OUT       where reported files go (default /out)
 
@@ -22,23 +28,36 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 out="${LANE_OUT:-/out}"
 work="${E2E_LANE_WORK:-/var/tmp/e2e-lane}"
-channel="${E2E_CHANNEL:-release}"
+channels="${E2E_CHANNELS:-release nightly}"
 
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
-# On every way out, so a failing suite still reports which scenarios failed.
-# The lane's status stays the suite's: a failed copy only warns.
+# The channels are checked before anything is built, so a typo costs nothing.
+for channel in ${channels}; do
+  case "${channel}" in
+    release | nightly) ;;
+    *)
+      echo "E2E_CHANNELS: unknown channel '${channel}' (release or nightly)" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ -z "${channels// /}" ]]; then
+  echo "E2E_CHANNELS names no channel" >&2
+  exit 2
+fi
+
+# After each channel's run, so a failing suite still reports which scenarios
+# failed. The lane's status stays the suite's: a failed copy only warns.
 save_results() {
-  local rc=$?
+  local channel="$1"
   if [[ -d tests/e2e-cucumber/results ]]; then
-    mkdir -p "${out}/results" &&
-      cp -R tests/e2e-cucumber/results/. "${out}/results/" ||
-      echo "warning: could not copy the E2E results to ${out}" >&2
+    mkdir -p "${out}/${channel}/results" &&
+      cp -R tests/e2e-cucumber/results/. "${out}/${channel}/results/" ||
+      echo "warning: could not copy the E2E results to ${out}/${channel}" >&2
   fi
-  exit "${rc}"
 }
-trap save_results EXIT
 
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
@@ -46,9 +65,6 @@ mkdir -p "${work}"
 export CARGO_TARGET_DIR="${work}/target"
 export E2E_SHARED_CACHE_DIR="${work}/shared"
 export E2E_SHARED_UV_CACHE_DIR="${work}/uv-cache"
-prewarm="${work}/prewarm"
-export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
-
 # What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
 # installs it; the ROCm dev images carry a compiler but not these. The update is
 # retried as there: a mirror mid-sync fails it for a few minutes.
@@ -85,10 +101,32 @@ cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
 export ROCM_CLI_BINARY="${CARGO_TARGET_DIR}/release/rocm"
 export ROCM_CLI_ROCMD_BINARY="${CARGO_TARGET_DIR}/release/rocmd"
 
-# Installed in place, never moved: install sdk bakes absolute paths into the
-# runtime manifest. See `xtask e2e-prewarm`.
-HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
-  UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
-  cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}"
+# One channel: its runtimes, installed in place, never moved (install sdk bakes
+# absolute paths into the runtime manifest; see `xtask e2e-prewarm`), in a tree
+# of its own so the two channels' runtimes never meet; then the full suite on
+# the build. A failure is returned, not fatal, so the next channel still runs.
+run_channel() {
+  local channel="$1"
+  local prewarm="${work}/prewarm-${channel}"
+  export E2E_SHARED_RUNTIMES_DIR="${prewarm}/data/runtimes"
+  # The suite writes here, and a channel must not report the last one's files.
+  rm -rf tests/e2e-cucumber/results
+  HF_HOME="${E2E_SHARED_CACHE_DIR}/huggingface" \
+    UV_CACHE_DIR="${E2E_SHARED_UV_CACHE_DIR}" \
+    cargo xtask e2e-prewarm --channel "${channel}" --prewarm-dir "${prewarm}" ||
+    return $?
+  cargo xtask e2e
+}
 
-cargo xtask e2e
+status=0
+for channel in ${channels}; do
+  echo "== channel ${channel}"
+  rc=0
+  run_channel "${channel}" || rc=$?
+  save_results "${channel}"
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "channel ${channel} failed (status ${rc})" >&2
+    [[ "${status}" -ne 0 ]] || status="${rc}"
+  fi
+done
+exit "${status}"

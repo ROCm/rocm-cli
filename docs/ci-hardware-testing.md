@@ -48,7 +48,9 @@ rung instead of being removed outright.
 shared GPU queue, one per GPU model, so no runner holds a GPU for the length
 of a job, and publishes the result;
 [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) publishes a
-finished run again. They are not a rung yet and gate nothing; see
+finished run again. They cover the Linux GPU nightly on both the release and
+the nightly channel; native Windows and WSL stay on their dedicated runners,
+since the queue runs Linux pods. See
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so

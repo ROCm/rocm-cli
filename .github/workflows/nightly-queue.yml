@@ -5,12 +5,12 @@
 # run went on: once the run's lanes are done, it has the queue side finish the
 # run if no one has, prints its report and lane matrix, uploads the lanes'
 # files, and passes or fails with the run's verdict. It needs no credential, so
-# the shared self-hosted runner never holds the queue's. What that does and does
-# not protect is in docs/nightly-on-the-queue.md.
+# the shared self-hosted runner never holds the queue's. What that protects is
+# in docs/nightly-on-the-queue.md.
 name: Nightly E2E (queue)
 
 on:
-  # Manual only, and gating nothing.
+  # Manual only.
   workflow_dispatch:
     inputs:
       request_id:

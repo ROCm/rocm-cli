@@ -15,16 +15,18 @@ summary, the lanes' files as the `queue-run-results` artifact, and a pass or
 fail. [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) publishes
 a run that has already finished.
 
-This gates nothing yet. The scheduled GPU lanes in
-[`nightly.yml`](../.github/workflows/nightly.yml) remain the nightly coverage
-gate described in [ci-hardware-testing.md](ci-hardware-testing.md). Three
-things must happen before this could replace them: a lane must be seen to
-build and run the suite from a cold start in the lane image; the published
-verdict must become trustworthy enough to gate on — see "What this does not
-protect yet" below; and the lanes must cover what those jobs cover. A lane is
-one Linux container testing the `release` channel (see "What a run
-executes"), while `nightly.yml` also tests the `nightly` channel and native
-Windows and WSL.
+The queue's lanes cover the Linux GPU nightly: one lane per GPU model, each
+running the full suite on both the `release` and the `nightly` channel, as the
+GPU jobs of [`nightly.yml`](../.github/workflows/nightly.yml) do (see
+[ci-hardware-testing.md](ci-hardware-testing.md)). Their results are trusted the
+way those jobs' results are: the queue runs on the same infrastructure and under
+the same access as the self-hosted runners, and neither signs what it reports.
+
+**The remaining gap is native Windows and WSL.** The queue runs Linux pods, so
+the native Windows and WSL lanes stay on their dedicated runners, in `nightly.yml`
+and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml); nothing
+here replaces them. Which checks are required before merging is a repository
+setting, outside this page.
 
 This page is the **contract** between this repository and the queue side: what
 a lane must do to be reported, and how to read the report. The queue side —
@@ -82,8 +84,8 @@ can be overridden for a single run (`queue-run.yml` sets the branch):
   that image, from the root of the checkout, with the commit in
   `ROCM_CLI_COMMIT`. The default is
   [`scripts/run-e2e-lane.sh`](../scripts/run-e2e-lane.sh), which builds
-  and runs the full suite from a cold start, so what a lane runs is changed
-  here, by a pull request, like any other test
+  once and runs the full suite from a cold start on each channel, so what a
+  lane runs is changed here, by a pull request, like any other test
 - the blocking lanes — which lanes can fail the run; left empty, every lane can
 - the excluded lanes — GPU models to leave out of this run
 - the wait — how long the run waits for its slowest lane before cancelling
@@ -99,11 +101,17 @@ did not test it. A run that discovers no lanes at all fails.
 A discovered lane that is not blocking is advisory: reported, but unable to
 fail the run. Promoting it is a deliberate edit once it has run clean.
 
-Every lane runs the same image and command; there is no per-lane variant.
+Every lane runs the same image and command; there is no per-lane variant. The
+channels are the command's, not the queue's: the default command runs the
+`release` channel and then the `nightly` one (`E2E_CHANNELS`, default `release
+nightly`), each with its own runtimes and its own suite run, so a lane takes
+about twice as long as one channel would. Both always run, so a failing
+channel does not hide the other, and the lane fails if either did.
 
 ## Output
 
-**A lane must write everything it wants reported directly into `/out`.**
+**A lane must write everything it wants reported directly into `/out`.** The
+default command writes each channel's suite results to `/out/<channel>/results`.
 
 - Each lane's `/out` lands in the workflow's artifact, `queue-run-results`
   from `queue-run.yml` or `nightly-queue-results` from `nightly-queue.yml`,
@@ -168,7 +176,7 @@ keep it that way.
 
 That test reads the workflow files on `main`. A workflow on another branch of
 this repository can still name the runner's label, which is one reason the
-runner is treated as untrusted below. On `main`, the tests also refuse any
+runner holds no credential, below. On `main`, the tests also refuse any
 other workflow that names the `queue-report` label or these workflows, so none
 sends a job to the runner or waits on them by mistake. The runner itself
 refuses, before any step runs, every job that is not one of these two
@@ -191,16 +199,13 @@ workflow, or making it ephemeral, needs organisation-level configuration or a
 token-minting credential. So the queue credential stays with the queue side,
 and the runner has no credential for the queue or the cluster, and no sudo.
 
-**What this does not protect yet: the report's integrity.** The runner keeps
-its own registration with GitHub between jobs, so a published verdict is only
-as trustworthy as every job that has run on that runner. Such a job can also
-read every retained run's results, including runs started by hand that were
-never published. None of this reaches the queue or its credential. Each job also receives GitHub's own short-lived
-runtime token, which a tampered runner could misuse within that job's reach,
-such as writing build caches. Together these are why this workflow must not
-gate anything until the runner is single-use (a fresh registration per job),
-or the queue side signs what it reports and something other than this runner
-checks the signature: a tampered runner would skip its own check.
+**What the report is trusted for.** The runner keeps its own registration with
+GitHub between jobs, and a job on it can read every retained run's results,
+including runs started by hand that were never published. That is the same trust
+the self-hosted runners already carry: their nightly results are not signed
+either, and the queue runs on the same infrastructure under the same access. A
+job on this runner still cannot reach the queue or its credential. Each job also
+receives GitHub's own short-lived runtime token, as on any runner.
 
 **Results move by a shared volume, not a network call.** The queue side writes
 each finished run's publishable files; the runner reads them read-only. No

@@ -8885,9 +8885,9 @@ permissions:
         // default `self-hosted`, OS and architecture labels, so only a job naming
         // that literal label lands on it. No other workflow on `main` may name it,
         // nor name this workflow, which is how another one would wait on its
-        // result; it gates nothing. This catches a mistake on `main`, not an
+        // result. This catches a mistake on `main`, not an
         // attempt to hide one: a workflow on any other branch can name the label
-        // anyway, which is why the runner holds nothing worth taking.
+        // anyway, which is why the runner holds no credential.
         let workflow_name = strip_comment(&top_level_block(&plain, "name")).to_owned();
         let dir = repo_root().join(".github/workflows");
         for entry in std::fs::read_dir(&dir).expect("reading .github/workflows") {
@@ -8902,7 +8902,7 @@ permissions:
             assert!(
                 found.is_empty(),
                 "{name} names {found:?}: only {QUEUE_WORKFLOWS:?} may use the queue-report \
-                 runner, and no workflow may depend on them, which gate nothing (see \
+                 runner, and no workflow may depend on them (see \
                  docs/nightly-on-the-queue.md)"
             );
         }
@@ -9076,6 +9076,44 @@ permissions:
         std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
     }
 
+    /// The queue covers the Linux GPU nightly on both channels and not native
+    /// Windows or WSL; the doc must say both, plainly, and say no more than the
+    /// lane script does about the channels.
+    #[test]
+    fn the_queue_doc_states_its_channels_and_its_remaining_gap() {
+        let doc = docs_nightly_on_the_queue();
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needed in [
+            "both the `release` and the `nightly` channel",
+            "The remaining gap is native Windows and WSL.",
+            "the native Windows and WSL lanes stay on their dedicated runners",
+            "`E2E_CHANNELS`",
+            "`/out/<channel>/results`",
+        ] {
+            assert!(
+                flat.contains(needed),
+                "docs/nightly-on-the-queue.md must say: {needed}"
+            );
+        }
+        let script = std::fs::read_to_string(repo_root().join("scripts/run-e2e-lane.sh"))
+            .expect("reading the lane script");
+        assert!(
+            script.contains("E2E_CHANNELS:-release nightly"),
+            "the lane script must default to both channels, as the doc says"
+        );
+        // Neither the framing nor the caveat the owners dropped.
+        for gone in [
+            "(advisory)",
+            "the report's integrity",
+            "must not gate anything",
+        ] {
+            assert!(
+                !flat.contains(gone),
+                "docs/nightly-on-the-queue.md still says {gone}"
+            );
+        }
+    }
+
     #[test]
     fn each_queue_workflow_uploads_the_artifact_the_doc_names_for_it() {
         let doc = docs_nightly_on_the_queue();
@@ -9106,15 +9144,19 @@ permissions:
     /// directory that becomes the whole `PATH`, so a test decides what is
     /// missing.
     #[cfg(unix)]
-    const LANE_TOOLS: [&str; 5] = ["bash", "dirname", "mkdir", "cp", "cat"];
+    const LANE_TOOLS: [&str; 6] = ["bash", "dirname", "mkdir", "cp", "cat", "rm"];
 
     /// One run of the lane script against stubbed tools: how often
-    /// `apt-get update` fails first, what the suite exits with, whether cargo
-    /// is already installed, and whether the out directory cannot be written.
+    /// `apt-get update` fails first, what the suite exits with (on the nightly
+    /// channel too, unless `nightly_rc` says otherwise), the channels asked for,
+    /// whether cargo is already installed, and whether the out directory cannot
+    /// be written.
     #[cfg(unix)]
     struct LaneCase {
         apt_failures: u32,
         suite_rc: i32,
+        nightly_rc: Option<i32>,
+        channels: Option<&'static str>,
         cargo_installed: bool,
         out_blocked: bool,
     }
@@ -9125,6 +9167,8 @@ permissions:
             Self {
                 apt_failures: 0,
                 suite_rc: 0,
+                nightly_rc: None,
+                channels: None,
                 cargo_installed: true,
                 out_blocked: false,
             }
@@ -9229,24 +9273,32 @@ permissions:
                  \"xtask e2e\")\n\
                  echo \"suite E2E_INCLUDE_NIGHTLY=${{E2E_INCLUDE_NIGHTLY-unset}} \
                  ROCM_CLI_BINARY=$ROCM_CLI_BINARY\"\n\
+                 echo \"suite runtimes=$E2E_SHARED_RUNTIMES_DIR\"\n\
+                 [ -d tests/e2e-cucumber/results ] && echo \"stale results\"\n\
                  mkdir -p tests/e2e-cucumber/results\n\
-                 echo suite > tests/e2e-cucumber/results/junit.xml\n\
-                 exit {rc};;\n\
+                 echo \"suite $E2E_SHARED_RUNTIMES_DIR\" > tests/e2e-cucumber/results/junit.xml\n\
+                 case \"$E2E_SHARED_RUNTIMES_DIR\" in\n\
+                 *prewarm-nightly*) exit {nightly};;\n\
+                 *) exit {rc};;\n\
+                 esac;;\n\
                  esac\n",
-                rc = case.suite_rc
+                rc = case.suite_rc,
+                nightly = case.nightly_rc.unwrap_or(case.suite_rc)
             ),
         )
         .expect("stub cargo");
 
-        let output = std::process::Command::new(tools.join("bash"))
-            .arg(root.join("scripts/run-e2e-lane.sh"))
+        let mut lane = std::process::Command::new(tools.join("bash"));
+        lane.arg(root.join("scripts/run-e2e-lane.sh"))
             .env_clear()
             .env("PATH", &tools)
             .env("HOME", &home)
             .env("LANE_OUT", &out)
-            .env("E2E_LANE_WORK", dir.path().join("work"))
-            .output()
-            .expect("running the lane script");
+            .env("E2E_LANE_WORK", dir.path().join("work"));
+        if let Some(channels) = case.channels {
+            lane.env("E2E_CHANNELS", channels);
+        }
+        let output = lane.output().expect("running the lane script");
         let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&output.stderr));
         LaneRun {
@@ -9267,33 +9319,50 @@ permissions:
             });
             let work = dir.path().join("work");
             assert_eq!(rc, suite_rc, "{log}");
-            assert_eq!(
-                std::fs::read_to_string(out.join("results/junit.xml"))
-                    .ok()
-                    .as_deref(),
-                Some("suite\n"),
-                "the suite's results must reach the lane's out directory:\n{log}"
+            // Each channel's results in a directory of its own, and each the
+            // run of its own runtimes: nothing of one in the other.
+            for channel in ["release", "nightly"] {
+                assert_eq!(
+                    std::fs::read_to_string(out.join(channel).join("results/junit.xml"))
+                        .ok()
+                        .as_deref(),
+                    Some(
+                        format!("suite {}/prewarm-{channel}/data/runtimes\n", work.display())
+                            .as_str()
+                    ),
+                    "the {channel} suite's results must reach the lane's out directory:\n{log}"
+                );
+            }
+            assert!(
+                !out.join("results").exists(),
+                "results sit under their channel:\n{log}"
             );
-            // In this order, as the nightly job runs them.
-            let steps = [
+            assert!(!log.contains("stale results"), "{log}");
+            // In this order, as the nightly jobs run them: one build, then
+            // each channel's pre-warm and full suite, nightly scenarios
+            // included.
+            let mut steps = vec![
                 "preflight ran\n".to_owned(),
                 "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks\n"
                     .to_owned(),
-                format!(
-                    "cargo xtask e2e-prewarm --channel release --prewarm-dir {}/prewarm\n",
-                    work.display()
-                ),
-                // The pre-warm's caches on the same mount as the runtimes.
-                format!(
-                    "prewarm HF_HOME={w}/shared/huggingface UV_CACHE_DIR={w}/uv-cache\n",
-                    w = work.display()
-                ),
-                // The full suite, nightly scenarios included, on the build.
-                format!(
-                    "suite E2E_INCLUDE_NIGHTLY=1 ROCM_CLI_BINARY={}/target/release/rocm\n",
-                    work.display()
-                ),
             ];
+            for channel in ["release", "nightly"] {
+                steps.extend([
+                    format!(
+                        "cargo xtask e2e-prewarm --channel {channel} --prewarm-dir {}/prewarm-{channel}\n",
+                        work.display()
+                    ),
+                    // The pre-warm's caches on the same mount as the runtimes.
+                    format!(
+                        "prewarm HF_HOME={w}/shared/huggingface UV_CACHE_DIR={w}/uv-cache\n",
+                        w = work.display()
+                    ),
+                    format!(
+                        "suite E2E_INCLUDE_NIGHTLY=1 ROCM_CLI_BINARY={}/target/release/rocm\n",
+                        work.display()
+                    ),
+                ]);
+            }
             let mut from = 0;
             for step in &steps {
                 let at = log[from..]
@@ -9301,7 +9370,81 @@ permissions:
                     .unwrap_or_else(|| panic!("`{step}` missing or out of order in:\n{log}"));
                 from += at + step.len();
             }
+            assert_eq!(log.matches("cargo build").count(), 1, "{log}");
             assert!(!log.contains("curl"), "cargo was there already:\n{log}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_channel_does_not_hide_the_other() {
+        // Nightly fails, release passes: both ran and reported, and the lane
+        // is red.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            nightly_rc: Some(3),
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 3, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert!(log.contains("channel nightly failed (status 3)"), "{log}");
+        assert!(!log.contains("channel release failed"), "{log}");
+
+        // Release fails, nightly passes: the nightly channel still runs, and
+        // the lane's status is the first failure's.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            suite_rc: 1,
+            nightly_rc: Some(0),
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert!(log.contains("channel release failed (status 1)"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_runs_only_the_channels_it_is_asked_for_and_refuses_others() {
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            channels: Some("nightly"),
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert!(!out.join("release").exists(), "{log}");
+        assert!(!log.contains("--channel release"), "{log}");
+
+        for channels in ["beta", "release  stable", "  "] {
+            let LaneRun {
+                rc,
+                log,
+                out,
+                dir: _dir,
+            } = run_lane(&LaneCase {
+                channels: Some(channels),
+                ..LaneCase::default()
+            });
+            assert_eq!(rc, 2, "{channels:?}: {log}");
+            assert!(
+                !log.contains("cargo"),
+                "nothing is built for {channels:?}:\n{log}"
+            );
+            assert!(!out.exists(), "{channels:?}: {log}");
         }
     }
 
@@ -9346,7 +9489,7 @@ permissions:
             "{log}"
         );
         assert!(log.contains("cargo xtask e2e\n"), "{log}");
-        assert!(out.join("results/junit.xml").is_file(), "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
     }
 
     #[cfg(unix)]
